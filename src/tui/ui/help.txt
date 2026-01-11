@@ -1,0 +1,20 @@
+May - AI coding assistant
+
+COMMANDS
+  /help         Show this help
+  /new          Create new session
+  /session      Switch sessions
+  /config       Provider settings
+  /clear        Clear chat
+  /quit         Exit
+
+SHORTCUTS
+  Enter         Send message
+  Ctrl+v        Paste image
+  Ctrl+c        Quit
+  Up/Down       History / Scroll chat
+  Mouse wheel   Scroll chat
+  Esc           Clear input
+
+Type a message and press Enter to chat.
+Type @ to attach files.
