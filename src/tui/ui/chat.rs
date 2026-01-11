@@ -1,0 +1,1168 @@
+//! Chat stream display with inline tools and todos.
+
+use std::cell::Cell;
+use std::path::PathBuf;
+
+use aither_sandbox::{BashArgs, BashMode, BashResult, Content, OutputEntry};
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Borders, Paragraph, Wrap},
+};
+
+use super::super::queue::Attachment;
+use super::markdown;
+
+/// Status of a tool call.
+#[derive(Debug, Clone)]
+pub enum ToolStatus {
+    Running,
+    Done,
+    /// Search completed with N results.
+    SearchDone(usize),
+    Failed(String),
+}
+
+/// Information about a bash command execution.
+#[derive(Debug, Clone)]
+pub struct BashCallInfo {
+    /// The command that was executed.
+    pub command: String,
+    /// The output (may be truncated, matching what agent sees).
+    pub output: String,
+    /// Path to full output if truncated/offloaded.
+    pub output_file: Option<PathBuf>,
+}
+
+impl BashCallInfo {
+    /// Create a new bash call info.
+    pub fn new(command: String) -> Self {
+        Self {
+            command,
+            output: String::new(),
+            output_file: None,
+        }
+    }
+
+    /// Set the output.
+    pub fn with_output(mut self, output: String) -> Self {
+        self.output = output;
+        self
+    }
+
+    /// Set the output file.
+    pub fn with_output_file(mut self, path: PathBuf) -> Self {
+        self.output_file = Some(path);
+        self
+    }
+
+    /// Get a truncated preview of the command for inline display (unicode-safe).
+    pub fn command_preview(&self, max_chars: usize) -> &str {
+        match self.command.char_indices().nth(max_chars) {
+            Some((pos, _)) => &self.command[..pos],
+            None => &self.command,
+        }
+    }
+
+    /// Get a truncated preview of the output for inline display.
+    pub fn output_preview(&self, max_lines: usize) -> String {
+        let mut lines = Vec::with_capacity(max_lines);
+        let mut line_iter = self.output.lines();
+
+        for line in line_iter.by_ref().take(max_lines) {
+            lines.push(line);
+        }
+
+        // Check if there are more lines
+        if line_iter.next().is_some() {
+            format!("{}...", lines.join("\n"))
+        } else {
+            lines.join("\n")
+        }
+    }
+}
+
+/// Display representation of a tool call.
+#[derive(Debug, Clone)]
+pub enum ToolDisplay {
+    /// Web search query.
+    Search {
+        query: String,
+        status: ToolStatus,
+        results: Option<usize>,
+        /// The underlying bash call info.
+        bash_info: Option<BashCallInfo>,
+    },
+    /// URL fetch.
+    Fetch {
+        url: String,
+        status: ToolStatus,
+        /// The underlying bash call info.
+        bash_info: Option<BashCallInfo>,
+    },
+    /// Subagent task.
+    Task {
+        subagent: String,
+        prompt: String,
+        status: ToolStatus,
+        /// Bash calls made by this subagent (most recent at end).
+        bash_calls: Vec<BashCallInfo>,
+    },
+    /// Direct bash command.
+    Bash {
+        command: String,
+        mode: BashMode,
+        status: ToolStatus,
+        /// The output from this command.
+        output: Option<BashCallInfo>,
+    },
+}
+
+impl ToolDisplay {
+    /// Get the most recent bash call for this tool.
+    pub fn latest_bash(&self) -> Option<&BashCallInfo> {
+        match self {
+            ToolDisplay::Search { bash_info, .. } => bash_info.as_ref(),
+            ToolDisplay::Fetch { bash_info, .. } => bash_info.as_ref(),
+            ToolDisplay::Task { bash_calls, .. } => bash_calls.last(),
+            ToolDisplay::Bash { output, .. } => output.as_ref(),
+        }
+    }
+
+    /// Get all bash calls for this tool.
+    pub fn all_bash_calls(&self) -> Vec<&BashCallInfo> {
+        match self {
+            ToolDisplay::Search { bash_info, .. } => bash_info.iter().collect(),
+            ToolDisplay::Fetch { bash_info, .. } => bash_info.iter().collect(),
+            ToolDisplay::Task { bash_calls, .. } => bash_calls.iter().collect(),
+            ToolDisplay::Bash { output, .. } => output.iter().collect(),
+        }
+    }
+
+    /// Get status reference.
+    pub fn status(&self) -> &ToolStatus {
+        match self {
+            ToolDisplay::Search { status, .. } => status,
+            ToolDisplay::Fetch { status, .. } => status,
+            ToolDisplay::Task { status, .. } => status,
+            ToolDisplay::Bash { status, .. } => status,
+        }
+    }
+
+    /// Check if this is a subagent task.
+    pub fn is_subagent(&self) -> bool {
+        matches!(self, ToolDisplay::Task { .. })
+    }
+
+    /// Get a short type name for display.
+    pub fn type_name(&self) -> &str {
+        match self {
+            ToolDisplay::Search { .. } => "search",
+            ToolDisplay::Fetch { .. } => "fetch",
+            ToolDisplay::Task { subagent, .. } => subagent,
+            ToolDisplay::Bash { .. } => "bash",
+        }
+    }
+}
+
+/// Status of a todo item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// A todo item.
+#[derive(Debug, Clone)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+/// An element in the chat stream.
+#[derive(Debug, Clone)]
+pub enum ChatElement {
+    /// User message with optional attachments
+    UserMessage {
+        content: String,
+        attachments: Vec<Attachment>,
+    },
+    /// Assistant text (streaming or complete)
+    AssistantText { content: String, streaming: bool },
+    /// Tool call
+    ToolCall { id: String, display: ToolDisplay },
+    /// Todo block
+    TodoBlock { items: Vec<TodoItem> },
+    /// Error message
+    Error { message: String },
+    /// Loading indicator (waiting for LLM response)
+    Loading { frame: usize },
+    /// Thinking indicator (for thinking models)
+    Thinking { seconds: u64 },
+}
+
+/// The chat stream containing all elements.
+#[derive(Debug, Default)]
+pub struct ChatStream {
+    elements: Vec<ChatElement>,
+}
+
+impl ChatStream {
+    /// Create a new empty chat stream.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a user message.
+    pub fn push_user(&mut self, content: &str, attachments: Vec<Attachment>) {
+        self.elements.push(ChatElement::UserMessage {
+            content: content.to_string(),
+            attachments,
+        });
+    }
+
+    /// Add an error message.
+    pub fn push_error(&mut self, message: &str) {
+        self.elements.push(ChatElement::Error {
+            message: message.to_string(),
+        });
+    }
+
+    /// Start loading indicator.
+    pub fn start_loading(&mut self) {
+        self.elements.push(ChatElement::Loading { frame: 0 });
+    }
+
+    /// Update loading animation frame.
+    pub fn tick_loading(&mut self) {
+        if let Some(ChatElement::Loading { frame }) = self.elements.last_mut() {
+            *frame = (*frame + 1) % 4;
+        }
+    }
+
+    /// Start thinking indicator.
+    pub fn start_thinking(&mut self) {
+        // Remove loading if present
+        if matches!(self.elements.last(), Some(ChatElement::Loading { .. })) {
+            self.elements.pop();
+        }
+        self.elements.push(ChatElement::Thinking { seconds: 0 });
+    }
+
+    /// Update thinking time.
+    pub fn update_thinking(&mut self, seconds: u64) {
+        if let Some(ChatElement::Thinking { seconds: s }) = self.elements.last_mut() {
+            *s = seconds;
+        }
+    }
+
+    /// End loading/thinking state (called when first text arrives).
+    pub fn end_loading(&mut self) {
+        // Remove loading or thinking element if present
+        if matches!(
+            self.elements.last(),
+            Some(ChatElement::Loading { .. }) | Some(ChatElement::Thinking { .. })
+        ) {
+            self.elements.pop();
+        }
+    }
+
+    /// Start a new assistant text block.
+    pub fn start_assistant(&mut self) {
+        self.elements.push(ChatElement::AssistantText {
+            content: String::new(),
+            streaming: true,
+        });
+    }
+
+    /// Append text to the current streaming element.
+    pub fn push_text(&mut self, chunk: &str) {
+        if let Some(ChatElement::AssistantText {
+            content,
+            streaming: true,
+        }) = self.elements.last_mut()
+        {
+            content.push_str(chunk);
+        } else {
+            // Create new streaming element
+            self.elements.push(ChatElement::AssistantText {
+                content: chunk.to_string(),
+                streaming: true,
+            });
+        }
+    }
+
+    /// Mark the current text element as done streaming.
+    pub fn end_text(&mut self) {
+        if let Some(ChatElement::AssistantText { streaming, .. }) = self.elements.last_mut() {
+            *streaming = false;
+        }
+    }
+
+    /// Add a tool call.
+    pub fn push_tool(&mut self, id: String, display: ToolDisplay) {
+        // End any current text block first
+        self.end_text();
+        self.elements.push(ChatElement::ToolCall { id, display });
+    }
+
+    /// Update a tool's status and output by ID.
+    pub fn update_tool_with_output(
+        &mut self,
+        id: &str,
+        status: ToolStatus,
+        results: Option<usize>,
+        output: Option<String>,
+    ) {
+        for elem in &mut self.elements {
+            if let ChatElement::ToolCall {
+                id: tool_id,
+                display,
+            } = elem
+            {
+                if tool_id == id {
+                    match display {
+                        ToolDisplay::Search {
+                            status: s,
+                            results: r,
+                            bash_info,
+                            ..
+                        } => {
+                            *s = status;
+                            *r = results;
+                            if let Some(ref out) = output {
+                                if let Some(info) = bash_info {
+                                    info.output = out.clone();
+                                }
+                            }
+                        }
+                        ToolDisplay::Fetch {
+                            status: s,
+                            bash_info,
+                            ..
+                        } => {
+                            *s = status;
+                            if let Some(ref out) = output {
+                                if let Some(info) = bash_info {
+                                    info.output = out.clone();
+                                }
+                            }
+                        }
+                        ToolDisplay::Task { status: s, .. } => {
+                            *s = status;
+                            // For tasks, output is parsed to extract bash calls
+                            // This is handled separately via update_subagent_bash
+                        }
+                        ToolDisplay::Bash {
+                            status: s,
+                            command,
+                            output: out,
+                            ..
+                        } => {
+                            *s = status;
+                            if let Some(ref output_text) = output {
+                                *out = Some(BashCallInfo {
+                                    command: command.clone(),
+                                    output: output_text.clone(),
+                                    output_file: None,
+                                });
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Update a tool's status by ID (legacy compatibility).
+    pub fn update_tool(&mut self, id: &str, status: ToolStatus, results: Option<usize>) {
+        self.update_tool_with_output(id, status, results, None);
+    }
+
+    /// Update a tool with feedback from result parsing.
+    pub fn update_tool_with_feedback(&mut self, id: &str, feedback: ToolFeedback) {
+        for elem in &mut self.elements {
+            if let ChatElement::ToolCall {
+                id: tool_id,
+                display,
+            } = elem
+            {
+                if tool_id == id {
+                    if let ToolDisplay::Bash {
+                        status,
+                        output,
+                        command,
+                        ..
+                    } = display
+                    {
+                        match feedback {
+                            ToolFeedback::SearchResults(count) => {
+                                *status = ToolStatus::SearchDone(count);
+                                *output = Some(BashCallInfo::new(command.clone()));
+                            }
+                            ToolFeedback::Fetched => {
+                                *status = ToolStatus::Done;
+                                *output = Some(BashCallInfo::new(command.clone()));
+                            }
+                            ToolFeedback::Output(out) => {
+                                *status = ToolStatus::Done;
+                                *output = Some(BashCallInfo {
+                                    command: command.clone(),
+                                    output: out,
+                                    output_file: None,
+                                });
+                            }
+                            ToolFeedback::Error(e) => {
+                                *status = ToolStatus::Failed(e);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Add a bash call to a subagent task.
+    pub fn update_subagent_bash(&mut self, id: &str, bash_info: BashCallInfo) {
+        for elem in &mut self.elements {
+            if let ChatElement::ToolCall {
+                id: tool_id,
+                display: ToolDisplay::Task { bash_calls, .. },
+            } = elem
+            {
+                if tool_id == id {
+                    bash_calls.push(bash_info);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Set the todo block (replaces previous).
+    pub fn set_todos(&mut self, items: Vec<TodoItem>) {
+        // Remove existing todo block
+        self.elements
+            .retain(|e| !matches!(e, ChatElement::TodoBlock { .. }));
+        // Add new one at end
+        if !items.is_empty() {
+            self.elements.push(ChatElement::TodoBlock { items });
+        }
+    }
+
+    /// Get all elements.
+    pub fn elements(&self) -> &[ChatElement] {
+        &self.elements
+    }
+
+    /// Get all tool calls with their indices.
+    pub fn tool_calls(&self) -> Vec<(usize, &str, &ToolDisplay)> {
+        self.elements
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                if let ChatElement::ToolCall { id, display } = e {
+                    Some((i, id.as_str(), display))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get a tool call by ID.
+    pub fn get_tool(&self, id: &str) -> Option<&ToolDisplay> {
+        self.elements.iter().find_map(|e| {
+            if let ChatElement::ToolCall {
+                id: tool_id,
+                display,
+            } = e
+            {
+                if tool_id == id {
+                    Some(display)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Check if currently streaming.
+    pub fn is_streaming(&self) -> bool {
+        matches!(
+            self.elements.last(),
+            Some(ChatElement::AssistantText { streaming: true, .. })
+        )
+    }
+}
+
+/// Input rendering context for combined view.
+pub struct InputContext<'a> {
+    /// Current input text.
+    pub input: &'a str,
+    /// Cursor position (character index).
+    pub cursor: usize,
+    /// Pending attachments.
+    pub attachments: &'a [Attachment],
+}
+
+/// Render the chat stream.
+pub fn render(frame: &mut Frame, area: Rect, chat: &ChatStream, scroll: usize) {
+    render_with_selection(frame, area, chat, scroll, None, None, None, None);
+}
+
+/// Render the chat stream with input line at bottom (full-screen scrollable).
+pub fn render_with_input(
+    frame: &mut Frame,
+    area: Rect,
+    chat: &ChatStream,
+    scroll: usize,
+    input_ctx: InputContext<'_>,
+    content_height_out: Option<&Cell<usize>>,
+    view_height_out: Option<&Cell<usize>>,
+) {
+    render_with_selection(
+        frame,
+        area,
+        chat,
+        scroll,
+        None,
+        content_height_out,
+        view_height_out,
+        Some(input_ctx),
+    );
+}
+
+/// Safely clamp scroll value for u16 and content bounds.
+fn safe_scroll(scroll: usize, content_height: usize, area_height: u16) -> u16 {
+    // Don't allow scroll beyond content
+    let max_scroll = content_height.saturating_sub(area_height as usize);
+    let clamped = scroll.min(max_scroll);
+    // Clamp to u16::MAX to prevent overflow
+    clamped.min(u16::MAX as usize) as u16
+}
+
+/// Render the chat stream with optional tool selection.
+pub fn render_with_selection(
+    frame: &mut Frame,
+    area: Rect,
+    chat: &ChatStream,
+    scroll: usize,
+    selected_tool: Option<&str>,
+    content_height_out: Option<&Cell<usize>>,
+    view_height_out: Option<&Cell<usize>>,
+    input_ctx: Option<InputContext<'_>>,
+) {
+    // Guard against zero-dimension areas to prevent overflow
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for elem in chat.elements() {
+        match elem {
+            ChatElement::UserMessage {
+                content,
+                attachments,
+            } => {
+                // User message with > prefix
+                for (i, line) in content.lines().enumerate() {
+                    if i == 0 {
+                        lines.push(Line::from(vec![
+                            Span::styled("> ", Style::default().fg(Color::Cyan)),
+                            Span::raw(line.to_string()),
+                        ]));
+                    } else {
+                        lines.push(Line::from(format!("  {}", line)));
+                    }
+                }
+
+                // Attachments
+                for att in attachments {
+                    let att_text = match att {
+                        Attachment::Image { .. } => "[image]".to_string(),
+                        Attachment::FileReference { path } => {
+                            format!("@{}", path.display())
+                        }
+                        Attachment::PastedText { content, saved_path } => {
+                            let char_count = content.chars().count();
+                            if let Some(path) = saved_path {
+                                format!("[pasted text: {} chars -> {}]", char_count, path.display())
+                            } else {
+                                format!("[pasted text: {} chars]", char_count)
+                            }
+                        }
+                    };
+                    lines.push(Line::from(Span::styled(
+                        att_text,
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+
+                lines.push(Line::from(""));
+            }
+
+            ChatElement::AssistantText { content, streaming } => {
+                // Always render markdown, even during streaming
+                let md_lines = markdown::render_markdown(content);
+                lines.extend(md_lines);
+
+                if *streaming {
+                    // Show cursor for streaming
+                    lines.push(Line::from(Span::styled("_", Style::default().fg(Color::DarkGray))));
+                }
+
+                lines.push(Line::from(""));
+            }
+
+            ChatElement::ToolCall { id, display } => {
+                let is_selected = selected_tool == Some(id.as_str());
+                render_tool_inline(&mut lines, display, is_selected);
+            }
+
+            ChatElement::TodoBlock { items } => {
+                lines.push(Line::from(Span::styled(
+                    "[todo] ────────────────────────────",
+                    Style::default().fg(Color::Green),
+                )));
+
+                for item in items {
+                    let (marker, style) = match item.status {
+                        TodoStatus::Pending => ("[ ]", Style::default()),
+                        TodoStatus::InProgress => ("[>]", Style::default().fg(Color::Yellow)),
+                        TodoStatus::Completed => ("[x]", Style::default().fg(Color::DarkGray)),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {} ", marker), style),
+                        Span::styled(&item.content, style),
+                    ]));
+                }
+
+                lines.push(Line::from(Span::styled(
+                    "─────────────────────────────────────",
+                    Style::default().fg(Color::Green),
+                )));
+                lines.push(Line::from(""));
+            }
+
+            ChatElement::Error { message } => {
+                // Error message with icon and red color
+                lines.push(Line::from(vec![
+                    Span::styled("✗ ", Style::default().fg(Color::Red)),
+                    Span::styled(message, Style::default().fg(Color::Red)),
+                ]));
+                lines.push(Line::from(""));
+            }
+
+            ChatElement::Loading { frame } => {
+                // Animated loading indicator
+                let spinner = match frame % 4 {
+                    0 => "⠋",
+                    1 => "⠙",
+                    2 => "⠹",
+                    _ => "⠸",
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{} Waiting for response...", spinner),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            ChatElement::Thinking { seconds } => {
+                // Thinking indicator with time
+                let text = if *seconds == 0 {
+                    "◐ Thinking...".to_string()
+                } else {
+                    format!("◐ Thinking... ({} sec)", seconds)
+                };
+                lines.push(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(Color::Magenta),
+                )));
+            }
+        }
+    }
+
+    // Render input line if provided (for full-screen scroll mode)
+    if let Some(ctx) = input_ctx {
+        render_input_line(&mut lines, ctx);
+    }
+
+    // Calculate safe scroll value
+    let inner_height = area.height;
+
+    // Export dimensions for scroll normalization
+    if let Some(cell) = content_height_out {
+        cell.set(lines.len());
+    }
+    if let Some(cell) = view_height_out {
+        cell.set(inner_height as usize);
+    }
+
+    let scroll_y = safe_scroll(scroll, lines.len(), inner_height);
+
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
+
+    frame.render_widget(paragraph, area);
+}
+
+/// Convert a character index to a byte index in a string.
+fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
+/// Render the input line into the lines vector.
+fn render_input_line<'a>(lines: &mut Vec<Line<'a>>, ctx: InputContext<'_>) {
+    let mut spans = Vec::new();
+
+    // Prompt
+    spans.push(Span::styled("> ", Style::default().fg(Color::Cyan)));
+
+    // Render image attachments
+    for att in ctx.attachments {
+        if matches!(att, Attachment::Image { .. }) {
+            spans.push(Span::styled(
+                "[image] ",
+                Style::default().bg(Color::DarkGray),
+            ));
+        }
+    }
+
+    // File references
+    for att in ctx.attachments {
+        if let Attachment::FileReference { path } = att {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+            spans.push(Span::styled(
+                format!("@{} ", name),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+    }
+
+    // Pasted text attachments
+    for att in ctx.attachments {
+        if let Attachment::PastedText { content, .. } = att {
+            let char_count = content.chars().count();
+            spans.push(Span::styled(
+                format!("[pasted: {} chars] ", char_count),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    // Input text with cursor (convert char index to byte index)
+    let byte_idx = char_to_byte_index(ctx.input, ctx.cursor);
+    let (before, after) = ctx.input.split_at(byte_idx);
+    spans.push(Span::raw(before.to_string()));
+    spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
+    spans.push(Span::raw(after.to_string()));
+
+    lines.push(Line::from(spans));
+}
+
+/// Render a tool call inline with optional selection highlight.
+fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, is_selected: bool) {
+    let selection_marker = if is_selected { "▶ " } else { "  " };
+    let selection_style = if is_selected {
+        Style::default().bg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+
+    match display {
+        ToolDisplay::Search {
+            query,
+            status,
+            results,
+            bash_info,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => "...".to_string(),
+                ToolStatus::Done => results.map_or("done".to_string(), |n| format!("{n} results")),
+                ToolStatus::SearchDone(n) => format!("{n} results"),
+                ToolStatus::Failed(e) => format!("failed: {e}"),
+            };
+            lines.push(Line::from(vec![
+                Span::raw(selection_marker),
+                Span::styled("[search] ", Style::default().fg(Color::Blue)),
+                Span::styled(format!("\"{}\" {}", query, status_text), selection_style),
+            ]));
+
+            // Show bash output preview if available
+            if let Some(info) = bash_info {
+                if !info.output.is_empty() {
+                    let preview = info.output_preview(2);
+                    for line in preview.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", line),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+        }
+        ToolDisplay::Fetch {
+            url,
+            status,
+            bash_info,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => "...",
+                ToolStatus::Done | ToolStatus::SearchDone(_) => "done",
+                ToolStatus::Failed(_) => "failed",
+            };
+            lines.push(Line::from(vec![
+                Span::raw(selection_marker),
+                Span::styled("[fetch] ", Style::default().fg(Color::Cyan)),
+                Span::styled(format!("{} {}", url, status_text), selection_style),
+            ]));
+
+            // Show bash output preview if available
+            if let Some(info) = bash_info {
+                if !info.output.is_empty() {
+                    let preview = info.output_preview(2);
+                    for line in preview.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", line),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+        }
+        ToolDisplay::Task {
+            subagent,
+            prompt,
+            status,
+            bash_calls,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => "...",
+                ToolStatus::Done | ToolStatus::SearchDone(_) => "done",
+                ToolStatus::Failed(_) => "failed",
+            };
+
+            // Truncate prompt for display (unicode-safe)
+            let prompt_preview = match prompt.char_indices().nth(50) {
+                Some((pos, _)) => format!("{}...", &prompt[..pos]),
+                None => prompt.clone(),
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw(selection_marker),
+                Span::styled(
+                    format!("[task:{}] ", subagent),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(format!("{} {}", prompt_preview, status_text), selection_style),
+            ]));
+
+            // Show most recent bash call for subagent
+            if let Some(latest) = bash_calls.last() {
+                let cmd_preview = latest.command_preview(60);
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("$ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(cmd_preview, Style::default().fg(Color::DarkGray)),
+                ]));
+
+                // Show output preview
+                if !latest.output.is_empty() {
+                    let preview = latest.output_preview(2);
+                    for line in preview.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("      {}", line),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+        }
+        ToolDisplay::Bash {
+            command,
+            mode,
+            status,
+            output,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => "...".to_string(),
+                ToolStatus::Done => "done".to_string(),
+                ToolStatus::SearchDone(n) => format!("{} results", n),
+                ToolStatus::Failed(_) => "failed".to_string(),
+            };
+
+            // Mode prefix for unsafe commands
+            let mode_prefix = match mode {
+                BashMode::Unsafe => "[unsafe] ",
+                BashMode::Network => "[network] ",
+                BashMode::Sandboxed => "",
+            };
+
+            // For unsafe mode, never truncate - show full command
+            // For other modes, use reasonable limit (120 chars) or show multi-line
+            // Find byte position at 120th char (unicode-safe, single pass)
+            let truncate_pos = command.char_indices().nth(120).map(|(i, _)| i);
+            let should_truncate = *mode != BashMode::Unsafe && truncate_pos.is_some();
+
+            if let (true, Some(pos)) = (should_truncate, truncate_pos) {
+                // Show truncated on single line
+                let cmd_preview = format!("{}...", &command[..pos]);
+                lines.push(Line::from(vec![
+                    Span::raw(selection_marker),
+                    Span::styled(mode_prefix, Style::default().fg(Color::Red).bold()),
+                    Span::styled("$ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{} {}", cmd_preview, status_text), selection_style),
+                ]));
+            } else {
+                // Show full command - may span multiple lines
+                let cmd_lines: Vec<&str> = command.lines().collect();
+                for (i, cmd_line) in cmd_lines.iter().enumerate() {
+                    if i == 0 {
+                        lines.push(Line::from(vec![
+                            Span::raw(selection_marker),
+                            Span::styled(mode_prefix, Style::default().fg(Color::Red).bold()),
+                            Span::styled("$ ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                if cmd_lines.len() == 1 {
+                                    format!("{} {}", cmd_line, status_text)
+                                } else {
+                                    (*cmd_line).to_string()
+                                },
+                                selection_style,
+                            ),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled((*cmd_line).to_string(), selection_style),
+                        ]));
+                    }
+                }
+                // Add status on separate line if multi-line command
+                if cmd_lines.len() > 1 {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(status_text, Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+            }
+
+            // Show output preview
+            if let Some(info) = output {
+                if !info.output.is_empty() {
+                    let preview = info.output_preview(3);
+                    for line in preview.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", line),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render full-screen tool detail view.
+pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDisplay, scroll: usize) {
+    // Guard against zero-dimension areas to prevent overflow
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header
+    let title = match display {
+        ToolDisplay::Search { query, .. } => format!("Search: \"{}\"", query),
+        ToolDisplay::Fetch { url, .. } => format!("Fetch: {}", url),
+        ToolDisplay::Task { subagent, prompt, .. } => format!("Task:{} - {}", subagent, prompt),
+        ToolDisplay::Bash { command, mode, .. } => {
+            let mode_prefix = match mode {
+                BashMode::Unsafe => "[unsafe] ",
+                BashMode::Network => "[network] ",
+                BashMode::Sandboxed => "",
+            };
+            format!("{}$ {}", mode_prefix, command)
+        }
+    };
+
+    lines.push(Line::from(Span::styled(
+        title,
+        Style::default().bold().fg(Color::Cyan),
+    )));
+    lines.push(Line::from(""));
+
+    // Status
+    let status_line = match display.status() {
+        ToolStatus::Running => Span::styled("Status: Running...", Style::default().fg(Color::Yellow)),
+        ToolStatus::Done => Span::styled("Status: Done", Style::default().fg(Color::Green)),
+        ToolStatus::SearchDone(n) => Span::styled(format!("Status: {} results", n), Style::default().fg(Color::Green)),
+        ToolStatus::Failed(e) => Span::styled(format!("Status: Failed - {}", e), Style::default().fg(Color::Red)),
+    };
+    lines.push(Line::from(status_line));
+    lines.push(Line::from(""));
+
+    // Bash calls
+    let bash_calls = display.all_bash_calls();
+    if bash_calls.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No bash calls yet.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, call) in bash_calls.iter().enumerate() {
+            lines.push(Line::from(Span::styled(
+                format!("─── Command {} ───", i + 1),
+                Style::default().fg(Color::Blue),
+            )));
+            lines.push(Line::from(""));
+
+            // Full command (no truncation)
+            lines.push(Line::from(vec![
+                Span::styled("$ ", Style::default().fg(Color::Yellow)),
+                Span::raw(&call.command),
+            ]));
+            lines.push(Line::from(""));
+
+            // Full output (no truncation - shows what agent sees)
+            lines.push(Line::from(Span::styled(
+                "Output:",
+                Style::default().fg(Color::Green),
+            )));
+
+            if call.output.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "(no output)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for line in call.output.lines() {
+                    lines.push(Line::from(line.to_string()));
+                }
+            }
+
+            // Show if output was offloaded
+            if let Some(ref path) = call.output_file {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("Full output saved to: {}", path.display()),
+                    Style::default().fg(Color::DarkGray).italic(),
+                )));
+            }
+
+            lines.push(Line::from(""));
+        }
+    }
+
+    // Help text at bottom
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press Esc to close, j/k to scroll",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Calculate safe scroll value (account for borders: 2 lines)
+    let inner_height = area.height.saturating_sub(2);
+    let scroll_y = safe_scroll(scroll, lines.len(), inner_height);
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Tool Details")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
+
+    frame.render_widget(paragraph, area);
+}
+
+/// Create a bash tool display from JSON arguments.
+pub fn parse_tool_display(arguments: &str) -> ToolDisplay {
+    let args: BashArgs = serde_json::from_str(arguments)
+        .expect("BashArgs deserialization should not fail");
+
+    ToolDisplay::Bash {
+        command: args.script,
+        mode: args.mode,
+        status: ToolStatus::Running,
+        output: None,
+    }
+}
+
+/// Feedback extracted from tool result.
+#[derive(Debug, Clone)]
+pub enum ToolFeedback {
+    /// Web search completed with N results.
+    SearchResults(usize),
+    /// URL fetched successfully.
+    Fetched,
+    /// Generic output with text.
+    Output(String),
+    /// Error occurred.
+    Error(String),
+}
+
+/// Parse a bash tool result to extract feedback.
+pub fn parse_tool_result(result: &Result<String, String>) -> ToolFeedback {
+    match result {
+        Ok(output) => {
+            // Try to parse as BashResult
+            if let Ok(bash_result) = serde_json::from_str::<BashResult>(output) {
+                extract_feedback_from_result(&bash_result)
+            } else {
+                // Raw output
+                ToolFeedback::Output(output.clone())
+            }
+        }
+        Err(e) => ToolFeedback::Error(e.clone()),
+    }
+}
+
+/// Extract feedback from a BashResult by inspecting stdout content.
+fn extract_feedback_from_result(result: &BashResult) -> ToolFeedback {
+    let text = match &result.stdout {
+        OutputEntry::Empty => return ToolFeedback::Output(String::new()),
+        OutputEntry::Inline { content } | OutputEntry::Loaded { content, .. } => {
+            match content {
+                Content::Text { text, .. } => text,
+                Content::Image { .. } => return ToolFeedback::Output("[image]".to_string()),
+            }
+        }
+        OutputEntry::Stored { url, content } => {
+            if let Some(Content::Text { text, .. }) = content {
+                text
+            } else {
+                return ToolFeedback::Output(format!("[stored: {}]", url));
+            }
+        }
+    };
+
+    // Try to detect websearch results (array of objects with title/url/snippet)
+    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(text) {
+        if !arr.is_empty() {
+            if let Some(first) = arr.first() {
+                if first.get("title").is_some()
+                    && first.get("url").is_some()
+                    && first.get("snippet").is_some()
+                {
+                    return ToolFeedback::SearchResults(arr.len());
+                }
+            }
+        }
+    }
+
+    // Default: return the text output
+    ToolFeedback::Output(text.clone())
+}

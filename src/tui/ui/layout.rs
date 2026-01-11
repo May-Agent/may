@@ -1,0 +1,1208 @@
+//! Main layout for the TUI.
+
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+};
+
+use super::super::app::{App, AppMode, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode};
+use super::{chat, input, status};
+use crate::workspace_request::WorkspaceRequest;
+
+/// Convert character index to byte index for safe string slicing.
+fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
+/// Render the main layout.
+pub fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+
+    // Full-screen modes (don't show chat behind them)
+    match &app.mode {
+        AppMode::Config => {
+            render_config_screen(frame, area, app);
+            return;
+        }
+        AppMode::TierModelPicker => {
+            // Render config screen as background, then tier picker as overlay
+            render_config_screen(frame, area, app);
+            render_tier_model_picker(frame, area, app);
+            return;
+        }
+        AppMode::CopilotAuth => {
+            render_copilot_auth_screen(frame, area, app);
+            return;
+        }
+        AppMode::WorkspaceConfirm(request) => {
+            render_workspace_confirm(frame, area, request);
+            return;
+        }
+        _ => {}
+    }
+
+    // Check for queued messages
+    let queue_len = app.queue.len();
+    let queue_height = if queue_len > 0 {
+        // Show up to 3 queued messages, each on one line plus a header
+        (queue_len.min(3) + 1) as u16
+    } else {
+        0
+    };
+
+    // Main layout: Chat | Queue (optional) | Input | Status
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),              // Chat stream (scrollable)
+            Constraint::Length(queue_height), // Queued messages (0 if empty)
+            Constraint::Length(1),           // Input line (fixed at bottom)
+            Constraint::Length(1),           // Status bar
+        ])
+        .split(area);
+
+    // Render chat (scrollable)
+    chat::render_with_selection(
+        frame,
+        chunks[0],
+        &app.chat,
+        app.scroll,
+        app.selected_tool.as_deref(),
+        Some(&app.content_height),
+        Some(&app.view_height),
+        None,
+    );
+
+    // Render queued messages (if any)
+    if queue_len > 0 {
+        render_queue(frame, chunks[1], app);
+    }
+
+    // Render input (fixed at bottom)
+    input::render(frame, chunks[2], app);
+
+    status::render(frame, chunks[3], app);
+
+    // Render popups if in special modes
+    match app.mode {
+        AppMode::SessionSelect => {
+            render_session_popup(frame, area, app);
+        }
+        AppMode::FilePicker => {
+            render_file_picker_popup(frame, area, app);
+        }
+        AppMode::Help => {
+            render_help_popup(frame, area);
+        }
+        AppMode::ToolDetail => {
+            render_tool_detail_popup(frame, area, app);
+        }
+        AppMode::ModelSelect => {
+            render_model_select_popup(frame, chunks[1], app);
+        }
+        AppMode::McpManage => {
+            render_mcp_popup(frame, area, app);
+        }
+        _ => {}
+    }
+}
+
+/// Help text content.
+const HELP_TEXT: &str = include_str!("help.txt");
+
+/// Render session selection popup.
+fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_area = centered_rect(60, 50, area);
+
+    // Clear background
+    frame.render_widget(Clear, popup_area);
+
+    // Get current session ID for highlighting
+    let current_id = app.session_manager.current().map(|s| s.id.as_str());
+
+    // Build session list items
+    let items: Vec<ListItem> = app.session_list
+        .iter()
+        .enumerate()
+        .map(|(idx, summary)| {
+            // Display title if available, otherwise show "Untitled"
+            let display_name = summary.title.as_deref().unwrap_or("Untitled");
+            let text = format!(
+                "{} ({} messages)",
+                display_name,
+                summary.message_count
+            );
+
+            // Check if this is the current session
+            let is_current = current_id == Some(summary.id.as_str());
+
+            let mut style = if idx == app.session_selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            // Bold current session
+            if is_current {
+                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+            }
+
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let help_text = if app.session_list.is_empty() {
+        "No sessions. Press 'n' to create new."
+    } else {
+        "j/k: navigate | Enter: select | n: new | d: delete | Esc: cancel"
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!("Sessions ({})", app.session_list.len()))
+            .title_bottom(help_text),
+    );
+
+    frame.render_widget(list, popup_area);
+}
+
+/// Render file picker popup.
+fn render_file_picker_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_area = centered_rect(70, 60, area);
+
+    // Clear background
+    frame.render_widget(Clear, popup_area);
+
+    let Some(picker) = &app.file_picker else {
+        return;
+    };
+
+    // Split popup into search input and results list
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Search input
+            Constraint::Min(1),    // Results list
+        ])
+        .split(popup_area);
+
+    // Search input
+    let query = picker.query();
+    let input_text = if query.is_empty() {
+        "Type to search files...".to_string()
+    } else {
+        query.to_string()
+    };
+
+    let input_style = if query.is_empty() {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let search_input = Paragraph::new(input_text)
+        .style(input_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(format!("Select File ({} matches)", picker.match_count())),
+        );
+
+    frame.render_widget(search_input, chunks[0]);
+
+    // Results list
+    let max_visible = (chunks[1].height as usize).saturating_sub(2);
+    let selected_idx = picker.selected_index();
+
+    let items: Vec<ListItem> = picker
+        .visible_matches(max_visible)
+        .map(|(idx, path)| {
+            let path_str = path.to_string_lossy();
+            let style = if idx == selected_idx {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(path_str.to_string()).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Plain)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+
+    frame.render_widget(list, chunks[1]);
+}
+
+/// Render help popup.
+fn render_help_popup(frame: &mut Frame, area: Rect) {
+    let popup_area = centered_rect(70, 80, area);
+
+    // Clear background
+    frame.render_widget(Clear, popup_area);
+
+    let help = Paragraph::new(HELP_TEXT)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title("Help (press ? or Esc to close)"),
+        )
+        .style(Style::default().fg(Color::White))
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(help, popup_area);
+}
+
+/// Render tool detail popup (full screen).
+fn render_tool_detail_popup(frame: &mut Frame, area: Rect, app: &App) {
+    // Full screen popup
+    let popup_area = centered_rect(90, 90, area);
+
+    // Clear background
+    frame.render_widget(Clear, popup_area);
+
+    // Get the selected tool
+    if let Some(ref tool_id) = app.selected_tool {
+        if let Some(display) = app.chat.get_tool(tool_id) {
+            chat::render_tool_fullscreen(frame, popup_area, display, app.tool_detail_scroll);
+        }
+    }
+}
+
+/// Render tier model picker as a popup menu.
+fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::config::ModelTier;
+
+    let tier_name = match app.tier_picker_tier {
+        Some(ModelTier::Advanced) => "Advanced",
+        Some(ModelTier::Balanced) => "Balanced",
+        Some(ModelTier::Fast) => "Fast",
+        Some(ModelTier::ImageGeneration) => "Image Generation",
+        None => "Model",
+    };
+
+    // Create a popup area (60% width, 50% height, centered)
+    let popup_width = (area.width * 60 / 100).min(80).max(40);
+    let popup_height = (area.height * 50 / 100).min(20).max(10);
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear the popup area
+    frame.render_widget(Clear, popup_area);
+
+    // Layout: Search + List
+    let inner_area = Rect::new(
+        popup_area.x + 1,
+        popup_area.y + 1,
+        popup_area.width.saturating_sub(2),
+        popup_area.height.saturating_sub(2),
+    );
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Search box
+            Constraint::Min(3),    // Model list
+        ])
+        .split(inner_area);
+
+    // Search box
+    let search_display = if app.tier_picker_query.is_empty() {
+        "Type to search...".to_string()
+    } else {
+        app.tier_picker_query.clone()
+    };
+    let search = Paragraph::new(search_display)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" Search "),
+        )
+        .style(if app.tier_picker_query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        });
+    frame.render_widget(search, chunks[0]);
+
+    // Model list or loading indicator
+    if app.tier_picker_loading {
+        let loading = Paragraph::new("Loading models...")
+            .style(Style::default().fg(Color::Yellow))
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(" Models "),
+            );
+        frame.render_widget(loading, chunks[1]);
+    } else {
+        // Show visible window of models (scrolling)
+        let visible_height = chunks[1].height.saturating_sub(2) as usize; // -2 for borders
+        let total = app.tier_picker_filtered.len();
+        let selected = app.tier_picker_selected;
+
+        // Calculate scroll offset to keep selected item visible
+        let scroll_offset = if selected >= visible_height {
+            selected - visible_height + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = app
+            .tier_picker_filtered
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(visible_height)
+            .map(|(display_idx, &model_idx)| {
+                let fetched = app.tier_picker_models.get(model_idx);
+                let model_id = fetched.map(|m| m.id.as_str()).unwrap_or("");
+                // Check if model matches tier (for visual indicator)
+                let info = aither_models::lookup(model_id);
+                let tier_match = app.tier_picker_tier
+                    .map(|t| match t {
+                        ModelTier::Advanced => aither_models::ModelTier::Flagship,
+                        ModelTier::Balanced => aither_models::ModelTier::Balanced,
+                        ModelTier::Fast => aither_models::ModelTier::Fast,
+                        ModelTier::ImageGeneration => aither_models::ModelTier::Flagship,
+                    })
+                    .and_then(|tier| info.map(|i| i.has_tier(tier)))
+                    .unwrap_or(false);
+
+                let style = if display_idx == selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else if tier_match {
+                    Style::default().fg(Color::Green)
+                } else if info.is_some() {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let prefix = if display_idx == selected { "> " } else { "  " };
+                ListItem::new(format!("{}{}", prefix, model_id)).style(style)
+            })
+            .collect();
+
+        let title = if total > 0 {
+            format!(" {} ({}) ", tier_name, total)
+        } else {
+            format!(" {} (no models) ", tier_name)
+        };
+
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        );
+        frame.render_widget(list, chunks[1]);
+    }
+
+    // Draw popup border
+    let title = format!(" Select {} Model ", tier_name);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    frame.render_widget(block, popup_area);
+}
+
+/// Render unified configuration screen (full screen) with tabs.
+fn render_config_screen(frame: &mut Frame, area: Rect, app: &App) {
+    // Guard: need minimum size to render safely
+    if area.width < 40 || area.height < 15 {
+        let msg = Paragraph::new("Terminal too small")
+            .style(Style::default().fg(Color::Red))
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    let state = &app.config_state;
+
+    // Layout: Header (tabs) | Content | Help
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(1), // Tab bar
+            Constraint::Min(5),    // Content
+            Constraint::Length(1), // Help
+        ])
+        .split(area);
+
+    // Tab bar
+    let tabs: Vec<Span> = ConfigSection::ALL
+        .iter()
+        .map(|s| {
+            if *s == state.section {
+                Span::styled(
+                    format!(" [{}] ", s.name()),
+                    Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD),
+                )
+            } else {
+                Span::styled(format!(" {} ", s.name()), Style::default().fg(Color::White))
+            }
+        })
+        .collect();
+    let tab_line = Line::from(vec![
+        Span::styled("Settings: ", Style::default().fg(Color::Cyan)),
+    ].into_iter().chain(tabs).collect::<Vec<_>>());
+    frame.render_widget(Paragraph::new(tab_line), chunks[0]);
+
+    // Content based on section
+    match state.section {
+        ConfigSection::Providers => render_providers_section(frame, chunks[1], app),
+        ConfigSection::Models => render_models_section(frame, chunks[1], app),
+        ConfigSection::Preferences => render_preferences_section(frame, chunks[1], app),
+    }
+
+    // Help text
+    let help_text = if state.is_editing() {
+        "Enter: save | Esc: cancel"
+    } else {
+        "Tab: switch section | j/k: navigate | Enter: edit | d: delete | Esc: close"
+    };
+    let help = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, chunks[2]);
+}
+
+/// Render providers section content.
+fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
+    let state = &app.config_state;
+
+    // Build provider list
+    let mut items: Vec<ListItem> = state
+        .provider_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| {
+            let prefix = if idx == state.selected { "> " } else { "  " };
+            let instance = app.config.provider.get(id);
+            let status = if let Some(inst) = instance {
+                // For custom providers, show base_url
+                if let Some(ref base_url) = inst.base_url {
+                    // Truncate URL safely (unicode-safe)
+                    let url_short = match base_url.char_indices().nth(27) {
+                        Some((pos, _)) => format!("{}...", &base_url[..pos]),
+                        None => base_url.clone(),
+                    };
+                    url_short
+                } else if inst.api_key.is_some() {
+                    let key = inst.api_key.as_ref().unwrap();
+                    let masked: String = key.chars().take(4).collect::<String>() + "****";
+                    format!("{} (configured)", masked)
+                } else if id == "copilot" {
+                    "(OAuth)".to_string()
+                } else {
+                    "(no API key)".to_string()
+                }
+            } else {
+                "(unknown)".to_string()
+            };
+            let text = format!("{}{:<20} {}", prefix, id, status);
+            let style = if idx == state.selected {
+                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    // Add "Add provider..." item
+    let add_prefix = if state.selected >= state.provider_ids.len() { "> " } else { "  " };
+    let add_style = if state.selected >= state.provider_ids.len() {
+        Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    items.push(ListItem::new(format!("{}+ Add provider...", add_prefix)).style(add_style));
+
+    // If in list selection mode, show provider type selector overlay
+    if let ConfigEditMode::List { items: list_items, selected } = &state.edit_mode {
+        let popup_area = centered_rect(50, 60, area);
+        frame.render_widget(Clear, popup_area);
+
+        let list_items: Vec<ListItem> = list_items
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                let prefix = if idx == *selected { "> " } else { "  " };
+                let style = if idx == *selected {
+                    Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(format!("{}{}", prefix, name)).style(style)
+            })
+            .collect();
+
+        let list = List::new(list_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title("Select Provider Type"),
+        );
+        frame.render_widget(list, popup_area);
+        return;
+    }
+
+    // If in custom provider edit mode, show form overlay
+    if let ConfigEditMode::CustomProvider {
+        focused_field,
+        name,
+        base_url,
+        api_key,
+        cursor,
+        ..
+    } = &state.edit_mode
+    {
+        let popup_area = centered_rect(60, 40, area);
+        frame.render_widget(Clear, popup_area);
+
+        // Split into 3 input fields + instructions
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3), // Name
+                Constraint::Length(3), // Base URL
+                Constraint::Length(3), // API Key
+                Constraint::Min(1),    // Instructions
+            ])
+            .split(popup_area);
+
+        // Helper to render a field
+        let render_field = |frame: &mut Frame, area: Rect, label: &str, value: &str, is_focused: bool, cur: usize, mask: bool| {
+            let display_value = if mask {
+                value.chars().map(|_| '*').collect::<String>()
+            } else {
+                value.to_string()
+            };
+            // Convert char index to byte index for safe slicing
+            let cursor_pos = char_to_byte_idx(&display_value, cur);
+            let display = if is_focused {
+                format!("{}|{}", &display_value[..cursor_pos], &display_value[cursor_pos..])
+            } else {
+                display_value
+            };
+            let style = if is_focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(if is_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Gray) })
+                .title(label);
+            let paragraph = Paragraph::new(display).style(style).block(block);
+            frame.render_widget(paragraph, area);
+        };
+
+        render_field(frame, chunks[0], "Name (ID)", name, *focused_field == 0, *cursor, false);
+        render_field(frame, chunks[1], "Base URL", base_url, *focused_field == 1, *cursor, false);
+        render_field(frame, chunks[2], "API Key (optional)", api_key, *focused_field == 2, *cursor, true);
+
+        let instructions = Paragraph::new("Tab/↓↑ to switch fields · Enter to save · Esc to cancel")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(instructions, chunks[3]);
+
+        // Draw border around the popup
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Add Custom Provider");
+        frame.render_widget(block, popup_area);
+        return;
+    }
+
+    // If in text edit mode, show edit overlay
+    if let Some((input, cursor)) = state.edit_text() {
+        // Show input at selected row (masked is ASCII so byte=char, but use helper for consistency)
+        let masked: String = input.chars().map(|_| '*').collect();
+        let cursor_pos = char_to_byte_idx(&masked, cursor);
+        let display = format!("{}|{}", &masked[..cursor_pos], &masked[cursor_pos..]);
+        items[state.selected] = ListItem::new(format!("  API Key: {}", display))
+            .style(Style::default().fg(Color::Yellow));
+    }
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Manage LLM providers"),
+    );
+    frame.render_widget(list, area);
+}
+
+/// Render models section content.
+fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
+    let state = &app.config_state;
+    let config = &app.config;
+
+    let tier_names = ["Advanced", "Balanced", "Fast", "Image Generation"];
+    let tier_values: Vec<String> = vec![
+        config.models.advanced.join(", "),
+        config.models.balanced.join(", "),
+        config.models.fast.join(", "),
+        config.models.image_generation.join(", "),
+    ];
+
+    let mut items: Vec<ListItem> = tier_names
+        .iter()
+        .zip(tier_values.iter())
+        .enumerate()
+        .map(|(idx, (name, value))| {
+            let prefix = if idx == state.selected { "> " } else { "  " };
+            let display_value = if value.is_empty() { "(not set)" } else { value };
+            let text = format!("{}{:<20} {}", prefix, name, display_value);
+            let style = if idx == state.selected {
+                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    // If in text edit mode, show edit overlay
+    if let Some((input, cursor)) = state.edit_text() {
+        let cursor_pos = char_to_byte_idx(input, cursor);
+        let display = format!("{}|{}", &input[..cursor_pos], &input[cursor_pos..]);
+        items[state.selected] = ListItem::new(format!("  {}: {}", tier_names[state.selected], display))
+            .style(Style::default().fg(Color::Yellow));
+    }
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Configure model preferences by tier"),
+    );
+    frame.render_widget(list, area);
+}
+
+/// Render preferences section content.
+fn render_preferences_section(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::config::LoadBalanceStrategy;
+
+    let state = &app.config_state;
+    let config = &app.config;
+
+    let pref_names = ["Max iterations", "Load balance", "Warn on model change"];
+    let pref_values: Vec<String> = vec![
+        config.max_iterations.to_string(),
+        match config.preferences.load_balance_strategy {
+            LoadBalanceStrategy::RoundRobin => "Round Robin".to_string(),
+            LoadBalanceStrategy::FailoverOnly => "Failover Only".to_string(),
+            LoadBalanceStrategy::Random => "Random".to_string(),
+        },
+        config.preferences.warn_on_model_change.to_string(),
+    ];
+
+    let mut items: Vec<ListItem> = pref_names
+        .iter()
+        .zip(pref_values.iter())
+        .enumerate()
+        .map(|(idx, (name, value))| {
+            let prefix = if idx == state.selected { "> " } else { "  " };
+            let text = format!("{}{:<25} {}", prefix, name, value);
+            let style = if idx == state.selected {
+                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    // If in text edit mode for max_iterations
+    if let Some((input, cursor)) = state.edit_text() {
+        if state.selected == 0 {
+            let cursor_pos = char_to_byte_idx(input, cursor);
+            let display = format!("{}|{}", &input[..cursor_pos], &input[cursor_pos..]);
+            items[0] = ListItem::new(format!("  Max iterations:        {}", display))
+                .style(Style::default().fg(Color::Yellow));
+        }
+    }
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("General preferences"),
+    );
+    frame.render_widget(list, area);
+}
+
+/// Render model select popup (anchored near input area).
+fn render_model_select_popup(frame: &mut Frame, input_area: Rect, app: &App) {
+    // Position popup just above the input line, left-aligned
+    let popup_height = (app.model_select_list.len() + 2).min(10) as u16;
+    let popup_width = 40.min(input_area.width);
+    let popup_x = input_area.x;
+    let popup_y = input_area.y.saturating_sub(popup_height);
+
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = app
+        .model_select_list
+        .iter()
+        .enumerate()
+        .map(|(idx, model)| {
+            let prefix = if idx == app.model_select_index { "> " } else { "  " };
+            // Check if this is current model
+            let current = app.current_model.as_deref().map(|m| m == model).unwrap_or(false);
+            let suffix = if current { " (current)" } else { "" };
+            let text = format!("{}{}{}", prefix, model, suffix);
+            let style = if idx == app.model_select_index {
+                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Select Model"),
+    );
+    frame.render_widget(list, popup_area);
+}
+
+/// Helper to create a centered rect.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+/// Render Copilot OAuth authentication screen.
+fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
+    // Center the content
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Min(12),
+            Constraint::Percentage(25),
+        ])
+        .split(area);
+
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Min(50),
+            Constraint::Percentage(15),
+        ])
+        .split(chunks[1]);
+
+    let content = match &app.copilot_auth_status {
+        Some(CopilotAuthStatus::RequestingCode) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Requesting authorization code...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+            ]
+        }
+        Some(CopilotAuthStatus::WaitingForUser { user_code, verification_uri }) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "1. Open your browser and visit:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    format!("   {}", verification_uri),
+                    Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "2. Enter the code:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    format!("   {}", user_code),
+                    Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Waiting for authorization...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter: open browser & copy code | Esc: cancel]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(CopilotAuthStatus::Success) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication successful!",
+                    Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to continue]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(CopilotAuthStatus::Failed(error)) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication failed:",
+                    Style::default().fg(Color::Red).add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}", error),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to go back]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        None => {
+            vec![Line::from("")]
+        }
+    };
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" GitHub Copilot Authentication ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+/// Render the workspace access confirmation dialog.
+fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRequest) {
+    // Clear background
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
+    // Center the dialog
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Min(10),
+            Constraint::Percentage(30),
+        ])
+        .split(area);
+
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Min(50),
+            Constraint::Percentage(15),
+        ])
+        .split(chunks[1]);
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "The agent is requesting access to:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", request.path()),
+            Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Reason:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", request.reason()),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
+            Span::styled("Approve", Style::default().fg(Color::White)),
+            Span::raw("    "),
+            Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
+            Span::styled("Deny", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Workspace Access Request ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+/// Render queued messages indicator.
+fn render_queue(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header line
+    let queue_len = app.queue.len();
+    let header = format!(
+        "── Queued ({}) {} ──",
+        queue_len,
+        if queue_len == 1 { "message" } else { "messages" }
+    );
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::default().fg(Color::Yellow),
+    )));
+
+    // Show up to 3 queued messages
+    for msg in app.queue.iter().take(3) {
+        // Truncate long messages for display (unicode-safe)
+        let max_width = area.width.saturating_sub(6) as usize;
+        let content = &msg.content;
+        let preview: String = content
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(max_width)
+            .collect();
+        let truncated = if content.chars().count() > max_width
+            || content.lines().count() > 1
+        {
+            format!("{}...", preview)
+        } else {
+            preview
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("  ⏳ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(truncated, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    // If more than 3 messages, show indicator
+    if queue_len > 3 {
+        lines.push(Line::from(Span::styled(
+            format!("  ... and {} more", queue_len - 3),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render MCP server management popup.
+fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_area = centered_rect(70, 60, area);
+
+    // Clear background
+    frame.render_widget(Clear, popup_area);
+
+    // Title based on mode
+    let title = match app.mcp_add_mode {
+        McpAddMode::None => " MCP Servers ",
+        McpAddMode::Name => " Add MCP Server - Enter Name ",
+        McpAddMode::Command => " Add MCP Server - Enter Command ",
+    };
+
+    // Build content based on mode
+    let content: Vec<Line> = match app.mcp_add_mode {
+        McpAddMode::None => {
+            let mut lines = Vec::new();
+
+            if app.mcp_servers.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "No MCP servers configured.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Press 'a' to add a new server.",
+                    Style::default().fg(Color::Yellow),
+                )));
+            } else {
+                // List servers
+                for (idx, server) in app.mcp_servers.iter().enumerate() {
+                    let selected = idx == app.mcp_selected;
+                    let prefix = if selected { "> " } else { "  " };
+
+                    let status_color = if server.is_connected {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    };
+
+                    let line = Line::from(vec![
+                        Span::styled(
+                            prefix,
+                            if selected {
+                                Style::default().fg(Color::Yellow)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                        Span::styled(
+                            &server.name,
+                            if selected {
+                                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            },
+                        ),
+                        Span::styled(" - ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(&server.status, Style::default().fg(status_color)),
+                    ]);
+                    lines.push(line);
+
+                    // Show command/URL on second line if selected
+                    if selected {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", server.source),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("[a] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Add", Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled("[d] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Delete", Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled("[r] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Reconnect", Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Close", Style::default().fg(Color::White)),
+            ]));
+
+            lines
+        }
+        McpAddMode::Name => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Server name (alphanumeric, -, _):",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("> {}_", app.mcp_add_name),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter] Continue  [Esc] Cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        McpAddMode::Command => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("Name: {}", app.mcp_add_name),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Command (program and arguments):",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("> {}_", app.mcp_add_command),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Example: npx -y @modelcontextprotocol/server-filesystem /path",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter] Add Server  [Esc] Back",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+    };
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(title)
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, popup_area);
+}
