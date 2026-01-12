@@ -61,6 +61,8 @@ pub enum AppMode {
     McpManage,
     /// Ask user dialog
     AskUser(AskUserRequest, Vec<usize>),
+    /// Skill management popup
+    SkillManage,
 }
 
 /// Status of Copilot OAuth authentication flow.
@@ -89,6 +91,16 @@ pub enum McpAddMode {
     Name,
     /// Entering command
     Command,
+}
+
+/// Skill add mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillAddMode {
+    /// Not adding a skill
+    #[default]
+    None,
+    /// Entering GitHub repo (owner/repo format)
+    GitHubRepo,
 }
 
 /// Config section tabs (like Claude Code's /config).
@@ -391,6 +403,14 @@ pub struct App {
     pub mcp_add_name: String,
     /// MCP add command input
     pub mcp_add_command: String,
+    /// Skill list for display
+    pub skill_list: Vec<crate::skill::SkillInfo>,
+    /// Selected skill index
+    pub skill_selected: usize,
+    /// Skill add mode (entering GitHub repo)
+    pub skill_add_mode: SkillAddMode,
+    /// GitHub repo input for skill installation
+    pub skill_github_input: String,
     /// Current option selected in AskUser mode
     pub ask_user_cursor: usize,
     /// Event sender for spawning background tasks
@@ -509,6 +529,10 @@ impl App {
             mcp_add_mode: McpAddMode::None,
             mcp_add_name: String::new(),
             mcp_add_command: String::new(),
+            skill_list: Vec::new(),
+            skill_selected: 0,
+            skill_add_mode: SkillAddMode::None,
+            skill_github_input: String::new(),
             ask_user_cursor: 0,
             event_tx,
         })
@@ -687,6 +711,54 @@ impl App {
                 }
                 Ok(None)
             }
+
+            // ─── Skill events ────────────────────────────────────────────
+            AppEvent::SkillsLoaded(result) => {
+                self.status = None;
+                match result {
+                    Ok(skills) => {
+                        self.skill_list = skills;
+                        self.skill_selected = 0;
+                        self.mode = AppMode::SkillManage;
+                    }
+                    Err(e) => {
+                        self.chat.push_error(&format!("Failed to load skills: {}", e));
+                    }
+                }
+                Ok(None)
+            }
+            AppEvent::SkillInstalled(result) => {
+                self.status = None;
+                match result {
+                    Ok(skills) => {
+                        self.skill_list = skills;
+                        // Adjust selection if needed
+                        if self.skill_selected >= self.skill_list.len() && self.skill_selected > 0 {
+                            self.skill_selected = self.skill_list.len().saturating_sub(1);
+                        }
+                    }
+                    Err(e) => {
+                        self.chat.push_error(&format!("Failed to install skill: {}", e));
+                    }
+                }
+                Ok(None)
+            }
+            AppEvent::SkillDeleted(result) => {
+                self.status = None;
+                match result {
+                    Ok(skills) => {
+                        self.skill_list = skills;
+                        // Adjust selection if needed
+                        if self.skill_selected >= self.skill_list.len() && self.skill_selected > 0 {
+                            self.skill_selected -= 1;
+                        }
+                    }
+                    Err(e) => {
+                        self.chat.push_error(&format!("Failed to delete skill: {}", e));
+                    }
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -785,6 +857,7 @@ impl App {
             AppMode::WorkspaceConfirm(_) => self.handle_workspace_confirm_key(code),
             AppMode::McpManage => self.handle_mcp_key(code),
             AppMode::AskUser(_, _) => self.handle_ask_user_key(code),
+            AppMode::SkillManage => self.handle_skill_key(code),
         }
     }
 
@@ -1008,6 +1081,69 @@ impl App {
         Ok(None)
     }
 
+    /// Handle key in skill management mode.
+    fn handle_skill_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
+        match self.skill_add_mode {
+            SkillAddMode::None => {
+                // Normal navigation mode
+                match code {
+                    KeyCode::Esc => {
+                        self.mode = AppMode::Chat;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if self.skill_selected > 0 {
+                            self.skill_selected -= 1;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if self.skill_selected + 1 < self.skill_list.len() {
+                            self.skill_selected += 1;
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        // Start GitHub repo input mode
+                        self.skill_add_mode = SkillAddMode::GitHubRepo;
+                        self.skill_github_input.clear();
+                    }
+                    KeyCode::Char('d') | KeyCode::Delete => {
+                        // Delete selected skill
+                        if let Some(skill) = self.skill_list.get(self.skill_selected) {
+                            let dir_name = skill.dir_name.clone();
+                            return Ok(Some(SendAction::SkillDelete { dir_name }));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            SkillAddMode::GitHubRepo => {
+                match code {
+                    KeyCode::Esc => {
+                        self.skill_add_mode = SkillAddMode::None;
+                        self.skill_github_input.clear();
+                    }
+                    KeyCode::Enter => {
+                        if !self.skill_github_input.is_empty() {
+                            let input = std::mem::take(&mut self.skill_github_input);
+                            self.skill_add_mode = SkillAddMode::None;
+                            return Ok(Some(SendAction::SkillInstall { repo: input }));
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        self.skill_github_input.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        // Allow alphanumeric, dash, underscore, and slash
+                        if c.is_alphanumeric() || c == '-' || c == '_' || c == '/' {
+                            self.skill_github_input.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Start the Copilot OAuth device flow.
     ///
     /// This sets the mode to `CopilotAuth` and status to `RequestingCode`.
@@ -1183,11 +1319,8 @@ impl App {
 
     /// Execute a slash command directly (from menu selection only).
     fn execute_slash_command(&mut self, cmd: &str) -> anyhow::Result<Option<SendAction>> {
-        let cmd_lower = cmd.trim().to_lowercase();
-
-        match cmd_lower.as_str() {
-            "/session" | "/sessions" | "/s" => {
-                // Spawn background task to load sessions
+        match cmd {
+            "/session" => {
                 let tx = self.event_tx.clone();
                 let store = self.session_manager.store().clone();
                 spawn(async move {
@@ -1199,14 +1332,11 @@ impl App {
                         .await;
                 })
                 .detach();
-                self.status = Some("Loading sessions...".to_string());
+                self.status = Some("Loading skills...".to_string());
                 Ok(None)
             }
-            "/new" | "/n" => {
-                Ok(Some(SendAction::NewSession))
-            }
+            "/new" => Ok(Some(SendAction::NewSession)),
             "/sandbox" => {
-                // Open sandbox folder in system file manager
                 if let Some(session) = self.session_manager.current() {
                     let sandbox_dir = &session.sandbox_dir;
                     #[cfg(target_os = "macos")]
@@ -1230,17 +1360,15 @@ impl App {
                 }
                 Ok(None)
             }
-            "/config" | "/settings" => {
+            "/config" => {
                 self.config_state = ConfigState::default();
                 self.config_state.load_providers(&self.config);
                 self.mode = AppMode::Config;
                 Ok(None)
             }
-            "/model" | "/m" => {
-                // Build list of all configured models
+            "/model" => {
                 self.model_select_list = self.collect_all_models();
                 self.model_select_index = 0;
-                // Try to select current model
                 if let Some(current) = self.current_model.as_deref().or(self.config.last_model.as_deref()) {
                     if let Some(idx) = self.model_select_list.iter().position(|m| m == current) {
                         self.model_select_index = idx;
@@ -1249,20 +1377,27 @@ impl App {
                 self.mode = AppMode::ModelSelect;
                 Ok(None)
             }
-            "/quit" | "/q" | "/exit" => {
-                Ok(Some(SendAction::Quit))
-            }
-            "/compact" => {
-                Ok(Some(SendAction::Compact))
-            }
+            "/quit" => Ok(Some(SendAction::Quit)),
+            "/compact" => Ok(Some(SendAction::Compact)),
             "/mcp" => {
                 self.mode = AppMode::McpManage;
                 Ok(None)
             }
-            _ => {
-                // This should not happen since commands only come from menu
+            "/skill" => {
+                let tx = self.event_tx.clone();
+                let may_dir = self.session_manager.may_dir().to_path_buf();
+                spawn(async move {
+                    let manager = crate::skill::SkillManager::new(&may_dir);
+                    let result = manager.list_skills();
+                    let _ = tx
+                        .send(AppEvent::SkillsLoaded(result.map_err(|e| e.to_string())))
+                        .await;
+                })
+                .detach();
+                self.status = Some("Loading skills...".to_string());
                 Ok(None)
             }
+            _ => Ok(None),
         }
     }
 
@@ -2447,4 +2582,7 @@ pub enum SendAction {
     McpAdd { name: String, command: String, args: Vec<String> },
     McpRemove { name: String },
     McpReconnect { name: String },
+    /// Skill management actions.
+    SkillInstall { repo: String },
+    SkillDelete { dir_name: String },
 }
