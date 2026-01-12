@@ -407,10 +407,14 @@ pub struct App {
     pub skill_list: Vec<crate::skill::SkillInfo>,
     /// Selected skill index
     pub skill_selected: usize,
-    /// Skill add mode (entering GitHub repo)
+    /// Skill scroll offset for long lists
+    pub skill_scroll: usize,
+    /// Skill add mode (entering GitHub repo or searching)
     pub skill_add_mode: SkillAddMode,
     /// GitHub repo input for skill installation
     pub skill_github_input: String,
+    /// Skill search query
+    pub skill_search: String,
     /// Current option selected in AskUser mode
     pub ask_user_cursor: usize,
     /// Event sender for spawning background tasks
@@ -531,8 +535,10 @@ impl App {
             mcp_add_command: String::new(),
             skill_list: Vec::new(),
             skill_selected: 0,
+            skill_scroll: 0,
             skill_add_mode: SkillAddMode::None,
             skill_github_input: String::new(),
+            skill_search: String::new(),
             ask_user_cursor: 0,
             event_tx,
         })
@@ -1081,36 +1087,99 @@ impl App {
         Ok(None)
     }
 
+    /// Get filtered skill list based on search query.
+    pub fn filtered_skills(&self) -> Vec<&crate::skill::SkillInfo> {
+        if self.skill_search.is_empty() {
+            self.skill_list.iter().collect()
+        } else {
+            let query = self.skill_search.to_lowercase();
+            self.skill_list
+                .iter()
+                .filter(|s| {
+                    s.name.to_lowercase().contains(&query)
+                        || s.description.to_lowercase().contains(&query)
+                })
+                .collect()
+        }
+    }
+
     /// Handle key in skill management mode.
     fn handle_skill_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
         match self.skill_add_mode {
             SkillAddMode::None => {
-                // Normal navigation mode
+                // Normal navigation mode with search
                 match code {
                     KeyCode::Esc => {
-                        self.mode = AppMode::Chat;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if self.skill_selected > 0 {
-                            self.skill_selected -= 1;
+                        if !self.skill_search.is_empty() {
+                            // Clear search first
+                            self.skill_search.clear();
+                            self.skill_selected = 0;
+                            self.skill_scroll = 0;
+                        } else {
+                            self.mode = AppMode::Chat;
+                            self.skill_search.clear();
+                            self.skill_scroll = 0;
                         }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if self.skill_selected + 1 < self.skill_list.len() {
+                    KeyCode::Up => {
+                        if self.skill_selected > 0 {
+                            self.skill_selected -= 1;
+                            // Scroll up if needed
+                            if self.skill_selected < self.skill_scroll {
+                                self.skill_scroll = self.skill_selected;
+                            }
+                        }
+                    }
+                    KeyCode::Down => {
+                        let filtered_len = self.filtered_skills().len();
+                        if self.skill_selected + 1 < filtered_len {
                             self.skill_selected += 1;
                         }
                     }
-                    KeyCode::Char('a') => {
-                        // Start GitHub repo input mode
+                    KeyCode::Backspace => {
+                        self.skill_search.pop();
+                        self.skill_selected = 0;
+                        self.skill_scroll = 0;
+                    }
+                    KeyCode::Char('a') if self.skill_search.is_empty() => {
+                        // Start GitHub repo input mode (only if not searching)
                         self.skill_add_mode = SkillAddMode::GitHubRepo;
                         self.skill_github_input.clear();
                     }
-                    KeyCode::Char('d') | KeyCode::Delete => {
-                        // Delete selected skill
-                        if let Some(skill) = self.skill_list.get(self.skill_selected) {
+                    KeyCode::Char('d') if self.skill_search.is_empty() => {
+                        // Delete selected skill (only if not searching)
+                        let filtered = self.filtered_skills();
+                        if let Some(skill) = filtered.get(self.skill_selected) {
                             let dir_name = skill.dir_name.clone();
                             return Ok(Some(SendAction::SkillDelete { dir_name }));
                         }
+                    }
+                    KeyCode::Delete => {
+                        // Delete selected skill
+                        let filtered = self.filtered_skills();
+                        if let Some(skill) = filtered.get(self.skill_selected) {
+                            let dir_name = skill.dir_name.clone();
+                            return Ok(Some(SendAction::SkillDelete { dir_name }));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        // Select skill and insert into input
+                        let filtered = self.filtered_skills();
+                        if let Some(skill) = filtered.get(self.skill_selected) {
+                            let prefix = format!("Use {} skill, ", skill.name);
+                            let prefix_len = prefix.chars().count();
+                            self.input.insert_str(0, &prefix);
+                            self.cursor += prefix_len;
+                            self.mode = AppMode::Chat;
+                            self.skill_search.clear();
+                            self.skill_scroll = 0;
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        // Add to search query
+                        self.skill_search.push(c);
+                        self.skill_selected = 0;
+                        self.skill_scroll = 0;
                     }
                     _ => {}
                 }
@@ -1388,7 +1457,7 @@ impl App {
                 let may_dir = self.session_manager.may_dir().to_path_buf();
                 spawn(async move {
                     let manager = crate::skill::SkillManager::new(&may_dir);
-                    let result = manager.list_skills();
+                    let result = manager.list_skills().await;
                     let _ = tx
                         .send(AppEvent::SkillsLoaded(result.map_err(|e| e.to_string())))
                         .await;
