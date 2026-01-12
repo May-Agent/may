@@ -263,8 +263,13 @@ impl ProviderType {
             return true;
         }
 
-        // Copilot can serve various models (gpt-4, claude, etc.)
+        // Copilot can serve OpenAI and Anthropic models, but not Google models.
         if self == Self::Copilot {
+            if let Some(info) = aither_models::lookup(model_id) {
+                return info.provider.eq_ignore_ascii_case("openai")
+                    || info.provider.eq_ignore_ascii_case("anthropic");
+            }
+            // Unknown model - allow the provider to try
             return true;
         }
 
@@ -1065,6 +1070,11 @@ fast = ["llama3"]
         // OpenRouter can serve anything
         assert!(ProviderType::OpenRouter.can_serve_model("claude-sonnet-4"));
         assert!(ProviderType::OpenRouter.can_serve_model("gpt-4o"));
+
+        // Copilot can serve OpenAI and Anthropic models, but not Google models
+        assert!(ProviderType::Copilot.can_serve_model("gpt-4o"));
+        assert!(ProviderType::Copilot.can_serve_model("claude-3-5-sonnet"));
+        assert!(!ProviderType::Copilot.can_serve_model("gemini-3-flash-preview"));
     }
 
     #[test]
