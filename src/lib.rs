@@ -7,12 +7,14 @@ pub mod agent;
 pub mod bundle;
 pub mod config;
 pub mod copilot;
+mod fs_util;
 pub mod mcp;
 pub mod models;
 pub mod session;
 pub mod tui;
 pub mod workspace;
-pub mod workspace_request;
+pub use aither_agent::ask_user;
+pub use aither_agent::workspace_request;
 
 pub use agent::{generate_session_title, MayAgent};
 pub use config::MayConfig;
@@ -21,5 +23,5 @@ pub use session::{
     SessionSummary,
 };
 pub use workspace::{Workspace, WorkspaceConfig};
-pub use workspace_request::{WorkspaceRequest, WorkspaceRequestReceiver, WorkspaceRequestSender};
+pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};
 pub use mcp::{McpConfig, McpManager, McpServerInfo, MayMcpServerConfig};

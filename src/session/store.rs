@@ -1,22 +1,11 @@
 //! Filesystem persistence for sessions.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use futures_lite::StreamExt;
 
 use super::{ChatHistory, ChatHistoryError};
-
-/// Session metadata stored in metadata.json.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SessionMetadata {
-    /// Session title (generated after first response).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    /// Model bound to this session (set via /model command).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-}
+use crate::fs_util;
 
 /// Session store error.
 #[derive(Debug, thiserror::Error)]
@@ -25,9 +14,12 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("Chat history error: {0}")]
     History(#[from] ChatHistoryError),
+    #[error("Bundle error: {0}")]
+    Bundle(#[from] crate::bundle::BundleError),
 }
 
 /// Handles persistence of sessions to filesystem.
+#[derive(Clone)]
 pub struct SessionStore {
     sessions_dir: PathBuf,
 }
@@ -64,59 +56,54 @@ impl SessionStore {
         self.session_dir(id)
     }
 
-    /// Get path for session metadata file.
-    pub fn metadata_path(&self, id: &str) -> PathBuf {
-        self.session_dir(id).join("metadata.json")
-    }
-
     /// Check if a session exists.
     pub fn exists(&self, id: &str) -> bool {
         self.session_dir(id).exists()
     }
 
     /// Create session directory structure.
-    pub fn create_session_dirs(&self, id: &str) -> Result<(), StoreError> {
+    pub async fn create_session_dirs(&self, id: &str) -> Result<(), StoreError> {
         let session_dir = self.session_dir(id);
-        fs::create_dir_all(&session_dir)?;
-        fs::create_dir_all(self.images_dir(id))?;
+        async_fs::create_dir_all(&session_dir).await?;
+        async_fs::create_dir_all(self.images_dir(id)).await?;
 
         // Create sandbox symlinks to global resources
-        let may_dir = self.sessions_dir.parent().unwrap_or(&self.sessions_dir);
-        crate::bundle::Bundle::create_sandbox_symlinks(&session_dir, may_dir)
-            .map_err(|e| StoreError::Io(std::io::Error::other(e.to_string())))?;
+        let may_dir = self.sessions_dir.parent().unwrap_or(&self.sessions_dir).to_path_buf();
+        crate::bundle::Bundle::create_sandbox_symlinks(&session_dir, &may_dir).await?;
 
         Ok(())
     }
 
     /// Read chat history from disk.
-    pub fn read_history(&self, id: &str) -> Result<ChatHistory, StoreError> {
+    pub async fn read_history(&self, id: &str) -> Result<ChatHistory, StoreError> {
         let path = self.chat_path(id);
-        if !path.exists() {
+        if async_fs::metadata(&path).await.is_err() {
             return Ok(ChatHistory::new());
         }
-        let content = fs::read_to_string(&path)?;
+        let content = fs_util::read_to_string(&path).await?;
         Ok(ChatHistory::parse(&content)?)
     }
 
     /// Write chat history to disk.
-    pub fn write_history(&self, id: &str, history: &ChatHistory) -> Result<(), StoreError> {
+    pub async fn write_history(&self, id: &str, history: &ChatHistory) -> Result<(), StoreError> {
         let path = self.chat_path(id);
         let content = history.serialize();
-        fs::write(&path, content)?;
+        async_fs::write(&path, content).await?;
         Ok(())
     }
 
     /// List all session IDs.
-    pub fn list_sessions(&self) -> Result<Vec<String>, StoreError> {
+    pub async fn list_sessions(&self) -> Result<Vec<String>, StoreError> {
         let mut sessions = Vec::new();
 
         if !self.sessions_dir.exists() {
             return Ok(sessions);
         }
 
-        for entry in fs::read_dir(&self.sessions_dir)? {
+        let mut entries = async_fs::read_dir(&self.sessions_dir).await?;
+        while let Some(entry) = entries.next().await {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
+            if entry.file_type().await?.is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
                     sessions.push(name.to_string());
                 }
@@ -126,33 +113,39 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    /// List all sessions with summaries (for background loading).
+    pub async fn list_session_summaries(
+        &self,
+    ) -> Result<Vec<super::manager::SessionSummary>, StoreError> {
+        use super::manager::{SessionId, SessionSummary};
+
+        let ids = self.list_sessions().await?;
+        let mut summaries = Vec::new();
+
+        for id_str in ids {
+            let history = self.read_history(&id_str).await?;
+            let created_at = history.messages().first().and_then(|m| m.timestamp);
+
+            summaries.push(SessionSummary {
+                id: SessionId::from_string(id_str),
+                title: history.metadata.title.clone(),
+                message_count: history.len(),
+                created_at,
+            });
+        }
+
+        // Sort by created_at descending (newest first)
+        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        Ok(summaries)
+    }
+
     /// Delete a session.
-    pub fn delete_session(&self, id: &str) -> Result<(), StoreError> {
+    pub async fn delete_session(&self, id: &str) -> Result<(), StoreError> {
         let path = self.session_dir(id);
         if path.exists() {
-            fs::remove_dir_all(&path)?;
+            async_fs::remove_dir_all(&path).await?;
         }
-        Ok(())
-    }
-
-    /// Read session metadata from disk.
-    pub fn read_metadata(&self, id: &str) -> SessionMetadata {
-        let path = self.metadata_path(id);
-        if !path.exists() {
-            return SessionMetadata::default();
-        }
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default()
-    }
-
-    /// Write session metadata to disk.
-    pub fn write_metadata(&self, id: &str, metadata: &SessionMetadata) -> Result<(), StoreError> {
-        let path = self.metadata_path(id);
-        let content = serde_json::to_string_pretty(metadata)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        fs::write(&path, content)?;
         Ok(())
     }
 }

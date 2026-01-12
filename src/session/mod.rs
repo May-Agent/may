@@ -6,6 +6,6 @@ mod history;
 mod manager;
 mod store;
 
-pub use history::{ChatHistory, ChatHistoryError, ChatMessage, MessageRole};
+pub use history::{ChatHistory, ChatHistoryError, ChatMessage, MessageRole, SessionMetadata};
 pub use manager::{Session, SessionError, SessionId, SessionManager, SessionSummary};
-pub use store::{SessionMetadata, SessionStore};
+pub use store::SessionStore;

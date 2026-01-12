@@ -14,6 +14,8 @@ SHORTCUTS
   Ctrl+c        Quit
   Up/Down       History / Scroll chat
   Mouse wheel   Scroll chat
+  g             Top
+  G             Bottom
   Esc           Clear input
 
 Type a message and press Enter to chat.

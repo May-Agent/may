@@ -8,6 +8,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::super::queue::Attachment;
 use super::markdown;
@@ -509,30 +510,62 @@ pub struct InputContext<'a> {
     pub attachments: &'a [Attachment],
 }
 
-/// Render the chat stream.
-pub fn render(frame: &mut Frame, area: Rect, chat: &ChatStream, scroll: usize) {
-    render_with_selection(frame, area, chat, scroll, None, None, None, None);
+/// Status bar rendering context for combined view.
+pub struct StatusContext<'a> {
+    /// Model display string.
+    pub model: &'a str,
+    /// Token usage info (prompt_tokens, context_window).
+    pub usage: Option<(u64, Option<u64>)>,
+    /// Queued message count.
+    pub queue_count: usize,
+    /// Background task count.
+    pub background_tasks: usize,
+    /// Whether currently processing.
+    pub processing: bool,
+    /// Optional status message.
+    pub status_message: Option<&'a str>,
 }
 
-/// Render the chat stream with input line at bottom (full-screen scrollable).
-pub fn render_with_input(
+/// Queued message context for rendering queue indicator.
+pub struct QueueContext<'a> {
+    /// Queued message previews.
+    pub messages: &'a [String],
+}
+
+/// Render the chat stream.
+pub fn render(frame: &mut Frame, area: Rect, chat: &ChatStream, scroll: usize) {
+    render_impl(frame, area, chat, scroll, None, None, None, None, None, None);
+}
+
+/// Full-screen unified render context.
+pub struct UnifiedRenderContext<'a> {
+    pub selected_tool: Option<&'a str>,
+    pub content_height_out: Option<&'a Cell<usize>>,
+    pub view_height_out: Option<&'a Cell<usize>>,
+    pub input_ctx: Option<InputContext<'a>>,
+    pub queue_ctx: Option<QueueContext<'a>>,
+    pub status_ctx: Option<StatusContext<'a>>,
+}
+
+/// Render the chat stream with full-screen scrolling (chat + queue + input + status).
+pub fn render_unified(
     frame: &mut Frame,
     area: Rect,
     chat: &ChatStream,
     scroll: usize,
-    input_ctx: InputContext<'_>,
-    content_height_out: Option<&Cell<usize>>,
-    view_height_out: Option<&Cell<usize>>,
+    ctx: UnifiedRenderContext<'_>,
 ) {
-    render_with_selection(
+    render_impl(
         frame,
         area,
         chat,
         scroll,
-        None,
-        content_height_out,
-        view_height_out,
-        Some(input_ctx),
+        ctx.selected_tool,
+        ctx.content_height_out,
+        ctx.view_height_out,
+        ctx.input_ctx,
+        ctx.queue_ctx,
+        ctx.status_ctx,
     );
 }
 
@@ -545,7 +578,31 @@ fn safe_scroll(scroll: usize, content_height: usize, area_height: u16) -> u16 {
     clamped.min(u16::MAX as usize) as u16
 }
 
-/// Render the chat stream with optional tool selection.
+/// Calculate how many visual lines a Line will take when wrapped to a given width.
+fn wrapped_line_count(line: &Line, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+
+    // Calculate total display width of the line
+    let content_width: usize = line.spans.iter()
+        .map(|s| s.content.as_ref().width())
+        .sum();
+
+    if content_width == 0 {
+        return 1; // Empty line still takes 1 row
+    }
+
+    // Ceiling division: how many rows needed
+    (content_width + width - 1) / width
+}
+
+/// Calculate total visual lines for a slice of Lines when wrapped.
+fn total_wrapped_lines(lines: &[Line], width: usize) -> usize {
+    lines.iter().map(|line| wrapped_line_count(line, width)).sum()
+}
+
+/// Render the chat stream with optional tool selection (legacy API).
 pub fn render_with_selection(
     frame: &mut Frame,
     area: Rect,
@@ -555,6 +612,33 @@ pub fn render_with_selection(
     content_height_out: Option<&Cell<usize>>,
     view_height_out: Option<&Cell<usize>>,
     input_ctx: Option<InputContext<'_>>,
+) {
+    render_impl(
+        frame,
+        area,
+        chat,
+        scroll,
+        selected_tool,
+        content_height_out,
+        view_height_out,
+        input_ctx,
+        None,
+        None,
+    );
+}
+
+/// Internal implementation for rendering chat stream.
+fn render_impl(
+    frame: &mut Frame,
+    area: Rect,
+    chat: &ChatStream,
+    scroll: usize,
+    selected_tool: Option<&str>,
+    content_height_out: Option<&Cell<usize>>,
+    view_height_out: Option<&Cell<usize>>,
+    input_ctx: Option<InputContext<'_>>,
+    queue_ctx: Option<QueueContext<'_>>,
+    status_ctx: Option<StatusContext<'_>>,
 ) {
     // Guard against zero-dimension areas to prevent overflow
     if area.width < 3 || area.height < 3 {
@@ -687,25 +771,66 @@ pub fn render_with_selection(
         }
     }
 
+    // Render queue messages if provided
+    if let Some(ref ctx) = queue_ctx {
+        if !ctx.messages.is_empty() {
+            render_queue_lines(&mut lines, ctx, area.width);
+        }
+    }
+
     // Render input line if provided (for full-screen scroll mode)
     if let Some(ctx) = input_ctx {
         render_input_line(&mut lines, ctx);
     }
 
-    // Calculate safe scroll value
-    let inner_height = area.height;
+    // Render status bar if provided
+    if let Some(ref ctx) = status_ctx {
+        render_status_line(&mut lines, ctx);
+    }
+
+    // Calculate dimensions using VISUAL line count (accounting for wrap)
+    let view_height = area.height as usize;
+    let render_width = area.width as usize;
+    let visual_content_height = total_wrapped_lines(&lines, render_width);
 
     // Export dimensions for scroll normalization
+    // Use visual height so scrolling works correctly with wrapped lines
     if let Some(cell) = content_height_out {
-        cell.set(lines.len());
+        cell.set(visual_content_height);
     }
     if let Some(cell) = view_height_out {
-        cell.set(inner_height as usize);
+        cell.set(view_height);
     }
 
-    let scroll_y = safe_scroll(scroll, lines.len(), inner_height);
+    // Determine scroll position and whether to add padding
+    let (scroll_y, padding) = if visual_content_height < view_height {
+        // Content fits on screen - add padding at top to push content to bottom
+        // No scrolling needed
+        (0u16, view_height - visual_content_height)
+    } else {
+        // Content exceeds screen - calculate scroll position
+        let max_scroll = visual_content_height - view_height;
+        let actual_scroll = if scroll == usize::MAX {
+            max_scroll // Follow bottom
+        } else {
+            scroll.min(max_scroll)
+        };
+        (actual_scroll.min(u16::MAX as usize) as u16, 0)
+    };
 
-    let paragraph = Paragraph::new(lines)
+    // Build final content with padding if needed
+    let final_lines = if padding > 0 {
+        let mut padded = Vec::with_capacity(padding + lines.len());
+        for _ in 0..padding {
+            padded.push(Line::from(""));
+        }
+        padded.extend(lines);
+        padded
+    } else {
+        lines
+    };
+
+    let paragraph = Paragraph::new(final_lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
 
@@ -769,6 +894,106 @@ fn render_input_line<'a>(lines: &mut Vec<Line<'a>>, ctx: InputContext<'_>) {
     lines.push(Line::from(spans));
 }
 
+/// Render queued messages into the lines vector.
+fn render_queue_lines<'a>(lines: &mut Vec<Line<'a>>, ctx: &QueueContext<'_>, width: u16) {
+    let queue_len = ctx.messages.len();
+
+    // Header line
+    let header = format!(
+        "── Queued ({}) {} ──",
+        queue_len,
+        if queue_len == 1 { "message" } else { "messages" }
+    );
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::default().fg(Color::Yellow),
+    )));
+
+    // Show up to 3 queued messages
+    let max_width = width.saturating_sub(6) as usize;
+    for msg in ctx.messages.iter().take(3) {
+        let preview: String = msg
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(max_width)
+            .collect();
+        let truncated = if msg.chars().count() > max_width || msg.lines().count() > 1 {
+            format!("{}...", preview)
+        } else {
+            preview
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("  ⏳ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(truncated, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    // If more than 3 messages, show indicator
+    if queue_len > 3 {
+        lines.push(Line::from(Span::styled(
+            format!("  ... and {} more", queue_len - 3),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+}
+
+/// Render the status bar into the lines vector.
+fn render_status_line<'a>(lines: &mut Vec<Line<'a>>, ctx: &StatusContext<'_>) {
+    // If there's a status message (like Ctrl+C hint), show it prominently
+    if let Some(status) = ctx.status_message {
+        lines.push(Line::from(Span::styled(
+            status.to_string(),
+            Style::default().fg(Color::Yellow),
+        )));
+        return;
+    }
+
+    let mut parts = vec![ctx.model.to_string()];
+
+    // Add token usage info
+    if let Some((prompt_tokens, context_window)) = ctx.usage {
+        let used = format_number(prompt_tokens as usize);
+        if let Some(window) = context_window {
+            parts.push(format!("{}/{}", used, format_number(window as usize)));
+        } else {
+            parts.push(format!("{}tok", used));
+        }
+    }
+
+    if ctx.queue_count > 0 {
+        parts.push(format!("Q:{}", ctx.queue_count));
+    }
+
+    if ctx.background_tasks > 0 {
+        parts.push(format!("BG:{}", ctx.background_tasks));
+    }
+
+    if ctx.processing {
+        parts.push("...".to_string());
+    }
+
+    let status_text = parts.join(" | ");
+
+    lines.push(Line::from(Span::styled(
+        status_text,
+        Style::default().fg(Color::Cyan),
+    )));
+}
+
+/// Format large numbers with K/M suffix for readability.
+fn format_number(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Render a tool call inline with optional selection highlight.
 fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, is_selected: bool) {
     let selection_marker = if is_selected { "▶ " } else { "  " };
@@ -787,14 +1012,19 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
         } => {
             let status_text = match status {
                 ToolStatus::Running => "...".to_string(),
-                ToolStatus::Done => results.map_or("done".to_string(), |n| format!("{n} results")),
+                ToolStatus::Done => results.map_or("".to_string(), |n| format!("{n} results")),
                 ToolStatus::SearchDone(n) => format!("{n} results"),
                 ToolStatus::Failed(e) => format!("failed: {e}"),
+            };
+            let query_display = if status_text.is_empty() {
+                format!("\"{}\"", query)
+            } else {
+                format!("\"{}\" {}", query, status_text)
             };
             lines.push(Line::from(vec![
                 Span::raw(selection_marker),
                 Span::styled("[search] ", Style::default().fg(Color::Blue)),
-                Span::styled(format!("\"{}\" {}", query, status_text), selection_style),
+                Span::styled(query_display, selection_style),
             ]));
 
             // Show bash output preview if available
@@ -817,13 +1047,18 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
         } => {
             let status_text = match status {
                 ToolStatus::Running => "...",
-                ToolStatus::Done | ToolStatus::SearchDone(_) => "done",
+                ToolStatus::Done | ToolStatus::SearchDone(_) => "",
                 ToolStatus::Failed(_) => "failed",
+            };
+            let url_display = if status_text.is_empty() {
+                url.to_string()
+            } else {
+                format!("{} {}", url, status_text)
             };
             lines.push(Line::from(vec![
                 Span::raw(selection_marker),
                 Span::styled("[fetch] ", Style::default().fg(Color::Cyan)),
-                Span::styled(format!("{} {}", url, status_text), selection_style),
+                Span::styled(url_display, selection_style),
             ]));
 
             // Show bash output preview if available
@@ -847,7 +1082,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
         } => {
             let status_text = match status {
                 ToolStatus::Running => "...",
-                ToolStatus::Done | ToolStatus::SearchDone(_) => "done",
+                ToolStatus::Done | ToolStatus::SearchDone(_) => "",
                 ToolStatus::Failed(_) => "failed",
             };
 
@@ -857,13 +1092,19 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 None => prompt.clone(),
             };
 
+            let prompt_display = if status_text.is_empty() {
+                prompt_preview.clone()
+            } else {
+                format!("{} {}", prompt_preview, status_text)
+            };
+
             lines.push(Line::from(vec![
                 Span::raw(selection_marker),
                 Span::styled(
                     format!("[task:{}] ", subagent),
                     Style::default().fg(Color::Yellow),
                 ),
-                Span::styled(format!("{} {}", prompt_preview, status_text), selection_style),
+                Span::styled(prompt_display, selection_style),
             ]));
 
             // Show most recent bash call for subagent
@@ -895,7 +1136,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
         } => {
             let status_text = match status {
                 ToolStatus::Running => "...".to_string(),
-                ToolStatus::Done => "done".to_string(),
+                ToolStatus::Done => "".to_string(),
                 ToolStatus::SearchDone(n) => format!("{} results", n),
                 ToolStatus::Failed(_) => "failed".to_string(),
             };
@@ -913,47 +1154,75 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             let truncate_pos = command.char_indices().nth(120).map(|(i, _)| i);
             let should_truncate = *mode != BashMode::Unsafe && truncate_pos.is_some();
 
-            if let (true, Some(pos)) = (should_truncate, truncate_pos) {
-                // Show truncated on single line
-                let cmd_preview = format!("{}...", &command[..pos]);
-                lines.push(Line::from(vec![
-                    Span::raw(selection_marker),
-                    Span::styled(mode_prefix, Style::default().fg(Color::Red).bold()),
-                    Span::styled("$ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("{} {}", cmd_preview, status_text), selection_style),
-                ]));
+            // Render command with syntax highlighting if possible (wrap in markdown)
+            // Or just clean up indentation
+            let cmd_text = if should_truncate {
+                format!("{}...", &command[..truncate_pos.unwrap()])
             } else {
-                // Show full command - may span multiple lines
-                let cmd_lines: Vec<&str> = command.lines().collect();
-                for (i, cmd_line) in cmd_lines.iter().enumerate() {
-                    if i == 0 {
-                        lines.push(Line::from(vec![
-                            Span::raw(selection_marker),
-                            Span::styled(mode_prefix, Style::default().fg(Color::Red).bold()),
-                            Span::styled("$ ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(
-                                if cmd_lines.len() == 1 {
-                                    format!("{} {}", cmd_line, status_text)
-                                } else {
-                                    (*cmd_line).to_string()
-                                },
-                                selection_style,
-                            ),
-                        ]));
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::raw("    "),
-                            Span::styled((*cmd_line).to_string(), selection_style),
-                        ]));
+                command.clone()
+            };
+
+            // Render as markdown code block for syntax highlighting
+            // We format it as a bash block
+            let md_input = format!("```bash\n{}\n```", cmd_text);
+            let md_lines = markdown::render_markdown(&md_input);
+
+            // Extract lines from markdown rendering
+            // Skip the first/last lines if they are code block markers (tui-markdown might output them)
+            // But tui-markdown output depends on implementation.
+            // Usually it outputs styled lines. We'll just take them all for now and see.
+            // Actually, we want to construct our own lines to include the prompt $
+
+            // Just use the spans from the rendered markdown lines
+            // Assuming tui-markdown renders code blocks as a series of lines with spans
+            let mut highlighted_lines = Vec::new();
+            for line in md_lines {
+                // Filter out lines that look like ```bash or ```
+                // This is a heuristic - tui-markdown might not render the markers if configured not to
+                // or it might render them with specific style.
+                // For now, let's assume we want to skip lines that are just "```..."
+                let content = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+                if !content.trim().starts_with("```") {
+                    highlighted_lines.push(line);
+                }
+            }
+
+            if highlighted_lines.is_empty() {
+                // Fallback if markdown rendering failed to produce content
+                // (shouldn't happen, but safe)
+                highlighted_lines.push(Line::from(cmd_text));
+            }
+
+            for (i, cmd_line) in highlighted_lines.iter().enumerate() {
+                if i == 0 {
+                    // First line includes the prompt
+                    let mut spans = vec![
+                        Span::raw(selection_marker),
+                        Span::styled(mode_prefix, Style::default().fg(Color::Red).bold()),
+                        Span::styled("$ ", Style::default().fg(Color::DarkGray)),
+                    ];
+                    // Add spans from the highlighted line
+                    spans.extend(cmd_line.spans.clone());
+
+                    // Add status if single line
+                    if highlighted_lines.len() == 1 && !status_text.is_empty() {
+                         spans.push(Span::styled(format!(" {}", status_text), selection_style));
                     }
+
+                    lines.push(Line::from(spans));
+                } else {
+                    // subsequent lines - NO INDENTATION as requested
+                    // Just the highlighted content
+                    lines.push(cmd_line.clone());
                 }
-                // Add status on separate line if multi-line command
-                if cmd_lines.len() > 1 {
-                    lines.push(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(status_text, Style::default().fg(Color::DarkGray)),
-                    ]));
-                }
+            }
+
+            // Add status on separate line if multi-line command
+            if highlighted_lines.len() > 1 && !status_text.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(status_text, Style::default().fg(Color::DarkGray)),
+                ]));
             }
 
             // Show output preview
@@ -961,10 +1230,20 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 if !info.output.is_empty() {
                     let preview = info.output_preview(3);
                     for line in preview.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("    {}", line),
-                            Style::default().fg(Color::DarkGray),
-                        )));
+                        // NO INDENTATION for output as requested
+                        // Just 2 spaces for alignment with prompt?
+                        // Or absolute 0?
+                        // "Align the $ completely to the left (0 indentation)"
+                        // So output should probably also be left-aligned.
+                        // But we probably want it to look distinct from commands?
+                        // Maybe color is enough.
+                        lines.push(Line::from(vec![
+                            Span::raw("  "), // Align with $ prompt start
+                            Span::styled(
+                                line.to_string(),
+                                Style::default().fg(Color::DarkGray),
+                            )
+                        ]));
                     }
                 }
             }
