@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
-use super::super::app::{App, AppMode, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode};
+use super::super::app::{App, AppMode, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode, SkillAddMode};
 use super::super::completion::CompletionMode;
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 use crate::workspace_request::WorkspaceRequest;
@@ -111,6 +111,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         AppMode::McpManage => {
             render_mcp_popup(frame, area, app);
+        }
+        AppMode::SkillManage => {
+            render_skill_popup(frame, area, app);
         }
         _ => {}
     }
@@ -1146,6 +1149,127 @@ fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "[Enter] Add Server  [Esc] Back",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+    };
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(title)
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, popup_area);
+}
+
+/// Render the skill management popup.
+fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_area = centered_rect(70, 60, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = match app.skill_add_mode {
+        SkillAddMode::None => " Skills ",
+        SkillAddMode::GitHubRepo => " Install Skill from GitHub ",
+    };
+
+    let content: Vec<Line> = match app.skill_add_mode {
+        SkillAddMode::None => {
+            let mut lines = Vec::new();
+
+            if app.skill_list.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "No skills installed.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Press 'a' to install from GitHub.",
+                    Style::default().fg(Color::Yellow),
+                )));
+            } else {
+                for (idx, skill) in app.skill_list.iter().enumerate() {
+                    let selected = idx == app.skill_selected;
+                    let prefix = if selected { "> " } else { "  " };
+
+                    let source_str = match &skill.source {
+                        crate::skill::SkillSource::Bundled => String::new(),
+                        crate::skill::SkillSource::GitHub { owner, repo } => {
+                            format!(" ({})", format!("{}/{}", owner, repo))
+                        }
+                    };
+
+                    let line = Line::from(vec![
+                        Span::styled(
+                            prefix,
+                            if selected {
+                                Style::default().fg(Color::Yellow)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                        Span::styled(
+                            &skill.name,
+                            if selected {
+                                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            },
+                        ),
+                        Span::styled(source_str, Style::default().fg(Color::DarkGray)),
+                    ]);
+                    lines.push(line);
+
+                    if selected {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", skill.description),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("[a] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Add from GitHub", Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled("[d] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Delete", Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Close", Style::default().fg(Color::White)),
+            ]));
+
+            lines
+        }
+        SkillAddMode::GitHubRepo => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter repository (owner/repo):",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("> {}_", app.skill_github_input),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Example: lexoliu/may-skills",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter] Install  [Esc] Cancel",
                     Style::default().fg(Color::DarkGray),
                 )),
             ]

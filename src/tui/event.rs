@@ -7,7 +7,7 @@ use blocking::unblock;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
 use executor_core::spawn;
 
-use crate::SessionSummary;
+use crate::{SessionSummary, SkillInfo};
 
 const ERR_TUI_EVENT_POLL: &str = include_str!("../texts/event_poll_failed.txt");
 
@@ -33,6 +33,14 @@ pub enum AppEvent {
         was_current: bool,
         result: Result<Vec<SessionSummary>, String>,
     },
+
+    // ─── Skill operation results ───────────────────────────────────────
+    /// Skills list loaded from background task
+    SkillsLoaded(Result<Vec<SkillInfo>, String>),
+    /// Skill installed from GitHub
+    SkillInstalled(Result<Vec<SkillInfo>, String>),
+    /// Skill deleted
+    SkillDeleted(Result<Vec<SkillInfo>, String>),
 }
 
 /// Sender type for sending events back to the main loop.
