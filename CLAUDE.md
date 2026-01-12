@@ -116,6 +116,10 @@ During streaming:
   - AgentEvent::Complete → ChatStream::end_text()
 ```
 
+# Bash-based tool calling
+From the perspective of LLM, there is only one tool: `bash`. All capabilities are exposed via CLI commands.
+For instance, web search is done by calling `websearch "query"` command in bash.
+
 ### Key Patterns
 
 - **State machine UI**: `AppMode` enum controls which handler processes keys

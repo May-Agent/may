@@ -160,23 +160,22 @@ impl SessionManager {
 
     /// Ensure current session is persisted to disk.
     /// Call this before writing any data to the session.
-    pub fn ensure_persisted(&mut self) -> Result<(), SessionError> {
+    pub async fn ensure_persisted(&mut self) -> Result<(), SessionError> {
         let session = self.current.as_mut().ok_or(SessionError::NoActiveSession)?;
         if !session.persisted {
-            self.store.create_session_dirs(session.id.as_str())?;
+            self.store.create_session_dirs(session.id.as_str()).await?;
             session.persisted = true;
         }
         Ok(())
     }
 
     /// Load an existing session by ID.
-    pub fn load_session(&mut self, id: &SessionId) -> Result<&Session, SessionError> {
+    pub async fn load_session(&mut self, id: &SessionId) -> Result<&Session, SessionError> {
         if !self.store.exists(id.as_str()) {
             return Err(SessionError::NotFound(id.as_str().to_string()));
         }
 
-        let history = self.store.read_history(id.as_str())?;
-        let metadata = self.store.read_metadata(id.as_str());
+        let history = self.store.read_history(id.as_str()).await?;
         let sandbox_dir = self.store.sandbox_dir(id.as_str());
 
         // Get created time from first message if available
@@ -192,10 +191,14 @@ impl SessionManager {
             .and_then(|m| m.timestamp)
             .unwrap_or(created_at);
 
+        // Extract metadata from history
+        let title = history.metadata.title.clone();
+        let model = history.metadata.model.clone();
+
         let session = Session {
             id: id.clone(),
-            title: metadata.title,
-            model: metadata.model,
+            title,
+            model,
             history,
             sandbox_dir,
             created_at,
@@ -208,18 +211,17 @@ impl SessionManager {
     }
 
     /// List all sessions.
-    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, SessionError> {
-        let ids = self.store.list_sessions()?;
+    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, SessionError> {
+        let ids = self.store.list_sessions().await?;
         let mut summaries = Vec::new();
 
         for id_str in ids {
-            let history = self.store.read_history(&id_str)?;
-            let metadata = self.store.read_metadata(&id_str);
+            let history = self.store.read_history(&id_str).await?;
             let created_at = history.messages().first().and_then(|m| m.timestamp);
 
             summaries.push(SessionSummary {
                 id: SessionId::from_string(id_str),
-                title: metadata.title,
+                title: history.metadata.title.clone(),
                 message_count: history.len(),
                 created_at,
             });
@@ -232,35 +234,38 @@ impl SessionManager {
     }
 
     /// Save current session state (ensures session is persisted first).
-    pub fn save_current(&mut self) -> Result<(), SessionError> {
-        self.ensure_persisted()?;
+    pub async fn save_current(&mut self) -> Result<(), SessionError> {
+        self.ensure_persisted().await?;
         let session = self.current.as_ref().ok_or(SessionError::NoActiveSession)?;
         self.store
-            .write_history(session.id.as_str(), &session.history)?;
+            .write_history(session.id.as_str(), &session.history)
+            .await?;
         Ok(())
     }
 
     /// Set title for the current session (ensures session is persisted first).
-    pub fn set_current_title(&mut self, title: String) -> Result<(), SessionError> {
-        self.ensure_persisted()?;
+    pub async fn set_current_title(&mut self, title: String) -> Result<(), SessionError> {
+        self.ensure_persisted().await?;
         let session = self.current.as_mut().ok_or(SessionError::NoActiveSession)?;
         session.title = Some(title.clone());
-        // Read existing metadata to preserve model
-        let mut metadata = self.store.read_metadata(session.id.as_str());
-        metadata.title = Some(title);
-        self.store.write_metadata(session.id.as_str(), &metadata)?;
+        session.history.metadata.title = Some(title);
+        // Save history with updated metadata
+        self.store
+            .write_history(session.id.as_str(), &session.history)
+            .await?;
         Ok(())
     }
 
     /// Set model for the current session (ensures session is persisted first).
-    pub fn set_current_model(&mut self, model: String) -> Result<(), SessionError> {
-        self.ensure_persisted()?;
+    pub async fn set_current_model(&mut self, model: String) -> Result<(), SessionError> {
+        self.ensure_persisted().await?;
         let session = self.current.as_mut().ok_or(SessionError::NoActiveSession)?;
         session.model = Some(model.clone());
-        // Read existing metadata to preserve title
-        let mut metadata = self.store.read_metadata(session.id.as_str());
-        metadata.model = Some(model);
-        self.store.write_metadata(session.id.as_str(), &metadata)?;
+        session.history.metadata.model = Some(model);
+        // Save history with updated metadata
+        self.store
+            .write_history(session.id.as_str(), &session.history)
+            .await?;
         Ok(())
     }
 

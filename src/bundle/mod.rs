@@ -7,6 +7,8 @@
 use std::fs;
 use std::path::Path;
 
+use async_fs;
+
 use include_dir::{include_dir, Dir};
 
 // Embed the skills and subagents directories at compile time
@@ -43,17 +45,20 @@ impl Bundle {
     }
 
     /// Create symlinks in session sandbox pointing to global resources.
-    pub fn create_sandbox_symlinks(sandbox_dir: &Path, may_dir: &Path) -> Result<(), BundleError> {
+    pub async fn create_sandbox_symlinks(
+        sandbox_dir: &Path,
+        may_dir: &Path,
+    ) -> Result<(), BundleError> {
         let subagents_target = may_dir.join("subagents");
         let skills_target = may_dir.join("skills");
         let memory_target = may_dir.join("memory.md");
 
-        Self::create_dir_symlink(sandbox_dir, &subagents_target, ".subagents")?;
-        Self::create_dir_symlink(sandbox_dir, &skills_target, ".skills")?;
-        Self::create_file_symlink(sandbox_dir, &memory_target, "memory.md")?;
+        Self::create_dir_symlink(sandbox_dir, &subagents_target, ".subagents").await?;
+        Self::create_dir_symlink(sandbox_dir, &skills_target, ".skills").await?;
+        Self::create_file_symlink(sandbox_dir, &memory_target, "memory.md").await?;
 
         // Also create artifacts directory in sandbox
-        fs::create_dir_all(sandbox_dir.join("artifacts"))?;
+        async_fs::create_dir_all(sandbox_dir.join("artifacts")).await?;
 
         Ok(())
     }
@@ -79,49 +84,61 @@ impl Bundle {
     }
 
     /// Create file symlink from parent/name to target file.
-    fn create_file_symlink(parent: &Path, target: &Path, name: &str) -> Result<(), BundleError> {
+    async fn create_file_symlink(
+        parent: &Path,
+        target: &Path,
+        name: &str,
+    ) -> Result<(), BundleError> {
         let link = parent.join(name);
 
-        if link.is_symlink() {
-            if let Ok(existing_target) = fs::read_link(&link) {
-                if existing_target == target {
-                    return Ok(());
+        if let Ok(metadata) = async_fs::symlink_metadata(&link).await {
+            if metadata.file_type().is_symlink() {
+                if let Ok(existing_target) = async_fs::read_link(&link).await {
+                    if existing_target == target {
+                        return Ok(());
+                    }
                 }
+                let _ = async_fs::remove_file(&link).await;
             }
-            fs::remove_file(&link).ok();
         }
 
         #[cfg(unix)]
-        std::os::unix::fs::symlink(target, &link)?;
+        async_fs::unix::symlink(target, &link).await?;
 
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(target, &link)?;
+        async_fs::windows::symlink_file(target, &link).await?;
 
         Ok(())
     }
 
     /// Create directory symlink from parent/name to target.
-    fn create_dir_symlink(parent: &Path, target: &Path, name: &str) -> Result<(), BundleError> {
+    async fn create_dir_symlink(
+        parent: &Path,
+        target: &Path,
+        name: &str,
+    ) -> Result<(), BundleError> {
         let link = parent.join(name);
 
         // Skip if already correct
-        if link.is_symlink() {
-            if let Ok(existing_target) = fs::read_link(&link) {
-                if existing_target == target {
-                    return Ok(());
+        if let Ok(metadata) = async_fs::symlink_metadata(&link).await {
+            if metadata.file_type().is_symlink() {
+                if let Ok(existing_target) = async_fs::read_link(&link).await {
+                    if existing_target == target {
+                        return Ok(());
+                    }
                 }
+                let _ = async_fs::remove_file(&link).await;
             }
-            fs::remove_file(&link).ok();
         }
 
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(target, &link)?;
+            async_fs::unix::symlink(target, &link).await?;
         }
 
         #[cfg(windows)]
         {
-            std::os::windows::fs::symlink_dir(target, &link)?;
+            async_fs::windows::symlink_dir(target, &link).await?;
         }
 
         Ok(())
