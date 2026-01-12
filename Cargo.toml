@@ -74,6 +74,7 @@ askama = "0.15"
 include_dir = "0.7"
 itertools = "0.14.0"
 tempfile = "3.24.0"
+git2 = "0.20.3"
 
 [dev-dependencies]
 tokio-test = "0.4"
