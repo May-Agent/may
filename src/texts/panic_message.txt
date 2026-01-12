@@ -1,1 +1,3 @@
 May encountered a fatal error and must exit.
+
+It might be a bug, please create an issue at: https://github.com/may-agent/may/issues
