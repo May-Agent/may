@@ -126,11 +126,20 @@ impl SessionStore {
             let history = self.read_history(&id_str).await?;
             let created_at = history.messages().first().and_then(|m| m.timestamp);
 
+            // Build content preview from messages for search
+            let content_preview: String = history
+                .messages()
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+
             summaries.push(SessionSummary {
                 id: SessionId::from_string(id_str),
                 title: history.metadata.title.clone(),
                 message_count: history.len(),
                 created_at,
+                content_preview,
             });
         }
 
