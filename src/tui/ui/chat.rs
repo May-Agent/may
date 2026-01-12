@@ -692,14 +692,19 @@ fn render_impl(
 
             ChatElement::AssistantText { content, streaming } => {
                 // Always render markdown, even during streaming
-                let md_lines = markdown::render_markdown(content);
-                lines.extend(md_lines);
+                let mut md_lines = markdown::render_markdown(content);
 
                 if *streaming {
-                    // Show cursor for streaming
-                    lines.push(Line::from(Span::styled("_", Style::default().fg(Color::DarkGray))));
+                    // Append cursor to the last line of text (inline)
+                    if let Some(last_line) = md_lines.last_mut() {
+                        last_line.spans.push(Span::styled("_", Style::default().fg(Color::DarkGray)));
+                    } else {
+                        // No content yet, show cursor on its own line
+                        md_lines.push(Line::from(Span::styled("_", Style::default().fg(Color::DarkGray))));
+                    }
                 }
 
+                lines.extend(md_lines);
                 lines.push(Line::from(""));
             }
 

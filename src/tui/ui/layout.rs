@@ -129,60 +129,235 @@ const HELP_TEXT: &str = include_str!("help.txt");
 
 /// Render session selection popup.
 fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(60, 50, area);
+    let popup_area = centered_rect(70, 60, area);
 
     // Clear background
     frame.render_widget(Clear, popup_area);
 
+    // Get filtered sessions
+    let filtered = app.filtered_sessions();
+    let filtered_len = filtered.len();
+
     // Get current session ID for highlighting
     let current_id = app.session_manager.current().map(|s| s.id.as_str());
 
-    // Build session list items
-    let items: Vec<ListItem> = app.session_list
-        .iter()
-        .enumerate()
-        .map(|(idx, summary)| {
-            // Display title if available, otherwise show "Untitled"
-            let display_name = summary.title.as_deref().unwrap_or("Untitled");
-            let text = format!(
-                "{} ({} messages)",
-                display_name,
-                summary.message_count
-            );
+    // Render the border block
+    let title = if app.session_search.is_empty() {
+        format!("Sessions ({})", app.session_list.len())
+    } else {
+        format!("Sessions ({}/{})", filtered_len, app.session_list.len())
+    };
 
-            // Check if this is the current session
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title)
+        .title_alignment(ratatui::layout::Alignment::Left);
+    let inner_area = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    // Split inner area: search (2 lines) | sessions list | footer (2 lines)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Search input
+            Constraint::Min(1),    // Session list
+            Constraint::Length(2), // Footer hints
+        ])
+        .split(inner_area);
+
+    // Render search input
+    let search_line = if app.session_search.is_empty() {
+        Line::from(Span::styled(
+            "Type to search...",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
+            Span::styled(&app.session_search, Style::default().fg(Color::Yellow)),
+            Span::styled("_", Style::default().fg(Color::Yellow)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
+
+    // Render session list with scrolling
+    let list_height = chunks[1].height as usize;
+    let visible_height = list_height.saturating_sub(2); // Account for potential scroll indicators
+
+    // Calculate scroll to keep selected item visible
+    let scroll = if visible_height == 0 {
+        0
+    } else if app.session_selected >= app.session_scroll + visible_height {
+        app.session_selected.saturating_sub(visible_height - 1)
+    } else if app.session_selected < app.session_scroll {
+        app.session_selected
+    } else {
+        app.session_scroll
+    };
+
+    let mut session_lines = Vec::new();
+
+    if filtered.is_empty() {
+        if app.session_list.is_empty() {
+            session_lines.push(Line::from(Span::styled(
+                "No sessions.",
+                Style::default().fg(Color::DarkGray),
+            )));
+            session_lines.push(Line::from(""));
+            session_lines.push(Line::from(Span::styled(
+                "Press 'n' to create a new session.",
+                Style::default().fg(Color::Yellow),
+            )));
+        } else {
+            session_lines.push(Line::from(Span::styled(
+                "No matching sessions.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    } else {
+        // Show scroll indicator at top if scrolled
+        if scroll > 0 {
+            session_lines.push(Line::from(Span::styled(
+                format!("↑ {} more above", scroll),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        for (display_idx, (_original_idx, summary)) in filtered.iter().enumerate().skip(scroll).take(visible_height) {
+            let selected = display_idx == app.session_selected;
+            let prefix = if selected { "> " } else { "  " };
+
+            let display_name = summary.title.as_deref().unwrap_or("Untitled");
             let is_current = current_id == Some(summary.id.as_str());
 
-            let mut style = if idx == app.session_selected {
-                Style::default().bg(Color::Blue).fg(Color::White)
+            let mut name_style = if selected {
+                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
 
-            // Bold current session
             if is_current {
-                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                name_style = name_style.add_modifier(ratatui::style::Modifier::BOLD);
             }
 
-            ListItem::new(text).style(style)
-        })
-        .collect();
+            let line = Line::from(vec![
+                Span::styled(
+                    prefix,
+                    if selected {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(display_name, name_style),
+                Span::styled(
+                    format!(" ({} messages)", summary.message_count),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                if is_current {
+                    Span::styled(" (current)", Style::default().fg(Color::Green))
+                } else {
+                    Span::raw("")
+                },
+            ]);
+            session_lines.push(line);
 
-    let help_text = if app.session_list.is_empty() {
-        "No sessions. Press 'n' to create new."
+            // Show content preview on second line if selected and searching
+            if selected && !app.session_search.is_empty() {
+                // Find and show matching content snippet with highlighting
+                let query = app.session_search.to_lowercase();
+                let query_char_count = query.chars().count();
+                let content_lower = summary.content_preview.to_lowercase();
+                if let Some(pos) = content_lower.find(&query) {
+                    // Find safe UTF-8 boundaries around the match
+                    let start = summary.content_preview[..pos].char_indices()
+                        .rev()
+                        .nth(20)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let end = summary.content_preview[pos..].char_indices()
+                        .nth(query_char_count + 40)
+                        .map(|(i, _)| pos + i)
+                        .unwrap_or(summary.content_preview.len());
+
+                    let snippet = summary.content_preview[start..end].replace('\n', " ");
+                    let snippet_lower = snippet.to_lowercase();
+
+                    let prefix = if start > 0 { "..." } else { "" };
+                    let suffix = if end < summary.content_preview.len() { "..." } else { "" };
+
+                    // Find match position in the processed snippet for accurate highlighting
+                    if let Some(match_pos) = snippet_lower.find(&query) {
+                        let match_end = match_pos + query.len();
+                        let before_match = snippet[..match_pos].to_string();
+                        let matched = snippet[match_pos..match_end.min(snippet.len())].to_string();
+                        let after_match = snippet[match_end.min(snippet.len())..].to_string();
+
+                        session_lines.push(Line::from(vec![
+                            Span::styled("    ", Style::default()),
+                            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                            Span::styled(before_match, Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                matched,
+                                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD),
+                            ),
+                            Span::styled(after_match, Style::default().fg(Color::DarkGray)),
+                            Span::styled(suffix.to_string(), Style::default().fg(Color::DarkGray)),
+                        ]));
+                    } else {
+                        // Fallback: no highlight if match not found in snippet
+                        session_lines.push(Line::from(Span::styled(
+                            format!("    {}{}{}", prefix, snippet, suffix),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Show scroll indicator at bottom if more items
+        let shown_end = scroll + visible_height;
+        if shown_end < filtered_len {
+            session_lines.push(Line::from(Span::styled(
+                format!("↓ {} more below", filtered_len - shown_end),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(session_lines), chunks[1]);
+
+    // Render footer hints
+    let footer_line = if app.session_search.is_empty() {
+        Line::from(vec![
+            Span::styled("[↑↓/jk] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Navigate", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Select", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[n] ", Style::default().fg(Color::Cyan)),
+            Span::styled("New", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[d] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Delete", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Close", Style::default().fg(Color::White)),
+        ])
     } else {
-        "j/k: navigate | Enter: select | n: new | d: delete | Esc: cancel"
+        Line::from(vec![
+            Span::styled("[↑↓] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Navigate", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Select", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Clear search", Style::default().fg(Color::White)),
+        ])
     };
-
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!("Sessions ({})", app.session_list.len()))
-            .title_bottom(help_text),
-    );
-
-    frame.render_widget(list, popup_area);
+    frame.render_widget(Paragraph::new(vec![Line::from(""), footer_line]), chunks[2]);
 }
 
 /// Render file picker popup.
