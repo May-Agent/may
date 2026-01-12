@@ -8,15 +8,18 @@ use aither_agent::specialized::TaskTool;
 use aither_agent::webfetch::WebFetchTool;
 use aither_agent::websearch::WebSearchTool;
 use aither_cloud::{claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI, CloudProvider};
+use aither_core::llm::tool::{Tool, ToolDefinition};
 use aither_sandbox::{permission::PermissionError, BashMode, BashTool, PermissionHandler};
 use askama::Template;
-use executor_core::tokio::TokioGlobal;
+use executor_core::DefaultExecutor;
 use futures_lite::Stream;
 
+use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MayConfig, ProviderInstance, ProviderType, SelectedProvider};
+use crate::fs_util;
 use crate::session::SessionId;
 use crate::workspace::Workspace;
-use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestSender};
+use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
 // Error message templates
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
@@ -28,6 +31,8 @@ const ERR_API_KEY_FMT: &str = include_str!("../texts/agent_err_api_key_required.
 pub enum MayAgentError {
     #[error("Config error: {0}")]
     Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error("LLM error: {0}")]
     Llm(String),
     #[error("Sandbox error: {0}")]
@@ -46,6 +51,35 @@ pub struct WorkdirInfo {
     pub description: String,
 }
 
+/// Tool info for template rendering.
+pub struct ToolInfo {
+    pub name: String,
+    pub description: String,
+}
+
+impl ToolInfo {
+    /// Create ToolInfo from a tool implementing the Tool trait.
+    /// Only the first paragraph of the description is used.
+    pub fn from_tool<T: Tool>(tool: &T) -> Self {
+        let definition = ToolDefinition::new(tool);
+        // Extract only the first paragraph (up to first double newline or end)
+        let full_desc = definition.description();
+        let first_paragraph = full_desc
+            .split("\n\n")
+            .next()
+            .unwrap_or(full_desc)
+            .lines()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+        Self {
+            name: definition.name().to_string(),
+            description: first_paragraph,
+        }
+    }
+}
+
 /// System prompt template.
 #[derive(Template)]
 #[template(path = "system.md")]
@@ -54,6 +88,7 @@ struct SystemPromptTemplate<'a> {
     sandbox: &'a str,
     cwd: &'a str,
     workdirs: Vec<WorkdirInfo>,
+    tools: Vec<ToolInfo>,
     memory: &'a str,
 }
 
@@ -127,7 +162,9 @@ pub struct MayAgentConfig {
     /// Maximum iterations.
     pub max_iterations: usize,
     /// Channel for workspace access requests.
-    pub workspace_request_sender: WorkspaceRequestSender,
+    pub workspace_request_broker: WorkspaceRequestBroker,
+    /// Channel for ask user requests.
+    pub ask_user_broker: AskUserBroker,
 }
 
 /// The May agent.
@@ -143,12 +180,11 @@ impl MayAgent {
         // Create permission handler
         let permission_handler = MayPermissionHandler::new();
 
-        // Create executor
-        let executor = TokioGlobal;
+        let executor = DefaultExecutor;
 
         // Create bash tool in sandbox dir (BashTool creates its own working directory inside)
         let memory_file = config.may_dir.join("memory.md");
-        let bash_tool: BashTool<MayPermissionHandler, TokioGlobal> =
+        let bash_tool: BashTool<MayPermissionHandler, DefaultExecutor> =
             BashTool::new_exact(&config.sandbox_dir, permission_handler, executor)
                 .await
                 .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
@@ -165,9 +201,7 @@ impl MayAgent {
         // We read from the source directly to avoid race conditions with symlink creation
         // which happens when the session is first persisted (on first user message)
         let memory_path = config.may_dir.join("memory.md");
-        let memory_content = tokio::fs::read_to_string(&memory_path)
-            .await
-            .unwrap_or_default();
+        let memory_content = fs_util::read_to_string(&memory_path).await?;
 
         // Clone LLM for tools that need it before it's moved into the builder
         let fast_llm = config.llm.clone(); // For AskCommand
@@ -178,10 +212,25 @@ impl MayAgent {
         let webfetch = WebFetchTool::new();
         let todo = TodoTool::new();
         let ask = AskCommand::new(fast_llm);
-        let request_workspace = RequestWorkspaceTool::new(config.workspace_request_sender);
+        let request_workspace = RequestWorkspaceTool::new(config.workspace_request_broker);
+        let ask_user = AskUserTool::new(config.ask_user_broker);
+        tracing::info!("AskUserTool created and will be registered as bash command 'ask_user'");
+        // Create TaskTool (will configure base_dir after getting sandbox path)
+        let task_tool = TaskTool::new(task_llm).with_builtins();
 
-        // Build system prompt with session context and workspace
-        let system_prompt = build_system_prompt(&config.session_id, &workspace, &memory_content);
+        // Collect tool info for system prompt
+        let tools = vec![
+            ToolInfo::from_tool(&websearch),
+            ToolInfo::from_tool(&webfetch),
+            ToolInfo::from_tool(&todo),
+            ToolInfo::from_tool(&ask),
+            ToolInfo::from_tool(&request_workspace),
+            ToolInfo::from_tool(&ask_user),
+            ToolInfo::from_tool(&task_tool),
+        ];
+
+        // Build system prompt with session context, workspace, and tools
+        let system_prompt = build_system_prompt(&config.session_id, &workspace, &memory_content, tools);
 
         // Build the agent using BashAgentBuilder
         let mut builder = BashAgentBuilder::new(config.llm, bash_tool)
@@ -190,16 +239,15 @@ impl MayAgent {
             .tool(todo)
             .tool(ask)
             .tool(request_workspace)
+            .tool(ask_user)
             .system_prompt_raw(system_prompt)
             .max_iterations(config.max_iterations);
 
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
 
-        // Create and add TaskTool with the sandbox directory
-        let task_tool = TaskTool::new(task_llm)
-            .with_builtins()
-            .with_base_dir(actual_sandbox_dir.clone());
+        // Configure TaskTool with the sandbox directory and add to builder
+        let task_tool = task_tool.with_base_dir(actual_sandbox_dir.clone());
         builder = builder.tool(task_tool);
 
         let agent = builder.build();
@@ -218,7 +266,8 @@ impl MayAgent {
         may_dir: PathBuf,
         cwd: PathBuf,
         session_id: SessionId,
-        workspace_request_sender: WorkspaceRequestSender,
+        workspace_request_broker: WorkspaceRequestBroker,
+        ask_user_broker: AskUserBroker,
     ) -> Result<Self, MayAgentError> {
         // Get model: use last_model if set, otherwise fallback to Balanced tier
         let model = may_config.last_model.as_deref()
@@ -233,7 +282,8 @@ impl MayAgent {
             may_dir,
             cwd,
             session_id,
-            workspace_request_sender,
+            workspace_request_broker,
+            ask_user_broker,
             model,
         )
         .await
@@ -249,7 +299,8 @@ impl MayAgent {
         may_dir: PathBuf,
         cwd: PathBuf,
         session_id: SessionId,
-        workspace_request_sender: WorkspaceRequestSender,
+        workspace_request_broker: WorkspaceRequestBroker,
+        ask_user_broker: AskUserBroker,
         model: &str,
     ) -> Result<Self, MayAgentError> {
         // Check if we have a stored provider mapping for this model
@@ -269,7 +320,8 @@ impl MayAgent {
                     cwd,
                     session_id,
                     max_iterations: may_config.max_iterations,
-                    workspace_request_sender,
+                    workspace_request_broker: workspace_request_broker.clone(),
+                    ask_user_broker: ask_user_broker.clone(),
                 };
 
                 return Self::new(config).await;
@@ -292,7 +344,8 @@ impl MayAgent {
             cwd,
             session_id,
             max_iterations: may_config.max_iterations,
-            workspace_request_sender,
+            workspace_request_broker,
+            ask_user_broker,
         };
 
         Self::new(config).await
@@ -514,7 +567,12 @@ pub async fn generate_session_title(
 }
 
 /// Build the complete system prompt with dynamic context.
-fn build_system_prompt(session_id: &SessionId, workspace: &Workspace, memory: &str) -> String {
+fn build_system_prompt(
+    session_id: &SessionId,
+    workspace: &Workspace,
+    memory: &str,
+    tools: Vec<ToolInfo>,
+) -> String {
     // Collect workdir info for template
     let workdirs: Vec<WorkdirInfo> = workspace
         .config
@@ -534,6 +592,7 @@ fn build_system_prompt(session_id: &SessionId, workspace: &Workspace, memory: &s
         sandbox: &workspace.sandbox.display().to_string(),
         cwd: &workspace.cwd.display().to_string(),
         workdirs,
+        tools,
         memory,
     };
 

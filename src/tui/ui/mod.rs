@@ -2,10 +2,8 @@
 
 pub mod chat;
 pub mod file_picker;
-mod input;
 mod layout;
 mod markdown;
-mod status;
 
 use ratatui::Frame;
 

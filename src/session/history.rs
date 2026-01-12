@@ -3,6 +3,11 @@
 //! Format:
 //! ```markdown
 //! ---
+//! title: My Session
+//! model: claude-3-sonnet
+//! ---
+//!
+//! ---
 //! role: user
 //! timestamp: 2024-01-15T10:30:00Z
 //! ---
@@ -30,6 +35,17 @@ pub enum ChatHistoryError {
     InvalidRole(String),
     #[error("YAML parse error: {0}")]
     Yaml(String),
+}
+
+/// Session metadata stored in the chat history header.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    /// Session title (generated after first response).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Model bound to this session (set via /model command).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Role of a message in the conversation.
@@ -106,20 +122,28 @@ impl ChatMessage {
     }
 }
 
-/// YAML frontmatter for a message.
+/// YAML frontmatter for a message or metadata block.
+/// If `role` is None, this is a metadata block; otherwise it's a message.
 #[derive(Debug, Deserialize)]
 struct Frontmatter {
-    role: String,
+    #[serde(default)]
+    role: Option<String>,
     #[serde(default)]
     timestamp: Option<Timestamp>,
     #[serde(default)]
     tool_call_id: Option<String>,
+    // Metadata fields (only present in header block)
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
-/// Escape content lines that are exactly "---" to prevent splitting issues.
+/// Escape content lines that are "---" (with optional trailing whitespace) to prevent splitting issues.
+/// Lines like "---", "--- ", "---  " are all normalized to "\---" during serialization.
 fn escape_content(s: &str) -> String {
     s.lines()
-        .map(|line| if line == "---" { "\\---" } else { line })
+        .map(|line| if line.trim() == "---" { "\\---" } else { line })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -135,6 +159,9 @@ fn unescape_content(s: &str) -> String {
 /// Chat history with YAML frontmatter parsing.
 #[derive(Debug, Clone, Default)]
 pub struct ChatHistory {
+    /// Session metadata (title, model).
+    pub metadata: SessionMetadata,
+    /// Chat messages.
     messages: Vec<ChatMessage>,
 }
 
@@ -144,9 +171,18 @@ impl ChatHistory {
         Self::default()
     }
 
+    /// Create a chat history with metadata.
+    pub fn with_metadata(metadata: SessionMetadata) -> Self {
+        Self {
+            metadata,
+            messages: Vec::new(),
+        }
+    }
+
     /// Parse chat history from the markdown format with YAML frontmatter.
     pub fn parse(content: &str) -> Result<Self, ChatHistoryError> {
         let mut messages = Vec::new();
+        let mut metadata = SessionMetadata::default();
 
         // Skip leading whitespace
         let content = content.trim_start();
@@ -158,6 +194,8 @@ impl ChatHistory {
         let parts: Vec<&str> = content.split("\n---\n").collect();
 
         let mut i = 0;
+        let mut found_metadata = false;
+
         while i < parts.len() {
             let part = parts[i].trim();
 
@@ -179,34 +217,58 @@ impl ChatHistory {
             let frontmatter: Frontmatter = serde_yml::from_str(yaml_content)
                 .map_err(|e| ChatHistoryError::Yaml(e.to_string()))?;
 
-            let role = MessageRole::from_str(&frontmatter.role)?;
+            // Check if this is a metadata block (no role) or a message block
+            if let Some(role_str) = &frontmatter.role {
+                // This is a message block
+                let role = MessageRole::from_str(role_str)?;
 
-            // Get message content from next part
-            i += 1;
-            let content = if i < parts.len() {
-                // Unescape any escaped "---" lines in content
-                unescape_content(parts[i].trim())
-            } else {
-                String::new()
-            };
+                // Get message content from next part
+                i += 1;
+                let content = if i < parts.len() {
+                    // Unescape any escaped "---" lines in content
+                    unescape_content(parts[i].trim())
+                } else {
+                    String::new()
+                };
 
-            messages.push(ChatMessage {
-                role,
-                content,
-                timestamp: frontmatter.timestamp,
-                tool_call_id: frontmatter.tool_call_id,
-            });
+                messages.push(ChatMessage {
+                    role,
+                    content,
+                    timestamp: frontmatter.timestamp,
+                    tool_call_id: frontmatter.tool_call_id,
+                });
+            } else if !found_metadata {
+                // This is the metadata block (first block without role)
+                metadata = SessionMetadata {
+                    title: frontmatter.title,
+                    model: frontmatter.model,
+                };
+                found_metadata = true;
+                // Skip the empty content part after metadata
+                i += 1;
+            }
 
             i += 1;
         }
 
-        Ok(Self { messages })
+        Ok(Self { metadata, messages })
     }
 
     /// Serialize to the markdown format with YAML frontmatter.
     pub fn serialize(&self) -> String {
         let mut output = String::new();
 
+        // Write metadata block first (even if empty, to maintain consistent format)
+        output.push_str("---\n");
+        if let Some(title) = &self.metadata.title {
+            let _ = writeln!(output, "title: {title}");
+        }
+        if let Some(model) = &self.metadata.model {
+            let _ = writeln!(output, "model: {model}");
+        }
+        output.push_str("---\n\n");
+
+        // Write messages
         for msg in &self.messages {
             output.push_str("---\n");
             let _ = writeln!(output, "role: {}", msg.role.as_str());
@@ -295,6 +357,33 @@ Hello, May!"#;
     }
 
     #[test]
+    fn test_parse_with_metadata() {
+        let content = r#"---
+title: My Session
+model: claude-3-sonnet
+---
+
+---
+role: user
+timestamp: 2024-01-15T10:30:00Z
+---
+Hello!
+
+---
+role: assistant
+timestamp: 2024-01-15T10:30:05Z
+---
+Hi! How can I help?"#;
+
+        let history = ChatHistory::parse(content).unwrap();
+        assert_eq!(history.metadata.title.as_deref(), Some("My Session"));
+        assert_eq!(history.metadata.model.as_deref(), Some("claude-3-sonnet"));
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.messages()[0].role, MessageRole::User);
+        assert_eq!(history.messages()[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
     fn test_parse_conversation() {
         let content = r#"---
 role: user
@@ -316,13 +405,18 @@ Hi! How can I help?"#;
 
     #[test]
     fn test_serialize_roundtrip() {
-        let mut history = ChatHistory::new();
+        let mut history = ChatHistory::with_metadata(SessionMetadata {
+            title: Some("Test Session".to_string()),
+            model: Some("test-model".to_string()),
+        });
         history.push(ChatMessage::user("Hello!"));
         history.push(ChatMessage::assistant("Hi there!"));
 
         let serialized = history.serialize();
         let parsed = ChatHistory::parse(&serialized).unwrap();
 
+        assert_eq!(parsed.metadata.title.as_deref(), Some("Test Session"));
+        assert_eq!(parsed.metadata.model.as_deref(), Some("test-model"));
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed.messages()[0].content, "Hello!");
         assert_eq!(parsed.messages()[1].content, "Hi there!");
@@ -353,12 +447,32 @@ What's in this image?
         let serialized = history.serialize();
         // Verify the escaped form in serialized output
         assert!(serialized.contains("\\---"));
-        assert!(!serialized.contains("\n---\n") || serialized.matches("\n---\n").count() == 1);
 
         // Parse it back and verify content is preserved exactly
         let parsed = ChatHistory::parse(&serialized).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed.messages()[0].content, poem);
+    }
+
+    #[test]
+    fn test_content_with_triple_dash_trailing_whitespace() {
+        // Content containing "--- " (with trailing space) should also be escaped
+        let mut history = ChatHistory::new();
+        let poem = "A poem:\n--- \nSome verse\n---  \nThe end.";
+        history.push(ChatMessage::assistant(poem));
+
+        let serialized = history.serialize();
+        // Verify the escaped form in serialized output (trailing whitespace normalized away)
+        assert!(serialized.contains("\\---"));
+        // Should not contain unescaped "--- " with trailing space followed by newline
+        assert!(!serialized.contains("\n--- \n"));
+        assert!(!serialized.contains("\n---  \n"));
+
+        // Parse it back - note: trailing whitespace on --- lines is normalized to just ---
+        let parsed = ChatHistory::parse(&serialized).unwrap();
+        assert_eq!(parsed.len(), 1);
+        // The content is normalized (trailing whitespace on --- lines removed)
+        assert_eq!(parsed.messages()[0].content, "A poem:\n---\nSome verse\n---\nThe end.");
     }
 
     #[test]
@@ -368,5 +482,8 @@ What's in this image?
         // No change when no --- present
         assert_eq!(escape_content("hello world"), "hello world");
         assert_eq!(unescape_content("hello world"), "hello world");
+        // Test with trailing whitespace
+        assert_eq!(escape_content("hello\n--- \nworld"), "hello\n\\---\nworld");
+        assert_eq!(escape_content("hello\n---  \nworld"), "hello\n\\---\nworld");
     }
 }
