@@ -2,8 +2,14 @@
 
 use std::time::Duration;
 
+use async_channel::{Receiver, Sender};
+use blocking::unblock;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
-use tokio::sync::mpsc;
+use executor_core::spawn;
+
+use crate::SessionSummary;
+
+const ERR_TUI_EVENT_POLL: &str = include_str!("../texts/event_poll_failed.txt");
 
 /// Application events.
 #[derive(Debug)]
@@ -18,56 +24,75 @@ pub enum AppEvent {
     Paste(String),
     /// Mouse wheel scroll (positive = up, negative = down)
     Scroll(i16),
+
+    // ─── Async operation results ───────────────────────────────────────
+    /// Session list loaded from background task
+    SessionsLoaded(Result<Vec<SessionSummary>, String>),
+    /// Session deleted from background task (includes refreshed list)
+    SessionDeleted {
+        was_current: bool,
+        result: Result<Vec<SessionSummary>, String>,
+    },
 }
+
+/// Sender type for sending events back to the main loop.
+pub type EventSender = Sender<AppEvent>;
 
 /// Event handler that polls terminal events.
 pub struct EventHandler {
-    rx: mpsc::UnboundedReceiver<AppEvent>,
-    _tx: mpsc::UnboundedSender<AppEvent>,
+    rx: Receiver<AppEvent>,
+    tx: EventSender,
 }
 
 impl EventHandler {
     /// Create a new event handler.
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = async_channel::unbounded();
         let tx_clone = tx.clone();
 
         // Spawn event polling task
-        tokio::spawn(async move {
+        spawn(async move {
             loop {
                 // Poll with timeout for tick events
-                if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                    if let Ok(evt) = event::read() {
-                        let app_event = match evt {
-                            Event::Key(key) => AppEvent::Key(key.code, key.modifiers),
-                            Event::Resize(w, h) => AppEvent::Resize(w, h),
-                            Event::Paste(text) => AppEvent::Paste(text),
-                            Event::Mouse(mouse) => match mouse.kind {
-                                MouseEventKind::ScrollUp => AppEvent::Scroll(1),
-                                MouseEventKind::ScrollDown => AppEvent::Scroll(-1),
-                                _ => continue,
-                            },
+                let has_event = unblock(|| event::poll(Duration::from_millis(50)))
+                    .await
+                    .expect(ERR_TUI_EVENT_POLL.trim());
+                if has_event {
+                    let evt = unblock(event::read)
+                        .await
+                        .expect(ERR_TUI_EVENT_POLL.trim());
+                    let app_event = match evt {
+                        Event::Key(key) => AppEvent::Key(key.code, key.modifiers),
+                        Event::Resize(w, h) => AppEvent::Resize(w, h),
+                        Event::Paste(text) => AppEvent::Paste(text),
+                        Event::Mouse(mouse) => match mouse.kind {
+                            MouseEventKind::ScrollUp => AppEvent::Scroll(1),
+                            MouseEventKind::ScrollDown => AppEvent::Scroll(-1),
                             _ => continue,
-                        };
-                        if tx_clone.send(app_event).is_err() {
-                            break;
-                        }
-                    }
-                } else {
-                    // Send tick event
-                    if tx_clone.send(AppEvent::Tick).is_err() {
+                        },
+                        _ => continue,
+                    };
+                    if tx_clone.send(app_event).await.is_err() {
                         break;
                     }
+                } else if tx_clone.send(AppEvent::Tick).await.is_err() {
+                    break;
                 }
             }
-        });
+        })
+        .detach();
 
-        Self { rx, _tx: tx }
+        Self { rx, tx }
+    }
+
+    /// Get a clone of the sender for sending events from background tasks.
+    pub fn sender(&self) -> EventSender {
+        self.tx.clone()
     }
 
     /// Get the next event.
     pub async fn next(&mut self) -> Option<AppEvent> {
-        self.rx.recv().await
+        self.rx.recv().await.ok()
     }
 }
 

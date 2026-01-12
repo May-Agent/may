@@ -3,21 +3,25 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 
+use async_channel::Receiver;
 use crossterm::event::{KeyCode, KeyModifiers};
-use tokio::sync::mpsc;
+use executor_core::spawn;
 
 use crate::config::{ModelTier, Provider};
 use crate::models::FetchedModel;
+use crate::ask_user::AskUserRequest;
 use crate::workspace_request::WorkspaceRequest;
 use crate::{ChatMessage, MayConfig, MessageRole, SessionId, SessionManager, SessionSummary};
 
 use super::clipboard::{get_clipboard_image, get_clipboard_text, ImageManager, TextManager};
 use super::completion::{Completion, CompletionMode};
-use super::event::AppEvent;
+use super::event::{AppEvent, EventSender};
 use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage, LARGE_PASTE_THRESHOLD};
-use super::ui::chat::{parse_tool_display, parse_tool_result, ChatElement, ChatStream, ToolFeedback, ToolStatus};
+use super::ui::chat::{parse_tool_display, parse_tool_result, ChatElement, ChatStream};
 use super::ui::file_picker::FilePicker;
+
+const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../texts/tool_response_send_failed.txt");
 
 /// Convert a character index to a byte index in a string.
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
@@ -55,6 +59,8 @@ pub enum AppMode {
     WorkspaceConfirm(WorkspaceRequest),
     /// MCP server management overlay
     McpManage,
+    /// Ask user dialog
+    AskUser(AskUserRequest, Vec<usize>),
 }
 
 /// Status of Copilot OAuth authentication flow.
@@ -301,8 +307,10 @@ pub struct App {
     pub attachments: Vec<Attachment>,
     /// Chat stream for display
     pub chat: ChatStream,
-    /// Scroll offset in chat
+    /// Scroll offset in chat (usize::MAX = follow bottom)
     pub scroll: usize,
+    /// Whether chat input is shown (hidden during full-screen scroll)
+    pub input_visible: bool,
     /// Last known content height (set during rendering for scroll normalization)
     pub content_height: Cell<usize>,
     /// View height (set during rendering for scroll normalization)
@@ -366,7 +374,7 @@ pub struct App {
     /// Whether models are being fetched
     pub tier_picker_loading: bool,
     /// Receiver for fetched models (oneshot)
-    pub model_fetch_rx: Option<mpsc::Receiver<Vec<FetchedModel>>>,
+    pub model_fetch_rx: Option<Receiver<Vec<FetchedModel>>>,
     /// Cumulative token usage for current session
     pub usage: Option<aither_core::llm::Usage>,
     /// Context window size for current model
@@ -383,11 +391,15 @@ pub struct App {
     pub mcp_add_name: String,
     /// MCP add command input
     pub mcp_add_command: String,
+    /// Current option selected in AskUser mode
+    pub ask_user_cursor: usize,
+    /// Event sender for spawning background tasks
+    pub event_tx: EventSender,
 }
 
 impl App {
     /// Create a new application.
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(event_tx: EventSender) -> anyhow::Result<Self> {
         let mut config = MayConfig::load().unwrap_or_default();
         let session_manager = SessionManager::new()?;
 
@@ -455,7 +467,8 @@ impl App {
             input_char_count: 0,
             attachments: Vec::new(),
             chat: ChatStream::new(),
-            scroll: 0,
+            scroll: usize::MAX, // Follow bottom by default
+            input_visible: true,
             content_height: Cell::new(0),
             view_height: Cell::new(0),
             mode,
@@ -496,6 +509,8 @@ impl App {
             mcp_add_mode: McpAddMode::None,
             mcp_add_name: String::new(),
             mcp_add_command: String::new(),
+            ask_user_cursor: 0,
+            event_tx,
         })
     }
 
@@ -527,14 +542,28 @@ impl App {
 
     /// Scroll up by a number of lines.
     fn scroll_up_by(&mut self, lines: usize) {
-        self.normalize_scroll();
+        if self.scroll == usize::MAX {
+            self.normalize_scroll();
+        }
         self.scroll = self.scroll.saturating_sub(lines);
     }
 
     /// Scroll down by a number of lines.
     fn scroll_down_by(&mut self, lines: usize) {
-        self.normalize_scroll();
+        if self.scroll == usize::MAX {
+            self.normalize_scroll();
+        }
+
         self.scroll = self.scroll.saturating_add(lines);
+
+        // Check if we've reached the bottom - snap to sentinel
+        let content = self.content_height.get();
+        let view = self.view_height.get();
+        let max_scroll = content.saturating_sub(view);
+
+        if self.scroll >= max_scroll {
+            self.scroll = usize::MAX;
+        }
     }
 
     /// Handle a mouse wheel scroll event based on current mode.
@@ -619,6 +648,45 @@ impl App {
                 Ok(None)
             }
             AppEvent::Paste(text) => self.handle_bracketed_paste(text),
+
+            // ─── Async operation results ───────────────────────────────────
+            AppEvent::SessionsLoaded(result) => {
+                self.status = None;
+                match result {
+                    Ok(sessions) => {
+                        self.session_list = sessions;
+                        self.session_selected = 0;
+                        self.mode = AppMode::SessionSelect;
+                    }
+                    Err(e) => {
+                        self.chat.push_error(&format!("Failed to load sessions: {}", e));
+                    }
+                }
+                Ok(None)
+            }
+            AppEvent::SessionDeleted { was_current, result } => {
+                self.status = None;
+                match result {
+                    Ok(sessions) => {
+                        self.session_list = sessions;
+                        // Adjust selection if needed
+                        if self.session_selected >= self.session_list.len()
+                            && self.session_selected > 0
+                        {
+                            self.session_selected -= 1;
+                        }
+                        // If we deleted the current session, create a new one
+                        if was_current {
+                            self.mode = AppMode::Chat;
+                            return Ok(Some(SendAction::NewSession));
+                        }
+                    }
+                    Err(e) => {
+                        self.chat.push_error(&format!("Failed to delete session: {}", e));
+                    }
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -716,6 +784,7 @@ impl App {
             AppMode::CopilotAuth => self.handle_copilot_auth_key(code),
             AppMode::WorkspaceConfirm(_) => self.handle_workspace_confirm_key(code),
             AppMode::McpManage => self.handle_mcp_key(code),
+            AppMode::AskUser(_, _) => self.handle_ask_user_key(code),
         }
     }
 
@@ -756,14 +825,82 @@ impl App {
                 // Approve: take the request and approve it
                 let mode = std::mem::replace(&mut self.mode, AppMode::Chat);
                 if let AppMode::WorkspaceConfirm(request) = mode {
-                    request.approve();
+                    request
+                        .respond(true)
+                        .expect(ERR_TOOL_RESPONSE_SEND.trim());
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 // Deny: take the request and deny it
                 let mode = std::mem::replace(&mut self.mode, AppMode::Chat);
                 if let AppMode::WorkspaceConfirm(request) = mode {
-                    request.deny();
+                    request
+                        .respond(false)
+                        .expect(ERR_TOOL_RESPONSE_SEND.trim());
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// Handle key in AskUser mode.
+    fn handle_ask_user_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
+        let (request, selections) = match &mut self.mode {
+            AppMode::AskUser(req, sels) => (req, sels),
+            _ => return Ok(None),
+        };
+
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.ask_user_cursor > 0 {
+                    self.ask_user_cursor -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.ask_user_cursor + 1 < request.args.options.len() {
+                    self.ask_user_cursor += 1;
+                }
+            }
+            KeyCode::Char(' ') => {
+                // Toggle selection
+                if request.args.multi_select {
+                    let cursor = self.ask_user_cursor;
+                    if selections.iter().any(|&x| x == cursor) {
+                        selections.retain(|&x| x != cursor);
+                    } else {
+                        selections.push(cursor);
+                    }
+                } else {
+                    selections.clear();
+                    selections.push(self.ask_user_cursor);
+                }
+            }
+            KeyCode::Enter => {
+                // If single select and nothing selected, select current cursor
+                if !request.args.multi_select && selections.is_empty() {
+                    selections.push(self.ask_user_cursor);
+                }
+
+                // If multi select and nothing selected, do nothing or allow empty?
+                // For now, let's require at least one selection if options exist
+                if !request.args.options.is_empty() && selections.is_empty() {
+                    return Ok(None);
+                }
+
+                // Get selected values
+                use itertools::Itertools;
+                let selected_values: Vec<String> = selections
+                    .iter()
+                    .sorted()
+                    .filter_map(|&idx| request.args.options.get(idx).cloned())
+                    .collect();
+
+                // Send response
+                let mode = std::mem::replace(&mut self.mode, AppMode::Chat);
+                if let AppMode::AskUser(req, _) = mode {
+                    req.respond(selected_values)
+                        .expect(ERR_TOOL_RESPONSE_SEND.trim());
                 }
             }
             _ => {}
@@ -1050,9 +1187,19 @@ impl App {
 
         match cmd_lower.as_str() {
             "/session" | "/sessions" | "/s" => {
-                self.session_list = self.session_manager.list_sessions()?;
-                self.session_selected = 0;
-                self.mode = AppMode::SessionSelect;
+                // Spawn background task to load sessions
+                let tx = self.event_tx.clone();
+                let store = self.session_manager.store().clone();
+                spawn(async move {
+                    let result = store.list_session_summaries().await;
+                    let _ = tx
+                        .send(AppEvent::SessionsLoaded(
+                            result.map_err(|e| e.to_string()),
+                        ))
+                        .await;
+                })
+                .detach();
+                self.status = Some("Loading sessions...".to_string());
                 Ok(None)
             }
             "/new" | "/n" => {
@@ -1147,29 +1294,40 @@ impl App {
                 return Ok(Some(SendAction::NewSession));
             }
             KeyCode::Char('d') => {
-                // Delete selected session
+                // Delete selected session (async)
                 if let Some(summary) = self.session_list.get(self.session_selected) {
                     let deleted_id = summary.id.as_str().to_string();
-                    let is_current = self.session_manager
+                    let was_current = self
+                        .session_manager
                         .current()
                         .map(|s| s.id.as_str() == deleted_id)
                         .unwrap_or(false);
 
-                    self.session_manager
-                        .store()
-                        .delete_session(&deleted_id)?;
-                    self.session_list = self.session_manager.list_sessions()?;
-
-                    if self.session_selected >= self.session_list.len() && self.session_selected > 0
-                    {
-                        self.session_selected -= 1;
-                    }
-
-                    // If we deleted the current session, create a new one
-                    if is_current {
-                        self.mode = AppMode::Chat;
-                        return Ok(Some(SendAction::NewSession));
-                    }
+                    // Spawn background task to delete and refresh
+                    let tx = self.event_tx.clone();
+                    let store = self.session_manager.store().clone();
+                    spawn(async move {
+                        // Delete the session
+                        if let Err(e) = store.delete_session(&deleted_id).await {
+                            let _ = tx
+                                .send(AppEvent::SessionDeleted {
+                                    was_current,
+                                    result: Err(e.to_string()),
+                                })
+                                .await;
+                            return;
+                        }
+                        // Refresh list
+                        let result = store.list_session_summaries().await;
+                        let _ = tx
+                            .send(AppEvent::SessionDeleted {
+                                was_current,
+                                result: result.map_err(|e| e.to_string()),
+                            })
+                            .await;
+                    })
+                    .detach();
+                    self.status = Some("Deleting session...".to_string());
                 }
             }
             _ => {}
@@ -1315,7 +1473,7 @@ impl App {
 
     /// Open tier model picker for a specific tier.
     /// Returns a receiver to poll for fetched models if async fetch was started.
-    pub fn open_tier_model_picker(&mut self, tier: ModelTier) -> Option<mpsc::Receiver<Vec<FetchedModel>>> {
+    pub fn open_tier_model_picker(&mut self, tier: ModelTier) -> Option<Receiver<Vec<FetchedModel>>> {
         self.tier_picker_tier = Some(tier);
         self.tier_picker_query.clear();
         self.tier_picker_selected = 0;
@@ -1325,12 +1483,13 @@ impl App {
         self.mode = AppMode::TierModelPicker;
 
         // Create channel and spawn fetch task
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = async_channel::bounded(1);
         let config = self.config.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             let models = crate::models::fetch_all_models(&config).await;
             let _ = tx.send(models).await;
-        });
+        })
+        .detach();
 
         Some(rx)
     }
@@ -2018,6 +2177,7 @@ impl App {
 
         // Scroll to bottom
         self.scroll = usize::MAX;
+        self.input_visible = true;
 
         // Show loading indicator (will be replaced when first response arrives)
         self.chat.start_loading();
@@ -2034,6 +2194,7 @@ impl App {
                         self.thinking_start = None;
                         self.chat.push_text(&chunk);
                         self.scroll = usize::MAX;
+                        self.input_visible = true;
                     }
                     AgentEvent::Reasoning(_) => {
                         // Start or update thinking indicator
@@ -2063,6 +2224,7 @@ impl App {
                         self.chat.end_loading();
                         self.chat.end_text();
                         self.scroll = usize::MAX;
+                        self.input_visible = true;
                         // Signal that processing is complete
                         return true;
                     }
@@ -2077,6 +2239,7 @@ impl App {
                         self.chat.end_loading();
                         self.chat.end_text();
                         self.scroll = usize::MAX;
+                        self.input_visible = true;
                         return true;
                     }
                     _ => {}
@@ -2089,6 +2252,7 @@ impl App {
                 self.chat.end_loading();
                 self.chat.push_error(&format!("{}", e));
                 self.scroll = usize::MAX;
+                self.input_visible = true;
                 true
             }
         }
@@ -2117,7 +2281,7 @@ impl App {
             session.history.push(ChatMessage::assistant(&assistant_content));
         }
 
-        let _ = self.session_manager.save_current();
+        // Note: History is saved asynchronously in src/bin/may.rs after finish_processing returns
     }
 
     /// Get next queued message if any.

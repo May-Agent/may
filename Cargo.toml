@@ -26,7 +26,10 @@ leash = { path = "../native-sandbox" }
 tokio = { version = "1", features = ["full"] }
 futures-lite = "2.6"
 async-stream = "0.3"
-executor-core = "0.7"
+executor-core = { version = "0.7", features = ["tokio"] }
+async-fs = "2.1"
+async-channel = "2"
+blocking = "1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -49,6 +52,7 @@ anyhow = "1"
 ratatui = "0.30"
 crossterm = "0.28"
 tui-markdown = "0.3"
+unicode-width = "0.2"
 
 # Clipboard, image, and browser
 arboard = "3"
@@ -68,6 +72,7 @@ askama = "0.15"
 
 # Embedded resources
 include_dir = "0.7"
+itertools = "0.14.0"
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -6,8 +6,10 @@ use ratatui::{
 };
 
 use super::super::app::{App, AppMode, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode};
-use super::{chat, input, status};
+use super::super::completion::CompletionMode;
+use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 use crate::workspace_request::WorkspaceRequest;
+use crate::ask_user::AskUserRequest;
 
 /// Convert character index to byte index for safe string slicing.
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
@@ -41,50 +43,54 @@ pub fn render(frame: &mut Frame, app: &App) {
             render_workspace_confirm(frame, area, request);
             return;
         }
+        AppMode::AskUser(request, selections) => {
+            render_ask_user(frame, area, app, request, selections);
+            return;
+        }
         _ => {}
     }
 
-    // Check for queued messages
-    let queue_len = app.queue.len();
-    let queue_height = if queue_len > 0 {
-        // Show up to 3 queued messages, each on one line plus a header
-        (queue_len.min(3) + 1) as u16
-    } else {
-        0
-    };
+    // Build queue message previews
+    let queue_messages: Vec<String> = app.queue.iter().map(|m| m.content.clone()).collect();
 
-    // Main layout: Chat | Queue (optional) | Input | Status
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),              // Chat stream (scrollable)
-            Constraint::Length(queue_height), // Queued messages (0 if empty)
-            Constraint::Length(1),           // Input line (fixed at bottom)
-            Constraint::Length(1),           // Status bar
-        ])
-        .split(area);
+    // Build usage info for status
+    let usage_info = app.usage.as_ref().and_then(|u| {
+        u.prompt_tokens
+            .map(|pt| (pt as u64, app.context_window.map(|w| w as u64)))
+    });
 
-    // Render chat (scrollable)
-    chat::render_with_selection(
+    // Render everything in a single unified scrollable area
+    chat::render_unified(
         frame,
-        chunks[0],
+        area,
         &app.chat,
         app.scroll,
-        app.selected_tool.as_deref(),
-        Some(&app.content_height),
-        Some(&app.view_height),
-        None,
+        UnifiedRenderContext {
+            selected_tool: app.selected_tool.as_deref(),
+            content_height_out: Some(&app.content_height),
+            view_height_out: Some(&app.view_height),
+            input_ctx: Some(InputContext {
+                input: &app.input,
+                cursor: app.cursor,
+                attachments: &app.attachments,
+            }),
+            queue_ctx: if queue_messages.is_empty() {
+                None
+            } else {
+                Some(QueueContext {
+                    messages: &queue_messages,
+                })
+            },
+            status_ctx: Some(StatusContext {
+                model: &app.model_display(),
+                usage: usage_info,
+                queue_count: app.queue.len(),
+                background_tasks: app.background_tasks,
+                processing: app.processing,
+                status_message: app.status.as_deref(),
+            }),
+        },
     );
-
-    // Render queued messages (if any)
-    if queue_len > 0 {
-        render_queue(frame, chunks[1], app);
-    }
-
-    // Render input (fixed at bottom)
-    input::render(frame, chunks[2], app);
-
-    status::render(frame, chunks[3], app);
 
     // Render popups if in special modes
     match app.mode {
@@ -101,12 +107,17 @@ pub fn render(frame: &mut Frame, app: &App) {
             render_tool_detail_popup(frame, area, app);
         }
         AppMode::ModelSelect => {
-            render_model_select_popup(frame, chunks[1], app);
+            render_model_select_popup(frame, area, app);
         }
         AppMode::McpManage => {
             render_mcp_popup(frame, area, app);
         }
         _ => {}
+    }
+
+    // Render completion overlay if active (always on top)
+    if app.completion.is_active() && !app.completion.is_empty() {
+        render_completion_overlay(frame, area, app);
     }
 }
 
@@ -753,12 +764,13 @@ fn render_preferences_section(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render model select popup (anchored near input area).
-fn render_model_select_popup(frame: &mut Frame, input_area: Rect, app: &App) {
-    // Position popup just above the input line, left-aligned
+fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
+    // Position popup near bottom of screen, left-aligned
     let popup_height = (app.model_select_list.len() + 2).min(10) as u16;
-    let popup_width = 40.min(input_area.width);
-    let popup_x = input_area.x;
-    let popup_y = input_area.y.saturating_sub(popup_height);
+    let popup_width = 40.min(area.width);
+    let popup_x = area.x;
+    // Position near bottom, leaving space for status and input (2 lines from bottom)
+    let popup_y = area.height.saturating_sub(popup_height + 2);
 
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
@@ -963,7 +975,7 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRe
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("  {}", request.path()),
+            format!("  {}", request.args.path.as_str()),
             Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
         )),
         Line::from(""),
@@ -972,7 +984,7 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRe
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
-            format!("  {}", request.reason()),
+            format!("  {}", request.args.reason.as_str()),
             Style::default().fg(Color::Yellow),
         )),
         Line::from(""),
@@ -997,60 +1009,6 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRe
         .alignment(ratatui::layout::Alignment::Left);
 
     frame.render_widget(widget, center_chunks[1]);
-}
-
-/// Render queued messages indicator.
-fn render_queue(frame: &mut Frame, area: Rect, app: &App) {
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Header line
-    let queue_len = app.queue.len();
-    let header = format!(
-        "── Queued ({}) {} ──",
-        queue_len,
-        if queue_len == 1 { "message" } else { "messages" }
-    );
-    lines.push(Line::from(Span::styled(
-        header,
-        Style::default().fg(Color::Yellow),
-    )));
-
-    // Show up to 3 queued messages
-    for msg in app.queue.iter().take(3) {
-        // Truncate long messages for display (unicode-safe)
-        let max_width = area.width.saturating_sub(6) as usize;
-        let content = &msg.content;
-        let preview: String = content
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(max_width)
-            .collect();
-        let truncated = if content.chars().count() > max_width
-            || content.lines().count() > 1
-        {
-            format!("{}...", preview)
-        } else {
-            preview
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled("  ⏳ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(truncated, Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    // If more than 3 messages, show indicator
-    if queue_len > 3 {
-        lines.push(Line::from(Span::styled(
-            format!("  ... and {} more", queue_len - 3),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, area);
 }
 
 /// Render MCP server management popup.
@@ -1205,4 +1163,179 @@ fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
         .alignment(ratatui::layout::Alignment::Left);
 
     frame.render_widget(widget, popup_area);
+}
+
+/// Render the AskUser dialog.
+fn render_ask_user(frame: &mut Frame, area: Rect, app: &App, request: &AskUserRequest, selections: &[usize]) {
+    // Clear background
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
+    // Calculate height based on options (limit to 60% of screen)
+    let option_count = request.args.options.len();
+    let max_height = (area.height as usize * 60) / 100;
+    // Header (2) + Question (2) + Options (N) + Footer (2) + Borders (2)
+    let needed_height = 8 + option_count;
+    let height = needed_height.min(max_height) as u16;
+    let width = 70.min(area.width);
+
+    let popup_x = (area.width.saturating_sub(width)) / 2;
+    let popup_y = (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, width, height);
+
+    // Split into Question and Options list
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4), // Question + spacing
+            Constraint::Min(1),    // Options
+            Constraint::Length(1), // Help text
+        ])
+        .margin(1)
+        .split(popup_area);
+
+    // Render Question
+    let question = Paragraph::new(vec![
+        Line::from(Span::styled(
+            &request.args.question,
+            Style::default().fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+    ])
+    .wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(question, chunks[0]);
+
+    // Render Options
+    let visible_height = chunks[1].height as usize;
+    let scroll_offset = if app.ask_user_cursor >= visible_height {
+        app.ask_user_cursor - visible_height + 1
+    } else {
+        0
+    };
+
+    let items: Vec<ListItem> = request.args.options
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .map(|(idx, option)| {
+            let is_selected = selections.contains(&idx);
+            let is_cursor = idx == app.ask_user_cursor;
+
+            let prefix = if is_cursor { "> " } else { "  " };
+
+            let checkbox = if request.args.multi_select {
+                if is_selected { "[x] " } else { "[ ] " }
+            } else {
+                if is_selected { "(*) " } else { "( ) " }
+            };
+
+            let style = if is_cursor {
+                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let selected_style = if is_selected {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(checkbox, selected_style),
+                Span::styled(option, style),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items);
+    frame.render_widget(list, chunks[1]);
+
+    // Render Help Text
+    let help_text = if request.args.multi_select {
+        "Space: toggle | Enter: confirm | j/k: navigate"
+    } else {
+        "Enter: select & confirm | j/k: navigate"
+    };
+
+    let help = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, chunks[2]);
+
+    // Render Border
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(if request.args.multi_select { " Multiple Choice " } else { " Single Choice " })
+        .title_alignment(ratatui::layout::Alignment::Center);
+
+    frame.render_widget(block, popup_area);
+}
+
+/// Render completion overlay near bottom of screen.
+fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let max_items = 10;
+    let item_count = app.completion.len().min(max_items);
+    let height = (item_count + 2) as u16; // +2 for borders
+
+    // Position overlay near bottom, leaving 2 lines for input/status
+    let overlay_y = area.height.saturating_sub(height + 2);
+    let overlay_area = Rect {
+        x: area.x,
+        y: overlay_y,
+        width: area.width,
+        height,
+    };
+
+    // Clear background
+    frame.render_widget(Clear, overlay_area);
+
+    // Build list items
+    let selected = app.completion.selected();
+    let items: Vec<ListItem> = app
+        .completion
+        .visible_items(max_items)
+        .map(|(idx, item)| {
+            let is_selected = idx == selected;
+            let style = if is_selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            // Format based on completion mode
+            let text = match app.completion.mode {
+                CompletionMode::Slash => {
+                    format!("{:<15} {}", item.label, item.description)
+                }
+                CompletionMode::File => {
+                    item.label.clone()
+                }
+                CompletionMode::None => item.label.clone(),
+            };
+
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let title = match app.completion.mode {
+        CompletionMode::Slash => "Commands",
+        CompletionMode::File => "Files",
+        CompletionMode::None => "",
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title),
+    );
+
+    frame.render_widget(list, overlay_area);
 }
