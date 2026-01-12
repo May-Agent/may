@@ -181,7 +181,7 @@ impl ChatHistory {
 
     /// Parse chat history from the markdown format with YAML frontmatter.
     pub fn parse(content: &str) -> Result<Self, ChatHistoryError> {
-        let mut messages = Vec::new();
+        let mut messages: Vec<ChatMessage> = Vec::new();
         let mut metadata = SessionMetadata::default();
 
         // Skip leading whitespace
@@ -205,13 +205,29 @@ impl ChatHistory {
                 continue;
             }
 
-            // Check if this starts with --- (frontmatter opener)
-            let yaml_content = if part.starts_with("---") {
-                // Remove leading ---
-                part.strip_prefix("---").unwrap_or(part).trim()
-            } else {
-                part
-            };
+            // Determine if this part is a frontmatter block or message content.
+            // Frontmatter blocks either:
+            // 1. Start with --- (first block or after metadata)
+            // 2. Start with known frontmatter fields (role:, title:, model:)
+            //    because the split on \n---\n consumed the opening ---
+            let is_frontmatter = part.starts_with("---")
+                || part.starts_with("role:")
+                || part.starts_with("title:")
+                || part.starts_with("model:");
+
+            if !is_frontmatter {
+                // This is stray content from unescaped separator in message content.
+                // Append to the previous message's content.
+                if let Some(last_msg) = messages.last_mut() {
+                    last_msg.content.push_str("\n---\n");
+                    last_msg.content.push_str(&unescape_content(part));
+                }
+                i += 1;
+                continue;
+            }
+
+            // Remove leading --- if present and parse as YAML
+            let yaml_content = part.strip_prefix("---").unwrap_or(part).trim();
 
             // Parse frontmatter
             let frontmatter: Frontmatter = serde_yml::from_str(yaml_content)
@@ -485,5 +501,26 @@ What's in this image?
         // Test with trailing whitespace
         assert_eq!(escape_content("hello\n--- \nworld"), "hello\n\\---\nworld");
         assert_eq!(escape_content("hello\n---  \nworld"), "hello\n\\---\nworld");
+    }
+
+    #[test]
+    fn test_parse_corrupted_unescaped_separator() {
+        // Simulate old/corrupted data where content contains unescaped ---
+        // This would have been saved by an older version without proper escaping
+        let corrupted_content = r#"---
+role: assistant
+---
+Beneath the sky, both warm and wide,
+---
+Dreams and whispers gently glide."#;
+
+        // This should NOT fail with YAML parse error
+        let history = ChatHistory::parse(corrupted_content).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.messages()[0].role, MessageRole::Assistant);
+        // The content should be reconstructed with the --- separator
+        assert!(history.messages()[0].content.contains("Beneath the sky"));
+        assert!(history.messages()[0].content.contains("---"));
+        assert!(history.messages()[0].content.contains("Dreams and whispers"));
     }
 }

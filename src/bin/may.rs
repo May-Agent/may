@@ -329,7 +329,11 @@ where
                             if let Some(handle) = agent_handle.take() {
                                 handle.cancel();
                             }
+                            // Clean up loading/streaming state before adding interrupt message
+                            app.chat.end_loading();
+                            app.chat.end_text();
                             app.chat.push_text("\n\n[Interrupted]");
+                            app.chat.end_text();
                             app.finish_processing();
                             continue;
                         }

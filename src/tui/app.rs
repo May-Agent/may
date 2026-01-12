@@ -349,8 +349,12 @@ pub struct App {
     pub completion: Completion,
     /// Session list for selection (when in SessionSelect mode)
     pub session_list: Vec<SessionSummary>,
-    /// Selected session index
+    /// Selected session index (in filtered list)
     pub session_selected: usize,
+    /// Session search query
+    pub session_search: String,
+    /// Session list scroll offset
+    pub session_scroll: usize,
     /// Currently selected tool ID (for ToolDetail mode)
     pub selected_tool: Option<String>,
     /// Tool selection index in tool list
@@ -507,6 +511,8 @@ impl App {
             completion,
             session_list: Vec::new(),
             session_selected: 0,
+            session_search: String::new(),
+            session_scroll: 0,
             selected_tool: None,
             selected_tool_index: 0,
             tool_detail_scroll: 0,
@@ -686,6 +692,8 @@ impl App {
                     Ok(sessions) => {
                         self.session_list = sessions;
                         self.session_selected = 0;
+                        self.session_search.clear();
+                        self.session_scroll = 0;
                         self.mode = AppMode::SessionSelect;
                     }
                     Err(e) => {
@@ -1103,6 +1111,29 @@ impl App {
         }
     }
 
+    /// Get filtered sessions based on search query.
+    /// Searches in both title and content preview.
+    pub fn filtered_sessions(&self) -> Vec<(usize, &SessionSummary)> {
+        if self.session_search.is_empty() {
+            self.session_list.iter().enumerate().collect()
+        } else {
+            let query = self.session_search.to_lowercase();
+            self.session_list
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    // Search in title
+                    s.title
+                        .as_ref()
+                        .map(|t| t.to_lowercase().contains(&query))
+                        .unwrap_or(false)
+                        // Search in content preview
+                        || s.content_preview.to_lowercase().contains(&query)
+                })
+                .collect()
+        }
+    }
+
     /// Handle key in skill management mode.
     fn handle_skill_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
         match self.skill_add_mode {
@@ -1472,67 +1503,113 @@ impl App {
 
     /// Handle key in session select mode.
     fn handle_session_select_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
+        let filtered = self.filtered_sessions();
+        let filtered_len = filtered.len();
+
         match code {
             KeyCode::Esc => {
-                self.mode = AppMode::Chat;
+                if !self.session_search.is_empty() {
+                    // Clear search first
+                    self.session_search.clear();
+                    self.session_selected = 0;
+                    self.session_scroll = 0;
+                } else {
+                    self.mode = AppMode::Chat;
+                }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 if self.session_selected > 0 {
                     self.session_selected -= 1;
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.session_selected + 1 < self.session_list.len() {
+            KeyCode::Down => {
+                if self.session_selected + 1 < filtered_len {
                     self.session_selected += 1;
                 }
             }
             KeyCode::Enter => {
-                if let Some(summary) = self.session_list.get(self.session_selected) {
-                    let id = summary.id.clone();
-                    self.mode = AppMode::Chat;
-                    return Ok(Some(SendAction::LoadSession(id)));
+                if let Some((original_idx, _)) = filtered.get(self.session_selected) {
+                    if let Some(summary) = self.session_list.get(*original_idx) {
+                        let id = summary.id.clone();
+                        self.mode = AppMode::Chat;
+                        return Ok(Some(SendAction::LoadSession(id)));
+                    }
                 }
             }
-            KeyCode::Char('n') => {
-                self.mode = AppMode::Chat;
-                return Ok(Some(SendAction::NewSession));
+            KeyCode::Backspace => {
+                self.session_search.pop();
+                // Reset selection when search changes
+                self.session_selected = 0;
+                self.session_scroll = 0;
             }
-            KeyCode::Char('d') => {
-                // Delete selected session (async)
-                if let Some(summary) = self.session_list.get(self.session_selected) {
-                    let deleted_id = summary.id.as_str().to_string();
-                    let was_current = self
-                        .session_manager
-                        .current()
-                        .map(|s| s.id.as_str() == deleted_id)
-                        .unwrap_or(false);
-
-                    // Spawn background task to delete and refresh
-                    let tx = self.event_tx.clone();
-                    let store = self.session_manager.store().clone();
-                    spawn(async move {
-                        // Delete the session
-                        if let Err(e) = store.delete_session(&deleted_id).await {
-                            let _ = tx
-                                .send(AppEvent::SessionDeleted {
-                                    was_current,
-                                    result: Err(e.to_string()),
-                                })
-                                .await;
-                            return;
+            KeyCode::Char(c) => {
+                // Special keys only work when search is empty
+                if self.session_search.is_empty() {
+                    match c {
+                        'k' => {
+                            if self.session_selected > 0 {
+                                self.session_selected -= 1;
+                            }
+                            return Ok(None);
                         }
-                        // Refresh list
-                        let result = store.list_session_summaries().await;
-                        let _ = tx
-                            .send(AppEvent::SessionDeleted {
-                                was_current,
-                                result: result.map_err(|e| e.to_string()),
-                            })
-                            .await;
-                    })
-                    .detach();
-                    self.status = Some("Deleting session...".to_string());
+                        'j' => {
+                            if self.session_selected + 1 < filtered_len {
+                                self.session_selected += 1;
+                            }
+                            return Ok(None);
+                        }
+                        'n' => {
+                            self.mode = AppMode::Chat;
+                            return Ok(Some(SendAction::NewSession));
+                        }
+                        'd' => {
+                            // Delete selected session (async)
+                            if let Some((original_idx, _)) = filtered.get(self.session_selected) {
+                                if let Some(summary) = self.session_list.get(*original_idx) {
+                                    let deleted_id = summary.id.as_str().to_string();
+                                    let was_current = self
+                                        .session_manager
+                                        .current()
+                                        .map(|s| s.id.as_str() == deleted_id)
+                                        .unwrap_or(false);
+
+                                    // Spawn background task to delete and refresh
+                                    let tx = self.event_tx.clone();
+                                    let store = self.session_manager.store().clone();
+                                    spawn(async move {
+                                        // Delete the session
+                                        if let Err(e) = store.delete_session(&deleted_id).await {
+                                            let _ = tx
+                                                .send(AppEvent::SessionDeleted {
+                                                    was_current,
+                                                    result: Err(e.to_string()),
+                                                })
+                                                .await;
+                                            return;
+                                        }
+                                        // Refresh list
+                                        let result = store.list_session_summaries().await;
+                                        let _ = tx
+                                            .send(AppEvent::SessionDeleted {
+                                                was_current,
+                                                result: result.map_err(|e| e.to_string()),
+                                            })
+                                            .await;
+                                    })
+                                    .detach();
+                                    self.status = Some("Deleting session...".to_string());
+                                }
+                            }
+                            return Ok(None);
+                        }
+                        _ => {}
+                    }
                 }
+                // Add character to search
+                self.session_search.push(c);
+                // Reset selection when search changes
+                self.session_selected = 0;
+                self.session_scroll = 0;
             }
             _ => {}
         }
