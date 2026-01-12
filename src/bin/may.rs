@@ -29,7 +29,7 @@ use may_agent::mcp::McpConfig;
 use may_agent::tui::queue::{LARGE_PASTE_THRESHOLD, PASTE_TRUNCATE_LIMIT};
 use may_agent::tui::{ui, App, AppEvent, Attachment, EventHandler, PendingMessage, SendAction};
 use may_agent::workspace_request::{self, WorkspaceRequestQueue, WorkspaceRequestBroker};
-use may_agent::{generate_session_title, MayAgent, MayMcpServerConfig, McpManager, SessionId};
+use may_agent::{generate_session_title, MayAgent, MayMcpServerConfig, McpManager, SessionId, SkillManager};
 use serde::Serialize;
 
 const PANIC_MESSAGE: &str = include_str!("../texts/panic_message.txt");
@@ -454,6 +454,47 @@ where
                                 tracing::error!("{}", err_msg);
                             }
                         }
+                    }
+                    Some(SendAction::SkillInstall { repo }) => {
+                        let tx = events.sender();
+                        let may_dir = app.session_manager.may_dir().to_path_buf();
+                        app.status = Some(format!("Installing from {}...", repo));
+                        spawn(async move {
+                            let manager = SkillManager::new(&may_dir);
+                            let result = match SkillManager::parse_github_repo(&repo) {
+                                Ok((owner, repo_name)) => {
+                                    manager.install_from_github(owner, repo_name).await
+                                }
+                                Err(e) => Err(e),
+                            };
+                            // Refresh skill list after install
+                            let final_result = match result {
+                                Ok(_) => manager.list_skills(),
+                                Err(e) => Err(e),
+                            };
+                            let _ = tx
+                                .send(AppEvent::SkillInstalled(final_result.map_err(|e| e.to_string())))
+                                .await;
+                        })
+                        .detach();
+                    }
+                    Some(SendAction::SkillDelete { dir_name }) => {
+                        let tx = events.sender();
+                        let may_dir = app.session_manager.may_dir().to_path_buf();
+                        app.status = Some(format!("Deleting {}...", dir_name));
+                        spawn(async move {
+                            let manager = SkillManager::new(&may_dir);
+                            let result = manager.delete_skill(&dir_name);
+                            // Refresh skill list after delete
+                            let final_result = match result {
+                                Ok(()) => manager.list_skills(),
+                                Err(e) => Err(e),
+                            };
+                            let _ = tx
+                                .send(AppEvent::SkillDeleted(final_result.map_err(|e| e.to_string())))
+                                .await;
+                        })
+                        .detach();
                     }
                     Some(SendAction::Queued) | None => {}
                 }

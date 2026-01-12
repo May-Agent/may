@@ -11,6 +11,7 @@ mod fs_util;
 pub mod mcp;
 pub mod models;
 pub mod session;
+pub mod skill;
 pub mod tui;
 pub mod workspace;
 pub use aither_agent::ask_user;
@@ -25,3 +26,4 @@ pub use session::{
 pub use workspace::{Workspace, WorkspaceConfig};
 pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};
 pub use mcp::{McpConfig, McpManager, McpServerInfo, MayMcpServerConfig};
+pub use skill::{SkillInfo, SkillManager, SkillSource};
