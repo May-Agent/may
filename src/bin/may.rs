@@ -469,7 +469,7 @@ where
                             };
                             // Refresh skill list after install
                             let final_result = match result {
-                                Ok(_) => manager.list_skills(),
+                                Ok(_) => manager.list_skills().await,
                                 Err(e) => Err(e),
                             };
                             let _ = tx
@@ -484,10 +484,10 @@ where
                         app.status = Some(format!("Deleting {}...", dir_name));
                         spawn(async move {
                             let manager = SkillManager::new(&may_dir);
-                            let result = manager.delete_skill(&dir_name);
+                            let result = manager.delete_skill(&dir_name).await;
                             // Refresh skill list after delete
                             let final_result = match result {
-                                Ok(()) => manager.list_skills(),
+                                Ok(()) => manager.list_skills().await,
                                 Err(e) => Err(e),
                             };
                             let _ = tx

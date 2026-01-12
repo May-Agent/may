@@ -8,8 +8,10 @@
 
 use std::path::{Path, PathBuf};
 
+use async_fs;
+use blocking::unblock;
+use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 /// Skill management error.
 #[derive(Debug, thiserror::Error)]
@@ -92,19 +94,19 @@ impl SkillManager {
     }
 
     /// List all installed skills.
-    pub fn list_skills(&self) -> Result<Vec<SkillInfo>, SkillError> {
+    pub async fn list_skills(&self) -> Result<Vec<SkillInfo>, SkillError> {
         let mut skills = Vec::new();
 
-        if !self.skills_dir.exists() {
+        if async_fs::metadata(&self.skills_dir).await.is_err() {
             return Ok(skills);
         }
 
-        for entry in std::fs::read_dir(&self.skills_dir)? {
-            let entry = entry?;
+        let mut entries = async_fs::read_dir(&self.skills_dir).await?;
+        while let Some(entry) = entries.try_next().await? {
             let path = entry.path();
-            if path.is_dir() {
-                let source = self.detect_source(&path);
-                if let Some(skill) = self.parse_skill(&path, source) {
+            if async_fs::metadata(&path).await?.is_dir() {
+                let source = self.detect_source(&path).await;
+                if let Some(skill) = self.parse_skill(&path, source).await {
                     skills.push(skill);
                 }
             }
@@ -116,13 +118,13 @@ impl SkillManager {
     }
 
     /// Parse a single skill from its directory.
-    fn parse_skill(&self, skill_dir: &Path, source: SkillSource) -> Option<SkillInfo> {
+    async fn parse_skill(&self, skill_dir: &Path, source: SkillSource) -> Option<SkillInfo> {
         let skill_md = skill_dir.join("SKILL.md");
-        if !skill_md.exists() {
+        if async_fs::metadata(&skill_md).await.is_err() {
             return None;
         }
 
-        let content = std::fs::read_to_string(&skill_md).ok()?;
+        let content = async_fs::read_to_string(&skill_md).await.ok()?;
 
         // Parse YAML frontmatter (between --- markers)
         let metadata = self.parse_frontmatter(&content)?;
@@ -157,10 +159,10 @@ impl SkillManager {
     }
 
     /// Detect skill source from metadata file.
-    fn detect_source(&self, skill_dir: &Path) -> SkillSource {
+    async fn detect_source(&self, skill_dir: &Path) -> SkillSource {
         let metadata_path = skill_dir.join(".source.json");
-        if metadata_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+        if async_fs::metadata(&metadata_path).await.is_ok() {
+            if let Ok(content) = async_fs::read_to_string(&metadata_path).await {
                 if let Ok(source) = serde_json::from_str(&content) {
                     return source;
                 }
@@ -169,18 +171,10 @@ impl SkillManager {
         SkillSource::Bundled
     }
 
-    /// Write source metadata to skill directory.
-    fn write_source_metadata(&self, skill_dir: &Path, source: &SkillSource) -> Result<(), SkillError> {
-        let metadata_path = skill_dir.join(".source.json");
-        let content = serde_json::to_string_pretty(source)?;
-        std::fs::write(metadata_path, content)?;
-        Ok(())
-    }
-
     /// Install skills from a GitHub repository.
     ///
     /// The repo should have a `skills/` directory containing skill folders.
-    /// Uses sparse checkout to only download the skills directory.
+    /// Uses git2 for cloning (non-blocking via unblock).
     ///
     /// # Arguments
     /// * `owner` - GitHub repository owner
@@ -193,113 +187,80 @@ impl SkillManager {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<SkillInfo>, SkillError> {
-        let temp_dir = tempfile::tempdir()?;
-        let temp_path = temp_dir.path();
-
         let repo_url = format!("https://github.com/{}/{}.git", owner, repo);
+        let skills_dir = self.skills_dir.clone();
+        let owner = owner.to_string();
+        let repo_name = repo.to_string();
 
-        // Clone with sparse checkout (only download skills directory)
-        let status = Command::new("git")
-            .args([
-                "clone",
-                "--filter=blob:none",
-                "--no-checkout",
-                "--depth=1",
-                &repo_url,
-                ".",
-            ])
-            .current_dir(temp_path)
-            .status()
-            .await?;
+        // Run blocking git operations in background thread
+        let installed = unblock(move || -> Result<Vec<SkillInfo>, SkillError> {
+            let temp_dir = tempfile::tempdir()?;
+            let temp_path = temp_dir.path();
 
-        if !status.success() {
-            return Err(SkillError::GitCloneFailed(repo_url));
-        }
+            // Configure fetch options for shallow clone
+            let mut fetch_opts = git2::FetchOptions::new();
+            fetch_opts.depth(1);
 
-        // Configure sparse checkout
-        let _ = Command::new("git")
-            .args(["sparse-checkout", "init", "--cone"])
-            .current_dir(temp_path)
-            .status()
-            .await?;
+            // Clone the repository (shallow)
+            let mut builder = git2::build::RepoBuilder::new();
+            builder.fetch_options(fetch_opts);
 
-        let _ = Command::new("git")
-            .args(["sparse-checkout", "set", "skills"])
-            .current_dir(temp_path)
-            .status()
-            .await?;
+            builder
+                .clone(&repo_url, temp_path)
+                .map_err(|_| SkillError::GitCloneFailed(repo_url.clone()))?;
 
-        // Checkout
-        let _ = Command::new("git")
-            .args(["checkout"])
-            .current_dir(temp_path)
-            .status()
-            .await?;
+            // Check for skills directory
+            let skills_source = temp_path.join("skills");
+            if !skills_source.exists() {
+                return Err(SkillError::NoSkillsDirectory);
+            }
 
-        // Copy skills to ~/.may/skills/
-        let skills_source = temp_path.join("skills");
-        if !skills_source.exists() {
-            return Err(SkillError::NoSkillsDirectory);
-        }
+            // Ensure target skills directory exists
+            std::fs::create_dir_all(&skills_dir)?;
 
-        // Ensure skills directory exists
-        std::fs::create_dir_all(&self.skills_dir)?;
+            let source = SkillSource::GitHub {
+                owner: owner.clone(),
+                repo: repo_name.clone(),
+            };
 
-        let source = SkillSource::GitHub {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-        };
+            let mut installed = Vec::new();
+            for entry in std::fs::read_dir(&skills_source)? {
+                let entry = entry?;
+                let src = entry.path();
+                if src.is_dir() {
+                    let skill_name = src.file_name().unwrap().to_string_lossy().to_string();
+                    let dest = skills_dir.join(&skill_name);
 
-        let mut installed = Vec::new();
-        for entry in std::fs::read_dir(&skills_source)? {
-            let entry = entry?;
-            let src = entry.path();
-            if src.is_dir() {
-                let skill_name = src.file_name().unwrap().to_string_lossy().to_string();
-                let dest = self.skills_dir.join(&skill_name);
+                    // Copy skill directory recursively
+                    copy_dir_recursive(&src, &dest)?;
 
-                // Copy skill directory recursively
-                self.copy_dir_recursive(&src, &dest)?;
+                    // Write source metadata
+                    let metadata_path = dest.join(".source.json");
+                    let content = serde_json::to_string_pretty(&source)?;
+                    std::fs::write(metadata_path, content)?;
 
-                // Write source metadata
-                self.write_source_metadata(&dest, &source)?;
-
-                if let Some(skill) = self.parse_skill(&dest, source.clone()) {
-                    installed.push(skill);
+                    // Parse skill info
+                    if let Some(skill) = parse_skill_sync(&dest, source.clone()) {
+                        installed.push(skill);
+                    }
                 }
             }
-        }
+
+            Ok(installed)
+        })
+        .await?;
 
         Ok(installed)
     }
 
-    /// Copy a directory recursively.
-    fn copy_dir_recursive(&self, src: &Path, dest: &Path) -> Result<(), SkillError> {
-        std::fs::create_dir_all(dest)?;
-
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-            let dest_path = dest.join(entry.file_name());
-
-            if entry_path.is_dir() {
-                self.copy_dir_recursive(&entry_path, &dest_path)?;
-            } else {
-                std::fs::copy(&entry_path, &dest_path)?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Delete a skill by directory name.
-    pub fn delete_skill(&self, dir_name: &str) -> Result<(), SkillError> {
+    pub async fn delete_skill(&self, dir_name: &str) -> Result<(), SkillError> {
         let skill_dir = self.skills_dir.join(dir_name);
-        if !skill_dir.exists() {
+        if async_fs::metadata(&skill_dir).await.is_err() {
             return Err(SkillError::NotFound(dir_name.to_string()));
         }
 
-        std::fs::remove_dir_all(&skill_dir)?;
+        async_fs::remove_dir_all(&skill_dir).await?;
         Ok(())
     }
 
@@ -311,4 +272,65 @@ impl SkillManager {
             _ => Err(SkillError::InvalidRepoFormat),
         }
     }
+}
+
+/// Copy a directory recursively (standalone for use in closures).
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), SkillError> {
+    std::fs::create_dir_all(dest)?;
+
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+
+        if entry_path.is_dir() {
+            copy_dir_recursive(&entry_path, &dest_path)?;
+        } else {
+            std::fs::copy(&entry_path, &dest_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a skill from its directory (standalone for use in closures).
+fn parse_skill_sync(skill_dir: &Path, source: SkillSource) -> Option<SkillInfo> {
+    let skill_md = skill_dir.join("SKILL.md");
+    if !skill_md.exists() {
+        return None;
+    }
+
+    let content = std::fs::read_to_string(&skill_md).ok()?;
+
+    // Parse YAML frontmatter (between --- markers)
+    let mut lines = content.lines();
+    let first_line = lines.next()?;
+    if first_line.trim() != "---" {
+        return None;
+    }
+
+    let mut frontmatter = String::new();
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        frontmatter.push_str(line);
+        frontmatter.push('\n');
+    }
+
+    #[derive(Deserialize)]
+    struct Frontmatter {
+        name: String,
+        description: String,
+    }
+
+    let metadata: Frontmatter = serde_yml::from_str(&frontmatter).ok()?;
+
+    Some(SkillInfo {
+        name: metadata.name,
+        description: metadata.description,
+        dir_name: skill_dir.file_name()?.to_string_lossy().to_string(),
+        path: skill_dir.to_path_buf(),
+        source,
+    })
 }

@@ -1170,7 +1170,7 @@ fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Render the skill management popup.
 fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(70, 60, area);
+    let popup_area = centered_rect(80, 70, area);
 
     frame.render_widget(Clear, popup_area);
 
@@ -1179,30 +1179,93 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
         SkillAddMode::GitHubRepo => " Install Skill from GitHub ",
     };
 
-    let content: Vec<Line> = match app.skill_add_mode {
-        SkillAddMode::None => {
-            let mut lines = Vec::new();
+    // Render the border block
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(title)
+        .title_alignment(ratatui::layout::Alignment::Center);
+    let inner_area = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
 
-            if app.skill_list.is_empty() {
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "No skills installed.",
+    match app.skill_add_mode {
+        SkillAddMode::None => {
+            // Split inner area: search (2 lines) | skills list | footer (2 lines)
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2), // Search input
+                    Constraint::Min(1),    // Skill list
+                    Constraint::Length(2), // Footer hints
+                ])
+                .split(inner_area);
+
+            // Render search input
+            let search_line = if app.skill_search.is_empty() {
+                Line::from(Span::styled(
+                    "Type to search...",
                     Style::default().fg(Color::DarkGray),
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "Press 'a' to install from GitHub.",
-                    Style::default().fg(Color::Yellow),
-                )));
+                ))
             } else {
-                for (idx, skill) in app.skill_list.iter().enumerate() {
+                Line::from(vec![
+                    Span::styled("Search: ", Style::default().fg(Color::Cyan)),
+                    Span::styled(&app.skill_search, Style::default().fg(Color::Yellow)),
+                    Span::styled("_", Style::default().fg(Color::Yellow)),
+                ])
+            };
+            frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
+
+            // Render skill list
+            let filtered = app.filtered_skills();
+            let total = filtered.len();
+            let mut skill_lines = Vec::new();
+
+            if filtered.is_empty() {
+                if app.skill_list.is_empty() {
+                    skill_lines.push(Line::from(Span::styled(
+                        "No skills installed.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    skill_lines.push(Line::from(""));
+                    skill_lines.push(Line::from(Span::styled(
+                        "Press 'a' to install from GitHub.",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                } else {
+                    skill_lines.push(Line::from(Span::styled(
+                        "No matching skills.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            } else {
+                // Calculate visible height for skills (each selected skill takes 2 lines)
+                let list_height = chunks[1].height as usize;
+                // Account for scroll indicators (1 line each if needed)
+                let visible_height = list_height.saturating_sub(2);
+
+                // Calculate scroll to keep selected item visible
+                let scroll = if app.skill_selected >= app.skill_scroll + visible_height {
+                    app.skill_selected.saturating_sub(visible_height - 1)
+                } else {
+                    app.skill_scroll
+                };
+
+                // Show scroll indicator at top if scrolled
+                if scroll > 0 {
+                    skill_lines.push(Line::from(Span::styled(
+                        format!("↑ {} more above", scroll),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+
+                for (idx, skill) in filtered.iter().enumerate().skip(scroll).take(visible_height) {
                     let selected = idx == app.skill_selected;
                     let prefix = if selected { "> " } else { "  " };
 
                     let source_str = match &skill.source {
                         crate::skill::SkillSource::Bundled => String::new(),
                         crate::skill::SkillSource::GitHub { owner, repo } => {
-                            format!(" ({})", format!("{}/{}", owner, repo))
+                            format!(" ({}/{})", owner, repo)
                         }
                     };
 
@@ -1225,33 +1288,58 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                         ),
                         Span::styled(source_str, Style::default().fg(Color::DarkGray)),
                     ]);
-                    lines.push(line);
+                    skill_lines.push(line);
 
                     if selected {
-                        lines.push(Line::from(Span::styled(
+                        skill_lines.push(Line::from(Span::styled(
                             format!("    {}", skill.description),
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
                 }
+
+                // Show scroll indicator at bottom if more items
+                let shown_end = scroll + visible_height;
+                if shown_end < total {
+                    skill_lines.push(Line::from(Span::styled(
+                        format!("↓ {} more below", total - shown_end),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
             }
+            frame.render_widget(Paragraph::new(skill_lines), chunks[1]);
 
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("[a] ", Style::default().fg(Color::Cyan)),
-                Span::styled("Add from GitHub", Style::default().fg(Color::White)),
-                Span::raw("  "),
-                Span::styled("[d] ", Style::default().fg(Color::Cyan)),
-                Span::styled("Delete", Style::default().fg(Color::White)),
-                Span::raw("  "),
-                Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
-                Span::styled("Close", Style::default().fg(Color::White)),
-            ]));
-
-            lines
+            // Render footer hints (always visible)
+            let footer_line = if app.skill_search.is_empty() {
+                Line::from(vec![
+                    Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Use", Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled("[a] ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Add", Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled("[d] ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Delete", Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Close", Style::default().fg(Color::White)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Use", Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled("[Del] ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Delete", Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Clear search", Style::default().fg(Color::White)),
+                ])
+            };
+            frame.render_widget(Paragraph::new(vec![Line::from(""), footer_line]), chunks[2]);
         }
         SkillAddMode::GitHubRepo => {
-            vec![
+            let content = vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     "Enter repository (owner/repo):",
@@ -1264,7 +1352,7 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Example: lexoliu/may-skills",
+                    "Example: anthropics/skills",
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(""),
@@ -1272,21 +1360,10 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                     "[Enter] Install  [Esc] Cancel",
                     Style::default().fg(Color::DarkGray),
                 )),
-            ]
+            ];
+            frame.render_widget(Paragraph::new(content), inner_area);
         }
-    };
-
-    let widget = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(title)
-                .title_alignment(ratatui::layout::Alignment::Center),
-        )
-        .alignment(ratatui::layout::Alignment::Left);
-
-    frame.render_widget(widget, popup_area);
+    }
 }
 
 /// Render the AskUser dialog.
