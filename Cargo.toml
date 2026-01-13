@@ -48,16 +48,24 @@ thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
 
+# Markdown parsing (incremental/streaming)
+streamdown-parser = "0.1"
+
 # TUI
 ratatui = "0.30"
 crossterm = "0.28"
-tui-markdown = "0.3"
+ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+ahash = "0.8"
 
 # Clipboard, image, and browser
 arboard = "3"
 open = "5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# HTTP client for fetching images
+zenwave = { path = "../zenwave" }
 
 # File picker
 nucleo = "0.5"

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use blocking::unblock;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use executor_core::spawn;
 
 use crate::{SessionSummary, SkillInfo};
@@ -24,6 +24,12 @@ pub enum AppEvent {
     Paste(String),
     /// Mouse wheel scroll (positive = up, negative = down)
     Scroll(i16),
+    /// Mouse button pressed at (column, row)
+    MouseDown { x: u16, y: u16 },
+    /// Mouse dragged to (column, row)
+    MouseDrag { x: u16, y: u16 },
+    /// Mouse button released at (column, row)
+    MouseUp { x: u16, y: u16 },
 
     // ─── Async operation results ───────────────────────────────────────
     /// Session list loaded from background task
@@ -41,6 +47,10 @@ pub enum AppEvent {
     SkillInstalled(Result<Vec<SkillInfo>, String>),
     /// Skill deleted
     SkillDeleted(Result<Vec<SkillInfo>, String>),
+
+    // ─── Image loading ────────────────────────────────────────────────
+    /// Image fetched from URL
+    ImageFetched { url: String, data: Vec<u8> },
 }
 
 /// Sender type for sending events back to the main loop.
@@ -76,6 +86,24 @@ impl EventHandler {
                         Event::Mouse(mouse) => match mouse.kind {
                             MouseEventKind::ScrollUp => AppEvent::Scroll(1),
                             MouseEventKind::ScrollDown => AppEvent::Scroll(-1),
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                AppEvent::MouseDown {
+                                    x: mouse.column,
+                                    y: mouse.row,
+                                }
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                AppEvent::MouseDrag {
+                                    x: mouse.column,
+                                    y: mouse.row,
+                                }
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                AppEvent::MouseUp {
+                                    x: mouse.column,
+                                    y: mouse.row,
+                                }
+                            }
                             _ => continue,
                         },
                         _ => continue,
