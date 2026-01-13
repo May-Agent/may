@@ -19,6 +19,7 @@ use super::event::{AppEvent, EventSender};
 use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage, LARGE_PASTE_THRESHOLD};
 use super::ui::chat::{parse_tool_display, parse_tool_result, ChatElement, ChatStream};
+use super::selection::{CoordinateMapper, Selection};
 use super::ui::file_picker::FilePicker;
 
 const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../texts/tool_response_send_failed.txt");
@@ -327,6 +328,10 @@ pub struct App {
     pub content_height: Cell<usize>,
     /// View height (set during rendering for scroll normalization)
     pub view_height: Cell<usize>,
+    /// Text selection state
+    pub selection: Selection,
+    /// Coordinate mapper for selection (rebuilt during render)
+    pub coord_mapper: CoordinateMapper,
     /// Current mode
     pub mode: AppMode,
     /// Message queue
@@ -423,11 +428,21 @@ pub struct App {
     pub ask_user_cursor: usize,
     /// Event sender for spawning background tasks
     pub event_tx: EventSender,
+    /// Terminal image rendering support (None if terminal doesn't support graphics)
+    pub image_support: Option<super::ui::image::TerminalImageSupport>,
+    /// Image cache: URL -> fetched image state (for terminal image rendering)
+    pub image_cache: ahash::AHashMap<String, super::ui::image::ImageState>,
+    /// URLs currently being fetched (to avoid duplicate requests)
+    pub image_fetching: ahash::AHashSet<String>,
 }
 
 impl App {
     /// Create a new application.
-    pub fn new(event_tx: EventSender) -> anyhow::Result<Self> {
+    /// `image_support` should be detected before entering raw mode using `TerminalImageSupport::detect()`.
+    pub fn new(
+        event_tx: EventSender,
+        image_support: Option<super::ui::image::TerminalImageSupport>,
+    ) -> anyhow::Result<Self> {
         let mut config = MayConfig::load().unwrap_or_default();
         let session_manager = SessionManager::new()?;
 
@@ -499,6 +514,8 @@ impl App {
             input_visible: true,
             content_height: Cell::new(0),
             view_height: Cell::new(0),
+            selection: Selection::new(),
+            coord_mapper: CoordinateMapper::new(),
             mode,
             queue: MessageQueue::new(),
             status,
@@ -547,12 +564,106 @@ impl App {
             skill_search: String::new(),
             ask_user_cursor: 0,
             event_tx,
+            image_support,
+            image_cache: ahash::AHashMap::new(),
+            image_fetching: ahash::AHashSet::new(),
         })
     }
 
     /// Check if configuration is complete.
     pub fn is_configured(&self) -> bool {
         self.config.is_configured()
+    }
+
+    /// Request fetching an image from URL if not already cached or fetching.
+    /// Returns true if the image is already cached.
+    pub fn request_image(&mut self, url: &str) -> bool {
+        // Already cached?
+        if self.image_cache.contains_key(url) {
+            return true;
+        }
+        // Already fetching?
+        if self.image_fetching.contains(url) {
+            return false;
+        }
+        // Check if terminal supports images
+        if self.image_support.is_none() {
+            return false;
+        }
+        // Mark as fetching
+        self.image_fetching.insert(url.to_string());
+
+        // Spawn background fetch task
+        let url_owned = url.to_string();
+        let tx = self.event_tx.clone();
+        tracing::debug!("Starting image fetch: {}", url);
+        spawn(async move {
+            match super::ui::image::fetch_image(&url_owned).await {
+                Some(data) => {
+                    tracing::debug!("Image fetch succeeded: {} ({} bytes)", url_owned, data.len());
+                    if let Err(e) = tx.send(AppEvent::ImageFetched {
+                        url: url_owned,
+                        data,
+                    }).await {
+                        tracing::warn!("Failed to send ImageFetched event: {}", e);
+                    }
+                }
+                None => {
+                    tracing::debug!("Image fetch returned None: {}", url_owned);
+                }
+            }
+        }).detach();
+
+        false
+    }
+
+    /// Handle image fetched event.
+    pub fn handle_image_fetched(&mut self, url: String, data: Vec<u8>) {
+        tracing::debug!("Image fetched: url={}, {} bytes", url, data.len());
+        self.image_fetching.remove(&url);
+        if let Some(ref support) = self.image_support {
+            if let Some(state) = support.create_image_state_from_bytes(&data) {
+                tracing::debug!("Image cached successfully: {}", url);
+                self.image_cache.insert(url, state);
+            } else {
+                tracing::debug!("Failed to create image state from bytes: {}", url);
+            }
+        } else {
+            tracing::debug!("No image support, not caching: {}", url);
+        }
+    }
+
+    /// Check if terminal supports image rendering.
+    pub fn supports_images(&self) -> bool {
+        self.image_support.is_some()
+    }
+
+    /// Get cached image state for a URL.
+    pub fn get_cached_image(&self, url: &str) -> Option<&super::ui::image::ImageState> {
+        self.image_cache.get(url)
+    }
+
+    /// Scan chat content for images and request fetches for any not yet cached.
+    pub fn scan_and_fetch_images(&mut self) {
+        use super::ui::chat::ChatElement;
+        use super::ui::markdown::extract_images;
+
+        // Collect image URLs first to avoid borrow issues
+        let urls: Vec<String> = self.chat.elements().iter().flat_map(|elem| {
+            if let ChatElement::AssistantText { content, .. } = elem {
+                extract_images(content.as_str()).into_iter().map(|(_, url)| url).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        }).collect();
+
+        if !urls.is_empty() {
+            tracing::debug!("scan_and_fetch_images: found {} URLs: {:?}", urls.len(), urls);
+        }
+
+        for url in urls {
+            self.request_image(&url);
+        }
     }
 
     /// Normalize scroll value if it's at the "follow bottom" sentinel.
@@ -623,6 +734,64 @@ impl App {
         }
     }
 
+    /// Handle mouse button down event.
+    fn handle_mouse_down(&mut self, x: u16, y: u16) {
+        // Only handle in chat mode
+        if !matches!(self.mode, AppMode::Chat) {
+            return;
+        }
+
+        // Clear any existing selection and start a new one
+        if let Some(pos) = self.coord_mapper.screen_to_position(x, y) {
+            self.selection.start(pos);
+        }
+    }
+
+    /// Handle mouse drag event.
+    fn handle_mouse_drag(&mut self, x: u16, y: u16) {
+        // Only handle in chat mode
+        if !matches!(self.mode, AppMode::Chat) {
+            return;
+        }
+
+        if let Some(pos) = self.coord_mapper.screen_to_position(x, y) {
+            self.selection.extend(pos);
+        }
+    }
+
+    /// Handle mouse button up event.
+    fn handle_mouse_up(&mut self, x: u16, y: u16) {
+        // Only handle in chat mode
+        if !matches!(self.mode, AppMode::Chat) {
+            return;
+        }
+
+        // Extend to final position
+        if let Some(pos) = self.coord_mapper.screen_to_position(x, y) {
+            self.selection.extend(pos);
+        }
+
+        // Finish selection
+        self.selection.finish();
+
+        // Copy to clipboard if selection is not empty
+        if self.selection.is_active() {
+            if let Some((start, end)) = self.selection.range() {
+                let text = self.coord_mapper.extract(start, end);
+                if !text.is_empty() {
+                    if let Err(e) = super::clipboard::set_clipboard_text(&text) {
+                        tracing::warn!("Failed to copy selection to clipboard: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clear the current selection.
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+    }
+
     /// Initialize for a session (sets up image manager and status).
     ///
     /// Takes the session ID and a slice of messages to avoid borrow conflicts
@@ -681,6 +850,18 @@ impl App {
             AppEvent::Resize(_, _) => Ok(None),
             AppEvent::Scroll(delta) => {
                 self.handle_scroll(delta);
+                Ok(None)
+            }
+            AppEvent::MouseDown { x, y } => {
+                self.handle_mouse_down(x, y);
+                Ok(None)
+            }
+            AppEvent::MouseDrag { x, y } => {
+                self.handle_mouse_drag(x, y);
+                Ok(None)
+            }
+            AppEvent::MouseUp { x, y } => {
+                self.handle_mouse_up(x, y);
                 Ok(None)
             }
             AppEvent::Paste(text) => self.handle_bracketed_paste(text),
@@ -771,6 +952,10 @@ impl App {
                         self.chat.push_error(&format!("Failed to delete skill: {}", e));
                     }
                 }
+                Ok(None)
+            }
+            AppEvent::ImageFetched { url, data } => {
+                self.handle_image_fetched(url, data);
                 Ok(None)
             }
         }
@@ -1277,6 +1462,9 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> anyhow::Result<Option<SendAction>> {
+        // Clear selection on any keyboard input
+        self.selection.clear();
+
         // Handle Ctrl+V for paste
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('v') {
             self.handle_paste()?;

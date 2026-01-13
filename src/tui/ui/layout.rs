@@ -20,7 +20,7 @@ fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
 }
 
 /// Render the main layout.
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // Full-screen modes (don't show chat behind them)
@@ -50,6 +50,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         _ => {}
     }
 
+    // Scan chat content for images and request fetches for any not yet cached
+    app.scan_and_fetch_images();
+
     // Build queue message previews
     let queue_messages: Vec<String> = app.queue.iter().map(|m| m.content.clone()).collect();
 
@@ -59,12 +62,22 @@ pub fn render(frame: &mut Frame, app: &App) {
             .map(|pt| (pt as u64, app.context_window.map(|w| w as u64)))
     });
 
+    // Check image support before borrowing coord_mapper mutably
+    let images_supported = app.supports_images();
+    let chat_area = area;
+
+    // Collect image positions during rendering
+    let mut image_positions: Vec<(String, usize)> = Vec::new();
+
+    // Capture scroll value for image position calculations
+    let scroll = app.scroll;
+
     // Render everything in a single unified scrollable area
     chat::render_unified(
         frame,
-        area,
+        chat_area,
         &app.chat,
-        app.scroll,
+        scroll,
         UnifiedRenderContext {
             selected_tool: app.selected_tool.as_deref(),
             content_height_out: Some(&app.content_height),
@@ -89,8 +102,17 @@ pub fn render(frame: &mut Frame, app: &App) {
                 processing: app.processing,
                 status_message: app.status.as_deref(),
             }),
+            selection: Some(&app.selection),
+            coord_mapper: Some(&mut app.coord_mapper),
+            images_supported,
+            image_positions_out: Some(&mut image_positions),
         },
     );
+
+    // Render images as overlays at their scroll-adjusted positions
+    if images_supported && !image_positions.is_empty() {
+        render_inline_images(frame, chat_area, app, &image_positions, scroll);
+    }
 
     // Render popups if in special modes
     match app.mode {
@@ -1714,4 +1736,134 @@ fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
     );
 
     frame.render_widget(list, overlay_area);
+}
+
+/// Render images inline at their scroll-adjusted positions.
+/// Images appear within the content flow and scroll with the text.
+fn render_inline_images(
+    frame: &mut Frame,
+    chat_area: Rect,
+    app: &mut App,
+    image_positions: &[(String, usize)],
+    _scroll: usize,
+) {
+    use ratatui_image::StatefulImage;
+    use super::streaming_markdown::IMAGE_HEIGHT;
+
+    // Early exit if image support was disabled during session
+    if app.image_support.is_none() {
+        return;
+    }
+
+    let view_height = chat_area.height as usize;
+    let content_height = app.content_height.get();
+
+    // Calculate padding the same way as render_impl does:
+    // When content doesn't fill the screen, padding is added at the TOP
+    // to push content to the bottom of the screen.
+    let (padding, actual_scroll) = if content_height < view_height {
+        // Content fits - padding at top, no scroll
+        (view_height - content_height, 0)
+    } else {
+        // Content exceeds screen - no padding, use scroll
+        let max_scroll = content_height - view_height;
+        let scroll_val = if app.scroll == usize::MAX {
+            max_scroll
+        } else {
+            app.scroll.min(max_scroll)
+        };
+        (0, scroll_val)
+    };
+
+    tracing::debug!(
+        "render_inline_images: {} positions, {} cached, padding={}, actual_scroll={}, content_height={}, view_height={}",
+        image_positions.len(),
+        app.image_cache.len(),
+        padding,
+        actual_scroll,
+        content_height,
+        view_height
+    );
+
+    for (url, line_index) in image_positions {
+        let is_cached = app.image_cache.contains_key(url);
+        tracing::debug!(
+            "Image at line {}: url={}, cached={}",
+            line_index, url, is_cached
+        );
+
+        // Calculate screen position accounting for both padding and scroll
+        // line_index is in the unpadded content coordinate system
+        // Screen position = padding + line_index - actual_scroll
+
+        // Skip if the image is scrolled above the visible area
+        if *line_index < actual_scroll {
+            // Image might be partially visible at top
+            let lines_hidden = actual_scroll - line_index;
+            if lines_hidden >= IMAGE_HEIGHT {
+                // Completely scrolled past
+                continue;
+            }
+            // Partial visibility at top - handled below
+        }
+
+        // Screen line position (accounting for padding and scroll)
+        let screen_line = padding + line_index.saturating_sub(actual_scroll);
+
+        // Skip if completely below visible area
+        if screen_line >= view_height {
+            continue;
+        }
+
+        // Get the cached image state
+        let Some(state) = app.image_cache.get_mut(url) else {
+            // Image not yet fetched
+            continue;
+        };
+
+        // Calculate visible portion of the image
+        // The image starts at line_index + 1 (skip the header line "🖼 Alt [loading...]")
+        // and spans IMAGE_HEIGHT - 1 lines
+        let image_content_line = screen_line + 1; // Skip header line
+
+        // Skip if header line is at or past the bottom
+        if image_content_line >= view_height {
+            continue;
+        }
+
+        let image_start_y = chat_area.y + image_content_line as u16;
+        let available_height = (chat_area.y + chat_area.height).saturating_sub(image_start_y);
+
+        // Skip if no space available
+        if available_height == 0 {
+            continue;
+        }
+
+        // Calculate image area with proper bounds
+        // IMAGE_HEIGHT - 1 because we skip the header line
+        let image_height = ((IMAGE_HEIGHT - 1) as u16).min(available_height);
+        let indent = 2u16; // Indent from left edge
+
+        let image_area = Rect::new(
+            chat_area.x + indent,
+            image_start_y,
+            chat_area.width.saturating_sub(indent * 2),
+            image_height,
+        );
+
+        tracing::debug!(
+            "Rendering image at area: x={}, y={}, w={}, h={} (screen_line={}, padding={}, line_index={})",
+            image_area.x, image_area.y, image_area.width, image_area.height,
+            screen_line, padding, line_index
+        );
+
+        // Skip if area is too small
+        if image_area.width < 4 || image_area.height < 2 {
+            continue;
+        }
+
+        // Render the image
+        let image_widget = StatefulImage::default();
+        frame.render_stateful_widget(image_widget, image_area, &mut state.protocol);
+    }
 }

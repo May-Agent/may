@@ -78,6 +78,9 @@ async fn main() -> anyhow::Result<()> {
         default_hook(panic_info);
     }));
 
+    // Detect terminal image support (must be before raw mode)
+    let image_support = may_agent::tui::ui::image::TerminalImageSupport::detect();
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -91,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let result = run_app(&mut terminal).await;
+    let result = run_app(&mut terminal, image_support).await;
 
     // Cleanup terminal
     disable_raw_mode()?;
@@ -106,12 +109,15 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> anyhow::Result<()>
+async fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
+) -> anyhow::Result<()>
 where
     B::Error: Send + Sync + 'static,
 {
     let mut events = EventHandler::new();
-    let mut app = App::new(events.sender())?;
+    let mut app = App::new(events.sender(), image_support)?;
     let mut worker: Option<AgentWorker> = None;
 
     // Create workspace request channel (runtime-agnostic)
