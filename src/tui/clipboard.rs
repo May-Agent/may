@@ -119,6 +119,14 @@ pub fn get_clipboard_text() -> Result<Option<String>, ImageError> {
     }
 }
 
+/// Copy text to the system clipboard.
+pub fn set_clipboard_text(text: &str) -> Result<(), ImageError> {
+    let mut clipboard = Clipboard::new().map_err(|e| ImageError::Clipboard(e.to_string()))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| ImageError::Clipboard(e.to_string()))
+}
+
 /// Manager for pasted text content.
 pub struct TextManager {
     session_dir: PathBuf,
