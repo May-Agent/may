@@ -82,6 +82,48 @@ pub enum CopilotAuthStatus {
     Failed(String),
 }
 
+/// Character filter for paste validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteFilter {
+    /// Allow all characters
+    Any,
+    /// Only alphanumeric, dash, underscore (for identifiers)
+    Identifier,
+    /// Alphanumeric, dash, underscore, slash (for GitHub repos)
+    GitHubRepo,
+}
+
+impl PasteFilter {
+    /// Filter a string, keeping only valid characters.
+    fn filter(self, s: &str) -> String {
+        match self {
+            PasteFilter::Any => s.to_string(),
+            PasteFilter::Identifier => s
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect(),
+            PasteFilter::GitHubRepo => s
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '/')
+                .collect(),
+        }
+    }
+}
+
+/// Represents an active text input field for paste handling.
+pub enum ActiveTextInput<'a> {
+    /// Input with cursor position tracking (insert at cursor)
+    Cursored {
+        input: &'a mut String,
+        cursor: &'a mut usize,
+    },
+    /// Simple input (append at end) with character filter
+    Simple {
+        input: &'a mut String,
+        filter: PasteFilter,
+    },
+}
+
 /// MCP add server mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum McpAddMode {
@@ -961,15 +1003,101 @@ impl App {
         }
     }
 
+    /// Get the currently active text input field, if any.
+    fn active_text_input(&mut self) -> Option<ActiveTextInput<'_>> {
+        // Check mode-specific inputs first
+        match &self.mode {
+            AppMode::Chat => {
+                // Chat has special handling for large pastes (attachments)
+                return Some(ActiveTextInput::Cursored {
+                    input: &mut self.input,
+                    cursor: &mut self.cursor,
+                });
+            }
+            AppMode::Config => {
+                // Handle all config edit modes via a single match
+                match &mut self.config_state.edit_mode {
+                    ConfigEditMode::CustomProvider {
+                        focused_field,
+                        name,
+                        base_url,
+                        api_key,
+                        cursor,
+                        ..
+                    } => {
+                        let input = match *focused_field {
+                            0 => name,
+                            1 => base_url,
+                            _ => api_key,
+                        };
+                        return Some(ActiveTextInput::Cursored { input, cursor });
+                    }
+                    ConfigEditMode::Text { input, cursor } => {
+                        return Some(ActiveTextInput::Cursored { input, cursor });
+                    }
+                    _ => {}
+                }
+            }
+            AppMode::SessionSelect => {
+                return Some(ActiveTextInput::Simple {
+                    input: &mut self.session_search,
+                    filter: PasteFilter::Any,
+                });
+            }
+            AppMode::TierModelPicker => {
+                return Some(ActiveTextInput::Simple {
+                    input: &mut self.tier_picker_query,
+                    filter: PasteFilter::Any,
+                });
+            }
+            AppMode::McpManage => {
+                match self.mcp_add_mode {
+                    McpAddMode::Name => {
+                        return Some(ActiveTextInput::Simple {
+                            input: &mut self.mcp_add_name,
+                            filter: PasteFilter::Identifier,
+                        });
+                    }
+                    McpAddMode::Command => {
+                        return Some(ActiveTextInput::Simple {
+                            input: &mut self.mcp_add_command,
+                            filter: PasteFilter::Any,
+                        });
+                    }
+                    McpAddMode::None => {}
+                }
+            }
+            AppMode::SkillManage => {
+                match self.skill_add_mode {
+                    SkillAddMode::GitHubRepo => {
+                        return Some(ActiveTextInput::Simple {
+                            input: &mut self.skill_github_input,
+                            filter: PasteFilter::GitHubRepo,
+                        });
+                    }
+                    SkillAddMode::None => {
+                        // Skill search is always active in SkillManage
+                        return Some(ActiveTextInput::Simple {
+                            input: &mut self.skill_search,
+                            filter: PasteFilter::Any,
+                        });
+                    }
+                }
+            }
+            AppMode::FilePicker => {
+                // FilePicker is handled separately (has its own insert_str method)
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Handle bracketed paste event.
     fn handle_bracketed_paste(&mut self, text: String) -> anyhow::Result<Option<SendAction>> {
-        // Only handle paste in chat mode
-        if !matches!(self.mode, AppMode::Chat) {
-            return Ok(None);
-        }
-
-        // For multiline text, add as attachment instead of inserting into input
-        if text.contains('\n') || text.len() > LARGE_PASTE_THRESHOLD {
+        // Special handling for Chat mode: large pastes become attachments
+        if matches!(self.mode, AppMode::Chat)
+            && (text.contains('\n') || text.len() > LARGE_PASTE_THRESHOLD)
+        {
             let saved_path = if text.len() > LARGE_PASTE_THRESHOLD {
                 if let Some(manager) = &mut self.text_manager {
                     match manager.save(&text) {
@@ -990,14 +1118,46 @@ impl App {
                 content: text,
                 saved_path,
             });
+            return Ok(None);
+        }
+
+        // Use first line only for non-chat inputs (URLs, API keys, etc. are single-line)
+        let text = if matches!(self.mode, AppMode::Chat) {
+            text
         } else {
-            // Single line, short text - insert into input field
-            let byte_idx = char_to_byte_index(&self.input, self.cursor);
-            self.input.insert_str(byte_idx, &text);
-            let added_chars = text.chars().count();
-            self.cursor += added_chars;
-            self.input_char_count += added_chars;
-            self.update_completion_state();
+            text.lines().next().unwrap_or("").to_string()
+        };
+
+        if text.is_empty() {
+            return Ok(None);
+        }
+
+        // Handle FilePicker separately (has its own insert_str method)
+        if matches!(self.mode, AppMode::FilePicker) {
+            if let Some(picker) = &mut self.file_picker {
+                picker.insert_str(&text);
+            }
+            return Ok(None);
+        }
+
+        // Get active text input and paste into it
+        match self.active_text_input() {
+            Some(ActiveTextInput::Cursored { input, cursor }) => {
+                let byte_idx = char_to_byte_index(input, *cursor);
+                input.insert_str(byte_idx, &text);
+                *cursor += text.chars().count();
+
+                // Update input_char_count if this is the main chat input
+                if matches!(self.mode, AppMode::Chat) {
+                    self.input_char_count = self.input.chars().count();
+                    self.update_completion_state();
+                }
+            }
+            Some(ActiveTextInput::Simple { input, filter }) => {
+                let filtered = filter.filter(&text);
+                input.push_str(&filtered);
+            }
+            None => {}
         }
 
         Ok(None)
