@@ -2,14 +2,16 @@
 
 pub mod chat;
 pub mod file_picker;
+pub mod image;
 mod layout;
-mod markdown;
+pub mod markdown;
+pub mod streaming_markdown;
 
 use ratatui::Frame;
 
 use super::app::App;
 
 /// Render the entire UI.
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     layout::render(frame, app);
 }
