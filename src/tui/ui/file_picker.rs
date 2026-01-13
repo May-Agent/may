@@ -87,6 +87,12 @@ impl FilePicker {
         self.update_query(&self.query.clone());
     }
 
+    /// Insert a string into query (for paste support).
+    pub fn insert_str(&mut self, s: &str) {
+        self.query.push_str(s);
+        self.update_query(&self.query.clone());
+    }
+
     /// Delete last character from query.
     pub fn delete_char(&mut self) {
         self.query.pop();
