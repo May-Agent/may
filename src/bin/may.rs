@@ -19,6 +19,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use executor_core::{DefaultExecutor, spawn, try_init_global_executor};
+use async_channel::TryRecvError;
 use executor_core::tokio::TokioGlobal;
 use ratatui::prelude::*;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -206,6 +207,29 @@ where
                 app.handle_fetched_models(models);
                 app.model_fetch_rx = None;
             }
+        }
+
+        // Check for clipboard paste results (non-blocking)
+        if let Some(ref mut rx) = app.clipboard_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    app.clipboard_rx = None;
+                    app.pending_attachment_jobs = app.pending_attachment_jobs.saturating_sub(1);
+                    app.enqueue_paste_result(result);
+                }
+                Err(TryRecvError::Closed) => {
+                    app.clipboard_rx = None;
+                    app.pending_attachment_jobs = app.pending_attachment_jobs.saturating_sub(1);
+                    return Err(anyhow::anyhow!(
+                        "Clipboard task closed before sending a result"
+                    ));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        while let Some(result) = app.dequeue_paste_result() {
+            app.handle_paste_result(result).await?;
         }
 
         // Check for queued messages - start processing if agent is idle
@@ -540,14 +564,14 @@ fn start_agent_task(
         });
     }
 
+    // Prepare message content and extract image URLs
+    let (prompt, image_urls) = prepare_message_content(&msg)?;
+
     // Start processing UI
     app.start_processing(&msg);
 
-    // Format message with attachments
-    let prompt = format_message_with_attachments(&msg);
-
     // Send to worker and get handle
-    let handle = worker.run(prompt);
+    let handle = worker.run(prompt, image_urls);
 
     Ok(handle)
 }
@@ -746,14 +770,32 @@ async fn switch_model(
     Ok(())
 }
 
-/// Format a message with attachments into a single prompt string.
-fn format_message_with_attachments(msg: &PendingMessage) -> String {
+/// Prepare message content and extract attachment URLs for multimodal messages.
+///
+/// Returns (text_prompt, attachment_urls) where:
+/// - text_prompt: The message text with non-image attachments formatted inline
+/// - attachment_urls: File URLs for images/media to be sent to the LLM
+///
+/// Uses file:// URLs so the provider can handle large files efficiently
+/// (upload, stream, or convert as appropriate for the provider).
+///
+/// Errors if any attachment path cannot be represented as a file URL or if
+/// attachment metadata fails to serialize.
+fn prepare_message_content(msg: &PendingMessage) -> anyhow::Result<(String, Vec<url::Url>)> {
     let mut parts = vec![msg.content.clone()];
+    let mut attachment_urls = Vec::new();
 
     for attachment in &msg.attachments {
         match attachment {
             Attachment::Image { path, .. } => {
-                parts.push(format!("\n[Attached image: {}]", path.display()));
+                // Use file:// URL - provider handles reading and conversion
+                let url = url::Url::from_file_path(path).map_err(|_| {
+                    anyhow::anyhow!(
+                        "Failed to convert attachment path to URL: {}",
+                        path.display()
+                    )
+                })?;
+                attachment_urls.push(url);
             }
             Attachment::FileReference { path } => {
                 parts.push(format!("\n[File reference: {}]", path.display()));
@@ -763,13 +805,13 @@ fn format_message_with_attachments(msg: &PendingMessage) -> String {
                 saved_path,
             } => {
                 let char_count = content.chars().count();
-                let xml = build_pasted_text_xml(content, char_count, saved_path.as_ref());
+                let xml = build_pasted_text_xml(content, char_count, saved_path.as_ref())?;
                 parts.push(format!("\n{}", xml));
             }
         }
     }
 
-    parts.join("")
+    Ok((parts.join(""), attachment_urls))
 }
 
 /// XML structure for pasted text content.
@@ -791,7 +833,7 @@ fn build_pasted_text_xml(
     content: &str,
     char_count: usize,
     saved_path: Option<&std::path::PathBuf>,
-) -> String {
+) -> anyhow::Result<String> {
     let (text_content, is_truncated) = if char_count > LARGE_PASTE_THRESHOLD {
         let truncated: String = content.chars().take(PASTE_TRUNCATE_LIMIT).collect();
         (truncated, true)
@@ -806,7 +848,7 @@ fn build_pasted_text_xml(
         content: text_content,
     };
 
-    quick_xml::se::to_string(&xml).unwrap_or_default()
+    quick_xml::se::to_string(&xml).map_err(|e| anyhow::anyhow!("Failed to serialize paste XML: {}", e))
 }
 
 /// Run the GitHub Copilot OAuth device flow.

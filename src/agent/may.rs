@@ -352,8 +352,12 @@ impl MayAgent {
     }
 
     /// Run a query and stream events.
-    pub fn run(&mut self, prompt: &str) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
-        self.inner.run(prompt)
+    pub fn run(
+        &mut self,
+        prompt: &str,
+        attachments: impl IntoIterator<Item = url::Url>,
+    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+        self.inner.run(prompt, attachments)
     }
 
     /// One-shot query.

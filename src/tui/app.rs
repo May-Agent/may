@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 use async_channel::Receiver;
+use blocking::unblock;
 use crossterm::event::{KeyCode, KeyModifiers};
 use executor_core::spawn;
 
@@ -13,7 +14,7 @@ use crate::ask_user::AskUserRequest;
 use crate::workspace_request::WorkspaceRequest;
 use crate::{ChatMessage, MayConfig, MessageRole, SessionId, SessionManager, SessionSummary};
 
-use super::clipboard::{get_clipboard_image, get_clipboard_text, ImageManager, TextManager};
+use super::clipboard::{download_image, is_image_url, read_clipboard, ClipboardPasteResult, ImageManager, TextManager};
 use super::completion::{Completion, CompletionMode};
 use super::event::{AppEvent, EventSender};
 use super::history::InputHistory;
@@ -438,6 +439,12 @@ pub struct App {
     pub tier_picker_loading: bool,
     /// Receiver for fetched models (oneshot)
     pub model_fetch_rx: Option<Receiver<Vec<FetchedModel>>>,
+    /// Receiver for clipboard paste resolution (oneshot)
+    pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, String>>>,
+    /// Pending paste results waiting to be handled
+    pub pending_paste_results: std::collections::VecDeque<Result<ClipboardPasteResult, String>>,
+    /// Pending attachment jobs (clipboard read / download)
+    pub pending_attachment_jobs: usize,
     /// Cumulative token usage for current session
     pub usage: Option<aither_core::llm::Usage>,
     /// Context window size for current model
@@ -590,6 +597,9 @@ impl App {
             tier_picker_query: String::new(),
             tier_picker_loading: false,
             model_fetch_rx: None,
+            clipboard_rx: None,
+            pending_paste_results: std::collections::VecDeque::new(),
+            pending_attachment_jobs: 0,
             usage: None,
             context_window: None,
             current_model: None,
@@ -1098,26 +1108,8 @@ impl App {
         if matches!(self.mode, AppMode::Chat)
             && (text.contains('\n') || text.len() > LARGE_PASTE_THRESHOLD)
         {
-            let saved_path = if text.len() > LARGE_PASTE_THRESHOLD {
-                if let Some(manager) = &mut self.text_manager {
-                    match manager.save(&text) {
-                        Ok(path) => Some(path),
-                        Err(e) => {
-                            tracing::warn!("Failed to save pasted text: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            self.attachments.push(Attachment::PastedText {
-                content: text,
-                saved_path,
-            });
+            self.status = Some("Saving pasted text...".to_string());
+            self.enqueue_paste_result(Ok(ClipboardPasteResult::text(text)));
             return Ok(None);
         }
 
@@ -1656,6 +1648,10 @@ impl App {
                     }
                     return Ok(None);
                 }
+                if self.has_pending_attachments() {
+                    self.status = Some("Waiting for attachments to finish...".to_string());
+                    return Ok(None);
+                }
                 // Send as message (slash commands only work from menu selection)
                 if !self.input.is_empty() || !self.attachments.is_empty() {
                     return Ok(Some(self.prepare_message()));
@@ -2121,6 +2117,78 @@ impl App {
         .detach();
 
         Some(rx)
+    }
+
+    /// Queue a paste result to be handled by the main loop.
+    pub fn enqueue_paste_result(&mut self, result: Result<ClipboardPasteResult, String>) {
+        self.pending_paste_results.push_back(result);
+    }
+
+    /// Dequeue the next pending paste result.
+    pub fn dequeue_paste_result(&mut self) -> Option<Result<ClipboardPasteResult, String>> {
+        self.pending_paste_results.pop_front()
+    }
+
+    /// Check if any attachment jobs are still pending.
+    pub fn has_pending_attachments(&self) -> bool {
+        self.pending_attachment_jobs > 0 || !self.pending_paste_results.is_empty()
+    }
+
+    /// Handle a completed paste result (clipboard or bracketed paste).
+    pub async fn handle_paste_result(
+        &mut self,
+        result: Result<ClipboardPasteResult, String>,
+    ) -> anyhow::Result<()> {
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                self.status = Some(format!("Clipboard paste failed: {}", e));
+                return Ok(());
+            }
+        };
+
+        if result.is_empty() {
+            self.status = Some("Clipboard is empty".to_string());
+            return Ok(());
+        }
+
+        let (image, text) = result.into_parts();
+        if let Some(image) = image {
+            let manager = self
+                .image_manager
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Image manager not initialized"))?;
+            let path = manager.save(&image).await?;
+            self.attachments.push(Attachment::Image {
+                path,
+                data: image.data,
+            });
+            self.status = Some("Image attached".to_string());
+            return Ok(());
+        }
+
+        if let Some(text) = text {
+            let saved_path = if text.len() > LARGE_PASTE_THRESHOLD {
+                let manager = self
+                    .text_manager
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Text manager not initialized"))?;
+                Some(manager.save(&text).await?)
+            } else {
+                None
+            };
+
+            self.attachments.push(Attachment::PastedText {
+                content: text,
+                saved_path,
+            });
+            self.status = Some("Text attached".to_string());
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(
+            "Clipboard paste result contained no image or text"
+        ))
     }
 
     /// Handle fetched models from async task.
@@ -2717,49 +2785,41 @@ impl App {
 
     /// Handle paste (Ctrl+V) - check for image or text in clipboard.
     fn handle_paste(&mut self) -> anyhow::Result<()> {
-        // Try to get image from clipboard first
-        if let Ok(Some(clipboard_image)) = get_clipboard_image() {
-            // Save image and add as attachment
-            if let Some(manager) = &mut self.image_manager {
-                match manager.save(&clipboard_image) {
-                    Ok(path) => {
-                        self.attachments.push(Attachment::Image {
-                            path,
-                            data: clipboard_image.data,
-                        });
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to save clipboard image: {}", e);
-                    }
-                }
-            }
+        if self.clipboard_rx.is_some() {
+            self.status = Some("Clipboard paste already in progress".to_string());
+            return Ok(());
         }
 
-        // Try to get text from clipboard
-        if let Ok(Some(text)) = get_clipboard_text() {
-            // Check if text is large enough to save to file
-            let saved_path = if text.len() > LARGE_PASTE_THRESHOLD {
-                if let Some(manager) = &mut self.text_manager {
-                    match manager.save(&text) {
-                        Ok(path) => Some(path),
-                        Err(e) => {
-                            tracing::warn!("Failed to save pasted text: {}", e);
-                            None
+        let (tx, rx) = async_channel::bounded(1);
+        self.clipboard_rx = Some(rx);
+        self.pending_attachment_jobs = self.pending_attachment_jobs.saturating_add(1);
+        self.status = Some("Reading clipboard...".to_string());
+
+        spawn(async move {
+            let result = match unblock(|| read_clipboard()).await {
+                Ok(paste) => {
+                    let (image, text) = paste.into_parts();
+                    if let Some(image) = image {
+                        Ok(ClipboardPasteResult::image(image))
+                    } else if let Some(text) = text {
+                        if let Some(url) = is_image_url(&text) {
+                            download_image(&url)
+                                .await
+                                .map(ClipboardPasteResult::image)
+                                .map_err(|e| e.to_string())
+                        } else {
+                            Ok(ClipboardPasteResult::text(text))
                         }
+                    } else {
+                        Ok(ClipboardPasteResult::empty())
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
+                Err(e) => Err(e.to_string()),
             };
 
-            self.attachments.push(Attachment::PastedText {
-                content: text,
-                saved_path,
-            });
-        }
+            let _ = tx.send(result).await;
+        })
+        .detach();
 
         Ok(())
     }
