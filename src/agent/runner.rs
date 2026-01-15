@@ -41,6 +41,7 @@ enum WorkerCommand {
     /// Run a prompt.
     Run {
         prompt: String,
+        attachments: Vec<url::Url>,
         event_tx: Sender<TuiEvent>,
     },
     /// Cancel current processing.
@@ -65,12 +66,12 @@ impl AgentWorker {
     /// Start processing a prompt.
     ///
     /// Returns a handle to receive events from this run.
-    pub fn run(&self, prompt: String) -> AgentHandle {
+    pub fn run(&self, prompt: String, attachments: Vec<url::Url>) -> AgentHandle {
         const ERR_WORKER_CHANNEL_CLOSED: &str =
             include_str!("../texts/agent_worker_channel_closed.txt");
         let (event_tx, event_rx) = unbounded();
         self.command_tx
-            .try_send(WorkerCommand::Run { prompt, event_tx })
+            .try_send(WorkerCommand::Run { prompt, attachments, event_tx })
             .expect(ERR_WORKER_CHANNEL_CLOSED.trim());
         AgentHandle {
             event_rx,
@@ -141,8 +142,8 @@ async fn run_worker(
         };
 
         match command {
-            WorkerCommand::Run { prompt, event_tx } => {
-                run_agent_prompt(&mut agent, &prompt, &command_rx, &event_tx).await;
+            WorkerCommand::Run { prompt, attachments, event_tx } => {
+                run_agent_prompt(&mut agent, &prompt, attachments, &command_rx, &event_tx).await;
             }
             WorkerCommand::Cancel => {
                 // No active processing, ignore
@@ -158,10 +159,11 @@ async fn run_worker(
 async fn run_agent_prompt(
     agent: &mut MayAgent,
     prompt: &str,
+    attachments: Vec<url::Url>,
     command_rx: &Receiver<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
 ) {
-    let mut stream = std::pin::pin!(agent.run(prompt));
+    let mut stream = std::pin::pin!(agent.run(prompt, attachments));
     let mut cancelled = false;
 
     loop {
