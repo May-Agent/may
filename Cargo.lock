@@ -34,6 +34,7 @@ dependencies = [
 name = "aither-agent"
 version = "0.1.0"
 dependencies = [
+ "aither-attachments",
  "aither-core",
  "aither-mcp",
  "aither-sandbox",
@@ -52,7 +53,20 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "aither-attachments"
+version = "0.1.0"
+dependencies = [
+ "async-fs",
+ "futures-lite",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -62,12 +76,14 @@ dependencies = [
  "aither-core",
  "aither-models",
  "async-stream",
+ "base64 0.22.1",
  "futures-core",
  "futures-lite",
  "schemars",
  "serde",
  "serde_json",
  "tracing",
+ "url",
  "zenwave",
 ]
 
@@ -135,17 +151,21 @@ dependencies = [
 name = "aither-gemini"
 version = "0.1.0"
 dependencies = [
+ "aither-attachments",
  "aither-core",
  "aither-models",
+ "async-fs",
  "async-io",
  "async-stream",
- "base64 0.21.7",
+ "base64 0.22.1",
  "futures-core",
  "futures-lite",
+ "mime_guess",
  "schemars",
  "serde",
  "serde_json",
  "tracing",
+ "url",
  "zenwave",
 ]
 
@@ -181,18 +201,22 @@ dependencies = [
 name = "aither-openai"
 version = "0.1.0"
 dependencies = [
+ "aither-attachments",
  "aither-core",
  "aither-models",
+ "async-fs",
  "async-io",
  "async-stream",
- "base64 0.21.7",
+ "base64 0.22.1",
  "futures-core",
  "futures-lite",
  "http 1.4.0",
+ "mime_guess",
  "schemars",
  "serde",
  "serde_json",
  "tracing",
+ "url",
  "zenwave",
 ]
 
@@ -2846,6 +2870,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "unicode-width",
+ "url",
  "uuid",
  "zenwave",
 ]

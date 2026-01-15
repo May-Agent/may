@@ -47,6 +47,7 @@ dirs = "6"
 thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
+url = "2"
 
 # Markdown parsing (incremental/streaming)
 streamdown-parser = "0.1"
