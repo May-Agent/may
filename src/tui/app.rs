@@ -20,7 +20,6 @@ use super::event::{AppEvent, EventSender};
 use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage, LARGE_PASTE_THRESHOLD};
 use super::ui::chat::{parse_tool_display, parse_tool_result, ChatElement, ChatStream};
-use super::selection::{CoordinateMapper, Selection};
 use super::ui::file_picker::FilePicker;
 
 const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../texts/tool_response_send_failed.txt");
@@ -371,10 +370,6 @@ pub struct App {
     pub content_height: Cell<usize>,
     /// View height (set during rendering for scroll normalization)
     pub view_height: Cell<usize>,
-    /// Text selection state
-    pub selection: Selection,
-    /// Coordinate mapper for selection (rebuilt during render)
-    pub coord_mapper: CoordinateMapper,
     /// Current mode
     pub mode: AppMode,
     /// Message queue
@@ -563,8 +558,6 @@ impl App {
             input_visible: true,
             content_height: Cell::new(0),
             view_height: Cell::new(0),
-            selection: Selection::new(),
-            coord_mapper: CoordinateMapper::new(),
             mode,
             queue: MessageQueue::new(),
             status,
@@ -765,85 +758,6 @@ impl App {
         }
     }
 
-    /// Handle a mouse wheel scroll event based on current mode.
-    fn handle_scroll(&mut self, delta: i16) {
-        match self.mode {
-            AppMode::Chat => {
-                if delta > 0 {
-                    self.scroll_up();
-                } else if delta < 0 {
-                    self.scroll_down();
-                }
-            }
-            AppMode::ToolDetail => {
-                if delta > 0 {
-                    self.tool_detail_scroll = self.tool_detail_scroll.saturating_sub(1);
-                } else if delta < 0 {
-                    self.tool_detail_scroll = self.tool_detail_scroll.saturating_add(1);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle mouse button down event.
-    fn handle_mouse_down(&mut self, x: u16, y: u16) {
-        // Only handle in chat mode
-        if !matches!(self.mode, AppMode::Chat) {
-            return;
-        }
-
-        // Clear any existing selection and start a new one
-        if let Some(pos) = self.coord_mapper.screen_to_position(x, y) {
-            self.selection.start(pos);
-        }
-    }
-
-    /// Handle mouse drag event.
-    fn handle_mouse_drag(&mut self, x: u16, y: u16) {
-        // Only handle in chat mode
-        if !matches!(self.mode, AppMode::Chat) {
-            return;
-        }
-
-        if let Some(pos) = self.coord_mapper.screen_to_position(x, y) {
-            self.selection.extend(pos);
-        }
-    }
-
-    /// Handle mouse button up event.
-    fn handle_mouse_up(&mut self, x: u16, y: u16) {
-        // Only handle in chat mode
-        if !matches!(self.mode, AppMode::Chat) {
-            return;
-        }
-
-        // Extend to final position
-        if let Some(pos) = self.coord_mapper.screen_to_position(x, y) {
-            self.selection.extend(pos);
-        }
-
-        // Finish selection
-        self.selection.finish();
-
-        // Copy to clipboard if selection is not empty
-        if self.selection.is_active() {
-            if let Some((start, end)) = self.selection.range() {
-                let text = self.coord_mapper.extract(start, end);
-                if !text.is_empty() {
-                    if let Err(e) = super::clipboard::set_clipboard_text(&text) {
-                        tracing::warn!("Failed to copy selection to clipboard: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Clear the current selection.
-    pub fn clear_selection(&mut self) {
-        self.selection.clear();
-    }
-
     /// Initialize for a session (sets up image manager and status).
     ///
     /// Takes the session ID and a slice of messages to avoid borrow conflicts
@@ -900,22 +814,6 @@ impl App {
                 Ok(None)
             }
             AppEvent::Resize(_, _) => Ok(None),
-            AppEvent::Scroll(delta) => {
-                self.handle_scroll(delta);
-                Ok(None)
-            }
-            AppEvent::MouseDown { x, y } => {
-                self.handle_mouse_down(x, y);
-                Ok(None)
-            }
-            AppEvent::MouseDrag { x, y } => {
-                self.handle_mouse_drag(x, y);
-                Ok(None)
-            }
-            AppEvent::MouseUp { x, y } => {
-                self.handle_mouse_up(x, y);
-                Ok(None)
-            }
             AppEvent::Paste(text) => self.handle_bracketed_paste(text),
 
             // ─── Async operation results ───────────────────────────────────
@@ -1614,9 +1512,6 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> anyhow::Result<Option<SendAction>> {
-        // Clear selection on any keyboard input
-        self.selection.clear();
-
         // Handle Ctrl+V for paste
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('v') {
             self.handle_paste()?;

@@ -62,7 +62,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .map(|pt| (pt as u64, app.context_window.map(|w| w as u64)))
     });
 
-    // Check image support before borrowing coord_mapper mutably
     let images_supported = app.supports_images();
     let chat_area = area;
 
@@ -102,8 +101,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 processing: app.processing,
                 status_message: app.status.as_deref(),
             }),
-            selection: Some(&app.selection),
-            coord_mapper: Some(&mut app.coord_mapper),
             images_supported,
             image_positions_out: Some(&mut image_positions),
         },
