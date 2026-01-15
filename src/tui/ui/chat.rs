@@ -534,7 +534,7 @@ pub struct QueueContext<'a> {
 
 /// Render the chat stream.
 pub fn render(frame: &mut Frame, area: Rect, chat: &ChatStream, scroll: usize) {
-    render_impl(frame, area, chat, scroll, None, None, None, None, None, None, None, None, false, None);
+    render_impl(frame, area, chat, scroll, None, None, None, None, None, None, false, None);
 }
 
 /// Full-screen unified render context.
@@ -545,10 +545,6 @@ pub struct UnifiedRenderContext<'a> {
     pub input_ctx: Option<InputContext<'a>>,
     pub queue_ctx: Option<QueueContext<'a>>,
     pub status_ctx: Option<StatusContext<'a>>,
-    /// Text selection state
-    pub selection: Option<&'a super::super::selection::Selection>,
-    /// Coordinate mapper to rebuild during rendering
-    pub coord_mapper: Option<&'a mut super::super::selection::CoordinateMapper>,
     /// Whether terminal supports image rendering
     pub images_supported: bool,
     /// Output: accumulated image positions (url, line_index) for overlay rendering
@@ -574,8 +570,6 @@ pub fn render_unified(
         ctx.input_ctx,
         ctx.queue_ctx,
         ctx.status_ctx,
-        ctx.selection,
-        ctx.coord_mapper,
         ctx.images_supported,
         ctx.image_positions_out,
     );
@@ -636,8 +630,6 @@ pub fn render_with_selection(
         input_ctx,
         None,
         None,
-        None,
-        None,
         false,
         None,
     );
@@ -655,8 +647,6 @@ fn render_impl(
     input_ctx: Option<InputContext<'_>>,
     queue_ctx: Option<QueueContext<'_>>,
     status_ctx: Option<StatusContext<'_>>,
-    selection: Option<&super::super::selection::Selection>,
-    coord_mapper: Option<&mut super::super::selection::CoordinateMapper>,
     images_supported: bool,
     image_positions_out: Option<&mut Vec<(String, usize)>>,
 ) {
@@ -821,18 +811,6 @@ fn render_impl(
     // Render status bar if provided
     if let Some(ref ctx) = status_ctx {
         render_status_line(&mut lines, ctx);
-    }
-
-    // Apply selection highlighting if active
-    if let Some(sel) = selection {
-        if let Some((start, end)) = sel.range() {
-            super::super::selection::apply_selection_highlight(&mut lines, start, end);
-        }
-    }
-
-    // Rebuild coordinate mapper for next frame's mouse events
-    if let Some(mapper) = coord_mapper {
-        mapper.rebuild(&lines, scroll, area.width as usize);
     }
 
     // Export collected image positions for overlay rendering

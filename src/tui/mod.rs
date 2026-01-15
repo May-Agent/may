@@ -6,7 +6,6 @@ pub mod completion;
 pub mod event;
 pub mod history;
 pub mod queue;
-pub mod selection;
 pub mod ui;
 
 pub use app::{App, AppMode, SendAction};
@@ -14,4 +13,3 @@ pub use completion::{Completion, CompletionMode};
 pub use event::{AppEvent, EventHandler};
 pub use history::InputHistory;
 pub use queue::{Attachment, PendingMessage};
-pub use selection::{CoordinateMapper, Position, Selection};

@@ -9,14 +9,13 @@ use std::io;
 use std::panic;
 
 use aither_agent::AgentEvent;
+
 use crossterm::{
-    event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyCode, KeyModifiers,
-    },
+    cursor::MoveTo,
+    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use executor_core::{DefaultExecutor, spawn, try_init_global_executor};
 use async_channel::TryRecvError;
@@ -65,9 +64,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
-            LeaveAlternateScreen,
             DisableBracketedPaste,
-            DisableMouseCapture
+            Clear(ClearType::All),
+            MoveTo(0, 0)
         );
         let _ = execute!(
             io::stderr(),
@@ -82,14 +81,14 @@ async fn main() -> anyhow::Result<()> {
     // Detect terminal image support (must be before raw mode)
     let image_support = may_agent::tui::ui::image::TerminalImageSupport::detect();
 
-    // Setup terminal
+    // Setup terminal - using main buffer for native scroll/selection support
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
         stdout,
-        EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture
+        Clear(ClearType::All),
+        MoveTo(0, 0)
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -101,9 +100,9 @@ async fn main() -> anyhow::Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
         DisableBracketedPaste,
-        DisableMouseCapture
+        Clear(ClearType::All),
+        MoveTo(0, 0)
     )?;
     terminal.show_cursor()?;
 
