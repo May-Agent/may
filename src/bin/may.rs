@@ -8,6 +8,8 @@
 use std::io;
 use std::panic;
 
+use std::io::Write;
+
 use aither_agent::AgentEvent;
 
 use crossterm::{
@@ -82,21 +84,23 @@ async fn main() -> anyhow::Result<()> {
     let image_support = may_agent::tui::ui::image::TerminalImageSupport::detect();
 
     // Setup terminal - using main buffer for native scroll/selection support
-    enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnableBracketedPaste,
-        Clear(ClearType::All),
-        MoveTo(0, 0)
-    )?;
+    // Clear screen and scrollback BEFORE enabling raw mode (RIS resets terminal state)
+    // 1. RIS (Reset to Initial State) - most thorough reset
+    // 2. CSI 3J - clear scrollback (xterm extension)
+    // 3. CSI 2J - clear screen
+    write!(stdout, "\x1bc\x1b[3J\x1b[2J\x1b[H")?;
+    stdout.flush()?;
+    // Now enable raw mode after reset
+    enable_raw_mode()?;
+    execute!(stdout, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
     let result = run_app(&mut terminal, image_support).await;
 
-    // Cleanup terminal
+    // Cleanup terminal - don't purge scrollback on exit, just clear screen
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
