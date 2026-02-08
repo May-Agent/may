@@ -9,7 +9,7 @@ use std::path::Path;
 
 use async_fs;
 
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 
 // Embed the skills and subagents directories at compile time
 static SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");

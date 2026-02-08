@@ -1,7 +1,7 @@
 //! Model fetching from provider APIs.
 
 use aither_cloud::{
-    CloudModelProvider, ClaudeProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
+    ClaudeProvider, CloudModelProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
 };
 use aither_core::llm::LanguageModelProvider;
 

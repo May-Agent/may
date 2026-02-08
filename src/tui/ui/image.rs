@@ -8,9 +8,9 @@
 use anyhow;
 use image::DynamicImage;
 use ratatui::prelude::*;
+use ratatui_image::StatefulImage;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::StatefulImage;
 
 /// Terminal image support state.
 /// Created once at startup, before raw mode, and stored in App.

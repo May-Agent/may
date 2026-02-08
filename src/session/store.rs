@@ -68,7 +68,11 @@ impl SessionStore {
         async_fs::create_dir_all(self.images_dir(id)).await?;
 
         // Create sandbox symlinks to global resources
-        let may_dir = self.sessions_dir.parent().unwrap_or(&self.sessions_dir).to_path_buf();
+        let may_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .to_path_buf();
         crate::bundle::Bundle::create_sandbox_symlinks(&session_dir, &may_dir).await?;
 
         Ok(())

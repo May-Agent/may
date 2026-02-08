@@ -139,7 +139,10 @@ impl SessionManager {
     }
 
     /// Create a new session with a specific model.
-    pub fn create_session_with_model(&mut self, model: Option<String>) -> Result<&Session, SessionError> {
+    pub fn create_session_with_model(
+        &mut self,
+        model: Option<String>,
+    ) -> Result<&Session, SessionError> {
         let id = SessionId::new();
         let now = Timestamp::now();
 

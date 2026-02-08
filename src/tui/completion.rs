@@ -210,11 +210,11 @@ impl Completion {
         let injector = matcher.injector();
 
         let walker = WalkBuilder::new(dir)
-            .hidden(true)       // Skip hidden files/directories (including .git)
-            .ignore(true)       // Respect .ignore files
-            .git_ignore(true)   // Respect .gitignore
-            .git_global(true)   // Respect global gitignore
-            .git_exclude(true)  // Respect .git/info/exclude
+            .hidden(true) // Skip hidden files/directories (including .git)
+            .ignore(true) // Respect .ignore files
+            .git_ignore(true) // Respect .gitignore
+            .git_global(true) // Respect global gitignore
+            .git_exclude(true) // Respect .git/info/exclude
             .max_depth(Some(10))
             .build();
 
@@ -283,7 +283,8 @@ impl Completion {
                 } else if let Some(ref home) = home_dir {
                     if path.starts_with(home) {
                         // Files under home directory: use ~ prefix
-                        let rel = path.strip_prefix(home)
+                        let rel = path
+                            .strip_prefix(home)
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_else(|_| path.to_string_lossy().to_string());
                         format!("~/{}", rel)

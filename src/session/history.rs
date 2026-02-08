@@ -449,7 +449,11 @@ What's in this image?
 
         let history = ChatHistory::parse(content).unwrap();
         assert_eq!(history.len(), 1);
-        assert!(history.messages()[0].content.contains("![](images/img_001.png)"));
+        assert!(
+            history.messages()[0]
+                .content
+                .contains("![](images/img_001.png)")
+        );
     }
 
     #[test]
@@ -488,7 +492,10 @@ What's in this image?
         let parsed = ChatHistory::parse(&serialized).unwrap();
         assert_eq!(parsed.len(), 1);
         // The content is normalized (trailing whitespace on --- lines removed)
-        assert_eq!(parsed.messages()[0].content, "A poem:\n---\nSome verse\n---\nThe end.");
+        assert_eq!(
+            parsed.messages()[0].content,
+            "A poem:\n---\nSome verse\n---\nThe end."
+        );
     }
 
     #[test]
@@ -521,6 +528,10 @@ Dreams and whispers gently glide."#;
         // The content should be reconstructed with the --- separator
         assert!(history.messages()[0].content.contains("Beneath the sky"));
         assert!(history.messages()[0].content.contains("---"));
-        assert!(history.messages()[0].content.contains("Dreams and whispers"));
+        assert!(
+            history.messages()[0]
+                .content
+                .contains("Dreams and whispers")
+        );
     }
 }
