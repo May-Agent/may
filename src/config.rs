@@ -533,7 +533,8 @@ impl ModelsConfig {
             list.push(model_id.to_string());
         }
         // Store the provider mapping
-        self.model_providers.insert(model_id.to_string(), provider_id.to_string());
+        self.model_providers
+            .insert(model_id.to_string(), provider_id.to_string());
     }
 
     /// Get the provider ID for a model (if known).
@@ -647,10 +648,7 @@ impl MayConfig {
     /// Check if configuration is complete enough to use.
     pub fn is_configured(&self) -> bool {
         // Need at least one valid provider
-        let has_provider = self
-            .provider
-            .iter()
-            .any(|(id, p)| p.is_valid(id));
+        let has_provider = self.provider.iter().any(|(id, p)| p.is_valid(id));
         // Need at least one model configured
         let has_models = self.models.has_any_models();
         has_provider && has_models
@@ -692,7 +690,10 @@ impl MayConfig {
 
     /// Get the first available model for a tier.
     pub fn default_model_for_tier(&self, tier: ModelTier) -> Option<&str> {
-        self.models.models_for_tier(tier).first().map(|s| s.as_str())
+        self.models
+            .models_for_tier(tier)
+            .first()
+            .map(|s| s.as_str())
     }
 
     /// Create a provider resolver for runtime model selection.
@@ -719,7 +720,10 @@ impl MayConfig {
             let ptype = instance.resolve_type(id);
 
             // Providers that can serve any model (proxies/aggregators)
-            if matches!(ptype, ProviderType::OpenRouter | ProviderType::Ollama | ProviderType::Custom) {
+            if matches!(
+                ptype,
+                ProviderType::OpenRouter | ProviderType::Ollama | ProviderType::Custom
+            ) {
                 has_any_model_provider = true;
                 continue;
             }
@@ -833,9 +837,7 @@ impl ProviderResolver {
             .iter()
             .filter(|(id, p)| {
                 p.can_serve_model(id, model_id)
-                    && failed_ids
-                        .map(|ids| !ids.contains(*id))
-                        .unwrap_or(true)
+                    && failed_ids.map(|ids| !ids.contains(*id)).unwrap_or(true)
             })
             .map(|(id, _)| id.as_str())
             .collect()
@@ -868,7 +870,9 @@ impl ProviderResolver {
             }
         }?;
 
-        self.providers.get(id).map(|instance| SelectedProvider { id, instance })
+        self.providers
+            .get(id)
+            .map(|instance| SelectedProvider { id, instance })
     }
 
     /// Get a provider by ID.
@@ -911,7 +915,10 @@ impl ProviderResolver {
 
     /// Get the first model in a tier.
     pub fn first_model_in_tier(&self, tier: ModelTier) -> Option<&str> {
-        self.models.models_for_tier(tier).first().map(|s| s.as_str())
+        self.models
+            .models_for_tier(tier)
+            .first()
+            .map(|s| s.as_str())
     }
 }
 
@@ -1024,7 +1031,10 @@ fast = ["llama3"]
         let config: MayConfig = toml::from_str(toml).unwrap();
         let provider = config.get_provider("my-ollama").unwrap();
         assert_eq!(provider.resolve_type("my-ollama"), ProviderType::Ollama);
-        assert_eq!(provider.base_url.as_deref(), Some("http://192.168.1.100:11434/v1"));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("http://192.168.1.100:11434/v1")
+        );
     }
 
     #[test]
@@ -1034,8 +1044,14 @@ fast = ["llama3"]
         assert_eq!(ProviderType::from_id("openai"), ProviderType::OpenAI);
         assert_eq!(ProviderType::from_id("google"), ProviderType::Google);
         assert_eq!(ProviderType::from_id("gemini"), ProviderType::Google);
-        assert_eq!(ProviderType::from_id("openrouter"), ProviderType::OpenRouter);
-        assert_eq!(ProviderType::from_id("my-custom-thing"), ProviderType::Custom);
+        assert_eq!(
+            ProviderType::from_id("openrouter"),
+            ProviderType::OpenRouter
+        );
+        assert_eq!(
+            ProviderType::from_id("my-custom-thing"),
+            ProviderType::Custom
+        );
     }
 
     #[test]
@@ -1057,8 +1073,8 @@ fast = ["llama3"]
         assert!(!custom_invalid.is_valid("my-custom"));
 
         // Custom with base_url is valid (API key optional)
-        let custom_valid = ProviderInstance::new(ProviderType::Custom)
-            .with_base_url("http://localhost:8080");
+        let custom_valid =
+            ProviderInstance::new(ProviderType::Custom).with_base_url("http://localhost:8080");
         assert!(custom_valid.is_valid("my-custom"));
     }
 
@@ -1081,7 +1097,10 @@ fast = ["llama3"]
     fn test_providers_for_model() {
         let mut config = MayConfig::default();
         config.upsert_provider("anthropic", ProviderInstance::default().with_api_key("key"));
-        config.upsert_provider("openrouter", ProviderInstance::default().with_api_key("key"));
+        config.upsert_provider(
+            "openrouter",
+            ProviderInstance::default().with_api_key("key"),
+        );
         config.models.balanced = vec!["claude-sonnet-4".to_string()];
 
         let providers = config.providers_for_model("claude-sonnet-4");
@@ -1091,8 +1110,14 @@ fast = ["llama3"]
     #[test]
     fn test_resolver_failover() {
         let mut config = MayConfig::default();
-        config.upsert_provider("anthropic", ProviderInstance::default().with_api_key("key1"));
-        config.upsert_provider("openrouter", ProviderInstance::default().with_api_key("key2"));
+        config.upsert_provider(
+            "anthropic",
+            ProviderInstance::default().with_api_key("key1"),
+        );
+        config.upsert_provider(
+            "openrouter",
+            ProviderInstance::default().with_api_key("key2"),
+        );
         config.models.balanced = vec!["claude-sonnet-4".to_string()];
         config.preferences.load_balance_strategy = LoadBalanceStrategy::FailoverOnly;
 
@@ -1119,7 +1144,10 @@ fast = ["llama3"]
     #[test]
     fn test_serialize_config() {
         let mut config = MayConfig::default();
-        config.upsert_provider("anthropic", ProviderInstance::default().with_api_key("test-key"));
+        config.upsert_provider(
+            "anthropic",
+            ProviderInstance::default().with_api_key("test-key"),
+        );
         config.models.balanced = vec!["claude-sonnet-4".to_string()];
 
         let toml = toml::to_string_pretty(&config).unwrap();

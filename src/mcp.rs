@@ -313,9 +313,9 @@ impl McpManager {
         let name = name.into();
         self.config.mcp_servers.insert(name.clone(), config.clone());
         self.connect_server_internal(&name, &config).await?;
-        self.config.save().map_err(|e| {
-            McpError::InvalidConfig(format!("Failed to save config: {e}"))
-        })?;
+        self.config
+            .save()
+            .map_err(|e| McpError::InvalidConfig(format!("Failed to save config: {e}")))?;
         Ok(())
     }
 
@@ -330,9 +330,9 @@ impl McpManager {
 
         // Remove from config
         self.config.mcp_servers.remove(name);
-        self.config.save().map_err(|e| {
-            McpError::InvalidConfig(format!("Failed to save config: {e}"))
-        })?;
+        self.config
+            .save()
+            .map_err(|e| McpError::InvalidConfig(format!("Failed to save config: {e}")))?;
 
         Ok(())
     }
@@ -372,8 +372,9 @@ impl McpManager {
 
         let mut connections = Vec::new();
         for name in names {
-            if let Some(McpConnectionState::Connected(conn)) =
-                self.connections.insert(name, McpConnectionState::Disconnected)
+            if let Some(McpConnectionState::Connected(conn)) = self
+                .connections
+                .insert(name, McpConnectionState::Disconnected)
             {
                 connections.push(conn);
             }
@@ -395,22 +396,17 @@ impl McpManager {
                     "Unknown".to_string()
                 };
 
-                let (status, is_connected, tool_count) =
-                    match self.connections.get(name) {
-                        Some(McpConnectionState::Connected(conn)) => {
-                            let count = conn.definitions().len();
-                            (format!("Connected ({count} tools)"), true, count)
-                        }
-                        Some(McpConnectionState::Connecting) => {
-                            ("Connecting...".to_string(), false, 0)
-                        }
-                        Some(McpConnectionState::Error(e)) => {
-                            (format!("Error: {e}"), false, 0)
-                        }
-                        Some(McpConnectionState::Disconnected) | None => {
-                            ("Disconnected".to_string(), false, 0)
-                        }
-                    };
+                let (status, is_connected, tool_count) = match self.connections.get(name) {
+                    Some(McpConnectionState::Connected(conn)) => {
+                        let count = conn.definitions().len();
+                        (format!("Connected ({count} tools)"), true, count)
+                    }
+                    Some(McpConnectionState::Connecting) => ("Connecting...".to_string(), false, 0),
+                    Some(McpConnectionState::Error(e)) => (format!("Error: {e}"), false, 0),
+                    Some(McpConnectionState::Disconnected) | None => {
+                        ("Disconnected".to_string(), false, 0)
+                    }
+                };
 
                 McpServerInfo {
                     name: name.clone(),
