@@ -109,7 +109,10 @@ impl FilePicker {
     /// Select previous match.
     pub fn select_prev(&mut self) {
         if !self.matches.is_empty() {
-            self.selected = self.selected.checked_sub(1).unwrap_or(self.matches.len() - 1);
+            self.selected = self
+                .selected
+                .checked_sub(1)
+                .unwrap_or(self.matches.len() - 1);
         }
     }
 
@@ -126,11 +129,7 @@ impl FilePicker {
     /// Get visible matches for rendering.
     pub fn visible_matches(&self, max_count: usize) -> impl Iterator<Item = (usize, &PathBuf)> {
         let start = self.selected.saturating_sub(max_count / 2);
-        self.matches
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(max_count)
+        self.matches.iter().enumerate().skip(start).take(max_count)
     }
 
     /// Get the selected index.
@@ -149,11 +148,11 @@ fn collect_files(base_dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
     let walker = WalkBuilder::new(base_dir)
-        .hidden(true)        // Skip hidden files/directories (including .git)
-        .ignore(true)        // Respect .ignore files
-        .git_ignore(true)    // Respect .gitignore
-        .git_global(true)    // Respect global gitignore
-        .git_exclude(true)   // Respect .git/info/exclude
+        .hidden(true) // Skip hidden files/directories (including .git)
+        .ignore(true) // Respect .ignore files
+        .git_ignore(true) // Respect .gitignore
+        .git_global(true) // Respect global gitignore
+        .git_exclude(true) // Respect .git/info/exclude
         .max_depth(Some(10)) // Limit depth
         .build();
 

@@ -41,8 +41,8 @@ pub enum AppEvent {
     SkillDeleted(Result<Vec<SkillInfo>, String>),
 
     // ─── Image loading ────────────────────────────────────────────────
-    /// Image fetched from URL
-    ImageFetched { url: String, data: Vec<u8> },
+    /// Image fetch finished from URL (data=None means fetch failed)
+    ImageFetchResult { url: String, data: Option<Vec<u8>> },
 }
 
 /// Sender type for sending events back to the main loop.
@@ -66,11 +66,11 @@ impl EventHandler {
                 // Poll with timeout for tick events
                 let has_event = unblock(|| event::poll(Duration::from_millis(50)))
                     .await
-                    .expect(ERR_TUI_EVENT_POLL.trim());
+                    .unwrap_or_else(|e| panic!("{}: {}", ERR_TUI_EVENT_POLL.trim(), e));
                 if has_event {
                     let evt = unblock(event::read)
                         .await
-                        .expect(ERR_TUI_EVENT_POLL.trim());
+                        .unwrap_or_else(|e| panic!("{}: {}", ERR_TUI_EVENT_POLL.trim(), e));
                     let app_event = match evt {
                         Event::Key(key) => AppEvent::Key(key.code, key.modifiers),
                         Event::Resize(w, h) => AppEvent::Resize(w, h),

@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use async_fs;
 use arboard::Clipboard;
+use async_fs;
 use image::ImageFormat as ImgFormat;
 use url::Url;
 use zenwave::ResponseExt;
@@ -178,8 +178,7 @@ pub enum ImageError {
 
 /// Try to get an image from the clipboard.
 pub fn get_clipboard_image() -> Result<Option<ClipboardImage>, ImageError> {
-    let mut clipboard =
-        Clipboard::new().map_err(|e| ImageError::Clipboard(e.to_string()))?;
+    let mut clipboard = Clipboard::new().map_err(|e| ImageError::Clipboard(e.to_string()))?;
 
     // Try to get image from clipboard
     let image_data = match clipboard.get_image() {

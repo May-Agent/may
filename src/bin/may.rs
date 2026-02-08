@@ -12,36 +12,41 @@ use std::io::Write;
 
 use aither_agent::AgentEvent;
 
+use async_channel::TryRecvError;
 use crossterm::{
     cursor::MoveTo,
     event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
-use executor_core::{DefaultExecutor, spawn, try_init_global_executor};
-use async_channel::TryRecvError;
 use executor_core::tokio::TokioGlobal;
+use executor_core::{spawn, try_init_global_executor};
 use ratatui::prelude::*;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent, spawn_worker};
-use may_agent::ask_user::{self, AskUserQueue, AskUserBroker};
+use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
+use may_agent::ask_user::{self, AskUserQueue};
 use may_agent::mcp::McpConfig;
-use may_agent::tui::queue::{LARGE_PASTE_THRESHOLD, PASTE_TRUNCATE_LIMIT};
-use may_agent::tui::{ui, App, AppEvent, Attachment, EventHandler, PendingMessage, SendAction};
-use may_agent::workspace_request::{self, WorkspaceRequestQueue, WorkspaceRequestBroker};
-use may_agent::{generate_session_title, MayAgent, MayMcpServerConfig, McpManager, SessionId, SkillManager};
-use serde::Serialize;
+use may_agent::tui::runtime::{RuntimeDeps, TitleGenContext};
+use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
+use may_agent::workspace_request::{self, WorkspaceRequestQueue};
+use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
 
 const PANIC_MESSAGE: &str = include_str!("../texts/panic_message.txt");
+
+/// Terminal reset sequence: RIS + clear scrollback + clear screen + home cursor
+const TERM_RESET: &str = "\x1bc\x1b[3J\x1b[2J\x1b[H";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
     // Initialize logging to file
     let file_appender = tracing_appender::rolling::daily(
-        dirs::home_dir().unwrap_or_default().join(".may").join("logs"),
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".may")
+            .join("logs"),
         "may.log",
     );
     tracing_subscriber::registry()
@@ -62,52 +67,50 @@ async fn main() -> anyhow::Result<()> {
     // Set up panic hook to restore terminal state before panicking
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
-        // Best-effort terminal cleanup
+        // Best-effort terminal cleanup (inline viewport, no alternate screen)
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        );
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = execute!(
             io::stderr(),
             SetForegroundColor(Color::Red),
             Print(PANIC_MESSAGE),
             ResetColor
         );
-        // Call the default panic handler
         default_hook(panic_info);
     }));
 
     // Detect terminal image support (must be before raw mode)
     let image_support = may_agent::tui::ui::image::TerminalImageSupport::detect();
 
-    // Setup terminal - using main buffer for native scroll/selection support
+    // Setup terminal with inline viewport for native scroll/selection
     let mut stdout = io::stdout();
-    // Clear screen and scrollback BEFORE enabling raw mode (RIS resets terminal state)
-    // 1. RIS (Reset to Initial State) - most thorough reset
-    // 2. CSI 3J - clear scrollback (xterm extension)
-    // 3. CSI 2J - clear screen
-    write!(stdout, "\x1bc\x1b[3J\x1b[2J\x1b[H")?;
+    write!(stdout, "{TERM_RESET}")?;
     stdout.flush()?;
-    // Now enable raw mode after reset
     enable_raw_mode()?;
     execute!(stdout, EnableBracketedPaste)?;
+    let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+    // Inline viewport is anchored from cursor position at init time.
+    // Place cursor at (term_height - viewport_height) so viewport starts near bottom.
+    let viewport_height = term_height.saturating_sub(1).min(20).max(8);
+    let init_row = term_height.saturating_sub(viewport_height);
+    execute!(stdout, MoveTo(0, init_row))?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Inline(viewport_height),
+        },
+    )?;
 
     // Create app and run
     let result = run_app(&mut terminal, image_support).await;
 
-    // Cleanup terminal - don't purge scrollback on exit, just clear screen
+    // Cleanup terminal - no alternate screen to leave since we use inline viewport
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        Clear(ClearType::All),
-        MoveTo(0, 0)
-    )?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste)?;
+    // Move to the line after the viewport so the shell prompt appears below
+    let vp = terminal.get_frame().area();
+    execute!(terminal.backend_mut(), MoveTo(0, vp.bottom()))?;
     terminal.show_cursor()?;
 
     result
@@ -151,9 +154,18 @@ where
     // Update app's MCP server list
     app.mcp_servers = mcp_manager.server_info();
 
+    let runtime_deps = RuntimeDeps::new(workspace_broker.clone(), ask_user_broker.clone());
+
     // Only start a session if configuration is complete
     if app.is_configured() {
-        start_new_session(&mut app, &mut worker, workspace_broker.clone(), ask_user_broker.clone()).await?;
+        if let Err(e) = runtime_deps.start_new_session(&mut app, &mut worker).await {
+            tracing::warn!("Initial session start failed: {}", e);
+            app.mode = may_agent::tui::AppMode::Chat;
+            app.status = Some(format!(
+                "Session start failed: {} (open /config to fix provider/model)",
+                e
+            ));
+        }
     }
 
     // Main event loop - only receives from channels, never blocks on agent processing
@@ -162,9 +174,8 @@ where
         &mut worker,
         &mut events,
         terminal,
-        workspace_broker,
+        runtime_deps,
         workspace_queue,
-        ask_user_broker,
         ask_user_queue,
         &mut mcp_manager,
     )
@@ -181,9 +192,8 @@ async fn main_event_loop<B: Backend>(
     worker: &mut Option<AgentWorker>,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
-    workspace_broker: WorkspaceRequestBroker,
+    runtime_deps: RuntimeDeps,
     workspace_queue: WorkspaceRequestQueue,
-    ask_user_broker: AskUserBroker,
     ask_user_queue: AskUserQueue,
     mcp_manager: &mut McpManager,
 ) -> anyhow::Result<()>
@@ -200,9 +210,49 @@ where
     loop {
         tracing::info!("=== LOOP START ===");
 
-        // Draw UI
+        // Draw UI first so content_height/view_height are up to date
         terminal.draw(|frame| ui::render(frame, app))?;
         tracing::info!("after draw");
+
+        // Push only the minimum completed prefix needed to resolve overflow.
+        // Pushing everything at once causes visible jumps when content grows.
+        {
+            use may_agent::tui::ui::chat::{render_elements_to_lines, visual_line_count};
+            let content_h = app.content_height.get();
+            let view_h = app.view_height.get();
+            let overflow = content_h.saturating_sub(view_h);
+            if overflow > 0 {
+                let completed = app.chat.completed_elements();
+                if !completed.is_empty() {
+                    let viewport_width = terminal.get_frame().area().width.max(1) as usize;
+                    let mut elem_count = 0usize;
+                    let mut pushed_rows = 0usize;
+
+                    for elem in completed {
+                        let elem_lines = render_elements_to_lines(std::slice::from_ref(elem));
+                        elem_count += 1;
+                        pushed_rows += visual_line_count(&elem_lines, viewport_width);
+                        if pushed_rows >= overflow {
+                            break;
+                        }
+                    }
+
+                    if elem_count > 0 {
+                        let lines = render_elements_to_lines(&completed[..elem_count]);
+                        let row_count =
+                            visual_line_count(&lines, viewport_width).min(u16::MAX as usize) as u16;
+                        if row_count > 0 {
+                            terminal.insert_before(row_count, |buf| {
+                                use ratatui::widgets::Paragraph;
+                                let text = ratatui::text::Text::from(lines);
+                                Paragraph::new(text).render(buf.area, buf);
+                            })?;
+                        }
+                        app.chat.mark_pushed(elem_count);
+                    }
+                }
+            }
+        }
 
         // Check for model fetch results (non-blocking)
         if let Some(ref mut rx) = app.model_fetch_rx {
@@ -239,7 +289,8 @@ where
         if agent_handle.is_none() {
             if let Some(msg) = app.next_queued() {
                 if let Some(w) = worker.as_ref() {
-                    agent_handle = Some(start_agent_task(app, w, msg, &mut pending_title_gen)?);
+                    agent_handle =
+                        Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
                     assistant_response.clear();
                     continue;
                 }
@@ -290,7 +341,10 @@ where
                         let result = events.next().await;
                         // Don't log ticks, too noisy
                         if !matches!(result, Some(AppEvent::Tick)) {
-                            tracing::info!("events.next() RETURNED: {:?}", result.as_ref().map(|_| "event"));
+                            tracing::info!(
+                                "events.next() RETURNED: {:?}",
+                                result.as_ref().map(|_| "event")
+                            );
                         }
                         result.map(Event::Terminal)
                     },
@@ -299,13 +353,16 @@ where
         )
         .await;
 
-        tracing::info!("select completed, event type: {}", match &event {
-            Some(Event::AskUser(_)) => "AskUser",
-            Some(Event::Workspace(_)) => "Workspace",
-            Some(Event::Agent(_)) => "Agent",
-            Some(Event::Terminal(_)) => "Terminal",
-            None => "None",
-        });
+        tracing::info!(
+            "select completed, event type: {}",
+            match &event {
+                Some(Event::AskUser(_)) => "AskUser",
+                Some(Event::Workspace(_)) => "Workspace",
+                Some(Event::Agent(_)) => "Agent",
+                Some(Event::Terminal(_)) => "Terminal",
+                None => "None",
+            }
+        );
 
         let Some(event) = event else {
             tracing::warn!("All channels closed, exiting");
@@ -337,15 +394,36 @@ where
                         }
                         let ended = app.handle_agent_event(result);
                         if ended {
-                            finish_agent_task(app, &mut agent_handle, &mut pending_title_gen, &assistant_response).await;
+                            runtime_deps
+                                .finish_agent_task(
+                                    app,
+                                    &mut agent_handle,
+                                    &mut pending_title_gen,
+                                    &assistant_response,
+                                )
+                                .await;
                         }
                     }
                     TuiEvent::Complete => {
-                        finish_agent_task(app, &mut agent_handle, &mut pending_title_gen, &assistant_response).await;
+                        runtime_deps
+                            .finish_agent_task(
+                                app,
+                                &mut agent_handle,
+                                &mut pending_title_gen,
+                                &assistant_response,
+                            )
+                            .await;
                     }
                     TuiEvent::Error(err) => {
                         app.chat.push_error(&err);
-                        finish_agent_task(app, &mut agent_handle, &mut pending_title_gen, &assistant_response).await;
+                        runtime_deps
+                            .finish_agent_task(
+                                app,
+                                &mut agent_handle,
+                                &mut pending_title_gen,
+                                &assistant_response,
+                            )
+                            .await;
                     }
                 }
             }
@@ -354,8 +432,8 @@ where
                 // Check for interrupt during agent processing
                 if agent_handle.is_some() {
                     if let AppEvent::Key(key_code, modifiers) = &terminal_event {
-                        let is_ctrl_c =
-                            *key_code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL);
+                        let is_ctrl_c = *key_code == KeyCode::Char('c')
+                            && modifiers.contains(KeyModifiers::CONTROL);
                         let is_esc = *key_code == KeyCode::Esc;
                         if is_ctrl_c || is_esc {
                             tracing::info!("Agent interrupted by user");
@@ -377,17 +455,20 @@ where
                 match app.handle_event(terminal_event)? {
                     Some(SendAction::Quit) => break,
                     Some(SendAction::NewSession) => {
-                        start_new_session(app, worker, workspace_broker.clone(), ask_user_broker.clone())
-                            .await?;
+                        runtime_deps.start_new_session(app, worker).await?;
                     }
                     Some(SendAction::LoadSession(id)) => {
-                        load_session(app, worker, &id, workspace_broker.clone(), ask_user_broker.clone())
-                            .await?;
+                        runtime_deps.load_session(app, worker, &id).await?;
                     }
                     Some(SendAction::Send(msg)) => {
                         if agent_handle.is_none() {
                             if let Some(w) = worker.as_ref() {
-                                agent_handle = Some(start_agent_task(app, w, msg, &mut pending_title_gen)?);
+                                agent_handle = Some(runtime_deps.start_agent_task(
+                                    app,
+                                    w,
+                                    msg,
+                                    &mut pending_title_gen,
+                                )?);
                                 assistant_response.clear();
                             }
                         } else {
@@ -399,21 +480,14 @@ where
                         run_copilot_auth(app, events, terminal).await?;
                     }
                     Some(SendAction::SwitchModel(model)) => {
-                        if let Err(e) = switch_model(
-                            app,
-                            worker,
-                            workspace_broker.clone(),
-                            ask_user_broker.clone(),
-                            &model,
-                        )
-                        .await
-                        {
+                        if let Err(e) = runtime_deps.switch_model(app, worker, &model).await {
                             let err_msg = format!("Failed to switch model: {}", e);
                             app.chat.push_error(&err_msg);
                         } else {
                             tracing::info!("Switched model to: {}", model);
                             app.status = Some(format!("Model: {}", model));
-                            if let Err(e) = app.session_manager.set_current_model(model.clone()).await
+                            if let Err(e) =
+                                app.session_manager.set_current_model(model.clone()).await
                             {
                                 tracing::warn!("Failed to save model to session: {}", e);
                             }
@@ -438,7 +512,11 @@ where
                         // TODO: Add compact command to worker protocol if needed
                         app.status = Some("Compaction not available in worker mode".to_string());
                     }
-                    Some(SendAction::McpAdd { name, command, args }) => {
+                    Some(SendAction::McpAdd {
+                        name,
+                        command,
+                        args,
+                    }) => {
                         let config = MayMcpServerConfig {
                             command: Some(command),
                             args,
@@ -510,7 +588,9 @@ where
                                 Err(e) => Err(e),
                             };
                             let _ = tx
-                                .send(AppEvent::SkillInstalled(final_result.map_err(|e| e.to_string())))
+                                .send(AppEvent::SkillInstalled(
+                                    final_result.map_err(|e| e.to_string()),
+                                ))
                                 .await;
                         })
                         .detach();
@@ -528,7 +608,9 @@ where
                                 Err(e) => Err(e),
                             };
                             let _ = tx
-                                .send(AppEvent::SkillDeleted(final_result.map_err(|e| e.to_string())))
+                                .send(AppEvent::SkillDeleted(
+                                    final_result.map_err(|e| e.to_string()),
+                                ))
                                 .await;
                         })
                         .detach();
@@ -540,318 +622,6 @@ where
     }
 
     Ok(())
-}
-
-/// Context for title generation after agent completes.
-struct TitleGenContext {
-    user_message: String,
-}
-
-/// Start agent processing via the worker.
-fn start_agent_task(
-    app: &mut App,
-    worker: &AgentWorker,
-    msg: PendingMessage,
-    title_gen: &mut Option<TitleGenContext>,
-) -> anyhow::Result<AgentHandle> {
-    // Check if we need to generate a title
-    let needs_title = app
-        .session_manager
-        .current()
-        .map(|s| s.title.is_none())
-        .unwrap_or(false);
-
-    if needs_title {
-        *title_gen = Some(TitleGenContext {
-            user_message: msg.content.clone(),
-        });
-    }
-
-    // Prepare message content and extract image URLs
-    let (prompt, image_urls) = prepare_message_content(&msg)?;
-
-    // Start processing UI
-    app.start_processing(&msg);
-
-    // Send to worker and get handle
-    let handle = worker.run(prompt, image_urls);
-
-    Ok(handle)
-}
-
-/// Finish agent task and handle cleanup.
-async fn finish_agent_task(
-    app: &mut App,
-    agent_handle: &mut Option<AgentHandle>,
-    title_gen: &mut Option<TitleGenContext>,
-    assistant_response: &str,
-) {
-    // Clear the handle
-    *agent_handle = None;
-
-    // Finish processing UI
-    app.finish_processing();
-
-    // Save history
-    if let Err(e) = app.session_manager.save_current().await {
-        tracing::warn!("Failed to save session history: {}", e);
-    }
-
-    // Generate title if needed
-    if let Some(ctx) = title_gen.take() {
-        if !assistant_response.is_empty() {
-            let config = app.config.clone();
-            let user_msg = ctx.user_message;
-            let assistant_resp = assistant_response.to_string();
-            let may_dir = app.session_manager.may_dir().to_path_buf();
-            let session_id = app
-                .session_manager
-                .current()
-                .map(|s| s.id.clone())
-                .expect("session should exist");
-
-            // Spawn title generation in background
-            spawn(async move {
-                use may_agent::session::SessionStore;
-
-                if let Some(title) = generate_session_title(&config, &user_msg, &assistant_resp).await {
-                    let store = SessionStore::new(may_dir.join("sessions"));
-                    match store.read_history(session_id.as_str()).await {
-                        Ok(mut history) => {
-                            history.metadata.title = Some(title);
-                            if let Err(e) =
-                                store.write_history(session_id.as_str(), &history).await
-                            {
-                                tracing::warn!("Failed to write session title: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to read history for title update: {}", e);
-                        }
-                    }
-                }
-            })
-            .detach();
-        }
-    }
-}
-
-/// Start a new session.
-async fn start_new_session(
-    app: &mut App,
-    worker: &mut Option<AgentWorker>,
-    workspace_broker: WorkspaceRequestBroker,
-    ask_user_broker: AskUserBroker,
-) -> anyhow::Result<()> {
-    let may_dir = app.session_manager.may_dir().to_path_buf();
-    let model = app.config.last_model.clone();
-    let session = app.session_manager.create_session_with_model(model.clone())?;
-
-    let sandbox_dir = session.sandbox_dir.clone();
-    let session_id = session.id.clone();
-    let messages: Vec<_> = session.history.messages().to_vec();
-
-    app.init_session(&session_id, &messages, model.as_deref());
-
-    let actual_model = model
-        .clone()
-        .or_else(|| app.config.last_model.clone())
-        .or_else(|| {
-            app.config
-                .default_model_for_tier(may_agent::config::ModelTier::Balanced)
-                .map(|s| s.to_string())
-        });
-
-    let new_agent = match &actual_model {
-        Some(model) => {
-            MayAgent::from_config_with_model(
-                &app.config,
-                sandbox_dir,
-                may_dir,
-                app.cwd.clone(),
-                session_id,
-                workspace_broker,
-                ask_user_broker,
-                model,
-            )
-            .await?
-        }
-        None => anyhow::bail!("No model configured"),
-    };
-
-    if let Some(ref model) = actual_model {
-        app.set_current_model(model);
-    }
-
-    // Spawn the agent in a worker task
-    *worker = Some(spawn_worker(DefaultExecutor, new_agent));
-    Ok(())
-}
-
-/// Load an existing session.
-async fn load_session(
-    app: &mut App,
-    worker: &mut Option<AgentWorker>,
-    id: &SessionId,
-    workspace_broker: WorkspaceRequestBroker,
-    ask_user_broker: AskUserBroker,
-) -> anyhow::Result<()> {
-    let may_dir = app.session_manager.may_dir().to_path_buf();
-    let session = app.session_manager.load_session(id).await?;
-
-    let sandbox_dir = session.sandbox_dir.clone();
-    let session_id = session.id.clone();
-    let session_model = session.model.clone();
-    let messages: Vec<_> = session.history.messages().to_vec();
-
-    app.init_session(&session_id, &messages, session_model.as_deref());
-
-    let actual_model = session_model.or_else(|| app.config.last_model.clone()).or_else(|| {
-        app.config
-            .default_model_for_tier(may_agent::config::ModelTier::Balanced)
-            .map(|s| s.to_string())
-    });
-
-    let new_agent = match &actual_model {
-        Some(model) => {
-            MayAgent::from_config_with_model(
-                &app.config,
-                sandbox_dir,
-                may_dir,
-                app.cwd.clone(),
-                session_id,
-                workspace_broker,
-                ask_user_broker,
-                model,
-            )
-            .await?
-        }
-        None => anyhow::bail!("No model configured"),
-    };
-
-    if let Some(ref model) = actual_model {
-        app.set_current_model(model);
-    }
-
-    // Spawn the agent in a worker task
-    *worker = Some(spawn_worker(DefaultExecutor, new_agent));
-    Ok(())
-}
-
-/// Switch to a different model while keeping the current session.
-async fn switch_model(
-    app: &mut App,
-    worker: &mut Option<AgentWorker>,
-    workspace_broker: WorkspaceRequestBroker,
-    ask_user_broker: AskUserBroker,
-    model: &str,
-) -> anyhow::Result<()> {
-    let session = app
-        .session_manager
-        .current()
-        .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-
-    let sandbox_dir = session.sandbox_dir.clone();
-    let session_id = session.id.clone();
-    let may_dir = app.session_manager.may_dir().to_path_buf();
-
-    let new_agent = MayAgent::from_config_with_model(
-        &app.config,
-        sandbox_dir,
-        may_dir,
-        app.cwd.clone(),
-        session_id,
-        workspace_broker,
-        ask_user_broker,
-        model,
-    )
-    .await?;
-
-    app.set_current_model(model);
-    // Spawn the agent in a worker task
-    *worker = Some(spawn_worker(DefaultExecutor, new_agent));
-    Ok(())
-}
-
-/// Prepare message content and extract attachment URLs for multimodal messages.
-///
-/// Returns (text_prompt, attachment_urls) where:
-/// - text_prompt: The message text with non-image attachments formatted inline
-/// - attachment_urls: File URLs for images/media to be sent to the LLM
-///
-/// Uses file:// URLs so the provider can handle large files efficiently
-/// (upload, stream, or convert as appropriate for the provider).
-///
-/// Errors if any attachment path cannot be represented as a file URL or if
-/// attachment metadata fails to serialize.
-fn prepare_message_content(msg: &PendingMessage) -> anyhow::Result<(String, Vec<url::Url>)> {
-    let mut parts = vec![msg.content.clone()];
-    let mut attachment_urls = Vec::new();
-
-    for attachment in &msg.attachments {
-        match attachment {
-            Attachment::Image { path, .. } => {
-                // Use file:// URL - provider handles reading and conversion
-                let url = url::Url::from_file_path(path).map_err(|_| {
-                    anyhow::anyhow!(
-                        "Failed to convert attachment path to URL: {}",
-                        path.display()
-                    )
-                })?;
-                attachment_urls.push(url);
-            }
-            Attachment::FileReference { path } => {
-                parts.push(format!("\n[File reference: {}]", path.display()));
-            }
-            Attachment::PastedText {
-                content,
-                saved_path,
-            } => {
-                let char_count = content.chars().count();
-                let xml = build_pasted_text_xml(content, char_count, saved_path.as_ref())?;
-                parts.push(format!("\n{}", xml));
-            }
-        }
-    }
-
-    Ok((parts.join(""), attachment_urls))
-}
-
-/// XML structure for pasted text content.
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-struct PastedText {
-    #[serde(rename = "@chars")]
-    chars: usize,
-    #[serde(rename = "@truncated", skip_serializing_if = "Option::is_none")]
-    truncated: Option<bool>,
-    #[serde(rename = "@full_path", skip_serializing_if = "Option::is_none")]
-    full_path: Option<String>,
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-/// Build XML for pasted text using serde + quick-xml.
-fn build_pasted_text_xml(
-    content: &str,
-    char_count: usize,
-    saved_path: Option<&std::path::PathBuf>,
-) -> anyhow::Result<String> {
-    let (text_content, is_truncated) = if char_count > LARGE_PASTE_THRESHOLD {
-        let truncated: String = content.chars().take(PASTE_TRUNCATE_LIMIT).collect();
-        (truncated, true)
-    } else {
-        (content.to_string(), false)
-    };
-
-    let xml = PastedText {
-        chars: char_count,
-        truncated: is_truncated.then_some(true),
-        full_path: saved_path.map(|p| p.display().to_string()),
-        content: text_content,
-    };
-
-    quick_xml::se::to_string(&xml).map_err(|e| anyhow::anyhow!("Failed to serialize paste XML: {}", e))
 }
 
 /// Run the GitHub Copilot OAuth device flow.
@@ -878,7 +648,10 @@ where
         }
     };
 
-    app.set_copilot_device_code(device_code.user_code.clone(), device_code.verification_uri.clone());
+    app.set_copilot_device_code(
+        device_code.user_code.clone(),
+        device_code.verification_uri.clone(),
+    );
     terminal.draw(|frame| ui::render(frame, app))?;
 
     let poll_interval = std::time::Duration::from_secs(device_code.interval.max(5));

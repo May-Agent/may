@@ -8,18 +8,21 @@ use blocking::unblock;
 use crossterm::event::{KeyCode, KeyModifiers};
 use executor_core::spawn;
 
+use crate::ask_user::AskUserRequest;
 use crate::config::{ModelTier, Provider};
 use crate::models::FetchedModel;
-use crate::ask_user::AskUserRequest;
 use crate::workspace_request::WorkspaceRequest;
 use crate::{ChatMessage, MayConfig, MessageRole, SessionId, SessionManager, SessionSummary};
 
-use super::clipboard::{download_image, is_image_url, read_clipboard, ClipboardPasteResult, ImageManager, TextManager};
+use super::agent_event_adapter::{ToolEndKind, ToolStartKind, parse_tool_end, parse_tool_start};
+use super::clipboard::{
+    ClipboardPasteResult, ImageManager, TextManager, download_image, is_image_url, read_clipboard,
+};
 use super::completion::{Completion, CompletionMode};
 use super::event::{AppEvent, EventSender};
 use super::history::InputHistory;
-use super::queue::{Attachment, MessageQueue, PendingMessage, LARGE_PASTE_THRESHOLD};
-use super::ui::chat::{parse_tool_display, parse_tool_result, ChatElement, ChatStream};
+use super::queue::{Attachment, LARGE_PASTE_THRESHOLD, MessageQueue, PendingMessage};
+use super::ui::chat::{ChatElement, ChatStream, ToolDisplay};
 use super::ui::file_picker::FilePicker;
 
 const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../texts/tool_response_send_failed.txt");
@@ -197,15 +200,9 @@ pub enum ConfigEditMode {
     /// Not editing, just navigating
     None,
     /// Editing a text field (provider API key, base URL, etc.)
-    Text {
-        input: String,
-        cursor: usize,
-    },
+    Text { input: String, cursor: usize },
     /// Selecting from a list (provider type, model list)
-    List {
-        items: Vec<String>,
-        selected: usize,
-    },
+    List { items: Vec<String>, selected: usize },
     /// Editing a custom provider (name, base_url, api_key)
     CustomProvider {
         /// Which field is focused (0=name, 1=base_url, 2=api_key)
@@ -540,7 +537,10 @@ impl App {
 
         // Build status message for env-detected providers
         let status = if !env_providers_added.is_empty() {
-            let names: Vec<_> = env_providers_added.iter().map(|(id, _)| id.as_str()).collect();
+            let names: Vec<_> = env_providers_added
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect();
             Some(format!("Auto-configured from env: {}", names.join(", ")))
         } else {
             None
@@ -643,38 +643,52 @@ impl App {
         let tx = self.event_tx.clone();
         tracing::debug!("Starting image fetch: {}", url);
         spawn(async move {
-            match super::ui::image::fetch_image(&url_owned).await {
-                Some(data) => {
-                    tracing::debug!("Image fetch succeeded: {} ({} bytes)", url_owned, data.len());
-                    if let Err(e) = tx.send(AppEvent::ImageFetched {
-                        url: url_owned,
-                        data,
-                    }).await {
-                        tracing::warn!("Failed to send ImageFetched event: {}", e);
-                    }
-                }
-                None => {
-                    tracing::debug!("Image fetch returned None: {}", url_owned);
-                }
+            let data = super::ui::image::fetch_image(&url_owned).await;
+            if let Some(ref bytes) = data {
+                tracing::debug!(
+                    "Image fetch succeeded: {} ({} bytes)",
+                    url_owned,
+                    bytes.len()
+                );
+            } else {
+                tracing::debug!("Image fetch returned None: {}", url_owned);
             }
-        }).detach();
+
+            if let Err(e) = tx
+                .send(AppEvent::ImageFetchResult {
+                    url: url_owned,
+                    data,
+                })
+                .await
+            {
+                tracing::warn!("Failed to send ImageFetchResult event: {}", e);
+            }
+        })
+        .detach();
 
         false
     }
 
-    /// Handle image fetched event.
-    pub fn handle_image_fetched(&mut self, url: String, data: Vec<u8>) {
-        tracing::debug!("Image fetched: url={}, {} bytes", url, data.len());
+    /// Handle image fetch completion event.
+    pub fn handle_image_fetch_result(&mut self, url: String, data: Option<Vec<u8>>) {
         self.image_fetching.remove(&url);
-        if let Some(ref support) = self.image_support {
-            if let Some(state) = support.create_image_state_from_bytes(&data) {
-                tracing::debug!("Image cached successfully: {}", url);
-                self.image_cache.insert(url, state);
-            } else {
-                tracing::debug!("Failed to create image state from bytes: {}", url);
-            }
-        } else {
+
+        let Some(bytes) = data else {
+            tracing::debug!("Image fetch failed for URL: {}", url);
+            return;
+        };
+
+        tracing::debug!("Image fetched: url={}, {} bytes", url, bytes.len());
+        let Some(ref support) = self.image_support else {
             tracing::debug!("No image support, not caching: {}", url);
+            return;
+        };
+
+        if let Some(state) = support.create_image_state_from_bytes(&bytes) {
+            tracing::debug!("Image cached successfully: {}", url);
+            self.image_cache.insert(url, state);
+        } else {
+            tracing::debug!("Failed to create image state from bytes: {}", url);
         }
     }
 
@@ -694,16 +708,28 @@ impl App {
         use super::ui::markdown::extract_images;
 
         // Collect image URLs first to avoid borrow issues
-        let urls: Vec<String> = self.chat.elements().iter().flat_map(|elem| {
-            if let ChatElement::AssistantText { content, .. } = elem {
-                extract_images(content.as_str()).into_iter().map(|(_, url)| url).collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            }
-        }).collect();
+        let urls: Vec<String> = self
+            .chat
+            .active_elements()
+            .iter()
+            .flat_map(|elem| {
+                if let ChatElement::AssistantText { content, .. } = elem {
+                    extract_images(content.as_str())
+                        .into_iter()
+                        .map(|(_, url)| url)
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
 
         if !urls.is_empty() {
-            tracing::debug!("scan_and_fetch_images: found {} URLs: {:?}", urls.len(), urls);
+            tracing::debug!(
+                "scan_and_fetch_images: found {} URLs: {:?}",
+                urls.len(),
+                urls
+            );
         }
 
         for url in urls {
@@ -712,57 +738,17 @@ impl App {
     }
 
     /// Normalize scroll value if it's at the "follow bottom" sentinel.
-    /// This converts usize::MAX to actual max scroll position.
-    pub fn normalize_scroll(&mut self) {
-        let content = self.content_height.get();
-        let view = self.view_height.get();
-        if self.scroll > content {
-            let max_scroll = content.saturating_sub(view);
-            self.scroll = max_scroll;
-        }
-    }
-
-    /// Scroll up by one line.
-    fn scroll_up(&mut self) {
-        self.scroll_up_by(1);
-    }
-
-    /// Scroll down by one line.
-    fn scroll_down(&mut self) {
-        self.scroll_down_by(1);
-    }
-
-    /// Scroll up by a number of lines.
-    fn scroll_up_by(&mut self, lines: usize) {
-        if self.scroll == usize::MAX {
-            self.normalize_scroll();
-        }
-        self.scroll = self.scroll.saturating_sub(lines);
-    }
-
-    /// Scroll down by a number of lines.
-    fn scroll_down_by(&mut self, lines: usize) {
-        if self.scroll == usize::MAX {
-            self.normalize_scroll();
-        }
-
-        self.scroll = self.scroll.saturating_add(lines);
-
-        // Check if we've reached the bottom - snap to sentinel
-        let content = self.content_height.get();
-        let view = self.view_height.get();
-        let max_scroll = content.saturating_sub(view);
-
-        if self.scroll >= max_scroll {
-            self.scroll = usize::MAX;
-        }
-    }
 
     /// Initialize for a session (sets up image manager and status).
     ///
     /// Takes the session ID and a slice of messages to avoid borrow conflicts
     /// with the session manager.
-    pub fn init_session(&mut self, session_id: &SessionId, messages: &[ChatMessage], model: Option<&str>) {
+    pub fn init_session(
+        &mut self,
+        session_id: &SessionId,
+        messages: &[ChatMessage],
+        model: Option<&str>,
+    ) {
         // Load chat history into display
         self.chat = ChatStream::new();
         for msg in messages {
@@ -778,7 +764,10 @@ impl App {
             }
         }
 
-        let session_dir = self.session_manager.store().session_dir(session_id.as_str());
+        let session_dir = self
+            .session_manager
+            .store()
+            .session_dir(session_id.as_str());
         self.image_manager = Some(ImageManager::new(&session_dir));
         self.text_manager = Some(TextManager::new(&session_dir));
 
@@ -828,12 +817,16 @@ impl App {
                         self.mode = AppMode::SessionSelect;
                     }
                     Err(e) => {
-                        self.chat.push_error(&format!("Failed to load sessions: {}", e));
+                        self.chat
+                            .push_error(&format!("Failed to load sessions: {}", e));
                     }
                 }
                 Ok(None)
             }
-            AppEvent::SessionDeleted { was_current, result } => {
+            AppEvent::SessionDeleted {
+                was_current,
+                result,
+            } => {
                 self.status = None;
                 match result {
                     Ok(sessions) => {
@@ -851,7 +844,8 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.chat.push_error(&format!("Failed to delete session: {}", e));
+                        self.chat
+                            .push_error(&format!("Failed to delete session: {}", e));
                     }
                 }
                 Ok(None)
@@ -867,7 +861,8 @@ impl App {
                         self.mode = AppMode::SkillManage;
                     }
                     Err(e) => {
-                        self.chat.push_error(&format!("Failed to load skills: {}", e));
+                        self.chat
+                            .push_error(&format!("Failed to load skills: {}", e));
                     }
                 }
                 Ok(None)
@@ -883,7 +878,8 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.chat.push_error(&format!("Failed to install skill: {}", e));
+                        self.chat
+                            .push_error(&format!("Failed to install skill: {}", e));
                     }
                 }
                 Ok(None)
@@ -899,13 +895,14 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.chat.push_error(&format!("Failed to delete skill: {}", e));
+                        self.chat
+                            .push_error(&format!("Failed to delete skill: {}", e));
                     }
                 }
                 Ok(None)
             }
-            AppEvent::ImageFetched { url, data } => {
-                self.handle_image_fetched(url, data);
+            AppEvent::ImageFetchResult { url, data } => {
+                self.handle_image_fetch_result(url, data);
                 Ok(None)
             }
         }
@@ -958,23 +955,21 @@ impl App {
                     filter: PasteFilter::Any,
                 });
             }
-            AppMode::McpManage => {
-                match self.mcp_add_mode {
-                    McpAddMode::Name => {
-                        return Some(ActiveTextInput::Simple {
-                            input: &mut self.mcp_add_name,
-                            filter: PasteFilter::Identifier,
-                        });
-                    }
-                    McpAddMode::Command => {
-                        return Some(ActiveTextInput::Simple {
-                            input: &mut self.mcp_add_command,
-                            filter: PasteFilter::Any,
-                        });
-                    }
-                    McpAddMode::None => {}
+            AppMode::McpManage => match self.mcp_add_mode {
+                McpAddMode::Name => {
+                    return Some(ActiveTextInput::Simple {
+                        input: &mut self.mcp_add_name,
+                        filter: PasteFilter::Identifier,
+                    });
                 }
-            }
+                McpAddMode::Command => {
+                    return Some(ActiveTextInput::Simple {
+                        input: &mut self.mcp_add_command,
+                        filter: PasteFilter::Any,
+                    });
+                }
+                McpAddMode::None => {}
+            },
             AppMode::SkillManage => {
                 match self.skill_add_mode {
                     SkillAddMode::GitHubRepo => {
@@ -1120,7 +1115,11 @@ impl App {
             }
             KeyCode::Enter => {
                 // If waiting for user, open URL in browser and copy code
-                if let Some(CopilotAuthStatus::WaitingForUser { user_code, verification_uri }) = &self.copilot_auth_status {
+                if let Some(CopilotAuthStatus::WaitingForUser {
+                    user_code,
+                    verification_uri,
+                }) = &self.copilot_auth_status
+                {
                     return Ok(Some(SendAction::OpenCopilotAuthUrl {
                         url: verification_uri.clone(),
                         code: user_code.clone(),
@@ -1141,24 +1140,23 @@ impl App {
     }
 
     /// Handle key in workspace confirmation dialog.
-    fn handle_workspace_confirm_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
+    fn handle_workspace_confirm_key(
+        &mut self,
+        code: KeyCode,
+    ) -> anyhow::Result<Option<SendAction>> {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 // Approve: take the request and approve it
                 let mode = std::mem::replace(&mut self.mode, AppMode::Chat);
                 if let AppMode::WorkspaceConfirm(request) = mode {
-                    request
-                        .respond(true)
-                        .expect(ERR_TOOL_RESPONSE_SEND.trim());
+                    request.respond(true).expect(ERR_TOOL_RESPONSE_SEND.trim());
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 // Deny: take the request and deny it
                 let mode = std::mem::replace(&mut self.mode, AppMode::Chat);
                 if let AppMode::WorkspaceConfirm(request) = mode {
-                    request
-                        .respond(false)
-                        .expect(ERR_TOOL_RESPONSE_SEND.trim());
+                    request.respond(false).expect(ERR_TOOL_RESPONSE_SEND.trim());
                 }
             }
             _ => {}
@@ -1302,11 +1300,13 @@ impl App {
                     KeyCode::Enter => {
                         if !self.mcp_add_command.is_empty() {
                             // Parse command into program and args
-                            let parts: Vec<&str> = self.mcp_add_command.split_whitespace().collect();
+                            let parts: Vec<&str> =
+                                self.mcp_add_command.split_whitespace().collect();
                             if let Some((command, args)) = parts.split_first() {
                                 let name = std::mem::take(&mut self.mcp_add_name);
                                 let command_str = (*command).to_string();
-                                let args_vec: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+                                let args_vec: Vec<String> =
+                                    args.iter().map(|s| (*s).to_string()).collect();
                                 self.mcp_add_mode = McpAddMode::None;
                                 self.mcp_add_command.clear();
                                 return Ok(Some(SendAction::McpAdd {
@@ -1582,41 +1582,24 @@ impl App {
                 self.cursor = (self.cursor + 1).min(self.input_char_count);
             }
             KeyCode::Up => {
-                // Up navigates completion if active
                 if self.completion.is_active() {
                     self.completion.prev();
-                } else if self.input.is_empty() || self.history.is_navigating() {
-                    // Up navigates history when input is empty or already navigating
-                    if let Some(entry) = self.history.prev(&self.input) {
-                        self.input = entry.to_string();
-                        self.input_char_count = self.input.chars().count();
-                        self.cursor = self.input_char_count;
-                    }
-                } else {
-                    self.scroll_up();
+                } else if let Some(entry) = self.history.prev(&self.input) {
+                    self.input = entry.to_string();
+                    self.input_char_count = self.input.chars().count();
+                    self.cursor = self.input_char_count;
                 }
             }
             KeyCode::Down => {
-                // Down navigates completion if active
                 if self.completion.is_active() {
                     self.completion.next();
-                } else if self.history.is_navigating() {
-                    // Down navigates history when already navigating
-                    if let Some(entry) = self.history.next() {
-                        self.input = entry.to_string();
-                        self.input_char_count = self.input.chars().count();
-                        self.cursor = self.input_char_count;
-                    }
-                } else {
-                    self.scroll_down();
+                } else if let Some(entry) = self.history.next() {
+                    self.input = entry.to_string();
+                    self.input_char_count = self.input.chars().count();
+                    self.cursor = self.input_char_count;
                 }
             }
-            KeyCode::PageUp => {
-                self.scroll_up_by(10);
-            }
-            KeyCode::PageDown => {
-                self.scroll_down_by(10);
-            }
+            // PageUp/PageDown: native terminal scroll handles this now
             KeyCode::Home => {
                 self.cursor = 0;
             }
@@ -1665,9 +1648,7 @@ impl App {
                 spawn(async move {
                     let result = store.list_session_summaries().await;
                     let _ = tx
-                        .send(AppEvent::SessionsLoaded(
-                            result.map_err(|e| e.to_string()),
-                        ))
+                        .send(AppEvent::SessionsLoaded(result.map_err(|e| e.to_string())))
                         .await;
                 })
                 .detach();
@@ -1680,9 +1661,7 @@ impl App {
                     let sandbox_dir = &session.sandbox_dir;
                     #[cfg(target_os = "macos")]
                     {
-                        let _ = std::process::Command::new("open")
-                            .arg(sandbox_dir)
-                            .spawn();
+                        let _ = std::process::Command::new("open").arg(sandbox_dir).spawn();
                     }
                     #[cfg(target_os = "linux")]
                     {
@@ -1708,7 +1687,11 @@ impl App {
             "/model" => {
                 self.model_select_list = self.collect_all_models();
                 self.model_select_index = 0;
-                if let Some(current) = self.current_model.as_deref().or(self.config.last_model.as_deref()) {
+                if let Some(current) = self
+                    .current_model
+                    .as_deref()
+                    .or(self.config.last_model.as_deref())
+                {
                     if let Some(idx) = self.model_select_list.iter().position(|m| m == current) {
                         self.model_select_index = idx;
                     }
@@ -1929,7 +1912,10 @@ impl App {
     }
 
     /// Handle key in tier model picker mode.
-    fn handle_tier_model_picker_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
+    fn handle_tier_model_picker_key(
+        &mut self,
+        code: KeyCode,
+    ) -> anyhow::Result<Option<SendAction>> {
         match code {
             KeyCode::Esc => {
                 // Cancel and go back to config
@@ -1941,7 +1927,9 @@ impl App {
                 if let Some(&idx) = self.tier_picker_filtered.get(self.tier_picker_selected) {
                     if let Some(model) = self.tier_picker_models.get(idx) {
                         if let Some(tier) = self.tier_picker_tier {
-                            self.config.models.add_model(tier, &model.id, &model.provider_id);
+                            self.config
+                                .models
+                                .add_model(tier, &model.id, &model.provider_id);
                             if let Err(e) = self.config.save() {
                                 tracing::error!("Failed to save config: {}", e);
                             }
@@ -1993,7 +1981,10 @@ impl App {
 
     /// Open tier model picker for a specific tier.
     /// Returns a receiver to poll for fetched models if async fetch was started.
-    pub fn open_tier_model_picker(&mut self, tier: ModelTier) -> Option<Receiver<Vec<FetchedModel>>> {
+    pub fn open_tier_model_picker(
+        &mut self,
+        tier: ModelTier,
+    ) -> Option<Receiver<Vec<FetchedModel>>> {
         self.tier_picker_tier = Some(tier);
         self.tier_picker_query.clear();
         self.tier_picker_selected = 0;
@@ -2116,13 +2107,11 @@ impl App {
             match (a_tier_match, b_tier_match) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => {
-                    match (a_info.is_some(), b_info.is_some()) {
-                        (true, false) => std::cmp::Ordering::Less,
-                        (false, true) => std::cmp::Ordering::Greater,
-                        _ => a.id.cmp(&b.id),
-                    }
-                }
+                _ => match (a_info.is_some(), b_info.is_some()) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.id.cmp(&b.id),
+                },
             }
         });
 
@@ -2241,22 +2230,30 @@ impl App {
                         }
                     }
                     // Regular provider - just edit API key
-                    let current_key = self.config.provider
+                    let current_key = self
+                        .config
+                        .provider
                         .get(&id)
                         .and_then(|p| p.api_key.clone())
                         .unwrap_or_default();
                     state.start_text_edit(&current_key);
                 }
             }
-            ConfigSection::Models => {
-                match state.selected {
-                    0 => { self.model_fetch_rx = self.open_tier_model_picker(ModelTier::Advanced); }
-                    1 => { self.model_fetch_rx = self.open_tier_model_picker(ModelTier::Balanced); }
-                    2 => { self.model_fetch_rx = self.open_tier_model_picker(ModelTier::Fast); }
-                    3 => { self.model_fetch_rx = self.open_tier_model_picker(ModelTier::ImageGeneration); }
-                    _ => {}
+            ConfigSection::Models => match state.selected {
+                0 => {
+                    self.model_fetch_rx = self.open_tier_model_picker(ModelTier::Advanced);
                 }
-            }
+                1 => {
+                    self.model_fetch_rx = self.open_tier_model_picker(ModelTier::Balanced);
+                }
+                2 => {
+                    self.model_fetch_rx = self.open_tier_model_picker(ModelTier::Fast);
+                }
+                3 => {
+                    self.model_fetch_rx = self.open_tier_model_picker(ModelTier::ImageGeneration);
+                }
+                _ => {}
+            },
             ConfigSection::Preferences => {
                 match state.selected {
                     0 => {
@@ -2266,18 +2263,22 @@ impl App {
                     1 => {
                         // Toggle load balance strategy
                         use crate::config::LoadBalanceStrategy;
-                        self.config.preferences.load_balance_strategy = match self.config.preferences.load_balance_strategy {
-                            LoadBalanceStrategy::RoundRobin => LoadBalanceStrategy::FailoverOnly,
-                            LoadBalanceStrategy::FailoverOnly => LoadBalanceStrategy::Random,
-                            LoadBalanceStrategy::Random => LoadBalanceStrategy::RoundRobin,
-                        };
+                        self.config.preferences.load_balance_strategy =
+                            match self.config.preferences.load_balance_strategy {
+                                LoadBalanceStrategy::RoundRobin => {
+                                    LoadBalanceStrategy::FailoverOnly
+                                }
+                                LoadBalanceStrategy::FailoverOnly => LoadBalanceStrategy::Random,
+                                LoadBalanceStrategy::Random => LoadBalanceStrategy::RoundRobin,
+                            };
                         if let Err(e) = self.config.save() {
                             tracing::error!("Failed to save config: {}", e);
                         }
                     }
                     2 => {
                         // Toggle warn_on_model_change
-                        self.config.preferences.warn_on_model_change = !self.config.preferences.warn_on_model_change;
+                        self.config.preferences.warn_on_model_change =
+                            !self.config.preferences.warn_on_model_change;
                         if let Err(e) = self.config.save() {
                             tracing::error!("Failed to save config: {}", e);
                         }
@@ -2348,7 +2349,9 @@ impl App {
                             self.config.upsert_provider(&provider_id, instance);
                             state.load_providers(&self.config);
                             // Find the new provider in the list and select it
-                            if let Some(pos) = state.provider_ids.iter().position(|id| id == &provider_id) {
+                            if let Some(pos) =
+                                state.provider_ids.iter().position(|id| id == &provider_id)
+                            {
                                 state.selected = pos;
                             }
                             // Start editing API key
@@ -2448,7 +2451,11 @@ impl App {
                     // Clone values before moving out of the borrowed state
                     let name_val = name.clone();
                     let base_url_val = base_url.clone();
-                    let api_key_val = if api_key.is_empty() { None } else { Some(api_key.clone()) };
+                    let api_key_val = if api_key.is_empty() {
+                        None
+                    } else {
+                        Some(api_key.clone())
+                    };
                     let was_editing = *editing_existing;
                     let orig_name = original_name.clone();
 
@@ -2792,15 +2799,49 @@ impl App {
                             self.chat.update_thinking(secs);
                         }
                     }
-                    AgentEvent::ToolCallStart { id, arguments, .. } => {
+                    AgentEvent::ToolCallStart {
+                        id,
+                        name,
+                        arguments,
+                    } => {
                         self.chat.end_loading();
                         self.chat.end_text();
-                        let display = parse_tool_display(&arguments);
+                        let display = match parse_tool_start(&name, &arguments) {
+                            ToolStartKind::Bash { command, mode } => ToolDisplay::Bash {
+                                command,
+                                mode,
+                                status: super::ui::chat::ToolStatus::Running,
+                                output: None,
+                            },
+                            ToolStartKind::Generic { name, arguments } => ToolDisplay::Bash {
+                                command: format!("{} {}", name, arguments),
+                                mode: aither_sandbox::BashMode::Sandboxed,
+                                status: super::ui::chat::ToolStatus::Running,
+                                output: None,
+                            },
+                        };
                         self.chat.push_tool(id, display);
                     }
                     AgentEvent::ToolCallEnd { id, result, .. } => {
-                        let feedback = parse_tool_result(&result);
-                        self.chat.update_tool_with_feedback(&id, feedback);
+                        let feedback = parse_tool_end(&result);
+                        match feedback {
+                            ToolEndKind::Output(out) => {
+                                self.chat.update_tool_with_output(
+                                    &id,
+                                    super::ui::chat::ToolStatus::Done,
+                                    None,
+                                    Some(out),
+                                );
+                            }
+                            ToolEndKind::Error(err) => {
+                                self.chat.update_tool_with_output(
+                                    &id,
+                                    super::ui::chat::ToolStatus::Failed(err),
+                                    None,
+                                    None,
+                                );
+                            }
+                        }
                     }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events
@@ -2862,7 +2903,9 @@ impl App {
             .unwrap_or_default();
 
         if let Some(session) = self.session_manager.current_mut() {
-            session.history.push(ChatMessage::assistant(&assistant_content));
+            session
+                .history
+                .push(ChatMessage::assistant(&assistant_content));
         }
 
         // Note: History is saved asynchronously in src/bin/may.rs after finish_processing returns
@@ -3022,16 +3065,31 @@ pub enum SendAction {
     /// Start GitHub Copilot OAuth authentication.
     StartCopilotAuth,
     /// Open Copilot auth URL in browser and copy code to clipboard.
-    OpenCopilotAuthUrl { url: String, code: String },
+    OpenCopilotAuthUrl {
+        url: String,
+        code: String,
+    },
     /// Switch to a different model for this session.
     SwitchModel(String),
     /// Compact the conversation history.
     Compact,
     /// MCP server management actions.
-    McpAdd { name: String, command: String, args: Vec<String> },
-    McpRemove { name: String },
-    McpReconnect { name: String },
+    McpAdd {
+        name: String,
+        command: String,
+        args: Vec<String>,
+    },
+    McpRemove {
+        name: String,
+    },
+    McpReconnect {
+        name: String,
+    },
     /// Skill management actions.
-    SkillInstall { repo: String },
-    SkillDelete { dir_name: String },
+    SkillInstall {
+        repo: String,
+    },
+    SkillDelete {
+        dir_name: String,
+    },
 }

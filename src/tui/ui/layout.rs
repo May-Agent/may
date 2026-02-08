@@ -5,11 +5,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
-use super::super::app::{App, AppMode, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode, SkillAddMode};
+use super::super::app::{
+    App, AppMode, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode, SkillAddMode,
+};
 use super::super::completion::CompletionMode;
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
-use crate::workspace_request::WorkspaceRequest;
 use crate::ask_user::AskUserRequest;
+use crate::workspace_request::WorkspaceRequest;
 
 /// Convert character index to byte index for safe string slicing.
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
@@ -243,7 +245,12 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
             )));
         }
 
-        for (display_idx, (_original_idx, summary)) in filtered.iter().enumerate().skip(scroll).take(visible_height) {
+        for (display_idx, (_original_idx, summary)) in filtered
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible_height)
+        {
             let selected = display_idx == app.session_selected;
             let prefix = if selected { "> " } else { "  " };
 
@@ -251,7 +258,9 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
             let is_current = current_id == Some(summary.id.as_str());
 
             let mut name_style = if selected {
-                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -290,12 +299,14 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                 let content_lower = summary.content_preview.to_lowercase();
                 if let Some(pos) = content_lower.find(&query) {
                     // Find safe UTF-8 boundaries around the match
-                    let start = summary.content_preview[..pos].char_indices()
+                    let start = summary.content_preview[..pos]
+                        .char_indices()
                         .rev()
                         .nth(20)
                         .map(|(i, _)| i)
                         .unwrap_or(0);
-                    let end = summary.content_preview[pos..].char_indices()
+                    let end = summary.content_preview[pos..]
+                        .char_indices()
                         .nth(query_char_count + 40)
                         .map(|(i, _)| pos + i)
                         .unwrap_or(summary.content_preview.len());
@@ -304,7 +315,11 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                     let snippet_lower = snippet.to_lowercase();
 
                     let prefix = if start > 0 { "..." } else { "" };
-                    let suffix = if end < summary.content_preview.len() { "..." } else { "" };
+                    let suffix = if end < summary.content_preview.len() {
+                        "..."
+                    } else {
+                        ""
+                    };
 
                     // Find match position in the processed snippet for accurate highlighting
                     if let Some(match_pos) = snippet_lower.find(&query) {
@@ -319,7 +334,9 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                             Span::styled(before_match, Style::default().fg(Color::DarkGray)),
                             Span::styled(
                                 matched,
-                                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD),
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
                             ),
                             Span::styled(after_match, Style::default().fg(Color::DarkGray)),
                             Span::styled(suffix.to_string(), Style::default().fg(Color::DarkGray)),
@@ -413,14 +430,12 @@ fn render_file_picker_popup(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::White)
     };
 
-    let search_input = Paragraph::new(input_text)
-        .style(input_style)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(format!("Select File ({} matches)", picker.match_count())),
-        );
+    let search_input = Paragraph::new(input_text).style(input_style).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!("Select File ({} matches)", picker.match_count())),
+    );
 
     frame.render_widget(search_input, chunks[0]);
 
@@ -502,8 +517,8 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     // Create a popup area (60% width, 50% height, centered)
     let popup_width = (area.width * 60 / 100).min(80).max(40);
     let popup_height = (area.height * 50 / 100).min(20).max(10);
-    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
-    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
     // Clear the popup area
@@ -580,7 +595,8 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
                 let model_id = fetched.map(|m| m.id.as_str()).unwrap_or("");
                 // Check if model matches tier (for visual indicator)
                 let info = aither_models::lookup(model_id);
-                let tier_match = app.tier_picker_tier
+                let tier_match = app
+                    .tier_picker_tier
                     .map(|t| match t {
                         ModelTier::Advanced => aither_models::ModelTier::Flagship,
                         ModelTier::Balanced => aither_models::ModelTier::Balanced,
@@ -659,16 +675,21 @@ fn render_config_screen(frame: &mut Frame, area: Rect, app: &App) {
             if *s == state.section {
                 Span::styled(
                     format!(" [{}] ", s.name()),
-                    Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
                 )
             } else {
                 Span::styled(format!(" {} ", s.name()), Style::default().fg(Color::White))
             }
         })
         .collect();
-    let tab_line = Line::from(vec![
-        Span::styled("Settings: ", Style::default().fg(Color::Cyan)),
-    ].into_iter().chain(tabs).collect::<Vec<_>>());
+    let tab_line = Line::from(
+        vec![Span::styled("Settings: ", Style::default().fg(Color::Cyan))]
+            .into_iter()
+            .chain(tabs)
+            .collect::<Vec<_>>(),
+    );
     frame.render_widget(Paragraph::new(tab_line), chunks[0]);
 
     // Content based on section
@@ -725,7 +746,9 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
             };
             let text = format!("{}{:<20} {}", prefix, id, status);
             let style = if idx == state.selected {
-                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -734,16 +757,26 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     // Add "Add provider..." item
-    let add_prefix = if state.selected >= state.provider_ids.len() { "> " } else { "  " };
+    let add_prefix = if state.selected >= state.provider_ids.len() {
+        "> "
+    } else {
+        "  "
+    };
     let add_style = if state.selected >= state.provider_ids.len() {
-        Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD)
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(ratatui::style::Modifier::BOLD)
     } else {
         Style::default().fg(Color::Green)
     };
     items.push(ListItem::new(format!("{}+ Add provider...", add_prefix)).style(add_style));
 
     // If in list selection mode, show provider type selector overlay
-    if let ConfigEditMode::List { items: list_items, selected } = &state.edit_mode {
+    if let ConfigEditMode::List {
+        items: list_items,
+        selected,
+    } = &state.edit_mode
+    {
         let popup_area = centered_rect(50, 60, area);
         frame.render_widget(Clear, popup_area);
 
@@ -753,7 +786,9 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
             .map(|(idx, name)| {
                 let prefix = if idx == *selected { "> " } else { "  " };
                 let style = if idx == *selected {
-                    Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(ratatui::style::Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -797,7 +832,13 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
             .split(popup_area);
 
         // Helper to render a field
-        let render_field = |frame: &mut Frame, area: Rect, label: &str, value: &str, is_focused: bool, cur: usize, mask: bool| {
+        let render_field = |frame: &mut Frame,
+                            area: Rect,
+                            label: &str,
+                            value: &str,
+                            is_focused: bool,
+                            cur: usize,
+                            mask: bool| {
             let display_value = if mask {
                 value.chars().map(|_| '*').collect::<String>()
             } else {
@@ -806,7 +847,11 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
             // Convert char index to byte index for safe slicing
             let cursor_pos = char_to_byte_idx(&display_value, cur);
             let display = if is_focused {
-                format!("{}|{}", &display_value[..cursor_pos], &display_value[cursor_pos..])
+                format!(
+                    "{}|{}",
+                    &display_value[..cursor_pos],
+                    &display_value[cursor_pos..]
+                )
             } else {
                 display_value
             };
@@ -817,19 +862,48 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
             };
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(if is_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Gray) })
+                .border_style(if is_focused {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Gray)
+                })
                 .title(label);
             let paragraph = Paragraph::new(display).style(style).block(block);
             frame.render_widget(paragraph, area);
         };
 
-        render_field(frame, chunks[0], "Name (ID)", name, *focused_field == 0, *cursor, false);
-        render_field(frame, chunks[1], "Base URL", base_url, *focused_field == 1, *cursor, false);
-        render_field(frame, chunks[2], "API Key (optional)", api_key, *focused_field == 2, *cursor, true);
+        render_field(
+            frame,
+            chunks[0],
+            "Name (ID)",
+            name,
+            *focused_field == 0,
+            *cursor,
+            false,
+        );
+        render_field(
+            frame,
+            chunks[1],
+            "Base URL",
+            base_url,
+            *focused_field == 1,
+            *cursor,
+            false,
+        );
+        render_field(
+            frame,
+            chunks[2],
+            "API Key (optional)",
+            api_key,
+            *focused_field == 2,
+            *cursor,
+            true,
+        );
 
-        let instructions = Paragraph::new("Tab/↓↑ to switch fields · Enter to save · Esc to cancel")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(ratatui::layout::Alignment::Center);
+        let instructions =
+            Paragraph::new("Tab/↓↑ to switch fields · Enter to save · Esc to cancel")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(instructions, chunks[3]);
 
         // Draw border around the popup
@@ -882,7 +956,9 @@ fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
             let display_value = if value.is_empty() { "(not set)" } else { value };
             let text = format!("{}{:<20} {}", prefix, name, display_value);
             let style = if idx == state.selected {
-                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -894,8 +970,9 @@ fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
     if let Some((input, cursor)) = state.edit_text() {
         let cursor_pos = char_to_byte_idx(input, cursor);
         let display = format!("{}|{}", &input[..cursor_pos], &input[cursor_pos..]);
-        items[state.selected] = ListItem::new(format!("  {}: {}", tier_names[state.selected], display))
-            .style(Style::default().fg(Color::Yellow));
+        items[state.selected] =
+            ListItem::new(format!("  {}: {}", tier_names[state.selected], display))
+                .style(Style::default().fg(Color::Yellow));
     }
 
     let list = List::new(items).block(
@@ -933,7 +1010,9 @@ fn render_preferences_section(frame: &mut Frame, area: Rect, app: &App) {
             let prefix = if idx == state.selected { "> " } else { "  " };
             let text = format!("{}{:<25} {}", prefix, name, value);
             let style = if idx == state.selected {
-                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -967,7 +1046,7 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_width = 40.min(area.width);
     let popup_x = area.x;
     // Position near bottom, leaving space for status and input (2 lines from bottom)
-    let popup_y = area.height.saturating_sub(popup_height + 2);
+    let popup_y = area.y + area.height.saturating_sub(popup_height + 2);
 
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
@@ -978,13 +1057,23 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, model)| {
-            let prefix = if idx == app.model_select_index { "> " } else { "  " };
+            let prefix = if idx == app.model_select_index {
+                "> "
+            } else {
+                "  "
+            };
             // Check if this is current model
-            let current = app.current_model.as_deref().map(|m| m == model).unwrap_or(false);
+            let current = app
+                .current_model
+                .as_deref()
+                .map(|m| m == model)
+                .unwrap_or(false);
             let suffix = if current { " (current)" } else { "" };
             let text = format!("{}{}{}", prefix, model, suffix);
             let style = if idx == app.model_select_index {
-                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -1054,7 +1143,10 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(""),
             ]
         }
-        Some(CopilotAuthStatus::WaitingForUser { user_code, verification_uri }) => {
+        Some(CopilotAuthStatus::WaitingForUser {
+            user_code,
+            verification_uri,
+        }) => {
             vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1063,7 +1155,9 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                 )),
                 Line::from(Span::styled(
                     format!("   {}", verification_uri),
-                    Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1072,7 +1166,9 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                 )),
                 Line::from(Span::styled(
                     format!("   {}", user_code),
-                    Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1091,7 +1187,9 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "Authentication successful!",
-                    Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1105,7 +1203,9 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "Authentication failed:",
-                    Style::default().fg(Color::Red).add_modifier(ratatui::style::Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     format!("  {}", error),
@@ -1173,13 +1273,12 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRe
         Line::from(""),
         Line::from(Span::styled(
             format!("  {}", request.args.path.as_str()),
-            Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "Reason:",
-            Style::default().fg(Color::White),
-        )),
+        Line::from(Span::styled("Reason:", Style::default().fg(Color::White))),
         Line::from(Span::styled(
             format!("  {}", request.args.reason.as_str()),
             Style::default().fg(Color::Yellow),
@@ -1262,7 +1361,9 @@ fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
                         Span::styled(
                             &server.name,
                             if selected {
-                                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(ratatui::style::Modifier::BOLD)
                             } else {
                                 Style::default().fg(Color::White)
                             },
@@ -1452,7 +1553,12 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                     )));
                 }
 
-                for (idx, skill) in filtered.iter().enumerate().skip(scroll).take(visible_height) {
+                for (idx, skill) in filtered
+                    .iter()
+                    .enumerate()
+                    .skip(scroll)
+                    .take(visible_height)
+                {
                     let selected = idx == app.skill_selected;
                     let prefix = if selected { "> " } else { "  " };
 
@@ -1475,7 +1581,9 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                         Span::styled(
                             &skill.name,
                             if selected {
-                                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(ratatui::style::Modifier::BOLD)
                             } else {
                                 Style::default().fg(Color::White)
                             },
@@ -1561,7 +1669,13 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render the AskUser dialog.
-fn render_ask_user(frame: &mut Frame, area: Rect, app: &App, request: &AskUserRequest, selections: &[usize]) {
+fn render_ask_user(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    request: &AskUserRequest,
+    selections: &[usize],
+) {
     // Clear background
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -1577,8 +1691,8 @@ fn render_ask_user(frame: &mut Frame, area: Rect, app: &App, request: &AskUserRe
     let height = needed_height.min(max_height) as u16;
     let width = 70.min(area.width);
 
-    let popup_x = (area.width.saturating_sub(width)) / 2;
-    let popup_y = (area.height.saturating_sub(height)) / 2;
+    let popup_x = area.x + (area.width.saturating_sub(width)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup_area = Rect::new(popup_x, popup_y, width, height);
 
     // Split into Question and Options list
@@ -1596,7 +1710,9 @@ fn render_ask_user(frame: &mut Frame, area: Rect, app: &App, request: &AskUserRe
     let question = Paragraph::new(vec![
         Line::from(Span::styled(
             &request.args.question,
-            Style::default().fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(ratatui::style::Modifier::BOLD),
         )),
         Line::from(""),
     ])
@@ -1611,7 +1727,9 @@ fn render_ask_user(frame: &mut Frame, area: Rect, app: &App, request: &AskUserRe
         0
     };
 
-    let items: Vec<ListItem> = request.args.options
+    let items: Vec<ListItem> = request
+        .args
+        .options
         .iter()
         .enumerate()
         .skip(scroll_offset)
@@ -1629,7 +1747,9 @@ fn render_ask_user(frame: &mut Frame, area: Rect, app: &App, request: &AskUserRe
             };
 
             let style = if is_cursor {
-                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -1667,7 +1787,11 @@ fn render_ask_user(frame: &mut Frame, area: Rect, app: &App, request: &AskUserRe
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(if request.args.multi_select { " Multiple Choice " } else { " Single Choice " })
+        .title(if request.args.multi_select {
+            " Multiple Choice "
+        } else {
+            " Single Choice "
+        })
         .title_alignment(ratatui::layout::Alignment::Center);
 
     frame.render_widget(block, popup_area);
@@ -1680,7 +1804,7 @@ fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let height = (item_count + 2) as u16; // +2 for borders
 
     // Position overlay near bottom, leaving 2 lines for input/status
-    let overlay_y = area.height.saturating_sub(height + 2);
+    let overlay_y = area.y + area.height.saturating_sub(height + 2);
     let overlay_area = Rect {
         x: area.x,
         y: overlay_y,
@@ -1709,9 +1833,7 @@ fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
                 CompletionMode::Slash => {
                     format!("{:<15} {}", item.label, item.description)
                 }
-                CompletionMode::File => {
-                    item.label.clone()
-                }
+                CompletionMode::File => item.label.clone(),
                 CompletionMode::None => item.label.clone(),
             };
 
@@ -1744,8 +1866,8 @@ fn render_inline_images(
     image_positions: &[(String, usize)],
     _scroll: usize,
 ) {
-    use ratatui_image::StatefulImage;
     use super::streaming_markdown::IMAGE_HEIGHT;
+    use ratatui_image::StatefulImage;
 
     // Early exit if image support was disabled during session
     if app.image_support.is_none() {
@@ -1786,7 +1908,9 @@ fn render_inline_images(
         let is_cached = app.image_cache.contains_key(url);
         tracing::debug!(
             "Image at line {}: url={}, cached={}",
-            line_index, url, is_cached
+            line_index,
+            url,
+            is_cached
         );
 
         // Calculate screen position accounting for both padding and scroll
@@ -1850,8 +1974,13 @@ fn render_inline_images(
 
         tracing::debug!(
             "Rendering image at area: x={}, y={}, w={}, h={} (screen_line={}, padding={}, line_index={})",
-            image_area.x, image_area.y, image_area.width, image_area.height,
-            screen_line, padding, line_index
+            image_area.x,
+            image_area.y,
+            image_area.width,
+            image_area.height,
+            screen_line,
+            padding,
+            line_index
         );
 
         // Skip if area is too small

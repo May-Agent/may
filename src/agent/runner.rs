@@ -71,7 +71,11 @@ impl AgentWorker {
             include_str!("../texts/agent_worker_channel_closed.txt");
         let (event_tx, event_rx) = unbounded();
         self.command_tx
-            .try_send(WorkerCommand::Run { prompt, attachments, event_tx })
+            .try_send(WorkerCommand::Run {
+                prompt,
+                attachments,
+                event_tx,
+            })
             .expect(ERR_WORKER_CHANNEL_CLOSED.trim());
         AgentHandle {
             event_rx,
@@ -130,10 +134,7 @@ pub fn spawn_worker<E: Executor + 'static>(executor: E, agent: MayAgent) -> Agen
 }
 
 /// The worker loop that owns and runs the agent.
-async fn run_worker(
-    mut agent: MayAgent,
-    command_rx: Receiver<WorkerCommand>,
-) {
+async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>) {
     loop {
         // Wait for a command
         let Ok(command) = command_rx.recv().await else {
@@ -142,7 +143,11 @@ async fn run_worker(
         };
 
         match command {
-            WorkerCommand::Run { prompt, attachments, event_tx } => {
+            WorkerCommand::Run {
+                prompt,
+                attachments,
+                event_tx,
+            } => {
                 run_agent_prompt(&mut agent, &prompt, attachments, &command_rx, &event_tx).await;
             }
             WorkerCommand::Cancel => {
