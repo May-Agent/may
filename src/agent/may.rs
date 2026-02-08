@@ -2,23 +2,29 @@
 
 use std::path::PathBuf;
 
-use aither_agent::{Agent, AgentEvent, AgentError, BashAgentBuilder, TodoTool};
+use askama::Template;
+
 use aither_agent::sandbox::builtin::AskCommand;
 use aither_agent::specialized::TaskTool;
 use aither_agent::webfetch::WebFetchTool;
 use aither_agent::websearch::WebSearchTool;
-use aither_cloud::{claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI, CloudProvider};
-use aither_core::llm::tool::{Tool, ToolDefinition};
-use aither_sandbox::{permission::PermissionError, BashMode, BashTool, PermissionHandler};
-use askama::Template;
+use aither_agent::{
+    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, BuiltinToolHint, ContextBlock,
+    ContextBlockPriority, TodoTool,
+};
+use aither_cloud::{
+    CloudProvider, claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI,
+};
+use aither_sandbox::{BashMode, BashTool, PermissionHandler, permission::PermissionError};
 use executor_core::DefaultExecutor;
 use futures_lite::Stream;
 
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MayConfig, ProviderInstance, ProviderType, SelectedProvider};
+use crate::copilot::clear_copilot_credentials;
 use crate::fs_util;
 use crate::session::SessionId;
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, WorkspaceDir};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
 // Error message templates
@@ -43,53 +49,6 @@ pub enum MayAgentError {
     MissingApiKey(String),
     #[error("Copilot token error: {0}")]
     CopilotToken(#[from] crate::copilot::CopilotTokenError),
-}
-
-/// Workspace directory for template rendering.
-pub struct WorkdirInfo {
-    pub path: String,
-    pub description: String,
-}
-
-/// Tool info for template rendering.
-pub struct ToolInfo {
-    pub name: String,
-    pub description: String,
-}
-
-impl ToolInfo {
-    /// Create ToolInfo from a tool implementing the Tool trait.
-    /// Only the first paragraph of the description is used.
-    pub fn from_tool<T: Tool>(tool: &T) -> Self {
-        let definition = ToolDefinition::new(tool);
-        // Extract only the first paragraph (up to first double newline or end)
-        let full_desc = definition.description();
-        let first_paragraph = full_desc
-            .split("\n\n")
-            .next()
-            .unwrap_or(full_desc)
-            .lines()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim()
-            .to_string();
-        Self {
-            name: definition.name().to_string(),
-            description: first_paragraph,
-        }
-    }
-}
-
-/// System prompt template.
-#[derive(Template)]
-#[template(path = "system.md")]
-struct SystemPromptTemplate<'a> {
-    session_id: &'a str,
-    sandbox: &'a str,
-    cwd: &'a str,
-    workdirs: Vec<WorkdirInfo>,
-    tools: Vec<ToolInfo>,
-    memory: &'a str,
 }
 
 /// Permission handler for May agent.
@@ -197,15 +156,13 @@ impl MayAgent {
             config.may_dir.clone(),
         );
 
-        // Read memory content asynchronously from global may directory
-        // We read from the source directly to avoid race conditions with symlink creation
-        // which happens when the session is first persisted (on first user message)
+        // Read global memory from ~/.may/memory.md.
         let memory_path = config.may_dir.join("memory.md");
         let memory_content = fs_util::read_to_string(&memory_path).await?;
 
         // Clone LLM for tools that need it before it's moved into the builder
-        let fast_llm = config.llm.clone(); // For AskCommand
-        let task_llm = config.llm.clone(); // For TaskTool
+        let fast_llm = config.llm.clone();
+        let task_llm = config.llm.clone();
 
         // Create tools
         let websearch = WebSearchTool::default();
@@ -214,25 +171,11 @@ impl MayAgent {
         let ask = AskCommand::new(fast_llm);
         let request_workspace = RequestWorkspaceTool::new(config.workspace_request_broker);
         let ask_user = AskUserTool::new(config.ask_user_broker);
-        tracing::info!("AskUserTool created and will be registered as bash command 'ask_user'");
-        // Create TaskTool (will configure base_dir after getting sandbox path)
         let task_tool = TaskTool::new(task_llm).with_builtins();
 
-        // Collect tool info for system prompt
-        let tools = vec![
-            ToolInfo::from_tool(&websearch),
-            ToolInfo::from_tool(&webfetch),
-            ToolInfo::from_tool(&todo),
-            ToolInfo::from_tool(&ask),
-            ToolInfo::from_tool(&request_workspace),
-            ToolInfo::from_tool(&ask_user),
-            ToolInfo::from_tool(&task_tool),
-        ];
+        let transcript_path = config.sandbox_dir.join("chat.txt").display().to_string();
 
-        // Build system prompt with session context, workspace, and tools
-        let system_prompt = build_system_prompt(&config.session_id, &workspace, &memory_content, tools);
-
-        // Build the agent using BashAgentBuilder
+        // Build the agent using a minimal base prompt + structured context blocks.
         let mut builder = BashAgentBuilder::new(config.llm, bash_tool)
             .tool(websearch)
             .tool(webfetch)
@@ -240,7 +183,20 @@ impl MayAgent {
             .tool(ask)
             .tool(request_workspace)
             .tool(ask_user)
-            .system_prompt_raw(system_prompt)
+            .with_default_prompt()
+            .agent_kind(AgentKind::Coding)
+            .persona_prompt(include_str!("../../templates/system.md"))
+            .transcript_path(transcript_path)
+            .context_block(build_workspace_context_block(&workspace))
+            .context_block(build_memory_context_block(&memory_content))
+            .builtin_tool_hint(BuiltinToolHint::new(
+                "ask",
+                "Fast side-analysis for piped content; use `ask --help` for usage.",
+            ))
+            .builtin_tool_hint(BuiltinToolHint::new(
+                "task",
+                "Spawn a subagent for isolated complex work; use `task --help`.",
+            ))
             .max_iterations(config.max_iterations);
 
         // Get the actual working directory before building
@@ -270,11 +226,11 @@ impl MayAgent {
         ask_user_broker: AskUserBroker,
     ) -> Result<Self, MayAgentError> {
         // Get model: use last_model if set, otherwise fallback to Balanced tier
-        let model = may_config.last_model.as_deref()
+        let model = may_config
+            .last_model
+            .as_deref()
             .or_else(|| may_config.default_model_for_tier(crate::config::ModelTier::Balanced))
-            .ok_or_else(|| {
-                MayAgentError::MissingApiKey(ERR_NO_MODELS.trim().to_string())
-            })?;
+            .ok_or_else(|| MayAgentError::MissingApiKey(ERR_NO_MODELS.trim().to_string()))?;
 
         Self::from_config_with_model(
             may_config,
@@ -391,14 +347,22 @@ async fn build_cloud_provider(
     selected: &SelectedProvider<'_>,
     model: &str,
 ) -> Result<CloudProvider, MayAgentError> {
-    let provider_type = selected.instance.resolve_type(selected.id);
-    let api_key = selected.instance.api_key.as_deref().unwrap_or("");
-    let base_url = selected.instance.effective_base_url(selected.id);
+    build_cloud_provider_from_instance(selected.id, selected.instance, model).await
+}
 
-    // Validate API key for providers that require it
+/// Build a CloudProvider from a ProviderInstance directly.
+async fn build_cloud_provider_from_instance(
+    id: &str,
+    instance: &ProviderInstance,
+    model: &str,
+) -> Result<CloudProvider, MayAgentError> {
+    let provider_type = instance.resolve_type(id);
+    let api_key = instance.api_key.as_deref().unwrap_or("");
+    let base_url = instance.effective_base_url(id);
+
     if provider_type.requires_api_key() && api_key.is_empty() {
         return Err(MayAgentError::MissingApiKey(
-            ERR_API_KEY_FMT.replace("{provider}", selected.id),
+            ERR_API_KEY_FMT.replace("{provider}", id),
         ));
     }
 
@@ -424,18 +388,30 @@ async fn build_cloud_provider(
             }
             client.into()
         }
-        ProviderType::OpenRouter => {
-            OpenAI::openrouter(api_key).with_model(model).into()
-        }
-        ProviderType::DeepSeek => {
-            OpenAI::deepseek(api_key).with_model(model).into()
-        }
+        ProviderType::OpenRouter => OpenAI::openrouter(api_key).with_model(model).into(),
+        ProviderType::DeepSeek => OpenAI::deepseek(api_key).with_model(model).into(),
         ProviderType::Copilot => {
-            // Get session token (exchanges OAuth token if needed)
-            let credentials = crate::copilot::get_copilot_credentials().await?
-                .ok_or_else(|| MayAgentError::MissingApiKey(
-                    "GitHub Copilot not authenticated. Use /config to set up OAuth.".to_string()
-                ))?;
+            let credentials = match crate::copilot::get_copilot_credentials().await {
+                Ok(Some(credentials)) => credentials,
+                Ok(None) => {
+                    return Err(MayAgentError::MissingApiKey(
+                        "GitHub Copilot not authenticated. Use /config to set up OAuth."
+                            .to_string(),
+                    ));
+                }
+                Err(e) => {
+                    if is_copilot_unauthorized(&e) {
+                        if let Err(clear_err) = clear_copilot_credentials() {
+                            tracing::warn!(
+                                "Failed to clear invalid Copilot credentials: {}",
+                                clear_err
+                            );
+                        }
+                    }
+                    return Err(MayAgentError::CopilotToken(e));
+                }
+            };
+
             Copilot::new(credentials.token)
                 .with_base_url(credentials.api_endpoint)
                 .with_oauth_token(credentials.oauth_token)
@@ -444,7 +420,10 @@ async fn build_cloud_provider(
         }
         ProviderType::Ollama => {
             let url = base_url.unwrap_or("http://localhost:11434/v1");
-            OpenAI::new(api_key).with_base_url(url).with_model(model).into()
+            OpenAI::new(api_key)
+                .with_base_url(url)
+                .with_model(model)
+                .into()
         }
         ProviderType::Groq | ProviderType::Together | ProviderType::Mistral | ProviderType::XAI => {
             let mut client = OpenAI::new(api_key).with_model(model);
@@ -457,63 +436,26 @@ async fn build_cloud_provider(
             let url = base_url.ok_or_else(|| {
                 MayAgentError::MissingApiKey(format!(
                     "Base URL required for custom provider '{}'",
-                    selected.id
+                    id
                 ))
             })?;
-            OpenAI::new(api_key).with_base_url(url).with_model(model).into()
+            OpenAI::new(api_key)
+                .with_base_url(url)
+                .with_model(model)
+                .into()
         }
     };
 
     Ok(llm)
 }
 
-/// Build a CloudProvider from a ProviderInstance directly (for title generation).
-async fn build_cloud_provider_from_instance(
-    id: &str,
-    instance: &ProviderInstance,
-    model: &str,
-) -> Result<CloudProvider, MayAgentError> {
-    let provider_type = instance.resolve_type(id);
-    let api_key = instance.api_key.as_deref().unwrap_or("");
-    let base_url = instance.effective_base_url(id);
-
-    let llm: CloudProvider = match provider_type {
-        ProviderType::Anthropic => {
-            let mut client = Claude::new(api_key).with_model(model);
-            if let Some(url) = base_url {
-                client = client.with_base_url(url);
-            }
-            client.into()
-        }
-        ProviderType::Google => {
-            let mut client = Gemini::new(api_key).with_text_model(model);
-            if let Some(url) = base_url {
-                client = client.with_base_url(url);
-            }
-            client.into()
-        }
-        ProviderType::OpenRouter => {
-            OpenAI::openrouter(api_key).with_model(model).into()
-        }
-        ProviderType::Copilot => {
-            let credentials = crate::copilot::get_copilot_credentials().await?
-                .ok_or_else(|| MayAgentError::MissingApiKey("Copilot not authenticated".to_string()))?;
-            Copilot::new(credentials.token)
-                .with_base_url(credentials.api_endpoint)
-                .with_oauth_token(credentials.oauth_token)
-                .with_model(model)
-                .into()
-        }
-        _ => {
-            let mut client = OpenAI::new(api_key).with_model(model);
-            if let Some(url) = base_url {
-                client = client.with_base_url(url);
-            }
-            client.into()
-        }
-    };
-
-    Ok(llm)
+fn is_copilot_unauthorized(err: &crate::copilot::CopilotTokenError) -> bool {
+    matches!(
+        err,
+        crate::copilot::CopilotTokenError::Exchange(
+            aither_copilot::CopilotError::Http(zenwave::Error::Http { status, .. })
+        ) if status.as_u16() == 401
+    )
 }
 
 /// Generate a session title using the fast model.
@@ -528,7 +470,8 @@ pub async fn generate_session_title(
     use futures_lite::StreamExt;
 
     // Get a fast model
-    let model = config.default_model_for_tier(crate::config::ModelTier::Fast)
+    let model = config
+        .default_model_for_tier(crate::config::ModelTier::Fast)
         .or(config.last_model.as_deref())?;
 
     // Find a provider for this model
@@ -536,7 +479,9 @@ pub async fn generate_session_title(
     let selected = resolver.select_provider(model)?;
 
     // Build the cloud provider
-    let llm = build_cloud_provider_from_instance(selected.id, selected.instance, model).await.ok()?;
+    let llm = build_cloud_provider_from_instance(selected.id, selected.instance, model)
+        .await
+        .ok()?;
 
     // Truncate messages for prompt
     let user_truncated: String = user_message.chars().take(200).collect();
@@ -544,8 +489,7 @@ pub async fn generate_session_title(
 
     let prompt = format!(
         "Generate a short, descriptive title (3-6 words) for this conversation. Output ONLY the title, nothing else.\n\nUser: {}\n\nAssistant: {}",
-        user_truncated,
-        assistant_truncated
+        user_truncated, assistant_truncated
     );
 
     let request = LLMRequest::new(vec![Message::user(&prompt)]);
@@ -570,35 +514,59 @@ pub async fn generate_session_title(
     }
 }
 
-/// Build the complete system prompt with dynamic context.
-fn build_system_prompt(
-    session_id: &SessionId,
-    workspace: &Workspace,
-    memory: &str,
-    tools: Vec<ToolInfo>,
-) -> String {
-    // Collect workdir info for template
-    let workdirs: Vec<WorkdirInfo> = workspace
+fn build_workspace_context_block(workspace: &Workspace) -> ContextBlock {
+    #[derive(askama::Template)]
+    #[template(
+        source = "<workspace>\n<sandbox>{{ sandbox }}</sandbox>\n<cwd>{{ cwd }}</cwd>\n{% if !workdirs.is_empty() %}<approved_workdirs>\n{% for wd in workdirs %}<workdir path=\"{{ wd.path }}\">{{ wd.description }}</workdir>\n{% endfor %}</approved_workdirs>\n{% endif %}</workspace>",
+        ext = "xml",
+        escape = "none"
+    )]
+    struct WorkspaceBlockTemplate {
+        sandbox: String,
+        cwd: String,
+        workdirs: Vec<WorkspaceDirView>,
+    }
+
+    #[derive(Clone)]
+    struct WorkspaceDirView {
+        path: String,
+        description: String,
+    }
+
+    impl From<&WorkspaceDir> for WorkspaceDirView {
+        fn from(value: &WorkspaceDir) -> Self {
+            Self {
+                path: value.path.display().to_string(),
+                description: value
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| "User-approved directory".to_string()),
+            }
+        }
+    }
+
+    let workdirs = workspace
         .config
         .workdirs
         .iter()
-        .map(|wd| WorkdirInfo {
-            path: wd.path.display().to_string(),
-            description: wd
-                .description
-                .clone()
-                .unwrap_or_else(|| "User-approved directory".to_string()),
-        })
-        .collect();
+        .map(WorkspaceDirView::from)
+        .collect::<Vec<_>>();
 
-    let template = SystemPromptTemplate {
-        session_id: session_id.as_str(),
-        sandbox: &workspace.sandbox.display().to_string(),
-        cwd: &workspace.cwd.display().to_string(),
+    let template = WorkspaceBlockTemplate {
+        sandbox: workspace.sandbox.display().to_string(),
+        cwd: workspace.cwd.display().to_string(),
         workdirs,
-        tools,
-        memory,
     };
 
-    template.render().expect("Failed to render system prompt")
+    ContextBlock::new(
+        "workspace",
+        template
+            .render()
+            .unwrap_or_else(|e| panic!("failed to render workspace context block: {e}")),
+    )
+    .with_priority(ContextBlockPriority::High)
+}
+
+fn build_memory_context_block(memory: &str) -> ContextBlock {
+    ContextBlock::new("memory", memory).with_priority(ContextBlockPriority::Low)
 }

@@ -27,6 +27,8 @@ pub enum CopilotTokenError {
     Write(std::io::Error),
     #[error("Failed to parse token file: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("Token exchange failed: {0}")]
+    Exchange(#[from] aither_copilot::CopilotError),
 }
 
 /// Get the path to the Copilot token file.
@@ -75,6 +77,24 @@ pub fn delete_copilot_token() -> Result<(), CopilotTokenError> {
         std::fs::remove_file(&path).map_err(CopilotTokenError::Write)?;
     }
 
+    Ok(())
+}
+
+/// Delete cached Copilot session token from disk.
+pub fn delete_session_token() -> Result<(), CopilotTokenError> {
+    let path = session_path()?;
+
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(CopilotTokenError::Write)?;
+    }
+
+    Ok(())
+}
+
+/// Delete both OAuth and cached session tokens from disk.
+pub fn clear_copilot_credentials() -> Result<(), CopilotTokenError> {
+    delete_session_token()?;
+    delete_copilot_token()?;
     Ok(())
 }
 
@@ -175,12 +195,7 @@ pub async fn get_copilot_credentials() -> Result<Option<CopilotCredentials>, Cop
 
     // Exchange OAuth token for session token
     tracing::info!("Exchanging OAuth token for Copilot session token");
-    let session = aither_copilot::auth::get_session_token(&oauth_token.access_token)
-        .await
-        .map_err(|e| CopilotTokenError::Read(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Token exchange failed: {}", e),
-        )))?;
+    let session = aither_copilot::auth::get_session_token(&oauth_token.access_token).await?;
 
     // Cache the session token
     if let Err(e) = save_session_token(&session) {

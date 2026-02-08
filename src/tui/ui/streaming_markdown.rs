@@ -277,8 +277,7 @@ impl StreamingMarkdown {
             ParseEvent::BoldItalic(text) => {
                 self.rendered.push(Line::from(Span::styled(
                     text,
-                    Style::default()
-                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
                 )));
             }
             ParseEvent::Strikeout(text) => {
@@ -392,10 +391,9 @@ impl StreamingMarkdown {
 fn render_inline_element(elem: streamdown_parser::InlineElement) -> Span<'static> {
     match elem {
         streamdown_parser::InlineElement::Text(t) => Span::raw(t),
-        streamdown_parser::InlineElement::Code(c) => Span::styled(
-            c,
-            Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-        ),
+        streamdown_parser::InlineElement::Code(c) => {
+            Span::styled(c, Style::default().fg(Color::Yellow).bg(Color::DarkGray))
+        }
         streamdown_parser::InlineElement::Bold(t) => {
             Span::styled(t, Style::default().add_modifier(Modifier::BOLD))
         }
