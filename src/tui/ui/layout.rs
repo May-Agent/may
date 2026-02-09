@@ -6,11 +6,11 @@ use ratatui::{
 };
 
 use super::super::app::{
-    App, AppMode, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode, SkillAddMode,
+    App, AppMode, AskUserState, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode,
+    SkillAddMode, SshAddMode,
 };
 use super::super::completion::CompletionMode;
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
-use crate::ask_user::AskUserRequest;
 use crate::workspace_request::WorkspaceRequest;
 
 /// Convert character index to byte index for safe string slicing.
@@ -45,8 +45,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_workspace_confirm(frame, area, request);
             return;
         }
-        AppMode::AskUser(request, selections) => {
-            render_ask_user(frame, area, app, request, selections);
+        AppMode::AskUser(state) => {
+            render_ask_user(frame, area, state);
             return;
         }
         _ => {}
@@ -132,6 +132,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         AppMode::McpManage => {
             render_mcp_popup(frame, area, app);
+        }
+        AppMode::SshManage => {
+            render_ssh_popup(frame, area, app);
         }
         AppMode::SkillManage => {
             render_skill_popup(frame, area, app);
@@ -1463,6 +1466,124 @@ fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(widget, popup_area);
 }
 
+/// Render SSH server management popup.
+fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_area = centered_rect(70, 60, area);
+    frame.render_widget(Clear, popup_area);
+
+    let title = match app.ssh_add_mode {
+        SshAddMode::None => " SSH Servers ",
+        SshAddMode::Name => " Add SSH Server - Enter Name ",
+        SshAddMode::Target => " Add SSH Server - Enter Target ",
+    };
+
+    let content: Vec<Line> = match app.ssh_add_mode {
+        SshAddMode::None => {
+            let mut lines = Vec::new();
+            if app.config.ssh_servers.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "No SSH servers configured.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Press 'a' to add a server.",
+                    Style::default().fg(Color::Yellow),
+                )));
+            } else {
+                for (idx, server) in app.config.ssh_servers.iter().enumerate() {
+                    let selected = idx == app.ssh_selected;
+                    let prefix = if selected { "> " } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            prefix,
+                            if selected {
+                                Style::default().fg(Color::Yellow)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                        Span::styled(
+                            &server.name,
+                            if selected {
+                                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            },
+                        ),
+                        Span::styled(" -> ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(&server.target, Style::default().fg(Color::Cyan)),
+                    ]));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("[a] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Add", Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled("[d] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Delete", Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+                Span::styled("Close", Style::default().fg(Color::White)),
+            ]));
+            lines
+        }
+        SshAddMode::Name => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Server name (alphanumeric, -, _):",
+                Style::default().fg(Color::White),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("> {}_", app.ssh_add_name),
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "[Enter] Continue  [Esc] Cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
+        SshAddMode::Target => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Name: {}", app.ssh_add_name),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "SSH target (user@host):",
+                Style::default().fg(Color::White),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("> {}_", app.ssh_add_target),
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "[Enter] Save  [Esc] Back",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
+    };
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(title)
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, popup_area);
+}
+
 /// Render the skill management popup.
 fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_area = centered_rect(80, 70, area);
@@ -1668,133 +1789,195 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// Render the AskUser dialog.
-fn render_ask_user(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    request: &AskUserRequest,
-    selections: &[usize],
-) {
-    // Clear background
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Black)),
-        area,
-    );
+/// Render the AskUser dialog as a bottom overlay.
+fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
+    let Some(question) = state.current() else {
+        return;
+    };
+    let Some(qs) = state.current_state() else {
+        return;
+    };
 
-    // Calculate height based on options (limit to 60% of screen)
-    let option_count = request.args.options.len();
-    let max_height = (area.height as usize * 60) / 100;
-    // Header (2) + Question (2) + Options (N) + Footer (2) + Borders (2)
-    let needed_height = 8 + option_count;
-    let height = needed_height.min(max_height) as u16;
-    let width = 70.min(area.width);
+    // Item count: options + Skip + Custom answer
+    let opt_count = question.option.len();
+    let total_items = opt_count + 2;
 
-    let popup_x = area.x + (area.width.saturating_sub(width)) / 2;
-    let popup_y = area.y + (area.height.saturating_sub(height)) / 2;
-    let popup_area = Rect::new(popup_x, popup_y, width, height);
+    // Calculate overlay height: question(2) + items + custom_input?(1) + help(1) + border(2)
+    let custom_line = if qs.custom_mode { 1u16 } else { 0 };
+    let max_height = (area.height * 60) / 100;
+    let needed = 2 + total_items as u16 + custom_line + 1 + 2;
+    let height = needed.min(max_height);
 
-    // Split into Question and Options list
+    // Bottom-anchored overlay
+    let overlay = Rect::new(area.x, area.y + area.height.saturating_sub(height), area.width, height);
+    frame.render_widget(Clear, overlay);
+
+    // Build section tabs line for multi-question
+    let mut title_spans: Vec<Span> = Vec::new();
+    if state.is_multi() {
+        for (i, q) in state.questions.iter().enumerate() {
+            let label = if q.section.is_empty() {
+                format!(" {} ", i + 1)
+            } else {
+                format!(" {} ", q.section)
+            };
+            if i == state.current_question {
+                title_spans.push(Span::styled(
+                    label,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                title_spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            }
+            if i + 1 < state.questions.len() {
+                title_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            }
+        }
+    }
+
+    let border_title = if state.is_multi() {
+        Line::from(title_spans)
+    } else if question.multi_select {
+        Line::from(" Multiple Choice ")
+    } else {
+        Line::from(" Single Choice ")
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(border_title)
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    // Layout inner: question + items + optional custom input + help
+    let mut constraints = vec![
+        Constraint::Length(2),        // question text
+        Constraint::Min(1),           // items list
+    ];
+    if qs.custom_mode {
+        constraints.push(Constraint::Length(1)); // custom input
+    }
+    constraints.push(Constraint::Length(1)); // help text
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4), // Question + spacing
-            Constraint::Min(1),    // Options
-            Constraint::Length(1), // Help text
-        ])
-        .margin(1)
-        .split(popup_area);
+        .constraints(constraints)
+        .split(inner);
 
-    // Render Question
-    let question = Paragraph::new(vec![
-        Line::from(Span::styled(
-            &request.args.question,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )),
-        Line::from(""),
-    ])
+    // Render question text
+    let q_text = Paragraph::new(Line::from(Span::styled(
+        &question.question,
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )))
     .wrap(ratatui::widgets::Wrap { trim: false });
-    frame.render_widget(question, chunks[0]);
+    frame.render_widget(q_text, chunks[0]);
 
-    // Render Options
+    // Render items: options + Skip + Custom answer
     let visible_height = chunks[1].height as usize;
-    let scroll_offset = if app.ask_user_cursor >= visible_height {
-        app.ask_user_cursor - visible_height + 1
+    let scroll_offset = if qs.cursor >= visible_height {
+        qs.cursor - visible_height + 1
     } else {
         0
     };
 
-    let items: Vec<ListItem> = request
-        .args
-        .options
-        .iter()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height)
-        .map(|(idx, option)| {
-            let is_selected = selections.contains(&idx);
-            let is_cursor = idx == app.ask_user_cursor;
+    let mut items: Vec<ListItem> = Vec::with_capacity(total_items);
+    for global_idx in 0..total_items {
+        if global_idx < scroll_offset || global_idx >= scroll_offset + visible_height {
+            continue;
+        }
+        let is_cursor = global_idx == qs.cursor;
+        let prefix = if is_cursor { "> " } else { "  " };
+        let cursor_style = if is_cursor {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
 
-            let prefix = if is_cursor { "> " } else { "  " };
-
-            let checkbox = if request.args.multi_select {
+        if global_idx < opt_count {
+            // Regular option
+            let is_selected = qs.selections.contains(&global_idx);
+            let checkbox = if question.multi_select {
                 if is_selected { "[x] " } else { "[ ] " }
+            } else if is_selected {
+                "(*) "
             } else {
-                if is_selected { "(*) " } else { "( ) " }
+                "( ) "
             };
-
-            let style = if is_cursor {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(ratatui::style::Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            let selected_style = if is_selected {
+            let sel_style = if is_selected {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(prefix, cursor_style),
+                Span::styled(checkbox, sel_style),
+                Span::styled(&question.option[global_idx], cursor_style),
+            ])));
+        } else if global_idx == opt_count {
+            // Skip
+            let skip_style = if qs.skipped {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let mark = if qs.skipped { ">> " } else { "   " };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(prefix, cursor_style),
+                Span::styled(mark, skip_style),
+                Span::styled("Skip", if is_cursor { cursor_style } else { skip_style }),
+            ])));
+        } else {
+            // Custom answer
+            let has_custom = !qs.custom_text.is_empty();
+            let custom_style = if has_custom {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let mark = if has_custom { ">> " } else { "   " };
+            let label = if has_custom {
+                format!("Custom: {}", qs.custom_text)
+            } else {
+                "Custom answer...".to_string()
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(prefix, cursor_style),
+                Span::styled(mark, custom_style),
+                Span::styled(label, if is_cursor { cursor_style } else { custom_style }),
+            ])));
+        }
+    }
+    frame.render_widget(List::new(items), chunks[1]);
 
-            ListItem::new(Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(checkbox, selected_style),
-                Span::styled(option, style),
-            ]))
-        })
-        .collect();
-
-    let list = List::new(items);
-    frame.render_widget(list, chunks[1]);
-
-    // Render Help Text
-    let help_text = if request.args.multi_select {
-        "Space: toggle | Enter: confirm | j/k: navigate"
+    // Custom text input line
+    let chunk_idx_help;
+    if qs.custom_mode {
+        let input_line = Paragraph::new(Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::Cyan)),
+            Span::styled(&qs.custom_text, Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(input_line, chunks[2]);
+        chunk_idx_help = 3;
     } else {
-        "Enter: select & confirm | j/k: navigate"
-    };
+        chunk_idx_help = 2;
+    }
 
+    // Help text
+    let nav = if state.is_multi() { " | Tab/l: next | Shift-Tab/H: prev" } else { "" };
+    let help_text = if question.multi_select {
+        format!("Space: toggle | Enter: confirm | j/k: navigate{nav} | Esc: skip all")
+    } else {
+        format!("Enter: select | j/k: navigate{nav} | Esc: skip all")
+    };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))
-        .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(help, chunks[2]);
-
-    // Render Border
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(if request.args.multi_select {
-            " Multiple Choice "
-        } else {
-            " Single Choice "
-        })
-        .title_alignment(ratatui::layout::Alignment::Center);
-
-    frame.render_widget(block, popup_area);
+        .alignment(Alignment::Center);
+    if chunk_idx_help < chunks.len() {
+        frame.render_widget(help, chunks[chunk_idx_help]);
+    }
 }
 
 /// Render completion overlay near bottom of screen.

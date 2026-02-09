@@ -21,7 +21,7 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
             .unwrap_or_else(|e| panic!("invalid bash tool args payload: {e}"));
         ToolStartKind::Bash {
             command: args.script,
-            mode: args.mode,
+            mode: BashMode::Sandboxed,
         }
     } else {
         ToolStartKind::Generic {

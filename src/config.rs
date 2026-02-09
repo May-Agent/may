@@ -543,6 +543,13 @@ impl ModelsConfig {
     }
 }
 
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshServerConfig {
+    pub name: String,
+    pub target: String,
+}
+
 /// Global preferences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preferences {
@@ -582,6 +589,9 @@ pub struct MayConfig {
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
+    /// Preconfigured SSH targets available to the agent.
+    #[serde(default)]
+    pub ssh_servers: Vec<SshServerConfig>,
 }
 
 fn default_max_iterations() -> usize {
@@ -596,6 +606,7 @@ impl Default for MayConfig {
             models: ModelsConfig::default(),
             preferences: Preferences::default(),
             last_model: None,
+            ssh_servers: Vec::new(),
         }
     }
 }
@@ -686,6 +697,27 @@ impl MayConfig {
     /// Get all provider IDs.
     pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
         self.provider.keys().map(|s| s.as_str())
+    }
+
+    /// Get configured SSH servers.
+    pub fn ssh_servers(&self) -> &[SshServerConfig] {
+        &self.ssh_servers
+    }
+
+    /// Add or update an SSH server by name.
+    pub fn upsert_ssh_server(&mut self, server: SshServerConfig) {
+        if let Some(existing) = self.ssh_servers.iter_mut().find(|s| s.name == server.name) {
+            *existing = server;
+        } else {
+            self.ssh_servers.push(server);
+        }
+    }
+
+    /// Remove an SSH server by name. Returns true if removed.
+    pub fn remove_ssh_server(&mut self, name: &str) -> bool {
+        let before = self.ssh_servers.len();
+        self.ssh_servers.retain(|s| s.name != name);
+        before != self.ssh_servers.len()
     }
 
     /// Get the first available model for a tier.
