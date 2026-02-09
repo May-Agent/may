@@ -154,6 +154,7 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>) {
                 // No active processing, ignore
             }
             WorkerCommand::Shutdown => {
+                agent.close_shell_sessions().await;
                 break;
             }
         }
