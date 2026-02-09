@@ -8,7 +8,7 @@ use blocking::unblock;
 use crossterm::event::{KeyCode, KeyModifiers};
 use executor_core::spawn;
 
-use crate::ask_user::AskUserRequest;
+use crate::ask_user::{AskUserRequest, AnswerValue, Question, QuestionAnswer};
 use crate::config::{ModelTier, Provider};
 use crate::models::FetchedModel;
 use crate::workspace_request::WorkspaceRequest;
@@ -63,10 +63,99 @@ pub enum AppMode {
     WorkspaceConfirm(WorkspaceRequest),
     /// MCP server management overlay
     McpManage,
+    /// SSH server management overlay
+    SshManage,
     /// Ask user dialog
-    AskUser(AskUserRequest, Vec<usize>),
+    AskUser(AskUserState),
     /// Skill management popup
     SkillManage,
+}
+
+/// Per-question interaction state.
+pub struct AskUserQuestionState {
+    /// Cursor position in the option list (includes extra items: skip, custom).
+    pub cursor: usize,
+    /// Selected option indices (for the predefined options).
+    pub selections: Vec<usize>,
+    /// Whether the user is typing a custom answer.
+    pub custom_mode: bool,
+    /// Custom answer text buffer.
+    pub custom_text: String,
+    /// Whether this question was skipped.
+    pub skipped: bool,
+}
+
+impl AskUserQuestionState {
+    fn new() -> Self {
+        Self {
+            cursor: 0,
+            selections: Vec::new(),
+            custom_mode: false,
+            custom_text: String::new(),
+            skipped: false,
+        }
+    }
+}
+
+/// State for the ask_user interaction.
+impl std::fmt::Debug for AskUserState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskUserState")
+            .field("question_count", &self.questions.len())
+            .field("current_question", &self.current_question)
+            .finish()
+    }
+}
+
+pub struct AskUserState {
+    /// The original request (holds the response channel).
+    pub request: AskUserRequest,
+    /// Normalized list of questions.
+    pub questions: Vec<Question>,
+    /// Current question index.
+    pub current_question: usize,
+    /// Per-question state.
+    pub question_states: Vec<AskUserQuestionState>,
+}
+
+impl AskUserState {
+    pub fn new(request: AskUserRequest, questions: Vec<Question>) -> Self {
+        let states = questions.iter().map(|_| AskUserQuestionState::new()).collect();
+        Self {
+            request,
+            questions,
+            current_question: 0,
+            question_states: states,
+        }
+    }
+
+    /// Current question being displayed.
+    pub fn current(&self) -> Option<&Question> {
+        self.questions.get(self.current_question)
+    }
+
+    /// Current question's mutable state.
+    pub fn current_state_mut(&mut self) -> Option<&mut AskUserQuestionState> {
+        self.question_states.get_mut(self.current_question)
+    }
+
+    /// Current question's state.
+    pub fn current_state(&self) -> Option<&AskUserQuestionState> {
+        self.question_states.get(self.current_question)
+    }
+
+    /// Total number of items in the list for current question:
+    /// options + "Skip" + "Custom answer"
+    pub fn current_item_count(&self) -> usize {
+        self.current()
+            .map(|q| q.option.len() + 2)
+            .unwrap_or(0)
+    }
+
+    /// Whether there are multiple questions.
+    pub fn is_multi(&self) -> bool {
+        self.questions.len() > 1
+    }
 }
 
 /// Status of Copilot OAuth authentication flow.
@@ -137,6 +226,18 @@ pub enum McpAddMode {
     Name,
     /// Entering command
     Command,
+}
+
+/// SSH add server mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SshAddMode {
+    /// Not adding a server
+    #[default]
+    None,
+    /// Entering server name
+    Name,
+    /// Entering SSH target
+    Target,
 }
 
 /// Skill add mode.
@@ -453,6 +554,14 @@ pub struct App {
     pub mcp_add_name: String,
     /// MCP add command input
     pub mcp_add_command: String,
+    /// Selected SSH server index
+    pub ssh_selected: usize,
+    /// SSH add mode (entering name/target)
+    pub ssh_add_mode: SshAddMode,
+    /// SSH add name input
+    pub ssh_add_name: String,
+    /// SSH add target input (`user@host`)
+    pub ssh_add_target: String,
     /// Skill list for display
     pub skill_list: Vec<crate::skill::SkillInfo>,
     /// Selected skill index
@@ -465,8 +574,7 @@ pub struct App {
     pub skill_github_input: String,
     /// Skill search query
     pub skill_search: String,
-    /// Current option selected in AskUser mode
-    pub ask_user_cursor: usize,
+
     /// Event sender for spawning background tasks
     pub event_tx: EventSender,
     /// Terminal image rendering support (None if terminal doesn't support graphics)
@@ -601,13 +709,17 @@ impl App {
             mcp_add_mode: McpAddMode::None,
             mcp_add_name: String::new(),
             mcp_add_command: String::new(),
+            ssh_selected: 0,
+            ssh_add_mode: SshAddMode::None,
+            ssh_add_name: String::new(),
+            ssh_add_target: String::new(),
             skill_list: Vec::new(),
             skill_selected: 0,
             skill_scroll: 0,
             skill_add_mode: SkillAddMode::None,
             skill_github_input: String::new(),
             skill_search: String::new(),
-            ask_user_cursor: 0,
+
             event_tx,
             image_support,
             image_cache: ahash::AHashMap::new(),
@@ -749,6 +861,24 @@ impl App {
         messages: &[ChatMessage],
         model: Option<&str>,
     ) {
+        // Reset per-session UI state so /new starts from a clean screen in inline viewport mode.
+        self.input.clear();
+        self.cursor = 0;
+        self.input_char_count = 0;
+        self.attachments.clear();
+        self.completion.cancel();
+        self.queue = MessageQueue::new();
+        self.status = None;
+        self.processing = false;
+        self.background_tasks = 0;
+        self.selected_tool = None;
+        self.selected_tool_index = 0;
+        self.tool_detail_scroll = 0;
+        self.quit_pending = false;
+        self.thinking_start = None;
+        self.content_height.set(0);
+        self.view_height.set(0);
+
         // Load chat history into display
         self.chat = ChatStream::new();
         for msg in messages {
@@ -970,6 +1100,21 @@ impl App {
                 }
                 McpAddMode::None => {}
             },
+            AppMode::SshManage => match self.ssh_add_mode {
+                SshAddMode::Name => {
+                    return Some(ActiveTextInput::Simple {
+                        input: &mut self.ssh_add_name,
+                        filter: PasteFilter::Identifier,
+                    });
+                }
+                SshAddMode::Target => {
+                    return Some(ActiveTextInput::Simple {
+                        input: &mut self.ssh_add_target,
+                        filter: PasteFilter::Any,
+                    });
+                }
+                SshAddMode::None => {}
+            },
             AppMode::SkillManage => {
                 match self.skill_add_mode {
                     SkillAddMode::GitHubRepo => {
@@ -1100,7 +1245,8 @@ impl App {
             AppMode::CopilotAuth => self.handle_copilot_auth_key(code),
             AppMode::WorkspaceConfirm(_) => self.handle_workspace_confirm_key(code),
             AppMode::McpManage => self.handle_mcp_key(code),
-            AppMode::AskUser(_, _) => self.handle_ask_user_key(code),
+            AppMode::SshManage => self.handle_ssh_key(code),
+            AppMode::AskUser(_) => self.handle_ask_user_key(code),
             AppMode::SkillManage => self.handle_skill_key(code),
         }
     }
@@ -1166,66 +1312,200 @@ impl App {
 
     /// Handle key in AskUser mode.
     fn handle_ask_user_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
-        let (request, selections) = match &mut self.mode {
-            AppMode::AskUser(req, sels) => (req, sels),
+        let state = match &mut self.mode {
+            AppMode::AskUser(s) => s,
             _ => return Ok(None),
         };
 
+        // In custom text input mode, handle typing
+        if let Some(qs) = state.current_state_mut() {
+            if qs.custom_mode {
+                match code {
+                    KeyCode::Esc => {
+                        qs.custom_mode = false;
+                    }
+                    KeyCode::Enter => {
+                        // Accept custom text and advance
+                        qs.custom_mode = false;
+                        self.ask_user_advance_or_submit();
+                    }
+                    KeyCode::Backspace => {
+                        qs.custom_text.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        qs.custom_text.push(c);
+                    }
+                    _ => {}
+                }
+                return Ok(None);
+            }
+        }
+
+        let item_count = state.current_item_count();
+        let question = state.current().cloned();
+
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.ask_user_cursor > 0 {
-                    self.ask_user_cursor -= 1;
+                if let Some(qs) = state.current_state_mut() {
+                    if qs.cursor > 0 {
+                        qs.cursor -= 1;
+                    }
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.ask_user_cursor + 1 < request.args.options.len() {
-                    self.ask_user_cursor += 1;
+                if let Some(qs) = state.current_state_mut() {
+                    if qs.cursor + 1 < item_count {
+                        qs.cursor += 1;
+                    }
+                }
+            }
+            // Tab / Shift-Tab to navigate between questions
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                if state.current_question + 1 < state.questions.len() {
+                    state.current_question += 1;
+                }
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('H') => {
+                if state.current_question > 0 {
+                    state.current_question -= 1;
                 }
             }
             KeyCode::Char(' ') => {
-                // Toggle selection
-                if request.args.multi_select {
-                    let cursor = self.ask_user_cursor;
-                    if selections.iter().any(|&x| x == cursor) {
-                        selections.retain(|&x| x != cursor);
-                    } else {
-                        selections.push(cursor);
+                if let (Some(q), Some(qs)) =
+                    (&question, state.current_state_mut())
+                {
+                    let cursor = qs.cursor;
+                    let opt_count = q.option.len();
+                    if cursor < opt_count {
+                        // Toggle option selection
+                        if q.multi_select {
+                            if qs.selections.iter().any(|&x| x == cursor) {
+                                qs.selections.retain(|&x| x != cursor);
+                            } else {
+                                qs.selections.push(cursor);
+                            }
+                        } else {
+                            qs.selections.clear();
+                            qs.selections.push(cursor);
+                        }
+                        qs.skipped = false;
                     }
-                } else {
-                    selections.clear();
-                    selections.push(self.ask_user_cursor);
+                    // cursor == opt_count -> "Skip" row
+                    // cursor == opt_count + 1 -> "Custom answer" row
                 }
             }
             KeyCode::Enter => {
-                // If single select and nothing selected, select current cursor
-                if !request.args.multi_select && selections.is_empty() {
-                    selections.push(self.ask_user_cursor);
-                }
+                if let (Some(q), Some(qs)) =
+                    (&question, state.current_state_mut())
+                {
+                    let cursor = qs.cursor;
+                    let opt_count = q.option.len();
 
-                // If multi select and nothing selected, do nothing or allow empty?
-                // For now, let's require at least one selection if options exist
-                if !request.args.options.is_empty() && selections.is_empty() {
-                    return Ok(None);
+                    if cursor < opt_count {
+                        // Select this option (for single-select, immediately select & advance)
+                        if !q.multi_select {
+                            qs.selections.clear();
+                            qs.selections.push(cursor);
+                            qs.skipped = false;
+                        }
+                        self.ask_user_advance_or_submit();
+                    } else if cursor == opt_count {
+                        // "Skip" selected
+                        if let Some(qs) = state.current_state_mut() {
+                            qs.skipped = true;
+                            qs.selections.clear();
+                            qs.custom_text.clear();
+                        }
+                        self.ask_user_advance_or_submit();
+                    } else if cursor == opt_count + 1 {
+                        // "Custom answer" selected -> enter text mode
+                        if let Some(qs) = state.current_state_mut() {
+                            qs.custom_mode = true;
+                            qs.skipped = false;
+                            qs.selections.clear();
+                        }
+                    } else if q.multi_select {
+                        // Multi-select: Enter confirms current selections
+                        self.ask_user_advance_or_submit();
+                    }
                 }
-
-                // Get selected values
-                use itertools::Itertools;
-                let selected_values: Vec<String> = selections
-                    .iter()
-                    .sorted()
-                    .filter_map(|&idx| request.args.options.get(idx).cloned())
-                    .collect();
-
-                // Send response
-                let mode = std::mem::replace(&mut self.mode, AppMode::Chat);
-                if let AppMode::AskUser(req, _) = mode {
-                    req.respond(selected_values)
-                        .expect(ERR_TOOL_RESPONSE_SEND.trim());
-                }
+            }
+            KeyCode::Esc => {
+                // Escape with no custom mode -> skip all and submit
+                self.ask_user_submit_all_skipped();
             }
             _ => {}
         }
         Ok(None)
+    }
+
+    /// Advance to next question, or submit if on the last one.
+    fn ask_user_advance_or_submit(&mut self) {
+        let state = match &mut self.mode {
+            AppMode::AskUser(s) => s,
+            _ => return,
+        };
+
+        if state.current_question + 1 < state.questions.len() {
+            state.current_question += 1;
+        } else {
+            self.ask_user_submit();
+        }
+    }
+
+    /// Build answers from all question states and send the response.
+    fn ask_user_submit(&mut self) {
+        let mode = std::mem::replace(&mut self.mode, AppMode::Chat);
+        if let AppMode::AskUser(state) = mode {
+            let answers: Vec<QuestionAnswer> = state
+                .questions
+                .iter()
+                .zip(state.question_states.iter())
+                .map(|(q, qs)| {
+                    let answer = if qs.skipped {
+                        AnswerValue::Skipped
+                    } else if !qs.custom_text.is_empty() {
+                        AnswerValue::Custom(qs.custom_text.clone())
+                    } else {
+                        use itertools::Itertools;
+                        let selected: Vec<String> = qs
+                            .selections
+                            .iter()
+                            .sorted()
+                            .filter_map(|&idx| q.option.get(idx).cloned())
+                            .collect();
+                        AnswerValue::Selected(selected)
+                    };
+                    QuestionAnswer {
+                        section: q.section.clone(),
+                        answer,
+                    }
+                })
+                .collect();
+            state
+                .request
+                .respond(answers)
+                .expect(ERR_TOOL_RESPONSE_SEND.trim());
+        }
+    }
+
+    /// Skip all questions and submit empty responses.
+    fn ask_user_submit_all_skipped(&mut self) {
+        let mode = std::mem::replace(&mut self.mode, AppMode::Chat);
+        if let AppMode::AskUser(state) = mode {
+            let answers: Vec<QuestionAnswer> = state
+                .questions
+                .iter()
+                .map(|q| QuestionAnswer {
+                    section: q.section.clone(),
+                    answer: AnswerValue::Skipped,
+                })
+                .collect();
+            state
+                .request
+                .respond(answers)
+                .expect(ERR_TOOL_RESPONSE_SEND.trim());
+        }
     }
 
     /// Handle key in MCP management mode.
@@ -1326,6 +1606,78 @@ impl App {
                     _ => {}
                 }
             }
+        }
+        Ok(None)
+    }
+
+    /// Handle key in SSH management mode.
+    fn handle_ssh_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
+        match self.ssh_add_mode {
+            SshAddMode::None => match code {
+                KeyCode::Esc => {
+                    self.mode = AppMode::Chat;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.ssh_selected > 0 {
+                        self.ssh_selected -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.ssh_selected + 1 < self.config.ssh_servers.len() {
+                        self.ssh_selected += 1;
+                    }
+                }
+                KeyCode::Char('a') => {
+                    self.ssh_add_mode = SshAddMode::Name;
+                    self.ssh_add_name.clear();
+                    self.ssh_add_target.clear();
+                }
+                KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                    if let Some(server) = self.config.ssh_servers.get(self.ssh_selected) {
+                        return Ok(Some(SendAction::SshRemove {
+                            name: server.name.clone(),
+                        }));
+                    }
+                }
+                _ => {}
+            },
+            SshAddMode::Name => match code {
+                KeyCode::Esc => self.ssh_add_mode = SshAddMode::None,
+                KeyCode::Enter => {
+                    if !self.ssh_add_name.is_empty() {
+                        self.ssh_add_mode = SshAddMode::Target;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.ssh_add_name.pop();
+                }
+                KeyCode::Char(c) => {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        self.ssh_add_name.push(c);
+                    }
+                }
+                _ => {}
+            },
+            SshAddMode::Target => match code {
+                KeyCode::Esc => self.ssh_add_mode = SshAddMode::Name,
+                KeyCode::Enter => {
+                    let target = self.ssh_add_target.trim().to_string();
+                    let name = self.ssh_add_name.trim().to_string();
+                    if !name.is_empty() && !target.is_empty() && target.contains('@') {
+                        self.ssh_add_mode = SshAddMode::None;
+                        self.ssh_add_name.clear();
+                        self.ssh_add_target.clear();
+                        return Ok(Some(SendAction::SshAdd { name, target }));
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.ssh_add_target.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.ssh_add_target.push(c);
+                }
+                _ => {}
+            },
         }
         Ok(None)
     }
@@ -1703,6 +2055,10 @@ impl App {
             "/compact" => Ok(Some(SendAction::Compact)),
             "/mcp" => {
                 self.mode = AppMode::McpManage;
+                Ok(None)
+            }
+            "/ssh" => {
+                self.mode = AppMode::SshManage;
                 Ok(None)
             }
             "/skill" => {
@@ -3083,6 +3439,14 @@ pub enum SendAction {
         name: String,
     },
     McpReconnect {
+        name: String,
+    },
+    /// SSH server management actions.
+    SshAdd {
+        name: String,
+        target: String,
+    },
+    SshRemove {
         name: String,
     },
     /// Skill management actions.

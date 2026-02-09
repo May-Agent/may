@@ -15,7 +15,10 @@ use aither_agent::{
 use aither_cloud::{
     CloudProvider, claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI,
 };
-use aither_sandbox::{BashMode, BashTool, PermissionHandler, permission::PermissionError};
+use aither_sandbox::{
+    BashMode, BashTool, PermissionHandler, ShellRuntimeAvailability, SshServer,
+    permission::PermissionError,
+};
 use executor_core::DefaultExecutor;
 use futures_lite::Stream;
 
@@ -124,6 +127,8 @@ pub struct MayAgentConfig {
     pub workspace_request_broker: WorkspaceRequestBroker,
     /// Channel for ask user requests.
     pub ask_user_broker: AskUserBroker,
+    /// Preconfigured SSH servers available for `open_shell` ssh backend.
+    pub ssh_servers: Vec<crate::config::SshServerConfig>,
 }
 
 /// The May agent.
@@ -147,6 +152,7 @@ impl MayAgent {
             BashTool::new_exact(&config.sandbox_dir, permission_handler, executor)
                 .await
                 .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+                .with_auto_open_default_session(true)
                 .with_writable_paths([memory_file]);
 
         // Create workspace with permissions
@@ -155,6 +161,16 @@ impl MayAgent {
             config.cwd.clone(),
             config.may_dir.clone(),
         );
+
+        let ssh_servers: Vec<SshServer> = config
+            .ssh_servers
+            .iter()
+            .map(|s| SshServer {
+                name: s.name.clone(),
+                target: s.target.clone(),
+            })
+            .collect();
+        let ssh_enabled = !ssh_servers.is_empty();
 
         // Read global memory from ~/.may/memory.md.
         let memory_path = config.may_dir.join("memory.md");
@@ -175,7 +191,12 @@ impl MayAgent {
 
         let transcript_path = config.sandbox_dir.join("chat.txt").display().to_string();
 
+        let skills_dir = config.may_dir.join("skills");
+        let subagents_dir = config.may_dir.join("subagents");
+
         // Build the agent using a minimal base prompt + structured context blocks.
+        // Skills and subagents must be registered before with_default_prompt()
+        // so they appear in the system prompt.
         let mut builder = BashAgentBuilder::new(config.llm, bash_tool)
             .tool(websearch)
             .tool(webfetch)
@@ -183,7 +204,17 @@ impl MayAgent {
             .tool(ask)
             .tool(request_workspace)
             .tool(ask_user)
+            .with_skills_async(&skills_dir)
+            .await
+            .with_subagents_async(&subagents_dir)
+            .await
             .with_default_prompt()
+            .shell_runtime_availability(ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: ssh_enabled,
+            })
+            .ssh_servers(ssh_servers)
             .agent_kind(AgentKind::Coding)
             .persona_prompt(include_str!("../../templates/system.md"))
             .transcript_path(transcript_path)
@@ -196,6 +227,22 @@ impl MayAgent {
             .builtin_tool_hint(BuiltinToolHint::new(
                 "task",
                 "Spawn a subagent for isolated complex work; use `task --help`.",
+            ))
+            .builtin_tool_hint(BuiltinToolHint::new(
+                "list_ssh",
+                "List preconfigured SSH targets before opening ssh shells.",
+            ))
+            .builtin_tool_hint(BuiltinToolHint::new(
+                "open_shell",
+                "Open a shell session first; SSH requires ssh_target from list_ssh and connects only to preconfigured targets.",
+            ))
+            .builtin_tool_hint(BuiltinToolHint::new(
+                "bash",
+                "Run commands with required shell_id and timeout; use timeout=0 for background.",
+            ))
+            .builtin_tool_hint(BuiltinToolHint::new(
+                "close_shell",
+                "Close shell session when done; closing kills its background jobs.",
             ))
             .max_iterations(config.max_iterations);
 
@@ -278,6 +325,7 @@ impl MayAgent {
                     max_iterations: may_config.max_iterations,
                     workspace_request_broker: workspace_request_broker.clone(),
                     ask_user_broker: ask_user_broker.clone(),
+                    ssh_servers: may_config.ssh_servers.clone(),
                 };
 
                 return Self::new(config).await;
@@ -302,6 +350,7 @@ impl MayAgent {
             max_iterations: may_config.max_iterations,
             workspace_request_broker,
             ask_user_broker,
+            ssh_servers: may_config.ssh_servers.clone(),
         };
 
         Self::new(config).await
@@ -339,6 +388,11 @@ impl MayAgent {
     /// Clear conversation history.
     pub fn clear_history(&mut self) {
         self.inner.clear_history();
+    }
+
+    /// Force-close shell sessions and terminate their running jobs.
+    pub async fn close_shell_sessions(&self) {
+        self.inner.close_shell_sessions().await;
     }
 }
 

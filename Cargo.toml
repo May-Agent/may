@@ -12,7 +12,7 @@ path = "src/bin/may.rs"
 [dependencies]
 # Aither framework
 aither-core = { path = "../aither/core" }
-aither-agent = { path = "../aither/agent", features = ["mcp", "websearch", "webfetch"] }
+aither-agent = { path = "../aither/agent", features = ["mcp", "websearch", "webfetch", "skills"] }
 aither-sandbox = { path = "../aither/sandbox" }
 aither-cloud = { path = "../aither/cloud" }
 aither-copilot = { path = "../aither/copilot" }
