@@ -25,6 +25,8 @@ pub struct StreamingMarkdown {
     image_positions: Vec<(String, usize)>,
     /// Current incomplete line (not yet parsed)
     pending_line: String,
+    /// Whether we're currently appending inline spans into an open visual line
+    inline_open: bool,
     /// Whether terminal supports image rendering
     images_supported: bool,
 }
@@ -47,6 +49,7 @@ impl StreamingMarkdown {
             images: Vec::new(),
             image_positions: Vec::new(),
             pending_line: String::new(),
+            inline_open: false,
             images_supported: false,
         }
     }
@@ -61,6 +64,7 @@ impl StreamingMarkdown {
             images: Vec::new(),
             image_positions: Vec::new(),
             pending_line: String::new(),
+            inline_open: false,
             images_supported,
         }
     }
@@ -105,6 +109,7 @@ impl StreamingMarkdown {
         self.images.clear();
         self.image_positions.clear();
         self.pending_line.clear();
+        self.inline_open = false;
     }
 
     /// Get the current raw content.
@@ -139,13 +144,99 @@ impl StreamingMarkdown {
         &self.image_positions
     }
 
+    fn push_inline_span(&mut self, span: Span<'static>) {
+        if self.inline_open {
+            if let Some(last) = self.rendered.last_mut() {
+                last.spans.push(span);
+            } else {
+                self.rendered.push(Line::from(vec![span]));
+            }
+        } else {
+            self.rendered.push(Line::from(vec![span]));
+            self.inline_open = true;
+        }
+    }
+
+    fn end_inline_line(&mut self) {
+        self.inline_open = false;
+    }
+
     /// Render a parse event to output lines.
     fn render_event(&mut self, event: ParseEvent) {
         match event {
             ParseEvent::Text(text) => {
-                self.rendered.push(Line::from(text));
+                self.push_inline_span(Span::raw(text));
+            }
+            ParseEvent::InlineCode(code) => {
+                self.push_inline_span(Span::styled(
+                    code,
+                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+                ));
+            }
+            ParseEvent::Bold(text) => {
+                self.push_inline_span(Span::styled(
+                    text,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+            }
+            ParseEvent::Italic(text) => {
+                self.push_inline_span(Span::styled(
+                    text,
+                    Style::default().add_modifier(Modifier::ITALIC),
+                ));
+            }
+            ParseEvent::BoldItalic(text) => {
+                self.push_inline_span(Span::styled(
+                    text,
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                ));
+            }
+            ParseEvent::Strikeout(text) => {
+                self.push_inline_span(Span::styled(
+                    text,
+                    Style::default().add_modifier(Modifier::CROSSED_OUT),
+                ));
+            }
+            ParseEvent::Link { text, url } => {
+                self.push_inline_span(Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::UNDERLINED),
+                ));
+                self.push_inline_span(Span::styled(
+                    format!(" ({})", url),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            ParseEvent::InlineElements(elements) => {
+                // Track inline images at the current visual line.
+                let line_index = if self.inline_open {
+                    self.rendered.len().saturating_sub(1)
+                } else {
+                    self.rendered.len()
+                };
+                for elem in &elements {
+                    if let streamdown_parser::InlineElement::Image { alt, url } = elem {
+                        tracing::debug!("InlineElement::Image detected: alt={}, url={}", alt, url);
+                        self.images.push((alt.clone(), url.clone()));
+                        self.image_positions.push((url.clone(), line_index));
+                    }
+                }
+                for elem in elements {
+                    self.push_inline_span(render_inline_element(elem));
+                }
+            }
+            ParseEvent::Image { alt, url } => {
+                self.end_inline_line();
+                tracing::debug!("ParseEvent::Image detected: alt={}, url={}", alt, url);
+                self.images.push((alt.clone(), url.clone()));
+                let line_index = self.rendered.len();
+                self.image_positions.push((url.clone(), line_index));
+                self.render_image_placeholder(&alt, &url);
             }
             ParseEvent::Heading { level, content } => {
+                self.end_inline_line();
                 let style = match level {
                     1 => Style::default()
                         .fg(Color::Magenta)
@@ -158,13 +249,11 @@ impl StreamingMarkdown {
                         .add_modifier(Modifier::BOLD),
                     _ => Style::default().add_modifier(Modifier::BOLD),
                 };
-
                 let prefix = if level > 1 {
                     format!("{} ", "#".repeat(level as usize))
                 } else {
                     String::new()
                 };
-
                 self.rendered.push(Line::from(vec![
                     Span::styled(prefix, style.fg(Color::DarkGray)),
                     Span::styled(content, style),
@@ -172,6 +261,7 @@ impl StreamingMarkdown {
                 self.rendered.push(Line::from(""));
             }
             ParseEvent::CodeBlockStart { language, .. } => {
+                self.end_inline_line();
                 if let Some(lang) = language {
                     self.rendered.push(Line::from(vec![
                         Span::styled("│ ", Style::default().fg(Color::DarkGray)),
@@ -185,6 +275,7 @@ impl StreamingMarkdown {
                 }
             }
             ParseEvent::CodeBlockLine(line) => {
+                self.end_inline_line();
                 self.rendered.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
@@ -194,6 +285,7 @@ impl StreamingMarkdown {
                 ]));
             }
             ParseEvent::CodeBlockEnd => {
+                self.end_inline_line();
                 self.rendered.push(Line::from(""));
             }
             ParseEvent::ListItem {
@@ -201,6 +293,7 @@ impl StreamingMarkdown {
                 bullet,
                 content,
             } => {
+                self.end_inline_line();
                 let indent_str = "  ".repeat(indent);
                 let bullet_str = match bullet {
                     streamdown_parser::ListBullet::Dash
@@ -209,7 +302,6 @@ impl StreamingMarkdown {
                     | streamdown_parser::ListBullet::PlusExpand => "• ".to_string(),
                     streamdown_parser::ListBullet::Ordered(n) => format!("{}. ", n),
                 };
-
                 self.rendered.push(Line::from(vec![
                     Span::styled(
                         format!("{}{}", indent_str, bullet_str),
@@ -219,10 +311,14 @@ impl StreamingMarkdown {
                 ]));
             }
             ParseEvent::ListEnd => {
+                self.end_inline_line();
                 self.rendered.push(Line::from(""));
             }
-            ParseEvent::BlockquoteStart { .. } => {}
+            ParseEvent::BlockquoteStart { .. } => {
+                self.end_inline_line();
+            }
             ParseEvent::BlockquoteLine(line) => {
+                self.end_inline_line();
                 self.rendered.push(Line::from(vec![
                     Span::styled("┃ ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
@@ -234,69 +330,19 @@ impl StreamingMarkdown {
                 ]));
             }
             ParseEvent::BlockquoteEnd => {
+                self.end_inline_line();
                 self.rendered.push(Line::from(""));
             }
-            ParseEvent::Link { text, url } => {
-                self.rendered.push(Line::from(vec![
-                    Span::styled(
-                        text,
-                        Style::default()
-                            .fg(Color::Blue)
-                            .add_modifier(Modifier::UNDERLINED),
-                    ),
-                    Span::styled(format!(" ({})", url), Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-            ParseEvent::Image { alt, url } => {
-                tracing::debug!("ParseEvent::Image detected: alt={}, url={}", alt, url);
-                self.images.push((alt.clone(), url.clone()));
-                // Record position before rendering placeholder
-                let line_index = self.rendered.len();
-                self.image_positions.push((url.clone(), line_index));
-                tracing::debug!("Image position tracked: line_index={}", line_index);
-                self.render_image_placeholder(&alt, &url);
-            }
-            ParseEvent::InlineCode(code) => {
-                self.rendered.push(Line::from(Span::styled(
-                    code,
-                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-                )));
-            }
-            ParseEvent::Bold(text) => {
-                self.rendered.push(Line::from(Span::styled(
-                    text,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-            }
-            ParseEvent::Italic(text) => {
-                self.rendered.push(Line::from(Span::styled(
-                    text,
-                    Style::default().add_modifier(Modifier::ITALIC),
-                )));
-            }
-            ParseEvent::BoldItalic(text) => {
-                self.rendered.push(Line::from(Span::styled(
-                    text,
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
-                )));
-            }
-            ParseEvent::Strikeout(text) => {
-                self.rendered.push(Line::from(Span::styled(
-                    text,
-                    Style::default().add_modifier(Modifier::CROSSED_OUT),
-                )));
-            }
             ParseEvent::HorizontalRule => {
+                self.end_inline_line();
                 self.rendered.push(Line::from(Span::styled(
                     "─".repeat(40),
                     Style::default().fg(Color::DarkGray),
                 )));
                 self.rendered.push(Line::from(""));
             }
-            ParseEvent::EmptyLine | ParseEvent::Newline => {
-                self.rendered.push(Line::from(""));
-            }
             ParseEvent::TableHeader(cells) => {
+                self.end_inline_line();
                 let spans: Vec<Span> = cells
                     .into_iter()
                     .map(|c| {
@@ -309,12 +355,14 @@ impl StreamingMarkdown {
                 self.rendered.push(Line::from(spans));
             }
             ParseEvent::TableSeparator => {
+                self.end_inline_line();
                 self.rendered.push(Line::from(Span::styled(
                     "├────────────────────────────────────────┤",
                     Style::default().fg(Color::DarkGray),
                 )));
             }
             ParseEvent::TableRow(cells) => {
+                self.end_inline_line();
                 let spans: Vec<Span> = cells
                     .into_iter()
                     .map(|c| Span::raw(format!("│ {} ", c)))
@@ -322,29 +370,18 @@ impl StreamingMarkdown {
                 self.rendered.push(Line::from(spans));
             }
             ParseEvent::TableEnd => {
+                self.end_inline_line();
                 self.rendered.push(Line::from(""));
             }
-            ParseEvent::InlineElements(elements) => {
-                // First pass: collect images and track positions
-                for elem in &elements {
-                    if let streamdown_parser::InlineElement::Image { alt, url } = elem {
-                        tracing::debug!("InlineElement::Image detected: alt={}, url={}", alt, url);
-                        self.images.push((alt.clone(), url.clone()));
-                        // Track position for inline images too
-                        let line_index = self.rendered.len();
-                        self.image_positions.push((url.clone(), line_index));
-                    }
-                }
-                // Second pass: render spans
-                let spans: Vec<Span<'static>> = elements
-                    .into_iter()
-                    .map(|elem| render_inline_element(elem))
-                    .collect();
-                if !spans.is_empty() {
-                    self.rendered.push(Line::from(spans));
-                }
+            ParseEvent::EmptyLine => {
+                self.end_inline_line();
+                self.rendered.push(Line::from(""));
             }
-            // Handle other events
+            ParseEvent::Newline => {
+                // Newline terminates the current logical line; it should not add
+                // an extra blank visual row.
+                self.end_inline_line();
+            }
             _ => {}
         }
     }

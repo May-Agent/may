@@ -91,7 +91,9 @@ async fn main() -> anyhow::Result<()> {
     let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
     // Inline viewport is anchored from cursor position at init time.
     // Place cursor at (term_height - viewport_height) so viewport starts near bottom.
-    let viewport_height = term_height.saturating_sub(1).min(20).max(8);
+    // Use almost full terminal height for inline viewport so session switches/new can redraw
+    // the whole visible chat region instead of leaving stale content above.
+    let viewport_height = term_height.saturating_sub(1).max(1);
     let init_row = term_height.saturating_sub(viewport_height);
     execute!(stdout, MoveTo(0, init_row))?;
     let backend = CrosstermBackend::new(stdout);
@@ -210,47 +212,41 @@ where
     loop {
         tracing::info!("=== LOOP START ===");
 
-        // Draw UI first so content_height/view_height are up to date
+        // First draw: updates content_height/view_height for accurate overflow calculation.
         terminal.draw(|frame| ui::render(frame, app))?;
         tracing::info!("after draw");
 
-        // Push only the minimum completed prefix needed to resolve overflow.
-        // Pushing everything at once causes visible jumps when content grows.
+        // Move only overflowing, completed content into native terminal scrollback.
+        // Keep a recent window in viewport; never push while streaming.
         {
             use may_agent::tui::ui::chat::{render_elements_to_lines, visual_line_count};
-            let content_h = app.content_height.get();
-            let view_h = app.view_height.get();
-            let overflow = content_h.saturating_sub(view_h);
-            if overflow > 0 {
+            let mut pushed_any = false;
+
+            if !app.chat.is_streaming() {
                 let completed = app.chat.completed_elements();
-                if !completed.is_empty() {
+                // Push only one oldest completed element per frame to keep ordering stable
+                // and avoid large viewport jumps during long conversations.
+                if completed.len() > 1 {
+                    let push_count = 1usize;
                     let viewport_width = terminal.get_frame().area().width.max(1) as usize;
-                    let mut elem_count = 0usize;
-                    let mut pushed_rows = 0usize;
-
-                    for elem in completed {
-                        let elem_lines = render_elements_to_lines(std::slice::from_ref(elem));
-                        elem_count += 1;
-                        pushed_rows += visual_line_count(&elem_lines, viewport_width);
-                        if pushed_rows >= overflow {
-                            break;
-                        }
+                    let lines = render_elements_to_lines(&completed[..push_count]);
+                    let row_count =
+                        visual_line_count(&lines, viewport_width).min(u16::MAX as usize) as u16;
+                    if row_count > 0 {
+                        terminal.insert_before(row_count, |buf| {
+                            use ratatui::widgets::Paragraph;
+                            let text = ratatui::text::Text::from(lines);
+                            Paragraph::new(text).render(buf.area, buf);
+                        })?;
                     }
-
-                    if elem_count > 0 {
-                        let lines = render_elements_to_lines(&completed[..elem_count]);
-                        let row_count =
-                            visual_line_count(&lines, viewport_width).min(u16::MAX as usize) as u16;
-                        if row_count > 0 {
-                            terminal.insert_before(row_count, |buf| {
-                                use ratatui::widgets::Paragraph;
-                                let text = ratatui::text::Text::from(lines);
-                                Paragraph::new(text).render(buf.area, buf);
-                            })?;
-                        }
-                        app.chat.mark_pushed(elem_count);
-                    }
+                    app.chat.mark_pushed(push_count);
+                    pushed_any = true;
                 }
+            }
+
+            if pushed_any {
+                terminal.clear()?;
+                terminal.draw(|frame| ui::render(frame, app))?;
             }
         }
 
@@ -371,9 +367,10 @@ where
 
         match event {
             Event::AskUser(request) => {
-                tracing::info!(question = %request.args.question, "User question requested");
-                app.ask_user_cursor = 0;
-                app.mode = may_agent::tui::AppMode::AskUser(request, Vec::new());
+                let questions = request.args.clone().into_questions();
+                tracing::info!(question_count = questions.len(), "User question requested");
+                let state = may_agent::tui::AskUserState::new(request, questions);
+                app.mode = may_agent::tui::AppMode::AskUser(state);
             }
 
             Event::Workspace(request) => {
@@ -567,6 +564,34 @@ where
                                 app.chat.push_error(&err_msg);
                                 app.mcp_servers = mcp_manager.server_info();
                                 tracing::error!("{}", err_msg);
+                            }
+                        }
+                    }
+                    Some(SendAction::SshAdd { name, target }) => {
+                        app.config
+                            .upsert_ssh_server(may_agent::config::SshServerConfig { name: name.clone(), target });
+                        if let Err(e) = app.config.save() {
+                            let err_msg = format!("Failed to save SSH server: {}", e);
+                            app.chat.push_error(&err_msg);
+                        } else {
+                            app.status = Some(format!("Added SSH server: {}", name));
+                            if app.ssh_selected + 1 < app.config.ssh_servers.len() {
+                                app.ssh_selected = app.config.ssh_servers.len() - 1;
+                            }
+                        }
+                    }
+                    Some(SendAction::SshRemove { name }) => {
+                        if app.config.remove_ssh_server(&name) {
+                            if let Err(e) = app.config.save() {
+                                let err_msg = format!("Failed to save SSH config: {}", e);
+                                app.chat.push_error(&err_msg);
+                            } else {
+                                app.status = Some(format!("Removed SSH server: {}", name));
+                                if app.ssh_selected >= app.config.ssh_servers.len()
+                                    && !app.config.ssh_servers.is_empty()
+                                {
+                                    app.ssh_selected = app.config.ssh_servers.len() - 1;
+                                }
                             }
                         }
                     }

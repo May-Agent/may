@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use aither_sandbox::BashMode;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -680,11 +680,13 @@ pub fn render_elements_to_lines(elements: &[ChatElement]) -> Vec<Line<'static>> 
             }
 
             ChatElement::AssistantText { content, .. } => {
-                // For scrollback, just render plain text with basic formatting
-                // Full markdown rendering is done in the viewport
-                for line in content.lines() {
-                    lines.push(Line::from(line.to_string()));
+                // Use the same markdown renderer as viewport content so wrapped row counts
+                // stay consistent between insert_before() and regular rendering.
+                let mut md_lines = markdown::render_markdown(content);
+                while md_lines.last().is_some_and(|l| l.spans.is_empty()) {
+                    md_lines.pop();
                 }
+                lines.extend(md_lines);
                 lines.push(Line::from(""));
             }
 
@@ -881,6 +883,11 @@ fn render_impl(
                 // Render markdown with position tracking
                 let md_result = markdown::render_markdown_with_positions(content, images_supported);
                 let mut md_lines = md_result.lines;
+                // Strip accidental trailing empties from markdown renderer so we don't inflate
+                // content height and trigger premature scrollback insertion.
+                while md_lines.last().is_some_and(|l| l.spans.is_empty()) {
+                    md_lines.pop();
+                }
 
                 // Collect image positions with offset adjustment
                 for (url, pos) in md_result.image_positions {
@@ -1011,8 +1018,8 @@ fn render_impl(
         cell.set(view_height);
     }
 
-    // Keep input/composer anchored to the bottom of the viewport when underflowing.
-    // This matches chat UX expectations while still using native terminal scrollback.
+    // Keep input/composer anchored to the bottom when content underflows.
+    // Use explicit top padding lines to keep wrap + scroll behavior consistent.
     let (scroll_y, final_lines) = if visual_content_height < view_height {
         let padding = view_height - visual_content_height;
         let mut padded = Vec::with_capacity(padding + lines.len());
@@ -1031,10 +1038,10 @@ fn render_impl(
         (actual_scroll.min(u16::MAX as usize) as u16, lines)
     };
 
+    frame.render_widget(Clear, area);
     let paragraph = Paragraph::new(final_lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
-
     frame.render_widget(paragraph, area);
 }
 
