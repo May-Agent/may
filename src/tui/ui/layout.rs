@@ -4,12 +4,16 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
+use unicode_width::UnicodeWidthChar;
 
-use super::super::app::{
-    App, AppMode, AskUserState, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode,
+use ratatui::Frame;
+
+use super::super::app::App;
+use super::super::completion::CompletionMode;
+use super::super::state::{
+    AppMode, AskUserState, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode,
     SkillAddMode, SshAddMode,
 };
-use super::super::completion::CompletionMode;
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 use crate::workspace_request::WorkspaceRequest;
 
@@ -108,6 +112,40 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         },
     );
 
+    // Keep selection cache aligned with chat content and account for top padding.
+    let plain_all_lines = chat::build_plain_wrapped_lines_unified(
+        &app.chat,
+        chat_area.width,
+        if queue_messages.is_empty() {
+            None
+        } else {
+            Some(QueueContext {
+                messages: &queue_messages,
+            })
+        },
+        Some(InputContext {
+            input: &app.input,
+            cursor: app.cursor,
+            attachments: &app.attachments,
+        }),
+        Some(StatusContext {
+            model: &app.model_display(),
+            usage: usage_info,
+            queue_count: app.queue.len(),
+            background_tasks: app.background_tasks,
+            processing: app.processing,
+            status_message: app.status.as_deref(),
+        }),
+    );
+
+    let view_h = chat_area.height as usize;
+    app.render_top_padding = view_h.saturating_sub(plain_all_lines.len());
+    app.rendered_plain_lines = plain_all_lines;
+
+    if app.selection.is_some() {
+        render_text_selection_overlay(frame, chat_area, app);
+    }
+
     // Render images as overlays at their scroll-adjusted positions
     if images_supported && !image_positions.is_empty() {
         render_inline_images(frame, chat_area, app, &image_positions, scroll);
@@ -146,6 +184,82 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.completion.is_active() && !app.completion.is_empty() {
         render_completion_overlay(frame, area, app);
     }
+}
+
+fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(sel) = app.selection else {
+        return;
+    };
+    if sel.is_empty() || app.rendered_plain_lines.is_empty() {
+        return;
+    }
+
+    let (start, end) = sel.normalized();
+    let start_line = start
+        .line
+        .min(app.rendered_plain_lines.len().saturating_sub(1));
+    let end_line = end
+        .line
+        .min(app.rendered_plain_lines.len().saturating_sub(1));
+
+    let base_scroll = if app.scroll == usize::MAX {
+        app.content_height
+            .get()
+            .saturating_sub(app.view_height.get())
+    } else {
+        app.scroll
+    };
+
+    for line_idx in start_line..=end_line {
+        let visual_line = app.render_top_padding.saturating_add(line_idx);
+        if visual_line < base_scroll {
+            continue;
+        }
+
+        let y_in_view = visual_line - base_scroll;
+        if y_in_view >= area.height as usize {
+            continue;
+        }
+
+        let line = &app.rendered_plain_lines[line_idx];
+        let char_count = line.chars().count();
+        let from = if line_idx == start_line {
+            start.column.min(char_count)
+        } else {
+            0
+        };
+        let to = if line_idx == end_line {
+            end.column.min(char_count)
+        } else {
+            char_count
+        };
+        if to <= from {
+            continue;
+        }
+
+        let x0 = display_width_prefix(line, from).min(area.width as usize);
+        let x1 = display_width_prefix(line, to).min(area.width as usize);
+        if x1 <= x0 {
+            continue;
+        }
+
+        let rect = Rect::new(
+            area.x + x0 as u16,
+            area.y + y_in_view as u16,
+            (x1 - x0) as u16,
+            1,
+        );
+        frame
+            .buffer_mut()
+            .set_style(rect, Style::default().bg(Color::Rgb(70, 90, 130)));
+    }
+}
+
+fn display_width_prefix(text: &str, char_count: usize) -> usize {
+    text.chars()
+        .take(char_count)
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
+        .sum()
 }
 
 /// Help text content.
@@ -1507,7 +1621,9 @@ fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
                         Span::styled(
                             &server.name,
                             if selected {
-                                Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::BOLD)
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(ratatui::style::Modifier::BOLD)
                             } else {
                                 Style::default().fg(Color::White)
                             },
@@ -1809,7 +1925,12 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     let height = needed.min(max_height);
 
     // Bottom-anchored overlay
-    let overlay = Rect::new(area.x, area.y + area.height.saturating_sub(height), area.width, height);
+    let overlay = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(height),
+        area.width,
+        height,
+    );
     frame.render_widget(Clear, overlay);
 
     // Build section tabs line for multi-question
@@ -1824,7 +1945,9 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
             if i == state.current_question {
                 title_spans.push(Span::styled(
                     label,
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 title_spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
@@ -1853,8 +1976,8 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
 
     // Layout inner: question + items + optional custom input + help
     let mut constraints = vec![
-        Constraint::Length(2),        // question text
-        Constraint::Min(1),           // items list
+        Constraint::Length(2), // question text
+        Constraint::Min(1),    // items list
     ];
     if qs.custom_mode {
         constraints.push(Constraint::Length(1)); // custom input
@@ -1869,7 +1992,9 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     // Render question text
     let q_text = Paragraph::new(Line::from(Span::styled(
         &question.question,
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
     )))
     .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(q_text, chunks[0]);
@@ -1890,7 +2015,9 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
         let is_cursor = global_idx == qs.cursor;
         let prefix = if is_cursor { "> " } else { "  " };
         let cursor_style = if is_cursor {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
@@ -1945,7 +2072,14 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(prefix, cursor_style),
                 Span::styled(mark, custom_style),
-                Span::styled(label, if is_cursor { cursor_style } else { custom_style }),
+                Span::styled(
+                    label,
+                    if is_cursor {
+                        cursor_style
+                    } else {
+                        custom_style
+                    },
+                ),
             ])));
         }
     }
@@ -1966,7 +2100,11 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     }
 
     // Help text
-    let nav = if state.is_multi() { " | Tab/l: next | Shift-Tab/H: prev" } else { "" };
+    let nav = if state.is_multi() {
+        " | Tab/l: next | Shift-Tab/H: prev"
+    } else {
+        ""
+    };
     let help_text = if question.multi_select {
         format!("Space: toggle | Enter: confirm | j/k: navigate{nav} | Esc: skip all")
     } else {
@@ -2060,14 +2198,12 @@ fn render_inline_images(
     let view_height = chat_area.height as usize;
     let content_height = app.content_height.get();
 
-    // Calculate padding the same way as render_impl does:
-    // When content doesn't fill the screen, padding is added at the TOP
-    // to push content to the bottom of the screen.
+    // Calculate offset the same way as render_impl does:
+    // When content doesn't fill the screen, it renders at the BOTTOM of the
+    // viewport area, so the y-offset equals the unused space above.
     let (padding, actual_scroll) = if content_height < view_height {
-        // Content fits - padding at top, no scroll
         (view_height - content_height, 0)
     } else {
-        // Content exceeds screen - no padding, use scroll
         let max_scroll = content_height - view_height;
         let scroll_val = if app.scroll == usize::MAX {
             max_scroll

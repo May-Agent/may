@@ -535,4 +535,28 @@ mod tests {
         assert!(text.contains("🖼"));
         assert!(text.contains("My Image"));
     }
+
+    #[test]
+    fn test_horizontal_rule() {
+        let mut md = StreamingMarkdown::new();
+        md.push("Hello\n\n---\n\nWorld\n");
+        md.flush();
+        let lines = md.lines();
+        let all_text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        eprintln!("HR test lines: {:?}", all_text);
+        let has_rule = all_text.iter().any(|t| t.contains('─'));
+        assert!(
+            has_rule,
+            "Expected horizontal rule (─), got: {:?}",
+            all_text
+        );
+    }
 }

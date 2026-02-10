@@ -186,10 +186,12 @@ impl MayAgent {
         let todo = TodoTool::new();
         let ask = AskCommand::new(fast_llm);
         let request_workspace = RequestWorkspaceTool::new(config.workspace_request_broker);
+        let ssh_authorizer_broker = config.ask_user_broker.clone();
         let ask_user = AskUserTool::new(config.ask_user_broker);
         let task_tool = TaskTool::new(task_llm).with_builtins();
 
-        let transcript_path = config.sandbox_dir.join("chat.txt").display().to_string();
+        let transcript_file = config.sandbox_dir.join("transcript.md");
+        let transcript_path = transcript_file.display().to_string();
 
         let skills_dir = config.may_dir.join("skills");
         let subagents_dir = config.may_dir.join("subagents");
@@ -215,9 +217,13 @@ impl MayAgent {
                 ssh: ssh_enabled,
             })
             .ssh_servers(ssh_servers)
+            .ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
+                ssh_authorizer_broker,
+            ))
             .agent_kind(AgentKind::Coding)
             .persona_prompt(include_str!("../../templates/system.md"))
             .transcript_path(transcript_path)
+            .transcript(transcript_file)
             .context_block(build_workspace_context_block(&workspace))
             .context_block(build_memory_context_block(&memory_content))
             .builtin_tool_hint(BuiltinToolHint::new(
@@ -227,22 +233,6 @@ impl MayAgent {
             .builtin_tool_hint(BuiltinToolHint::new(
                 "task",
                 "Spawn a subagent for isolated complex work; use `task --help`.",
-            ))
-            .builtin_tool_hint(BuiltinToolHint::new(
-                "list_ssh",
-                "List preconfigured SSH targets before opening ssh shells.",
-            ))
-            .builtin_tool_hint(BuiltinToolHint::new(
-                "open_shell",
-                "Open a shell session first; SSH requires ssh_target from list_ssh and connects only to preconfigured targets.",
-            ))
-            .builtin_tool_hint(BuiltinToolHint::new(
-                "bash",
-                "Run commands with required shell_id and timeout; use timeout=0 for background.",
-            ))
-            .builtin_tool_hint(BuiltinToolHint::new(
-                "close_shell",
-                "Close shell session when done; closing kills its background jobs.",
             ))
             .max_iterations(config.max_iterations);
 

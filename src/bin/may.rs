@@ -18,15 +18,13 @@ use crossterm::{
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use executor_core::tokio::TokioGlobal;
 use executor_core::{spawn, try_init_global_executor};
+use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
@@ -38,7 +36,6 @@ use may_agent::workspace_request::{self, WorkspaceRequestQueue};
 use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
 
 const PANIC_MESSAGE: &str = include_str!("../texts/panic_message.txt");
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -215,7 +212,6 @@ where
         terminal.draw(|frame| ui::render(frame, app))?;
         tracing::info!("after draw");
 
-
         // Check for model fetch results (non-blocking)
         if let Some(ref mut rx) = app.model_fetch_rx {
             if let Ok(models) = rx.try_recv() {
@@ -367,6 +363,18 @@ where
                                 .await;
                         }
                     }
+                    TuiEvent::Compacted(result) => match result {
+                        Ok(Some(stats)) => {
+                            app.status =
+                                Some(format!("Compacted {} messages", stats.messages_compacted));
+                        }
+                        Ok(None) => {
+                            app.status = Some("Nothing to compact".to_string());
+                        }
+                        Err(err) => {
+                            app.chat.push_error(&format!("Compaction failed: {err}"));
+                        }
+                    },
                     TuiEvent::Complete => {
                         runtime_deps
                             .finish_agent_task(
@@ -470,10 +478,16 @@ where
                             tracing::warn!("Failed to open URL in browser: {}", e);
                         }
                     }
-                    Some(SendAction::Compact) => {
-                        // Compaction requires direct agent access, which we don't have with worker pattern
-                        // TODO: Add compact command to worker protocol if needed
-                        app.status = Some("Compaction not available in worker mode".to_string());
+                    Some(SendAction::Compact(focus)) => {
+                        if agent_handle.is_none() {
+                            if let Some(w) = worker.as_ref() {
+                                app.processing = true;
+                                app.status = Some("Compacting conversation...".to_string());
+                                agent_handle = Some(w.compact(focus));
+                            }
+                        } else {
+                            app.status = Some("Agent is busy".to_string());
+                        }
                     }
                     Some(SendAction::McpAdd {
                         name,
@@ -535,7 +549,10 @@ where
                     }
                     Some(SendAction::SshAdd { name, target }) => {
                         app.config
-                            .upsert_ssh_server(may_agent::config::SshServerConfig { name: name.clone(), target });
+                            .upsert_ssh_server(may_agent::config::SshServerConfig {
+                                name: name.clone(),
+                                target,
+                            });
                         if let Err(e) = app.config.save() {
                             let err_msg = format!("Failed to save SSH server: {}", e);
                             app.chat.push_error(&err_msg);
