@@ -15,6 +15,9 @@ export interface Message {
   content: string;
   timestamp: string;
   attachments?: Attachment[];
+  isStreaming?: boolean;
+  thinking?: string;
+  isThinking?: boolean;
 }
 
 export interface Session {
@@ -35,8 +38,4 @@ export interface Project {
   createdAt: string;
 }
 
-export interface User {
-  id: string;
-  name: string;
-  avatar: string;
-}
+

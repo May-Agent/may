@@ -6,7 +6,6 @@ import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { SettingsDialog } from '@/components/settings/SettingsDialog';
 import {
-  MessageSquare,
   Search,
   Plus,
   Trash2,
@@ -74,8 +73,7 @@ export function Sidebar({ className }: SidebarProps) {
                     )}
                     onClick={() => setCurrentSession(session.id)}
                   >
-                    <div className="flex items-center gap-2 truncate flex-1 min-w-0">
-                      <MessageSquare className="h-4 w-4 flex-shrink-0" />
+                    <div className="flex items-center truncate flex-1 min-w-0">
                       <span className="truncate">{session.title || "New Chat"}</span>
                     </div>
                     

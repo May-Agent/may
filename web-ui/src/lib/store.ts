@@ -24,6 +24,10 @@ interface AppState {
     sessionId: string,
     effort: "low" | "medium" | "high",
   ) => void;
+  updateMessageContent: (sessionId: string, messageId: string, content: string) => void;
+  setMessageStreaming: (sessionId: string, messageId: string, streaming: boolean) => void;
+  updateMessageThinking: (sessionId: string, messageId: string, thinking: string) => void;
+  setMessageThinkingState: (sessionId: string, messageId: string, isThinking: boolean) => void;
 
   createProject: (name: string, description?: string) => void;
   deleteProject: (projectId: string) => void;
@@ -208,6 +212,46 @@ export const useStore = create<AppState>((set, get) => ({
     set((state) => ({
       sessions: state.sessions.map((s) =>
         s.id === sessionId ? { ...s, reasoningEffort: effort } : s,
+      ),
+    }));
+  },
+
+  updateMessageContent: (sessionId, messageId, content) => {
+    set((state) => ({
+      sessions: state.sessions.map((s) =>
+        s.id === sessionId
+          ? { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, content } : m) }
+          : s,
+      ),
+    }));
+  },
+
+  setMessageStreaming: (sessionId, messageId, streaming) => {
+    set((state) => ({
+      sessions: state.sessions.map((s) =>
+        s.id === sessionId
+          ? { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, isStreaming: streaming } : m) }
+          : s,
+      ),
+    }));
+  },
+
+  updateMessageThinking: (sessionId, messageId, thinking) => {
+    set((state) => ({
+      sessions: state.sessions.map((s) =>
+        s.id === sessionId
+          ? { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, thinking } : m) }
+          : s,
+      ),
+    }));
+  },
+
+  setMessageThinkingState: (sessionId, messageId, isThinking) => {
+    set((state) => ({
+      sessions: state.sessions.map((s) =>
+        s.id === sessionId
+          ? { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, isThinking } : m) }
+          : s,
       ),
     }));
   },
