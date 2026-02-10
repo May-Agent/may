@@ -1,9 +1,11 @@
 //! Clipboard handling for image paste.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use arboard::Clipboard;
 use async_fs;
+use base64::Engine;
 use image::ImageFormat as ImgFormat;
 use url::Url;
 use zenwave::ResponseExt;
@@ -348,4 +350,66 @@ impl TextManager {
         async_fs::write(&path, text).await?;
         Ok(path)
     }
+}
+
+/// Convert basic markdown to simple HTML for rich clipboard copy.
+#[must_use]
+pub fn markdown_to_basic_html(markdown: &str) -> String {
+    // Keep this intentionally simple/safe for clipboard usage.
+    let escaped = markdown
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+
+    let mut html = escaped.replace("\n\n", "</p><p>");
+    html = html.replace('\n', "<br />");
+    html = html.replace("**", "__BOLD_TOGGLE__");
+    html = html.replace('*', "__ITALIC_TOGGLE__");
+
+    // Toggle-style replacement: good enough for LLM markdown snippets.
+    let mut out = String::new();
+    let mut bold = false;
+    let mut i = 0usize;
+    while let Some(pos) = html[i..].find("__BOLD_TOGGLE__") {
+        let abs = i + pos;
+        out.push_str(&html[i..abs]);
+        out.push_str(if bold { "</strong>" } else { "<strong>" });
+        bold = !bold;
+        i = abs + "__BOLD_TOGGLE__".len();
+    }
+    out.push_str(&html[i..]);
+
+    let html = out;
+    let mut out = String::new();
+    let mut italic = false;
+    let mut i = 0usize;
+    while let Some(pos) = html[i..].find("__ITALIC_TOGGLE__") {
+        let abs = i + pos;
+        out.push_str(&html[i..abs]);
+        out.push_str(if italic { "</em>" } else { "<em>" });
+        italic = !italic;
+        i = abs + "__ITALIC_TOGGLE__".len();
+    }
+    out.push_str(&html[i..]);
+
+    format!("<p>{}</p>", out)
+}
+
+/// Try to write plain text into terminal clipboard via OSC52.
+pub fn copy_via_osc52(text: &str) -> Result<(), ImageError> {
+    let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(format!("\x1b]52;c;{}\x07", payload).as_bytes())
+        .map_err(ImageError::Io)?;
+    stdout.flush().map_err(ImageError::Io)
+}
+
+/// Copy both rich text (HTML + alt text) and plain text using arboard.
+pub fn set_clipboard_html(html: &str, alt_text: &str) -> Result<(), ImageError> {
+    let mut clipboard = Clipboard::new().map_err(|e| ImageError::Clipboard(e.to_string()))?;
+    clipboard
+        .set_html(html, Some(alt_text))
+        .map_err(|e| ImageError::Clipboard(e.to_string()))
 }

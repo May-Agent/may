@@ -1,9 +1,9 @@
 //! State types for TUI modes and config editing.
 
-use crate::ask_user::{AskUserRequest, Question};
-use crate::config::{Provider};
-use crate::workspace_request::WorkspaceRequest;
 use crate::MayConfig;
+use crate::ask_user::{AskUserRequest, Question};
+use crate::config::Provider;
+use crate::workspace_request::WorkspaceRequest;
 
 /// Application mode.
 #[derive(Debug)]
@@ -87,7 +87,10 @@ pub struct AskUserState {
 
 impl AskUserState {
     pub fn new(request: AskUserRequest, questions: Vec<Question>) -> Self {
-        let states = questions.iter().map(|_| AskUserQuestionState::new()).collect();
+        let states = questions
+            .iter()
+            .map(|_| AskUserQuestionState::new())
+            .collect();
         Self {
             request,
             questions,
@@ -114,9 +117,7 @@ impl AskUserState {
     /// Total number of items in the list for current question:
     /// options + "Skip" + "Custom answer"
     pub fn current_item_count(&self) -> usize {
-        self.current()
-            .map(|q| q.option.len() + 2)
-            .unwrap_or(0)
+        self.current().map(|q| q.option.len() + 2).unwrap_or(0)
     }
 
     /// Whether there are multiple questions.
@@ -181,6 +182,36 @@ pub enum ActiveTextInput<'a> {
         input: &'a mut String,
         filter: PasteFilter,
     },
+}
+
+/// A visual cursor position in the rendered chat viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionPoint {
+    pub line: usize,
+    pub column: usize,
+}
+
+/// Drag selection in rendered chat content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelection {
+    pub anchor: SelectionPoint,
+    pub cursor: SelectionPoint,
+}
+
+impl TextSelection {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.cursor
+    }
+
+    #[must_use]
+    pub fn normalized(&self) -> (SelectionPoint, SelectionPoint) {
+        if (self.anchor.line, self.anchor.column) <= (self.cursor.line, self.cursor.column) {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
 }
 
 /// MCP add server mode.

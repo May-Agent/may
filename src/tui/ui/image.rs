@@ -8,6 +8,8 @@
 use anyhow;
 use image::DynamicImage;
 use ratatui::prelude::*;
+
+use ratatui::Frame;
 use ratatui_image::StatefulImage;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;

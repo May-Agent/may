@@ -543,7 +543,6 @@ impl ModelsConfig {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SshServerConfig {
     pub name: String,

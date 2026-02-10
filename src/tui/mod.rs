@@ -13,8 +13,8 @@ pub mod state;
 pub mod ui;
 
 pub use app::{App, SendAction};
-pub use state::{AppMode, AskUserState};
 pub use completion::{Completion, CompletionMode};
 pub use event::{AppEvent, EventHandler};
 pub use history::InputHistory;
 pub use queue::{Attachment, PendingMessage};
+pub use state::{AppMode, AskUserState, SelectionPoint, TextSelection};
