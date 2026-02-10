@@ -8,7 +8,9 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use unicode_width::UnicodeWidthStr;
+
+use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use super::super::queue::Attachment;
 use super::markdown;
@@ -207,29 +209,12 @@ pub enum ChatElement {
     Thinking { seconds: u64 },
 }
 
-impl ChatElement {
-    /// Check if this element is "complete" and can be pushed to scrollback.
-    /// Returns false for streaming/loading/thinking states.
-    pub fn is_complete(&self) -> bool {
-        match self {
-            Self::UserMessage { .. } => true,
-            Self::AssistantText { streaming, .. } => !streaming,
-            Self::ToolCall { display, .. } => display.is_complete(),
-            Self::TodoBlock { .. } => false, // Todo blocks are always active
-            Self::Error { .. } => true,
-            Self::Loading { .. } => false,
-            Self::Thinking { .. } => false,
-        }
-    }
-}
+impl ChatElement {}
 
 /// The chat stream containing all elements.
 #[derive(Debug, Default)]
 pub struct ChatStream {
     elements: Vec<ChatElement>,
-    /// Index of first element not yet pushed to terminal scrollback.
-    /// Elements before this index have been pushed and should not be re-rendered.
-    scrollback_cursor: usize,
 }
 
 impl ChatStream {
@@ -478,37 +463,9 @@ impl ChatStream {
         )
     }
 
-    /// Get elements that are active (not yet pushed to scrollback).
-    /// These are the only elements that should be rendered in the viewport.
+    /// Get all active elements.
     pub fn active_elements(&self) -> &[ChatElement] {
-        &self.elements[self.scrollback_cursor..]
-    }
-
-    /// Get elements that have been completed and can be pushed to scrollback.
-    /// Returns elements from scrollback_cursor that are "complete" (not streaming/loading).
-    pub fn completed_elements(&self) -> &[ChatElement] {
-        let active = &self.elements[self.scrollback_cursor..];
-        // Find how many consecutive complete elements from the start
-        let complete_count = active.iter().take_while(|e| e.is_complete()).count();
-        &active[..complete_count]
-    }
-
-    /// Mark the first N elements (from scrollback_cursor) as pushed to scrollback.
-    pub fn mark_pushed(&mut self, count: usize) {
-        self.scrollback_cursor = (self.scrollback_cursor + count).min(self.elements.len());
-    }
-
-    /// Check if there are completed elements ready to be pushed.
-    pub fn has_completed_to_push(&self) -> bool {
-        self.active_elements()
-            .first()
-            .map(|e| e.is_complete())
-            .unwrap_or(false)
-    }
-
-    /// Get the scrollback cursor position.
-    pub fn scrollback_cursor(&self) -> usize {
-        self.scrollback_cursor
+        &self.elements
     }
 }
 
@@ -589,6 +546,127 @@ pub fn render_unified(
     );
 }
 
+/// Build plain wrapped lines for selection/copy from unified viewport content.
+pub fn build_plain_wrapped_lines_unified(
+    chat: &ChatStream,
+    width: u16,
+    queue_ctx: Option<QueueContext<'_>>,
+    input_ctx: Option<InputContext<'_>>,
+    status_ctx: Option<StatusContext<'_>>,
+) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<Line<'static>> = build_plain_chat_lines(chat);
+
+    if let Some(ref ctx) = queue_ctx {
+        if !ctx.messages.is_empty() {
+            render_queue_lines(&mut lines, ctx, width);
+        }
+    }
+
+    if let Some(ctx) = input_ctx {
+        render_input_line(&mut lines, ctx);
+    }
+
+    if let Some(ref ctx) = status_ctx {
+        render_status_line(&mut lines, ctx);
+    }
+
+    paragraph_to_wrapped_plain(lines, width)
+}
+
+fn build_plain_chat_lines(chat: &ChatStream) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for elem in chat.active_elements() {
+        match elem {
+            ChatElement::UserMessage { content, .. } => {
+                for (i, line) in content.lines().enumerate() {
+                    if i == 0 {
+                        lines.push(Line::from(format!("> {}", line)));
+                    } else {
+                        lines.push(Line::from(format!("  {}", line)));
+                    }
+                }
+                lines.push(Line::from(""));
+            }
+            ChatElement::AssistantText { content, .. } => {
+                lines.extend(markdown::render_markdown_with_config(content, false));
+                lines.push(Line::from(""));
+            }
+            ChatElement::Error { message } => {
+                lines.push(Line::from(format!("error: {}", message)));
+                lines.push(Line::from(""));
+            }
+            ChatElement::ToolCall { .. }
+            | ChatElement::TodoBlock { .. }
+            | ChatElement::Loading { .. }
+            | ChatElement::Thinking { .. } => {}
+        }
+    }
+    lines
+}
+
+fn paragraph_to_wrapped_plain(lines: Vec<Line>, width: u16) -> Vec<String> {
+    let mut out = Vec::new();
+    let max_width = width as usize;
+
+    for line in lines {
+        let plain = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        let mut wrapped = wrap_plain_line(&plain, max_width);
+        out.append(&mut wrapped);
+    }
+
+    out
+}
+
+fn wrap_plain_line(line: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+
+    for ch in line.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+        if current_w + w > max_width && !current.is_empty() {
+            out.push(current);
+            current = String::new();
+            current_w = 0;
+        }
+        current.push(ch);
+        current_w += w;
+    }
+
+    out.push(current);
+    out
+}
+
+#[must_use]
+pub fn clamp_column_by_width(line: &str, target_col: usize) -> usize {
+    let mut col = 0usize;
+    let mut out = 0usize;
+    for ch in line.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if col + w > target_col {
+            break;
+        }
+        col += w;
+        out += 1;
+    }
+    out
+}
+
 /// Safely clamp scroll value for u16 and content bounds.
 fn safe_scroll(scroll: usize, content_height: usize, area_height: u16) -> u16 {
     // Don't allow scroll beyond content
@@ -598,186 +676,17 @@ fn safe_scroll(scroll: usize, content_height: usize, area_height: u16) -> u16 {
     clamped.min(u16::MAX as usize) as u16
 }
 
-/// Calculate how many visual lines a Line will take when wrapped to a given width.
-fn wrapped_line_count(line: &Line, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-
-    // Calculate total display width of the line
-    let content_width: usize = line.spans.iter().map(|s| s.content.as_ref().width()).sum();
-
-    if content_width == 0 {
-        return 1; // Empty line still takes 1 row
-    }
-
-    // Ceiling division: how many rows needed
-    (content_width + width - 1) / width
-}
-
-/// Calculate total visual lines for a slice of Lines when wrapped.
+/// Calculate actual visual row count using ratatui's own Paragraph::line_count.
+/// This is the only way to get an exact match with how Paragraph renders wrapped text,
+/// especially for CJK wide characters and word-boundary wrapping.
 fn total_wrapped_lines(lines: &[Line], width: usize) -> usize {
-    lines
-        .iter()
-        .map(|line| wrapped_line_count(line, width))
-        .sum()
-}
-
-/// Calculate visual row count for lines under paragraph wrapping at `width`.
-pub fn visual_line_count(lines: &[Line], width: usize) -> usize {
-    total_wrapped_lines(lines, width)
-}
-
-/// Render a slice of chat elements to Lines for scrollback insertion.
-/// Returns owned Lines that can be pushed to terminal scrollback.
-pub fn render_elements_to_lines(elements: &[ChatElement]) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    for elem in elements {
-        match elem {
-            ChatElement::UserMessage {
-                content,
-                attachments,
-            } => {
-                // User message with > prefix
-                for (i, line) in content.lines().enumerate() {
-                    if i == 0 {
-                        lines.push(Line::from(vec![
-                            Span::styled("> ", Style::default().fg(Color::Cyan)),
-                            Span::raw(line.to_string()),
-                        ]));
-                    } else {
-                        lines.push(Line::from(format!("  {}", line)));
-                    }
-                }
-
-                // Attachments
-                for att in attachments {
-                    let att_text = match att {
-                        Attachment::Image { .. } => "[image]".to_string(),
-                        Attachment::FileReference { path } => {
-                            format!("@{}", path.display())
-                        }
-                        Attachment::PastedText {
-                            content,
-                            saved_path,
-                        } => {
-                            let char_count = content.chars().count();
-                            if let Some(path) = saved_path {
-                                format!("[pasted text: {} chars -> {}]", char_count, path.display())
-                            } else {
-                                format!("[pasted text: {} chars]", char_count)
-                            }
-                        }
-                    };
-                    lines.push(Line::from(Span::styled(
-                        att_text,
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-
-                lines.push(Line::from(""));
-            }
-
-            ChatElement::AssistantText { content, .. } => {
-                // Use the same markdown renderer as viewport content so wrapped row counts
-                // stay consistent between insert_before() and regular rendering.
-                let mut md_lines = markdown::render_markdown(content);
-                while md_lines.last().is_some_and(|l| l.spans.is_empty()) {
-                    md_lines.pop();
-                }
-                lines.extend(md_lines);
-                lines.push(Line::from(""));
-            }
-
-            ChatElement::ToolCall { display, .. } => {
-                // Simplified tool display for scrollback
-                let (icon, name, status_text) = match display {
-                    ToolDisplay::Search {
-                        query,
-                        status,
-                        results,
-                        ..
-                    } => {
-                        let status_str = match status {
-                            ToolStatus::Running => "searching...".to_string(),
-                            ToolStatus::Done => "done".to_string(),
-                            ToolStatus::SearchDone(n) => format!("{} results", n),
-                            ToolStatus::Failed(e) => format!("failed: {}", e),
-                        };
-                        let results_str = results
-                            .map(|n| format!(" ({} results)", n))
-                            .unwrap_or_default();
-                        (
-                            "🔍",
-                            format!("search: {}", query),
-                            format!("{}{}", status_str, results_str),
-                        )
-                    }
-                    ToolDisplay::Fetch { url, status, .. } => {
-                        let status_str = match status {
-                            ToolStatus::Running => "fetching...".to_string(),
-                            ToolStatus::Done => "done".to_string(),
-                            ToolStatus::SearchDone(_) => "done".to_string(),
-                            ToolStatus::Failed(e) => format!("failed: {}", e),
-                        };
-                        ("🌐", format!("fetch: {}", url), status_str)
-                    }
-                    ToolDisplay::Task {
-                        subagent,
-                        prompt,
-                        status,
-                        ..
-                    } => {
-                        let status_str = match status {
-                            ToolStatus::Running => "running...".to_string(),
-                            ToolStatus::Done => "done".to_string(),
-                            ToolStatus::SearchDone(_) => "done".to_string(),
-                            ToolStatus::Failed(e) => format!("failed: {}", e),
-                        };
-                        let short_prompt: String = prompt.chars().take(50).collect();
-                        ("🤖", format!("{}: {}", subagent, short_prompt), status_str)
-                    }
-                    ToolDisplay::Bash {
-                        command, status, ..
-                    } => {
-                        let status_str = match status {
-                            ToolStatus::Running => "running...".to_string(),
-                            ToolStatus::Done => "done".to_string(),
-                            ToolStatus::SearchDone(_) => "done".to_string(),
-                            ToolStatus::Failed(e) => format!("failed: {}", e),
-                        };
-                        let short_cmd: String = command.chars().take(60).collect();
-                        ("$", short_cmd, status_str)
-                    }
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{} ", icon), Style::default().fg(Color::Yellow)),
-                    Span::styled(name, Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!(" [{}]", status_text),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-            }
-
-            ChatElement::Error { message } => {
-                lines.push(Line::from(vec![
-                    Span::styled("✗ ", Style::default().fg(Color::Red)),
-                    Span::styled(message.clone(), Style::default().fg(Color::Red)),
-                ]));
-                lines.push(Line::from(""));
-            }
-
-            // Skip transient states for scrollback
-            ChatElement::TodoBlock { .. }
-            | ChatElement::Loading { .. }
-            | ChatElement::Thinking { .. } => {}
-        }
+    if width == 0 || lines.is_empty() {
+        return 0;
     }
-
-    lines
+    let w = width.min(u16::MAX as usize) as u16;
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(w)
 }
 
 /// Render the chat stream with optional tool selection (legacy API).

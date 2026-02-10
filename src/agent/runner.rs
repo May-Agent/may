@@ -18,7 +18,7 @@
 //! └──────────────┘                     └───────────────────────┘
 //! ```
 
-use aither_agent::AgentEvent;
+use aither_agent::{AgentEvent, CompactResult};
 use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
 use futures_lite::StreamExt;
@@ -30,6 +30,8 @@ use crate::MayAgent;
 pub enum TuiEvent {
     /// Agent produced a streaming event.
     Agent(Result<AgentEvent, aither_agent::AgentError>),
+    /// Compaction request finished.
+    Compacted(Result<Option<CompactResult>, aither_agent::AgentError>),
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.
@@ -42,6 +44,11 @@ enum WorkerCommand {
     Run {
         prompt: String,
         attachments: Vec<url::Url>,
+        event_tx: Sender<TuiEvent>,
+    },
+    /// Compact conversation history.
+    Compact {
+        focus: Option<String>,
         event_tx: Sender<TuiEvent>,
     },
     /// Cancel current processing.
@@ -84,6 +91,19 @@ impl AgentWorker {
     }
 
     /// Shutdown the worker task.
+    pub fn compact(&self, focus: Option<String>) -> AgentHandle {
+        const ERR_WORKER_CHANNEL_CLOSED: &str =
+            include_str!("../texts/agent_worker_channel_closed.txt");
+        let (event_tx, event_rx) = unbounded();
+        self.command_tx
+            .try_send(WorkerCommand::Compact { focus, event_tx })
+            .expect(ERR_WORKER_CHANNEL_CLOSED.trim());
+        AgentHandle {
+            event_rx,
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
     pub fn shutdown(&self) {
         let _ = self.command_tx.try_send(WorkerCommand::Shutdown);
     }
@@ -150,6 +170,11 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>) {
             } => {
                 run_agent_prompt(&mut agent, &prompt, attachments, &command_rx, &event_tx).await;
             }
+            WorkerCommand::Compact { focus, event_tx } => {
+                let result = agent.inner_mut().compact(focus.as_deref()).await;
+                let _ = event_tx.send(TuiEvent::Compacted(result)).await;
+                let _ = event_tx.send(TuiEvent::Complete).await;
+            }
             WorkerCommand::Cancel => {
                 // No active processing, ignore
             }
@@ -193,8 +218,8 @@ async fn run_agent_prompt(
                     if let Ok(cmd) = command_rx.recv().await {
                         match cmd {
                             WorkerCommand::Cancel | WorkerCommand::Shutdown => return None,
-                            WorkerCommand::Run { .. } => {
-                                // Ignore new run during processing
+                            WorkerCommand::Run { .. } | WorkerCommand::Compact { .. } => {
+                                // Ignore new run/compact commands during processing
                                 continue;
                             }
                         }

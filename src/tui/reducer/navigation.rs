@@ -4,7 +4,10 @@ use crossterm::event::KeyCode;
 use crate::tui::app::{App, SendAction};
 use crate::tui::state::AppMode;
 
-pub(crate) fn handle_session_select_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub(crate) fn handle_session_select_key(
+    app: &mut App,
+    code: KeyCode,
+) -> Result<Option<SendAction>> {
     let filtered = app.filtered_sessions();
     let filtered_len = filtered.len();
 
@@ -155,7 +158,8 @@ pub(crate) fn handle_file_picker_key(app: &mut App, code: KeyCode) -> Result<Opt
         }
         KeyCode::Enter => {
             if let Some(path) = picker.confirm() {
-                app.attachments.push(crate::tui::queue::Attachment::FileReference { path });
+                app.attachments
+                    .push(crate::tui::queue::Attachment::FileReference { path });
             }
             app.file_picker = None;
             app.mode = AppMode::Chat;

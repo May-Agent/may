@@ -45,7 +45,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
             }
             Ok(None)
         }
-        AppEvent::SessionDeleted { was_current, result } => {
+        AppEvent::SessionDeleted {
+            was_current,
+            result,
+        } => {
             app.status = None;
             match result {
                 Ok(sessions) => {
@@ -75,7 +78,8 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                     app.mode = AppMode::SkillManage;
                 }
                 Err(e) => {
-                    app.chat.push_error(&format!("Failed to load skills: {}", e));
+                    app.chat
+                        .push_error(&format!("Failed to load skills: {}", e));
                 }
             }
             Ok(None)
