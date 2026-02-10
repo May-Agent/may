@@ -5,7 +5,7 @@ import type { Message } from '@/types';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { Copy, Check } from 'lucide-react';
+import { Copy, Check, FileText, File } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
 import { ThinkingBlock } from './ThinkingBlock';
@@ -142,14 +142,28 @@ export function MessageItem({ message }: { message: Message }) {
           <div className={cn('flex flex-wrap gap-2 mt-2', isUser ? 'justify-end' : 'justify-start')}>
             {message.attachments.map(att => (
               <AttachmentPreview key={att.id} attachment={att}>
-                <div className="relative group border rounded-md overflow-hidden bg-background">
-                  {att.type === 'image'
-                    ? <img src={att.url} alt={att.name} className="h-32 w-32 object-cover transition-transform hover:scale-105" />
-                    : <div className="h-24 w-24 flex flex-col items-center justify-center p-2 text-center gap-1">
-                        <div className="h-8 w-8 bg-muted rounded flex items-center justify-center"><span className="text-xs font-bold text-muted-foreground">FILE</span></div>
-                        <span className="text-[10px] w-full truncate px-1" title={att.name}>{att.name}</span>
-                      </div>}
-                </div>
+                {att.type === 'image' ? (
+                  <div className="border rounded-md overflow-hidden bg-background">
+                    <img src={att.url} alt={att.name} className="h-32 w-32 object-cover transition-transform hover:scale-105" />
+                  </div>
+                ) : (att.type === 'document' || att.type === 'pdf') ? (
+                  <div className="h-20 w-48 border rounded-lg overflow-hidden bg-muted/40 p-2.5 flex flex-col gap-1">
+                    <div className="flex items-center gap-1.5">
+                      <FileText className={cn("h-3.5 w-3.5 flex-shrink-0", att.type === 'pdf' ? 'text-red-400' : 'text-blue-400')} />
+                      <span className="text-[11px] font-medium truncate">{att.name}</span>
+                    </div>
+                    {att.textPreview ? (
+                      <p className="text-[10px] text-muted-foreground/70 leading-tight line-clamp-3">{att.textPreview}</p>
+                    ) : (
+                      <p className="text-[10px] text-muted-foreground/50 uppercase tracking-wide mt-auto">{att.type === 'pdf' ? 'PDF' : 'DOCUMENT'}</p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted flex flex-col items-center justify-center p-2 gap-1">
+                    <File className="h-6 w-6 text-muted-foreground" />
+                    <span className="text-[9px] truncate w-full text-center" title={att.name}>{att.name}</span>
+                  </div>
+                )}
               </AttachmentPreview>
             ))}
           </div>

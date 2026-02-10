@@ -5,8 +5,10 @@ export type Role = 'user' | 'assistant' | 'system';
 export interface Attachment {
   id: string;
   name: string;
-  type: 'image' | 'file';
+  type: 'image' | 'file' | 'document' | 'pdf';
   url: string;
+  textContent?: string;
+  textPreview?: string;
 }
 
 export interface Message {

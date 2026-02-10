@@ -3,7 +3,7 @@ import { useStore } from "@/lib/store";
 import { MessageItem } from "./MessageItem";
 import { ModelSelector } from "./ModelSelector";
 import { AttachmentPreview } from "./AttachmentPreview";
-import { ScrollArea } from "@/components/ui/scroll-area";
+
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,6 +18,7 @@ import {
   Plus,
   X,
   File,
+  FileText,
   Pencil,
   Image as ImageIcon,
   Monitor,
@@ -85,7 +86,8 @@ export function ChatInterface({
   const [titleInput, setTitleInput] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([]);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const userScrolledUpRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
   const streamAbortRef = useRef(false);
@@ -101,9 +103,32 @@ export function ChatInterface({
   useEffect(() => {
     if (isEditingTitle) titleInputRef.current?.focus();
   }, [isEditingTitle]);
+  // Auto-scroll: follow output unless user scrolled up
+  // Auto-scroll via ResizeObserver: only scroll when content grows and user is near bottom
+  const contentRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    const container = scrollContainerRef.current;
+    const content = contentRef.current;
+    if (!container || !content) return;
+
+    const observer = new ResizeObserver(() => {
+      if (userScrolledUpRef.current) return;
+      container.scrollTop = container.scrollHeight;
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [currentSessionId]);
+
+  const handleScroll = () => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distFromBottom > 150) {
+      userScrolledUpRef.current = true;
+    } else if (distFromBottom < 30) {
+      userScrolledUpRef.current = false;
+    }
+  };
 
   useEffect(() => {
     return () => {
@@ -206,6 +231,7 @@ export function ChatInterface({
     }
 
     addMessage(currentSessionId, content, "user", atts);
+    userScrolledUpRef.current = false;
     setIsGenerating(true);
     streamAbortRef.current = false;
 
@@ -301,20 +327,113 @@ export function ChatInterface({
     }
   };
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const classifyFile = (file: File): Attachment["type"] => {
+    if (file.type.startsWith("image/")) return "image";
+    if (file.type === "application/pdf") return "pdf";
+    if (
+      file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+      file.name.endsWith(".docx")
+    )
+      return "document";
+    if (file.type === "text/plain" || file.name.endsWith(".txt") || file.name.endsWith(".md"))
+      return "document";
+    return "file";
+  };
+
+  const readTextFile = async (file: File): Promise<string> => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => resolve("");
+      reader.readAsText(file);
+    });
+  };
+
+  const processDocxFile = async (file: File): Promise<string> => {
+    try {
+      const mammoth = await import("mammoth");
+      const arrayBuffer = await file.arrayBuffer();
+      const result = await mammoth.default.extractRawText({ arrayBuffer });
+      return result.value;
+    } catch {
+      return "";
+    }
+  };
+
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files?.length) return;
-    setAttachments((prev) => [
-      ...prev,
-      ...Array.from(e.target.files!).map((f) => ({
+    const files = Array.from(e.target.files!);
+    const newAttachments: Attachment[] = [];
+
+    for (const f of files) {
+      const fileType = classifyFile(f);
+      const att: Attachment = {
         id: uuidv4(),
         name: f.name,
-        type: (f.type.startsWith("image/") ? "image" : "file") as
-          | "image"
-          | "file",
+        type: fileType,
         url: URL.createObjectURL(f),
-      })),
-    ]);
+      };
+
+      if (fileType === "document") {
+        if (f.name.endsWith(".docx")) {
+          const text = await processDocxFile(f);
+          att.textContent = text;
+          att.textPreview = text.slice(0, 200);
+        } else {
+          const text = await readTextFile(f);
+          att.textContent = text;
+          att.textPreview = text.slice(0, 200);
+        }
+      }
+
+      newAttachments.push(att);
+    }
+
+    setAttachments((prev) => [...prev, ...newAttachments]);
     if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const LONG_TEXT_THRESHOLD = 500;
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData.items;
+    const newAttachments: Attachment[] = [];
+    let hasHandledFile = false;
+
+    for (const item of items) {
+      if (item.kind === "file") {
+        const file = item.getAsFile();
+        if (!file) continue;
+        hasHandledFile = true;
+        const fileType = classifyFile(file);
+        newAttachments.push({
+          id: uuidv4(),
+          name: file.name || (fileType === "image" ? "Pasted Image" : "Pasted File"),
+          type: fileType,
+          url: URL.createObjectURL(file),
+        });
+      }
+    }
+
+    // Check for long text paste
+    const text = e.clipboardData.getData("text/plain");
+    if (!hasHandledFile && text && text.length >= LONG_TEXT_THRESHOLD) {
+      e.preventDefault();
+      const preview = text.slice(0, 200);
+      newAttachments.push({
+        id: uuidv4(),
+        name: "Pasted Text",
+        type: "document",
+        url: "",
+        textContent: text,
+        textPreview: preview,
+      });
+    }
+
+    if (newAttachments.length > 0) {
+      if (hasHandledFile) e.preventDefault();
+      setAttachments((prev) => [...prev, ...newAttachments]);
+    }
   };
 
   if (!currentSessionId || !currentSession) {
@@ -383,14 +502,18 @@ export function ChatInterface({
       </div>
 
       {/* Messages */}
-      <ScrollArea className="flex-1">
-        <div className="max-w-3xl mx-auto px-4 space-y-6 pb-[200px] pt-4">
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto"
+      >
+        <div ref={contentRef} className="max-w-3xl mx-auto px-4 space-y-6 pb-[200px] pt-4">
           {messages.map((msg) => (
             <MessageItem key={msg.id} message={msg} />
           ))}
-          <div ref={scrollRef} />
+
         </div>
-      </ScrollArea>
+      </div>
 
       {/* Input Area */}
       <div className="p-4 bg-transparent absolute bottom-0 left-0 right-0 w-full z-20 pointer-events-none">
@@ -401,24 +524,36 @@ export function ChatInterface({
                 {attachments.map((att) => (
                   <div key={att.id} className="relative group flex-shrink-0">
                     <AttachmentPreview attachment={att}>
-                      <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted flex items-center justify-center">
-                        {att.type === "image" ? (
-                          <img
-                            src={att.url}
-                            alt={att.name}
-                            className="h-full w-full object-cover"
-                          />
-                        ) : (
+                      {att.type === "image" ? (
+                        <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted">
+                          <img src={att.url} alt={att.name} className="h-full w-full object-cover" />
+                        </div>
+                      ) : att.type === "document" || att.type === "pdf" ? (
+                        <div className="h-20 w-44 border rounded-lg overflow-hidden bg-muted/50 p-2.5 flex flex-col gap-1">
+                          <div className="flex items-center gap-1.5">
+                            <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                            <span className="text-[11px] font-medium truncate">{att.name}</span>
+                          </div>
+                          {att.textPreview ? (
+                            <p className="text-[10px] text-muted-foreground/70 leading-tight line-clamp-3 overflow-hidden">
+                              {att.textPreview}
+                            </p>
+                          ) : (
+                            <p className="text-[10px] text-muted-foreground/50 uppercase tracking-wide mt-auto">
+                              {att.type === "pdf" ? "PDF" : "DOCUMENT"}
+                            </p>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted flex items-center justify-center">
                           <File className="h-8 w-8 text-muted-foreground" />
-                        )}
-                      </div>
+                        </div>
+                      )}
                     </AttachmentPreview>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        setAttachments((prev) =>
-                          prev.filter((a) => a.id !== att.id),
-                        );
+                        setAttachments((prev) => prev.filter((a) => a.id !== att.id));
                       }}
                       className="absolute -top-1 -right-1 bg-destructive text-destructive-foreground rounded-full p-0.5 shadow-sm opacity-0 group-hover:opacity-100 transition-opacity z-10"
                     >
@@ -458,6 +593,7 @@ export function ChatInterface({
             <Textarea
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
+              onPaste={handlePaste}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
