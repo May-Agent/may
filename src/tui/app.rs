@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use async_channel::Receiver;
 use blocking::unblock;
-use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use executor_core::spawn;
 
 use crate::config::{ModelTier, Provider};
@@ -15,15 +15,17 @@ use crate::{ChatMessage, MayConfig, MessageRole, SessionId, SessionManager, Sess
 use super::agent_event_adapter::{ToolEndKind, ToolStartKind, parse_tool_end, parse_tool_start};
 use super::clipboard::{
     ClipboardPasteResult, ImageManager, TextManager, download_image, is_image_url, read_clipboard,
+    set_clipboard_html, set_clipboard_text,
 };
 use super::completion::{Completion, CompletionMode};
 use super::event::{AppEvent, EventSender};
 use super::history::InputHistory;
 use super::queue::{Attachment, LARGE_PASTE_THRESHOLD, MessageQueue, PendingMessage};
-use super::ui::chat::{ChatElement, ChatStream, ToolDisplay};
+use super::ui::chat::{ChatElement, ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
 
-pub(crate) const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../texts/tool_response_send_failed.txt");
+pub(crate) const ERR_TOOL_RESPONSE_SEND: &str =
+    include_str!("../texts/tool_response_send_failed.txt");
 
 /// Convert a character index to a byte index in a string.
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
@@ -38,7 +40,8 @@ pub use aither_agent::{AgentError, AgentEvent};
 
 use super::state::{
     ActiveTextInput, AppMode, ConfigEditMode, ConfigSection, ConfigState, CopilotAuthStatus,
-    McpAddMode, PasteFilter, SkillAddMode, SshAddMode, detect_api_key_from_env,
+    McpAddMode, PasteFilter, SelectionPoint, SkillAddMode, SshAddMode, TextSelection,
+    detect_api_key_from_env,
 };
 /// Application state (UI only - agent managed externally).
 pub struct App {
@@ -179,6 +182,12 @@ pub struct App {
     pub image_cache: ahash::AHashMap<String, super::ui::image::ImageState>,
     /// URLs currently being fetched (to avoid duplicate requests)
     pub image_fetching: ahash::AHashSet<String>,
+    /// Mouse/text selection in rendered chat content
+    pub selection: Option<TextSelection>,
+    /// Plain text render cache used for selection copy
+    pub rendered_plain_lines: Vec<String>,
+    /// Top padding rows added when viewport is taller than rendered content
+    pub render_top_padding: usize,
 }
 
 impl App {
@@ -320,6 +329,9 @@ impl App {
             image_support,
             image_cache: ahash::AHashMap::new(),
             image_fetching: ahash::AHashSet::new(),
+            selection: None,
+            rendered_plain_lines: Vec::new(),
+            render_top_padding: 0,
         })
     }
 
@@ -474,6 +486,9 @@ impl App {
         self.thinking_start = None;
         self.content_height.set(0);
         self.view_height.set(0);
+        self.selection = None;
+        self.rendered_plain_lines.clear();
+        self.render_top_padding = 0;
 
         // Load chat history into display
         self.chat = ChatStream::new();
@@ -620,7 +635,10 @@ impl App {
     }
 
     /// Handle bracketed paste event.
-    pub(super) fn handle_bracketed_paste(&mut self, text: String) -> anyhow::Result<Option<SendAction>> {
+    pub(super) fn handle_bracketed_paste(
+        &mut self,
+        text: String,
+    ) -> anyhow::Result<Option<SendAction>> {
         // Special handling for Chat mode: large pastes become attachments
         if matches!(self.mode, AppMode::Chat)
             && (text.contains('\n') || text.len() > LARGE_PASTE_THRESHOLD)
@@ -682,6 +700,12 @@ impl App {
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
                 KeyCode::Char('c') => {
+                    if self.copy_selection_to_clipboard()? {
+                        self.quit_pending = false;
+                        self.status = Some("Copied selection".to_string());
+                        return Ok(None);
+                    }
+
                     // Double-press Ctrl+C to quit
                     if self.quit_pending {
                         return Ok(Some(SendAction::Quit));
@@ -938,14 +962,17 @@ impl App {
             return Ok(None);
         }
 
+        const SCROLL_STEP_LINES: usize = 1;
+
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if self.scroll == usize::MAX {
                     let content_h = self.content_height.get();
                     let view_h = self.view_height.get();
-                    self.scroll = content_h.saturating_sub(view_h).saturating_sub(1);
+                    let max_scroll = content_h.saturating_sub(view_h);
+                    self.scroll = max_scroll.saturating_sub(SCROLL_STEP_LINES);
                 } else {
-                    self.scroll = self.scroll.saturating_sub(3);
+                    self.scroll = self.scroll.saturating_sub(SCROLL_STEP_LINES);
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -953,14 +980,122 @@ impl App {
                     let content_h = self.content_height.get();
                     let view_h = self.view_height.get();
                     let max_scroll = content_h.saturating_sub(view_h);
-                    let next = (self.scroll + 3).min(max_scroll);
-                    self.scroll = if next >= max_scroll { usize::MAX } else { next };
+                    let next = self.scroll.saturating_add(SCROLL_STEP_LINES);
+                    self.scroll = if next > max_scroll { usize::MAX } else { next };
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = self.mouse_to_selection_point(mouse).map(|p| TextSelection {
+                    anchor: p,
+                    cursor: p,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let next = self.mouse_to_selection_point(mouse);
+                if let (Some(sel), Some(point)) = (&mut self.selection, next) {
+                    sel.cursor = point;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.selection.as_ref().is_some_and(TextSelection::is_empty) {
+                    self.selection = None;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.copy_selection_to_clipboard()? {
+                    self.status = Some("Copied selection".to_string());
                 }
             }
             _ => {}
         }
 
         Ok(None)
+    }
+
+    fn mouse_to_selection_point(&self, mouse: MouseEvent) -> Option<SelectionPoint> {
+        if self.rendered_plain_lines.is_empty() {
+            return None;
+        }
+
+        let base_scroll = if self.scroll == usize::MAX {
+            let content_h = self.content_height.get();
+            let view_h = self.view_height.get();
+            content_h.saturating_sub(view_h)
+        } else {
+            self.scroll
+        };
+
+        let raw_line = base_scroll.saturating_add(mouse.row as usize);
+        let line = raw_line.saturating_sub(self.render_top_padding);
+        let line = line.min(self.rendered_plain_lines.len().saturating_sub(1));
+        let text = self.rendered_plain_lines.get(line)?;
+        let column = clamp_column_by_width(text, mouse.column as usize);
+        Some(SelectionPoint { line, column })
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        if sel.is_empty() {
+            return None;
+        }
+        let (start, end) = sel.normalized();
+
+        if self.rendered_plain_lines.is_empty() || start.line >= self.rendered_plain_lines.len() {
+            return None;
+        }
+
+        let end_line = end
+            .line
+            .min(self.rendered_plain_lines.len().saturating_sub(1));
+        let mut out = String::new();
+
+        for line_idx in start.line..=end_line {
+            let line = &self.rendered_plain_lines[line_idx];
+            let char_count = line.chars().count();
+            let from = if line_idx == start.line {
+                start.column.min(char_count)
+            } else {
+                0
+            };
+            let to = if line_idx == end_line {
+                end.column.min(char_count)
+            } else {
+                char_count
+            };
+
+            if from < to {
+                let from_b = char_to_byte_index(line, from);
+                let to_b = char_to_byte_index(line, to);
+                out.push_str(&line[from_b..to_b]);
+            }
+
+            if line_idx != end_line {
+                out.push('\n');
+            }
+        }
+
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    fn copy_selection_to_clipboard(&mut self) -> anyhow::Result<bool> {
+        let Some(text) = self.selected_text() else {
+            return Ok(false);
+        };
+
+        // Try terminal clipboard first, but do not fail hard if OSC52 is unsupported.
+        let osc52_ok = super::clipboard::copy_via_osc52(&text).is_ok();
+
+        // Also try rich+plain system clipboard copy.
+        let html = super::clipboard::markdown_to_basic_html(&text);
+        let arboard_ok = set_clipboard_html(&html, &text)
+            .or_else(|_| set_clipboard_text(&text))
+            .is_ok();
+
+        if !osc52_ok && !arboard_ok {
+            return Err(anyhow::anyhow!("failed to copy selection to clipboard"));
+        }
+
+        Ok(true)
     }
 
     /// Execute a slash command directly (from menu selection only).
@@ -1024,7 +1159,7 @@ impl App {
                 Ok(None)
             }
             "/quit" => Ok(Some(SendAction::Quit)),
-            "/compact" => Ok(Some(SendAction::Compact)),
+            "/compact" => Ok(Some(SendAction::Compact(None))),
             "/mcp" => {
                 self.mode = AppMode::McpManage;
                 Ok(None)
@@ -1879,6 +2014,17 @@ impl App {
         self.cursor = 0;
         self.input_char_count = 0;
 
+        let trimmed = content.trim();
+        if let Some(rest) = trimmed.strip_prefix("/compact") {
+            if attachments.is_empty() {
+                let focus = rest.trim();
+                if focus.is_empty() {
+                    return SendAction::Compact(None);
+                }
+                return SendAction::Compact(Some(focus.to_string()));
+            }
+        }
+
         let msg = PendingMessage {
             content,
             attachments,
@@ -2211,8 +2357,8 @@ pub enum SendAction {
     },
     /// Switch to a different model for this session.
     SwitchModel(String),
-    /// Compact the conversation history.
-    Compact,
+    /// Compact the conversation history with optional focus hint.
+    Compact(Option<String>),
     /// MCP server management actions.
     McpAdd {
         name: String,
