@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use blocking::unblock;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEvent};
 use executor_core::spawn;
 
 use crate::{SessionSummary, SkillInfo};
@@ -22,6 +22,8 @@ pub enum AppEvent {
     Resize(u16, u16),
     /// Pasted text (from bracketed paste)
     Paste(String),
+    /// Mouse event (for wheel scrolling in alternate screen)
+    Mouse(MouseEvent),
 
     // ─── Async operation results ───────────────────────────────────────
     /// Session list loaded from background task
@@ -75,7 +77,7 @@ impl EventHandler {
                         Event::Key(key) => AppEvent::Key(key.code, key.modifiers),
                         Event::Resize(w, h) => AppEvent::Resize(w, h),
                         Event::Paste(text) => AppEvent::Paste(text),
-                        // No mouse capture - terminal handles scroll and selection natively
+                        Event::Mouse(mouse) => AppEvent::Mouse(mouse),
                         _ => continue,
                     };
                     if tx_clone.send(app_event).await.is_err() {

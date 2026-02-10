@@ -1,0 +1,403 @@
+//! State types for TUI modes and config editing.
+
+use crate::ask_user::{AskUserRequest, Question};
+use crate::config::{Provider};
+use crate::workspace_request::WorkspaceRequest;
+use crate::MayConfig;
+
+/// Application mode.
+#[derive(Debug)]
+pub enum AppMode {
+    /// Main chat mode - typing and viewing
+    Chat,
+    /// Session selection popup
+    SessionSelect,
+    /// File picker popup
+    FilePicker,
+    /// Help screen
+    Help,
+    /// Full-screen tool detail view
+    ToolDetail,
+    /// Unified configuration screen with sections (Providers, Models, Preferences)
+    Config,
+    /// Quick model selector popup (anchored near input)
+    ModelSelect,
+    /// Model picker for tier configuration in Config screen
+    TierModelPicker,
+    /// GitHub Copilot OAuth authentication
+    CopilotAuth,
+    /// Workspace access confirmation dialog
+    WorkspaceConfirm(WorkspaceRequest),
+    /// MCP server management overlay
+    McpManage,
+    /// SSH server management overlay
+    SshManage,
+    /// Ask user dialog
+    AskUser(AskUserState),
+    /// Skill management popup
+    SkillManage,
+}
+
+/// Per-question interaction state.
+pub struct AskUserQuestionState {
+    /// Cursor position in the option list (includes extra items: skip, custom).
+    pub cursor: usize,
+    /// Selected option indices (for the predefined options).
+    pub selections: Vec<usize>,
+    /// Whether the user is typing a custom answer.
+    pub custom_mode: bool,
+    /// Custom answer text buffer.
+    pub custom_text: String,
+    /// Whether this question was skipped.
+    pub skipped: bool,
+}
+
+impl AskUserQuestionState {
+    pub fn new() -> Self {
+        Self {
+            cursor: 0,
+            selections: Vec::new(),
+            custom_mode: false,
+            custom_text: String::new(),
+            skipped: false,
+        }
+    }
+}
+
+/// State for the ask_user interaction.
+impl std::fmt::Debug for AskUserState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskUserState")
+            .field("question_count", &self.questions.len())
+            .field("current_question", &self.current_question)
+            .finish()
+    }
+}
+
+pub struct AskUserState {
+    /// The original request (holds the response channel).
+    pub request: AskUserRequest,
+    /// Normalized list of questions.
+    pub questions: Vec<Question>,
+    /// Current question index.
+    pub current_question: usize,
+    /// Per-question state.
+    pub question_states: Vec<AskUserQuestionState>,
+}
+
+impl AskUserState {
+    pub fn new(request: AskUserRequest, questions: Vec<Question>) -> Self {
+        let states = questions.iter().map(|_| AskUserQuestionState::new()).collect();
+        Self {
+            request,
+            questions,
+            current_question: 0,
+            question_states: states,
+        }
+    }
+
+    /// Current question being displayed.
+    pub fn current(&self) -> Option<&Question> {
+        self.questions.get(self.current_question)
+    }
+
+    /// Current question's mutable state.
+    pub fn current_state_mut(&mut self) -> Option<&mut AskUserQuestionState> {
+        self.question_states.get_mut(self.current_question)
+    }
+
+    /// Current question's state.
+    pub fn current_state(&self) -> Option<&AskUserQuestionState> {
+        self.question_states.get(self.current_question)
+    }
+
+    /// Total number of items in the list for current question:
+    /// options + "Skip" + "Custom answer"
+    pub fn current_item_count(&self) -> usize {
+        self.current()
+            .map(|q| q.option.len() + 2)
+            .unwrap_or(0)
+    }
+
+    /// Whether there are multiple questions.
+    pub fn is_multi(&self) -> bool {
+        self.questions.len() > 1
+    }
+}
+
+/// Status of Copilot OAuth authentication flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopilotAuthStatus {
+    /// Requesting device code from GitHub
+    RequestingCode,
+    /// Waiting for user to authorize in browser
+    WaitingForUser {
+        user_code: String,
+        verification_uri: String,
+    },
+    /// Successfully authenticated
+    Success,
+    /// Authentication failed
+    Failed(String),
+}
+
+/// Character filter for paste validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteFilter {
+    /// Allow all characters
+    Any,
+    /// Only alphanumeric, dash, underscore (for identifiers)
+    Identifier,
+    /// Alphanumeric, dash, underscore, slash (for GitHub repos)
+    GitHubRepo,
+}
+
+impl PasteFilter {
+    /// Filter a string, keeping only valid characters.
+    pub fn filter(self, s: &str) -> String {
+        match self {
+            PasteFilter::Any => s.to_string(),
+            PasteFilter::Identifier => s
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect(),
+            PasteFilter::GitHubRepo => s
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '/')
+                .collect(),
+        }
+    }
+}
+
+/// Represents an active text input field for paste handling.
+pub enum ActiveTextInput<'a> {
+    /// Input with cursor position tracking (insert at cursor)
+    Cursored {
+        input: &'a mut String,
+        cursor: &'a mut usize,
+    },
+    /// Simple input (append at end) with character filter
+    Simple {
+        input: &'a mut String,
+        filter: PasteFilter,
+    },
+}
+
+/// MCP add server mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpAddMode {
+    /// Not adding a server
+    #[default]
+    None,
+    /// Entering server name
+    Name,
+    /// Entering command
+    Command,
+}
+
+/// SSH add server mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SshAddMode {
+    /// Not adding a server
+    #[default]
+    None,
+    /// Entering server name
+    Name,
+    /// Entering SSH target
+    Target,
+}
+
+/// Skill add mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillAddMode {
+    /// Not adding a skill
+    #[default]
+    None,
+    /// Entering GitHub repo (owner/repo format)
+    GitHubRepo,
+}
+
+/// Config section tabs (like Claude Code's /config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigSection {
+    #[default]
+    Providers,
+    Models,
+    Preferences,
+}
+
+impl ConfigSection {
+    /// All sections for iteration.
+    pub const ALL: &'static [ConfigSection] = &[
+        ConfigSection::Providers,
+        ConfigSection::Models,
+        ConfigSection::Preferences,
+    ];
+
+    /// Display name for the section tab.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Providers => "Providers",
+            Self::Models => "Models",
+            Self::Preferences => "Preferences",
+        }
+    }
+
+    /// Next section (Tab).
+    pub fn next(self) -> Self {
+        match self {
+            Self::Providers => Self::Models,
+            Self::Models => Self::Preferences,
+            Self::Preferences => Self::Providers,
+        }
+    }
+
+    /// Previous section (Shift+Tab).
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Providers => Self::Preferences,
+            Self::Models => Self::Providers,
+            Self::Preferences => Self::Models,
+        }
+    }
+}
+
+/// What field is being edited in the config screen.
+#[derive(Debug, Clone)]
+pub enum ConfigEditMode {
+    /// Not editing, just navigating
+    None,
+    /// Editing a text field (provider API key, base URL, etc.)
+    Text { input: String, cursor: usize },
+    /// Selecting from a list (provider type, model list)
+    List { items: Vec<String>, selected: usize },
+    /// Editing a custom provider (name, base_url, api_key)
+    CustomProvider {
+        /// Which field is focused (0=name, 1=base_url, 2=api_key)
+        focused_field: usize,
+        /// Provider name/ID
+        name: String,
+        /// Base URL (required)
+        base_url: String,
+        /// API key (optional)
+        api_key: String,
+        /// Cursor position in the focused field
+        cursor: usize,
+        /// Whether we're editing an existing provider
+        editing_existing: bool,
+        /// Original name if editing existing
+        original_name: Option<String>,
+    },
+}
+
+impl Default for ConfigEditMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Unified config state for all sections.
+pub struct ConfigState {
+    /// Current section (Tab to switch)
+    pub section: ConfigSection,
+    /// Selected row within current section
+    pub selected: usize,
+    /// Edit mode (text input, list selection, or none)
+    pub edit_mode: ConfigEditMode,
+    /// Cached provider list for display
+    pub provider_ids: Vec<String>,
+    /// Whether we detected API key from env var
+    pub key_from_env: bool,
+    /// Name of env var the key was found in
+    pub key_env_var_name: Option<String>,
+}
+
+impl Default for ConfigState {
+    fn default() -> Self {
+        Self {
+            section: ConfigSection::Providers,
+            selected: 0,
+            edit_mode: ConfigEditMode::None,
+            provider_ids: Vec::new(),
+            key_from_env: false,
+            key_env_var_name: None,
+        }
+    }
+}
+
+impl ConfigState {
+    /// Load provider IDs from config.
+    pub fn load_providers(&mut self, config: &MayConfig) {
+        self.provider_ids = config.provider.keys().cloned().collect();
+        self.provider_ids.sort();
+    }
+
+    /// Get row count for current section.
+    pub fn row_count(&self, _config: &MayConfig) -> usize {
+        match self.section {
+            ConfigSection::Providers => self.provider_ids.len() + 1,
+            ConfigSection::Models => 4,
+            ConfigSection::Preferences => 3,
+        }
+    }
+
+    /// Check if currently editing a text field.
+    pub fn is_editing(&self) -> bool {
+        !matches!(self.edit_mode, ConfigEditMode::None)
+    }
+
+    /// Start text editing mode.
+    pub fn start_text_edit(&mut self, initial: &str) {
+        let len = initial.len();
+        self.edit_mode = ConfigEditMode::Text {
+            input: initial.to_string(),
+            cursor: len,
+        };
+    }
+
+    /// Cancel editing.
+    pub fn cancel_edit(&mut self) {
+        self.edit_mode = ConfigEditMode::None;
+    }
+
+    /// Get current edit text (if in text edit mode).
+    pub fn edit_text(&self) -> Option<(&str, usize)> {
+        match &self.edit_mode {
+            ConfigEditMode::Text { input, cursor } => Some((input, *cursor)),
+            _ => None,
+        }
+    }
+
+    /// Get mutable edit text.
+    pub fn edit_text_mut(&mut self) -> Option<(&mut String, &mut usize)> {
+        match &mut self.edit_mode {
+            ConfigEditMode::Text { input, cursor } => Some((input, cursor)),
+            _ => None,
+        }
+    }
+}
+
+/// Try to detect API key from environment variables for the given provider.
+pub fn detect_api_key_from_env(provider: Provider) -> Option<(String, &'static str)> {
+    let env_vars = match provider {
+        Provider::Anthropic => &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"][..],
+        Provider::OpenAI => &["OPENAI_API_KEY"][..],
+        Provider::Google => &["GOOGLE_API_KEY", "GEMINI_API_KEY"][..],
+        Provider::OpenRouter => &["OPENROUTER_API_KEY"][..],
+        Provider::DeepSeek => &["DEEPSEEK_API_KEY"][..],
+        Provider::Groq => &["GROQ_API_KEY"][..],
+        Provider::Together => &["TOGETHER_API_KEY"][..],
+        Provider::Mistral => &["MISTRAL_API_KEY"][..],
+        Provider::XAI => &["XAI_API_KEY", "GROK_API_KEY"][..],
+        Provider::Copilot | Provider::Ollama | Provider::Custom => return None,
+    };
+
+    for var_name in env_vars {
+        if let Ok(key) = std::env::var(var_name)
+            && !key.is_empty()
+        {
+            return Some((key, *var_name));
+        }
+    }
+    None
+}
