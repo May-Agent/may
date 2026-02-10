@@ -8,21 +8,25 @@
 use std::io;
 use std::panic;
 
-use std::io::Write;
-
 use aither_agent::AgentEvent;
 
 use async_channel::TryRecvError;
 use crossterm::{
-    cursor::MoveTo,
-    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyModifiers},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyCode, KeyModifiers,
+    },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    },
 };
 use executor_core::tokio::TokioGlobal;
 use executor_core::{spawn, try_init_global_executor};
-use ratatui::prelude::*;
+use ratatui::backend::Backend;
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
@@ -35,8 +39,6 @@ use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
 
 const PANIC_MESSAGE: &str = include_str!("../texts/panic_message.txt");
 
-/// Terminal reset sequence: RIS + clear scrollback + clear screen + home cursor
-const TERM_RESET: &str = "\x1bc\x1b[3J\x1b[2J\x1b[H";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -67,9 +69,14 @@ async fn main() -> anyhow::Result<()> {
     // Set up panic hook to restore terminal state before panicking
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
-        // Best-effort terminal cleanup (inline viewport, no alternate screen)
+        // Best-effort terminal cleanup
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
         let _ = execute!(
             io::stderr(),
             SetForegroundColor(Color::Red),
@@ -82,37 +89,29 @@ async fn main() -> anyhow::Result<()> {
     // Detect terminal image support (must be before raw mode)
     let image_support = may_agent::tui::ui::image::TerminalImageSupport::detect();
 
-    // Setup terminal with inline viewport for native scroll/selection
-    let mut stdout = io::stdout();
-    write!(stdout, "{TERM_RESET}")?;
-    stdout.flush()?;
+    // Setup terminal (alternate screen)
     enable_raw_mode()?;
-    execute!(stdout, EnableBracketedPaste)?;
-    let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
-    // Inline viewport is anchored from cursor position at init time.
-    // Place cursor at (term_height - viewport_height) so viewport starts near bottom.
-    // Use almost full terminal height for inline viewport so session switches/new can redraw
-    // the whole visible chat region instead of leaving stale content above.
-    let viewport_height = term_height.saturating_sub(1).max(1);
-    let init_row = term_height.saturating_sub(viewport_height);
-    execute!(stdout, MoveTo(0, init_row))?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::with_options(
-        backend,
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(viewport_height),
-        },
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
     )?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
     let result = run_app(&mut terminal, image_support).await;
 
-    // Cleanup terminal - no alternate screen to leave since we use inline viewport
+    // Cleanup terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableBracketedPaste)?;
-    // Move to the line after the viewport so the shell prompt appears below
-    let vp = terminal.get_frame().area();
-    execute!(terminal.backend_mut(), MoveTo(0, vp.bottom()))?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -216,39 +215,6 @@ where
         terminal.draw(|frame| ui::render(frame, app))?;
         tracing::info!("after draw");
 
-        // Move only overflowing, completed content into native terminal scrollback.
-        // Keep a recent window in viewport; never push while streaming.
-        {
-            use may_agent::tui::ui::chat::{render_elements_to_lines, visual_line_count};
-            let mut pushed_any = false;
-
-            if !app.chat.is_streaming() {
-                let completed = app.chat.completed_elements();
-                // Push only one oldest completed element per frame to keep ordering stable
-                // and avoid large viewport jumps during long conversations.
-                if completed.len() > 1 {
-                    let push_count = 1usize;
-                    let viewport_width = terminal.get_frame().area().width.max(1) as usize;
-                    let lines = render_elements_to_lines(&completed[..push_count]);
-                    let row_count =
-                        visual_line_count(&lines, viewport_width).min(u16::MAX as usize) as u16;
-                    if row_count > 0 {
-                        terminal.insert_before(row_count, |buf| {
-                            use ratatui::widgets::Paragraph;
-                            let text = ratatui::text::Text::from(lines);
-                            Paragraph::new(text).render(buf.area, buf);
-                        })?;
-                    }
-                    app.chat.mark_pushed(push_count);
-                    pushed_any = true;
-                }
-            }
-
-            if pushed_any {
-                terminal.clear()?;
-                terminal.draw(|frame| ui::render(frame, app))?;
-            }
-        }
 
         // Check for model fetch results (non-blocking)
         if let Some(ref mut rx) = app.model_fetch_rx {
