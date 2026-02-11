@@ -40,8 +40,71 @@ interface PermissionRequest {
   script: string;
 }
 
+export interface AskUserQuestion {
+  section: string;
+  question: string;
+  option: string[];
+  multi_select: boolean;
+}
+
+export type AskUserAnswerValue = string[] | string | null;
+
+export interface AskUserAnswer {
+  section: string;
+  answer: AskUserAnswerValue;
+}
+
+export interface AskUserRequest {
+  id: string;
+  questions: AskUserQuestion[];
+}
+
 export interface UiConfig {
   ssh_servers: Array<{ name: string; target: string }>;
+  max_iterations: number;
+}
+
+export type ProviderType =
+  | 'anthropic'
+  | 'openai'
+  | 'google'
+  | 'copilot'
+  | 'openrouter'
+  | 'deepseek'
+  | 'ollama'
+  | 'groq'
+  | 'together'
+  | 'mistral'
+  | 'xai'
+  | 'custom';
+
+export interface UiProviderConfig {
+  id: string;
+  provider_type: ProviderType;
+  api_key: string | null;
+  base_url: string | null;
+  display_name: string | null;
+  enabled: boolean;
+}
+
+export interface UiModelsConfig {
+  advanced: string[];
+  balanced: string[];
+  fast: string[];
+  image_generation: string[];
+  model_providers: Record<string, string>;
+}
+
+export interface UiPreferencesConfig {
+  load_balance_strategy: 'round_robin' | 'failover_only' | 'random';
+  warn_on_model_change: boolean;
+}
+
+export interface UiFullConfig {
+  providers: UiProviderConfig[];
+  models: UiModelsConfig;
+  preferences: UiPreferencesConfig;
+  last_model: string | null;
   max_iterations: number;
 }
 
@@ -276,8 +339,33 @@ export async function respondPermissionRequest(id: string, approved: boolean): P
   });
 }
 
+export async function pollAskUserRequest(): Promise<AskUserRequest | null> {
+  const data = await request<{ request: AskUserRequest | null }>('/api/ask-user/next');
+  return data.request;
+}
+
+export async function respondAskUserRequest(id: string, answers: AskUserAnswer[]): Promise<void> {
+  await request<{ ok: boolean }>('/api/ask-user/respond', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ id, answers }),
+  });
+}
+
 export async function fetchUiConfig(): Promise<UiConfig> {
   return request<UiConfig>('/api/config');
+}
+
+export async function fetchFullConfig(): Promise<UiFullConfig> {
+  return request<UiFullConfig>('/api/config/full');
+}
+
+export async function saveFullConfig(config: UiFullConfig): Promise<void> {
+  await request<{ ok: boolean }>('/api/config/full', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(config),
+  });
 }
 
 export async function addSshServer(name: string, target: string): Promise<void> {

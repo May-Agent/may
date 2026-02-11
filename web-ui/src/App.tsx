@@ -16,6 +16,7 @@ function App() {
     settings,
     loadInitialData,
     refreshRuntimeSettings,
+    refreshFullConfig,
     refreshMcpServers,
     refreshSkills,
   } = useStore();
@@ -27,10 +28,11 @@ function App() {
   useEffect(() => {
     if (showSettingsPage) {
       void refreshRuntimeSettings();
+      void refreshFullConfig();
       void refreshMcpServers();
       void refreshSkills();
     }
-  }, [showSettingsPage, refreshRuntimeSettings, refreshMcpServers, refreshSkills]);
+  }, [showSettingsPage, refreshRuntimeSettings, refreshFullConfig, refreshMcpServers, refreshSkills]);
 
   useEffect(() => {
     if (settings.font && !settings.font.startsWith('Source Han')) {
