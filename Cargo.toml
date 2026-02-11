@@ -69,6 +69,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # HTTP client for fetching images
 zenwave = { path = "../zenwave" }
 
+# Web server for `may ui`
+skyzen = { path = "../skyzen", features = ["hyper"] }
+
 # File picker
 nucleo = "0.5"
 ignore = "0.4"
@@ -85,6 +88,7 @@ include_dir = "0.7"
 itertools = "0.14.0"
 tempfile = "3.24.0"
 git2 = "0.20.3"
+mime_guess = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"

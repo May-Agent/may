@@ -31,7 +31,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 <Label htmlFor="theme" className="text-base font-medium">Theme</Label>
                 <p className="text-xs text-muted-foreground">App color scheme</p>
               </div>
-              <Select value={settings.theme} onValueChange={(v: any) => updateSettings({ theme: v })}>
+              <Select value={settings.theme} onValueChange={(v) => updateSettings({ theme: v as 'light' | 'dark' | 'system' })}>
                 <SelectTrigger id="theme" className="w-full h-10"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="light"><div className="flex items-center gap-2"><Sun className="h-4 w-4" />Light</div></SelectItem>
