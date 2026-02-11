@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "May - A warm, boundaried AI assistant"
 license = "MIT"
+build = "build.rs"
 
 [[bin]]
 name = "may"

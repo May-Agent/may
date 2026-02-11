@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use async_channel::{Receiver, Sender, bounded, unbounded};
 use async_fs;
 use base64::Engine;
 use futures_lite::StreamExt;
@@ -12,25 +13,123 @@ use skyzen::responder::{Sse, sse::Event};
 use skyzen::routing::{CreateRouteNode, Params, Route, Router};
 use skyzen::runtime::native;
 use skyzen::utils::{Json, State};
-use skyzen::{Body, Error as SkyError, Response, Result as SkyResult, StatusCode, header};
+use skyzen::{EmbeddedStaticDir, Error as SkyError, Result as SkyResult, StatusCode};
 use tokio::sync::Mutex;
 
 use crate::agent::{MayAgent, PermissionApprover, PermissionRequest};
-use crate::ask_user::{self, AnswerValue, QuestionAnswer};
-use crate::config::{MayConfig, SshServerConfig};
+use crate::ask_user::{self, AnswerValue, AskUserRequest, Question, QuestionAnswer};
+use crate::config::{LoadBalanceStrategy, MayConfig, ProviderInstance, ProviderType, SshServerConfig};
 use crate::mcp::{MayMcpServerConfig, McpConfig, McpManager, McpServerInfo};
 use crate::session::{ChatMessage, MessageRole, SessionId, SessionManager};
 use crate::skill::{SkillInfo, SkillManager};
 use crate::workspace_request;
+
+static WEB_UI_DIST: include_dir::Dir<'static> =
+    skyzen::embed_dir!(include_dir::include_dir!("$CARGO_MANIFEST_DIR/web-ui/dist"));
 
 struct UiServerState {
     session_manager: Mutex<SessionManager>,
     mcp_manager: Mutex<McpManager>,
     skill_manager: SkillManager,
     permission_approver: PermissionApprover,
+    ask_user_approver: AskUserApprover,
     cwd: PathBuf,
     may_dir: PathBuf,
-    web_root: PathBuf,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AskUserRequestPayload {
+    id: String,
+    questions: Vec<Question>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AskUserPollResponse {
+    request: Option<AskUserRequestPayload>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UiQuestionAnswer {
+    section: String,
+    answer: serde_json::Value,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AskUserRespondRequest {
+    id: String,
+    answers: Vec<UiQuestionAnswer>,
+}
+
+#[derive(Debug, Clone)]
+struct AskUserApprover {
+    request_tx: Sender<AskUserRequestPayload>,
+    request_rx: Receiver<AskUserRequestPayload>,
+    pending: Arc<Mutex<std::collections::HashMap<String, Sender<Vec<QuestionAnswer>>>>>,
+}
+
+impl AskUserApprover {
+    fn new() -> Self {
+        let (request_tx, request_rx) = unbounded();
+        Self {
+            request_tx,
+            request_rx,
+            pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    async fn enqueue(&self, request: AskUserRequest) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let questions = request.args.clone().into_questions();
+        let payload = AskUserRequestPayload {
+            id: id.clone(),
+            questions,
+        };
+
+        let (tx, rx) = bounded(1);
+        self.pending.lock().await.insert(id.clone(), tx);
+
+        if self.request_tx.send(payload).await.is_err() {
+            let _ = self.pending.lock().await.remove(&id);
+            let fallback = request
+                .args
+                .clone()
+                .into_questions()
+                .into_iter()
+                .map(|question| QuestionAnswer {
+                    section: question.section,
+                    answer: AnswerValue::Skipped,
+                })
+                .collect::<Vec<_>>();
+            let _ = request.respond(fallback);
+            return;
+        }
+
+        let answers = rx.recv().await.unwrap_or_else(|_| {
+            request
+                .args
+                .clone()
+                .into_questions()
+                .into_iter()
+                .map(|question| QuestionAnswer {
+                    section: question.section,
+                    answer: AnswerValue::Skipped,
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let _ = request.respond(answers);
+    }
+
+    async fn next_request(&self) -> Option<AskUserRequestPayload> {
+        self.request_rx.recv().await.ok()
+    }
+
+    async fn respond(&self, request_id: &str, answers: Vec<QuestionAnswer>) {
+        let sender = self.pending.lock().await.remove(request_id);
+        if let Some(tx) = sender {
+            let _ = tx.send(answers).await;
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -132,6 +231,40 @@ struct UiConfigResponse {
     max_iterations: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct UiProviderConfig {
+    id: String,
+    provider_type: ProviderType,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    display_name: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct UiModelsConfig {
+    advanced: Vec<String>,
+    balanced: Vec<String>,
+    fast: Vec<String>,
+    image_generation: Vec<String>,
+    model_providers: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct UiPreferencesConfig {
+    load_balance_strategy: LoadBalanceStrategy,
+    warn_on_model_change: bool,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct UiFullConfig {
+    providers: Vec<UiProviderConfig>,
+    models: UiModelsConfig,
+    preferences: UiPreferencesConfig,
+    last_model: Option<String>,
+    max_iterations: usize,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct SshServerRequest {
     name: String,
@@ -178,7 +311,6 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
 
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
-    let web_root = cwd.join("web-ui").join("dist");
 
     let mut mcp_manager = McpManager::load().unwrap_or_else(|_| McpManager::new(McpConfig::default()));
     if mcp_manager.has_servers() {
@@ -186,15 +318,16 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     }
 
     let permission_approver = PermissionApprover::new();
+    let ask_user_approver = AskUserApprover::new();
 
     let state = Arc::new(UiServerState {
         session_manager: Mutex::new(SessionManager::new()?),
         mcp_manager: Mutex::new(mcp_manager),
         skill_manager: SkillManager::new(&may_dir),
         permission_approver,
+        ask_user_approver,
         cwd,
         may_dir,
-        web_root,
     });
 
     let state_for_server = state.clone();
@@ -230,7 +363,13 @@ fn build_router(state: Arc<UiServerState>) -> Router {
             "/next".at(poll_permission_request),
             "/respond".post(respond_permission_request),
         ))),
+        "/api/ask-user".route(Route::new((
+            "/next".at(poll_ask_user_request),
+            "/respond".post(respond_ask_user_request),
+        ))),
         "/api/config".at(get_ui_config),
+        "/api/config/full".at(get_full_config),
+        "/api/config/full".post(save_full_config),
         "/api/memory".at(get_memory),
         "/api/memory".post(save_memory),
         "/api/ssh".route(Route::new((
@@ -248,7 +387,7 @@ fn build_router(state: Arc<UiServerState>) -> Router {
             "/install".post(install_skill),
             "/{dir}".delete(delete_skill),
         ))),
-        "/{*path}".at(static_or_index),
+        EmbeddedStaticDir::new("/", &WEB_UI_DIST),
     ))
     .middleware(State(state))
     .build()
@@ -282,7 +421,9 @@ async fn list_sessions(State(state): State<Arc<UiServerState>>) -> SkyResult<Jso
 
     let mut sessions = Vec::new();
     for id in session_ids {
-        let history = store.read_history(&id).await.map_err(internal_error)?;
+        let Ok(history) = store.read_history(&id).await else {
+            continue;
+        };
         sessions.push(session_from_history(&id, &history));
     }
     sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
@@ -312,6 +453,7 @@ async fn create_session(
         .set_current_model(model.clone())
         .await
         .map_err(internal_error)?;
+    persist_last_model(&model).map_err(internal_error)?;
 
     Ok(Json(ApiSession {
         id,
@@ -336,7 +478,7 @@ async fn update_session(
     manager
         .load_session(&session_id)
         .await
-        .map_err(not_found_error)?;
+        .map_err(internal_error)?;
 
     if let Some(title) = req.title {
         manager
@@ -346,9 +488,10 @@ async fn update_session(
     }
     if let Some(model) = req.model {
         manager
-            .set_current_model(model)
+            .set_current_model(model.clone())
             .await
             .map_err(internal_error)?;
+        persist_last_model(&model).map_err(internal_error)?;
     }
 
     let current = manager.current().ok_or_else(|| {
@@ -417,78 +560,101 @@ async fn stream_chat_events(
     req: ChatRequest,
     sender: skyzen::responder::sse::Sender,
 ) -> anyhow::Result<()> {
-    let (session_id, mut agent, prompt, attachments) = prepare_agent_for_request(&state, &req).await?;
+    const MAX_RETRIES: usize = 2;
 
-    let assistant_id = format!("assistant-{}", uuid::Uuid::new_v4());
-    let mut assistant_text = String::new();
-    let mut reasoning_text = String::new();
+    for attempt in 0..=MAX_RETRIES {
+        let (session_id, mut agent, prompt, attachments) =
+            prepare_agent_for_request(&state, &req, attempt == 0).await?;
 
-    send_event(&sender, "start", &serde_json::json!({
-        "session_id": req.session_id,
-        "assistant_id": assistant_id,
-    }))
-    .await;
+        let assistant_id = format!("assistant-{}", uuid::Uuid::new_v4());
+        let mut assistant_text = String::new();
+        let mut reasoning_text = String::new();
+        let mut had_output = false;
 
-    let mut stream = std::pin::pin!(agent.run(&prompt, attachments));
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(aither_agent::AgentEvent::Reasoning(text)) => {
-                reasoning_text.push_str(&text);
-                send_event(&sender, "reasoning", &serde_json::json!({ "chunk": text })).await;
+        send_event(&sender, "start", &serde_json::json!({
+            "session_id": req.session_id,
+            "assistant_id": assistant_id,
+        }))
+        .await;
+
+        let mut terminal_error: Option<String> = None;
+        let mut stream = std::pin::pin!(agent.run(&prompt, attachments));
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(aither_agent::AgentEvent::Reasoning(text)) => {
+                    had_output = true;
+                    reasoning_text.push_str(&text);
+                    send_event(&sender, "reasoning", &serde_json::json!({ "chunk": text })).await;
+                }
+                Ok(aither_agent::AgentEvent::Text(text)) => {
+                    had_output = true;
+                    assistant_text.push_str(&text);
+                    send_event(&sender, "text", &serde_json::json!({ "chunk": text })).await;
+                }
+                Ok(aither_agent::AgentEvent::ToolCallStart { id, name, arguments }) => {
+                    had_output = true;
+                    send_event(&sender, "tool_start", &serde_json::json!({
+                        "id": id,
+                        "name": name,
+                        "arguments": arguments,
+                    }))
+                    .await;
+                }
+                Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
+                    had_output = true;
+                    send_event(&sender, "tool_end", &serde_json::json!({
+                        "id": id,
+                        "name": name,
+                        "result": result,
+                    }))
+                    .await;
+                }
+                Ok(aither_agent::AgentEvent::Error(err)) => {
+                    terminal_error = Some(err.to_string());
+                    break;
+                }
+                Err(err) => {
+                    terminal_error = Some(err.to_string());
+                    break;
+                }
+                Ok(_) => {}
             }
-            Ok(aither_agent::AgentEvent::Text(text)) => {
-                assistant_text.push_str(&text);
-                send_event(&sender, "text", &serde_json::json!({ "chunk": text })).await;
-            }
-            Ok(aither_agent::AgentEvent::ToolCallStart { id, name, arguments }) => {
-                send_event(&sender, "tool_start", &serde_json::json!({
-                    "id": id,
-                    "name": name,
-                    "arguments": arguments,
-                }))
-                .await;
-            }
-            Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
-                send_event(&sender, "tool_end", &serde_json::json!({
-                    "id": id,
-                    "name": name,
-                    "result": result,
-                }))
-                .await;
-            }
-            Ok(aither_agent::AgentEvent::Error(err)) => {
-                send_event(&sender, "error", &serde_json::json!({ "message": err.to_string() })).await;
-                return Ok(());
-            }
-            Err(err) => {
-                send_event(&sender, "error", &serde_json::json!({ "message": err.to_string() })).await;
-                return Ok(());
-            }
-            Ok(_) => {}
         }
+
+        if let Some(err) = terminal_error {
+            if !had_output && attempt < MAX_RETRIES && is_retryable_llm_error(&err) {
+                tokio::time::sleep(Duration::from_millis(400 * (attempt as u64 + 1))).await;
+                continue;
+            }
+            send_event(&sender, "error", &serde_json::json!({ "message": err })).await;
+            return Ok(());
+        }
+
+        persist_assistant_message(&state, &session_id, assistant_text.clone()).await?;
+
+        send_event(
+            &sender,
+            "done",
+            &serde_json::json!({
+                "session_id": req.session_id,
+                "assistant": {
+                    "id": assistant_id,
+                    "role": "assistant",
+                    "content": assistant_text,
+                    "timestamp": jiff::Timestamp::now().to_string(),
+                    "attachments": [],
+                    "thinking": if reasoning_text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(reasoning_text) },
+                    "is_streaming": false,
+                    "is_thinking": false
+                }
+            }),
+        )
+        .await;
+
+        return Ok(());
     }
 
-    persist_assistant_message(&state, &session_id, assistant_text.clone()).await?;
-
-    send_event(
-        &sender,
-        "done",
-        &serde_json::json!({
-            "session_id": req.session_id,
-            "assistant": {
-                "id": assistant_id,
-                "role": "assistant",
-                "content": assistant_text,
-                "timestamp": jiff::Timestamp::now().to_string(),
-                "attachments": [],
-                "thinking": if reasoning_text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(reasoning_text) },
-                "is_streaming": false,
-                "is_thinking": false
-            }
-        }),
-    )
-    .await;
-
+    send_event(&sender, "error", &serde_json::json!({ "message": "LLM endpoint unavailable after retries" })).await;
     Ok(())
 }
 
@@ -510,12 +676,108 @@ async fn respond_permission_request(
     Ok(Json(ApiHealth { ok: true }))
 }
 
+async fn poll_ask_user_request(
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<AskUserPollResponse>> {
+    let request =
+        match tokio::time::timeout(Duration::from_secs(20), state.ask_user_approver.next_request())
+            .await
+        {
+            Ok(req) => req,
+            Err(_) => None,
+        };
+    Ok(Json(AskUserPollResponse { request }))
+}
+
+async fn respond_ask_user_request(
+    Json(req): Json<AskUserRespondRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let answers = req
+        .answers
+        .into_iter()
+        .map(|answer| QuestionAnswer {
+            section: answer.section,
+            answer: parse_ui_answer_value(answer.answer),
+        })
+        .collect::<Vec<_>>();
+
+    state.ask_user_approver.respond(&req.id, answers).await;
+    Ok(Json(ApiHealth { ok: true }))
+}
+
 async fn get_ui_config(State(_state): State<Arc<UiServerState>>) -> SkyResult<Json<UiConfigResponse>> {
     let config = MayConfig::load().unwrap_or_default();
     Ok(Json(UiConfigResponse {
         ssh_servers: config.ssh_servers.clone(),
         max_iterations: config.max_iterations,
     }))
+}
+
+async fn get_full_config(State(_state): State<Arc<UiServerState>>) -> SkyResult<Json<UiFullConfig>> {
+    let config = MayConfig::load().unwrap_or_default();
+
+    let mut providers = config
+        .provider
+        .iter()
+        .map(|(id, instance)| UiProviderConfig {
+            id: id.clone(),
+            provider_type: instance.resolve_type(id),
+            api_key: instance.api_key.clone(),
+            base_url: instance.base_url.clone(),
+            display_name: instance.display_name.clone(),
+            enabled: instance.enabled,
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|a, b| a.id.cmp(&b.id));
+
+    Ok(Json(UiFullConfig {
+        providers,
+        models: UiModelsConfig {
+            advanced: config.models.advanced.clone(),
+            balanced: config.models.balanced.clone(),
+            fast: config.models.fast.clone(),
+            image_generation: config.models.image_generation.clone(),
+            model_providers: config.models.model_providers.clone(),
+        },
+        preferences: UiPreferencesConfig {
+            load_balance_strategy: config.preferences.load_balance_strategy,
+            warn_on_model_change: config.preferences.warn_on_model_change,
+        },
+        last_model: config.last_model.clone(),
+        max_iterations: config.max_iterations,
+    }))
+}
+
+async fn save_full_config(
+    Json(req): Json<UiFullConfig>,
+    State(_state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let mut config = MayConfig::load().unwrap_or_default();
+
+    let mut provider_map = std::collections::HashMap::new();
+    for p in req.providers {
+        let mut instance = ProviderInstance::new(p.provider_type);
+        instance.api_key = p.api_key.filter(|v| !v.trim().is_empty());
+        instance.base_url = p.base_url.filter(|v| !v.trim().is_empty());
+        instance.display_name = p.display_name.filter(|v| !v.trim().is_empty());
+        instance.enabled = p.enabled;
+        provider_map.insert(p.id, instance);
+    }
+
+    config.provider = provider_map;
+    config.models.advanced = req.models.advanced;
+    config.models.balanced = req.models.balanced;
+    config.models.fast = req.models.fast;
+    config.models.image_generation = req.models.image_generation;
+    config.models.model_providers = req.models.model_providers;
+    config.preferences.load_balance_strategy = req.preferences.load_balance_strategy;
+    config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
+    config.last_model = req.last_model;
+    config.max_iterations = req.max_iterations;
+
+    config.save().map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
 }
 
 async fn get_memory(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<MemoryPayload>> {
@@ -662,82 +924,80 @@ async fn delete_skill(
     Ok(Json(ApiHealth { ok: true }))
 }
 
-async fn static_or_index(
-    params: Params,
-    State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Response> {
-    let raw = params.get("path").unwrap_or("");
-    let relative = sanitize_relative_path(raw)
-        .ok_or_else(|| SkyError::msg("Invalid path").set_status(StatusCode::BAD_REQUEST))?;
-
-    let target = if relative.as_os_str().is_empty() {
-        state.web_root.join("index.html")
-    } else {
-        state.web_root.join(&relative)
-    };
-
-    let final_path = if async_fs::metadata(&target).await.is_ok() {
-        target
-    } else {
-        state.web_root.join("index.html")
-    };
-
-    let bytes = async_fs::read(&final_path).await.map_err(not_found_error)?;
-    let mut response = Response::new(Body::from(bytes));
-
-    if let Some(mime) = mime_guess::from_path(&final_path).first_raw() {
-        if let Ok(value) = header::HeaderValue::from_str(mime) {
-            response.headers_mut().insert(header::CONTENT_TYPE, value);
-        }
-    }
-
-    Ok(response)
-}
-
 async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyResult<ChatResponse> {
-    let (session_id, mut agent, prompt, attachments) = prepare_agent_for_request(&state, &req)
-        .await
-        .map_err(internal_error)?;
+    const MAX_RETRIES: usize = 2;
 
-    let mut assistant_text = String::new();
-    let mut reasoning_text = String::new();
-    let mut stream = std::pin::pin!(agent.run(&prompt, attachments));
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(aither_agent::AgentEvent::Text(text)) => assistant_text.push_str(&text),
-            Ok(aither_agent::AgentEvent::Reasoning(text)) => reasoning_text.push_str(&text),
-            Ok(aither_agent::AgentEvent::Error(err)) => return Err(internal_error(err)),
-            Err(err) => return Err(internal_error(err)),
-            Ok(_) => {}
+    for attempt in 0..=MAX_RETRIES {
+        let (session_id, mut agent, prompt, attachments) = prepare_agent_for_request(&state, &req, attempt == 0)
+            .await
+            .map_err(internal_error)?;
+
+        let mut assistant_text = String::new();
+        let mut reasoning_text = String::new();
+        let mut had_output = false;
+
+        let mut terminal_error: Option<String> = None;
+        let mut stream = std::pin::pin!(agent.run(&prompt, attachments));
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(aither_agent::AgentEvent::Text(text)) => {
+                    had_output = true;
+                    assistant_text.push_str(&text);
+                }
+                Ok(aither_agent::AgentEvent::Reasoning(text)) => {
+                    had_output = true;
+                    reasoning_text.push_str(&text);
+                }
+                Ok(aither_agent::AgentEvent::Error(err)) => {
+                    terminal_error = Some(err.to_string());
+                    break;
+                }
+                Err(err) => {
+                    terminal_error = Some(err.to_string());
+                    break;
+                }
+                Ok(_) => {}
+            }
         }
+
+        if let Some(err) = terminal_error {
+            if !had_output && attempt < MAX_RETRIES && is_retryable_llm_error(&err) {
+                tokio::time::sleep(Duration::from_millis(400 * (attempt as u64 + 1))).await;
+                continue;
+            }
+            return Err(internal_error(err));
+        }
+
+        persist_assistant_message(&state, &session_id, assistant_text.clone())
+            .await
+            .map_err(internal_error)?;
+
+        return Ok(ChatResponse {
+            session_id: req.session_id,
+            assistant: ApiMessage {
+                id: format!("assistant-{}", uuid::Uuid::new_v4()),
+                role: "assistant".to_string(),
+                content: assistant_text,
+                timestamp: jiff::Timestamp::now().to_string(),
+                attachments: Vec::new(),
+                thinking: if reasoning_text.is_empty() {
+                    None
+                } else {
+                    Some(reasoning_text)
+                },
+                is_streaming: Some(false),
+                is_thinking: Some(false),
+            },
+        });
     }
 
-    persist_assistant_message(&state, &session_id, assistant_text.clone())
-        .await
-        .map_err(internal_error)?;
-
-    Ok(ChatResponse {
-        session_id: req.session_id,
-        assistant: ApiMessage {
-            id: format!("assistant-{}", uuid::Uuid::new_v4()),
-            role: "assistant".to_string(),
-            content: assistant_text,
-            timestamp: jiff::Timestamp::now().to_string(),
-            attachments: Vec::new(),
-            thinking: if reasoning_text.is_empty() {
-                None
-            } else {
-                Some(reasoning_text)
-            },
-            is_streaming: Some(false),
-            is_thinking: Some(false),
-        },
-    })
+    Err(internal_error("LLM endpoint unavailable after retries"))
 }
 
 async fn prepare_agent_for_request(
     state: &Arc<UiServerState>,
     req: &ChatRequest,
+    persist_user_message: bool,
 ) -> anyhow::Result<(SessionId, MayAgent, String, Vec<url::Url>)> {
     let session_id = SessionId::from_string(req.session_id.clone());
 
@@ -754,10 +1014,12 @@ async fn prepare_agent_for_request(
             .or_else(|| MayConfig::load().ok().and_then(|c| c.last_model))
             .unwrap_or_else(|| "gpt-4".to_string());
 
-        if let Some(session) = manager.current_mut() {
-            session.history.push(ChatMessage::user(req.content.clone()));
+        if persist_user_message {
+            if let Some(session) = manager.current_mut() {
+                session.history.push(ChatMessage::user(req.content.clone()));
+            }
+            manager.save_current().await.map_err(anyhow::Error::from)?;
         }
-        manager.save_current().await.map_err(anyhow::Error::from)?;
 
         let history_messages = manager
             .current()
@@ -781,19 +1043,10 @@ async fn prepare_agent_for_request(
         }
     });
 
+    let ask_user_approver = state.ask_user_approver.clone();
     tokio::spawn(async move {
         while let Some(request) = ask_user_queue.next().await {
-            let answers = request
-                .args
-                .clone()
-                .into_questions()
-                .into_iter()
-                .map(|question| QuestionAnswer {
-                    section: question.section,
-                    answer: AnswerValue::Skipped,
-                })
-                .collect::<Vec<_>>();
-            let _ = request.respond(answers);
+            ask_user_approver.enqueue(request).await;
         }
     });
 
@@ -919,6 +1172,12 @@ fn map_skill(skill: SkillInfo) -> SkillInfoDto {
     }
 }
 
+fn persist_last_model(model: &str) -> anyhow::Result<()> {
+    let mut config = MayConfig::load().unwrap_or_default();
+    config.last_model = Some(model.to_string());
+    config.save().map_err(anyhow::Error::from)
+}
+
 fn parse_arg_value(args: &[String], key: &str) -> Option<String> {
     for (idx, arg) in args.iter().enumerate() {
         if let Some(value) = arg.strip_prefix(&format!("{key}=")) {
@@ -931,6 +1190,31 @@ fn parse_arg_value(args: &[String], key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn parse_ui_answer_value(value: serde_json::Value) -> AnswerValue {
+    match value {
+        serde_json::Value::Null => AnswerValue::Skipped,
+        serde_json::Value::String(s) => {
+            if s.trim().is_empty() {
+                AnswerValue::Skipped
+            } else {
+                AnswerValue::Custom(s)
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let selected = items
+                .into_iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                AnswerValue::Skipped
+            } else {
+                AnswerValue::Selected(selected)
+            }
+        }
+        _ => AnswerValue::Skipped,
+    }
 }
 
 fn truncate_preview(content: &str) -> String {
@@ -949,16 +1233,17 @@ fn truncate_preview(content: &str) -> String {
     preview
 }
 
-fn sanitize_relative_path(path: &str) -> Option<PathBuf> {
-    let mut sanitized = PathBuf::new();
-    for component in Path::new(path).components() {
-        match component {
-            Component::Normal(seg) => sanitized.push(seg),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(sanitized)
+fn is_retryable_llm_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("transport error")
+        || lower.contains("connection error")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("503")
+        || lower.contains("502")
+        || lower.contains("504")
 }
 
 async fn build_prompt_and_attachments(
@@ -1032,6 +1317,3 @@ fn bad_request_error(err: impl std::fmt::Display) -> SkyError {
     SkyError::msg(err.to_string()).set_status(StatusCode::BAD_REQUEST)
 }
 
-fn not_found_error(err: impl std::fmt::Display) -> SkyError {
-    SkyError::msg(err.to_string()).set_status(StatusCode::NOT_FOUND)
-}
