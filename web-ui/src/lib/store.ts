@@ -18,12 +18,13 @@ interface AppState {
   uiConfig: {
     sshServers: Array<{ name: string; target: string }>;
     maxIterations: number;
+    fullConfig: api.UiFullConfig | null;
   };
   mcpServers: api.McpServerInfo[];
   skills: api.SkillInfo[];
 
   loadInitialData: () => Promise<void>;
-  createSession: () => Promise<string>;
+  createSession: (model?: string) => Promise<string>;
   setCurrentSession: (sessionId: string | null) => void;
   addMessage: (
     sessionId: string,
@@ -44,6 +45,8 @@ interface AppState {
   searchSessions: (query: string) => Session[];
 
   refreshRuntimeSettings: () => Promise<void>;
+  refreshFullConfig: () => Promise<void>;
+  saveFullConfig: (config: api.UiFullConfig) => Promise<void>;
   addSshServer: (name: string, target: string) => Promise<void>;
   removeSshServer: (name: string) => Promise<void>;
 
@@ -89,6 +92,7 @@ export const useStore = create<AppState>((set, get) => ({
   uiConfig: {
     sshServers: [],
     maxIterations: 50,
+    fullConfig: null,
   },
   memoryContent: '',
   mcpServers: [],
@@ -97,14 +101,34 @@ export const useStore = create<AppState>((set, get) => ({
   loadInitialData: async () => {
     if (get().loaded) return;
 
-    const [sessions, modelIds, uiConfig, memoryContent, mcpServers, skills] = await Promise.all([
+    const [
+      sessionsRes,
+      modelIdsRes,
+      uiConfigRes,
+      fullConfigRes,
+      memoryRes,
+      mcpServersRes,
+      skillsRes,
+    ] = await Promise.allSettled([
       api.fetchSessions(),
       api.fetchModels(),
       api.fetchUiConfig(),
+      api.fetchFullConfig(),
       api.fetchMemory(),
       api.fetchMcpServers(),
       api.fetchSkills(),
     ]);
+
+    const sessions = sessionsRes.status === 'fulfilled' ? sessionsRes.value : [];
+    const modelIds = modelIdsRes.status === 'fulfilled' ? modelIdsRes.value : [];
+    const uiConfig =
+      uiConfigRes.status === 'fulfilled'
+        ? uiConfigRes.value
+        : { ssh_servers: [], max_iterations: 50 };
+    const fullConfig = fullConfigRes.status === 'fulfilled' ? fullConfigRes.value : null;
+    const memoryContent = memoryRes.status === 'fulfilled' ? memoryRes.value : '';
+    const mcpServers = mcpServersRes.status === 'fulfilled' ? mcpServersRes.value : [];
+    const skills = skillsRes.status === 'fulfilled' ? skillsRes.value : [];
 
     const sorted = sortSessions(sessions);
     set({
@@ -113,17 +137,18 @@ export const useStore = create<AppState>((set, get) => ({
       uiConfig: {
         sshServers: uiConfig.ssh_servers,
         maxIterations: uiConfig.max_iterations,
+        fullConfig,
       },
       memoryContent,
       mcpServers,
       skills,
       loaded: true,
-      currentSessionId: sorted[0]?.id ?? null,
+      currentSessionId: null,
     });
   },
 
-  createSession: async () => {
-    const session = await api.createSession();
+  createSession: async (model) => {
+    const session = await api.createSession(model);
     set((state) => ({
       sessions: sortSessions([session, ...state.sessions]),
       currentSessionId: session.id,
@@ -237,12 +262,23 @@ export const useStore = create<AppState>((set, get) => ({
 
   refreshRuntimeSettings: async () => {
     const config = await api.fetchUiConfig();
-    set({
+    set((state) => ({
       uiConfig: {
+        ...state.uiConfig,
         sshServers: config.ssh_servers,
         maxIterations: config.max_iterations,
       },
-    });
+    }));
+  },
+
+  refreshFullConfig: async () => {
+    const fullConfig = await api.fetchFullConfig();
+    set((state) => ({ uiConfig: { ...state.uiConfig, fullConfig } }));
+  },
+
+  saveFullConfig: async (fullConfig) => {
+    await api.saveFullConfig(fullConfig);
+    set((state) => ({ uiConfig: { ...state.uiConfig, fullConfig } }));
   },
 
   addSshServer: async (name, target) => {

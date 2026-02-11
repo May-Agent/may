@@ -277,10 +277,12 @@ impl ChatHistory {
         // Write metadata block first (even if empty, to maintain consistent format)
         output.push_str("---\n");
         if let Some(title) = &self.metadata.title {
-            let _ = writeln!(output, "title: {title}");
+            let encoded = serde_json::to_string(title).unwrap_or_else(|_| "\"\"".to_string());
+            let _ = writeln!(output, "title: {encoded}");
         }
         if let Some(model) = &self.metadata.model {
-            let _ = writeln!(output, "model: {model}");
+            let encoded = serde_json::to_string(model).unwrap_or_else(|_| "\"\"".to_string());
+            let _ = writeln!(output, "model: {encoded}");
         }
         output.push_str("---\n\n");
 
