@@ -20,7 +20,7 @@ export interface Model {
   reasoning?: boolean;
 }
 
-export const MODELS: Model[] = [
+export const DEFAULT_MODELS: Model[] = [
   { id: 'gpt-4', name: 'GPT-4', provider: 'openai' },
   { id: 'o1-preview', name: 'o1-preview', provider: 'openai', reasoning: true },
   { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', provider: 'openai' },
@@ -29,12 +29,29 @@ export const MODELS: Model[] = [
   { id: 'gemini-pro', name: 'Gemini Pro', provider: 'google' },
 ];
 
-export const PROVIDER_ICONS: Record<Provider, ComponentType<any>> = {
+export const PROVIDER_ICONS: Record<Provider, ComponentType<{ className?: string }>> = {
   openai: OpenAI,
   anthropic: Anthropic,
   google: Google,
 };
 
-export function getModel(modelId: string): Model {
-  return MODELS.find(m => m.id === modelId) || MODELS[0];
+export function inferProvider(modelId: string): Provider {
+  const id = modelId.toLowerCase();
+  if (id.includes('claude')) return 'anthropic';
+  if (id.includes('gemini')) return 'google';
+  return 'openai';
+}
+
+export function buildModelCatalog(modelIds: string[]): Model[] {
+  if (!modelIds.length) return DEFAULT_MODELS;
+  return modelIds.map((id) => ({
+    id,
+    name: id,
+    provider: inferProvider(id),
+    reasoning: /o1|reason/i.test(id),
+  }));
+}
+
+export function getModel(modelId: string, catalog: Model[]): Model {
+  return catalog.find((m) => m.id === modelId) || catalog[0] || DEFAULT_MODELS[0];
 }

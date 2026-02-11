@@ -13,11 +13,14 @@ pub mod models;
 pub mod session;
 pub mod skill;
 pub mod tui;
+pub mod ui_server;
 pub mod workspace;
 pub use aither_agent::ask_user;
 pub use aither_agent::workspace_request;
 
-pub use agent::{MayAgent, generate_session_title};
+pub use agent::{
+    MayAgent, PermissionApprover, PermissionRequest, PermissionRequestMode, generate_session_title,
+};
 pub use config::MayConfig;
 pub use mcp::{MayMcpServerConfig, McpConfig, McpManager, McpServerInfo};
 pub use session::{

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Sidebar } from '@/components/layout/Sidebar';
+import { SettingsPage } from '@/components/layout/SettingsPage';
 import { ChatInterface } from '@/components/chat/ChatInterface';
 import { Menu } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -10,7 +11,26 @@ import { FONTS } from '@/lib/constants';
 function App() {
   const [isSidebarOpen, setSidebarOpen] = useState(false);
   const [isDesktopSidebarOpen, setDesktopSidebarOpen] = useState(true);
-  const { settings } = useStore();
+  const [showSettingsPage, setShowSettingsPage] = useState(false);
+  const {
+    settings,
+    loadInitialData,
+    refreshRuntimeSettings,
+    refreshMcpServers,
+    refreshSkills,
+  } = useStore();
+
+  useEffect(() => {
+    void loadInitialData();
+  }, [loadInitialData]);
+
+  useEffect(() => {
+    if (showSettingsPage) {
+      void refreshRuntimeSettings();
+      void refreshMcpServers();
+      void refreshSkills();
+    }
+  }, [showSettingsPage, refreshRuntimeSettings, refreshMcpServers, refreshSkills]);
 
   useEffect(() => {
     if (settings.font && !settings.font.startsWith('Source Han')) {
@@ -30,14 +50,22 @@ function App() {
       <div className="md:hidden fixed top-4 left-4 z-50">
         <Sheet open={isSidebarOpen} onOpenChange={setSidebarOpen}>
           <SheetTrigger asChild><Button variant="outline" size="icon"><Menu className="h-4 w-4" /></Button></SheetTrigger>
-          <SheetContent side="left" className="p-0 w-72"><Sidebar /></SheetContent>
+          <SheetContent side="left" className="p-0 w-72">
+            <Sidebar onOpenSettings={() => setShowSettingsPage(true)} />
+          </SheetContent>
         </Sheet>
       </div>
+
       <div className={`${isDesktopSidebarOpen ? 'w-64' : 'w-0'} hidden md:block h-full transition-all duration-300 ease-in-out overflow-hidden border-r`}>
-        <Sidebar className="w-64" />
+        <Sidebar className="w-64" onOpenSettings={() => setShowSettingsPage(true)} />
       </div>
+
       <main className="flex-1 flex flex-col h-full relative">
-        <ChatInterface onToggleSidebar={() => setDesktopSidebarOpen(!isDesktopSidebarOpen)} isSidebarOpen={isDesktopSidebarOpen} />
+        {showSettingsPage ? (
+          <SettingsPage onClose={() => setShowSettingsPage(false)} />
+        ) : (
+          <ChatInterface onToggleSidebar={() => setDesktopSidebarOpen(!isDesktopSidebarOpen)} isSidebarOpen={isDesktopSidebarOpen} />
+        )}
       </main>
     </div>
   );

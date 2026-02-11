@@ -1,146 +1,137 @@
-// src/lib/store.ts
-import { create } from "zustand";
-import { v4 as uuidv4 } from "uuid";
-import type { Session, Message, Project, Attachment } from "@/types";
+import { create } from 'zustand';
+import { v4 as uuidv4 } from 'uuid';
+import type { Session, Message, Project, Attachment } from '@/types';
+import * as api from '@/lib/api';
+import { buildModelCatalog, DEFAULT_MODELS, type Model } from '@/lib/constants';
 
 interface AppState {
   sessions: Session[];
   currentSessionId: string | null;
   projects: Project[];
+  models: Model[];
+  settings: {
+    font: string;
+    theme: 'light' | 'dark' | 'system';
+  };
+  loaded: boolean;
 
-  // Actions
-  createSession: (projectId?: string) => string;
-  setCurrentSession: (sessionId: string) => void;
+  uiConfig: {
+    sshServers: Array<{ name: string; target: string }>;
+    maxIterations: number;
+  };
+  mcpServers: api.McpServerInfo[];
+  skills: api.SkillInfo[];
+
+  loadInitialData: () => Promise<void>;
+  createSession: () => Promise<string>;
+  setCurrentSession: (sessionId: string | null) => void;
   addMessage: (
     sessionId: string,
     content: string,
-    role: "user" | "assistant",
+    role: 'user' | 'assistant',
     attachments?: Attachment[],
   ) => void;
-  deleteSession: (sessionId: string) => void;
-  updateSessionTitle: (sessionId: string, title: string) => void;
-  updateSessionModel: (sessionId: string, model: string) => void;
+  deleteSession: (sessionId: string) => Promise<void>;
+  updateSessionTitle: (sessionId: string, title: string) => Promise<void>;
+  updateSessionModel: (sessionId: string, model: string) => Promise<void>;
   updateSessionReasoningEffort: (
     sessionId: string,
-    effort: "low" | "medium" | "high",
+    effort: 'low' | 'medium' | 'high',
   ) => void;
-  updateMessageContent: (sessionId: string, messageId: string, content: string) => void;
-  setMessageStreaming: (sessionId: string, messageId: string, streaming: boolean) => void;
-  updateMessageThinking: (sessionId: string, messageId: string, thinking: string) => void;
-  setMessageThinkingState: (sessionId: string, messageId: string, isThinking: boolean) => void;
+  replaceSessionMessages: (sessionId: string, messages: Message[]) => void;
 
-  createProject: (name: string, description?: string) => void;
-  deleteProject: (projectId: string) => void;
-
-  // Settings
-  settings: {
-    font: string;
-    theme: "light" | "dark" | "system";
-  };
-  updateSettings: (settings: Partial<AppState["settings"]>) => void;
-
+  updateSettings: (settings: Partial<AppState['settings']>) => void;
   searchSessions: (query: string) => Session[];
+
+  refreshRuntimeSettings: () => Promise<void>;
+  addSshServer: (name: string, target: string) => Promise<void>;
+  removeSshServer: (name: string) => Promise<void>;
+
+  memoryContent: string;
+  refreshMemory: () => Promise<void>;
+  saveMemory: (content: string) => Promise<void>;
+  deleteAllSessions: () => Promise<void>;
+
+  refreshMcpServers: () => Promise<void>;
+  addMcpServer: (input: { name: string; command?: string; args?: string[]; url?: string }) => Promise<void>;
+  removeMcpServer: (name: string) => Promise<void>;
+  reconnectMcpServer: (name: string) => Promise<void>;
+
+  refreshSkills: () => Promise<void>;
+  installSkill: (repo: string) => Promise<void>;
+  deleteSkill: (dirName: string) => Promise<void>;
 }
 
-// Mock Data
 const MOCK_PROJECTS: Project[] = [
   {
-    id: "proj-1",
-    name: "Personal",
-    description: "Personal projects",
-    createdAt: new Date().toISOString(),
-  },
-  {
-    id: "proj-2",
-    name: "Work",
-    description: "Work related stuff",
+    id: 'proj-1',
+    name: 'Personal',
+    description: 'Personal projects',
     createdAt: new Date().toISOString(),
   },
 ];
 
-const MOCK_SESSIONS: Session[] = [
-  {
-    id: "sess-1",
-    title: "React Components Help",
-    lastModified: new Date().toISOString(),
-    preview: "How do I create a reusable button component?",
-    projectId: "proj-1",
-    model: "gpt-4",
-    messages: [
-      {
-        id: "msg-1",
-        role: "user",
-        content: "How do I create a reusable button component in React?",
-        timestamp: new Date(Date.now() - 100000).toISOString(),
-      },
-      {
-        id: "msg-2",
-        role: "assistant",
-        content:
-          'Here is a simple example of a reusable Button component using TypeScript and Tailwind CSS:\n\n```tsx\nimport React from "react";\n\ninterface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {\n  variant?: "primary" | "secondary";\n}\n\nexport const Button: React.FC<ButtonProps> = ({ variant = "primary", className, ...props }) => {\n  const baseStyles = "px-4 py-2 rounded font-medium focus:outline-none";\n  const variants = {\n    primary: "bg-blue-500 text-white hover:bg-blue-600",\n    secondary: "bg-gray-200 text-gray-800 hover:bg-gray-300",\n  };\n\n  return (\n    <button \n      className={`${baseStyles} ${variants[variant]} ${className}`}\n      {...props}\n    />\n  );\n};\n```',
-        timestamp: new Date(Date.now() - 90000).toISOString(),
-      },
-    ],
-  },
-  {
-    id: "sess-2",
-    title: "Project Planning",
-    lastModified: new Date(Date.now() - 86400000).toISOString(),
-    preview: "Let's plan the roadmap for Q4.",
-    projectId: "proj-2",
-    model: "claude-3-opus",
-    messages: [
-      {
-        id: "msg-3",
-        role: "user",
-        content: "Let's plan the roadmap for Q4.",
-        timestamp: new Date(Date.now() - 86400000).toISOString(),
-      },
-      {
-        id: "msg-4",
-        role: "assistant",
-        content: "Sure! What are the key goals you want to achieve in Q4?",
-        timestamp: new Date(Date.now() - 86390000).toISOString(),
-      },
-    ],
-  },
-];
+function sortSessions(sessions: Session[]): Session[] {
+  return [...sessions].sort(
+    (a, b) =>
+      new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime(),
+  );
+}
 
 export const useStore = create<AppState>((set, get) => ({
-  sessions: MOCK_SESSIONS,
-  currentSessionId: MOCK_SESSIONS[0].id,
+  sessions: [],
+  currentSessionId: null,
   projects: MOCK_PROJECTS,
-  settings: {
-    font: "Inter",
-    theme: "system",
+  models: DEFAULT_MODELS,
+  settings: { font: 'Inter', theme: 'system' },
+  loaded: false,
+
+  uiConfig: {
+    sshServers: [],
+    maxIterations: 50,
+  },
+  memoryContent: '',
+  mcpServers: [],
+  skills: [],
+
+  loadInitialData: async () => {
+    if (get().loaded) return;
+
+    const [sessions, modelIds, uiConfig, memoryContent, mcpServers, skills] = await Promise.all([
+      api.fetchSessions(),
+      api.fetchModels(),
+      api.fetchUiConfig(),
+      api.fetchMemory(),
+      api.fetchMcpServers(),
+      api.fetchSkills(),
+    ]);
+
+    const sorted = sortSessions(sessions);
+    set({
+      sessions: sorted,
+      models: buildModelCatalog(modelIds),
+      uiConfig: {
+        sshServers: uiConfig.ssh_servers,
+        maxIterations: uiConfig.max_iterations,
+      },
+      memoryContent,
+      mcpServers,
+      skills,
+      loaded: true,
+      currentSessionId: sorted[0]?.id ?? null,
+    });
   },
 
-  updateSettings: (newSettings) => {
+  createSession: async () => {
+    const session = await api.createSession();
     set((state) => ({
-      settings: { ...state.settings, ...newSettings },
+      sessions: sortSessions([session, ...state.sessions]),
+      currentSessionId: session.id,
     }));
+    return session.id;
   },
 
-  createSession: (projectId) => {
-    const newSession: Session = {
-      id: uuidv4(),
-      title: "New Chat",
-      lastModified: new Date().toISOString(),
-      preview: "New conversation started",
-      messages: [],
-      projectId,
-      model: "gpt-4",
-    };
-    set((state) => ({
-      sessions: [newSession, ...state.sessions],
-      currentSessionId: newSession.id,
-    }));
-    return newSession.id;
-  },
-
-  setCurrentSession: (sessionId) => {
-    set({ currentSessionId: sessionId });
-  },
+  setCurrentSession: (sessionId) => set({ currentSessionId: sessionId }),
 
   addMessage: (sessionId, content, role, attachments = []) => {
     const newMessage: Message = {
@@ -151,59 +142,53 @@ export const useStore = create<AppState>((set, get) => ({
       attachments,
     };
 
-    set((state) => {
-      const updatedSessions = state.sessions.map((session) => {
-        if (session.id === sessionId) {
-          return {
-            ...session,
-            messages: [...session.messages, newMessage],
-            lastModified: new Date().toISOString(),
-            preview:
-              content.substring(0, 100) + (content.length > 100 ? "..." : ""),
-            // Auto-update title for first user message if it's "New Chat"
-            title:
-              session.messages.length === 0 && role === "user"
-                ? content.substring(0, 30)
-                : session.title,
-          };
-        }
-        return session;
-      });
-
-      // Move updated session to top
-      updatedSessions.sort(
-        (a, b) =>
-          new Date(b.lastModified).getTime() -
-          new Date(a.lastModified).getTime(),
-      );
-
-      return { sessions: updatedSessions };
-    });
-  },
-
-  deleteSession: (sessionId) => {
-    set((state) => {
-      const newSessions = state.sessions.filter((s) => s.id !== sessionId);
-      let newCurrentId = state.currentSessionId;
-      if (state.currentSessionId === sessionId) {
-        newCurrentId = newSessions.length > 0 ? newSessions[0].id : null;
-      }
-      return { sessions: newSessions, currentSessionId: newCurrentId };
-    });
-  },
-
-  updateSessionTitle: (sessionId, title) => {
     set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === sessionId ? { ...s, title } : s,
+      sessions: sortSessions(
+        state.sessions.map((session) =>
+          session.id === sessionId
+            ? {
+                ...session,
+                messages: [...session.messages, newMessage],
+                lastModified: new Date().toISOString(),
+                preview:
+                  content.substring(0, 100) + (content.length > 100 ? '...' : ''),
+                title:
+                  session.messages.length === 0 && role === 'user'
+                    ? content.substring(0, 30)
+                    : session.title,
+              }
+            : session,
+        ),
       ),
     }));
   },
 
-  updateSessionModel: (sessionId, model) => {
+  deleteSession: async (sessionId) => {
+    await api.removeSession(sessionId);
+    set((state) => {
+      const sessions = state.sessions.filter((s) => s.id !== sessionId);
+      const nextId =
+        state.currentSessionId === sessionId
+          ? (sessions[0]?.id ?? null)
+          : state.currentSessionId;
+      return { sessions, currentSessionId: nextId };
+    });
+  },
+
+  updateSessionTitle: async (sessionId, title) => {
+    const updated = await api.updateSession(sessionId, { title });
     set((state) => ({
       sessions: state.sessions.map((s) =>
-        s.id === sessionId ? { ...s, model } : s,
+        s.id === sessionId ? { ...s, title: updated.title } : s,
+      ),
+    }));
+  },
+
+  updateSessionModel: async (sessionId, model) => {
+    const updated = await api.updateSession(sessionId, { model });
+    set((state) => ({
+      sessions: state.sessions.map((s) =>
+        s.id === sessionId ? { ...s, model: updated.model } : s,
       ),
     }));
   },
@@ -216,74 +201,112 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
-  updateMessageContent: (sessionId, messageId, content) => {
+  replaceSessionMessages: (sessionId, messages) => {
     set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === sessionId
-          ? { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, content } : m) }
-          : s,
+      sessions: sortSessions(
+        state.sessions.map((s) =>
+          s.id === sessionId
+            ? {
+                ...s,
+                messages,
+                lastModified: new Date().toISOString(),
+                preview: messages.length
+                  ? messages[messages.length - 1].content.slice(0, 100)
+                  : s.preview,
+              }
+            : s,
+        ),
       ),
     }));
   },
 
-  setMessageStreaming: (sessionId, messageId, streaming) => {
-    set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === sessionId
-          ? { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, isStreaming: streaming } : m) }
-          : s,
-      ),
-    }));
-  },
-
-  updateMessageThinking: (sessionId, messageId, thinking) => {
-    set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === sessionId
-          ? { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, thinking } : m) }
-          : s,
-      ),
-    }));
-  },
-
-  setMessageThinkingState: (sessionId, messageId, isThinking) => {
-    set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === sessionId
-          ? { ...s, messages: s.messages.map((m) => m.id === messageId ? { ...m, isThinking } : m) }
-          : s,
-      ),
-    }));
-  },
-
-  createProject: (name, description) => {
-    const newProject: Project = {
-      id: uuidv4(),
-      name,
-      description,
-      createdAt: new Date().toISOString(),
-    };
-    set((state) => ({ projects: [...state.projects, newProject] }));
-  },
-
-  deleteProject: (projectId) => {
-    set((state) => ({
-      projects: state.projects.filter((p) => p.id !== projectId),
-      // Also maybe unlink sessions or delete them? For now, keep them but remove projectId
-      sessions: state.sessions.map((s) =>
-        s.projectId === projectId ? { ...s, projectId: undefined } : s,
-      ),
-    }));
+  updateSettings: (settings) => {
+    set((state) => ({ settings: { ...state.settings, ...settings } }));
   },
 
   searchSessions: (query) => {
-    const { sessions } = get();
+    const lower = query.toLowerCase();
+    const sessions = get().sessions;
     if (!query) return sessions;
-    const lowerQuery = query.toLowerCase();
     return sessions.filter(
       (s) =>
-        s.title.toLowerCase().includes(lowerQuery) ||
-        s.messages.some((m) => m.content.toLowerCase().includes(lowerQuery)),
+        s.title.toLowerCase().includes(lower) ||
+        s.messages.some((m) => m.content.toLowerCase().includes(lower)),
     );
+  },
+
+  refreshRuntimeSettings: async () => {
+    const config = await api.fetchUiConfig();
+    set({
+      uiConfig: {
+        sshServers: config.ssh_servers,
+        maxIterations: config.max_iterations,
+      },
+    });
+  },
+
+  addSshServer: async (name, target) => {
+    await api.addSshServer(name, target);
+    await get().refreshRuntimeSettings();
+  },
+
+  removeSshServer: async (name) => {
+    await api.removeSshServer(name);
+    await get().refreshRuntimeSettings();
+  },
+
+  refreshMemory: async () => {
+    const memoryContent = await api.fetchMemory();
+    set({ memoryContent });
+  },
+
+  saveMemory: async (content) => {
+    await api.saveMemory(content);
+    set({ memoryContent: content });
+  },
+
+  deleteAllSessions: async () => {
+    await api.deleteAllSessions();
+    const sessions = await api.fetchSessions();
+    const sorted = sortSessions(sessions);
+    set({
+      sessions: sorted,
+      currentSessionId: sorted[0]?.id ?? null,
+    });
+  },
+
+  refreshMcpServers: async () => {
+    const mcpServers = await api.fetchMcpServers();
+    set({ mcpServers });
+  },
+
+  addMcpServer: async (input) => {
+    await api.addMcpServer(input);
+    await get().refreshMcpServers();
+  },
+
+  removeMcpServer: async (name) => {
+    await api.removeMcpServer(name);
+    await get().refreshMcpServers();
+  },
+
+  reconnectMcpServer: async (name) => {
+    await api.reconnectMcpServer(name);
+    await get().refreshMcpServers();
+  },
+
+  refreshSkills: async () => {
+    const skills = await api.fetchSkills();
+    set({ skills });
+  },
+
+  installSkill: async (repo) => {
+    await api.installSkill(repo);
+    await get().refreshSkills();
+  },
+
+  deleteSkill: async (dirName) => {
+    await api.deleteSkill(dirName);
+    await get().refreshSkills();
   },
 }));

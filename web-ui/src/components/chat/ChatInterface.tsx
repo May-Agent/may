@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState } from "react";
 import { useStore } from "@/lib/store";
+import { streamChat } from '@/lib/api';
 import { MessageItem } from "./MessageItem";
 import { ModelSelector } from "./ModelSelector";
 import { AttachmentPreview } from "./AttachmentPreview";
@@ -29,31 +30,6 @@ import {
 import type { Attachment } from "@/types";
 import { v4 as uuidv4 } from "uuid";
 
-const MOCK_RESPONSE = `Here is a simple example of a reusable Button component using TypeScript and Tailwind CSS:
-
-\`\`\`tsx
-import React from "react";
-
-interface ButtonProps {
-  variant?: "primary" | "secondary";
-  children: React.ReactNode;
-}
-
-export const Button = ({ variant = "primary", children }: ButtonProps) => {
-  return <button className={variant}>{children}</button>;
-};
-\`\`\`
-
-This component accepts a \`variant\` prop and renders children inside a styled button. You can extend it with more variants, sizes, and other props as needed.`;
-
-const MOCK_THINKING = `The user is asking for a reusable Button component. I should create something with TypeScript generics for type safety, Tailwind CSS classes for styling, and a clean prop interface.
-
-Let me think about the variant pattern — a discriminated union would work well here. I could use a simple string union type like "primary" | "secondary" | "destructive" | "outline" | "ghost" for the variants.
-
-For the styling approach, I'll use class-variance-authority (cva) to handle the variant styles cleanly. This gives us type-safe variant props with Tailwind classes mapped to each variant.
-
-I should also consider the size prop — small, medium, large — and make the component extend native button attributes so it's fully compatible with HTML button props. I'll keep it simple but extensible.`;
-
 interface QueuedMessage {
   content: string;
   attachments: Attachment[];
@@ -71,11 +47,9 @@ export function ChatInterface({
   const {
     currentSessionId,
     sessions,
+    createSession,
     addMessage,
-    updateMessageContent,
-    setMessageStreaming,
-    updateMessageThinking,
-    setMessageThinkingState,
+    replaceSessionMessages,
     updateSessionTitle,
     updateSessionModel,
     updateSessionReasoningEffort,
@@ -90,9 +64,7 @@ export function ChatInterface({
   const userScrolledUpRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
-  const streamAbortRef = useRef(false);
-  const streamingMsgIdRef = useRef<string | null>(null);
-  const shouldFlushQueueRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const currentSession = sessions.find((s) => s.id === currentSessionId);
   const messages = currentSession?.messages || [];
@@ -130,96 +102,9 @@ export function ChatInterface({
     }
   };
 
-  useEffect(() => {
-    return () => {
-      streamAbortRef.current = true;
-    };
-  }, [currentSessionId]);
+  const handleSend = async () => {
+    if (!inputValue.trim() && attachments.length === 0) return;
 
-  // Auto-send all queued messages at once when generation finishes normally
-  useEffect(() => {
-    if (!isGenerating && shouldFlushQueueRef.current && queuedMessages.length > 0 && currentSessionId) {
-      shouldFlushQueueRef.current = false;
-      const allQueued = [...queuedMessages];
-      setQueuedMessages([]);
-
-      // Add all queued messages as user messages
-      for (const msg of allQueued) {
-        addMessage(currentSessionId, msg.content, "user", msg.attachments);
-      }
-
-      // Start a single AI response
-      setIsGenerating(true);
-      streamAbortRef.current = false;
-      const msgId = uuidv4();
-      streamingMsgIdRef.current = msgId;
-      useStore.setState((state) => ({
-        sessions: state.sessions.map((s) =>
-          s.id === currentSessionId
-            ? {
-                ...s,
-                messages: [
-                  ...s.messages,
-                  {
-                    id: msgId,
-                    role: "assistant" as const,
-                    content: "",
-                    thinking: "",
-                    isThinking: true,
-                    timestamp: new Date().toISOString(),
-                    isStreaming: true,
-                  },
-                ],
-                lastModified: new Date().toISOString(),
-              }
-            : s,
-        ),
-      }));
-      setTimeout(() => simulateStream(currentSessionId, msgId), 300);
-    } else if (!isGenerating) {
-      shouldFlushQueueRef.current = false;
-    }
-  }, [isGenerating]);
-
-  const simulateStream = async (sessionId: string, messageId: string) => {
-    // Phase 1: Thinking
-    setMessageThinkingState(sessionId, messageId, true);
-    const thinkTokens = MOCK_THINKING.split(/(?<=\s)/);
-    let thinkAcc = "";
-    for (const token of thinkTokens) {
-      if (streamAbortRef.current) break;
-      thinkAcc += token;
-      updateMessageThinking(sessionId, messageId, thinkAcc);
-      await new Promise((r) => setTimeout(r, 30 + Math.random() * 40));
-    }
-    if (streamAbortRef.current) {
-      setMessageThinkingState(sessionId, messageId, false);
-      setMessageStreaming(sessionId, messageId, false);
-      streamingMsgIdRef.current = null;
-      setIsGenerating(false);
-      return;
-    }
-    setMessageThinkingState(sessionId, messageId, false);
-
-    // Phase 2: Content streaming
-    await new Promise((r) => setTimeout(r, 200));
-    const tokens = MOCK_RESPONSE.split(/(?<=\s)/);
-    let accumulated = "";
-    for (const token of tokens) {
-      if (streamAbortRef.current) break;
-      accumulated += token;
-      updateMessageContent(sessionId, messageId, accumulated);
-      await new Promise((r) => setTimeout(r, 30 + Math.random() * 40));
-    }
-    setMessageStreaming(sessionId, messageId, false);
-    streamingMsgIdRef.current = null;
-    shouldFlushQueueRef.current = true;
-    setIsGenerating(false);
-  };
-
-  const handleSend = () => {
-    if (!currentSessionId || (!inputValue.trim() && attachments.length === 0))
-      return;
     const content = inputValue;
     const atts = [...attachments];
     setInputValue("");
@@ -230,63 +115,115 @@ export function ChatInterface({
       return;
     }
 
-    addMessage(currentSessionId, content, "user", atts);
+    let sessionId = currentSessionId;
+    if (!sessionId) {
+      sessionId = await createSession();
+    }
+
+    if (!sessionId) return;
+
+    const pendingBatch = [{ content, attachments: atts }, ...queuedMessages];
+    setQueuedMessages([]);
+
+    for (const queued of pendingBatch) {
+      addMessage(sessionId, queued.content, 'user', queued.attachments);
+    }
+
     userScrolledUpRef.current = false;
     setIsGenerating(true);
-    streamAbortRef.current = false;
 
-    // Create an empty assistant message with streaming flag
-    const msgId = uuidv4();
-    streamingMsgIdRef.current = msgId;
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
-    // Add empty streaming message to store
-    const { sessions } = useStore.getState();
-    const session = sessions.find((s) => s.id === currentSessionId);
-    if (!session) return;
+    try {
+      const finalPrompt = pendingBatch.map((m) => m.content).join('\n\n');
+      const mergedAttachments = pendingBatch.flatMap((m) => m.attachments);
+      const assistantId = `assistant-${Date.now()}`;
 
-    // Manually add the streaming message
-    useStore.setState((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === currentSessionId
-          ? {
-              ...s,
-              messages: [
-                ...s.messages,
-                {
-                  id: msgId,
-                  role: "assistant" as const,
-                  content: "",
-                  thinking: "",
-                  isThinking: true,
-                  timestamp: new Date().toISOString(),
-                  isStreaming: true,
-                },
-              ],
-              lastModified: new Date().toISOString(),
-            }
-          : s,
-      ),
-    }));
+      const current = useStore.getState().sessions.find((s) => s.id === sessionId);
+      if (!current) return;
 
-    // Start streaming after a small delay (simulating network latency)
-    setTimeout(() => simulateStream(currentSessionId, msgId), 300);
+      replaceSessionMessages(sessionId, [
+        ...current.messages,
+        {
+          id: assistantId,
+          role: 'assistant',
+          content: '',
+          timestamp: new Date().toISOString(),
+          attachments: [],
+          isStreaming: true,
+          isThinking: true,
+          thinking: '',
+        },
+      ]);
+
+      let streamedText = '';
+      let streamedReasoning = '';
+
+      await streamChat({
+        sessionId,
+        content: finalPrompt,
+        attachments: mergedAttachments,
+        signal: controller.signal,
+        onReasoning: (chunk) => {
+          streamedReasoning += chunk;
+          const latest = useStore.getState().sessions.find((s) => s.id === sessionId);
+          if (!latest) return;
+          replaceSessionMessages(
+            sessionId,
+            latest.messages.map((m) =>
+              m.id === assistantId ? { ...m, thinking: streamedReasoning, isThinking: true } : m,
+            ),
+          );
+        },
+        onText: (chunk) => {
+          streamedText += chunk;
+          const latest = useStore.getState().sessions.find((s) => s.id === sessionId);
+          if (!latest) return;
+          replaceSessionMessages(
+            sessionId,
+            latest.messages.map((m) =>
+              m.id === assistantId
+                ? { ...m, content: streamedText, isStreaming: true, isThinking: false }
+                : m,
+            ),
+          );
+        },
+        onDone: (assistant) => {
+          const latest = useStore.getState().sessions.find((s) => s.id === sessionId);
+          if (!latest) return;
+          replaceSessionMessages(
+            sessionId,
+            latest.messages.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...assistant,
+                    id: assistantId,
+                    thinking: streamedReasoning,
+                    isStreaming: false,
+                    isThinking: false,
+                  }
+                : m,
+            ),
+          );
+        },
+        onError: (message) => {
+          addMessage(sessionId, `Error: ${message}`, 'assistant');
+        },
+      });
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === 'AbortError')) {
+        addMessage(sessionId, `Error: ${(error as Error).message}`, 'assistant');
+      }
+    } finally {
+      abortControllerRef.current = null;
+      setIsGenerating(false);
+    }
   };
 
   const handleStop = () => {
-    streamAbortRef.current = true;
-    shouldFlushQueueRef.current = false;
-    if (streamingMsgIdRef.current && currentSessionId) {
-      setMessageThinkingState(currentSessionId, streamingMsgIdRef.current, false);
-      setMessageStreaming(currentSessionId, streamingMsgIdRef.current, false);
-      streamingMsgIdRef.current = null;
-    }
-    // Flush queued messages as user messages without triggering AI response
-    if (currentSessionId && queuedMessages.length > 0) {
-      for (const msg of queuedMessages) {
-        addMessage(currentSessionId, msg.content, "user", msg.attachments);
-      }
-      setQueuedMessages([]);
-    }
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
     setIsGenerating(false);
   };
 
@@ -437,9 +374,70 @@ export function ChatInterface({
   };
 
   if (!currentSessionId || !currentSession) {
+    const hasWelcomeInput = inputValue.trim() || attachments.length > 0;
     return (
-      <div className="flex items-center justify-center h-full text-muted-foreground">
-        Select a chat to start messaging
+      <div className="flex flex-col h-screen w-full relative">
+        <div className="flex items-center justify-between p-4 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 z-10">
+          <div className="flex-1 flex justify-start">
+            <Button variant="ghost" size="icon" onClick={onToggleSidebar} className="text-muted-foreground hover:text-foreground">
+              <PanelLeft className="h-5 w-5" />
+            </Button>
+          </div>
+          <span className="text-sm font-medium">New Chat</span>
+          <div className="flex-1" />
+        </div>
+
+        <div className="flex-1 flex flex-col items-center justify-center px-4 -mt-20">
+          <div className="text-center mb-8">
+            <h1 className="text-3xl font-semibold tracking-tight mb-2">What shall we think through?</h1>
+            <p className="text-muted-foreground text-sm">Ask anything. I'm here to help you think, create, and explore.</p>
+          </div>
+
+          <div className="w-full max-w-2xl">
+            <div className="relative bg-background/60 backdrop-blur-xl rounded-2xl border border-border/50 shadow-lg">
+              <Textarea
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
+                onPaste={handlePaste}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleSend();
+                  }
+                }}
+                placeholder="How can I help you today?"
+                className="min-h-[60px] max-h-[200px] w-full resize-none border-0 shadow-none focus-visible:ring-0 bg-transparent py-4 px-3 text-base"
+                rows={1}
+                autoFocus
+              />
+              <div className="flex items-center justify-between p-2 pl-3">
+                <div className="flex items-center gap-2">
+                  <input type="file" multiple className="hidden" ref={fileInputRef} onChange={handleFileSelect} />
+                  <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground rounded-lg" onClick={() => fileInputRef.current?.click()}>
+                    <Plus className="h-5 w-5" />
+                  </Button>
+                </div>
+                <div className="flex items-center gap-2">
+                  <ModelSelector
+                    currentModelId="claude-3-opus"
+                    onModelChange={() => {}}
+                    onReasoningEffortChange={() => {}}
+                  />
+                  <Button
+                    onClick={() => void handleSend()}
+                    disabled={!hasWelcomeInput}
+                    size="icon"
+                    className={hasWelcomeInput
+                      ? "h-8 w-8 bg-primary text-primary-foreground rounded-lg"
+                      : "h-8 w-8 bg-muted text-muted-foreground rounded-lg"}
+                  >
+                    <Send className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     );
   }
@@ -597,7 +595,7 @@ export function ChatInterface({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
-                  handleSend();
+                  void handleSend();
                 }
               }}
               placeholder="Type a message..."
@@ -665,7 +663,7 @@ export function ChatInterface({
                   </Button>
                 ) : (
                   <Button
-                    onClick={handleSend}
+                    onClick={() => void handleSend()}
                     disabled={!hasInput}
                     size="icon"
                     className={
