@@ -40,6 +40,12 @@ const PANIC_MESSAGE: &str = include_str!("../texts/panic_message.txt");
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "ui") {
+        return may_agent::ui_server::run_ui_server(&args[2..]).await;
+    }
+
     // Initialize logging to file
     let file_appender = tracing_appender::rolling::daily(
         dirs::home_dir()

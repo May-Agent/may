@@ -4,42 +4,34 @@ import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { SettingsDialog } from '@/components/settings/SettingsDialog';
-import {
-  Search,
-  Plus,
-  Trash2,
-  Settings,
-} from 'lucide-react';
+import { Search, Plus, Trash2, Settings } from 'lucide-react';
 
 interface SidebarProps {
   className?: string;
+  onOpenSettings: () => void;
 }
 
-export function Sidebar({ className }: SidebarProps) {
+export function Sidebar({ className, onOpenSettings }: SidebarProps) {
   const { 
     sessions, 
     currentSessionId, 
     setCurrentSession, 
-    createSession, 
     deleteSession,
     searchSessions 
   } = useStore();
   
   const [searchQuery, setSearchQuery] = useState('');
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   const filteredSessions = searchQuery 
     ? searchSessions(searchQuery)
     : sessions;
 
   return (
-    <>
-      <div className={cn("w-64 bg-muted/20 flex flex-col h-screen", className)}>
+    <div className={cn("w-64 bg-muted/20 flex flex-col h-screen", className)}>
         <div className="flex-1 flex flex-col min-h-0">
           <div className="px-3 py-4 space-y-4">
             <Button 
-              onClick={() => createSession()} 
+              onClick={() => setCurrentSession(null)} 
               variant="outline" 
               className="w-full justify-start gap-2"
             >
@@ -102,17 +94,15 @@ export function Sidebar({ className }: SidebarProps) {
         </div>
         
         <div className="mt-auto p-4 border-t bg-background">
-          <Button 
-            variant="ghost" 
+          <Button
+            variant="ghost"
             className="w-full justify-start gap-2"
-            onClick={() => setIsSettingsOpen(true)}
+            onClick={onOpenSettings}
           >
             <Settings className="h-4 w-4" />
             Settings
           </Button>
         </div>
       </div>
-      <SettingsDialog open={isSettingsOpen} onOpenChange={setIsSettingsOpen} />
-    </>
   );
 }

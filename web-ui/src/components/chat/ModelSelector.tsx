@@ -4,7 +4,8 @@ import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, Command
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Check } from 'lucide-react';
-import { MODELS, PROVIDER_ICONS, getModel } from '@/lib/constants';
+import { PROVIDER_ICONS, getModel } from '@/lib/constants';
+import { useStore } from '@/lib/store';
 
 interface ModelSelectorProps {
   currentModelId: string;
@@ -15,7 +16,8 @@ interface ModelSelectorProps {
 
 export function ModelSelector({ currentModelId, currentReasoningEffort = 'medium', onModelChange, onReasoningEffortChange }: ModelSelectorProps) {
   const [open, setOpen] = useState(false);
-  const selected = getModel(currentModelId);
+  const { models } = useStore();
+  const selected = getModel(currentModelId, models);
   const SelectedIcon = PROVIDER_ICONS[selected.provider];
 
   return (
@@ -26,23 +28,26 @@ export function ModelSelector({ currentModelId, currentReasoningEffort = 'medium
           <span className="truncate">{selected.name}</span>
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[300px] p-0" align="start">
+      <PopoverContent className="w-[320px] p-0" align="start">
         <Command>
           <CommandInput placeholder="Search model..." />
           <CommandList>
             <CommandEmpty>No model found.</CommandEmpty>
             <CommandGroup heading="Available Models">
-              {MODELS.map((model) => {
+              {models.map((model) => {
                 const Icon = PROVIDER_ICONS[model.provider];
                 return (
                   <CommandItem
                     key={model.id}
-                    value={model.name}
-                    onSelect={() => { onModelChange(model.id); if (!model.reasoning) setOpen(false); }}
+                    value={`${model.name} ${model.id}`}
+                    onSelect={() => {
+                      onModelChange(model.id);
+                      if (!model.reasoning) setOpen(false);
+                    }}
                     className="flex items-center gap-2 py-3 cursor-pointer"
                   >
                     <Icon className="h-5 w-5 flex-shrink-0" />
-                    <span className="font-medium flex-1">{model.name}</span>
+                    <span className="font-medium flex-1 truncate">{model.name}</span>
                     {currentModelId === model.id && <Check className="h-3 w-3 text-primary" />}
                   </CommandItem>
                 );
@@ -54,7 +59,7 @@ export function ModelSelector({ currentModelId, currentReasoningEffort = 'medium
           <div className="border-t p-3 bg-muted/30">
             <div className="flex items-center justify-between gap-2">
               <span className="text-xs font-medium text-muted-foreground">Reasoning Effort</span>
-              <Select value={currentReasoningEffort} onValueChange={(v: any) => onReasoningEffortChange(v)}>
+              <Select value={currentReasoningEffort} onValueChange={(v) => onReasoningEffortChange(v as 'low' | 'medium' | 'high')}>
                 <SelectTrigger className="h-7 w-[100px] text-xs"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="low">Low</SelectItem>
