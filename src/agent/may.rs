@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use async_channel::{Receiver, Sender, bounded, unbounded};
+
 use askama::Template;
 
 use aither_agent::sandbox::builtin::AskCommand;
@@ -60,23 +62,20 @@ pub enum MayAgentError {
 /// and unsafe mode requires explicit user approval.
 #[derive(Debug, Clone)]
 pub struct MayPermissionHandler {
-    /// Whether network mode has been approved (for future TUI integration).
-    #[allow(dead_code)]
-    network_approved: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mode: PermissionMode,
 }
 
 impl MayPermissionHandler {
     pub fn new() -> Self {
         Self {
-            network_approved: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mode: PermissionMode::Tui,
         }
     }
 
-    /// Approve network mode (for future TUI integration).
-    #[allow(dead_code)]
-    pub fn approve_network(&self) {
-        self.network_approved
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    pub fn with_webui(approver: PermissionApprover) -> Self {
+        Self {
+            mode: PermissionMode::WebUi(approver),
+        }
     }
 }
 
@@ -87,25 +86,131 @@ impl Default for MayPermissionHandler {
 }
 
 impl PermissionHandler for MayPermissionHandler {
-    async fn check(&self, mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
-        match mode {
-            BashMode::Sandboxed => Ok(true),
-            BashMode::Network => {
-                // For now, auto-approve network mode
-                // In a real TUI, this would prompt the user
-                Ok(true)
+    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
+        match (&self.mode, mode) {
+            (_, BashMode::Sandboxed) => Ok(true),
+            (PermissionMode::Tui, BashMode::Network) => Ok(true),
+            (PermissionMode::Tui, BashMode::Unsafe) => Ok(false),
+            (PermissionMode::WebUi(approver), BashMode::Network) => {
+                if approver.network_approved() {
+                    Ok(true)
+                } else {
+                    approver.request_and_wait(mode, script.to_string()).await
+                }
             }
-            BashMode::Unsafe => {
-                // Unsafe mode should be handled by the TUI
-                // For library usage, deny by default
-                Ok(false)
+            (PermissionMode::WebUi(approver), BashMode::Unsafe) => {
+                approver.request_and_wait(mode, script.to_string()).await
             }
         }
     }
 
     async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
-        // Allow all domains when in network mode
         true
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PermissionMode {
+    Tui,
+    WebUi(PermissionApprover),
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionRequestMode {
+    Sandboxed,
+    Network,
+    Unsafe,
+}
+
+impl From<BashMode> for PermissionRequestMode {
+    fn from(value: BashMode) -> Self {
+        match value {
+            BashMode::Sandboxed => Self::Sandboxed,
+            BashMode::Network => Self::Network,
+            BashMode::Unsafe => Self::Unsafe,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PermissionRequest {
+    pub id: String,
+    pub mode: PermissionRequestMode,
+    pub script: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionApprover {
+    request_tx: Sender<PermissionRequest>,
+    request_rx: Receiver<PermissionRequest>,
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (PermissionRequestMode, Sender<bool>)>>>,
+    network_approved: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PermissionApprover {
+    pub fn new() -> Self {
+        let (request_tx, request_rx) = unbounded();
+        Self {
+            request_tx,
+            request_rx,
+            pending: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            network_approved: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn network_approved(&self) -> bool {
+        self.network_approved
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub async fn request_and_wait(&self, mode: BashMode, script: String) -> Result<bool, PermissionError> {
+        let request = PermissionRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            mode: mode.into(),
+            script,
+        };
+
+        let (tx, rx) = bounded(1);
+        self.pending
+            .lock()
+            .map_err(|_| PermissionError::Interrupted)?
+            .insert(request.id.clone(), (request.mode, tx));
+
+        self.request_tx
+            .send(request)
+            .await
+            .map_err(|_| PermissionError::Interrupted)?;
+
+        rx.recv().await.map_err(|_| PermissionError::Interrupted)
+    }
+
+    pub async fn next_request(&self) -> Option<PermissionRequest> {
+        self.request_rx.recv().await.ok()
+    }
+
+    pub fn respond(&self, request_id: &str, approved: bool) -> bool {
+        let Some((mode, tx)) = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(request_id))
+        else {
+            return false;
+        };
+
+        if approved && matches!(mode, PermissionRequestMode::Network) {
+            self.network_approved
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        tx.try_send(approved).is_ok()
+    }
+}
+
+impl Default for PermissionApprover {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -129,6 +234,8 @@ pub struct MayAgentConfig {
     pub ask_user_broker: AskUserBroker,
     /// Preconfigured SSH servers available for `open_shell` ssh backend.
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
+    /// Optional web UI permission approver.
+    pub permission_approver: Option<PermissionApprover>,
 }
 
 /// The May agent.
@@ -142,7 +249,12 @@ impl MayAgent {
     /// Create a new MayAgent.
     pub async fn new(config: MayAgentConfig) -> Result<Self, MayAgentError> {
         // Create permission handler
-        let permission_handler = MayPermissionHandler::new();
+        let permission_handler = config
+            .permission_approver
+            .as_ref()
+            .map_or_else(MayPermissionHandler::new, |approver| {
+                MayPermissionHandler::with_webui(approver.clone())
+            });
 
         let executor = DefaultExecutor;
 
@@ -296,6 +408,31 @@ impl MayAgent {
         ask_user_broker: AskUserBroker,
         model: &str,
     ) -> Result<Self, MayAgentError> {
+        Self::from_config_with_model_and_permissions(
+            may_config,
+            sandbox_dir,
+            may_dir,
+            cwd,
+            session_id,
+            workspace_request_broker,
+            ask_user_broker,
+            model,
+            None,
+        )
+        .await
+    }
+
+    pub async fn from_config_with_model_and_permissions(
+        may_config: &MayConfig,
+        sandbox_dir: PathBuf,
+        may_dir: PathBuf,
+        cwd: PathBuf,
+        session_id: SessionId,
+        workspace_request_broker: WorkspaceRequestBroker,
+        ask_user_broker: AskUserBroker,
+        model: &str,
+        permission_approver: Option<PermissionApprover>,
+    ) -> Result<Self, MayAgentError> {
         // Check if we have a stored provider mapping for this model
         if let Some(provider_id) = may_config.models.provider_for_model(model) {
             if let Some(instance) = may_config.provider.get(provider_id) {
@@ -316,6 +453,7 @@ impl MayAgent {
                     workspace_request_broker: workspace_request_broker.clone(),
                     ask_user_broker: ask_user_broker.clone(),
                     ssh_servers: may_config.ssh_servers.clone(),
+                    permission_approver: permission_approver.clone(),
                 };
 
                 return Self::new(config).await;
@@ -341,6 +479,7 @@ impl MayAgent {
             workspace_request_broker,
             ask_user_broker,
             ssh_servers: may_config.ssh_servers.clone(),
+            permission_approver,
         };
 
         Self::new(config).await

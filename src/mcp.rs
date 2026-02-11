@@ -185,7 +185,7 @@ impl McpConnectionState {
 }
 
 /// Server information for display in UI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct McpServerInfo {
     /// Server name (configuration key).
     pub name: String,
