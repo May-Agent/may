@@ -1,0 +1,344 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use skyzen::responder::Sse;
+use skyzen::routing::Params;
+use skyzen::utils::{Json, State};
+use skyzen::Result as SkyResult;
+
+use crate::config::{MayConfig, ProviderInstance, SshServerConfig};
+use crate::copilot::{clear_copilot_credentials, has_copilot_token, save_copilot_token};
+use crate::mcp::MayMcpServerConfig;
+use crate::skill::SkillManager;
+
+use super::helpers::{bad_request_error, internal_error, map_skill, send_event};
+use super::state::UiServerState;
+use super::types::{
+    ApiHealth, CopilotPollRequest, CopilotPollResponse, CopilotStartResponse,
+    CopilotStatusResponse, McpAddRequest, MemoryPayload, SkillInfoDto, SkillInstallRequest,
+    SshServerRequest, UiAppearanceConfig, UiConfigResponse, UiFullConfig, UiModelsConfig,
+    UiPreferencesConfig, UiProviderConfig,
+};
+
+pub(super) async fn get_ui_config(
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<UiConfigResponse>> {
+    let config = state.config.read().await;
+    Ok(Json(UiConfigResponse {
+        ssh_servers: config.ssh_servers.clone(),
+        max_iterations: config.max_iterations,
+        ui_font: config.appearance.font.clone(),
+        ui_theme: config.appearance.theme.clone(),
+    }))
+}
+
+pub(super) async fn config_stream(
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Sse> {
+    let (sender, sse) = Sse::channel();
+
+    tokio::spawn(async move {
+        let mut last_sig = String::new();
+        loop {
+            // Reload from disk to detect external changes (TUI, manual edits).
+            if let Ok(fresh) = MayConfig::load() {
+                *state.config.write().await = fresh;
+            }
+            let config = state.config.read().await;
+            let sig = format!(
+                "{}|{}|{}|{}|{}",
+                config.appearance.font,
+                config.appearance.theme,
+                config.max_iterations,
+                config.ssh_servers.len(),
+                config.last_model.clone().unwrap_or_default()
+            );
+
+            if sig != last_sig {
+                send_event(
+                    &sender,
+                    "config",
+                    &serde_json::json!({
+                        "ui_font": config.appearance.font,
+                        "ui_theme": config.appearance.theme,
+                    }),
+                )
+                .await;
+                last_sig = sig;
+            }
+
+            send_event(&sender, "heartbeat", &serde_json::json!({ "ok": true })).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+
+    Ok(sse)
+}
+
+pub(super) async fn get_full_config(
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<UiFullConfig>> {
+    let config = state.config.read().await;
+
+    let mut providers = config
+        .provider
+        .iter()
+        .map(|(id, instance)| UiProviderConfig {
+            id: id.clone(),
+            provider_type: instance.resolve_type(id),
+            api_key: instance.api_key.clone(),
+            base_url: instance.base_url.clone(),
+            display_name: instance.display_name.clone(),
+            enabled: instance.enabled,
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|a, b| a.id.cmp(&b.id));
+
+    Ok(Json(UiFullConfig {
+        providers,
+        models: UiModelsConfig {
+            advanced: config.models.advanced.clone(),
+            balanced: config.models.balanced.clone(),
+            fast: config.models.fast.clone(),
+            image_generation: config.models.image_generation.clone(),
+            model_providers: config.models.model_providers.clone(),
+        },
+        preferences: UiPreferencesConfig {
+            load_balance_strategy: config.preferences.load_balance_strategy,
+            warn_on_model_change: config.preferences.warn_on_model_change,
+            show_token_usage: config.preferences.show_token_usage,
+            strict_model_matching: config.preferences.strict_model_matching,
+        },
+        appearance: UiAppearanceConfig {
+            font: config.appearance.font.clone(),
+            theme: config.appearance.theme.clone(),
+        },
+        last_model: config.last_model.clone(),
+        max_iterations: config.max_iterations,
+    }))
+}
+
+pub(super) async fn save_full_config(
+    Json(req): Json<UiFullConfig>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let mut config = state.config.write().await;
+
+    let mut provider_map = std::collections::HashMap::new();
+    for p in req.providers {
+        let mut instance = ProviderInstance::new(p.provider_type);
+        instance.api_key = p.api_key.filter(|v| !v.trim().is_empty());
+        instance.base_url = p.base_url.filter(|v| !v.trim().is_empty());
+        instance.display_name = p.display_name.filter(|v| !v.trim().is_empty());
+        instance.enabled = p.enabled;
+        provider_map.insert(p.id, instance);
+    }
+
+    config.provider = provider_map;
+    config.models.advanced = req.models.advanced;
+    config.models.balanced = req.models.balanced;
+    config.models.fast = req.models.fast;
+    config.models.image_generation = req.models.image_generation;
+    config.models.model_providers = req.models.model_providers;
+    config.preferences.load_balance_strategy = req.preferences.load_balance_strategy;
+    config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
+    config.preferences.show_token_usage = req.preferences.show_token_usage;
+    config.preferences.strict_model_matching = req.preferences.strict_model_matching;
+    config.appearance.font = req.appearance.font;
+    config.appearance.theme = req.appearance.theme;
+    config.last_model = req.last_model;
+    config.max_iterations = req.max_iterations;
+
+    config.save().map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+pub(super) async fn get_memory(
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<MemoryPayload>> {
+    let memory_path = state.may_dir.join("MEMORY.md");
+    let content = async_fs::read_to_string(memory_path)
+        .await
+        .unwrap_or_default();
+    Ok(Json(MemoryPayload { content }))
+}
+
+pub(super) async fn save_memory(
+    Json(payload): Json<MemoryPayload>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let memory_path = state.may_dir.join("MEMORY.md");
+    async_fs::write(memory_path, payload.content)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+// ── SSH ────────────────────────────────────────
+
+pub(super) async fn add_ssh_server(
+    Json(req): Json<SshServerRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let mut config = state.config.write().await;
+    config.upsert_ssh_server(SshServerConfig {
+        name: req.name,
+        target: req.target,
+    });
+    config.save().map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+pub(super) async fn remove_ssh_server(
+    params: Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let name = params.get("name").map_err(bad_request_error)?;
+    let mut config = state.config.write().await;
+    let _ = config.remove_ssh_server(name);
+    config.save().map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+// ── MCP ────────────────────────────────────────
+
+pub(super) async fn list_mcp_servers(
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<Vec<crate::mcp::McpServerInfo>>> {
+    let manager = state.mcp_manager.lock().await;
+    Ok(Json(manager.server_info()))
+}
+
+pub(super) async fn add_mcp_server(
+    Json(req): Json<McpAddRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let mut manager = state.mcp_manager.lock().await;
+    let config = MayMcpServerConfig {
+        command: req.command,
+        args: req.args,
+        url: req.url,
+        env: std::collections::HashMap::new(),
+    };
+    manager
+        .add_server(req.name, config)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+pub(super) async fn remove_mcp_server(
+    params: Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let name = params.get("name").map_err(bad_request_error)?;
+    let mut manager = state.mcp_manager.lock().await;
+    manager.remove_server(name).await.map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+pub(super) async fn reconnect_mcp_server(
+    params: Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let name = params.get("name").map_err(bad_request_error)?;
+    let mut manager = state.mcp_manager.lock().await;
+    manager.reconnect(name).await.map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+// ── Skills ────────────────────────────────────────
+
+pub(super) async fn list_skills(
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<Vec<SkillInfoDto>>> {
+    let skills = state
+        .skill_manager
+        .list_skills()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(
+        skills.into_iter().map(|s| map_skill(s)).collect::<Vec<_>>(),
+    ))
+}
+
+pub(super) async fn install_skill(
+    Json(req): Json<SkillInstallRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<Vec<SkillInfoDto>>> {
+    let (owner, repo) = SkillManager::parse_github_repo(&req.repo).map_err(bad_request_error)?;
+    let installed = state
+        .skill_manager
+        .install_from_github(owner, repo)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(installed.into_iter().map(map_skill).collect()))
+}
+
+pub(super) async fn delete_skill(
+    params: Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let dir = params.get("dir").map_err(bad_request_error)?;
+    state
+        .skill_manager
+        .delete_skill(dir)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+// ── Copilot ────────────────────────────────────────
+
+pub(super) async fn copilot_status() -> SkyResult<Json<CopilotStatusResponse>> {
+    Ok(Json(CopilotStatusResponse {
+        authenticated: has_copilot_token(),
+    }))
+}
+
+pub(super) async fn copilot_start() -> SkyResult<Json<CopilotStartResponse>> {
+    let device = aither_copilot::auth::request_device_code()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(CopilotStartResponse {
+        device_code: device.device_code,
+        user_code: device.user_code,
+        verification_uri: device.verification_uri,
+        interval: device.interval,
+    }))
+}
+
+pub(super) async fn copilot_poll(
+    Json(req): Json<CopilotPollRequest>,
+) -> SkyResult<Json<CopilotPollResponse>> {
+    match aither_copilot::auth::try_get_token(&req.device_code).await {
+        Ok(token) => {
+            save_copilot_token(&token).await.map_err(internal_error)?;
+            Ok(Json(CopilotPollResponse {
+                status: "success".to_string(),
+                message: None,
+            }))
+        }
+        Err(aither_copilot::CopilotError::AuthorizationPending) => Ok(Json(CopilotPollResponse {
+            status: "pending".to_string(),
+            message: None,
+        })),
+        Err(aither_copilot::CopilotError::DeviceCodeExpired) => Ok(Json(CopilotPollResponse {
+            status: "expired".to_string(),
+            message: Some("Device code expired. Please restart authentication.".to_string()),
+        })),
+        Err(aither_copilot::CopilotError::AccessDenied) => Ok(Json(CopilotPollResponse {
+            status: "denied".to_string(),
+            message: Some("Authorization denied by user.".to_string()),
+        })),
+        Err(err) => Ok(Json(CopilotPollResponse {
+            status: "error".to_string(),
+            message: Some(err.to_string()),
+        })),
+    }
+}
+
+pub(super) async fn copilot_logout() -> SkyResult<Json<ApiHealth>> {
+    clear_copilot_credentials().await.map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
+}

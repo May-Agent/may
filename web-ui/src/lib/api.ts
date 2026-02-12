@@ -1,11 +1,20 @@
-import type { Session, Message, Attachment } from '@/types';
+import type { Session, Message, Attachment, Artifact } from '@/types';
 
 interface ApiAttachment {
   id: string;
   name: string;
   type: string;
   url: string;
+  upload_data_url?: string;
   text_content?: string;
+}
+
+interface ApiBashExecution {
+  id: string;
+  input: string;
+  output?: string;
+  status: 'running' | 'done' | 'failed';
+  mode: 'sandboxed' | 'network' | 'unsafe' | string;
 }
 
 interface ApiMessage {
@@ -17,6 +26,22 @@ interface ApiMessage {
   thinking?: string;
   is_streaming?: boolean;
   is_thinking?: boolean;
+  tool_event?: {
+    id: string;
+    stage: 'start' | 'end';
+    name?: string;
+    arguments?: unknown;
+    result?: unknown;
+  };
+  bash_executions?: ApiBashExecution[];
+  stats?: {
+    provider_id?: string;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    context_window?: number;
+    elapsed_ms?: number;
+  };
 }
 
 interface ApiSession {
@@ -26,7 +51,7 @@ interface ApiSession {
   preview: string;
   messages: ApiMessage[];
   model: string;
-  reasoning_effort?: 'low' | 'medium' | 'high';
+  reasoning_effort?: string;
 }
 
 interface ChatResponse {
@@ -34,10 +59,28 @@ interface ChatResponse {
   assistant: ApiMessage;
 }
 
-interface PermissionRequest {
+interface ApiArtifact {
+  path: string;
+  name: string;
+  size: number;
+  is_html: boolean;
+  fingerprint?: string;
+}
+
+export interface PermissionRequest {
   id: string;
   mode: 'sandboxed' | 'network' | 'unsafe';
   script: string;
+  session_id?: string;
+}
+
+export interface PermissionPollResult {
+  request: PermissionRequest | null;
+  state: 'waiting_permission' | null;
+}
+
+export interface SessionRuntimeStatus {
+  state: 'idle' | 'streaming' | 'waiting_permission';
 }
 
 export interface AskUserQuestion {
@@ -45,6 +88,11 @@ export interface AskUserQuestion {
   question: string;
   option: string[];
   multi_select: boolean;
+}
+
+export interface ArtifactStreamEvent {
+  count: number;
+  signature: string;
 }
 
 export type AskUserAnswerValue = string[] | string | null;
@@ -62,6 +110,8 @@ export interface AskUserRequest {
 export interface UiConfig {
   ssh_servers: Array<{ name: string; target: string }>;
   max_iterations: number;
+  ui_font: string;
+  ui_theme: 'light' | 'dark' | 'system';
 }
 
 export type ProviderType =
@@ -87,6 +137,32 @@ export interface UiProviderConfig {
   enabled: boolean;
 }
 
+export interface ModelDetailsItem {
+  id: string;
+  nickname: string;
+  context_window?: number;
+  abilities: string[];
+}
+
+export interface ProviderModelsItem {
+  provider_id: string;
+  models: string[];
+  details?: ModelDetailsItem[];
+}
+
+export interface RequestLogEntry {
+  session_id: string;
+  timestamp: string;
+  model: string;
+  provider_id: string;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  elapsed_ms: number;
+  ok: boolean;
+  error?: string | null;
+}
+
 export interface UiModelsConfig {
   advanced: string[];
   balanced: string[];
@@ -98,12 +174,18 @@ export interface UiModelsConfig {
 export interface UiPreferencesConfig {
   load_balance_strategy: 'round_robin' | 'failover_only' | 'random';
   warn_on_model_change: boolean;
+  show_token_usage: boolean;
+  strict_model_matching: boolean;
 }
 
 export interface UiFullConfig {
   providers: UiProviderConfig[];
   models: UiModelsConfig;
   preferences: UiPreferencesConfig;
+  appearance: {
+    font: string;
+    theme: 'light' | 'dark' | 'system';
+  };
   last_model: string | null;
   max_iterations: number;
 }
@@ -146,7 +228,29 @@ function mapMessage(m: ApiMessage): Message {
     thinking: m.thinking,
     isStreaming: m.is_streaming,
     isThinking: m.is_thinking,
+    bashExecutions: (m.bash_executions || []).map((x) => ({
+      id: x.id,
+      input: x.input,
+      output: x.output,
+      status: x.status,
+      mode: x.mode,
+    })),
+    toolEvent: m.tool_event,
+    stats: m.stats
+      ? {
+          providerId: m.stats.provider_id,
+          promptTokens: m.stats.prompt_tokens,
+          completionTokens: m.stats.completion_tokens,
+          totalTokens: m.stats.total_tokens,
+          contextWindow: m.stats.context_window,
+          elapsedMs: m.stats.elapsed_ms,
+        }
+      : undefined,
   };
+}
+
+function mapSessionMessages(messages: ApiMessage[]): Message[] {
+  return messages.map(mapMessage);
 }
 
 function mapSession(s: ApiSession): Session {
@@ -155,7 +259,7 @@ function mapSession(s: ApiSession): Session {
     title: s.title,
     lastModified: s.last_modified,
     preview: s.preview,
-    messages: s.messages.map(mapMessage),
+    messages: mapSessionMessages(s.messages),
     model: s.model,
     reasoningEffort: s.reasoning_effort,
   };
@@ -211,6 +315,7 @@ export async function sendChat(input: {
       name: a.name,
       type: a.type,
       url: a.url,
+      upload_data_url: a.uploadDataUrl,
       text_content: a.textContent,
     })),
   };
@@ -246,6 +351,7 @@ export async function streamChat(input: {
       name: a.name,
       type: a.type,
       url: a.url,
+      upload_data_url: a.uploadDataUrl,
       text_content: a.textContent,
     })),
   };
@@ -321,14 +427,66 @@ export async function streamChat(input: {
   }
 }
 
-export async function fetchModels(): Promise<string[]> {
-  const data = await request<{ models: string[] }>('/api/models');
-  return data.models;
+export async function fetchModels(): Promise<{ models: string[]; details: ModelDetailsItem[] }> {
+  const data = await request<{ models: string[]; details?: ModelDetailsItem[] }>('/api/models');
+  return {
+    models: data.models,
+    details: data.details ?? [],
+  };
 }
 
-export async function pollPermissionRequest(): Promise<PermissionRequest | null> {
-  const data = await request<{ request: PermissionRequest | null }>('/api/permissions/next');
-  return data.request;
+export async function fetchModelsByProvider(): Promise<ProviderModelsItem[]> {
+  const data = await request<{ providers: ProviderModelsItem[] }>('/api/models/by-provider');
+  return data.providers;
+}
+
+export async function fetchRequestLogs(): Promise<RequestLogEntry[]> {
+  const data = await request<{ logs: RequestLogEntry[] }>('/api/logs/requests');
+  return data.logs;
+}
+
+export async function pollPermissionRequest(sessionId: string): Promise<PermissionPollResult> {
+  const data = await request<PermissionPollResult>(`/api/permissions/next?session_id=${encodeURIComponent(sessionId)}`);
+  return {
+    request: data.request ?? null,
+    state: data.state ?? null,
+  };
+}
+
+export async function fetchSessionRuntime(sessionId: string): Promise<SessionRuntimeStatus> {
+  return request<SessionRuntimeStatus>(`/api/sessions/${encodeURIComponent(sessionId)}/runtime`);
+}
+
+export async function fetchSessionArtifacts(sessionId: string): Promise<Artifact[]> {
+  const data = await request<{ artifacts: ApiArtifact[] }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/artifacts`,
+  );
+  return data.artifacts.map((a) => ({
+    path: a.path,
+    name: a.name,
+    size: a.size,
+    isHtml: a.is_html,
+    fingerprint: a.fingerprint,
+  }));
+}
+
+export async function fetchArtifactPreview(
+  sessionId: string,
+  path: string,
+): Promise<Response> {
+  const res = await fetch(
+    `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/preview?path=${encodeURIComponent(path)}`,
+    {
+      cache: 'default',
+    },
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Request failed: ${res.status}`);
+  }
+
+  return res;
 }
 
 export async function respondPermissionRequest(id: string, approved: boolean): Promise<void> {
@@ -429,6 +587,46 @@ export async function deleteSkill(dirName: string): Promise<void> {
   });
 }
 
+export interface CopilotStartResponse {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  interval: number;
+}
+
+export interface CopilotPollResponse {
+  status: 'pending' | 'success' | 'expired' | 'denied' | 'error';
+  message?: string | null;
+}
+
+export async function fetchCopilotStatus(): Promise<{ authenticated: boolean }> {
+  return request<{ authenticated: boolean }>('/api/copilot/status');
+}
+
+export async function startCopilotAuth(): Promise<CopilotStartResponse> {
+  return request<CopilotStartResponse>('/api/copilot/start', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
+export async function pollCopilotAuth(deviceCode: string): Promise<CopilotPollResponse> {
+  return request<CopilotPollResponse>('/api/copilot/poll', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ device_code: deviceCode }),
+  });
+}
+
+export async function logoutCopilot(): Promise<void> {
+  await request<{ ok: boolean }>('/api/copilot/logout', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({}),
+  });
+}
+
 export async function fetchMemory(): Promise<string> {
   const data = await request<{ content: string }>('/api/memory');
   return data.content;
@@ -446,4 +644,24 @@ export async function deleteAllSessions(): Promise<void> {
   await request<{ ok: boolean }>('/api/sessions/delete-all', {
     method: 'POST',
   });
+}
+
+export function subscribeSessionArtifacts(
+  sessionId: string,
+  onArtifacts: (event: ArtifactStreamEvent) => void,
+): () => void {
+  const source = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts/stream`);
+
+  source.addEventListener('artifacts', (ev) => {
+    try {
+      const data = JSON.parse((ev as MessageEvent).data) as ArtifactStreamEvent;
+      onArtifacts(data);
+    } catch {
+      // ignore malformed events
+    }
+  });
+
+  return () => {
+    source.close();
+  };
 }

@@ -39,21 +39,37 @@ pub struct WorkspaceConfig {
     pub workdirs: Vec<WorkspaceDir>,
 }
 
+/// Error type for workspace configuration operations.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceConfigError {
+    #[error("Failed to read workspace config: {0}")]
+    Read(#[from] std::io::Error),
+    #[error("Failed to parse workspace config: {0}")]
+    Parse(#[from] toml::de::Error),
+    #[error("Failed to serialize workspace config: {0}")]
+    Serialize(#[from] toml::ser::Error),
+}
+
 impl WorkspaceConfig {
     /// Load workspace config from file.
-    pub fn load(may_dir: &Path) -> Self {
+    ///
+    /// Returns `Ok(default)` if the file does not exist,
+    /// but propagates parse errors so corrupt configs are not silently dropped.
+    pub fn load(may_dir: &Path) -> Result<Self, WorkspaceConfigError> {
         let config_path = may_dir.join("workspace.toml");
         match fs::read_to_string(&config_path) {
-            Ok(content) => toml::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Ok(content) => Ok(toml::from_str(&content)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(WorkspaceConfigError::Read(e)),
         }
     }
 
     /// Save workspace config to file.
-    pub fn save(&self, may_dir: &Path) -> std::io::Result<()> {
+    pub fn save(&self, may_dir: &Path) -> Result<(), WorkspaceConfigError> {
         let config_path = may_dir.join("workspace.toml");
-        let content = toml::to_string_pretty(self).unwrap_or_default();
-        fs::write(config_path, content)
+        let content = toml::to_string_pretty(self)?;
+        fs::write(config_path, content)?;
+        Ok(())
     }
 
     /// Add a working directory with read/write access.
@@ -102,20 +118,28 @@ pub struct Workspace {
 
 impl Workspace {
     /// Create a new workspace.
-    pub fn new(sandbox: PathBuf, cwd: PathBuf, may_dir: PathBuf) -> Self {
-        let config = WorkspaceConfig::load(&may_dir);
-        Self {
+    pub fn new(
+        sandbox: PathBuf,
+        cwd: PathBuf,
+        may_dir: PathBuf,
+    ) -> Result<Self, WorkspaceConfigError> {
+        let config = WorkspaceConfig::load(&may_dir)?;
+        Ok(Self {
             sandbox,
             cwd,
             config,
             may_dir,
-        }
+        })
     }
 
     /// Add a working directory (requires user approval).
-    pub fn add_workdir(&mut self, path: PathBuf, description: Option<String>) {
+    pub fn add_workdir(
+        &mut self,
+        path: PathBuf,
+        description: Option<String>,
+    ) -> Result<(), WorkspaceConfigError> {
         self.config.add_workdir(path, description);
-        let _ = self.config.save(&self.may_dir);
+        self.config.save(&self.may_dir)
     }
 
     /// Get all readable directories.

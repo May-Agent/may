@@ -4,6 +4,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MAY_SKIP_WEB_UI_BUILD");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UI");
 
     watch_path("web-ui/src");
     watch_path("web-ui/public");
@@ -12,6 +13,11 @@ fn main() {
     watch_path("web-ui/bun.lock");
     watch_path("web-ui/tsconfig.json");
     watch_path("web-ui/vite.config.ts");
+
+    let enable_ui = std::env::var_os("CARGO_FEATURE_UI").is_some();
+    if !enable_ui {
+        return;
+    }
 
     if std::env::var("MAY_SKIP_WEB_UI_BUILD").as_deref() == Ok("1") {
         return;

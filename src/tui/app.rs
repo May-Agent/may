@@ -3,12 +3,13 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 
+use anyhow::Context;
 use async_channel::Receiver;
 use blocking::unblock;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use executor_core::spawn;
 
-use crate::config::{ModelTier, Provider};
+use crate::config::{ModelTier, ProviderType};
 use crate::models::FetchedModel;
 use crate::{ChatMessage, MayConfig, MessageRole, SessionId, SessionManager, SessionSummary};
 
@@ -132,9 +133,9 @@ pub struct App {
     /// Receiver for fetched models (oneshot)
     pub model_fetch_rx: Option<Receiver<Vec<FetchedModel>>>,
     /// Receiver for clipboard paste resolution (oneshot)
-    pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, String>>>,
+    pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, anyhow::Error>>>,
     /// Pending paste results waiting to be handled
-    pub pending_paste_results: std::collections::VecDeque<Result<ClipboardPasteResult, String>>,
+    pub pending_paste_results: std::collections::VecDeque<Result<ClipboardPasteResult, anyhow::Error>>,
     /// Pending attachment jobs (clipboard read / download)
     pub pending_attachment_jobs: usize,
     /// Cumulative token usage for current session
@@ -193,16 +194,16 @@ pub struct App {
 impl App {
     /// Create a new application.
     /// `image_support` should be detected before entering raw mode using `TerminalImageSupport::detect()`.
-    pub fn new(
+    pub async fn new(
         event_tx: EventSender,
         image_support: Option<super::ui::image::TerminalImageSupport>,
     ) -> anyhow::Result<Self> {
-        let mut config = MayConfig::load().unwrap_or_default();
-        let session_manager = SessionManager::new()?;
+        let mut config = MayConfig::load().context("Failed to load config")?;
+        let session_manager = SessionManager::new().await?;
 
         // Auto-detect API keys from environment variables
         let mut env_providers_added = Vec::new();
-        for provider_type in Provider::ALL {
+        for provider_type in ProviderType::ALL {
             if let Some((key, var_name)) = detect_api_key_from_env(*provider_type) {
                 let provider_id = provider_type.short_name();
                 // Only add if not already configured
@@ -456,8 +457,6 @@ impl App {
             self.request_image(&url);
         }
     }
-
-    /// Normalize scroll value if it's at the "follow bottom" sentinel.
 
     /// Initialize for a session (sets up image manager and status).
     ///
@@ -1103,15 +1102,15 @@ impl App {
         match cmd {
             "/session" => {
                 let tx = self.event_tx.clone();
-                let store = self.session_manager.store().clone();
+                let db = self.session_manager.db().clone();
                 spawn(async move {
-                    let result = store.list_session_summaries().await;
+                    let result = crate::session::list_summaries_from_db(&db).await;
                     let _ = tx
-                        .send(AppEvent::SessionsLoaded(result.map_err(|e| e.to_string())))
+                        .send(AppEvent::SessionsLoaded(result.map_err(anyhow::Error::from)))
                         .await;
                 })
                 .detach();
-                self.status = Some("Loading skills...".to_string());
+                self.status = Some("Loading sessions...".to_string());
                 Ok(None)
             }
             "/new" => Ok(Some(SendAction::NewSession)),
@@ -1175,7 +1174,7 @@ impl App {
                     let manager = crate::skill::SkillManager::new(&may_dir);
                     let result = manager.list_skills().await;
                     let _ = tx
-                        .send(AppEvent::SkillsLoaded(result.map_err(|e| e.to_string())))
+                        .send(AppEvent::SkillsLoaded(result.map_err(anyhow::Error::from)))
                         .await;
                 })
                 .detach();
@@ -1281,12 +1280,12 @@ impl App {
     }
 
     /// Queue a paste result to be handled by the main loop.
-    pub fn enqueue_paste_result(&mut self, result: Result<ClipboardPasteResult, String>) {
+    pub fn enqueue_paste_result(&mut self, result: Result<ClipboardPasteResult, anyhow::Error>) {
         self.pending_paste_results.push_back(result);
     }
 
     /// Dequeue the next pending paste result.
-    pub fn dequeue_paste_result(&mut self) -> Option<Result<ClipboardPasteResult, String>> {
+    pub fn dequeue_paste_result(&mut self) -> Option<Result<ClipboardPasteResult, anyhow::Error>> {
         self.pending_paste_results.pop_front()
     }
 
@@ -1298,7 +1297,7 @@ impl App {
     /// Handle a completed paste result (clipboard or bracketed paste).
     pub async fn handle_paste_result(
         &mut self,
-        result: Result<ClipboardPasteResult, String>,
+        result: Result<ClipboardPasteResult, anyhow::Error>,
     ) -> anyhow::Result<()> {
         let result = match result {
             Ok(result) => result,
@@ -1477,7 +1476,7 @@ impl App {
                 // Last row is "Add provider..."
                 if state.selected >= state.provider_ids.len() {
                     // Open provider type selector
-                    let items: Vec<String> = Provider::ALL
+                    let items: Vec<String> = ProviderType::ALL
                         .iter()
                         .map(|p| p.display_name().to_string())
                         .collect();
@@ -1584,14 +1583,14 @@ impl App {
                 KeyCode::Enter => {
                     // Add provider of selected type
                     let idx = *selected;
-                    if let Some(provider_type) = Provider::ALL.get(idx) {
+                    if let Some(provider_type) = ProviderType::ALL.get(idx) {
                         // For Copilot, start OAuth
-                        if *provider_type == Provider::Copilot {
+                        if *provider_type == ProviderType::Copilot {
                             state.edit_mode = ConfigEditMode::None;
                             return Ok(Some(SendAction::StartCopilotAuth));
                         }
                         // For Custom provider, need name + base_url + api_key
-                        if *provider_type == Provider::Custom {
+                        if *provider_type == ProviderType::Custom {
                             state.edit_mode = ConfigEditMode::CustomProvider {
                                 focused_field: 0,
                                 name: String::new(),
@@ -1747,7 +1746,7 @@ impl App {
                     }
 
                     // Create new provider instance
-                    let mut instance = crate::config::ProviderInstance::new(Provider::Custom);
+                    let mut instance = crate::config::ProviderInstance::new(ProviderType::Custom);
                     instance.base_url = Some(base_url_val);
                     instance.api_key = api_key_val;
                     self.config.upsert_provider(&name_val, instance);
@@ -1983,7 +1982,7 @@ impl App {
                             download_image(&url)
                                 .await
                                 .map(ClipboardPasteResult::image)
-                                .map_err(|e| e.to_string())
+                                .map_err(anyhow::Error::from)
                         } else {
                             Ok(ClipboardPasteResult::text(text))
                         }
@@ -1991,7 +1990,7 @@ impl App {
                         Ok(ClipboardPasteResult::empty())
                     }
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(anyhow::Error::from(e)),
             };
 
             let _ = tx.send(result).await;

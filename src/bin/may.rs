@@ -9,6 +9,7 @@ use std::io;
 use std::panic;
 
 use aither_agent::AgentEvent;
+use anyhow::Context;
 
 use async_channel::TryRecvError;
 use crossterm::{
@@ -37,9 +38,14 @@ use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
 
 const PANIC_MESSAGE: &str = include_str!("../texts/panic_message.txt");
 
+fn ensure_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
+    ensure_rustls_provider();
 
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|arg| arg == "ui") {
@@ -47,13 +53,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize logging to file
-    let file_appender = tracing_appender::rolling::daily(
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".may")
-            .join("logs"),
-        "may.log",
-    );
+    let log_dir = dirs::home_dir()
+        .context("Failed to determine home directory")?
+        .join(".may")
+        .join("logs");
+    let file_appender = tracing_appender::rolling::daily(log_dir, "may.log");
     tracing_subscriber::registry()
         .with(fmt::layer().with_writer(file_appender).with_ansi(false))
         .with(
@@ -128,7 +132,7 @@ where
     B::Error: Send + Sync + 'static,
 {
     let mut events = EventHandler::new();
-    let mut app = App::new(events.sender(), image_support)?;
+    let mut app = App::new(events.sender(), image_support).await?;
     let mut worker: Option<AgentWorker> = None;
 
     // Create workspace request channel (runtime-agnostic)
@@ -603,7 +607,7 @@ where
                             };
                             let _ = tx
                                 .send(AppEvent::SkillInstalled(
-                                    final_result.map_err(|e| e.to_string()),
+                                    final_result.map_err(anyhow::Error::from),
                                 ))
                                 .await;
                         })
@@ -623,7 +627,7 @@ where
                             };
                             let _ = tx
                                 .send(AppEvent::SkillDeleted(
-                                    final_result.map_err(|e| e.to_string()),
+                                    final_result.map_err(anyhow::Error::from),
                                 ))
                                 .await;
                         })
@@ -710,13 +714,13 @@ where
 
         match auth::try_get_token(&device_code.device_code).await {
             Ok(token) => {
-                if let Err(e) = save_copilot_token(&token) {
+                if let Err(e) = save_copilot_token(&token).await {
                     app.copilot_auth_failed(format!("Failed to save token: {}", e));
                     wait_for_auth_dismiss(app, events, terminal).await?;
                     return Ok(());
                 }
                 let instance =
-                    may_agent::config::ProviderInstance::new(may_agent::config::Provider::Copilot);
+                    may_agent::config::ProviderInstance::new(may_agent::config::ProviderType::Copilot);
                 app.config.upsert_provider("copilot", instance);
                 app.config_state.load_providers(&app.config);
                 if let Err(e) = app.config.save() {

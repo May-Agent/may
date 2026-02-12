@@ -17,17 +17,12 @@ export interface Model {
   id: string;
   name: string;
   provider: Provider;
+  contextWindow?: number;
+  abilities?: string[];
   reasoning?: boolean;
 }
 
-export const DEFAULT_MODELS: Model[] = [
-  { id: 'gpt-4', name: 'GPT-4', provider: 'openai' },
-  { id: 'o1-preview', name: 'o1-preview', provider: 'openai', reasoning: true },
-  { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', provider: 'openai' },
-  { id: 'claude-3-opus', name: 'Claude 3 Opus', provider: 'anthropic' },
-  { id: 'claude-3-sonnet', name: 'Claude 3 Sonnet', provider: 'anthropic' },
-  { id: 'gemini-pro', name: 'Gemini Pro', provider: 'google' },
-];
+export const DEFAULT_MODELS: Model[] = [];
 
 export const PROVIDER_ICONS: Record<Provider, ComponentType<{ className?: string }>> = {
   openai: OpenAI,
@@ -42,16 +37,26 @@ export function inferProvider(modelId: string): Provider {
   return 'openai';
 }
 
-export function buildModelCatalog(modelIds: string[]): Model[] {
-  if (!modelIds.length) return DEFAULT_MODELS;
-  return modelIds.map((id) => ({
-    id,
-    name: id,
-    provider: inferProvider(id),
-    reasoning: /o1|reason/i.test(id),
-  }));
+export function buildModelCatalog(
+  modelIds: string[],
+  details?: Array<{ id: string; nickname: string; context_window?: number; abilities?: string[] }>,
+): Model[] {
+  if (!modelIds.length) return [];
+  const detailsMap = new Map((details ?? []).map((d) => [d.id, d]));
+  return modelIds.map((id) => {
+    const meta = detailsMap.get(id);
+    const abilities = meta?.abilities ?? [];
+    return {
+      id,
+      name: meta?.nickname || id,
+      provider: inferProvider(id),
+      contextWindow: meta?.context_window,
+      abilities,
+      reasoning: abilities.includes('reasoning') || /o1|reason/i.test(id),
+    };
+  });
 }
 
-export function getModel(modelId: string, catalog: Model[]): Model {
-  return catalog.find((m) => m.id === modelId) || catalog[0] || DEFAULT_MODELS[0];
+export function getModel(modelId: string, catalog: Model[]): Model | undefined {
+  return catalog.find((m) => m.id === modelId);
 }

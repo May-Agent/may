@@ -8,7 +8,9 @@
 
 use crate::config::MayConfig;
 use aither_copilot::auth::{CopilotToken, SessionToken};
-use std::path::PathBuf;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
 
 /// Token file name for OAuth token (long-lived).
 const TOKEN_FILE: &str = "copilot_token.json";
@@ -31,70 +33,79 @@ pub enum CopilotTokenError {
     Exchange(#[from] aither_copilot::CopilotError),
 }
 
+// ─── Generic JSON file I/O helpers ──────────────────────────────────────────
+
+/// Load a JSON file, returning `Ok(None)` if not found.
+async fn load_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, CopilotTokenError> {
+    match async_fs::read_to_string(path).await {
+        Ok(content) => Ok(Some(serde_json::from_str(&content)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(CopilotTokenError::Read(e)),
+    }
+}
+
+/// Save a value as a JSON file, creating parent directories if needed.
+async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CopilotTokenError> {
+    if let Some(parent) = path.parent() {
+        async_fs::create_dir_all(parent)
+            .await
+            .map_err(CopilotTokenError::Write)?;
+    }
+    let content = serde_json::to_string_pretty(value)?;
+    async_fs::write(path, content)
+        .await
+        .map_err(CopilotTokenError::Write)
+}
+
+/// Delete a file if it exists.
+async fn delete_file(path: &Path) -> Result<(), CopilotTokenError> {
+    match async_fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(CopilotTokenError::Write(e)),
+    }
+}
+
+// ─── Path helpers ───────────────────────────────────────────────────────────
+
 /// Get the path to the Copilot token file.
 fn token_path() -> Result<PathBuf, CopilotTokenError> {
     Ok(MayConfig::may_dir()?.join(TOKEN_FILE))
 }
 
+/// Get the path to the session token file.
+fn session_path() -> Result<PathBuf, CopilotTokenError> {
+    Ok(MayConfig::may_dir()?.join(SESSION_FILE))
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
 /// Load the Copilot token from disk.
 ///
 /// Returns `Ok(None)` if the token file doesn't exist.
-/// Returns `Ok(Some(token))` if the token was loaded successfully.
-/// Returns `Err` if there was an error reading or parsing the file.
-pub fn load_copilot_token() -> Result<Option<CopilotToken>, CopilotTokenError> {
-    let path = token_path()?;
-
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content = std::fs::read_to_string(&path).map_err(CopilotTokenError::Read)?;
-    let token: CopilotToken = serde_json::from_str(&content)?;
-
-    Ok(Some(token))
+pub async fn load_copilot_token() -> Result<Option<CopilotToken>, CopilotTokenError> {
+    load_json(&token_path()?).await
 }
 
 /// Save the Copilot token to disk.
-pub fn save_copilot_token(token: &CopilotToken) -> Result<(), CopilotTokenError> {
-    let path = token_path()?;
-
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(CopilotTokenError::Write)?;
-    }
-
-    let content = serde_json::to_string_pretty(token)?;
-    std::fs::write(&path, content).map_err(CopilotTokenError::Write)?;
-
-    Ok(())
+pub async fn save_copilot_token(token: &CopilotToken) -> Result<(), CopilotTokenError> {
+    save_json(&token_path()?, token).await
 }
 
 /// Delete the Copilot token from disk.
-pub fn delete_copilot_token() -> Result<(), CopilotTokenError> {
-    let path = token_path()?;
-
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(CopilotTokenError::Write)?;
-    }
-
-    Ok(())
+pub async fn delete_copilot_token() -> Result<(), CopilotTokenError> {
+    delete_file(&token_path()?).await
 }
 
 /// Delete cached Copilot session token from disk.
-pub fn delete_session_token() -> Result<(), CopilotTokenError> {
-    let path = session_path()?;
-
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(CopilotTokenError::Write)?;
-    }
-
-    Ok(())
+pub async fn delete_session_token() -> Result<(), CopilotTokenError> {
+    delete_file(&session_path()?).await
 }
 
 /// Delete both OAuth and cached session tokens from disk.
-pub fn clear_copilot_credentials() -> Result<(), CopilotTokenError> {
-    delete_session_token()?;
-    delete_copilot_token()?;
+pub async fn clear_copilot_credentials() -> Result<(), CopilotTokenError> {
+    delete_session_token().await?;
+    delete_copilot_token().await?;
     Ok(())
 }
 
@@ -103,37 +114,14 @@ pub fn has_copilot_token() -> bool {
     token_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-/// Get the path to the session token file.
-fn session_path() -> Result<PathBuf, CopilotTokenError> {
-    Ok(MayConfig::may_dir()?.join(SESSION_FILE))
-}
-
 /// Load cached session token from disk.
-fn load_session_token() -> Result<Option<SessionToken>, CopilotTokenError> {
-    let path = session_path()?;
-
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content = std::fs::read_to_string(&path).map_err(CopilotTokenError::Read)?;
-    let token: SessionToken = serde_json::from_str(&content)?;
-
-    Ok(Some(token))
+async fn load_session_token() -> Result<Option<SessionToken>, CopilotTokenError> {
+    load_json(&session_path()?).await
 }
 
 /// Save session token to disk.
-fn save_session_token(token: &SessionToken) -> Result<(), CopilotTokenError> {
-    let path = session_path()?;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(CopilotTokenError::Write)?;
-    }
-
-    let content = serde_json::to_string_pretty(token)?;
-    std::fs::write(&path, content).map_err(CopilotTokenError::Write)?;
-
-    Ok(())
+async fn save_session_token(token: &SessionToken) -> Result<(), CopilotTokenError> {
+    save_json(&session_path()?, token).await
 }
 
 /// Check if a session token is still valid (not expired).
@@ -175,13 +163,13 @@ pub struct CopilotCredentials {
 /// - `Err` - error during token exchange
 pub async fn get_copilot_credentials() -> Result<Option<CopilotCredentials>, CopilotTokenError> {
     // First, check if we have an OAuth token
-    let oauth_token = match load_copilot_token()? {
+    let oauth_token = match load_copilot_token().await? {
         Some(t) => t,
         None => return Ok(None),
     };
 
     // Try to load cached session token
-    if let Ok(Some(session)) = load_session_token() {
+    if let Ok(Some(session)) = load_session_token().await {
         if is_session_valid(&session) {
             tracing::debug!("Using cached Copilot session token");
             return Ok(Some(CopilotCredentials {
@@ -198,7 +186,7 @@ pub async fn get_copilot_credentials() -> Result<Option<CopilotCredentials>, Cop
     let session = aither_copilot::auth::get_session_token(&oauth_token.access_token).await?;
 
     // Cache the session token
-    if let Err(e) = save_session_token(&session) {
+    if let Err(e) = save_session_token(&session).await {
         tracing::warn!("Failed to cache session token: {}", e);
     }
 

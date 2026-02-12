@@ -1,17 +1,24 @@
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect, useState, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import { useStore } from "@/lib/store";
 import {
+  fetchArtifactPreview,
+  fetchSessionArtifacts,
+  fetchSessionRuntime,
   pollAskUserRequest,
   pollPermissionRequest,
   respondAskUserRequest,
   respondPermissionRequest,
   streamChat,
+  subscribeSessionArtifacts,
   type AskUserAnswer,
   type AskUserRequest,
+  type PermissionRequest,
 } from "@/lib/api";
 import { MessageItem } from "./MessageItem";
 import { ModelSelector } from "./ModelSelector";
 import { AttachmentPreview } from "./AttachmentPreview";
+import { ArtifactsSidebar } from "./ArtifactsSidebar";
 
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
@@ -34,20 +41,34 @@ import {
   PanelLeft,
   Share2,
   Square,
+  Eye,
 } from "lucide-react";
-import type { Attachment } from "@/types";
+import type { Artifact, Attachment, Message } from "@/types";
 import { v4 as uuidv4 } from "uuid";
+import { useRuntimeStore } from "@/lib/runtimeStore";
 
 interface QueuedMessage {
   content: string;
   attachments: Attachment[];
 }
 
-interface PendingPermission {
-  id: string;
-  mode: "sandboxed" | "network" | "unsafe";
-  script: string;
+function collectRetryBatch(messages: Message[], assistantId: string): QueuedMessage[] {
+  const index = messages.findIndex((m) => m.id === assistantId);
+  if (index <= 0) return [];
+
+  const batch: QueuedMessage[] = [];
+  for (let i = index - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== "user") break;
+    batch.unshift({
+      content: msg.content,
+      attachments: msg.attachments ?? [],
+    });
+  }
+  return batch;
 }
+
+type QueueMap = Record<string, QueuedMessage[]>;
 
 interface AskUserState {
   request: AskUserRequest;
@@ -59,10 +80,18 @@ interface ChatInterfaceProps {
   isSidebarOpen: boolean;
 }
 
+type PreviewPaneState = {
+  kind: 'iframe' | 'image' | 'audio' | 'markdown' | 'text' | 'external';
+  url?: string;
+  markdown?: string;
+  text?: string;
+};
+
 export function ChatInterface({
   onToggleSidebar,
   isSidebarOpen,
 }: ChatInterfaceProps) {
+  const navigate = useNavigate();
   const {
     currentSessionId,
     sessions,
@@ -74,43 +103,192 @@ export function ChatInterface({
     updateSessionReasoningEffort,
     saveFullConfig,
     uiConfig,
-    models,
   } = useStore();
   const [inputValue, setInputValue] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleInput, setTitleInput] = useState("");
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([]);
-  const [newChatModelId, setNewChatModelId] = useState("gpt-4");
+  const [queuedBySession, setQueuedBySession] = useState<QueueMap>({});
+  const [newChatModelId, setNewChatModelId] = useState("");
+  const [newChatReasoningEffort, setNewChatReasoningEffort] = useState<string | undefined>(undefined);
   const [uiError, setUiError] = useState<string | null>(null);
   const [pendingPermission, setPendingPermission] =
-    useState<PendingPermission | null>(null);
+    useState<PermissionRequest | null>(null);
   const [isPermissionSubmitting, setIsPermissionSubmitting] = useState(false);
   const [pendingAskUser, setPendingAskUser] = useState<AskUserState | null>(null);
   const [isAskUserSubmitting, setIsAskUserSubmitting] = useState(false);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [isArtifactsOpen, setIsArtifactsOpen] = useState(false);
+  const [selectedPreviewPath, setSelectedPreviewPath] = useState<string | null>(null);
+  const [previewPane, setPreviewPane] = useState<PreviewPaneState | null>(null);
+  const previewBlobUrlRef = useRef<string | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const queuedBySessionRef = useRef<QueueMap>({});
 
   const currentSession = sessions.find((s) => s.id === currentSessionId);
   const messages = currentSession?.messages || [];
   const isNewChat = !currentSessionId || !currentSession;
+  const shouldShowWelcome = isNewChat || messages.length === 0;
   const hasInput = inputValue.trim() || attachments.length > 0;
+  const activeQueueKey = currentSessionId ?? '__new__';
+  const queuedMessages = queuedBySession[activeQueueKey] ?? [];
+  const canSend = hasInput && (!isNewChat || !!newChatModelId);
+  const showTokenUsage = uiConfig.fullConfig?.preferences.show_token_usage ?? true;
+  const latestAssistantWithStats = [...messages]
+    .reverse()
+    .find((m) => m.role === "assistant" && m.stats);
+  const latestStats = latestAssistantWithStats?.stats;
+  const contextWindow = latestStats?.contextWindow;
+  const totalTokens = latestStats?.totalTokens;
+  const contextUsagePercent =
+    contextWindow && typeof totalTokens === "number"
+      ? Math.max(0, Math.min(100, Math.round((totalTokens / contextWindow) * 100)))
+      : null;
+  const contextUsageTitle = latestStats
+    ? `Context usage\n${totalTokens ?? "-"}/${contextWindow ?? "-"} tokens (${contextUsagePercent ?? "-"}%)\nPrompt: ${latestStats.promptTokens ?? "-"}\nCompletion: ${latestStats.completionTokens ?? "-"}`
+    : "No context usage data yet";
 
-  useEffect(() => {
-    const persisted = uiConfig.fullConfig?.last_model;
-    if (persisted && models.some((m) => m.id === persisted) && persisted !== newChatModelId) {
-      setNewChatModelId(persisted);
+  const runtimeSession = useRuntimeStore((state) =>
+    currentSessionId ? state.sessions[currentSessionId] : undefined,
+  );
+  const isGenerating = runtimeSession?.state === 'streaming';
+  const setRuntimeStreaming = useRuntimeStore((state) => state.setStreaming);
+  const setRuntimeQueuedCount = useRuntimeStore((state) => state.setQueuedCount);
+  const setRuntimeWaitingPermission = useRuntimeStore(
+    (state) => state.setWaitingPermission,
+  );
+  const setRuntimeServerState = useRuntimeStore((state) => state.setServerState);
+  const markRuntimeFirstToken = useRuntimeStore((state) => state.markFirstToken);
+  const clearRuntimeSession = useRuntimeStore((state) => state.clearSessionRuntime);
+
+  const isPreviewUrl = useCallback((value: string): boolean => {
+    return value.startsWith('http://') || value.startsWith('https://');
+  }, []);
+
+  const refreshArtifacts = useCallback(async () => {
+    if (!currentSessionId) {
+      setArtifacts([]);
+      return;
+    }
+    try {
+      const next = await fetchSessionArtifacts(currentSessionId);
+      setArtifacts(next);
+      if (next.length === 0) {
+        setIsArtifactsOpen(false);
+        setSelectedPreviewPath(null);
+        return;
+      }
+
+      if (selectedPreviewPath && !isPreviewUrl(selectedPreviewPath)) {
+        const exists = next.some((a) => a.path === selectedPreviewPath);
+        if (!exists) {
+          setSelectedPreviewPath(next[0].path);
+        }
+      } else if (!selectedPreviewPath) {
+        setSelectedPreviewPath(next[0].path);
+      }
+    } catch {
+      // keep UI stable on transient failures
+    }
+  }, [currentSessionId, selectedPreviewPath, isPreviewUrl]);
+
+  const openPreview = useCallback(async (path: string) => {
+    const target = path.trim();
+    if (!target || !currentSessionId) return;
+
+    setSelectedPreviewPath(target);
+    setIsArtifactsOpen(true);
+
+    if (previewBlobUrlRef.current) {
+      URL.revokeObjectURL(previewBlobUrlRef.current);
+      previewBlobUrlRef.current = null;
+    }
+
+    if (isPreviewUrl(target)) {
+      setPreviewPane({ kind: 'external', url: target });
       return;
     }
 
-    if (models.length > 0 && !models.some((m) => m.id === newChatModelId)) {
-      setNewChatModelId(models[0].id);
+    try {
+      const response = await fetchArtifactPreview(currentSessionId, target);
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      const ext = target.split('.').pop()?.toLowerCase() || '';
+      const arrayBuffer = await response.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+
+      const text =
+        contentType.startsWith('text/') ||
+        contentType.includes('json') ||
+        contentType.includes('xml') ||
+        ['md', 'markdown', 'txt', 'log', 'csv'].includes(ext)
+          ? new TextDecoder().decode(bytes)
+          : '';
+
+      if (contentType.includes('markdown') || ['md', 'markdown'].includes(ext)) {
+        setPreviewPane({ kind: 'markdown', markdown: text });
+      } else if (contentType.startsWith('text/plain') || ['txt', 'log', 'csv', 'json', 'xml'].includes(ext)) {
+        setPreviewPane({ kind: 'text', text });
+      } else if (ext === 'docx' || contentType.includes('officedocument.wordprocessingml.document')) {
+        const mammoth = await import('mammoth');
+        const htmlResult = await mammoth.default.convertToHtml({ arrayBuffer });
+        const htmlBlob = new Blob([htmlResult.value], { type: 'text/html;charset=utf-8' });
+        const htmlUrl = URL.createObjectURL(htmlBlob);
+        previewBlobUrlRef.current = htmlUrl;
+        setPreviewPane({ kind: 'iframe', url: htmlUrl });
+      } else {
+        const blob = new Blob([bytes], { type: response.headers.get('content-type') || 'application/octet-stream' });
+        const objectUrl = URL.createObjectURL(blob);
+        previewBlobUrlRef.current = objectUrl;
+
+        if (contentType.startsWith('image/')) {
+          setPreviewPane({ kind: 'image', url: objectUrl });
+        } else if (contentType.startsWith('audio/')) {
+          setPreviewPane({ kind: 'audio', url: objectUrl });
+        } else {
+          setPreviewPane({ kind: 'iframe', url: objectUrl });
+        }
+      }
+    } catch {
+      setPreviewPane(null);
     }
-  }, [models, newChatModelId, uiConfig.fullConfig?.last_model]);
+  }, [currentSessionId, isPreviewUrl]);
+
+  const reloadPreview = useCallback(async () => {
+    if (!selectedPreviewPath) return;
+    await openPreview(selectedPreviewPath);
+  }, [selectedPreviewPath, openPreview]);
+
+  useEffect(() => {
+    queuedBySessionRef.current = queuedBySession;
+  }, [queuedBySession]);
+
+  useEffect(() => {
+    const persisted = uiConfig.fullConfig?.last_model;
+    if (persisted) {
+      if (newChatModelId !== persisted) {
+        setNewChatModelId(persisted);
+      }
+      return;
+    }
+
+    const advanced = uiConfig.fullConfig?.models.advanced ?? [];
+    const preferredAdvanced = advanced[0] ?? "";
+
+    if (preferredAdvanced) {
+      if (newChatModelId !== preferredAdvanced) {
+        setNewChatModelId(preferredAdvanced);
+      }
+      return;
+    }
+
+    if (newChatModelId !== "") {
+      setNewChatModelId("");
+    }
+  }, [newChatModelId, uiConfig.fullConfig?.last_model, uiConfig.fullConfig?.models.advanced]);
 
   useEffect(() => {
     if (currentSession) setTitleInput(currentSession.title);
@@ -120,6 +298,45 @@ export function ChatInterface({
   }, [isEditingTitle]);
 
   useEffect(() => {
+    if (!currentSessionId) return;
+    useRuntimeStore.getState().ensureSession(currentSessionId);
+    void (async () => {
+      try {
+        const runtime = await fetchSessionRuntime(currentSessionId);
+        if (runtime.state === 'streaming' || runtime.state === 'waiting_permission') {
+          setRuntimeServerState(currentSessionId, runtime.state);
+        }
+      } catch {
+        // polling loop will self-heal
+      }
+    })();
+  }, [currentSessionId, setRuntimeServerState]);
+
+  useEffect(() => {
+    if (!currentSessionId) {
+      setArtifacts([]);
+      setIsArtifactsOpen(false);
+      setSelectedPreviewPath(null);
+      setPreviewPane(null);
+      return;
+    }
+
+    void refreshArtifacts();
+    const unsubscribe = subscribeSessionArtifacts(currentSessionId, () => {
+      void refreshArtifacts();
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [currentSessionId, refreshArtifacts]);
+
+  useEffect(() => {
+    if (!currentSessionId) {
+      setPendingPermission(null);
+      return;
+    }
+
     let cancelled = false;
 
     const pollPermissions = async () => {
@@ -129,20 +346,31 @@ export function ChatInterface({
           continue;
         }
         try {
-          const req = await pollPermissionRequest();
+          const { request } = await pollPermissionRequest(currentSessionId);
           if (cancelled) break;
-          if (req) {
-            setPendingPermission(req);
+          if (request && request.session_id && request.session_id !== currentSessionId) {
+            throw new Error(`permission request session mismatch: expected ${currentSessionId}, got ${request.session_id}`);
           }
+          setPendingPermission(request);
+          setRuntimeWaitingPermission(currentSessionId, request);
         } catch {
           // keep polling even if one request fails
         }
       }
     };
 
+    void pollPermissions();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentSessionId, pendingAskUser, setRuntimeServerState, setRuntimeWaitingPermission]);
+
+  useEffect(() => {
+    let cancelled = false;
+
     const pollAskUser = async () => {
       while (!cancelled) {
-        if (pendingPermission) {
+        if (pendingPermission || pendingAskUser) {
           await new Promise((r) => setTimeout(r, 300));
           continue;
         }
@@ -156,20 +384,26 @@ export function ChatInterface({
             });
           }
         } catch {
-          // keep polling even if one request fails
+          // Keep polling after transient failures, but avoid tight retry loops.
+          await new Promise((r) => setTimeout(r, 500));
         }
       }
     };
 
-    void pollPermissions();
     void pollAskUser();
     return () => {
       cancelled = true;
     };
   }, [pendingPermission, pendingAskUser]);
-  // Auto-scroll: follow output unless user scrolled up
-  // Auto-scroll via ResizeObserver: only scroll when content grows and user is near bottom
+  // Auto-scroll: follow output unless user intentionally scrolled up.
   const contentRef = useRef<HTMLDivElement>(null);
+
+  const scrollToBottom = () => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    container.scrollTop = container.scrollHeight;
+  };
+
   useEffect(() => {
     const container = scrollContainerRef.current;
     const content = contentRef.current;
@@ -177,11 +411,24 @@ export function ChatInterface({
 
     const observer = new ResizeObserver(() => {
       if (userScrolledUpRef.current) return;
-      container.scrollTop = container.scrollHeight;
+      scrollToBottom();
     });
     observer.observe(content);
     return () => observer.disconnect();
   }, [currentSessionId]);
+
+  const lastMessage = messages[messages.length - 1];
+  useEffect(() => {
+    if (userScrolledUpRef.current) return;
+    requestAnimationFrame(scrollToBottom);
+  }, [
+    currentSessionId,
+    messages.length,
+    lastMessage?.content,
+    lastMessage?.thinking,
+    lastMessage?.isStreaming,
+    lastMessage?.isThinking,
+  ]);
 
   const handleScroll = () => {
     const el = scrollContainerRef.current;
@@ -194,66 +441,192 @@ export function ChatInterface({
     }
   };
 
-  const handleSend = async () => {
-    if (!inputValue.trim() && attachments.length === 0) return;
+
+  const handleSend = async (options?: {
+    sessionIdHint?: string;
+    includeComposerInput?: boolean;
+    retryAssistantId?: string;
+    overrideBatch?: QueuedMessage[];
+    skipAppendUserMessages?: boolean;
+  }) => {
+    const includeComposerInput = options?.includeComposerInput ?? true;
+    const composerHasInput = inputValue.trim().length > 0 || attachments.length > 0;
+    if (includeComposerInput && !composerHasInput) return;
 
     setUiError(null);
-    const content = inputValue;
-    const atts = [...attachments];
-    setInputValue("");
-    setAttachments([]);
 
-    if (isGenerating) {
-      setQueuedMessages((prev) => [...prev, { content, attachments: atts }]);
+    const content = includeComposerInput ? inputValue : "";
+    const atts = includeComposerInput ? [...attachments] : [];
+    if (includeComposerInput) {
+      setInputValue("");
+      setAttachments([]);
+    }
+
+    const queueSourceKey = options?.sessionIdHint ?? currentSessionId ?? '__new__';
+    const targetRuntime = options?.sessionIdHint
+      ? useRuntimeStore.getState().sessions[options.sessionIdHint]
+      : runtimeSession;
+    const targetGenerating = targetRuntime?.state === 'streaming';
+
+    if (targetGenerating) {
+      if (!includeComposerInput) return;
+      setQueuedBySession((prev) => {
+        const list = prev[queueSourceKey] ?? [];
+        const nextList = [...list, { content, attachments: atts }];
+        const runtimeSessionId = options?.sessionIdHint ?? currentSessionId;
+        if (runtimeSessionId) {
+          setRuntimeQueuedCount(runtimeSessionId, nextList.length);
+        }
+        return {
+          ...prev,
+          [queueSourceKey]: nextList,
+        };
+      });
       return;
     }
 
-    let sessionId = currentSessionId;
+    let sessionId = options?.sessionIdHint ?? currentSessionId;
     if (!sessionId) {
-      sessionId = await createSession(newChatModelId);
+      sessionId = await createSession(newChatModelId || undefined);
+      if (sessionId) {
+        navigate(`/chat/${encodeURIComponent(sessionId)}`);
+      }
     }
 
     if (!sessionId) return;
 
-    const pendingBatch = [{ content, attachments: atts }, ...queuedMessages];
-    setQueuedMessages([]);
+    const existingQueue = queuedBySessionRef.current[queueSourceKey] ?? [];
+    const pendingBatch = options?.overrideBatch
+      ? [...options.overrideBatch]
+      : includeComposerInput
+        ? [{ content, attachments: atts }, ...existingQueue]
+        : [...existingQueue];
 
-    for (const queued of pendingBatch) {
-      addMessage(sessionId, queued.content, "user", queued.attachments);
+    if (pendingBatch.length === 0) return;
+
+    setQueuedBySession((prev) => {
+      const next = { ...prev };
+      delete next[queueSourceKey];
+      delete next[sessionId];
+      return next;
+    });
+    setRuntimeQueuedCount(sessionId, 0);
+
+    if (!options?.skipAppendUserMessages) {
+      for (const queued of pendingBatch) {
+        addMessage(sessionId, queued.content, "user", queued.attachments);
+      }
     }
 
     userScrolledUpRef.current = false;
-    setIsGenerating(true);
+    setRuntimeStreaming(sessionId);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
+    let completedNormally = false;
+    const assistantId = options?.retryAssistantId ?? `assistant-${Date.now()}`;
+    let textFlushTimer: number | null = null;
 
     try {
-      const finalPrompt = pendingBatch.map((m) => m.content).join("\n\n");
-      const mergedAttachments = pendingBatch.flatMap((m) => m.attachments);
-      const assistantId = `assistant-${Date.now()}`;
 
       const current = useStore
         .getState()
         .sessions.find((s) => s.id === sessionId);
       if (!current) return;
 
-      replaceSessionMessages(sessionId, [
-        ...current.messages,
-        {
-          id: assistantId,
-          role: "assistant",
-          content: "",
-          timestamp: new Date().toISOString(),
-          attachments: [],
-          isStreaming: true,
-          isThinking: true,
-          thinking: "",
-        },
-      ]);
+      const isRetry = !!options?.retryAssistantId;
+      const retryBatch = isRetry
+        ? collectRetryBatch(current.messages, assistantId)
+        : [];
+      const streamingBatch = isRetry
+        ? retryBatch
+        : pendingBatch;
+
+      if (streamingBatch.length === 0) return;
+
+      const finalPrompt = streamingBatch.map((m) => m.content).join("\n\n");
+      const mergedAttachments = streamingBatch.flatMap((m) => m.attachments);
+
+      if (options?.retryAssistantId) {
+        replaceSessionMessages(
+          sessionId,
+          current.messages.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  content: "",
+                  error: undefined,
+                  isStreaming: true,
+                  isThinking: true,
+                  thinking: "",
+                }
+              : m,
+          ),
+        );
+      } else {
+        replaceSessionMessages(sessionId, [
+          ...current.messages,
+          {
+            id: assistantId,
+            role: "assistant",
+            content: "",
+            timestamp: new Date().toISOString(),
+            attachments: [],
+            isStreaming: true,
+            isThinking: true,
+            thinking: "",
+          },
+        ]);
+      }
 
       let streamedText = "";
       let streamedReasoning = "";
+      let bashExecutions: Array<{
+        id: string;
+        input: string;
+        output?: string;
+        status: "running" | "done" | "failed";
+        startedAt?: number;
+        endedAt?: number;
+      }> = [];
+      let lastTextFlushAt = 0;
+
+      const flushAssistantText = (force = false) => {
+        const now = Date.now();
+        const minIntervalMs = 50;
+        const elapsed = now - lastTextFlushAt;
+
+        if (!force && elapsed < minIntervalMs) {
+          if (textFlushTimer == null) {
+            textFlushTimer = window.setTimeout(() => {
+              textFlushTimer = null;
+              flushAssistantText(true);
+            }, minIntervalMs - elapsed);
+          }
+          return;
+        }
+
+        const latest = useStore
+          .getState()
+          .sessions.find((s) => s.id === sessionId);
+        if (!latest) return;
+
+        lastTextFlushAt = now;
+        replaceSessionMessages(
+          sessionId,
+          latest.messages.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  content: streamedText,
+                  isStreaming: true,
+                  isThinking: false,
+                  bashExecutions,
+                }
+              : m,
+          ),
+        );
+      };
 
       await streamChat({
         sessionId,
@@ -270,32 +643,63 @@ export function ChatInterface({
             sessionId,
             latest.messages.map((m) =>
               m.id === assistantId
-                ? { ...m, thinking: streamedReasoning, isThinking: true }
-                : m,
-            ),
-          );
-        },
-        onText: (chunk) => {
-          streamedText += chunk;
-          const latest = useStore
-            .getState()
-            .sessions.find((s) => s.id === sessionId);
-          if (!latest) return;
-          replaceSessionMessages(
-            sessionId,
-            latest.messages.map((m) =>
-              m.id === assistantId
                 ? {
                     ...m,
-                    content: streamedText,
-                    isStreaming: true,
-                    isThinking: false,
+                    thinking: streamedReasoning,
+                    isThinking: true,
+                    bashExecutions,
                   }
                 : m,
             ),
           );
         },
+        onToolStart: (tool: any) => {
+          const name = (tool.name ?? '').toLowerCase();
+          if (name === 'bash') {
+            let script = '(bash)';
+            try {
+              const args = typeof tool.arguments === 'string' ? JSON.parse(tool.arguments) : tool.arguments;
+              script = args?.script ?? args?.command ?? '(bash)';
+            } catch { /* keep default */ }
+            bashExecutions.push({
+              id: tool.id ?? `tool-${Date.now()}`,
+              input: script,
+              status: 'running',
+              startedAt: Date.now(),
+            });
+            flushAssistantText(true);
+          }
+        },
+        onToolEnd: (tool: any) => {
+          const idx = bashExecutions.findIndex((e) => e.id === tool.id);
+          if (idx !== -1) {
+            let output: string | undefined;
+            try {
+              const result = typeof tool.result === 'string' ? JSON.parse(tool.result) : tool.result;
+              output = result?.stdout?.content?.text ?? (typeof result === 'string' ? result : JSON.stringify(result));
+            } catch { /* ignore */ }
+            const raw = JSON.stringify(tool.result ?? '').toLowerCase();
+            const failed = raw.includes('"err"') || raw.includes('error');
+            bashExecutions[idx] = {
+              ...bashExecutions[idx],
+              output,
+              status: failed ? 'failed' : 'done',
+              endedAt: Date.now(),
+            };
+            flushAssistantText(true);
+          }
+        },
+        onText: (chunk) => {
+          streamedText += chunk;
+          markRuntimeFirstToken(sessionId);
+          flushAssistantText();
+        },
         onDone: (assistant) => {
+          completedNormally = true;
+          if (textFlushTimer != null) {
+            window.clearTimeout(textFlushTimer);
+            textFlushTimer = null;
+          }
           const latest = useStore
             .getState()
             .sessions.find((s) => s.id === sessionId);
@@ -310,69 +714,133 @@ export function ChatInterface({
                     thinking: streamedReasoning,
                     isStreaming: false,
                     isThinking: false,
+                    bashExecutions,
                   }
                 : m,
             ),
           );
         },
-        onToolStart: (tool) => {
-          const name = String((tool as { name?: string }).name ?? "bash");
-          streamedReasoning += `\n\n$ ${name} running...`;
-          const latest = useStore
-            .getState()
-            .sessions.find((s) => s.id === sessionId);
-          if (!latest) return;
-          replaceSessionMessages(
-            sessionId,
-            latest.messages.map((m) =>
-              m.id === assistantId
-                ? { ...m, thinking: streamedReasoning, isThinking: true }
-                : m,
-            ),
-          );
-        },
-        onToolEnd: (tool) => {
-          const name = String((tool as { name?: string }).name ?? "bash");
-          streamedReasoning += `\n$ ${name} finished`;
-          const latest = useStore
-            .getState()
-            .sessions.find((s) => s.id === sessionId);
-          if (!latest) return;
-          replaceSessionMessages(
-            sessionId,
-            latest.messages.map((m) =>
-              m.id === assistantId
-                ? { ...m, thinking: streamedReasoning, isThinking: true }
-                : m,
-            ),
-          );
-        },
         onError: (message) => {
-          setUiError(`LLM endpoint error: ${message}`);
+          const latest = useStore
+            .getState()
+            .sessions.find((s) => s.id === sessionId);
+          if (latest) {
+            replaceSessionMessages(
+              sessionId,
+              latest.messages.map((m) =>
+                m.id === assistantId
+                  ? {
+                      ...m,
+                      isStreaming: false,
+                      isThinking: false,
+                      error: `LLM endpoint error: ${message}`,
+                    }
+                  : m,
+              ),
+            );
+          }
+          setUiError(null);
         },
       });
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
-        setUiError(`LLM endpoint error: ${(error as Error).message}`);
+        const errText = `LLM endpoint error: ${(error as Error).message}`;
+        const latest = useStore
+          .getState()
+          .sessions.find((s) => s.id === sessionId);
+        if (latest) {
+          replaceSessionMessages(
+            sessionId,
+            latest.messages.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    isStreaming: false,
+                    isThinking: false,
+                    error: errText,
+                  }
+                : m,
+            ),
+          );
+        }
+        setUiError(null);
       }
     } finally {
+      if (textFlushTimer != null) {
+        window.clearTimeout(textFlushTimer);
+        textFlushTimer = null;
+      }
+
+      const latest = useStore
+        .getState()
+        .sessions.find((s) => s.id === sessionId);
+      if (latest) {
+        replaceSessionMessages(
+          sessionId,
+          latest.messages.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  isStreaming: false,
+                  isThinking: false,
+                }
+              : m,
+          ),
+        );
+      }
+
       abortControllerRef.current = null;
-      setIsGenerating(false);
+      clearRuntimeSession(sessionId);
+
+      if (completedNormally) {
+        const remaining = queuedBySessionRef.current[sessionId] ?? [];
+        if (remaining.length > 0) {
+          void handleSend({ sessionIdHint: sessionId, includeComposerInput: false });
+        }
+      }
     }
   };
 
   const handleStop = () => {
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
-    setIsGenerating(false);
+    if (currentSessionId) {
+      const latest = useStore
+        .getState()
+        .sessions.find((s) => s.id === currentSessionId);
+      if (latest) {
+        let stopped = false;
+        replaceSessionMessages(
+          currentSessionId,
+          latest.messages.map((m) => {
+            if (
+              !stopped &&
+              m.role === "assistant" &&
+              (m.isStreaming || m.isThinking)
+            ) {
+              stopped = true;
+              return {
+                ...m,
+                isStreaming: false,
+                isThinking: false,
+              };
+            }
+            return m;
+          }),
+        );
+      }
+
+      clearRuntimeSession(currentSessionId);
+    }
   };
 
   const handlePermissionDecision = async (approved: boolean) => {
-    if (!pendingPermission) return;
+    if (!pendingPermission || !currentSessionId) return;
     setIsPermissionSubmitting(true);
     try {
       await respondPermissionRequest(pendingPermission.id, approved);
       setPendingPermission(null);
+      setRuntimeWaitingPermission(currentSessionId, null);
     } finally {
       setIsPermissionSubmitting(false);
     }
@@ -396,16 +864,27 @@ export function ChatInterface({
   const handleAskUserSubmit = async (answersOverride?: AskUserAnswer[]) => {
     if (!pendingAskUser) return;
     setIsAskUserSubmitting(true);
+    setUiError(null);
     try {
       await respondAskUserRequest(
         pendingAskUser.request.id,
         answersOverride ?? pendingAskUser.answers,
       );
       setPendingAskUser(null);
+    } catch (error) {
+      setUiError(`ask_user submit failed: ${(error as Error).message}`);
     } finally {
       setIsAskUserSubmitting(false);
     }
   };
+
+  const permissionToneClass = pendingPermission
+    ? pendingPermission.mode === "unsafe"
+      ? "border-red-300 bg-red-100 text-red-900 dark:border-red-800 dark:bg-red-950/95 dark:text-red-100"
+      : pendingPermission.mode === "network"
+        ? "border-yellow-300 bg-yellow-100 text-yellow-900 dark:border-yellow-800 dark:bg-yellow-950/95 dark:text-yellow-100"
+        : "border-border bg-card text-foreground"
+    : "";
 
   const handleTitleSubmit = () => {
     if (currentSessionId && titleInput.trim())
@@ -471,6 +950,15 @@ export function ChatInterface({
     });
   };
 
+  const readFileAsDataUrl = async (file: File): Promise<string> => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+      reader.onerror = () => resolve("");
+      reader.readAsDataURL(file);
+    });
+  };
+
   const processDocxFile = async (file: File): Promise<string> => {
     try {
       const mammoth = await import("mammoth");
@@ -494,6 +982,7 @@ export function ChatInterface({
         name: f.name,
         type: fileType,
         url: URL.createObjectURL(f),
+        uploadDataUrl: await readFileAsDataUrl(f),
       };
 
       if (fileType === "document") {
@@ -517,32 +1006,36 @@ export function ChatInterface({
 
   const LONG_TEXT_THRESHOLD = 500;
 
-  const handlePaste = (e: React.ClipboardEvent) => {
-    const items = e.clipboardData.items;
-    const newAttachments: Attachment[] = [];
-    let hasHandledFile = false;
+  const handlePaste = async (e: React.ClipboardEvent) => {
+    const items = Array.from(e.clipboardData.items);
+    const text = e.clipboardData.getData("text/plain");
+    const hasFileItem = items.some((item) => item.kind === "file" && item.getAsFile());
+    const shouldAttachLargeText = !hasFileItem && !!text && text.length >= LONG_TEXT_THRESHOLD;
 
-    for (const item of items) {
-      if (item.kind === "file") {
-        const file = item.getAsFile();
-        if (!file) continue;
-        hasHandledFile = true;
-        const fileType = classifyFile(file);
-        newAttachments.push({
-          id: uuidv4(),
-          name:
-            file.name ||
-            (fileType === "image" ? "Pasted Image" : "Pasted File"),
-          type: fileType,
-          url: URL.createObjectURL(file),
-        });
-      }
+    // Prevent default immediately, before async work, so filename/text is never inserted into composer.
+    if (hasFileItem || shouldAttachLargeText) {
+      e.preventDefault();
     }
 
-    // Check for long text paste
-    const text = e.clipboardData.getData("text/plain");
-    if (!hasHandledFile && text && text.length >= LONG_TEXT_THRESHOLD) {
-      e.preventDefault();
+    const newAttachments: Attachment[] = [];
+
+    for (const item of items) {
+      if (item.kind !== "file") continue;
+      const file = item.getAsFile();
+      if (!file) continue;
+
+      const fileType = classifyFile(file);
+      const att: Attachment = {
+        id: uuidv4(),
+        name: file.name || (fileType === "image" ? "Pasted Image" : "Pasted File"),
+        type: fileType,
+        url: URL.createObjectURL(file),
+        uploadDataUrl: await readFileAsDataUrl(file),
+      };
+      newAttachments.push(att);
+    }
+
+    if (shouldAttachLargeText) {
       const preview = text.slice(0, 200);
       newAttachments.push({
         id: uuidv4(),
@@ -555,7 +1048,6 @@ export function ChatInterface({
     }
 
     if (newAttachments.length > 0) {
-      if (hasHandledFile) e.preventDefault();
       setAttachments((prev) => [...prev, ...newAttachments]);
     }
   };
@@ -563,104 +1055,137 @@ export function ChatInterface({
 
   const currentModelId = isNewChat ? newChatModelId : currentSession.model;
   const currentReasoningEffort = isNewChat
-    ? undefined
+    ? newChatReasoningEffort
     : currentSession.reasoningEffort;
 
+  const canShowArtifactsPanel = artifacts.length > 0 || !!selectedPreviewPath;
+
+  useEffect(() => {
+    return () => {
+      if (previewBlobUrlRef.current) {
+        URL.revokeObjectURL(previewBlobUrlRef.current);
+        previewBlobUrlRef.current = null;
+      }
+    };
+  }, []);
+
   return (
-    <div className="flex flex-col h-screen w-full relative">
-      {/* Header */}
-      <div className="flex items-center justify-between p-4 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 z-10">
-        <div className="flex-1 flex justify-start">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={onToggleSidebar}
-            className={isNewChat ? "text-muted-foreground hover:text-foreground" : "text-muted-foreground hover:text-foreground hidden md:flex"}
-            title={isSidebarOpen ? "Close sidebar" : "Open sidebar"}
-          >
-            <PanelLeft className="h-5 w-5" />
-          </Button>
-        </div>
-        <div className="flex items-center gap-2 min-w-0">
-          {isNewChat ? (
-            <span className="text-sm font-medium text-foreground">New Chat</span>
-          ) : isEditingTitle ? (
-            <Input
-              ref={titleInputRef}
-              value={titleInput}
-              onChange={(e) => setTitleInput(e.target.value)}
-              onBlur={handleTitleSubmit}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleTitleSubmit();
-                if (e.key === "Escape") {
-                  setTitleInput(currentSession.title);
-                  setIsEditingTitle(false);
-                }
-              }}
-              className="h-auto py-0 w-[300px] text-sm font-medium text-foreground text-center bg-transparent border-none focus-visible:ring-0 px-0"
-            />
-          ) : (
-            <div
-              className="flex items-center gap-2 group cursor-pointer min-w-0"
-              onClick={() => setIsEditingTitle(true)}
-            >
-              <span className="text-sm font-medium text-foreground truncate max-w-[300px]">
-                {currentSession.title}
-              </span>
-              <Pencil className="h-3 w-3 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-            </div>
-          )}
-        </div>
-        <div className="flex-1 flex justify-end">
-          {!isNewChat && (
+    <div className="flex h-screen w-full relative">
+      <div className="flex min-w-0 flex-1 flex-col h-screen relative">
+        <div className="flex items-center justify-between p-4 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 z-10">
+          <div className="flex-1 flex justify-start">
             <Button
               variant="ghost"
               size="icon"
-              className="text-muted-foreground hover:text-foreground"
-              title="Share chat"
+              onClick={onToggleSidebar}
+              className={isNewChat ? "text-muted-foreground hover:text-foreground" : "text-muted-foreground hover:text-foreground hidden md:flex"}
+              title={isSidebarOpen ? "Close sidebar" : "Open sidebar"}
             >
-              <Share2 className="h-5 w-5" />
+              <PanelLeft className="h-5 w-5" />
             </Button>
-          )}
-        </div>
-      </div>
-
-      {/* Messages */}
-      {isNewChat ? (
-        <div className="flex-1 flex flex-col items-center justify-center px-4 -mt-20">
-          <div className="text-center mb-8">
-            <h1 className="text-3xl font-semibold tracking-tight mb-2">
-              What shall we think through?
-            </h1>
-            <p className="text-muted-foreground text-sm">
-              Ask anything. I'm here to help you think, create, and explore.
-            </p>
           </div>
-        </div>
-      ) : (
-        <div
-          ref={scrollContainerRef}
-          onScroll={handleScroll}
-          className="flex-1 overflow-y-auto"
-        >
-          <div
-            ref={contentRef}
-            className="max-w-3xl mx-auto px-4 space-y-6 pb-[200px] pt-4"
-          >
-            {messages.map((msg) => (
-              <MessageItem key={msg.id} message={msg} />
+          <div className="flex items-center gap-2 min-w-0">
+            {!shouldShowWelcome && (isEditingTitle ? (
+              <Input
+                ref={titleInputRef}
+                value={titleInput}
+                onChange={(e) => setTitleInput(e.target.value)}
+                onBlur={handleTitleSubmit}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleTitleSubmit();
+                  if (e.key === "Escape") {
+                    setTitleInput(currentSession.title);
+                    setIsEditingTitle(false);
+                  }
+                }}
+                className="h-auto py-0 w-[300px] text-sm font-medium text-foreground text-center bg-transparent border-none focus-visible:ring-0 px-0"
+              />
+            ) : (
+              <div
+                className="flex items-center gap-2 group cursor-pointer min-w-0"
+                onClick={() => setIsEditingTitle(true)}
+              >
+                <span className="text-sm font-medium text-foreground truncate max-w-[300px]">
+                  {currentSession.title}
+                </span>
+                <Pencil className="h-3 w-3 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+              </div>
             ))}
           </div>
+          <div className="flex-1 flex justify-end">
+            {!shouldShowWelcome && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="text-muted-foreground hover:text-foreground"
+                title="Share chat"
+              >
+                <Share2 className="h-5 w-5" />
+              </Button>
+            )}
+          </div>
         </div>
-      )}
 
-      {/* Input Area */}
-      <div className="p-4 bg-transparent absolute bottom-0 left-0 right-0 w-full z-20 pointer-events-none">
-        <div className="max-w-3xl mx-auto w-full pointer-events-auto">
-          {pendingPermission && (
-            <div className="mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
-              <div className="font-medium text-amber-200">Approval required ({pendingPermission.mode})</div>
-              <div className="mt-1 text-amber-100/90 break-all">{pendingPermission.script}</div>
+        {shouldShowWelcome ? (
+          <div className="flex-1 flex flex-col items-center justify-center px-4 -mt-20">
+            <div className="text-center mb-8">
+              <h1 className="text-3xl font-semibold tracking-tight mb-2">
+                What shall we think through?
+              </h1>
+              <p className="text-muted-foreground text-sm">
+                Ask anything. I'm here to help you think, create, and explore.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div
+            ref={scrollContainerRef}
+            onScroll={handleScroll}
+            className="flex-1 overflow-y-auto"
+          >
+            <div
+              ref={contentRef}
+              className="max-w-3xl mx-auto px-4 space-y-6 pb-[200px] pt-4"
+            >
+              {messages.map((msg, index) => {
+                const isLast = index === messages.length - 1;
+                const retryFromUser = msg.role === "user" && isLast;
+                const retryFromAssistant = msg.role === "assistant" && !!msg.error;
+
+                return (
+                  <MessageItem
+                    key={msg.id}
+                    message={msg}
+                    canRetry={retryFromUser || retryFromAssistant}
+                    onOpenPreview={(path) => {
+                      void openPreview(path);
+                    }}
+                    onRetry={() => {
+                      const batch = retryFromUser
+                        ? [{ content: msg.content, attachments: msg.attachments ?? [] }]
+                        : collectRetryBatch(messages, msg.id);
+
+                      void handleSend({
+                        sessionIdHint: currentSessionId ?? undefined,
+                        includeComposerInput: false,
+                        retryAssistantId: retryFromAssistant ? msg.id : undefined,
+                        overrideBatch: batch,
+                        skipAppendUserMessages: true,
+                      });
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div className="p-4 bg-transparent absolute bottom-0 left-0 right-0 w-full z-20 pointer-events-none">
+          <div className="max-w-3xl mx-auto w-full pointer-events-auto">
+            {pendingPermission && (
+            <div className={`mb-3 rounded-lg border px-3 py-2 text-sm ${permissionToneClass}`}>
+              <div className="font-medium">Approval required ({pendingPermission.mode})</div>
+              <div className="mt-1 break-all">{pendingPermission.script}</div>
               <div className="mt-2 flex gap-2">
                 <Button
                   size="sm"
@@ -681,7 +1206,7 @@ export function ChatInterface({
               </div>
             </div>
           )}
-          {pendingAskUser && (
+            {pendingAskUser && (
             <div className="mb-3 rounded-xl border-2 border-primary/40 bg-card px-4 py-3 shadow-xl">
               <div className="flex items-center justify-between gap-3">
                 <div className="text-sm font-semibold text-foreground">Input required</div>
@@ -708,7 +1233,7 @@ export function ChatInterface({
                       </div>
 
                       {question.option.length > 0 && (
-                        <div className="mt-2 flex flex-wrap gap-2">
+                        <div className="mt-2 flex flex-col gap-2">
                           {question.option.map((option) => {
                             const active = selected.includes(option);
                             return (
@@ -716,7 +1241,7 @@ export function ChatInterface({
                                 key={option}
                                 size="sm"
                                 variant={active ? "default" : "outline"}
-                                className="h-8"
+                                className="h-8 w-full justify-start"
                                 disabled={isAskUserSubmitting}
                                 onClick={() => {
                                   if (question.multi_select) {
@@ -774,12 +1299,12 @@ export function ChatInterface({
               </div>
             </div>
           )}
-          {uiError && (
+            {uiError && (
             <div className="mb-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
               {uiError}
             </div>
           )}
-          <div className="relative bg-background/60 backdrop-blur-xl rounded-2xl border border-border/50">
+            <div className="relative bg-background/60 backdrop-blur-xl rounded-2xl border border-border/50">
             {attachments.length > 0 && (
               <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
                 {attachments.map((att) => (
@@ -845,11 +1370,22 @@ export function ChatInterface({
                   >
                     <span className="truncate">{msg.content}</span>
                     <button
-                      onClick={() =>
-                        setQueuedMessages((prev) =>
-                          prev.filter((_, idx) => idx !== i),
-                        )
-                      }
+                      onClick={() => {
+                        setQueuedBySession((prev) => {
+                          const list = prev[activeQueueKey] ?? [];
+                          const nextList = list.filter((_, idx) => idx !== i);
+                          const next = { ...prev, [activeQueueKey]: nextList };
+                          if (nextList.length === 0) {
+                            delete next[activeQueueKey];
+                          }
+                          return next;
+                        });
+                        if (currentSessionId) {
+                          const list = queuedBySessionRef.current[currentSessionId] ?? [];
+                          const nextLen = Math.max(0, list.length - 1);
+                          setRuntimeQueuedCount(currentSessionId, nextLen);
+                        }
+                      }}
                       className="flex-shrink-0 hover:text-foreground transition-colors"
                     >
                       <X className="h-3 w-3" />
@@ -866,6 +1402,7 @@ export function ChatInterface({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
+                  if (!canSend) return;
                   void handleSend();
                 }
               }}
@@ -929,11 +1466,22 @@ export function ChatInterface({
                     void updateSessionModel(currentSessionId, id);
                   }}
                   onReasoningEffortChange={(e) => {
-                    if (!isNewChat) {
+                    if (isNewChat) {
+                      setNewChatReasoningEffort(e);
+                    } else {
                       updateSessionReasoningEffort(currentSessionId, e);
                     }
                   }}
                 />
+                {showTokenUsage && (
+                  <div
+                    className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground hover:text-foreground"
+                    title={contextUsageTitle}
+                  >
+                    <Eye className="h-4 w-4" />
+                    <span>{contextUsagePercent != null ? `${contextUsagePercent}%` : "--"}</span>
+                  </div>
+                )}
                 {isGenerating ? (
                   <Button
                     onClick={handleStop}
@@ -945,10 +1493,10 @@ export function ChatInterface({
                 ) : (
                   <Button
                     onClick={() => void handleSend()}
-                    disabled={!hasInput}
+                    disabled={!canSend}
                     size="icon"
                     className={
-                      hasInput
+                      canSend
                         ? "h-8 w-8 bg-primary text-primary-foreground rounded-lg"
                         : "h-8 w-8 bg-muted text-muted-foreground rounded-lg"
                     }
@@ -961,6 +1509,23 @@ export function ChatInterface({
           </div>
         </div>
       </div>
+    </div>
+
+      {canShowArtifactsPanel && (
+        <ArtifactsSidebar
+          open={isArtifactsOpen}
+          artifacts={artifacts}
+          selectedPath={selectedPreviewPath}
+          preview={previewPane}
+          onClose={() => setIsArtifactsOpen(false)}
+          onReload={() => {
+            void reloadPreview();
+          }}
+          onSelect={(path) => {
+            void openPreview(path);
+          }}
+        />
+      )}
     </div>
   );
 }

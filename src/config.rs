@@ -65,6 +65,81 @@ pub fn get_model_tier(model_id: &str) -> ModelTier {
         .unwrap_or(ModelTier::Balanced)
 }
 
+fn strip_preview_suffix(id: &str) -> Option<String> {
+    id.strip_suffix("-preview").map(ToString::to_string)
+}
+
+fn strip_compact_date_suffix(id: &str) -> Option<String> {
+    let idx = id.rfind('-')?;
+    let tail = &id[idx + 1..];
+    if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(id[..idx].to_string());
+    }
+    None
+}
+
+fn strip_iso_date_suffix(id: &str) -> Option<String> {
+    if id.len() < 11 {
+        return None;
+    }
+    let idx = id.len() - 11;
+    if id.as_bytes().get(idx) != Some(&b'-') {
+        return None;
+    }
+    let tail = &id[idx + 1..];
+    let ok = tail.len() == 10
+        && tail.as_bytes().get(4) == Some(&b'-')
+        && tail.as_bytes().get(7) == Some(&b'-')
+        && tail
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| (i == 4 || i == 7) || b.is_ascii_digit());
+    if ok {
+        return Some(id[..idx].to_string());
+    }
+    None
+}
+
+pub fn normalize_model_id_for_relaxed_match(model_id: &str) -> String {
+    let mut current = model_id.trim().to_ascii_lowercase();
+    loop {
+        let next = strip_preview_suffix(&current)
+            .or_else(|| strip_compact_date_suffix(&current))
+            .or_else(|| strip_iso_date_suffix(&current));
+        match next {
+            Some(value) => current = value,
+            None => break,
+        }
+    }
+    current
+}
+
+/// Model ID matching mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchMode {
+    /// Only exact (case-insensitive) matches.
+    Strict,
+    /// Normalized relaxed matching (strips dates, versions, etc.).
+    Relaxed,
+}
+
+impl MatchMode {
+    /// Create from a `strict_model_matching` preference flag.
+    pub fn from_strict_flag(strict: bool) -> Self {
+        if strict { Self::Strict } else { Self::Relaxed }
+    }
+}
+
+pub fn model_ids_match(candidate: &str, requested: &str, mode: MatchMode) -> bool {
+    if candidate.eq_ignore_ascii_case(requested) {
+        return true;
+    }
+    if mode == MatchMode::Strict {
+        return false;
+    }
+    normalize_model_id_for_relaxed_match(candidate) == normalize_model_id_for_relaxed_match(requested)
+}
+
 /// Configuration error.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -248,37 +323,61 @@ impl ProviderType {
     /// OpenRouter can serve most models from other providers.
     /// Native providers can only serve their own models.
     pub fn can_serve_model(self, model_id: &str) -> bool {
-        // OpenRouter is an aggregator - it can serve most models
+        let model = model_id.to_ascii_lowercase();
+
+        // OpenRouter is an aggregator - it can serve most models.
         if self == Self::OpenRouter {
             return true;
         }
 
-        // Ollama can run any model that's been pulled locally
+        // Ollama can run any model that's been pulled locally.
         if self == Self::Ollama {
             return true;
         }
 
-        // Custom providers - we don't know what they support
+        // Custom providers - user-defined compatibility.
         if self == Self::Custom {
             return true;
         }
 
-        // Copilot can serve OpenAI and Anthropic models, but not Google models.
-        if self == Self::Copilot {
-            if let Some(info) = aither_models::lookup(model_id) {
-                return info.provider.eq_ignore_ascii_case("openai")
-                    || info.provider.eq_ignore_ascii_case("anthropic");
-            }
-            // Unknown model - allow the provider to try
-            return true;
+        // Prefer authoritative catalog match when available.
+        if let Some(info) = aither_models::lookup(model_id) {
+            return match self {
+                Self::Copilot => {
+                    info.provider.eq_ignore_ascii_case("openai")
+                        || info.provider.eq_ignore_ascii_case("anthropic")
+                }
+                _ => info.provider.eq_ignore_ascii_case(self.aither_provider()),
+            };
         }
 
-        // For native providers, check if the model belongs to them
-        if let Some(info) = aither_models::lookup(model_id) {
-            info.provider.eq_ignore_ascii_case(self.aither_provider())
-        } else {
-            // Unknown model - allow the provider to try
-            true
+        // Fallback heuristics for newer/unknown model IDs.
+        match self {
+            Self::Anthropic => model.starts_with("claude"),
+            Self::OpenAI => {
+                model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3")
+            }
+            Self::Google => model.starts_with("gemini"),
+            Self::Copilot => {
+                model.starts_with("gpt")
+                    || model.starts_with("o1")
+                    || model.starts_with("o3")
+                    || model.starts_with("claude")
+            }
+            Self::DeepSeek => model.starts_with("deepseek"),
+            Self::Groq => {
+                model.starts_with("llama")
+                    || model.starts_with("mixtral")
+                    || model.starts_with("qwen")
+            }
+            Self::Together => {
+                model.starts_with("llama")
+                    || model.starts_with("qwen")
+                    || model.starts_with("mistral")
+            }
+            Self::Mistral => model.starts_with("mistral"),
+            Self::XAI => model.starts_with("grok"),
+            Self::OpenRouter | Self::Ollama | Self::Custom => true,
         }
     }
 }
@@ -538,8 +637,19 @@ impl ModelsConfig {
     }
 
     /// Get the provider ID for a model (if known).
-    pub fn provider_for_model(&self, model_id: &str) -> Option<&str> {
-        self.model_providers.get(model_id).map(|s| s.as_str())
+    pub fn provider_for_model(&self, model_id: &str, strict: bool) -> Option<&str> {
+        if let Some(provider) = self.model_providers.get(model_id) {
+            return Some(provider.as_str());
+        }
+
+        if strict {
+            return None;
+        }
+
+        self.model_providers
+            .iter()
+            .find(|(saved, _)| model_ids_match(saved, model_id, MatchMode::Relaxed))
+            .map(|(_, provider)| provider.as_str())
     }
 }
 
@@ -558,6 +668,12 @@ pub struct Preferences {
     /// Warn user when changing model mid-conversation
     #[serde(default = "default_true")]
     pub warn_on_model_change: bool,
+    /// Show token/context usage in chat UI.
+    #[serde(default = "default_true")]
+    pub show_token_usage: bool,
+    /// Strict model matching (no relaxed fallback aliases).
+    #[serde(default)]
+    pub strict_model_matching: bool,
 }
 
 impl Default for Preferences {
@@ -565,8 +681,36 @@ impl Default for Preferences {
         Self {
             load_balance_strategy: LoadBalanceStrategy::RoundRobin,
             warn_on_model_change: true,
+            show_token_usage: true,
+            strict_model_matching: false,
         }
     }
+}
+
+/// UI appearance preferences persisted in config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Appearance {
+    #[serde(default = "default_ui_font")]
+    pub font: String,
+    #[serde(default = "default_ui_theme")]
+    pub theme: String,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            font: default_ui_font(),
+            theme: default_ui_theme(),
+        }
+    }
+}
+
+fn default_ui_font() -> String {
+    "Inter".to_string()
+}
+
+fn default_ui_theme() -> String {
+    "system".to_string()
 }
 
 /// May agent configuration.
@@ -585,6 +729,9 @@ pub struct MayConfig {
     /// Global preferences.
     #[serde(default)]
     pub preferences: Preferences,
+    /// UI appearance settings.
+    #[serde(default)]
+    pub appearance: Appearance,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
@@ -604,6 +751,7 @@ impl Default for MayConfig {
             provider: HashMap::new(),
             models: ModelsConfig::default(),
             preferences: Preferences::default(),
+            appearance: Appearance::default(),
             last_model: None,
             ssh_servers: Vec::new(),
         }
@@ -834,8 +982,9 @@ pub struct ProviderResolver {
     strategy: LoadBalanceStrategy,
     /// Round-robin counter per model
     counters: HashMap<String, AtomicUsize>,
-    /// Temporarily failed providers (model_id -> provider_ids)
-    failed: std::sync::RwLock<HashMap<String, Vec<String>>>,
+    /// Temporarily failed providers (model_id -> provider_ids).
+    /// Uses `RefCell` because `ProviderResolver` is always thread-local (created per-request).
+    failed: std::cell::RefCell<HashMap<String, Vec<String>>>,
 }
 
 /// A selected provider with its ID.
@@ -855,23 +1004,43 @@ impl ProviderResolver {
             models: config.models.clone(),
             strategy: config.preferences.load_balance_strategy,
             counters: HashMap::new(),
-            failed: std::sync::RwLock::new(HashMap::new()),
+            failed: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
     /// Get all provider IDs that can serve a model, excluding failed ones.
     fn available_provider_ids(&self, model_id: &str) -> Vec<&str> {
-        let failed = self.failed.read().expect("failed lock poisoned");
+        let failed = self.failed.borrow();
         let failed_ids = failed.get(model_id);
 
-        self.providers
-            .iter()
-            .filter(|(id, p)| {
-                p.can_serve_model(id, model_id)
-                    && failed_ids.map(|ids| !ids.contains(*id)).unwrap_or(true)
-            })
-            .map(|(id, _)| id.as_str())
-            .collect()
+        let mut explicit = Vec::new();
+        let mut generic = Vec::new();
+
+        for (id, p) in &self.providers {
+            if !p.can_serve_model(id, model_id)
+                || failed_ids.map(|list| list.contains(id)).unwrap_or(false)
+            {
+                continue;
+            }
+
+            match p.resolve_type(id) {
+                ProviderType::OpenRouter | ProviderType::Ollama | ProviderType::Custom => {
+                    generic.push(id.as_str())
+                }
+                _ => explicit.push(id.as_str()),
+            }
+        }
+
+        // Prefer explicit provider-model matches first; use generic aggregators as fallback.
+        let mut ids = if explicit.is_empty() {
+            generic
+        } else {
+            explicit
+        };
+
+        // Keep provider ordering deterministic; HashMap iteration order is not stable.
+        ids.sort_unstable();
+        ids
     }
 
     /// Select the next provider for a model based on strategy.
@@ -913,7 +1082,7 @@ impl ProviderResolver {
 
     /// Mark a provider as failed for a model.
     pub fn mark_failed(&self, model_id: &str, provider_id: &str) {
-        let mut failed = self.failed.write().expect("failed lock poisoned");
+        let mut failed = self.failed.borrow_mut();
         failed
             .entry(model_id.to_string())
             .or_default()
@@ -922,13 +1091,13 @@ impl ProviderResolver {
 
     /// Clear failed status for a model (e.g., after some time).
     pub fn clear_failed(&self, model_id: &str) {
-        let mut failed = self.failed.write().expect("failed lock poisoned");
+        let mut failed = self.failed.borrow_mut();
         failed.remove(model_id);
     }
 
     /// Clear all failed status.
     pub fn clear_all_failed(&self) {
-        let mut failed = self.failed.write().expect("failed lock poisoned");
+        let mut failed = self.failed.borrow_mut();
         failed.clear();
     }
 
@@ -953,56 +1122,6 @@ impl ProviderResolver {
     }
 }
 
-// Keep Provider as an alias for backward compatibility during migration
-pub use ProviderType as Provider;
-
-/// Legacy provider config for backward compatibility.
-/// This will be removed after full migration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    #[serde(default)]
-    pub name: ProviderType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-}
-
-impl ProviderConfig {
-    pub fn new(provider: ProviderType) -> Self {
-        Self {
-            name: provider,
-            ..Default::default()
-        }
-    }
-
-    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
-        self.api_key = Some(key.into());
-        self
-    }
-
-    pub fn effective_base_url(&self) -> Option<&str> {
-        self.base_url.as_deref().or_else(|| self.name.base_url())
-    }
-
-    pub fn is_valid(&self) -> bool {
-        if self.name.requires_api_key() && self.api_key.is_none() {
-            return false;
-        }
-        if self.name.requires_base_url() && self.base_url.is_none() {
-            return false;
-        }
-        true
-    }
-
-    pub fn provider_display_name(&self) -> &str {
-        self.display_name
-            .as_deref()
-            .unwrap_or_else(|| self.name.display_name())
-    }
-}
 
 #[cfg(test)]
 mod tests {

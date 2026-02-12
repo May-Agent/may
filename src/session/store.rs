@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use futures_lite::StreamExt;
 
 use super::{ChatHistory, ChatHistoryError};
-use crate::fs_util;
 
 /// Session store error.
 #[derive(Debug, thiserror::Error)]
@@ -21,13 +20,17 @@ pub enum StoreError {
 /// Handles persistence of sessions to filesystem.
 #[derive(Clone)]
 pub struct SessionStore {
+    may_dir: PathBuf,
     sessions_dir: PathBuf,
 }
 
 impl SessionStore {
     /// Create a new session store.
-    pub fn new(sessions_dir: PathBuf) -> Self {
-        Self { sessions_dir }
+    pub fn new(may_dir: PathBuf, sessions_dir: PathBuf) -> Self {
+        Self {
+            may_dir,
+            sessions_dir,
+        }
     }
 
     /// Get the sessions directory.
@@ -68,12 +71,7 @@ impl SessionStore {
         async_fs::create_dir_all(self.images_dir(id)).await?;
 
         // Create sandbox symlinks to global resources
-        let may_dir = self
-            .sessions_dir
-            .parent()
-            .unwrap_or(&self.sessions_dir)
-            .to_path_buf();
-        crate::bundle::Bundle::create_sandbox_symlinks(&session_dir, &may_dir).await?;
+        crate::bundle::Bundle::create_sandbox_symlinks(&session_dir, &self.may_dir).await?;
 
         Ok(())
     }
@@ -84,7 +82,7 @@ impl SessionStore {
         if async_fs::metadata(&path).await.is_err() {
             return Ok(ChatHistory::new());
         }
-        let content = fs_util::read_to_string(&path).await?;
+        let content = async_fs::read_to_string(&path).await?;
         Ok(ChatHistory::parse(&content)?)
     }
 
@@ -115,42 +113,6 @@ impl SessionStore {
         }
 
         Ok(sessions)
-    }
-
-    /// List all sessions with summaries (for background loading).
-    pub async fn list_session_summaries(
-        &self,
-    ) -> Result<Vec<super::manager::SessionSummary>, StoreError> {
-        use super::manager::{SessionId, SessionSummary};
-
-        let ids = self.list_sessions().await?;
-        let mut summaries = Vec::new();
-
-        for id_str in ids {
-            let history = self.read_history(&id_str).await?;
-            let created_at = history.messages().first().and_then(|m| m.timestamp);
-
-            // Build content preview from messages for search
-            let content_preview: String = history
-                .messages()
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-
-            summaries.push(SessionSummary {
-                id: SessionId::from_string(id_str),
-                title: history.metadata.title.clone(),
-                message_count: history.len(),
-                created_at,
-                content_preview,
-            });
-        }
-
-        // Sort by created_at descending (newest first)
-        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-        Ok(summaries)
     }
 
     /// Delete a session.

@@ -15,6 +15,42 @@ cargo fmt                      # Format code
 cargo clippy                   # Run lints
 ```
 
+## Fast Web UI + Rust API Iteration Workflow
+
+Use this workflow when iterating on `may ui` + web UI together:
+
+1. Run Rust server in API-only mode (default, fastest):
+
+```bash
+cargo run --bin may -- ui --port 8787
+```
+
+- The `ui` Cargo feature is **off by default**, so `build.rs` skips `web-ui` production build/embed.
+- This keeps Rust incremental compiles fast.
+- After completing any Rust code change, restart the Rust API server before validation.
+
+2. Run Vite dev server separately with API proxy:
+
+```bash
+cd web-ui
+MAY_API_TARGET=http://127.0.0.1:8787 bun run dev
+```
+
+- `vite.config.ts` proxies `/api/*` to `MAY_API_TARGET` (defaults to `http://127.0.0.1:8787`).
+- You get Vite HMR for frontend + incremental compile for Rust backend.
+- In debug/iteration workflows, do **not** run `vite build`.
+
+3. Only build embedded production UI when needed:
+
+```bash
+cargo build --features ui
+# or
+cargo run --features ui --bin may -- ui --port 8787
+```
+
+- Enabling feature `ui` triggers `build.rs` to run `bun run build` and embed `web-ui/dist`.
+- Use this for release-like verification, not daily inner-loop debugging.
+
 ## Architecture Overview
 
 May is a terminal-based AI assistant built as an application layer on the **aither** framework ecosystem.

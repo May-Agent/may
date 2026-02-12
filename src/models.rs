@@ -3,48 +3,104 @@
 use aither_cloud::{
     ClaudeProvider, CloudModelProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
 };
-use aither_core::llm::LanguageModelProvider;
+use aither_core::llm::{LanguageModelProvider, model::Ability};
 
 use crate::config::{MayConfig, ProviderInstance, ProviderType};
+
+/// Error type for model fetching operations.
+#[derive(Debug, thiserror::Error)]
+pub enum ModelFetchError {
+    #[error("Provider error: {0}")]
+    Provider(#[from] anyhow::Error),
+    #[error("Copilot not authenticated")]
+    CopilotNotAuthenticated,
+    #[error("Copilot auth error: {0}")]
+    CopilotAuth(#[from] crate::copilot::CopilotTokenError),
+}
 
 /// Fetched model info.
 #[derive(Debug, Clone)]
 pub struct FetchedModel {
     /// Model ID.
     pub id: String,
+    /// Human-readable model nickname.
+    pub nickname: String,
+    /// Context window if known.
+    pub context_window: Option<u32>,
+    /// Model abilities if known.
+    pub abilities: Vec<String>,
     /// Provider ID that can serve this model.
     pub provider_id: String,
+}
+
+/// Fetch result for one provider.
+#[derive(Debug, Clone)]
+pub struct ProviderModelFetchResult {
+    /// Provider ID.
+    pub provider_id: String,
+    /// Models fetched from this provider.
+    pub models: Vec<FetchedModel>,
+    /// Error if fetch failed.
+    pub error: Option<String>,
+}
+
+/// Fetch models from all configured providers with per-provider status.
+pub async fn fetch_models_by_provider(config: &MayConfig) -> Vec<ProviderModelFetchResult> {
+    let mut results = Vec::new();
+
+    for (id, instance) in &config.provider {
+        if !instance.is_valid(id) {
+            results.push(ProviderModelFetchResult {
+                provider_id: id.clone(),
+                models: Vec::new(),
+                error: Some("provider is disabled or missing required credentials".to_string()),
+            });
+            continue;
+        }
+
+        match fetch_models_for_provider(id, instance).await {
+            Ok(mut provider_models) => {
+                provider_models.sort_by(|a, b| a.id.cmp(&b.id));
+                provider_models.dedup_by(|a, b| a.id == b.id);
+                results.push(ProviderModelFetchResult {
+                    provider_id: id.clone(),
+                    models: provider_models,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch models from {}: {}", id, e);
+                results.push(ProviderModelFetchResult {
+                    provider_id: id.clone(),
+                    models: Vec::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    results.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+    results
 }
 
 /// Fetch models from all configured providers.
 ///
 /// This calls each provider's /models endpoint to get the real list.
 pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
-    let mut models = Vec::new();
+    let mut models = fetch_models_by_provider(config)
+        .await
+        .into_iter()
+        .flat_map(|entry| {
+            entry.models.into_iter().map(move |mut model| {
+                model.provider_id = entry.provider_id.clone();
+                model
+            })
+        })
+        .collect::<Vec<_>>();
 
-    for (id, instance) in &config.provider {
-        if !instance.is_valid(id) {
-            continue;
-        }
-
-        match fetch_models_for_provider(id, instance).await {
-            Ok(provider_models) => {
-                for model_id in provider_models {
-                    models.push(FetchedModel {
-                        id: model_id,
-                        provider_id: id.clone(),
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch models from {}: {}", id, e);
-            }
-        }
-    }
-
-    // Sort and dedupe
-    models.sort_by(|a, b| a.id.cmp(&b.id));
-    models.dedup_by(|a, b| a.id == b.id);
+    // Keep provider-model pairs (do not dedupe only by model ID).
+    models.sort_by(|a, b| a.id.cmp(&b.id).then(a.provider_id.cmp(&b.provider_id)));
+    models.dedup_by(|a, b| a.id == b.id && a.provider_id == b.provider_id);
     models
 }
 
@@ -52,7 +108,7 @@ pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
 async fn fetch_models_for_provider(
     id: &str,
     instance: &ProviderInstance,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<FetchedModel>, ModelFetchError> {
     let ptype = instance.resolve_type(id);
     let api_key = instance.api_key.as_deref().unwrap_or("");
     let base_url = instance.effective_base_url(id);
@@ -74,9 +130,8 @@ async fn fetch_models_for_provider(
         }
         ProviderType::Copilot => {
             let credentials = crate::copilot::get_copilot_credentials()
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "Copilot not authenticated".to_string())?;
+                .await?
+                .ok_or(ModelFetchError::CopilotNotAuthenticated)?;
             CopilotProvider::new(credentials.token)
                 .base_url(credentials.api_endpoint)
                 .into()
@@ -99,6 +154,65 @@ async fn fetch_models_for_provider(
         }
     };
 
-    let profiles = provider.list_models().await.map_err(|e| e.to_string())?;
-    Ok(profiles.into_iter().map(|p| p.name).collect())
+    let profiles = provider
+        .list_models()
+        .await
+        .map_err(|e| ModelFetchError::Provider(e.into()))?;
+    Ok(profiles
+        .into_iter()
+        .map(|p| {
+            let model_id = p.name;
+            let provider_description = p.description.trim();
+            let nickname = aither_models::lookup(&model_id)
+                .map(|info| info.name.to_string())
+                .or_else(|| {
+                    if provider_description.is_empty() {
+                        None
+                    } else {
+                        Some(provider_description.to_string())
+                    }
+                })
+                .unwrap_or_else(|| model_id.clone());
+
+            let mut abilities: Vec<String> = p
+                .abilities
+                .into_iter()
+                .map(ability_to_label)
+                .collect();
+
+            // Enrich with abilities from the static model database when the
+            // provider API returns none (Claude/Gemini list_models omit them).
+            if abilities.is_empty() {
+                if let Some(info) = aither_models::lookup(&model_id) {
+                    abilities = info
+                        .abilities
+                        .iter()
+                        .map(|a| ability_to_label(*a))
+                        .collect();
+                }
+            }
+
+            FetchedModel {
+                id: model_id,
+                nickname,
+                context_window: Some(p.context_length),
+                abilities,
+                provider_id: id.to_string(),
+            }
+        })
+        .collect())
+}
+
+pub fn ability_to_label(ability: Ability) -> String {
+    match ability {
+        Ability::ToolUse => "tool_use".to_string(),
+        Ability::Vision => "vision".to_string(),
+        Ability::Audio => "audio".to_string(),
+        Ability::Video => "video".to_string(),
+        Ability::WebSearch => "web_search".to_string(),
+        Ability::Pdf => "pdf".to_string(),
+        Ability::CodeExecution => "code_execution".to_string(),
+        Ability::Reasoning => "reasoning".to_string(),
+        Ability::ImageGeneration => "image_generation".to_string(),
+    }
 }
