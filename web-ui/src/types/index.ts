@@ -1,5 +1,8 @@
 // src/types/index.ts
 
+export type ModelKind = 'llm' | 'image' | 'embedding' | 'reranker';
+
+
 export type Role = 'user' | 'assistant' | 'system';
 
 export interface Attachment {
@@ -30,7 +33,7 @@ export interface Session {
   messages: Message[];
   projectId?: string;
   model: string;
-  reasoningEffort?: 'low' | 'medium' | 'high';
+  reasoningEffort?: string;
 }
 
 export interface Project {

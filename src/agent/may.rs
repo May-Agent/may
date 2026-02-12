@@ -11,7 +11,7 @@ use aither_agent::specialized::TaskTool;
 use aither_agent::webfetch::WebFetchTool;
 use aither_agent::websearch::WebSearchTool;
 use aither_agent::{
-    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, BuiltinToolHint, ContextBlock,
+    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, ContextBlock,
     ContextBlockPriority, TodoTool,
 };
 use aither_cloud::{
@@ -25,9 +25,10 @@ use executor_core::DefaultExecutor;
 use futures_lite::Stream;
 
 use crate::ask_user::{AskUserBroker, AskUserTool};
-use crate::config::{MayConfig, ProviderInstance, ProviderType, SelectedProvider};
+use crate::config::{LoadBalanceStrategy, MayConfig, ProviderInstance, ProviderType, SelectedProvider};
 use crate::copilot::clear_copilot_credentials;
 use crate::fs_util;
+use crate::models::fetch_all_models;
 use crate::session::SessionId;
 use crate::workspace::{Workspace, WorkspaceDir};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
@@ -338,14 +339,6 @@ impl MayAgent {
             .transcript(transcript_file)
             .context_block(build_workspace_context_block(&workspace))
             .context_block(build_memory_context_block(&memory_content))
-            .builtin_tool_hint(BuiltinToolHint::new(
-                "ask",
-                "Fast side-analysis for piped content; use `ask --help` for usage.",
-            ))
-            .builtin_tool_hint(BuiltinToolHint::new(
-                "task",
-                "Spawn a subagent for isolated complex work; use `task --help`.",
-            ))
             .max_iterations(config.max_iterations);
 
         // Get the actual working directory before building
@@ -433,40 +426,72 @@ impl MayAgent {
         model: &str,
         permission_approver: Option<PermissionApprover>,
     ) -> Result<Self, MayAgentError> {
-        // Check if we have a stored provider mapping for this model
-        if let Some(provider_id) = may_config.models.provider_for_model(model) {
-            if let Some(instance) = may_config.provider.get(provider_id) {
-                // Use the stored provider directly - no need to search
-                let selected = SelectedProvider {
-                    id: provider_id,
-                    instance,
-                };
-                let llm = build_cloud_provider(&selected, model).await?;
+        // Strict model policy: keep user-selected model unchanged.
+        // Only provider can vary, and only among providers that advertise this exact model.
 
-                let config = MayAgentConfig {
-                    llm,
-                    sandbox_dir,
-                    may_dir,
-                    cwd,
-                    session_id,
-                    max_iterations: may_config.max_iterations,
-                    workspace_request_broker: workspace_request_broker.clone(),
-                    ask_user_broker: ask_user_broker.clone(),
-                    ssh_servers: may_config.ssh_servers.clone(),
-                    permission_approver: permission_approver.clone(),
-                };
+        let provider_model_rows = fetch_all_models(may_config).await;
+        let mut exact_matches = provider_model_rows
+            .iter()
+            .filter(|row| row.id == model)
+            .map(|row| row.provider_id.clone())
+            .collect::<Vec<_>>();
 
-                return Self::new(config).await;
-            }
+        if exact_matches.is_empty() {
+            exact_matches = may_config
+                .provider
+                .iter()
+                .filter(|(id, p)| p.can_serve_model(id, model))
+                .map(|(id, _)| id.clone())
+                .collect();
         }
 
-        // Fallback: use the provider resolver to find a provider that can serve the model
-        let resolver = may_config.create_resolver();
-        let selected = resolver.select_provider(model).ok_or_else(|| {
+        exact_matches.sort();
+        exact_matches.dedup();
+
+        let pool = exact_matches
+            .into_iter()
+            .filter(|provider_id| {
+                may_config
+                    .provider
+                    .get(provider_id)
+                    .is_some_and(|instance| instance.is_valid(provider_id))
+            })
+            .collect::<Vec<_>>();
+
+        if pool.is_empty() {
+            return Err(MayAgentError::MissingApiKey(
+                ERR_NO_PROVIDER_FMT.replace("{model}", model),
+            ));
+        }
+
+        let picked_provider_id = match may_config.preferences.load_balance_strategy {
+            LoadBalanceStrategy::FailoverOnly => pool.first().cloned(),
+            LoadBalanceStrategy::Random => {
+                use std::collections::hash_map::RandomState;
+                use std::hash::{BuildHasher, Hasher};
+                let idx = RandomState::new().build_hasher().finish() as usize % pool.len();
+                pool.get(idx).cloned()
+            }
+            LoadBalanceStrategy::RoundRobin => {
+                // Use session_id to keep deterministic provider selection within one request/session.
+                let idx = session_id
+                    .as_str()
+                    .bytes()
+                    .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
+                    % pool.len();
+                pool.get(idx).cloned()
+            }
+        }
+        .ok_or_else(|| MayAgentError::MissingApiKey(ERR_NO_PROVIDER_FMT.replace("{model}", model)))?;
+
+        let instance = may_config.provider.get(&picked_provider_id).ok_or_else(|| {
             MayAgentError::MissingApiKey(ERR_NO_PROVIDER_FMT.replace("{model}", model))
         })?;
 
-        // Build the CloudProvider
+        let selected = SelectedProvider {
+            id: &picked_provider_id,
+            instance,
+        };
         let llm = build_cloud_provider(&selected, model).await?;
 
         let config = MayAgentConfig {

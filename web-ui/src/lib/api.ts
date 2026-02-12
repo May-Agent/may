@@ -19,6 +19,23 @@ interface ApiMessage {
   is_thinking?: boolean;
 }
 
+export interface ModelDetailsItem {
+  id: string;
+  nickname: string;
+  context_window?: number;
+  kind?: 'llm' | 'image' | 'embedding' | 'reranker' | string;
+  provider?: string;
+  abilities: string[];
+  reasoning_efforts?: string[];
+  reasoning_effort_default?: string;
+  adaptive_reasoning?: boolean;
+  reasoning_budget_tokens_min?: number;
+  reasoning_budget_tokens_max?: number;
+  embedding_dimensions?: number;
+  image_max_resolution?: string;
+  reranker_max_documents?: number;
+}
+
 interface ApiSession {
   id: string;
   title: string;
@@ -26,7 +43,7 @@ interface ApiSession {
   preview: string;
   messages: ApiMessage[];
   model: string;
-  reasoning_effort?: 'low' | 'medium' | 'high';
+  reasoning_effort?: string;
 }
 
 interface ChatResponse {
@@ -98,6 +115,11 @@ export interface UiModelsConfig {
 export interface UiPreferencesConfig {
   load_balance_strategy: 'round_robin' | 'failover_only' | 'random';
   warn_on_model_change: boolean;
+}
+
+export interface ModelReasoningPolicy {
+  enabled: boolean;
+  forcedLow: boolean;
 }
 
 export interface UiFullConfig {
@@ -321,9 +343,9 @@ export async function streamChat(input: {
   }
 }
 
-export async function fetchModels(): Promise<string[]> {
-  const data = await request<{ models: string[] }>('/api/models');
-  return data.models;
+export async function fetchModels(): Promise<{ models: string[]; details: ModelDetailsItem[] }> {
+  const data = await request<{ models: string[]; details?: ModelDetailsItem[] }>('/api/models');
+  return { models: data.models, details: data.details ?? [] };
 }
 
 export async function pollPermissionRequest(): Promise<PermissionRequest | null> {

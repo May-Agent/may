@@ -209,9 +209,36 @@ struct ChatResponse {
     assistant: ApiMessage,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct ModelInfoItem {
+    id: String,
+    nickname: String,
+    context_window: Option<u32>,
+    kind: String,
+    provider: String,
+    abilities: Vec<String>,
+    #[serde(default)]
+    reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    reasoning_effort_default: Option<String>,
+    adaptive_reasoning: bool,
+    #[serde(default)]
+    reasoning_budget_tokens_min: Option<u32>,
+    #[serde(default)]
+    reasoning_budget_tokens_max: Option<u32>,
+    #[serde(default)]
+    embedding_dimensions: Option<u32>,
+    #[serde(default)]
+    image_max_resolution: Option<String>,
+    #[serde(default)]
+    reranker_max_documents: Option<u32>,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct ModelsResponse {
     models: Vec<String>,
+    #[serde(default)]
+    details: Vec<ModelInfoItem>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -399,19 +426,98 @@ async fn health() -> SkyResult<Json<ApiHealth>> {
 
 async fn models() -> SkyResult<Json<ModelsResponse>> {
     let config = MayConfig::load().unwrap_or_default();
-    let mut models: Vec<String> = config.available_models().into_iter().map(|m| m.id).collect();
+    let mut model_map: std::collections::HashMap<String, ModelInfoItem> =
+        std::collections::HashMap::new();
+
+    for available in config.available_models() {
+        model_map
+            .entry(available.id.clone())
+            .or_insert_with(|| {
+                let meta = aither_models::model_meta(&available.id);
+                let reasoning_meta = aither_models::reasoning_meta(&available.id);
+                let specialized_meta = aither_models::specialized_meta(&available.id);
+                let mut abilities = aither_models::metadata_capabilities(&available.id)
+                    .iter()
+                    .map(|cap| cap.to_string())
+                    .collect::<Vec<_>>();
+                abilities.sort();
+                abilities.dedup();
+
+                ModelInfoItem {
+                    id: available.id.clone(),
+                    nickname: meta
+                        .map(|m| m.name.to_string())
+                        .unwrap_or_else(|| available.id.clone()),
+                    context_window: meta.map(|m| m.context_window),
+                    kind: meta
+                        .map(|m| m.kind.to_string())
+                        .unwrap_or_else(|| "llm".to_string()),
+                    provider: meta
+                        .map(|m| m.provider.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    abilities,
+                    reasoning_efforts: aither_models::reasoning_efforts(&available.id)
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    reasoning_effort_default: reasoning_meta.default_effort.map(|s| s.to_string()),
+                    adaptive_reasoning: reasoning_meta.adaptive_reasoning,
+                    reasoning_budget_tokens_min: reasoning_meta.budget_tokens_min,
+                    reasoning_budget_tokens_max: reasoning_meta.budget_tokens_max,
+                    embedding_dimensions: specialized_meta.embedding_dimensions,
+                    image_max_resolution: specialized_meta.image_max_resolution.map(|s| s.to_string()),
+                    reranker_max_documents: specialized_meta.reranker_max_documents,
+                }
+            });
+    }
 
     for tier in crate::config::ModelTier::ALL {
         for model in config.models.models_for_tier(*tier) {
-            if !models.iter().any(|m| m == model) {
-                models.push(model.clone());
-            }
+            model_map.entry(model.clone()).or_insert_with(|| {
+                let meta = aither_models::model_meta(model);
+                let reasoning_meta = aither_models::reasoning_meta(model);
+                let specialized_meta = aither_models::specialized_meta(model);
+                let mut abilities = aither_models::metadata_capabilities(model)
+                    .iter()
+                    .map(|cap| cap.to_string())
+                    .collect::<Vec<_>>();
+                abilities.sort();
+                abilities.dedup();
+
+                ModelInfoItem {
+                    id: model.clone(),
+                    nickname: meta
+                        .map(|m| m.name.to_string())
+                        .unwrap_or_else(|| model.clone()),
+                    context_window: meta.map(|m| m.context_window),
+                    kind: meta
+                        .map(|m| m.kind.to_string())
+                        .unwrap_or_else(|| "llm".to_string()),
+                    provider: meta
+                        .map(|m| m.provider.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    abilities,
+                    reasoning_efforts: aither_models::reasoning_efforts(model)
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    reasoning_effort_default: reasoning_meta.default_effort.map(|s| s.to_string()),
+                    adaptive_reasoning: reasoning_meta.adaptive_reasoning,
+                    reasoning_budget_tokens_min: reasoning_meta.budget_tokens_min,
+                    reasoning_budget_tokens_max: reasoning_meta.budget_tokens_max,
+                    embedding_dimensions: specialized_meta.embedding_dimensions,
+                    image_max_resolution: specialized_meta.image_max_resolution.map(|s| s.to_string()),
+                    reranker_max_documents: specialized_meta.reranker_max_documents,
+                }
+            });
         }
     }
 
-    models.sort();
-    models.dedup();
-    Ok(Json(ModelsResponse { models }))
+    let mut details = model_map.into_values().collect::<Vec<_>>();
+    details.sort_by(|a, b| a.id.cmp(&b.id));
+    let models = details.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+
+    Ok(Json(ModelsResponse { models, details }))
 }
 
 async fn list_sessions(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<Vec<ApiSession>>> {

@@ -17,7 +17,12 @@ export interface Model {
   id: string;
   name: string;
   provider: Provider;
+  kind?: 'llm' | 'image' | 'embedding' | 'reranker' | string;
   reasoning?: boolean;
+  alwaysReasoning?: boolean;
+  reasoningEfforts?: string[];
+  defaultReasoningEffort?: string;
+  adaptiveReasoning?: boolean;
 }
 
 export const DEFAULT_MODELS: Model[] = [
@@ -37,19 +42,50 @@ export const PROVIDER_ICONS: Record<Provider, ComponentType<{ className?: string
 
 export function inferProvider(modelId: string): Provider {
   const id = modelId.toLowerCase();
-  if (id.includes('claude')) return 'anthropic';
-  if (id.includes('gemini')) return 'google';
+  if (id.includes('anthropic') || id.includes('claude')) return 'anthropic';
+  if (id.includes('google') || id.includes('gemini')) return 'google';
   return 'openai';
 }
 
-export function buildModelCatalog(modelIds: string[]): Model[] {
+const REASONING_ABILITY = 'reasoning';
+const ALWAYS_REASONING_ABILITY = 'always_reasoning';
+
+function includesAbility(abilities: string[] | undefined, target: string): boolean {
+  return (abilities ?? []).some((a) => a.toLowerCase() === target);
+}
+
+export function buildModelCatalog(
+  modelIds: string[],
+  details: Array<{
+    id: string;
+    nickname: string;
+    abilities: string[];
+    kind?: string;
+    provider?: string;
+    reasoning_efforts?: string[];
+    reasoning_effort_default?: string;
+    adaptive_reasoning?: boolean;
+  }> = [],
+): Model[] {
   if (!modelIds.length) return DEFAULT_MODELS;
-  return modelIds.map((id) => ({
-    id,
-    name: id,
-    provider: inferProvider(id),
-    reasoning: /o1|reason/i.test(id),
-  }));
+
+  const detailMap = new Map(details.map((d) => [d.id, d]));
+
+  return modelIds.map((id) => {
+    const detail = detailMap.get(id);
+    const efforts = (detail?.reasoning_efforts ?? []).map((e) => e.toLowerCase());
+    return {
+      id,
+      name: detail?.nickname || id,
+      provider: (detail?.provider ? inferProvider(detail.provider) : inferProvider(id)),
+      kind: detail?.kind,
+      reasoning: includesAbility(detail?.abilities, REASONING_ABILITY),
+      alwaysReasoning: includesAbility(detail?.abilities, ALWAYS_REASONING_ABILITY),
+      reasoningEfforts: efforts,
+      defaultReasoningEffort: detail?.reasoning_effort_default?.toLowerCase(),
+      adaptiveReasoning: detail?.adaptive_reasoning,
+    };
+  });
 }
 
 export function getModel(modelId: string, catalog: Model[]): Model {
