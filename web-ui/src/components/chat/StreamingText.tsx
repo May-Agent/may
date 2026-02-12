@@ -28,14 +28,23 @@ export function TokenizedStream({ storeId, children }: { storeId: string; childr
   const text = extractText(children);
   const store = getOrCreate(storeId);
 
+  const pushTokens = (segment: string) => {
+    if (!segment) return;
+    const pieces = segment.match(/\s+|[^\s]+/g) ?? [segment];
+    for (const piece of pieces) {
+      store.tokens.push({ text: piece, key: store.counter++ });
+    }
+  };
+
   // Diff: only add new content
   if (text.length > store.fullText.length && text.startsWith(store.fullText)) {
     const newContent = text.slice(store.fullText.length);
-    store.tokens.push({ text: newContent, key: store.counter++ });
+    pushTokens(newContent);
     store.fullText = text;
   } else if (!text.startsWith(store.fullText)) {
     // Text was completely replaced (e.g. markdown re-parse changed structure)
-    store.tokens = [{ text, key: store.counter++ }];
+    store.tokens = [];
+    pushTokens(text);
     store.fullText = text;
   }
 
@@ -45,10 +54,11 @@ export function TokenizedStream({ storeId, children }: { storeId: string; childr
         <span
           key={t.key}
           style={{
-            animationName: 'streaming-fade',
-            animationDuration: '0.35s',
+            animationName: 'streaming-token-fade',
+            animationDuration: '220ms',
             animationTimingFunction: 'ease-out',
             animationFillMode: 'both',
+            display: 'inline',
           }}
         >
           {t.text}

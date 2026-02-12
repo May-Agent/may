@@ -2,13 +2,14 @@ import { create } from 'zustand';
 import { v4 as uuidv4 } from 'uuid';
 import type { Session, Message, Project, Attachment } from '@/types';
 import * as api from '@/lib/api';
-import { buildModelCatalog, DEFAULT_MODELS, type Model } from '@/lib/constants';
+import { buildModelCatalog, type Model } from '@/lib/constants';
 
 interface AppState {
   sessions: Session[];
   currentSessionId: string | null;
   projects: Project[];
   models: Model[];
+  modelsLoaded: boolean;
   settings: {
     font: string;
     theme: 'light' | 'dark' | 'system';
@@ -46,6 +47,7 @@ interface AppState {
 
   refreshRuntimeSettings: () => Promise<void>;
   refreshFullConfig: () => Promise<void>;
+  refreshModelsFromProviders: () => Promise<void>;
   saveFullConfig: (config: api.UiFullConfig) => Promise<void>;
   addSshServer: (name: string, target: string) => Promise<void>;
   removeSshServer: (name: string) => Promise<void>;
@@ -74,18 +76,28 @@ const MOCK_PROJECTS: Project[] = [
   },
 ];
 
+
 function sortSessions(sessions: Session[]): Session[] {
-  return [...sessions].sort(
-    (a, b) =>
-      new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime(),
-  );
+  return [...sessions].sort((a, b) => {
+    const aHasMessages = (a.messages?.length ?? 0) > 0;
+    const bHasMessages = (b.messages?.length ?? 0) > 0;
+
+    if (aHasMessages !== bHasMessages) {
+      return bHasMessages ? 1 : -1;
+    }
+
+    return (
+      new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime()
+    );
+  });
 }
 
 export const useStore = create<AppState>((set, get) => ({
   sessions: [],
   currentSessionId: null,
   projects: MOCK_PROJECTS,
-  models: DEFAULT_MODELS,
+  models: [],
+  modelsLoaded: false,
   settings: { font: 'Inter', theme: 'system' },
   loaded: false,
 
@@ -110,7 +122,12 @@ export const useStore = create<AppState>((set, get) => ({
       mcpServersRes,
       skillsRes,
     ] = await Promise.allSettled([
-      api.fetchSessions(),
+      (async () => {
+        const first = await api.fetchSessions();
+        if (first.length > 0) return first;
+        await new Promise((r) => setTimeout(r, 600));
+        return api.fetchSessions();
+      })(),
       api.fetchModels(),
       api.fetchUiConfig(),
       api.fetchFullConfig(),
@@ -119,12 +136,24 @@ export const useStore = create<AppState>((set, get) => ({
       api.fetchSkills(),
     ]);
 
-    const sessions = sessionsRes.status === 'fulfilled' ? sessionsRes.value : [];
-    const modelIds = modelIdsRes.status === 'fulfilled' ? modelIdsRes.value : [];
+    // Sessions are the critical payload for chat history; if this fails once on refresh,
+    // retry instead of permanently locking the UI into an empty history state.
+    if (sessionsRes.status !== 'fulfilled') {
+      setTimeout(() => {
+        void get().loadInitialData();
+      }, 1200);
+      return;
+    }
+
+    const sessions = sessionsRes.value;
+    const modelPayload =
+      modelIdsRes.status === 'fulfilled'
+        ? modelIdsRes.value
+        : { models: [], details: [] as api.ModelDetailsItem[] };
     const uiConfig =
       uiConfigRes.status === 'fulfilled'
         ? uiConfigRes.value
-        : { ssh_servers: [], max_iterations: 50 };
+        : { ssh_servers: [], max_iterations: 50, ui_font: 'Inter', ui_theme: 'system' as const };
     const fullConfig = fullConfigRes.status === 'fulfilled' ? fullConfigRes.value : null;
     const memoryContent = memoryRes.status === 'fulfilled' ? memoryRes.value : '';
     const mcpServers = mcpServersRes.status === 'fulfilled' ? mcpServersRes.value : [];
@@ -133,7 +162,12 @@ export const useStore = create<AppState>((set, get) => ({
     const sorted = sortSessions(sessions);
     set({
       sessions: sorted,
-      models: buildModelCatalog(modelIds),
+      models: buildModelCatalog(modelPayload.models, modelPayload.details),
+      modelsLoaded: true,
+      settings: {
+        font: uiConfig.ui_font,
+        theme: uiConfig.ui_theme,
+      },
       uiConfig: {
         sshServers: uiConfig.ssh_servers,
         maxIterations: uiConfig.max_iterations,
@@ -263,6 +297,10 @@ export const useStore = create<AppState>((set, get) => ({
   refreshRuntimeSettings: async () => {
     const config = await api.fetchUiConfig();
     set((state) => ({
+      settings: {
+        font: config.ui_font,
+        theme: config.ui_theme,
+      },
       uiConfig: {
         ...state.uiConfig,
         sshServers: config.ssh_servers,
@@ -274,6 +312,11 @@ export const useStore = create<AppState>((set, get) => ({
   refreshFullConfig: async () => {
     const fullConfig = await api.fetchFullConfig();
     set((state) => ({ uiConfig: { ...state.uiConfig, fullConfig } }));
+  },
+
+  refreshModelsFromProviders: async () => {
+    const payload = await api.fetchModels();
+    set({ models: buildModelCatalog(payload.models, payload.details), modelsLoaded: true });
   },
 
   saveFullConfig: async (fullConfig) => {

@@ -248,37 +248,61 @@ impl ProviderType {
     /// OpenRouter can serve most models from other providers.
     /// Native providers can only serve their own models.
     pub fn can_serve_model(self, model_id: &str) -> bool {
-        // OpenRouter is an aggregator - it can serve most models
+        let model = model_id.to_ascii_lowercase();
+
+        // OpenRouter is an aggregator - it can serve most models.
         if self == Self::OpenRouter {
             return true;
         }
 
-        // Ollama can run any model that's been pulled locally
+        // Ollama can run any model that's been pulled locally.
         if self == Self::Ollama {
             return true;
         }
 
-        // Custom providers - we don't know what they support
+        // Custom providers - user-defined compatibility.
         if self == Self::Custom {
             return true;
         }
 
-        // Copilot can serve OpenAI and Anthropic models, but not Google models.
-        if self == Self::Copilot {
-            if let Some(info) = aither_models::lookup(model_id) {
-                return info.provider.eq_ignore_ascii_case("openai")
-                    || info.provider.eq_ignore_ascii_case("anthropic");
-            }
-            // Unknown model - allow the provider to try
-            return true;
+        // Prefer authoritative catalog match when available.
+        if let Some(info) = aither_models::lookup(model_id) {
+            return match self {
+                Self::Copilot => {
+                    info.provider.eq_ignore_ascii_case("openai")
+                        || info.provider.eq_ignore_ascii_case("anthropic")
+                }
+                _ => info.provider.eq_ignore_ascii_case(self.aither_provider()),
+            };
         }
 
-        // For native providers, check if the model belongs to them
-        if let Some(info) = aither_models::lookup(model_id) {
-            info.provider.eq_ignore_ascii_case(self.aither_provider())
-        } else {
-            // Unknown model - allow the provider to try
-            true
+        // Fallback heuristics for newer/unknown model IDs.
+        match self {
+            Self::Anthropic => model.starts_with("claude"),
+            Self::OpenAI => {
+                model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3")
+            }
+            Self::Google => model.starts_with("gemini"),
+            Self::Copilot => {
+                model.starts_with("gpt")
+                    || model.starts_with("o1")
+                    || model.starts_with("o3")
+                    || model.starts_with("claude")
+            }
+            Self::DeepSeek => model.starts_with("deepseek"),
+            Self::Groq => {
+                model.starts_with("llama")
+                    || model.starts_with("mixtral")
+                    || model.starts_with("qwen")
+            }
+            Self::Together => {
+                model.starts_with("llama")
+                    || model.starts_with("qwen")
+                    || model.starts_with("mistral")
+            }
+            Self::Mistral => model.starts_with("mistral"),
+            Self::XAI => model.starts_with("grok"),
+            Self::OpenRouter | Self::Ollama | Self::Custom => true,
         }
     }
 }
@@ -558,6 +582,9 @@ pub struct Preferences {
     /// Warn user when changing model mid-conversation
     #[serde(default = "default_true")]
     pub warn_on_model_change: bool,
+    /// Show token/context usage in chat UI.
+    #[serde(default = "default_true")]
+    pub show_token_usage: bool,
 }
 
 impl Default for Preferences {
@@ -565,8 +592,35 @@ impl Default for Preferences {
         Self {
             load_balance_strategy: LoadBalanceStrategy::RoundRobin,
             warn_on_model_change: true,
+            show_token_usage: true,
         }
     }
+}
+
+/// UI appearance preferences persisted in config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Appearance {
+    #[serde(default = "default_ui_font")]
+    pub font: String,
+    #[serde(default = "default_ui_theme")]
+    pub theme: String,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            font: default_ui_font(),
+            theme: default_ui_theme(),
+        }
+    }
+}
+
+fn default_ui_font() -> String {
+    "Inter".to_string()
+}
+
+fn default_ui_theme() -> String {
+    "system".to_string()
 }
 
 /// May agent configuration.
@@ -585,6 +639,9 @@ pub struct MayConfig {
     /// Global preferences.
     #[serde(default)]
     pub preferences: Preferences,
+    /// UI appearance settings.
+    #[serde(default)]
+    pub appearance: Appearance,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
@@ -604,6 +661,7 @@ impl Default for MayConfig {
             provider: HashMap::new(),
             models: ModelsConfig::default(),
             preferences: Preferences::default(),
+            appearance: Appearance::default(),
             last_model: None,
             ssh_servers: Vec::new(),
         }
@@ -864,14 +922,34 @@ impl ProviderResolver {
         let failed = self.failed.read().expect("failed lock poisoned");
         let failed_ids = failed.get(model_id);
 
-        self.providers
-            .iter()
-            .filter(|(id, p)| {
-                p.can_serve_model(id, model_id)
-                    && failed_ids.map(|ids| !ids.contains(*id)).unwrap_or(true)
-            })
-            .map(|(id, _)| id.as_str())
-            .collect()
+        let mut explicit = Vec::new();
+        let mut generic = Vec::new();
+
+        for (id, p) in &self.providers {
+            if !p.can_serve_model(id, model_id)
+                || failed_ids.map(|list| list.contains(id)).unwrap_or(false)
+            {
+                continue;
+            }
+
+            match p.resolve_type(id) {
+                ProviderType::OpenRouter | ProviderType::Ollama | ProviderType::Custom => {
+                    generic.push(id.as_str())
+                }
+                _ => explicit.push(id.as_str()),
+            }
+        }
+
+        // Prefer explicit provider-model matches first; use generic aggregators as fallback.
+        let mut ids = if explicit.is_empty() {
+            generic
+        } else {
+            explicit
+        };
+
+        // Keep provider ordering deterministic; HashMap iteration order is not stable.
+        ids.sort_unstable();
+        ids
     }
 
     /// Select the next provider for a model based on strategy.
