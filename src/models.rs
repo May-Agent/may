@@ -42,9 +42,9 @@ pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
         }
     }
 
-    // Sort and dedupe
-    models.sort_by(|a, b| a.id.cmp(&b.id));
-    models.dedup_by(|a, b| a.id == b.id);
+    // Sort and dedupe by (model_id, provider_id) so we keep provider-level availability.
+    models.sort_by(|a, b| a.id.cmp(&b.id).then(a.provider_id.cmp(&b.provider_id)));
+    models.dedup_by(|a, b| a.id == b.id && a.provider_id == b.provider_id);
     models
 }
 

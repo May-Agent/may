@@ -12,6 +12,7 @@ import {
 import { MessageItem } from "./MessageItem";
 import { ModelSelector } from "./ModelSelector";
 import { AttachmentPreview } from "./AttachmentPreview";
+import { getModel } from "@/lib/constants";
 
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
@@ -99,6 +100,10 @@ export function ChatInterface({
   const messages = currentSession?.messages || [];
   const isNewChat = !currentSessionId || !currentSession;
   const hasInput = inputValue.trim() || attachments.length > 0;
+  const selectedModelMeta = getModel(
+    isNewChat ? newChatModelId : (currentSession?.model ?? newChatModelId),
+    models,
+  );
 
   useEffect(() => {
     const persisted = uiConfig.fullConfig?.last_model;
@@ -917,7 +922,7 @@ export function ChatInterface({
               <div className="flex items-center gap-2">
                 <ModelSelector
                   currentModelId={currentModelId}
-                  currentReasoningEffort={currentReasoningEffort}
+                  currentReasoningEffort={selectedModelMeta.alwaysReasoning ? 'low' : (currentReasoningEffort ?? selectedModelMeta.defaultReasoningEffort)}
                   onModelChange={(id) => {
                     if (isNewChat) {
                       setNewChatModelId(id);

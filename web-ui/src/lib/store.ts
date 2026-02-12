@@ -37,7 +37,7 @@ interface AppState {
   updateSessionModel: (sessionId: string, model: string) => Promise<void>;
   updateSessionReasoningEffort: (
     sessionId: string,
-    effort: 'low' | 'medium' | 'high',
+    effort: string,
   ) => void;
   replaceSessionMessages: (sessionId: string, messages: Message[]) => void;
 
@@ -120,7 +120,10 @@ export const useStore = create<AppState>((set, get) => ({
     ]);
 
     const sessions = sessionsRes.status === 'fulfilled' ? sessionsRes.value : [];
-    const modelIds = modelIdsRes.status === 'fulfilled' ? modelIdsRes.value : [];
+    const modelPayload =
+      modelIdsRes.status === 'fulfilled'
+        ? modelIdsRes.value
+        : { models: [] as string[], details: [] as api.ModelDetailsItem[] };
     const uiConfig =
       uiConfigRes.status === 'fulfilled'
         ? uiConfigRes.value
@@ -133,7 +136,7 @@ export const useStore = create<AppState>((set, get) => ({
     const sorted = sortSessions(sessions);
     set({
       sessions: sorted,
-      models: buildModelCatalog(modelIds),
+      models: buildModelCatalog(modelPayload.models, modelPayload.details),
       uiConfig: {
         sshServers: uiConfig.ssh_servers,
         maxIterations: uiConfig.max_iterations,

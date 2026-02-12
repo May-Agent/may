@@ -9,16 +9,22 @@ import { useStore } from '@/lib/store';
 
 interface ModelSelectorProps {
   currentModelId: string;
-  currentReasoningEffort?: 'low' | 'medium' | 'high';
+  currentReasoningEffort?: string;
   onModelChange: (modelId: string) => void;
-  onReasoningEffortChange: (effort: 'low' | 'medium' | 'high') => void;
+  onReasoningEffortChange: (effort: string) => void;
 }
 
-export function ModelSelector({ currentModelId, currentReasoningEffort = 'medium', onModelChange, onReasoningEffortChange }: ModelSelectorProps) {
+export function ModelSelector({ currentModelId, currentReasoningEffort, onModelChange, onReasoningEffortChange }: ModelSelectorProps) {
   const [open, setOpen] = useState(false);
   const { models } = useStore();
   const selected = getModel(currentModelId, models);
   const SelectedIcon = PROVIDER_ICONS[selected.provider];
+  const alwaysReasoning = !!selected.alwaysReasoning;
+  const availableEfforts = (selected.reasoningEfforts?.length ? selected.reasoningEfforts : ['low', 'medium', 'high'])
+    .filter((e) => !alwaysReasoning || e === 'low');
+  const selectedEffort = alwaysReasoning
+    ? 'low'
+    : (currentReasoningEffort || selected.defaultReasoningEffort || availableEfforts[0] || 'medium');
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -55,19 +61,26 @@ export function ModelSelector({ currentModelId, currentReasoningEffort = 'medium
             </CommandGroup>
           </CommandList>
         </Command>
-        {selected.reasoning && (
+        {selected.reasoning && selected.kind !== 'image' && selected.kind !== 'embedding' && selected.kind !== 'reranker' && (
           <div className="border-t p-3 bg-muted/30">
             <div className="flex items-center justify-between gap-2">
               <span className="text-xs font-medium text-muted-foreground">Reasoning Effort</span>
-              <Select value={currentReasoningEffort} onValueChange={(v) => onReasoningEffortChange(v as 'low' | 'medium' | 'high')}>
-                <SelectTrigger className="h-7 w-[100px] text-xs"><SelectValue /></SelectTrigger>
+              <Select
+                value={selectedEffort}
+                onValueChange={(v) => onReasoningEffortChange(v)}
+                disabled={alwaysReasoning}
+              >
+                <SelectTrigger className="h-7 w-[120px] text-xs"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="low">Low</SelectItem>
-                  <SelectItem value="medium">Medium</SelectItem>
-                  <SelectItem value="high">High</SelectItem>
+                  {availableEfforts.map((effort) => (
+                    <SelectItem key={effort} value={effort}>{effort.toUpperCase()}</SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
+            {alwaysReasoning && (
+              <div className="mt-1 text-[11px] text-muted-foreground">This model always uses reasoning (low).</div>
+            )}
           </div>
         )}
       </PopoverContent>
