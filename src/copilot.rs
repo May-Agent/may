@@ -8,8 +8,8 @@
 
 use crate::config::MayConfig;
 use aither_copilot::auth::{CopilotToken, SessionToken};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 
 /// Token file name for OAuth token (long-lived).

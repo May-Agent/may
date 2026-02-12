@@ -135,7 +135,8 @@ pub struct App {
     /// Receiver for clipboard paste resolution (oneshot)
     pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, anyhow::Error>>>,
     /// Pending paste results waiting to be handled
-    pub pending_paste_results: std::collections::VecDeque<Result<ClipboardPasteResult, anyhow::Error>>,
+    pub pending_paste_results:
+        std::collections::VecDeque<Result<ClipboardPasteResult, anyhow::Error>>,
     /// Pending attachment jobs (clipboard read / download)
     pub pending_attachment_jobs: usize,
     /// Cumulative token usage for current session
@@ -935,9 +936,10 @@ impl App {
             KeyCode::Tab => {
                 // Accept completion if active
                 if self.completion.is_active()
-                    && let Some(item) = self.completion.complete() {
-                        self.accept_completion(&item.insert.clone());
-                    }
+                    && let Some(item) = self.completion.complete()
+                {
+                    self.accept_completion(&item.insert.clone());
+                }
             }
             KeyCode::Char(c) => {
                 // Reset history navigation when typing
@@ -1105,7 +1107,9 @@ impl App {
                 spawn(async move {
                     let result = crate::session::list_summaries_from_db(&db).await;
                     let _ = tx
-                        .send(AppEvent::SessionsLoaded(result.map_err(anyhow::Error::from)))
+                        .send(AppEvent::SessionsLoaded(
+                            result.map_err(anyhow::Error::from),
+                        ))
                         .await;
                 })
                 .detach();
@@ -1148,9 +1152,10 @@ impl App {
                     .current_model
                     .as_deref()
                     .or(self.config.last_model.as_deref())
-                    && let Some(idx) = self.model_select_list.iter().position(|m| m == current) {
-                        self.model_select_index = idx;
-                    }
+                    && let Some(idx) = self.model_select_list.iter().position(|m| m == current)
+                {
+                    self.model_select_index = idx;
+                }
                 self.mode = AppMode::ModelSelect;
                 Ok(None)
             }
@@ -1197,14 +1202,15 @@ impl App {
                 // Select model and add to tier
                 if let Some(&idx) = self.tier_picker_filtered.get(self.tier_picker_selected)
                     && let Some(model) = self.tier_picker_models.get(idx)
-                        && let Some(tier) = self.tier_picker_tier {
-                            self.config
-                                .models
-                                .add_model(tier, &model.id, &model.provider_id);
-                            if let Err(e) = self.config.save() {
-                                tracing::error!("Failed to save config: {}", e);
-                            }
-                        }
+                    && let Some(tier) = self.tier_picker_tier
+                {
+                    self.config
+                        .models
+                        .add_model(tier, &model.id, &model.provider_id);
+                    if let Err(e) = self.config.save() {
+                        tracing::error!("Failed to save config: {}", e);
+                    }
+                }
                 self.mode = AppMode::Config;
                 self.tier_picker_query.clear();
             }
@@ -1434,16 +1440,17 @@ impl App {
             KeyCode::Char('d') | KeyCode::Delete => {
                 // Delete provider (only in Providers section)
                 if state.section == ConfigSection::Providers
-                    && let Some(id) = state.provider_ids.get(state.selected).cloned() {
-                        self.config.provider.remove(&id);
-                        state.load_providers(&self.config);
-                        if state.selected >= state.provider_ids.len() && state.selected > 0 {
-                            state.selected -= 1;
-                        }
-                        if let Err(e) = self.config.save() {
-                            tracing::error!("Failed to save config: {}", e);
-                        }
+                    && let Some(id) = state.provider_ids.get(state.selected).cloned()
+                {
+                    self.config.provider.remove(&id);
+                    state.load_providers(&self.config);
+                    if state.selected >= state.provider_ids.len() && state.selected > 0 {
+                        state.selected -= 1;
                     }
+                    if let Err(e) = self.config.save() {
+                        tracing::error!("Failed to save config: {}", e);
+                    }
+                }
             }
             KeyCode::Esc => {
                 if !self.needs_setup {
@@ -1483,19 +1490,20 @@ impl App {
                     // Check if this is a custom provider (has base_url)
                     let instance = self.config.provider.get(&id);
                     if let Some(inst) = instance
-                        && inst.base_url.is_some() {
-                            // Custom provider - open full edit form
-                            state.edit_mode = ConfigEditMode::CustomProvider {
-                                focused_field: 0,
-                                name: id.clone(),
-                                base_url: inst.base_url.clone().unwrap_or_default(),
-                                api_key: inst.api_key.clone().unwrap_or_default(),
-                                cursor: id.chars().count(),
-                                editing_existing: true,
-                                original_name: Some(id),
-                            };
-                            return Ok(None);
-                        }
+                        && inst.base_url.is_some()
+                    {
+                        // Custom provider - open full edit form
+                        state.edit_mode = ConfigEditMode::CustomProvider {
+                            focused_field: 0,
+                            name: id.clone(),
+                            base_url: inst.base_url.clone().unwrap_or_default(),
+                            api_key: inst.api_key.clone().unwrap_or_default(),
+                            cursor: id.chars().count(),
+                            editing_existing: true,
+                            original_name: Some(id),
+                        };
+                        return Ok(None);
+                    }
                     // Regular provider - just edit API key
                     let current_key = self
                         .config
@@ -1732,9 +1740,10 @@ impl App {
                     // If editing existing and name changed, remove old entry
                     if was_editing
                         && let Some(ref old_name) = orig_name
-                            && old_name != &name_val {
-                                self.config.provider.remove(old_name);
-                            }
+                        && old_name != &name_val
+                    {
+                        self.config.provider.remove(old_name);
+                    }
 
                     // Create new provider instance
                     let mut instance = crate::config::ProviderInstance::new(ProviderType::Custom);
@@ -2006,13 +2015,14 @@ impl App {
 
         let trimmed = content.trim();
         if let Some(rest) = trimmed.strip_prefix("/compact")
-            && attachments.is_empty() {
-                let focus = rest.trim();
-                if focus.is_empty() {
-                    return SendAction::Compact(None);
-                }
-                return SendAction::Compact(Some(focus.to_string()));
+            && attachments.is_empty()
+        {
+            let focus = rest.trim();
+            if focus.is_empty() {
+                return SendAction::Compact(None);
             }
+            return SendAction::Compact(Some(focus.to_string()));
+        }
 
         let msg = PendingMessage {
             content,
@@ -2290,9 +2300,10 @@ impl App {
 
         // Only return if cursor is within the mention
         if let Some(pos) = last_at
-            && self.cursor > pos {
-                return Some(pos);
-            }
+            && self.cursor > pos
+        {
+            return Some(pos);
+        }
         None
     }
 

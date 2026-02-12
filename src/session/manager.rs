@@ -124,7 +124,10 @@ impl SessionSummary {
 /// useful for spawned tasks that only need a `ChatDb` clone.
 pub async fn list_summaries_from_db(db: &ChatDb) -> Result<Vec<SessionSummary>, SessionError> {
     let db_sessions = db.list_sessions().await?;
-    Ok(db_sessions.into_iter().map(SessionSummary::from_db_model).collect())
+    Ok(db_sessions
+        .into_iter()
+        .map(SessionSummary::from_db_model)
+        .collect())
 }
 
 /// Manages sessions and their lifecycle.
@@ -217,11 +220,15 @@ impl SessionManager {
                 .unwrap_or_else(|| jiff::Timestamp::now().to_string());
 
             // Create session in DB
-            if let Err(e) = self.db.create_session(
-                id_str,
-                history.metadata.title.as_deref(),
-                history.metadata.model.as_deref(),
-            ).await {
+            if let Err(e) = self
+                .db
+                .create_session(
+                    id_str,
+                    history.metadata.title.as_deref(),
+                    history.metadata.model.as_deref(),
+                )
+                .await
+            {
                 tracing::warn!("Failed to create DB session for {}: {}", id_str, e);
                 continue;
             }
@@ -362,7 +369,12 @@ impl SessionManager {
                 .last()
                 .and_then(|m| m.timestamp)
                 .unwrap_or(ca);
-            (history.metadata.title.clone(), history.metadata.model.clone(), ca, ua)
+            (
+                history.metadata.title.clone(),
+                history.metadata.model.clone(),
+                ca,
+                ua,
+            )
         };
 
         // Load messages from DB to build ChatHistory
@@ -403,8 +415,7 @@ impl SessionManager {
 
         // Convert DB message rows to ChatMessage
         for msg in db_messages {
-            let role = MessageRole::from_str(&msg.role)
-                .unwrap_or(MessageRole::User);
+            let role = MessageRole::from_str(&msg.role).unwrap_or(MessageRole::User);
             let timestamp = msg
                 .timestamp
                 .as_deref()

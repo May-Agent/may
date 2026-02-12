@@ -33,11 +33,12 @@ pub(crate) fn handle_session_select_key(
         }
         KeyCode::Enter => {
             if let Some((original_idx, _)) = filtered.get(app.session_selected)
-                && let Some(summary) = app.session_list.get(*original_idx) {
-                    let id = summary.id.clone();
-                    app.mode = AppMode::Chat;
-                    return Ok(Some(SendAction::LoadSession(id)));
-                }
+                && let Some(summary) = app.session_list.get(*original_idx)
+            {
+                let id = summary.id.clone();
+                app.mode = AppMode::Chat;
+                return Ok(Some(SendAction::LoadSession(id)));
+            }
         }
         KeyCode::Backspace => {
             app.session_search.pop();
@@ -65,41 +66,41 @@ pub(crate) fn handle_session_select_key(
                     }
                     'd' => {
                         if let Some((original_idx, _)) = filtered.get(app.session_selected)
-                            && let Some(summary) = app.session_list.get(*original_idx) {
-                                let deleted_id = summary.id.as_str().to_string();
-                                let was_current = app
-                                    .session_manager
-                                    .current()
-                                    .map(|s| s.id.as_str() == deleted_id)
-                                    .unwrap_or(false);
+                            && let Some(summary) = app.session_list.get(*original_idx)
+                        {
+                            let deleted_id = summary.id.as_str().to_string();
+                            let was_current = app
+                                .session_manager
+                                .current()
+                                .map(|s| s.id.as_str() == deleted_id)
+                                .unwrap_or(false);
 
-                                let tx = app.event_tx.clone();
-                                let db = app.session_manager.db().clone();
-                                let store = app.session_manager.store().clone();
-                                executor_core::spawn(async move {
-                                    // Delete from both DB and filesystem
-                                    if let Err(e) = db.delete_session(&deleted_id).await {
-                                        let _ = tx
-                                            .send(crate::tui::event::AppEvent::SessionDeleted {
-                                                was_current,
-                                                result: Err(anyhow::Error::from(e)),
-                                            })
-                                            .await;
-                                        return;
-                                    }
-                                    let _ = store.delete_session(&deleted_id).await;
-                                    let result =
-                                        crate::session::list_summaries_from_db(&db).await;
+                            let tx = app.event_tx.clone();
+                            let db = app.session_manager.db().clone();
+                            let store = app.session_manager.store().clone();
+                            executor_core::spawn(async move {
+                                // Delete from both DB and filesystem
+                                if let Err(e) = db.delete_session(&deleted_id).await {
                                     let _ = tx
                                         .send(crate::tui::event::AppEvent::SessionDeleted {
                                             was_current,
-                                            result: result.map_err(anyhow::Error::from),
+                                            result: Err(anyhow::Error::from(e)),
                                         })
                                         .await;
-                                })
-                                .detach();
-                                app.status = Some("Deleting session...".to_string());
-                            }
+                                    return;
+                                }
+                                let _ = store.delete_session(&deleted_id).await;
+                                let result = crate::session::list_summaries_from_db(&db).await;
+                                let _ = tx
+                                    .send(crate::tui::event::AppEvent::SessionDeleted {
+                                        was_current,
+                                        result: result.map_err(anyhow::Error::from),
+                                    })
+                                    .await;
+                            })
+                            .detach();
+                            app.status = Some("Deleting session...".to_string());
+                        }
                         return Ok(None);
                     }
                     _ => {}

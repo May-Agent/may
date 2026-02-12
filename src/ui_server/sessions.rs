@@ -7,13 +7,11 @@ use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 use crate::session::SessionId;
 
 use super::helpers::{
-    bad_request_error, internal_error, map_db_messages, map_history_messages,
-    persist_last_model, preferred_advanced_model, resolve_default_model, truncate_preview,
+    bad_request_error, internal_error, map_db_messages, map_history_messages, persist_last_model,
+    preferred_advanced_model, resolve_default_model, truncate_preview,
 };
 use super::state::UiServerState;
-use super::types::{
-    ApiHealth, ApiSession, CreateSessionRequest, UpdateSessionRequest,
-};
+use super::types::{ApiHealth, ApiSession, CreateSessionRequest, UpdateSessionRequest};
 
 pub(super) async fn list_sessions(
     State(state): State<Arc<UiServerState>>,

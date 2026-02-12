@@ -98,13 +98,10 @@ impl AskUserApprover {
         };
 
         let (tx, rx) = bounded(1);
-        self.pending.lock().await.insert(
-            id.clone(),
-            AskUserPending {
-                tx,
-                session_id,
-            },
-        );
+        self.pending
+            .lock()
+            .await
+            .insert(id.clone(), AskUserPending { tx, session_id });
 
         if self.request_tx.send(payload).await.is_err() {
             let _ = self.pending.lock().await.remove(&id);

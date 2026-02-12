@@ -323,9 +323,10 @@ impl McpManager {
     pub async fn remove_server(&mut self, name: &str) -> Result<(), McpError> {
         // Close connection if exists
         if let Some(mut state) = self.connections.remove(name)
-            && let Some(conn) = state.connection_mut() {
-                let _ = conn.close().await;
-            }
+            && let Some(conn) = state.connection_mut()
+        {
+            let _ = conn.close().await;
+        }
 
         // Remove from config
         self.config.mcp_servers.remove(name);

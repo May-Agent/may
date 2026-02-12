@@ -166,14 +166,15 @@ where
 
     // Only start a session if configuration is complete
     if app.is_configured()
-        && let Err(e) = runtime_deps.start_new_session(&mut app, &mut worker).await {
-            tracing::warn!("Initial session start failed: {}", e);
-            app.mode = may_agent::tui::AppMode::Chat;
-            app.status = Some(format!(
-                "Session start failed: {} (open /config to fix provider/model)",
-                e
-            ));
-        }
+        && let Err(e) = runtime_deps.start_new_session(&mut app, &mut worker).await
+    {
+        tracing::warn!("Initial session start failed: {}", e);
+        app.mode = may_agent::tui::AppMode::Chat;
+        app.status = Some(format!(
+            "Session start failed: {} (open /config to fix provider/model)",
+            e
+        ));
+    }
 
     // Main event loop - only receives from channels, never blocks on agent processing
     main_event_loop(
@@ -223,10 +224,11 @@ where
 
         // Check for model fetch results (non-blocking)
         if let Some(ref mut rx) = app.model_fetch_rx
-            && let Ok(models) = rx.try_recv() {
-                app.handle_fetched_models(models);
-                app.model_fetch_rx = None;
-            }
+            && let Ok(models) = rx.try_recv()
+        {
+            app.handle_fetched_models(models);
+            app.model_fetch_rx = None;
+        }
 
         // Check for clipboard paste results (non-blocking)
         if let Some(ref mut rx) = app.clipboard_rx {
@@ -254,12 +256,13 @@ where
         // Check for queued messages - start processing if agent is idle
         if agent_handle.is_none()
             && let Some(msg) = app.next_queued()
-                && let Some(w) = worker.as_ref() {
-                    agent_handle =
-                        Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
-                    assistant_response.clear();
-                    continue;
-                }
+            && let Some(w) = worker.as_ref()
+        {
+            agent_handle =
+                Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
+            assistant_response.clear();
+            continue;
+        }
 
         // DIAGNOSTIC: Check channel states before entering select
         tracing::info!(
@@ -408,24 +411,25 @@ where
             Event::Terminal(terminal_event) => {
                 // Check for interrupt during agent processing
                 if agent_handle.is_some()
-                    && let AppEvent::Key(key_code, modifiers) = &terminal_event {
-                        let is_ctrl_c = *key_code == KeyCode::Char('c')
-                            && modifiers.contains(KeyModifiers::CONTROL);
-                        let is_esc = *key_code == KeyCode::Esc;
-                        if is_ctrl_c || is_esc {
-                            tracing::info!("Agent interrupted by user");
-                            if let Some(handle) = agent_handle.take() {
-                                handle.cancel();
-                            }
-                            // Clean up loading/streaming state before adding interrupt message
-                            app.chat.end_loading();
-                            app.chat.end_text();
-                            app.chat.push_text("\n\n[Interrupted]");
-                            app.chat.end_text();
-                            app.finish_processing();
-                            continue;
+                    && let AppEvent::Key(key_code, modifiers) = &terminal_event
+                {
+                    let is_ctrl_c = *key_code == KeyCode::Char('c')
+                        && modifiers.contains(KeyModifiers::CONTROL);
+                    let is_esc = *key_code == KeyCode::Esc;
+                    if is_ctrl_c || is_esc {
+                        tracing::info!("Agent interrupted by user");
+                        if let Some(handle) = agent_handle.take() {
+                            handle.cancel();
                         }
+                        // Clean up loading/streaming state before adding interrupt message
+                        app.chat.end_loading();
+                        app.chat.end_text();
+                        app.chat.push_text("\n\n[Interrupted]");
+                        app.chat.end_text();
+                        app.finish_processing();
+                        continue;
                     }
+                }
 
                 // Handle normal terminal events
                 match app.handle_event(terminal_event)? {
@@ -475,9 +479,10 @@ where
                     }
                     Some(SendAction::OpenCopilotAuthUrl { url, code }) => {
                         if let Ok(mut clipboard) = arboard::Clipboard::new()
-                            && let Err(e) = clipboard.set_text(&code) {
-                                tracing::warn!("Failed to copy code to clipboard: {}", e);
-                            }
+                            && let Err(e) = clipboard.set_text(&code)
+                        {
+                            tracing::warn!("Failed to copy code to clipboard: {}", e);
+                        }
                         if let Err(e) = open::that(&url) {
                             tracing::warn!("Failed to open URL in browser: {}", e);
                         }
@@ -685,9 +690,10 @@ where
                             SendAction::Quit => return Ok(()),
                             SendAction::OpenCopilotAuthUrl { url, code } => {
                                 if let Ok(mut clipboard) = arboard::Clipboard::new()
-                                    && let Err(e) = clipboard.set_text(&code) {
-                                        tracing::warn!("Failed to copy code to clipboard: {}", e);
-                                    }
+                                    && let Err(e) = clipboard.set_text(&code)
+                                {
+                                    tracing::warn!("Failed to copy code to clipboard: {}", e);
+                                }
                                 if let Err(e) = open::that(&url) {
                                     tracing::warn!("Failed to open URL in browser: {}", e);
                                 }
@@ -712,8 +718,9 @@ where
                     wait_for_auth_dismiss(app, events, terminal).await?;
                     return Ok(());
                 }
-                let instance =
-                    may_agent::config::ProviderInstance::new(may_agent::config::ProviderType::Copilot);
+                let instance = may_agent::config::ProviderInstance::new(
+                    may_agent::config::ProviderType::Copilot,
+                );
                 app.config.upsert_provider("copilot", instance);
                 app.config_state.load_providers(&app.config);
                 if let Err(e) = app.config.save() {

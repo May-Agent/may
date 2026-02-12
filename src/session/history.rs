@@ -153,7 +153,8 @@ impl ChatMessage {
     pub fn permission_request(data: &PermissionRequestData) -> Self {
         Self {
             role: MessageRole::PermissionRequest,
-            content: serde_json::to_string(data).expect("PermissionRequestData is always serializable"),
+            content: serde_json::to_string(data)
+                .expect("PermissionRequestData is always serializable"),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
         }
@@ -165,7 +166,8 @@ impl ChatMessage {
     pub fn permission_response(data: &PermissionResponseData) -> Self {
         Self {
             role: MessageRole::PermissionResponse,
-            content: serde_json::to_string(data).expect("PermissionResponseData is always serializable"),
+            content: serde_json::to_string(data)
+                .expect("PermissionResponseData is always serializable"),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
         }
@@ -177,7 +179,8 @@ impl ChatMessage {
     pub fn ask_user_request(data: &AskUserRequestData) -> Self {
         Self {
             role: MessageRole::AskUserRequest,
-            content: serde_json::to_string(data).expect("AskUserRequestData is always serializable"),
+            content: serde_json::to_string(data)
+                .expect("AskUserRequestData is always serializable"),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
         }
@@ -189,7 +192,8 @@ impl ChatMessage {
     pub fn ask_user_response(data: &AskUserResponseData) -> Self {
         Self {
             role: MessageRole::AskUserResponse,
-            content: serde_json::to_string(data).expect("AskUserResponseData is always serializable"),
+            content: serde_json::to_string(data)
+                .expect("AskUserResponseData is always serializable"),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
         }

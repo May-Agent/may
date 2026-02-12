@@ -174,22 +174,20 @@ async fn fetch_models_for_provider(
                 })
                 .unwrap_or_else(|| model_id.clone());
 
-            let mut abilities: Vec<String> = p
-                .abilities
-                .into_iter()
-                .map(ability_to_label)
-                .collect();
+            let mut abilities: Vec<String> =
+                p.abilities.into_iter().map(ability_to_label).collect();
 
             // Enrich with abilities from the static model database when the
             // provider API returns none (Claude/Gemini list_models omit them).
             if abilities.is_empty()
-                && let Some(info) = aither_models::lookup(&model_id) {
-                    abilities = info
-                        .abilities
-                        .iter()
-                        .map(|a| ability_to_label(*a))
-                        .collect();
-                }
+                && let Some(info) = aither_models::lookup(&model_id)
+            {
+                abilities = info
+                    .abilities
+                    .iter()
+                    .map(|a| ability_to_label(*a))
+                    .collect();
+            }
 
             FetchedModel {
                 id: model_id,

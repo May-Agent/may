@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use skyzen::Result as SkyResult;
 use skyzen::responder::Sse;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
-use skyzen::Result as SkyResult;
 
 use crate::config::{MayConfig, ProviderInstance, SshServerConfig};
 use crate::copilot::{clear_copilot_credentials, has_copilot_token, save_copilot_token};
@@ -32,9 +32,7 @@ pub(super) async fn get_ui_config(
     }))
 }
 
-pub(super) async fn config_stream(
-    State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Sse> {
+pub(super) async fn config_stream(State(state): State<Arc<UiServerState>>) -> SkyResult<Sse> {
     let (sender, sse) = Sse::channel();
 
     tokio::spawn(async move {
@@ -257,9 +255,7 @@ pub(super) async fn list_skills(
         .list_skills()
         .await
         .map_err(internal_error)?;
-    Ok(Json(
-        skills.into_iter().map(map_skill).collect::<Vec<_>>(),
-    ))
+    Ok(Json(skills.into_iter().map(map_skill).collect::<Vec<_>>()))
 }
 
 pub(super) async fn install_skill(

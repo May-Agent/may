@@ -11,9 +11,7 @@ use crate::config::MayConfig;
 use crate::session::{ChatMessage, MessageRole, SessionId};
 
 use super::state::UiServerState;
-use super::types::{
-    ApiAttachment, ApiBashExecution, ApiMessage, BashStateSnapshot,
-};
+use super::types::{ApiAttachment, ApiBashExecution, ApiMessage, BashStateSnapshot};
 
 pub(super) fn internal_error(err: impl std::fmt::Display) -> SkyError {
     SkyError::msg(err.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -33,7 +31,9 @@ pub(super) async fn send_event<T: Serialize>(
     data: &T,
 ) {
     if let Ok(payload) = serde_json::to_string(data) {
-        let _ = sender.send(skyzen::responder::sse::Event::data(payload).event(kind)).await;
+        let _ = sender
+            .send(skyzen::responder::sse::Event::data(payload).event(kind))
+            .await;
     }
 }
 
@@ -71,23 +71,17 @@ pub(super) fn resolve_default_model(
         .or_else(|| preferred_advanced_model(config))
 }
 
-pub(super) async fn persist_last_model(
-    state: &UiServerState,
-    model: &str,
-) -> anyhow::Result<()> {
+pub(super) async fn persist_last_model(state: &UiServerState, model: &str) -> anyhow::Result<()> {
     let mut config = state.config.write().await;
     let strict = config.preferences.strict_model_matching;
 
-    let normalized_existing = config
-        .last_model
-        .as_deref()
-        .map(|m| {
-            if strict {
-                m.to_string()
-            } else {
-                crate::config::normalize_model_id_for_relaxed_match(m)
-            }
-        });
+    let normalized_existing = config.last_model.as_deref().map(|m| {
+        if strict {
+            m.to_string()
+        } else {
+            crate::config::normalize_model_id_for_relaxed_match(m)
+        }
+    });
     let normalized_new = if strict {
         model.to_string()
     } else {
@@ -111,9 +105,10 @@ pub(super) fn parse_arg_value(args: &[String], key: &str) -> Option<String> {
             return Some(value.to_string());
         }
         if arg == key
-            && let Some(value) = args.get(idx + 1) {
-                return Some(value.clone());
-            }
+            && let Some(value) = args.get(idx + 1)
+        {
+            return Some(value.clone());
+        }
     }
     None
 }
@@ -223,9 +218,7 @@ pub(super) fn parse_bash_start(arguments: &str) -> (String, Option<String>) {
     (script, shell_id)
 }
 
-pub(super) fn parse_open_shell_end(
-    result: &serde_json::Value,
-) -> (Option<String>, Option<String>) {
+pub(super) fn parse_open_shell_end(result: &serde_json::Value) -> (Option<String>, Option<String>) {
     let Some(parsed) = parse_tool_json_string(result) else {
         return (None, None);
     };
@@ -284,12 +277,13 @@ pub(super) fn update_bash_snapshot_from_tool_event(
                     .insert("pending".to_string(), mode);
             }
         } else if stage == "end"
-            && let Some(result) = tool_event.get("result") {
-                let (shell_id, mode) = parse_open_shell_end(result);
-                if let (Some(shell_id), Some(mode)) = (shell_id, mode) {
-                    snapshot.shell_mode_by_id.insert(shell_id, mode);
-                }
+            && let Some(result) = tool_event.get("result")
+        {
+            let (shell_id, mode) = parse_open_shell_end(result);
+            if let (Some(shell_id), Some(mode)) = (shell_id, mode) {
+                snapshot.shell_mode_by_id.insert(shell_id, mode);
             }
+        }
         return;
     }
 
@@ -317,16 +311,17 @@ pub(super) fn update_bash_snapshot_from_tool_event(
                 },
             );
         } else if stage == "end" {
-            let mut exec = snapshot
-                .running_by_call_id
-                .remove(&call_id)
-                .unwrap_or(ApiBashExecution {
-                    id: call_id,
-                    input: "(bash)".to_string(),
-                    output: None,
-                    status: "done".to_string(),
-                    mode: "sandboxed".to_string(),
-                });
+            let mut exec =
+                snapshot
+                    .running_by_call_id
+                    .remove(&call_id)
+                    .unwrap_or(ApiBashExecution {
+                        id: call_id,
+                        input: "(bash)".to_string(),
+                        output: None,
+                        status: "done".to_string(),
+                        mode: "sandboxed".to_string(),
+                    });
 
             if let Some(result) = tool_event.get("result") {
                 let output = parse_bash_end_output(result);
@@ -343,17 +338,14 @@ pub(super) fn update_bash_snapshot_from_tool_event(
 
 // ── Message mapping ────────────────────────────────────────
 
-pub(super) fn map_history_messages(
-    messages: &[crate::session::ChatMessage],
-) -> Vec<ApiMessage> {
+pub(super) fn map_history_messages(messages: &[crate::session::ChatMessage]) -> Vec<ApiMessage> {
     let mut out = Vec::new();
     let mut snapshot = BashStateSnapshot::default();
 
     for (idx, msg) in messages.iter().enumerate() {
         match msg.role {
             MessageRole::Tool => {
-                let tool_event =
-                    serde_json::from_str::<serde_json::Value>(&msg.content).ok();
+                let tool_event = serde_json::from_str::<serde_json::Value>(&msg.content).ok();
                 if let Some(event) = tool_event.as_ref() {
                     update_bash_snapshot_from_tool_event(&mut snapshot, event);
                 }
@@ -391,8 +383,7 @@ pub(super) fn map_history_messages(
                 };
 
                 if matches!(msg.role, MessageRole::Assistant)
-                    && (!snapshot.executions.is_empty()
-                        || !snapshot.running_by_call_id.is_empty())
+                    && (!snapshot.executions.is_empty() || !snapshot.running_by_call_id.is_empty())
                 {
                     let mut executions = snapshot.executions.clone();
                     executions.extend(snapshot.running_by_call_id.values().cloned());
@@ -417,22 +408,21 @@ pub(super) fn map_db_messages(
     for (idx, msg) in db_messages.iter().enumerate() {
         match msg.role.as_str() {
             "tool" => {
-                let tool_event =
-                    serde_json::from_str::<serde_json::Value>(&msg.content).ok();
+                let tool_event = serde_json::from_str::<serde_json::Value>(&msg.content).ok();
                 if let Some(event) = tool_event.as_ref() {
                     update_bash_snapshot_from_tool_event(&mut snapshot, event);
                 }
                 continue;
             }
-            "permission_request" | "permission_response" | "ask_user_request"
+            "permission_request"
+            | "permission_response"
+            | "ask_user_request"
             | "ask_user_response" => continue,
             role @ ("user" | "assistant" | "system") => {
                 let timestamp = msg
                     .timestamp
                     .as_deref()
-                    .and_then(|t| {
-                        jiff::Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", t).ok()
-                    })
+                    .and_then(|t| jiff::Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", t).ok())
                     .unwrap_or_else(jiff::Timestamp::now)
                     .to_string();
 
@@ -451,8 +441,7 @@ pub(super) fn map_db_messages(
                 };
 
                 if role == "assistant"
-                    && (!snapshot.executions.is_empty()
-                        || !snapshot.running_by_call_id.is_empty())
+                    && (!snapshot.executions.is_empty() || !snapshot.running_by_call_id.is_empty())
                 {
                     let mut executions = snapshot.executions.clone();
                     executions.extend(snapshot.running_by_call_id.values().cloned());
@@ -496,26 +485,25 @@ pub(super) async fn build_prompt_and_attachments(
             } else {
                 None
             }
-        })
-            && let Some((saved_path, relative_path)) =
-                save_upload_data_url(state, &req.session_id, attachment, data_url).await?
-            {
-                xml_items.push(format!(
-                    "<attachment name=\"{}\" type=\"{}\" path=\"{}\" />",
-                    xml_escape(&attachment.name),
-                    xml_escape(&attachment.attachment_type),
-                    xml_escape(&relative_path),
-                ));
+        }) && let Some((saved_path, relative_path)) =
+            save_upload_data_url(state, &req.session_id, attachment, data_url).await?
+        {
+            xml_items.push(format!(
+                "<attachment name=\"{}\" type=\"{}\" path=\"{}\" />",
+                xml_escape(&attachment.name),
+                xml_escape(&attachment.attachment_type),
+                xml_escape(&relative_path),
+            ));
 
-                if attachment.attachment_type == "image" {
-                    let url = url::Url::from_file_path(saved_path).map_err(|_| {
-                        SkyError::msg("Failed to map image path to URL")
-                            .set_status(StatusCode::INTERNAL_SERVER_ERROR)
-                    })?;
-                    attachments.push(url);
-                }
-                continue;
+            if attachment.attachment_type == "image" {
+                let url = url::Url::from_file_path(saved_path).map_err(|_| {
+                    SkyError::msg("Failed to map image path to URL")
+                        .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+                })?;
+                attachments.push(url);
             }
+            continue;
+        }
 
         if let Some(text) = &attachment.text_content {
             if text.chars().count() <= INLINE_PASTED_TEXT_THRESHOLD {
@@ -578,8 +566,7 @@ async fn save_upload_data_url(
 
     let ext = guess_extension(header, &attachment.name);
     let base_name = sanitize_upload_stem(&attachment.name);
-    let (path, relative_path) =
-        allocate_upload_path(state, session_id, &base_name, &ext).await?;
+    let (path, relative_path) = allocate_upload_path(state, session_id, &base_name, &ext).await?;
 
     if let Some(parent) = path.parent() {
         async_fs::create_dir_all(parent)
@@ -674,11 +661,11 @@ fn guess_extension(data_url_header: &str, fallback_name: &str) -> String {
         .unwrap_or("");
 
     if !mime_str.is_empty()
-        && let Some(ext) = mime_guess::get_mime_extensions_str(mime_str)
-            .and_then(|exts| exts.first())
-        {
-            return (*ext).to_string();
-        }
+        && let Some(ext) =
+            mime_guess::get_mime_extensions_str(mime_str).and_then(|exts| exts.first())
+    {
+        return (*ext).to_string();
+    }
 
     Path::new(fallback_name)
         .extension()

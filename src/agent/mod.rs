@@ -2,6 +2,7 @@
 
 mod may;
 pub mod runner;
+mod session_tool;
 pub mod ssh_authorizer;
 
 pub use may::{

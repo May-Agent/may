@@ -22,12 +22,12 @@ pub use agent::{
     MayAgent, PermissionApprover, PermissionRequest, PermissionRequestMode, generate_session_title,
 };
 pub use config::MayConfig;
+pub use db::ChatDb;
 pub use mcp::{MayMcpServerConfig, McpConfig, McpManager, McpServerInfo};
 pub use session::{
     ChatHistory, ChatMessage, MessageRole, Session, SessionId, SessionManager, SessionMetadata,
     SessionStore, SessionSummary,
 };
 pub use skill::{SkillInfo, SkillManager, SkillSource};
-pub use db::ChatDb;
 pub use workspace::{Workspace, WorkspaceConfig};
 pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};
