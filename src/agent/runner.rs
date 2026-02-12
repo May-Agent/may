@@ -83,7 +83,7 @@ impl AgentWorker {
                 attachments,
                 event_tx,
             })
-            .expect(ERR_WORKER_CHANNEL_CLOSED.trim());
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
         AgentHandle {
             event_rx,
             command_tx: self.command_tx.clone(),
@@ -97,7 +97,7 @@ impl AgentWorker {
         let (event_tx, event_rx) = unbounded();
         self.command_tx
             .try_send(WorkerCommand::Compact { focus, event_tx })
-            .expect(ERR_WORKER_CHANNEL_CLOSED.trim());
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
         AgentHandle {
             event_rx,
             command_tx: self.command_tx.clone(),
@@ -208,11 +208,10 @@ async fn run_agent_prompt(
             },
             async {
                 // Check for cancel command (non-blocking peek then async recv)
-                if let Ok(cmd) = command_rx.try_recv() {
-                    if matches!(cmd, WorkerCommand::Cancel | WorkerCommand::Shutdown) {
+                if let Ok(cmd) = command_rx.try_recv()
+                    && matches!(cmd, WorkerCommand::Cancel | WorkerCommand::Shutdown) {
                         return None;
                     }
-                }
                 // Wait for cancel (this will also catch shutdown)
                 loop {
                     if let Ok(cmd) = command_rx.recv().await {

@@ -105,11 +105,10 @@ impl SessionStore {
         let mut entries = async_fs::read_dir(&self.sessions_dir).await?;
         while let Some(entry) = entries.next().await {
             let entry = entry?;
-            if entry.file_type().await?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
+            if entry.file_type().await?.is_dir()
+                && let Some(name) = entry.file_name().to_str() {
                     sessions.push(name.to_string());
                 }
-            }
         }
 
         Ok(sessions)

@@ -131,8 +131,8 @@ pub(super) async fn poll_ask_user_request(
     };
 
     // Persist the ask-user request to chat history
-    if let Some(ref payload) = request {
-        if let Some(sid) = &payload.session_id {
+    if let Some(ref payload) = request
+        && let Some(sid) = &payload.session_id {
             let data = AskUserRequestData {
                 id: payload.id.clone(),
                 questions: serde_json::to_value(&payload.questions).unwrap_or_default(),
@@ -145,7 +145,6 @@ pub(super) async fn poll_ask_user_request(
             )
             .await;
         }
-    }
 
     Ok(Json(AskUserPollResponse { request }))
 }

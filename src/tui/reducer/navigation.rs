@@ -32,13 +32,12 @@ pub(crate) fn handle_session_select_key(
             }
         }
         KeyCode::Enter => {
-            if let Some((original_idx, _)) = filtered.get(app.session_selected) {
-                if let Some(summary) = app.session_list.get(*original_idx) {
+            if let Some((original_idx, _)) = filtered.get(app.session_selected)
+                && let Some(summary) = app.session_list.get(*original_idx) {
                     let id = summary.id.clone();
                     app.mode = AppMode::Chat;
                     return Ok(Some(SendAction::LoadSession(id)));
                 }
-            }
         }
         KeyCode::Backspace => {
             app.session_search.pop();
@@ -65,8 +64,8 @@ pub(crate) fn handle_session_select_key(
                         return Ok(Some(SendAction::NewSession));
                     }
                     'd' => {
-                        if let Some((original_idx, _)) = filtered.get(app.session_selected) {
-                            if let Some(summary) = app.session_list.get(*original_idx) {
+                        if let Some((original_idx, _)) = filtered.get(app.session_selected)
+                            && let Some(summary) = app.session_list.get(*original_idx) {
                                 let deleted_id = summary.id.as_str().to_string();
                                 let was_current = app
                                     .session_manager
@@ -101,7 +100,6 @@ pub(crate) fn handle_session_select_key(
                                 .detach();
                                 app.status = Some("Deleting session...".to_string());
                             }
-                        }
                         return Ok(None);
                     }
                     _ => {}

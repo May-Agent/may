@@ -66,12 +66,13 @@ pub(super) async fn create_session(
     Json(req): Json<CreateSessionRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiSession>> {
-    let config = state.config.read().await;
-    let model = req
-        .model
-        .or_else(|| config.last_model.clone())
-        .or_else(|| preferred_advanced_model(&config))
-        .ok_or_else(|| bad_request_error("No model configured"))?;
+    let model = {
+        let config = state.config.read().await;
+        req.model
+            .or_else(|| config.last_model.clone())
+            .or_else(|| preferred_advanced_model(&config))
+            .ok_or_else(|| bad_request_error("No model configured"))?
+    };
 
     let mut manager = state.session_manager.lock().await;
 
@@ -85,6 +86,8 @@ pub(super) async fn create_session(
         .set_current_model(model.clone())
         .await
         .map_err(internal_error)?;
+    drop(manager);
+
     persist_last_model(&state, &model)
         .await
         .map_err(internal_error)?;

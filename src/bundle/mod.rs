@@ -91,16 +91,14 @@ impl Bundle {
     ) -> Result<(), BundleError> {
         let link = parent.join(name);
 
-        if let Ok(metadata) = async_fs::symlink_metadata(&link).await {
-            if metadata.file_type().is_symlink() {
-                if let Ok(existing_target) = async_fs::read_link(&link).await {
-                    if existing_target == target {
+        if let Ok(metadata) = async_fs::symlink_metadata(&link).await
+            && metadata.file_type().is_symlink() {
+                if let Ok(existing_target) = async_fs::read_link(&link).await
+                    && existing_target == target {
                         return Ok(());
                     }
-                }
                 let _ = async_fs::remove_file(&link).await;
             }
-        }
 
         #[cfg(unix)]
         async_fs::unix::symlink(target, &link).await?;
@@ -120,16 +118,14 @@ impl Bundle {
         let link = parent.join(name);
 
         // Skip if already correct
-        if let Ok(metadata) = async_fs::symlink_metadata(&link).await {
-            if metadata.file_type().is_symlink() {
-                if let Ok(existing_target) = async_fs::read_link(&link).await {
-                    if existing_target == target {
+        if let Ok(metadata) = async_fs::symlink_metadata(&link).await
+            && metadata.file_type().is_symlink() {
+                if let Ok(existing_target) = async_fs::read_link(&link).await
+                    && existing_target == target {
                         return Ok(());
                     }
-                }
                 let _ = async_fs::remove_file(&link).await;
             }
-        }
 
         #[cfg(unix)]
         {

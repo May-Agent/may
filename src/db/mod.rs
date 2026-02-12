@@ -341,11 +341,9 @@ impl ChatDb {
                 for req in &requests {
                     if let Ok(req_data) =
                         serde_json::from_str::<PermissionRequestPayload>(&req.content)
-                    {
-                        if req_data.id == data.id && req_data.mode == "network" {
+                        && req_data.id == data.id && req_data.mode == "network" {
                             return Ok(true);
                         }
-                    }
                 }
             }
         }

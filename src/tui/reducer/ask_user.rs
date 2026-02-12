@@ -12,8 +12,8 @@ pub(crate) fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option
         _ => return Ok(None),
     };
 
-    if let Some(qs) = state.current_state_mut() {
-        if qs.custom_mode {
+    if let Some(qs) = state.current_state_mut()
+        && qs.custom_mode {
             match code {
                 KeyCode::Esc => qs.custom_mode = false,
                 KeyCode::Enter => {
@@ -30,25 +30,22 @@ pub(crate) fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option
             }
             return Ok(None);
         }
-    }
 
     let item_count = state.current_item_count();
     let question = state.current().cloned();
 
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(qs) = state.current_state_mut() {
-                if qs.cursor > 0 {
+            if let Some(qs) = state.current_state_mut()
+                && qs.cursor > 0 {
                     qs.cursor -= 1;
                 }
-            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(qs) = state.current_state_mut() {
-                if qs.cursor + 1 < item_count {
+            if let Some(qs) = state.current_state_mut()
+                && qs.cursor + 1 < item_count {
                     qs.cursor += 1;
                 }
-            }
         }
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
             if state.current_question + 1 < state.questions.len() {
@@ -66,7 +63,7 @@ pub(crate) fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option
                 let opt_count = q.option.len();
                 if cursor < opt_count {
                     if q.multi_select {
-                        if qs.selections.iter().any(|&x| x == cursor) {
+                        if qs.selections.contains(&cursor) {
                             qs.selections.retain(|&x| x != cursor);
                         } else {
                             qs.selections.push(cursor);
@@ -159,7 +156,7 @@ fn ask_user_submit(app: &mut App) {
         state
             .request
             .respond(answers)
-            .expect(super::super::app::ERR_TOOL_RESPONSE_SEND.trim());
+            .unwrap_or_else(|_| panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim()));
     }
 }
 
@@ -177,6 +174,6 @@ fn ask_user_submit_all_skipped(app: &mut App) {
         state
             .request
             .respond(answers)
-            .expect(super::super::app::ERR_TOOL_RESPONSE_SEND.trim());
+            .unwrap_or_else(|_| panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim()));
     }
 }

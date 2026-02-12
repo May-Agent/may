@@ -834,14 +834,13 @@ async fn build_cloud_provider_from_instance(
                     ));
                 }
                 Err(e) => {
-                    if is_copilot_unauthorized(&e) {
-                        if let Err(clear_err) = clear_copilot_credentials().await {
+                    if is_copilot_unauthorized(&e)
+                        && let Err(clear_err) = clear_copilot_credentials().await {
                             tracing::warn!(
                                 "Failed to clear invalid Copilot credentials: {}",
                                 clear_err
                             );
                         }
-                    }
                     return Err(MayAgentError::CopilotToken(e));
                 }
             };
@@ -931,11 +930,10 @@ pub async fn generate_session_title(
     let mut title = String::new();
 
     while let Some(result) = stream.next().await {
-        if let Ok(event) = result {
-            if let aither_core::llm::Event::Text(text) = event {
+        if let Ok(event) = result
+            && let aither_core::llm::Event::Text(text) = event {
                 title.push_str(&text);
             }
-        }
     }
 
     let title = title.trim().to_string();

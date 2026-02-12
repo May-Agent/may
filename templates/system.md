@@ -60,5 +60,5 @@ Start responses naturally -- don't announce what you're doing unless asked. When
 
 You can display images directly in the chat using standard Markdown image syntax: `![Alt text](url)`. The image will be fetched and displayed inline within the chat content.
 
-When you create deliverable files (HTML, Markdown, code output, reports, assets users may want to open), copy them into the session sandbox `artifacts/` directory. If the file should be shown in the UI preview pane, include an artifact tag in your response: `<artifact url="relative/path/from/artifacts" />`. Prefer HTML files for richer preview experiences when appropriate.
+When you create deliverable files (HTML, Markdown, code output, reports, assets users may want to open), you must write them into the session sandbox `artifacts/` directory before referencing them. For UI preview, include an artifact tag using a path relative to `artifacts/` only: `<artifact url="relative/path/from/artifacts" />`. Do not reference files outside `artifacts/`, and do not emit artifact tags for files that do not exist there. Prefer HTML files for richer preview experiences when appropriate.
 </guidelines>

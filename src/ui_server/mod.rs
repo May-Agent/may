@@ -261,11 +261,10 @@ async fn models(
 
     {
         let cache = state.models_cache.lock().await;
-        if let Some((at, cached)) = &*cache {
-            if at.elapsed() < MODELS_CACHE_TTL {
+        if let Some((at, cached)) = &*cache
+            && at.elapsed() < MODELS_CACHE_TTL {
                 return Ok(Json(cached.clone()));
             }
-        }
     }
 
     let config = state.config.read().await;
@@ -274,12 +273,21 @@ async fn models(
     let mut model_map = std::collections::HashMap::<String, ModelInfoItem>::new();
 
     for item in fetched {
-        model_map.entry(item.id.clone()).or_insert(ModelInfoItem {
-            id: item.id,
+        let new_entry = ModelInfoItem {
+            id: item.id.clone(),
             nickname: item.nickname,
             context_window: item.context_window,
             abilities: item.abilities,
-        });
+        };
+        model_map
+            .entry(item.id)
+            .and_modify(|existing| {
+                // Prefer the entry with more abilities (richer metadata).
+                if new_entry.abilities.len() > existing.abilities.len() {
+                    *existing = new_entry.clone();
+                }
+            })
+            .or_insert(new_entry);
     }
 
     for tier in crate::config::ModelTier::ALL {
@@ -302,6 +310,17 @@ async fn models(
                         .unwrap_or_default(),
                 }
             });
+        }
+    }
+
+    // Sanitize generic placeholder nicknames from providers like Copilot/GitHub.
+    const GENERIC_NICKNAMES: &[&str] = &["OpenAI model", "github"];
+    for item in model_map.values_mut() {
+        if GENERIC_NICKNAMES.iter().any(|g| g.eq_ignore_ascii_case(&item.nickname)) {
+            // Try aither_models lookup first, then fall back to the raw model ID.
+            item.nickname = lookup_model_info(&item.id)
+                .map(|m| m.name.to_string())
+                .unwrap_or_else(|| item.id.clone());
         }
     }
 

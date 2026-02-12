@@ -934,11 +934,10 @@ impl App {
             }
             KeyCode::Tab => {
                 // Accept completion if active
-                if self.completion.is_active() {
-                    if let Some(item) = self.completion.complete() {
+                if self.completion.is_active()
+                    && let Some(item) = self.completion.complete() {
                         self.accept_completion(&item.insert.clone());
                     }
-                }
             }
             KeyCode::Char(c) => {
                 // Reset history navigation when typing
@@ -1149,11 +1148,9 @@ impl App {
                     .current_model
                     .as_deref()
                     .or(self.config.last_model.as_deref())
-                {
-                    if let Some(idx) = self.model_select_list.iter().position(|m| m == current) {
+                    && let Some(idx) = self.model_select_list.iter().position(|m| m == current) {
                         self.model_select_index = idx;
                     }
-                }
                 self.mode = AppMode::ModelSelect;
                 Ok(None)
             }
@@ -1198,9 +1195,9 @@ impl App {
             }
             KeyCode::Enter => {
                 // Select model and add to tier
-                if let Some(&idx) = self.tier_picker_filtered.get(self.tier_picker_selected) {
-                    if let Some(model) = self.tier_picker_models.get(idx) {
-                        if let Some(tier) = self.tier_picker_tier {
+                if let Some(&idx) = self.tier_picker_filtered.get(self.tier_picker_selected)
+                    && let Some(model) = self.tier_picker_models.get(idx)
+                        && let Some(tier) = self.tier_picker_tier {
                             self.config
                                 .models
                                 .add_model(tier, &model.id, &model.provider_id);
@@ -1208,8 +1205,6 @@ impl App {
                                 tracing::error!("Failed to save config: {}", e);
                             }
                         }
-                    }
-                }
                 self.mode = AppMode::Config;
                 self.tier_picker_query.clear();
             }
@@ -1438,8 +1433,8 @@ impl App {
             }
             KeyCode::Char('d') | KeyCode::Delete => {
                 // Delete provider (only in Providers section)
-                if state.section == ConfigSection::Providers {
-                    if let Some(id) = state.provider_ids.get(state.selected).cloned() {
+                if state.section == ConfigSection::Providers
+                    && let Some(id) = state.provider_ids.get(state.selected).cloned() {
                         self.config.provider.remove(&id);
                         state.load_providers(&self.config);
                         if state.selected >= state.provider_ids.len() && state.selected > 0 {
@@ -1449,7 +1444,6 @@ impl App {
                             tracing::error!("Failed to save config: {}", e);
                         }
                     }
-                }
             }
             KeyCode::Esc => {
                 if !self.needs_setup {
@@ -1488,8 +1482,8 @@ impl App {
                     }
                     // Check if this is a custom provider (has base_url)
                     let instance = self.config.provider.get(&id);
-                    if let Some(inst) = instance {
-                        if inst.base_url.is_some() {
+                    if let Some(inst) = instance
+                        && inst.base_url.is_some() {
                             // Custom provider - open full edit form
                             state.edit_mode = ConfigEditMode::CustomProvider {
                                 focused_field: 0,
@@ -1502,7 +1496,6 @@ impl App {
                             };
                             return Ok(None);
                         }
-                    }
                     // Regular provider - just edit API key
                     let current_key = self
                         .config
@@ -1737,13 +1730,11 @@ impl App {
                     self.config_state.edit_mode = ConfigEditMode::None;
 
                     // If editing existing and name changed, remove old entry
-                    if was_editing {
-                        if let Some(ref old_name) = orig_name {
-                            if old_name != &name_val {
+                    if was_editing
+                        && let Some(ref old_name) = orig_name
+                            && old_name != &name_val {
                                 self.config.provider.remove(old_name);
                             }
-                        }
-                    }
 
                     // Create new provider instance
                     let mut instance = crate::config::ProviderInstance::new(ProviderType::Custom);
@@ -1972,7 +1963,7 @@ impl App {
         self.status = Some("Reading clipboard...".to_string());
 
         spawn(async move {
-            let result = match unblock(|| read_clipboard()).await {
+            let result = match unblock(read_clipboard).await {
                 Ok(paste) => {
                     let (image, text) = paste.into_parts();
                     if let Some(image) = image {
@@ -2014,15 +2005,14 @@ impl App {
         self.input_char_count = 0;
 
         let trimmed = content.trim();
-        if let Some(rest) = trimmed.strip_prefix("/compact") {
-            if attachments.is_empty() {
+        if let Some(rest) = trimmed.strip_prefix("/compact")
+            && attachments.is_empty() {
                 let focus = rest.trim();
                 if focus.is_empty() {
                     return SendAction::Compact(None);
                 }
                 return SendAction::Compact(Some(focus.to_string()));
             }
-        }
 
         let msg = PendingMessage {
             content,
@@ -2299,11 +2289,10 @@ impl App {
         }
 
         // Only return if cursor is within the mention
-        if let Some(pos) = last_at {
-            if self.cursor > pos {
+        if let Some(pos) = last_at
+            && self.cursor > pos {
                 return Some(pos);
             }
-        }
         None
     }
 

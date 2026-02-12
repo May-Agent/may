@@ -1,4 +1,4 @@
-import { memo, useState, useMemo, useEffect } from 'react';
+import React, { memo, useState, useMemo, useEffect } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
@@ -152,9 +152,18 @@ export function MessageItem({
     [isUser, isStreaming]
   );
 
+  const previewPaths = useMemo(() => extractPreviewPaths(message.content || ''), [message.content]);
+  const displayContent = useMemo(() => stripPreviewTags(message.content || ''), [message.content]);
+
   useEffect(() => {
     setIsBashOpen(false);
   }, [message.id]);
+
+  useEffect(() => {
+    if (!isStreaming && bashExecutions.length > 0 && !displayContent) {
+      setIsBashOpen(true);
+    }
+  }, [isStreaming, bashExecutions.length, displayContent]);
 
   useEffect(() => {
     if (!isStreaming || message.content.length > 0 || !!message.error) {
@@ -166,15 +175,13 @@ export function MessageItem({
     return () => window.clearTimeout(timer);
   }, [isStreaming, message.content, message.id, message.error]);
 
-  const previewPaths = useMemo(() => extractPreviewPaths(message.content || ''), [message.content]);
-  const displayContent = useMemo(() => stripPreviewTags(message.content || ''), [message.content]);
-
   useEffect(() => {
     if (isUser || !onOpenPreview || previewPaths.length === 0) return;
     onOpenPreview(previewPaths[previewPaths.length - 1]);
   }, [isUser, onOpenPreview, previewPaths]);
 
   const runningBashCount = bashExecutions.filter((exec) => exec.status === 'running').length;
+  const doneBashCount = bashExecutions.filter((exec) => exec.status === 'done').length;
   const failedBashCount = bashExecutions.filter((exec) => exec.status === 'failed').length;
   const nowMs = Date.now();
   const bashElapsedMs = bashExecutions.reduce((sum, exec) => {
@@ -212,15 +219,19 @@ export function MessageItem({
                 <Terminal className="h-3.5 w-3.5 shrink-0" />
                 <span className="font-medium">{bashElapsedSeconds}s</span>
                 <span className="text-muted-foreground/70">&middot;</span>
-                <span className={cn(
-                  "text-[11px]",
-                  failedBashCount > 0 ? 'text-red-400' : runningBashCount > 0 ? 'text-blue-400' : 'text-muted-foreground/70'
-                )}>
-                  {runningBashCount > 0
-                    ? `${runningBashCount} running`
-                    : failedBashCount > 0
-                      ? `${failedBashCount} failed`
-                      : `${bashExecutions.length} cmd${bashExecutions.length > 1 ? 's' : ''}`}
+                <span className="text-[11px]">
+                  {(() => {
+                    const parts: React.ReactNode[] = [];
+                    if (runningBashCount > 0) parts.push(<span key="r" className="text-blue-400">{runningBashCount} running</span>);
+                    if (doneBashCount > 0) parts.push(<span key="d" className="text-muted-foreground/70">{doneBashCount} done</span>);
+                    if (failedBashCount > 0) parts.push(<span key="f" className="text-red-400">{failedBashCount} failed</span>);
+                    if (parts.length === 0) return <span className="text-muted-foreground/70">{bashExecutions.length} cmd{bashExecutions.length > 1 ? 's' : ''}</span>;
+                    return parts.reduce<React.ReactNode[]>((acc, part, i) => {
+                      if (i > 0) acc.push(<span key={`sep-${i}`} className="text-muted-foreground/40 mx-0.5">&middot;</span>);
+                      acc.push(part);
+                      return acc;
+                    }, []);
+                  })()}
                 </span>
                 <motion.div
                   animate={{ rotate: isBashOpen ? 90 : 0 }}
