@@ -120,6 +120,16 @@ impl ChatMessage {
             tool_call_id: None,
         }
     }
+
+    /// Create a new tool message.
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: content.into(),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
 }
 
 /// YAML frontmatter for a message or metadata block.
