@@ -44,7 +44,7 @@ pub(crate) fn handle_workspace_confirm_key(
             if let crate::tui::state::AppMode::WorkspaceConfirm(request) = mode {
                 request
                     .respond(true)
-                    .expect(super::super::app::ERR_TOOL_RESPONSE_SEND.trim());
+                    .unwrap_or_else(|_| panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim()));
             }
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -52,7 +52,7 @@ pub(crate) fn handle_workspace_confirm_key(
             if let crate::tui::state::AppMode::WorkspaceConfirm(request) = mode {
                 request
                     .respond(false)
-                    .expect(super::super::app::ERR_TOOL_RESPONSE_SEND.trim());
+                    .unwrap_or_else(|_| panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim()));
             }
         }
         _ => {}

@@ -110,11 +110,10 @@ pub(super) fn parse_arg_value(args: &[String], key: &str) -> Option<String> {
         if let Some(value) = arg.strip_prefix(&format!("{key}=")) {
             return Some(value.to_string());
         }
-        if arg == key {
-            if let Some(value) = args.get(idx + 1) {
+        if arg == key
+            && let Some(value) = args.get(idx + 1) {
                 return Some(value.clone());
             }
-        }
     }
     None
 }
@@ -284,14 +283,13 @@ pub(super) fn update_bash_snapshot_from_tool_event(
                     .shell_mode_by_id
                     .insert("pending".to_string(), mode);
             }
-        } else if stage == "end" {
-            if let Some(result) = tool_event.get("result") {
+        } else if stage == "end"
+            && let Some(result) = tool_event.get("result") {
                 let (shell_id, mode) = parse_open_shell_end(result);
                 if let (Some(shell_id), Some(mode)) = (shell_id, mode) {
                     snapshot.shell_mode_by_id.insert(shell_id, mode);
                 }
             }
-        }
         return;
     }
 
@@ -498,8 +496,8 @@ pub(super) async fn build_prompt_and_attachments(
             } else {
                 None
             }
-        }) {
-            if let Some((saved_path, relative_path)) =
+        })
+            && let Some((saved_path, relative_path)) =
                 save_upload_data_url(state, &req.session_id, attachment, data_url).await?
             {
                 xml_items.push(format!(
@@ -518,7 +516,6 @@ pub(super) async fn build_prompt_and_attachments(
                 }
                 continue;
             }
-        }
 
         if let Some(text) = &attachment.text_content {
             if text.chars().count() <= INLINE_PASTED_TEXT_THRESHOLD {
@@ -676,13 +673,12 @@ fn guess_extension(data_url_header: &str, fallback_name: &str) -> String {
         .and_then(|s| s.split(';').next())
         .unwrap_or("");
 
-    if !mime_str.is_empty() {
-        if let Some(ext) = mime_guess::get_mime_extensions_str(mime_str)
+    if !mime_str.is_empty()
+        && let Some(ext) = mime_guess::get_mime_extensions_str(mime_str)
             .and_then(|exts| exts.first())
         {
             return (*ext).to_string();
         }
-    }
 
     Path::new(fallback_name)
         .extension()

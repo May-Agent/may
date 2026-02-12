@@ -111,6 +111,7 @@ export function ChatInterface({
   const [queuedBySession, setQueuedBySession] = useState<QueueMap>({});
   const [newChatModelId, setNewChatModelId] = useState("");
   const [newChatReasoningEffort, setNewChatReasoningEffort] = useState<string | undefined>(undefined);
+  const [isSending, setIsSending] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
   const [pendingPermission, setPendingPermission] =
     useState<PermissionRequest | null>(null);
@@ -253,7 +254,7 @@ export function ChatInterface({
         }
       }
     } catch {
-      setPreviewPane(null);
+      setPreviewPane({ kind: 'text', text: `Preview failed: artifact path must exist under artifacts/. Got: ${target}` });
     }
   }, [currentSessionId, isPreviewUrl]);
 
@@ -261,6 +262,10 @@ export function ChatInterface({
     if (!selectedPreviewPath) return;
     await openPreview(selectedPreviewPath);
   }, [selectedPreviewPath, openPreview]);
+
+  const handleOpenPreview = useCallback((path: string) => {
+    void openPreview(path);
+  }, [openPreview]);
 
   useEffect(() => {
     queuedBySessionRef.current = queuedBySession;
@@ -453,6 +458,7 @@ export function ChatInterface({
     const composerHasInput = inputValue.trim().length > 0 || attachments.length > 0;
     if (includeComposerInput && !composerHasInput) return;
 
+    setIsSending(true);
     setUiError(null);
 
     const content = includeComposerInput ? inputValue : "";
@@ -469,7 +475,7 @@ export function ChatInterface({
     const targetGenerating = targetRuntime?.state === 'streaming';
 
     if (targetGenerating) {
-      if (!includeComposerInput) return;
+      if (!includeComposerInput) { setIsSending(false); return; }
       setQueuedBySession((prev) => {
         const list = prev[queueSourceKey] ?? [];
         const nextList = [...list, { content, attachments: atts }];
@@ -482,6 +488,7 @@ export function ChatInterface({
           [queueSourceKey]: nextList,
         };
       });
+      setIsSending(false);
       return;
     }
 
@@ -493,7 +500,7 @@ export function ChatInterface({
       }
     }
 
-    if (!sessionId) return;
+    if (!sessionId) { setIsSending(false); return; }
 
     const existingQueue = queuedBySessionRef.current[queueSourceKey] ?? [];
     const pendingBatch = options?.overrideBatch
@@ -502,7 +509,7 @@ export function ChatInterface({
         ? [{ content, attachments: atts }, ...existingQueue]
         : [...existingQueue];
 
-    if (pendingBatch.length === 0) return;
+    if (pendingBatch.length === 0) { setIsSending(false); return; }
 
     setQueuedBySession((prev) => {
       const next = { ...prev };
@@ -657,14 +664,17 @@ export function ChatInterface({
           const name = (tool.name ?? '').toLowerCase();
           if (name === 'bash') {
             let script = '(bash)';
+            let mode: string | undefined;
             try {
               const args = typeof tool.arguments === 'string' ? JSON.parse(tool.arguments) : tool.arguments;
               script = args?.script ?? args?.command ?? '(bash)';
+              mode = args?.mode;
             } catch { /* keep default */ }
             bashExecutions.push({
               id: tool.id ?? `tool-${Date.now()}`,
               input: script,
               status: 'running',
+              mode: mode ?? 'sandboxed',
               startedAt: Date.now(),
             });
             flushAssistantText(true);
@@ -674,12 +684,17 @@ export function ChatInterface({
           const idx = bashExecutions.findIndex((e) => e.id === tool.id);
           if (idx !== -1) {
             let output: string | undefined;
+            let failed = false;
             try {
-              const result = typeof tool.result === 'string' ? JSON.parse(tool.result) : tool.result;
-              output = result?.stdout?.content?.text ?? (typeof result === 'string' ? result : JSON.stringify(result));
+              const result = tool.result;
+              // Backend wraps in Ok/Err - Err at top level means the command failed
+              const errValue = result?.Err ?? result?.err;
+              const okValue = result?.Ok ?? result?.ok;
+              failed = errValue !== undefined && okValue === undefined;
+              const inner = okValue ?? errValue;
+              const parsed = typeof inner === 'string' ? JSON.parse(inner) : (inner ?? result);
+              output = parsed?.stdout?.content?.text ?? (typeof parsed === 'string' ? parsed : JSON.stringify(parsed));
             } catch { /* ignore */ }
-            const raw = JSON.stringify(tool.result ?? '').toLowerCase();
-            const failed = raw.includes('"err"') || raw.includes('error');
             bashExecutions[idx] = {
               ...bashExecutions[idx],
               output,
@@ -704,6 +719,10 @@ export function ChatInterface({
             .getState()
             .sessions.find((s) => s.id === sessionId);
           if (!latest) return;
+          // Use locally accumulated streamedText for content because the
+          // backend clears assistant_text after each tool call, so the
+          // server's done event only contains the final text segment.
+          // Stats and other metadata still come from the server response.
           replaceSessionMessages(
             sessionId,
             latest.messages.map((m) =>
@@ -711,6 +730,7 @@ export function ChatInterface({
                 ? {
                     ...assistant,
                     id: assistantId,
+                    content: streamedText,
                     thinking: streamedReasoning,
                     isStreaming: false,
                     isThinking: false,
@@ -790,6 +810,7 @@ export function ChatInterface({
       }
 
       abortControllerRef.current = null;
+      setIsSending(false);
       clearRuntimeSession(sessionId);
 
       if (completedNormally) {
@@ -804,6 +825,7 @@ export function ChatInterface({
   const handleStop = () => {
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
+    setIsSending(false);
     if (currentSessionId) {
       const latest = useStore
         .getState()
@@ -1157,9 +1179,7 @@ export function ChatInterface({
                     key={msg.id}
                     message={msg}
                     canRetry={retryFromUser || retryFromAssistant}
-                    onOpenPreview={(path) => {
-                      void openPreview(path);
-                    }}
+                    onOpenPreview={handleOpenPreview}
                     onRetry={() => {
                       const batch = retryFromUser
                         ? [{ content: msg.content, attachments: msg.attachments ?? [] }]
@@ -1482,7 +1502,7 @@ export function ChatInterface({
                     <span>{contextUsagePercent != null ? `${contextUsagePercent}%` : "--"}</span>
                   </div>
                 )}
-                {isGenerating ? (
+                {isGenerating || isSending ? (
                   <Button
                     onClick={handleStop}
                     size="icon"

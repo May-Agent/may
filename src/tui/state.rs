@@ -52,6 +52,12 @@ pub struct AskUserQuestionState {
     pub skipped: bool,
 }
 
+impl Default for AskUserQuestionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AskUserQuestionState {
     pub fn new() -> Self {
         Self {
@@ -295,8 +301,10 @@ impl ConfigSection {
 
 /// What field is being edited in the config screen.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum ConfigEditMode {
     /// Not editing, just navigating
+    #[default]
     None,
     /// Editing a text field (provider API key, base URL, etc.)
     Text { input: String, cursor: usize },
@@ -321,11 +329,6 @@ pub enum ConfigEditMode {
     },
 }
 
-impl Default for ConfigEditMode {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// Unified config state for all sections.
 pub struct ConfigState {

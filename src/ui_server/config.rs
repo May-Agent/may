@@ -258,7 +258,7 @@ pub(super) async fn list_skills(
         .await
         .map_err(internal_error)?;
     Ok(Json(
-        skills.into_iter().map(|s| map_skill(s)).collect::<Vec<_>>(),
+        skills.into_iter().map(map_skill).collect::<Vec<_>>(),
     ))
 }
 

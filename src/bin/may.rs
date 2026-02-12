@@ -165,8 +165,8 @@ where
     let runtime_deps = RuntimeDeps::new(workspace_broker.clone(), ask_user_broker.clone());
 
     // Only start a session if configuration is complete
-    if app.is_configured() {
-        if let Err(e) = runtime_deps.start_new_session(&mut app, &mut worker).await {
+    if app.is_configured()
+        && let Err(e) = runtime_deps.start_new_session(&mut app, &mut worker).await {
             tracing::warn!("Initial session start failed: {}", e);
             app.mode = may_agent::tui::AppMode::Chat;
             app.status = Some(format!(
@@ -174,7 +174,6 @@ where
                 e
             ));
         }
-    }
 
     // Main event loop - only receives from channels, never blocks on agent processing
     main_event_loop(
@@ -223,12 +222,11 @@ where
         tracing::info!("after draw");
 
         // Check for model fetch results (non-blocking)
-        if let Some(ref mut rx) = app.model_fetch_rx {
-            if let Ok(models) = rx.try_recv() {
+        if let Some(ref mut rx) = app.model_fetch_rx
+            && let Ok(models) = rx.try_recv() {
                 app.handle_fetched_models(models);
                 app.model_fetch_rx = None;
             }
-        }
 
         // Check for clipboard paste results (non-blocking)
         if let Some(ref mut rx) = app.clipboard_rx {
@@ -254,16 +252,14 @@ where
         }
 
         // Check for queued messages - start processing if agent is idle
-        if agent_handle.is_none() {
-            if let Some(msg) = app.next_queued() {
-                if let Some(w) = worker.as_ref() {
+        if agent_handle.is_none()
+            && let Some(msg) = app.next_queued()
+                && let Some(w) = worker.as_ref() {
                     agent_handle =
                         Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
                     assistant_response.clear();
                     continue;
                 }
-            }
-        }
 
         // DIAGNOSTIC: Check channel states before entering select
         tracing::info!(
@@ -411,8 +407,8 @@ where
 
             Event::Terminal(terminal_event) => {
                 // Check for interrupt during agent processing
-                if agent_handle.is_some() {
-                    if let AppEvent::Key(key_code, modifiers) = &terminal_event {
+                if agent_handle.is_some()
+                    && let AppEvent::Key(key_code, modifiers) = &terminal_event {
                         let is_ctrl_c = *key_code == KeyCode::Char('c')
                             && modifiers.contains(KeyModifiers::CONTROL);
                         let is_esc = *key_code == KeyCode::Esc;
@@ -430,7 +426,6 @@ where
                             continue;
                         }
                     }
-                }
 
                 // Handle normal terminal events
                 match app.handle_event(terminal_event)? {
@@ -479,11 +474,10 @@ where
                         }
                     }
                     Some(SendAction::OpenCopilotAuthUrl { url, code }) => {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            if let Err(e) = clipboard.set_text(&code) {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new()
+                            && let Err(e) = clipboard.set_text(&code) {
                                 tracing::warn!("Failed to copy code to clipboard: {}", e);
                             }
-                        }
                         if let Err(e) = open::that(&url) {
                             tracing::warn!("Failed to open URL in browser: {}", e);
                         }
@@ -690,11 +684,10 @@ where
                         match action {
                             SendAction::Quit => return Ok(()),
                             SendAction::OpenCopilotAuthUrl { url, code } => {
-                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                    if let Err(e) = clipboard.set_text(&code) {
+                                if let Ok(mut clipboard) = arboard::Clipboard::new()
+                                    && let Err(e) = clipboard.set_text(&code) {
                                         tracing::warn!("Failed to copy code to clipboard: {}", e);
                                     }
-                                }
                                 if let Err(e) = open::that(&url) {
                                     tracing::warn!("Failed to open URL in browser: {}", e);
                                 }

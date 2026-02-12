@@ -182,15 +182,14 @@ async fn fetch_models_for_provider(
 
             // Enrich with abilities from the static model database when the
             // provider API returns none (Claude/Gemini list_models omit them).
-            if abilities.is_empty() {
-                if let Some(info) = aither_models::lookup(&model_id) {
+            if abilities.is_empty()
+                && let Some(info) = aither_models::lookup(&model_id) {
                     abilities = info
                         .abilities
                         .iter()
                         .map(|a| ability_to_label(*a))
                         .collect();
                 }
-            }
 
             FetchedModel {
                 id: model_id,
