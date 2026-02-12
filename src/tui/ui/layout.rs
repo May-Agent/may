@@ -613,9 +613,10 @@ fn render_tool_detail_popup(frame: &mut Frame, area: Rect, app: &App) {
 
     // Get the selected tool
     if let Some(ref tool_id) = app.selected_tool
-        && let Some(display) = app.chat.get_tool(tool_id) {
-            chat::render_tool_fullscreen(frame, popup_area, display, app.tool_detail_scroll);
-        }
+        && let Some(display) = app.chat.get_tool(tool_id)
+    {
+        chat::render_tool_fullscreen(frame, popup_area, display, app.tool_detail_scroll);
+    }
 }
 
 /// Render tier model picker as a popup menu.
@@ -844,7 +845,7 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
                 if let Some(ref base_url) = inst.base_url {
                     // Truncate URL safely (unicode-safe)
                     const URL_DISPLAY_MAX_CHARS: usize = 27;
-                    
+
                     match base_url.char_indices().nth(URL_DISPLAY_MAX_CHARS) {
                         Some((pos, _)) => format!("{}...", &base_url[..pos]),
                         None => base_url.clone(),
@@ -1138,12 +1139,13 @@ fn render_preferences_section(frame: &mut Frame, area: Rect, app: &App) {
 
     // If in text edit mode for max_iterations
     if let Some((input, cursor)) = state.edit_text()
-        && state.selected == 0 {
-            let cursor_pos = char_to_byte_idx(input, cursor);
-            let display = format!("{}|{}", &input[..cursor_pos], &input[cursor_pos..]);
-            items[0] = ListItem::new(format!("  Max iterations:        {}", display))
-                .style(Style::default().fg(Color::Yellow));
-        }
+        && state.selected == 0
+    {
+        let cursor_pos = char_to_byte_idx(input, cursor);
+        let display = format!("{}|{}", &input[..cursor_pos], &input[cursor_pos..]);
+        items[0] = ListItem::new(format!("  Max iterations:        {}", display))
+            .style(Style::default().fg(Color::Yellow));
+    }
 
     let list = List::new(items).block(
         Block::default()

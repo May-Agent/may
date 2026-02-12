@@ -106,9 +106,10 @@ impl SessionStore {
         while let Some(entry) = entries.next().await {
             let entry = entry?;
             if entry.file_type().await?.is_dir()
-                && let Some(name) = entry.file_name().to_str() {
-                    sessions.push(name.to_string());
-                }
+                && let Some(name) = entry.file_name().to_str()
+            {
+                sessions.push(name.to_string());
+            }
         }
 
         Ok(sessions)

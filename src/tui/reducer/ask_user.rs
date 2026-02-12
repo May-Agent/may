@@ -13,23 +13,24 @@ pub(crate) fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option
     };
 
     if let Some(qs) = state.current_state_mut()
-        && qs.custom_mode {
-            match code {
-                KeyCode::Esc => qs.custom_mode = false,
-                KeyCode::Enter => {
-                    qs.custom_mode = false;
-                    ask_user_advance_or_submit(app);
-                }
-                KeyCode::Backspace => {
-                    qs.custom_text.pop();
-                }
-                KeyCode::Char(c) => {
-                    qs.custom_text.push(c);
-                }
-                _ => {}
+        && qs.custom_mode
+    {
+        match code {
+            KeyCode::Esc => qs.custom_mode = false,
+            KeyCode::Enter => {
+                qs.custom_mode = false;
+                ask_user_advance_or_submit(app);
             }
-            return Ok(None);
+            KeyCode::Backspace => {
+                qs.custom_text.pop();
+            }
+            KeyCode::Char(c) => {
+                qs.custom_text.push(c);
+            }
+            _ => {}
         }
+        return Ok(None);
+    }
 
     let item_count = state.current_item_count();
     let question = state.current().cloned();
@@ -37,15 +38,17 @@ pub(crate) fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(qs) = state.current_state_mut()
-                && qs.cursor > 0 {
-                    qs.cursor -= 1;
-                }
+                && qs.cursor > 0
+            {
+                qs.cursor -= 1;
+            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if let Some(qs) = state.current_state_mut()
-                && qs.cursor + 1 < item_count {
-                    qs.cursor += 1;
-                }
+                && qs.cursor + 1 < item_count
+            {
+                qs.cursor += 1;
+            }
         }
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
             if state.current_question + 1 < state.questions.len() {

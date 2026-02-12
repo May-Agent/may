@@ -155,16 +155,15 @@ impl SkillManager {
         })
     }
 
-
-
     /// Detect skill source from metadata file.
     async fn detect_source(&self, skill_dir: &Path) -> SkillSource {
         let metadata_path = skill_dir.join(".source.json");
         if async_fs::metadata(&metadata_path).await.is_ok()
             && let Ok(content) = async_fs::read_to_string(&metadata_path).await
-                && let Ok(source) = serde_json::from_str(&content) {
-                    return source;
-                }
+            && let Ok(source) = serde_json::from_str(&content)
+        {
+            return source;
+        }
         SkillSource::Bundled
     }
 

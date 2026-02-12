@@ -300,8 +300,7 @@ impl ConfigSection {
 }
 
 /// What field is being edited in the config screen.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum ConfigEditMode {
     /// Not editing, just navigating
     #[default]
@@ -328,7 +327,6 @@ pub enum ConfigEditMode {
         original_name: Option<String>,
     },
 }
-
 
 /// Unified config state for all sections.
 pub struct ConfigState {

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
 use skyzen::utils::{Json, State};
-use skyzen::Result as SkyResult;
 
 use crate::ask_user::QuestionAnswer;
 use crate::session::history::{
@@ -47,12 +47,9 @@ pub(super) async fn poll_permission_request(
                 script: req.script.clone(),
             };
             let session_id = SessionId::from_string(sid.clone());
-            let _ = append_history_message(
-                &state,
-                &session_id,
-                ChatMessage::permission_request(&data),
-            )
-            .await;
+            let _ =
+                append_history_message(&state, &session_id, ChatMessage::permission_request(&data))
+                    .await;
         }
         (Some(req), Some("waiting_permission"))
     } else if state
@@ -106,12 +103,9 @@ pub(super) async fn respond_permission_request(
             approved: req.approved,
         };
         let session_id = SessionId::from(sid);
-        let _ = append_history_message(
-            &state,
-            &session_id,
-            ChatMessage::permission_response(&data),
-        )
-        .await;
+        let _ =
+            append_history_message(&state, &session_id, ChatMessage::permission_response(&data))
+                .await;
     }
 
     Ok(Json(ApiHealth { ok: true }))
@@ -132,19 +126,16 @@ pub(super) async fn poll_ask_user_request(
 
     // Persist the ask-user request to chat history
     if let Some(ref payload) = request
-        && let Some(sid) = &payload.session_id {
-            let data = AskUserRequestData {
-                id: payload.id.clone(),
-                questions: serde_json::to_value(&payload.questions).unwrap_or_default(),
-            };
-            let session_id = SessionId::from_string(sid.clone());
-            let _ = append_history_message(
-                &state,
-                &session_id,
-                ChatMessage::ask_user_request(&data),
-            )
-            .await;
-        }
+        && let Some(sid) = &payload.session_id
+    {
+        let data = AskUserRequestData {
+            id: payload.id.clone(),
+            questions: serde_json::to_value(&payload.questions).unwrap_or_default(),
+        };
+        let session_id = SessionId::from_string(sid.clone());
+        let _ =
+            append_history_message(&state, &session_id, ChatMessage::ask_user_request(&data)).await;
+    }
 
     Ok(Json(AskUserPollResponse { request }))
 }
@@ -182,12 +173,8 @@ pub(super) async fn respond_ask_user_request(
             answers: serde_json::to_value(&answers).unwrap_or_default(),
         };
         let session_id = SessionId::from(sid);
-        let _ = append_history_message(
-            &state,
-            &session_id,
-            ChatMessage::ask_user_response(&data),
-        )
-        .await;
+        let _ = append_history_message(&state, &session_id, ChatMessage::ask_user_response(&data))
+            .await;
     }
 
     Ok(Json(ApiHealth { ok: true }))

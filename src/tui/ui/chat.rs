@@ -329,55 +329,58 @@ impl ChatStream {
                 id: tool_id,
                 display,
             } = elem
-                && tool_id == id {
-                    match display {
-                        ToolDisplay::Search {
-                            status: s,
-                            results: r,
-                            bash_info,
-                            ..
-                        } => {
-                            *s = status;
-                            *r = results;
-                            if let Some(ref out) = output
-                                && let Some(info) = bash_info {
-                                    info.output = out.clone();
-                                }
-                        }
-                        ToolDisplay::Fetch {
-                            status: s,
-                            bash_info,
-                            ..
-                        } => {
-                            *s = status;
-                            if let Some(ref out) = output
-                                && let Some(info) = bash_info {
-                                    info.output = out.clone();
-                                }
-                        }
-                        ToolDisplay::Task { status: s, .. } => {
-                            *s = status;
-                            // For tasks, output is parsed to extract bash calls
-                            // This is handled separately via update_subagent_bash
-                        }
-                        ToolDisplay::Bash {
-                            status: s,
-                            command,
-                            output: out,
-                            ..
-                        } => {
-                            *s = status;
-                            if let Some(ref output_text) = output {
-                                *out = Some(BashCallInfo {
-                                    command: command.clone(),
-                                    output: output_text.clone(),
-                                    output_file: None,
-                                });
-                            }
+                && tool_id == id
+            {
+                match display {
+                    ToolDisplay::Search {
+                        status: s,
+                        results: r,
+                        bash_info,
+                        ..
+                    } => {
+                        *s = status;
+                        *r = results;
+                        if let Some(ref out) = output
+                            && let Some(info) = bash_info
+                        {
+                            info.output = out.clone();
                         }
                     }
-                    break;
+                    ToolDisplay::Fetch {
+                        status: s,
+                        bash_info,
+                        ..
+                    } => {
+                        *s = status;
+                        if let Some(ref out) = output
+                            && let Some(info) = bash_info
+                        {
+                            info.output = out.clone();
+                        }
+                    }
+                    ToolDisplay::Task { status: s, .. } => {
+                        *s = status;
+                        // For tasks, output is parsed to extract bash calls
+                        // This is handled separately via update_subagent_bash
+                    }
+                    ToolDisplay::Bash {
+                        status: s,
+                        command,
+                        output: out,
+                        ..
+                    } => {
+                        *s = status;
+                        if let Some(ref output_text) = output {
+                            *out = Some(BashCallInfo {
+                                command: command.clone(),
+                                output: output_text.clone(),
+                                output_file: None,
+                            });
+                        }
+                    }
                 }
+                break;
+            }
         }
     }
 
@@ -393,10 +396,11 @@ impl ChatStream {
                 id: tool_id,
                 display: ToolDisplay::Task { bash_calls, .. },
             } = elem
-                && tool_id == id {
-                    bash_calls.push(bash_info);
-                    break;
-                }
+                && tool_id == id
+            {
+                bash_calls.push(bash_info);
+                break;
+            }
         }
     }
 
@@ -555,9 +559,10 @@ pub fn build_plain_wrapped_lines_unified(
     let mut lines: Vec<Line<'static>> = build_plain_chat_lines(chat);
 
     if let Some(ref ctx) = queue_ctx
-        && !ctx.messages.is_empty() {
-            render_queue_lines(&mut lines, ctx, width);
-        }
+        && !ctx.messages.is_empty()
+    {
+        render_queue_lines(&mut lines, ctx, width);
+    }
 
     if let Some(ctx) = input_ctx {
         render_input_line(&mut lines, ctx);
@@ -585,7 +590,10 @@ fn build_plain_chat_lines(chat: &ChatStream) -> Vec<Line<'static>> {
                 lines.push(Line::from(""));
             }
             ChatElement::AssistantText { content, .. } => {
-                lines.extend(markdown::render_markdown_with_config(content, markdown::ImageSupport::Disabled));
+                lines.extend(markdown::render_markdown_with_config(
+                    content,
+                    markdown::ImageSupport::Disabled,
+                ));
                 lines.push(Line::from(""));
             }
             ChatElement::Error { message } => {
@@ -906,9 +914,10 @@ fn render_impl(
 
     // Render queue messages if provided
     if let Some(ref ctx) = queue_ctx
-        && !ctx.messages.is_empty() {
-            render_queue_lines(&mut lines, ctx, area.width);
-        }
+        && !ctx.messages.is_empty()
+    {
+        render_queue_lines(&mut lines, ctx, area.width);
+    }
 
     // Render input line if provided (for full-screen scroll mode)
     if let Some(ctx) = input_ctx {
@@ -1163,15 +1172,16 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
 
             // Show bash output preview if available
             if let Some(info) = bash_info
-                && !info.output.is_empty() {
-                    let preview = info.output_preview(2);
-                    for line in preview.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("    {}", line),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
+                && !info.output.is_empty()
+            {
+                let preview = info.output_preview(2);
+                for line in preview.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", line),
+                        Style::default().fg(Color::DarkGray),
+                    )));
                 }
+            }
         }
         ToolDisplay::Fetch {
             url,
@@ -1196,15 +1206,16 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
 
             // Show bash output preview if available
             if let Some(info) = bash_info
-                && !info.output.is_empty() {
-                    let preview = info.output_preview(2);
-                    for line in preview.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("    {}", line),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
+                && !info.output.is_empty()
+            {
+                let preview = info.output_preview(2);
+                for line in preview.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", line),
+                        Style::default().fg(Color::DarkGray),
+                    )));
                 }
+            }
         }
         ToolDisplay::Task {
             subagent,
@@ -1312,16 +1323,17 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             }
 
             if let Some(info) = output
-                && !info.output.is_empty() {
-                    let preview = info.output_preview(3);
-                    for line in preview.lines() {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
-                        ]));
-                    }
+                && !info.output.is_empty()
+            {
+                let preview = info.output_preview(3);
+                for line in preview.lines() {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
+                    ]));
                 }
+            }
         }
     }
 }

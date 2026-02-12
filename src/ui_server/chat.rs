@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_lite::StreamExt;
+use skyzen::Result as SkyResult;
 use skyzen::responder::Sse;
 use skyzen::utils::{Json, State};
-use skyzen::Result as SkyResult;
 
 use aither_core::llm::Usage;
 use aither_models::lookup as lookup_model_info;
@@ -14,9 +14,9 @@ use crate::session::{ChatMessage, SessionId};
 use crate::{ask_user, workspace_request};
 
 use super::helpers::{
-    append_history_message, build_prompt_and_attachments, elapsed_ms_saturating, internal_error,
-    is_retryable_llm_error, resolve_default_model, send_event, truncate_preview,
-    update_bash_snapshot_from_tool_event, RETRY_BACKOFF_MS,
+    RETRY_BACKOFF_MS, append_history_message, build_prompt_and_attachments, elapsed_ms_saturating,
+    internal_error, is_retryable_llm_error, resolve_default_model, send_event, truncate_preview,
+    update_bash_snapshot_from_tool_event,
 };
 use super::state::UiServerState;
 use super::types::{
@@ -100,8 +100,7 @@ async fn stream_chat_events(
                 Ok(aither_agent::AgentEvent::Reasoning(text)) => {
                     had_output = true;
                     reasoning_text.push_str(&text);
-                    send_event(&sender, "reasoning", &serde_json::json!({ "chunk": text }))
-                        .await;
+                    send_event(&sender, "reasoning", &serde_json::json!({ "chunk": text })).await;
                 }
                 Ok(aither_agent::AgentEvent::Text(text)) => {
                     had_output = true;
@@ -210,8 +209,7 @@ async fn stream_chat_events(
 
             {
                 let mut logs = state.request_logs.lock().await;
-                let context_window =
-                    lookup_model_info(&current_model).map(|m| m.context_window);
+                let context_window = lookup_model_info(&current_model).map(|m| m.context_window);
                 logs.push_front(RequestLogEntry {
                     session_id: session_id.as_str().to_string(),
                     timestamp: jiff::Timestamp::now().to_string(),
@@ -306,10 +304,7 @@ async fn stream_chat_events(
     Ok(())
 }
 
-async fn run_chat_collect(
-    state: Arc<UiServerState>,
-    req: ChatRequest,
-) -> SkyResult<ChatResponse> {
+async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyResult<ChatResponse> {
     const MAX_RETRIES: usize = 2;
 
     for attempt in 0..=MAX_RETRIES {
@@ -413,8 +408,7 @@ async fn run_chat_collect(
 
             {
                 let mut logs = state.request_logs.lock().await;
-                let context_window =
-                    lookup_model_info(&current_model).map(|m| m.context_window);
+                let context_window = lookup_model_info(&current_model).map(|m| m.context_window);
                 logs.push_front(RequestLogEntry {
                     session_id: session_id.as_str().to_string(),
                     timestamp: jiff::Timestamp::now().to_string(),

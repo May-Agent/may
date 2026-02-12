@@ -209,9 +209,10 @@ async fn run_agent_prompt(
             async {
                 // Check for cancel command (non-blocking peek then async recv)
                 if let Ok(cmd) = command_rx.try_recv()
-                    && matches!(cmd, WorkerCommand::Cancel | WorkerCommand::Shutdown) {
-                        return None;
-                    }
+                    && matches!(cmd, WorkerCommand::Cancel | WorkerCommand::Shutdown)
+                {
+                    return None;
+                }
                 // Wait for cancel (this will also catch shutdown)
                 loop {
                     if let Ok(cmd) = command_rx.recv().await {

@@ -42,17 +42,17 @@ pub(crate) fn handle_workspace_confirm_key(
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::WorkspaceConfirm(request) = mode {
-                request
-                    .respond(true)
-                    .unwrap_or_else(|_| panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim()));
+                request.respond(true).unwrap_or_else(|_| {
+                    panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim())
+                });
             }
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::WorkspaceConfirm(request) = mode {
-                request
-                    .respond(false)
-                    .unwrap_or_else(|_| panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim()));
+                request.respond(false).unwrap_or_else(|_| {
+                    panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim())
+                });
             }
         }
         _ => {}

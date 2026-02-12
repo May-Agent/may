@@ -13,12 +13,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+#[cfg(feature = "ui")]
+use skyzen::EmbeddedStaticDir;
+use skyzen::Result as SkyResult;
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::runtime::native;
 use skyzen::utils::{Json, State};
-use skyzen::Result as SkyResult;
-#[cfg(feature = "ui")]
-use skyzen::EmbeddedStaticDir;
 use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
 
@@ -40,8 +40,7 @@ static WEB_UI_DIST: include_dir::Dir<'static> =
     skyzen::embed_dir!(include_dir::include_dir!("$CARGO_MANIFEST_DIR/web-ui/dist"));
 
 pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
-    let host =
-        helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
+    let host = helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
     let port = helpers::parse_arg_value(args, "--port")
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(8787);
@@ -173,63 +172,61 @@ fn build_router(state: Arc<UiServerState>) -> Router {
 
     #[cfg(not(feature = "ui"))]
     {
-        Route::new((
-            "/api".route(Route::new((
-                "/health".at(health),
-                "/models".at(models),
-                "/models/by-provider".at(models_by_provider),
-                "/logs".route(Route::new(("/requests".at(get_request_logs),))),
-                "/sessions".route(Route::new((
-                    "".at(list_sessions),
-                    "".post(create_session),
-                    "/delete-all".post(delete_all_sessions),
-                    "/{id}".put(update_session),
-                    "/{id}".delete(delete_session),
-                    "/{id}/runtime".at(get_session_runtime),
-                    "/{id}/artifacts".at(list_session_artifacts),
-                    "/{id}/artifacts/preview".at(get_artifact_preview),
-                    "/{id}/artifacts/stream".at(stream_session_artifacts),
-                ))),
-                "/chat".route(Route::new(("".post(chat), "/stream".post(chat_stream)))),
-                "/permissions".route(Route::new((
-                    "/next".at(poll_permission_request),
-                    "/respond".post(respond_permission_request),
-                ))),
-                "/ask-user".route(Route::new((
-                    "/next".at(poll_ask_user_request),
-                    "/respond".post(respond_ask_user_request),
-                ))),
-                "/config".route(Route::new((
-                    "".at(get_ui_config),
-                    "/stream".at(config_stream),
-                    "/full".at(get_full_config),
-                    "/full".post(save_full_config),
-                ))),
-                "/memory".at(get_memory),
-                "/memory".post(save_memory),
-                "/ssh".route(Route::new((
-                    "".post(add_ssh_server),
-                    "/{name}".delete(remove_ssh_server),
-                ))),
-                "/mcp".route(Route::new((
-                    "".at(list_mcp_servers),
-                    "".post(add_mcp_server),
-                    "/{name}".delete(remove_mcp_server),
-                    "/{name}/reconnect".post(reconnect_mcp_server),
-                ))),
-                "/skills".route(Route::new((
-                    "".at(list_skills),
-                    "/install".post(install_skill),
-                    "/{dir}".delete(delete_skill),
-                ))),
-                "/copilot".route(Route::new((
-                    "/status".at(copilot_status),
-                    "/start".post(copilot_start),
-                    "/poll".post(copilot_poll),
-                    "/logout".post(copilot_logout),
-                ))),
+        Route::new(("/api".route(Route::new((
+            "/health".at(health),
+            "/models".at(models),
+            "/models/by-provider".at(models_by_provider),
+            "/logs".route(Route::new(("/requests".at(get_request_logs),))),
+            "/sessions".route(Route::new((
+                "".at(list_sessions),
+                "".post(create_session),
+                "/delete-all".post(delete_all_sessions),
+                "/{id}".put(update_session),
+                "/{id}".delete(delete_session),
+                "/{id}/runtime".at(get_session_runtime),
+                "/{id}/artifacts".at(list_session_artifacts),
+                "/{id}/artifacts/preview".at(get_artifact_preview),
+                "/{id}/artifacts/stream".at(stream_session_artifacts),
             ))),
-        ))
+            "/chat".route(Route::new(("".post(chat), "/stream".post(chat_stream)))),
+            "/permissions".route(Route::new((
+                "/next".at(poll_permission_request),
+                "/respond".post(respond_permission_request),
+            ))),
+            "/ask-user".route(Route::new((
+                "/next".at(poll_ask_user_request),
+                "/respond".post(respond_ask_user_request),
+            ))),
+            "/config".route(Route::new((
+                "".at(get_ui_config),
+                "/stream".at(config_stream),
+                "/full".at(get_full_config),
+                "/full".post(save_full_config),
+            ))),
+            "/memory".at(get_memory),
+            "/memory".post(save_memory),
+            "/ssh".route(Route::new((
+                "".post(add_ssh_server),
+                "/{name}".delete(remove_ssh_server),
+            ))),
+            "/mcp".route(Route::new((
+                "".at(list_mcp_servers),
+                "".post(add_mcp_server),
+                "/{name}".delete(remove_mcp_server),
+                "/{name}/reconnect".post(reconnect_mcp_server),
+            ))),
+            "/skills".route(Route::new((
+                "".at(list_skills),
+                "/install".post(install_skill),
+                "/{dir}".delete(delete_skill),
+            ))),
+            "/copilot".route(Route::new((
+                "/status".at(copilot_status),
+                "/start".post(copilot_start),
+                "/poll".post(copilot_poll),
+                "/logout".post(copilot_logout),
+            ))),
+        ))),))
         .middleware(State(state))
         .build()
     }
@@ -254,17 +251,16 @@ async fn get_request_logs(
     Ok(Json(RequestLogsResponse { logs }))
 }
 
-async fn models(
-    State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Json<ModelsResponse>> {
+async fn models(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<ModelsResponse>> {
     const MODELS_CACHE_TTL: Duration = Duration::from_secs(20);
 
     {
         let cache = state.models_cache.lock().await;
         if let Some((at, cached)) = &*cache
-            && at.elapsed() < MODELS_CACHE_TTL {
-                return Ok(Json(cached.clone()));
-            }
+            && at.elapsed() < MODELS_CACHE_TTL
+        {
+            return Ok(Json(cached.clone()));
+        }
     }
 
     let config = state.config.read().await;
@@ -316,7 +312,10 @@ async fn models(
     // Sanitize generic placeholder nicknames from providers like Copilot/GitHub.
     const GENERIC_NICKNAMES: &[&str] = &["OpenAI model", "github"];
     for item in model_map.values_mut() {
-        if GENERIC_NICKNAMES.iter().any(|g| g.eq_ignore_ascii_case(&item.nickname)) {
+        if GENERIC_NICKNAMES
+            .iter()
+            .any(|g| g.eq_ignore_ascii_case(&item.nickname))
+        {
             // Try aither_models lookup first, then fall back to the raw model ID.
             item.nickname = lookup_model_info(&item.id)
                 .map(|m| m.name.to_string())

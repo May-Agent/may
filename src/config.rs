@@ -137,7 +137,8 @@ pub fn model_ids_match(candidate: &str, requested: &str, mode: MatchMode) -> boo
     if mode == MatchMode::Strict {
         return false;
     }
-    normalize_model_id_for_relaxed_match(candidate) == normalize_model_id_for_relaxed_match(requested)
+    normalize_model_id_for_relaxed_match(candidate)
+        == normalize_model_id_for_relaxed_match(requested)
 }
 
 /// Configuration error.
@@ -1121,7 +1122,6 @@ impl ProviderResolver {
             .map(|s| s.as_str())
     }
 }
-
 
 #[cfg(test)]
 mod tests {

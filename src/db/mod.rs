@@ -6,12 +6,12 @@ pub mod entity;
 
 use std::path::Path;
 
+use sea_orm::ConnectionTrait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, Database, DatabaseConnection, DbErr,
     EntityTrait, Order, QueryFilter, QueryOrder, Schema, Set,
     sea_query::{Expr, Query, SqliteQueryBuilder},
 };
-use sea_orm::ConnectionTrait;
 
 use entity::{messages, sessions};
 
@@ -250,7 +250,8 @@ impl ChatDb {
 
         // Update session: touch updated_at, increment message_count, set preview
         let preview = truncate_preview(content);
-        self.update_session_stats(session_id, &now, &preview, true).await?;
+        self.update_session_stats(session_id, &now, &preview, true)
+            .await?;
 
         Ok(model)
     }
@@ -341,9 +342,11 @@ impl ChatDb {
                 for req in &requests {
                     if let Ok(req_data) =
                         serde_json::from_str::<PermissionRequestPayload>(&req.content)
-                        && req_data.id == data.id && req_data.mode == "network" {
-                            return Ok(true);
-                        }
+                        && req_data.id == data.id
+                        && req_data.mode == "network"
+                    {
+                        return Ok(true);
+                    }
                 }
             }
         }

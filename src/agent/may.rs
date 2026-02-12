@@ -25,10 +25,10 @@ use aither_sandbox::{
 use executor_core::DefaultExecutor;
 use futures_lite::{Stream, StreamExt};
 
+use crate::agent::session_tool::SessionTool;
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{
-    LoadBalanceStrategy, MatchMode, MayConfig, ProviderInstance, ProviderType,
-    model_ids_match,
+    LoadBalanceStrategy, MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match,
 };
 use crate::copilot::clear_copilot_credentials;
 use crate::models::fetch_models_by_provider;
@@ -405,9 +405,7 @@ fn build_image_provider(config: &ImageGeneratorConfig) -> aither_core::Result<Cl
     let base_url = config.provider.effective_base_url(&config.provider_id);
 
     if provider_type.requires_api_key() && api_key.is_empty() {
-        return Err(anyhow::anyhow!(
-            err_api_key_required(&config.provider_id)
-        ));
+        return Err(anyhow::anyhow!(err_api_key_required(&config.provider_id)));
     }
 
     let provider = match provider_type {
@@ -517,6 +515,10 @@ impl MayAgent {
         let request_workspace = RequestWorkspaceTool::new(config.workspace_request_broker);
         let ssh_authorizer_broker = config.ask_user_broker.clone();
         let ask_user = AskUserTool::new(config.ask_user_broker);
+        let session_tool = SessionTool::new(
+            config.may_dir.clone(),
+            config.session_id.as_str().to_string(),
+        );
         let imagine = ImagineTool {
             generator: config.image_generator,
             artifacts_dir: config.sandbox_dir.join("artifacts"),
@@ -538,6 +540,7 @@ impl MayAgent {
             .tool(ask)
             .tool(request_workspace)
             .tool(ask_user)
+            .tool(session_tool)
             .tool(imagine)
             .with_skills_async(&skills_dir)
             .await
@@ -658,7 +661,11 @@ impl MayAgent {
             .iter()
             .filter(|row| {
                 row.models.iter().any(|m| {
-                    model_ids_match(&m.id, model, MatchMode::from_strict_flag(may_config.preferences.strict_model_matching))
+                    model_ids_match(
+                        &m.id,
+                        model,
+                        MatchMode::from_strict_flag(may_config.preferences.strict_model_matching),
+                    )
                 })
             })
             .map(|row| row.provider_id.clone())
@@ -694,27 +701,21 @@ impl MayAgent {
                         provider_id,
                     )
                 } else {
-                    return Err(MayAgentError::MissingApiKey(
-                        err_no_provider(model),
-                    ));
+                    return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
                 }
             } else {
-                return Err(MayAgentError::MissingApiKey(
-                    err_no_provider(model),
-                ));
+                return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
             }
         } else if successful_fetches > 0 {
             // We have authoritative /models data from at least one provider.
             // If none advertise this model, do not route by loose capability inference.
-            return Err(MayAgentError::MissingApiKey(
-                err_no_provider(model),
-            ));
+            return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
         } else {
             // Fallback only when provider model listing is unavailable.
             let resolver = may_config.create_resolver();
-            let selected = resolver.select_provider(model).ok_or_else(|| {
-                MayAgentError::MissingApiKey(err_no_provider(model))
-            })?;
+            let selected = resolver
+                .select_provider(model)
+                .ok_or_else(|| MayAgentError::MissingApiKey(err_no_provider(model)))?;
             (
                 build_cloud_provider_from_instance(selected.id, selected.instance, model).await?,
                 selected.id.to_string(),
@@ -795,9 +796,7 @@ async fn build_cloud_provider_from_instance(
     let base_url = instance.effective_base_url(id);
 
     if provider_type.requires_api_key() && api_key.is_empty() {
-        return Err(MayAgentError::MissingApiKey(
-            err_api_key_required(id),
-        ));
+        return Err(MayAgentError::MissingApiKey(err_api_key_required(id)));
     }
 
     let llm: CloudProvider = match provider_type {
@@ -835,12 +834,13 @@ async fn build_cloud_provider_from_instance(
                 }
                 Err(e) => {
                     if is_copilot_unauthorized(&e)
-                        && let Err(clear_err) = clear_copilot_credentials().await {
-                            tracing::warn!(
-                                "Failed to clear invalid Copilot credentials: {}",
-                                clear_err
-                            );
-                        }
+                        && let Err(clear_err) = clear_copilot_credentials().await
+                    {
+                        tracing::warn!(
+                            "Failed to clear invalid Copilot credentials: {}",
+                            clear_err
+                        );
+                    }
                     return Err(MayAgentError::CopilotToken(e));
                 }
             };
@@ -931,9 +931,10 @@ pub async fn generate_session_title(
 
     while let Some(result) = stream.next().await {
         if let Ok(event) = result
-            && let aither_core::llm::Event::Text(text) = event {
-                title.push_str(&text);
-            }
+            && let aither_core::llm::Event::Text(text) = event
+        {
+            title.push_str(&text);
+        }
     }
 
     let title = title.trim().to_string();
@@ -1004,8 +1005,7 @@ fn build_memory_context_block(memory: &str) -> ContextBlock {
 }
 
 fn build_workflow_context_block() -> ContextBlock {
-    ContextBlock::new("workflow", WORKFLOW_CONTEXT.trim())
-        .with_priority(ContextBlockPriority::High)
+    ContextBlock::new("workflow", WORKFLOW_CONTEXT.trim()).with_priority(ContextBlockPriority::High)
 }
 
 fn global_memory_file_path(may_dir: &std::path::Path) -> PathBuf {

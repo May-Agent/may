@@ -142,15 +142,16 @@ impl RuntimeDeps {
         }
 
         if let Some(ctx) = title_gen.take()
-            && !assistant_response.is_empty() {
-                self.spawn_title_generation(
-                    app.config.clone(),
-                    app.session_manager.db().clone(),
-                    app.session_manager.current().map(|s| s.id.clone()),
-                    ctx.user_message,
-                    assistant_response.to_string(),
-                );
-            }
+            && !assistant_response.is_empty()
+        {
+            self.spawn_title_generation(
+                app.config.clone(),
+                app.session_manager.db().clone(),
+                app.session_manager.current().map(|s| s.id.clone()),
+                ctx.user_message,
+                assistant_response.to_string(),
+            );
+        }
     }
 
     async fn build_worker_for_session(
@@ -195,9 +196,9 @@ impl RuntimeDeps {
                 && let Err(e) = db
                     .update_session(session_id.as_str(), Some(&title), None)
                     .await
-                {
-                    tracing::warn!("Failed to update session title in DB: {}", e);
-                }
+            {
+                tracing::warn!("Failed to update session title in DB: {}", e);
+            }
         })
         .detach();
     }
