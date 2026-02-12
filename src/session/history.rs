@@ -50,30 +50,46 @@ pub struct SessionMetadata {
 
 /// Role of a message in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     User,
     Assistant,
     System,
     Tool,
+    /// Agent requests permission to run a command.
+    PermissionRequest,
+    /// User's response to a permission request.
+    PermissionResponse,
+    /// Agent asks the user a question.
+    AskUserRequest,
+    /// User's answer to an ask-user question.
+    AskUserResponse,
 }
 
 impl MessageRole {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
             Self::System => "system",
             Self::Tool => "tool",
+            Self::PermissionRequest => "permission_request",
+            Self::PermissionResponse => "permission_response",
+            Self::AskUserRequest => "ask_user_request",
+            Self::AskUserResponse => "ask_user_response",
         }
     }
 
-    fn from_str(s: &str) -> Result<Self, ChatHistoryError> {
+    pub fn from_str(s: &str) -> Result<Self, ChatHistoryError> {
         match s.to_lowercase().as_str() {
             "user" => Ok(Self::User),
             "assistant" => Ok(Self::Assistant),
             "system" => Ok(Self::System),
             "tool" => Ok(Self::Tool),
+            "permission_request" => Ok(Self::PermissionRequest),
+            "permission_response" => Ok(Self::PermissionResponse),
+            "ask_user_request" => Ok(Self::AskUserRequest),
+            "ask_user_response" => Ok(Self::AskUserResponse),
             _ => Err(ChatHistoryError::InvalidRole(s.to_string())),
         }
     }
@@ -120,6 +136,107 @@ impl ChatMessage {
             tool_call_id: None,
         }
     }
+
+    /// Create a new tool message.
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: content.into(),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+
+    /// Create a permission request message.
+    ///
+    /// Content is JSON-serialized `PermissionRequestData`.
+    pub fn permission_request(data: &PermissionRequestData) -> Self {
+        Self {
+            role: MessageRole::PermissionRequest,
+            content: serde_json::to_string(data).expect("PermissionRequestData is always serializable"),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: None,
+        }
+    }
+
+    /// Create a permission response message.
+    ///
+    /// Content is JSON-serialized `PermissionResponseData`.
+    pub fn permission_response(data: &PermissionResponseData) -> Self {
+        Self {
+            role: MessageRole::PermissionResponse,
+            content: serde_json::to_string(data).expect("PermissionResponseData is always serializable"),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: None,
+        }
+    }
+
+    /// Create an ask-user request message.
+    ///
+    /// Content is JSON-serialized `AskUserRequestData`.
+    pub fn ask_user_request(data: &AskUserRequestData) -> Self {
+        Self {
+            role: MessageRole::AskUserRequest,
+            content: serde_json::to_string(data).expect("AskUserRequestData is always serializable"),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: None,
+        }
+    }
+
+    /// Create an ask-user response message.
+    ///
+    /// Content is JSON-serialized `AskUserResponseData`.
+    pub fn ask_user_response(data: &AskUserResponseData) -> Self {
+        Self {
+            role: MessageRole::AskUserResponse,
+            content: serde_json::to_string(data).expect("AskUserResponseData is always serializable"),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: None,
+        }
+    }
+
+    /// Try to parse the content as a specific type.
+    pub fn parse_content<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+        serde_json::from_str(&self.content).ok()
+    }
+}
+
+/// Permission request data stored in chat history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRequestData {
+    /// Unique request ID.
+    pub id: String,
+    /// Permission mode requested.
+    pub mode: String,
+    /// The script/command needing permission.
+    pub script: String,
+}
+
+/// Permission response data stored in chat history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionResponseData {
+    /// Request ID this responds to.
+    pub id: String,
+    /// Whether permission was granted.
+    pub approved: bool,
+}
+
+/// Ask-user request data stored in chat history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskUserRequestData {
+    /// Unique request ID.
+    pub id: String,
+    /// Questions asked (JSON representation of the questions).
+    pub questions: serde_json::Value,
+}
+
+/// Ask-user response data stored in chat history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskUserResponseData {
+    /// Request ID this responds to.
+    pub id: String,
+    /// Answers provided (JSON representation of answers).
+    pub answers: serde_json::Value,
 }
 
 /// YAML frontmatter for a message or metadata block.
@@ -332,22 +449,87 @@ impl ChatHistory {
     }
 
     /// Convert to aither messages.
+    ///
+    /// Skips interaction messages (permission/ask-user) which are not part of the LLM conversation.
     pub fn to_aither_messages(&self) -> Vec<aither_core::llm::Message> {
         self.messages
             .iter()
-            .map(|m| {
+            .filter_map(|m| {
                 use aither_core::llm::Message;
                 match m.role {
-                    MessageRole::User => Message::user(&m.content),
-                    MessageRole::Assistant => Message::assistant(&m.content),
-                    MessageRole::System => Message::system(&m.content),
-                    MessageRole::Tool => {
-                        // Tool messages need special handling
-                        Message::user(&m.content)
-                    }
+                    MessageRole::User => Some(Message::user(&m.content)),
+                    MessageRole::Assistant => Some(Message::assistant(&m.content)),
+                    MessageRole::System => Some(Message::system(&m.content)),
+                    MessageRole::Tool => Some(Message::user(&m.content)),
+                    // Interaction messages are metadata, not LLM context
+                    MessageRole::PermissionRequest
+                    | MessageRole::PermissionResponse
+                    | MessageRole::AskUserRequest
+                    | MessageRole::AskUserResponse => None,
                 }
             })
             .collect()
+    }
+
+    /// Check whether network permission was previously approved in this session.
+    pub fn has_network_approval(&self) -> bool {
+        self.was_permission_mode_approved("network")
+    }
+
+    /// Find unanswered permission requests (no matching PermissionResponse).
+    pub fn pending_permission_requests(&self) -> Vec<PermissionRequestData> {
+        let responded_ids: std::collections::HashSet<String> = self
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::PermissionResponse)
+            .filter_map(|m| m.parse_content::<PermissionResponseData>())
+            .map(|d| d.id)
+            .collect();
+
+        self.messages
+            .iter()
+            .filter(|m| m.role == MessageRole::PermissionRequest)
+            .filter_map(|m| m.parse_content::<PermissionRequestData>())
+            .filter(|d| !responded_ids.contains(&d.id))
+            .collect()
+    }
+
+    /// Find unanswered ask-user requests (no matching AskUserResponse).
+    pub fn pending_ask_user_requests(&self) -> Vec<AskUserRequestData> {
+        let responded_ids: std::collections::HashSet<String> = self
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::AskUserResponse)
+            .filter_map(|m| m.parse_content::<AskUserResponseData>())
+            .map(|d| d.id)
+            .collect();
+
+        self.messages
+            .iter()
+            .filter(|m| m.role == MessageRole::AskUserRequest)
+            .filter_map(|m| m.parse_content::<AskUserRequestData>())
+            .filter(|d| !responded_ids.contains(&d.id))
+            .collect()
+    }
+
+    /// Check if a specific permission mode was ever approved in this session's history.
+    pub fn was_permission_mode_approved(&self, mode: &str) -> bool {
+        // Collect all approved response IDs
+        let approved_ids: std::collections::HashSet<String> = self
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::PermissionResponse)
+            .filter_map(|m| m.parse_content::<PermissionResponseData>())
+            .filter(|d| d.approved)
+            .map(|d| d.id)
+            .collect();
+
+        // Check if any approved response matches a request with the given mode
+        self.messages
+            .iter()
+            .filter(|m| m.role == MessageRole::PermissionRequest)
+            .filter_map(|m| m.parse_content::<PermissionRequestData>())
+            .any(|d| d.mode == mode && approved_ids.contains(&d.id))
     }
 }
 

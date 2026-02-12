@@ -7,7 +7,7 @@ pub mod agent;
 pub mod bundle;
 pub mod config;
 pub mod copilot;
-mod fs_util;
+pub mod db;
 pub mod mcp;
 pub mod models;
 pub mod session;
@@ -28,5 +28,6 @@ pub use session::{
     SessionStore, SessionSummary,
 };
 pub use skill::{SkillInfo, SkillManager, SkillSource};
+pub use db::ChatDb;
 pub use workspace::{Workspace, WorkspaceConfig};
 pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};

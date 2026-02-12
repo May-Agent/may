@@ -1,0 +1,7 @@
+<workspace>
+<sandbox>{{ sandbox }}</sandbox>
+<cwd>{{ cwd }}</cwd>
+{% if !workdirs.is_empty() %}<approved_workdirs>
+{% for wd in workdirs %}<workdir path="{{ wd.path }}">{{ wd.description }}</workdir>
+{% endfor %}</approved_workdirs>
+{% endif %}</workspace>

@@ -145,7 +145,7 @@ impl RuntimeDeps {
             if !assistant_response.is_empty() {
                 self.spawn_title_generation(
                     app.config.clone(),
-                    app.session_manager.may_dir().to_path_buf(),
+                    app.session_manager.db().clone(),
                     app.session_manager.current().map(|s| s.id.clone()),
                     ctx.user_message,
                     assistant_response.to_string(),
@@ -180,7 +180,7 @@ impl RuntimeDeps {
     fn spawn_title_generation(
         &self,
         config: MayConfig,
-        may_dir: std::path::PathBuf,
+        db: crate::db::ChatDb,
         session_id: Option<SessionId>,
         user_message: String,
         assistant_response: String,
@@ -191,22 +191,14 @@ impl RuntimeDeps {
         };
 
         spawn(async move {
-            use crate::session::SessionStore;
-
             if let Some(title) =
                 generate_session_title(&config, &user_message, &assistant_response).await
             {
-                let store = SessionStore::new(may_dir.join("sessions"));
-                match store.read_history(session_id.as_str()).await {
-                    Ok(mut history) => {
-                        history.metadata.title = Some(title);
-                        if let Err(e) = store.write_history(session_id.as_str(), &history).await {
-                            tracing::warn!("Failed to write session title: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to read history for title update: {}", e);
-                    }
+                if let Err(e) = db
+                    .update_session(session_id.as_str(), Some(&title), None)
+                    .await
+                {
+                    tracing::warn!("Failed to update session title in DB: {}", e);
                 }
             }
         })

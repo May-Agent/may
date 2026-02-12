@@ -73,6 +73,23 @@ struct SkillFrontmatter {
     description: String,
 }
 
+/// Parse YAML frontmatter (`---` delimited) from content.
+fn parse_frontmatter(content: &str) -> Option<SkillFrontmatter> {
+    let mut lines = content.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let mut frontmatter = String::new();
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        frontmatter.push_str(line);
+        frontmatter.push('\n');
+    }
+    serde_yml::from_str(&frontmatter).ok()
+}
+
 /// Skill manager for listing, installing, and managing skills.
 #[derive(Debug)]
 pub struct SkillManager {
@@ -127,7 +144,7 @@ impl SkillManager {
         let content = async_fs::read_to_string(&skill_md).await.ok()?;
 
         // Parse YAML frontmatter (between --- markers)
-        let metadata = self.parse_frontmatter(&content)?;
+        let metadata = parse_frontmatter(&content)?;
 
         Some(SkillInfo {
             name: metadata.name,
@@ -138,25 +155,7 @@ impl SkillManager {
         })
     }
 
-    /// Parse YAML frontmatter from content.
-    fn parse_frontmatter(&self, content: &str) -> Option<SkillFrontmatter> {
-        let mut lines = content.lines();
-        let first_line = lines.next()?;
-        if first_line.trim() != "---" {
-            return None;
-        }
 
-        let mut frontmatter = String::new();
-        for line in lines {
-            if line.trim() == "---" {
-                break;
-            }
-            frontmatter.push_str(line);
-            frontmatter.push('\n');
-        }
-
-        serde_yml::from_str(&frontmatter).ok()
-    }
 
     /// Detect skill source from metadata file.
     async fn detect_source(&self, skill_dir: &Path) -> SkillSource {
@@ -296,36 +295,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), SkillError> {
 /// Parse a skill from its directory (standalone for use in closures).
 fn parse_skill_sync(skill_dir: &Path, source: SkillSource) -> Option<SkillInfo> {
     let skill_md = skill_dir.join("SKILL.md");
-    if !skill_md.exists() {
-        return None;
-    }
-
     let content = std::fs::read_to_string(&skill_md).ok()?;
-
-    // Parse YAML frontmatter (between --- markers)
-    let mut lines = content.lines();
-    let first_line = lines.next()?;
-    if first_line.trim() != "---" {
-        return None;
-    }
-
-    let mut frontmatter = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            break;
-        }
-        frontmatter.push_str(line);
-        frontmatter.push('\n');
-    }
-
-    #[derive(Deserialize)]
-    struct Frontmatter {
-        name: String,
-        description: String,
-    }
-
-    let metadata: Frontmatter = serde_yml::from_str(&frontmatter).ok()?;
-
+    let metadata = parse_frontmatter(&content)?;
     Some(SkillInfo {
         name: metadata.name,
         description: metadata.description,

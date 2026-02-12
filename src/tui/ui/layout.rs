@@ -844,13 +844,13 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
                 // For custom providers, show base_url
                 if let Some(ref base_url) = inst.base_url {
                     // Truncate URL safely (unicode-safe)
-                    let url_short = match base_url.char_indices().nth(27) {
+                    const URL_DISPLAY_MAX_CHARS: usize = 27;
+                    let url_short = match base_url.char_indices().nth(URL_DISPLAY_MAX_CHARS) {
                         Some((pos, _)) => format!("{}...", &base_url[..pos]),
                         None => base_url.clone(),
                     };
                     url_short
-                } else if inst.api_key.is_some() {
-                    let key = inst.api_key.as_ref().unwrap();
+                } else if let Some(key) = &inst.api_key {
                     let masked: String = key.chars().take(4).collect::<String>() + "****";
                     format!("{} (configured)", masked)
                 } else if id == "copilot" {

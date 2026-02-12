@@ -27,20 +27,20 @@ pub enum AppEvent {
 
     // ─── Async operation results ───────────────────────────────────────
     /// Session list loaded from background task
-    SessionsLoaded(Result<Vec<SessionSummary>, String>),
+    SessionsLoaded(Result<Vec<SessionSummary>, anyhow::Error>),
     /// Session deleted from background task (includes refreshed list)
     SessionDeleted {
         was_current: bool,
-        result: Result<Vec<SessionSummary>, String>,
+        result: Result<Vec<SessionSummary>, anyhow::Error>,
     },
 
     // ─── Skill operation results ───────────────────────────────────────
     /// Skills list loaded from background task
-    SkillsLoaded(Result<Vec<SkillInfo>, String>),
+    SkillsLoaded(Result<Vec<SkillInfo>, anyhow::Error>),
     /// Skill installed from GitHub
-    SkillInstalled(Result<Vec<SkillInfo>, String>),
+    SkillInstalled(Result<Vec<SkillInfo>, anyhow::Error>),
     /// Skill deleted
-    SkillDeleted(Result<Vec<SkillInfo>, String>),
+    SkillDeleted(Result<Vec<SkillInfo>, anyhow::Error>),
 
     // ─── Image loading ────────────────────────────────────────────────
     /// Image fetch finished from URL (data=None means fetch failed)

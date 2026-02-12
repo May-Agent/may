@@ -75,22 +75,26 @@ pub(crate) fn handle_session_select_key(
                                     .unwrap_or(false);
 
                                 let tx = app.event_tx.clone();
+                                let db = app.session_manager.db().clone();
                                 let store = app.session_manager.store().clone();
                                 executor_core::spawn(async move {
-                                    if let Err(e) = store.delete_session(&deleted_id).await {
+                                    // Delete from both DB and filesystem
+                                    if let Err(e) = db.delete_session(&deleted_id).await {
                                         let _ = tx
                                             .send(crate::tui::event::AppEvent::SessionDeleted {
                                                 was_current,
-                                                result: Err(e.to_string()),
+                                                result: Err(anyhow::Error::from(e)),
                                             })
                                             .await;
                                         return;
                                     }
-                                    let result = store.list_session_summaries().await;
+                                    let _ = store.delete_session(&deleted_id).await;
+                                    let result =
+                                        crate::session::list_summaries_from_db(&db).await;
                                     let _ = tx
                                         .send(crate::tui::event::AppEvent::SessionDeleted {
                                             was_current,
-                                            result: result.map_err(|e| e.to_string()),
+                                            result: result.map_err(anyhow::Error::from),
                                         })
                                         .await;
                                 })

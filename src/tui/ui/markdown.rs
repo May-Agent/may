@@ -7,6 +7,21 @@ use ratatui::prelude::*;
 
 use super::streaming_markdown::StreamingMarkdown;
 
+/// Whether terminal image rendering is supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSupport {
+    /// Terminal supports inline image rendering.
+    Enabled,
+    /// No image support — show as styled links.
+    Disabled,
+}
+
+impl ImageSupport {
+    fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
 /// Result of rendering markdown with image position tracking.
 pub struct MarkdownRenderResult {
     /// Rendered lines
@@ -24,8 +39,8 @@ pub struct MarkdownRenderResult {
 /// `images_supported` controls how images are rendered:
 /// - true: show loading indicator (actual image rendered as overlay)
 /// - false: show as styled link
-pub fn render_markdown_with_config(text: &str, images_supported: bool) -> Vec<Line<'static>> {
-    let mut renderer = StreamingMarkdown::with_image_support(images_supported);
+pub fn render_markdown_with_config(text: &str, images: ImageSupport) -> Vec<Line<'static>> {
+    let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled());
     renderer.push(text);
     renderer.flush(); // Ensure last line is parsed even without trailing newline
     renderer.lines().to_vec()
@@ -35,8 +50,8 @@ pub fn render_markdown_with_config(text: &str, images_supported: bool) -> Vec<Li
 ///
 /// Use this when you need to know where images are located in the rendered output
 /// for rendering actual images as overlays.
-pub fn render_markdown_with_positions(text: &str, images_supported: bool) -> MarkdownRenderResult {
-    let mut renderer = StreamingMarkdown::with_image_support(images_supported);
+pub fn render_markdown_with_positions(text: &str, images: ImageSupport) -> MarkdownRenderResult {
+    let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled());
     renderer.push(text);
     renderer.flush(); // Ensure last line is parsed even without trailing newline
     MarkdownRenderResult {
@@ -48,7 +63,7 @@ pub fn render_markdown_with_positions(text: &str, images_supported: bool) -> Mar
 /// Render markdown text to ratatui lines (no image support).
 /// For image support, use `render_markdown_with_config`.
 pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
-    render_markdown_with_config(text, false)
+    render_markdown_with_config(text, ImageSupport::Disabled)
 }
 
 /// Extract image URLs from markdown text.

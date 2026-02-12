@@ -551,7 +551,7 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        eprintln!("HR test lines: {:?}", all_text);
+        tracing::debug!("HR test lines: {:?}", all_text);
         let has_rule = all_text.iter().any(|t| t.contains('─'));
         assert!(
             has_rule,

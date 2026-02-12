@@ -503,9 +503,7 @@ pub struct QueueContext<'a> {
 
 /// Render the chat stream.
 pub fn render(frame: &mut Frame, area: Rect, chat: &ChatStream, scroll: usize) {
-    render_impl(
-        frame, area, chat, scroll, None, None, None, None, None, None, false, None,
-    );
+    render_impl(frame, area, chat, scroll, RenderContext::default());
 }
 
 /// Full-screen unified render context.
@@ -522,6 +520,21 @@ pub struct UnifiedRenderContext<'a> {
     pub image_positions_out: Option<&'a mut Vec<(String, usize)>>,
 }
 
+impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
+    fn from(ctx: UnifiedRenderContext<'a>) -> Self {
+        Self {
+            selected_tool: ctx.selected_tool,
+            content_height_out: ctx.content_height_out,
+            view_height_out: ctx.view_height_out,
+            input_ctx: ctx.input_ctx,
+            queue_ctx: ctx.queue_ctx,
+            status_ctx: ctx.status_ctx,
+            images_supported: ctx.images_supported,
+            image_positions_out: ctx.image_positions_out,
+        }
+    }
+}
+
 /// Render the chat stream with full-screen scrolling (chat + queue + input + status).
 pub fn render_unified(
     frame: &mut Frame,
@@ -530,20 +543,7 @@ pub fn render_unified(
     scroll: usize,
     ctx: UnifiedRenderContext<'_>,
 ) {
-    render_impl(
-        frame,
-        area,
-        chat,
-        scroll,
-        ctx.selected_tool,
-        ctx.content_height_out,
-        ctx.view_height_out,
-        ctx.input_ctx,
-        ctx.queue_ctx,
-        ctx.status_ctx,
-        ctx.images_supported,
-        ctx.image_positions_out,
-    );
+    render_impl(frame, area, chat, scroll, ctx.into());
 }
 
 /// Build plain wrapped lines for selection/copy from unified viewport content.
@@ -592,7 +592,7 @@ fn build_plain_chat_lines(chat: &ChatStream) -> Vec<Line<'static>> {
                 lines.push(Line::from(""));
             }
             ChatElement::AssistantText { content, .. } => {
-                lines.extend(markdown::render_markdown_with_config(content, false));
+                lines.extend(markdown::render_markdown_with_config(content, markdown::ImageSupport::Disabled));
                 lines.push(Line::from(""));
             }
             ChatElement::Error { message } => {
@@ -705,15 +705,27 @@ pub fn render_with_selection(
         area,
         chat,
         scroll,
-        selected_tool,
-        content_height_out,
-        view_height_out,
-        input_ctx,
-        None,
-        None,
-        false,
-        None,
+        RenderContext {
+            selected_tool,
+            content_height_out,
+            view_height_out,
+            input_ctx,
+            ..Default::default()
+        },
     );
+}
+
+/// Internal render context with all optional parameters.
+#[derive(Default)]
+struct RenderContext<'a> {
+    selected_tool: Option<&'a str>,
+    content_height_out: Option<&'a Cell<usize>>,
+    view_height_out: Option<&'a Cell<usize>>,
+    input_ctx: Option<InputContext<'a>>,
+    queue_ctx: Option<QueueContext<'a>>,
+    status_ctx: Option<StatusContext<'a>>,
+    images_supported: bool,
+    image_positions_out: Option<&'a mut Vec<(String, usize)>>,
 }
 
 /// Internal implementation for rendering chat stream.
@@ -722,19 +734,23 @@ fn render_impl(
     area: Rect,
     chat: &ChatStream,
     scroll: usize,
-    selected_tool: Option<&str>,
-    content_height_out: Option<&Cell<usize>>,
-    view_height_out: Option<&Cell<usize>>,
-    input_ctx: Option<InputContext<'_>>,
-    queue_ctx: Option<QueueContext<'_>>,
-    status_ctx: Option<StatusContext<'_>>,
-    images_supported: bool,
-    image_positions_out: Option<&mut Vec<(String, usize)>>,
+    ctx: RenderContext<'_>,
 ) {
     // Guard against zero-dimension areas to prevent overflow
     if area.width < 3 || area.height < 3 {
         return;
     }
+
+    let RenderContext {
+        selected_tool,
+        content_height_out,
+        view_height_out,
+        input_ctx,
+        queue_ctx,
+        status_ctx,
+        images_supported,
+        image_positions_out,
+    } = ctx;
 
     let mut lines: Vec<Line> = Vec::new();
     let mut collected_image_positions: Vec<(String, usize)> = Vec::new();
@@ -790,7 +806,12 @@ fn render_impl(
                 let line_offset = lines.len();
 
                 // Render markdown with position tracking
-                let md_result = markdown::render_markdown_with_positions(content, images_supported);
+                let image_mode = if images_supported {
+                    markdown::ImageSupport::Enabled
+                } else {
+                    markdown::ImageSupport::Disabled
+                };
+                let md_result = markdown::render_markdown_with_positions(content, image_mode);
                 let mut md_lines = md_result.lines;
                 // Strip accidental trailing empties from markdown renderer so we don't inflate
                 // content height and trigger premature scrollback insertion.

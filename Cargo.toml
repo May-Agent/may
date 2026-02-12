@@ -10,6 +10,10 @@ build = "build.rs"
 name = "may"
 path = "src/bin/may.rs"
 
+[features]
+default = []
+ui = []
+
 [dependencies]
 # Aither framework
 aither-core = { path = "../aither/core" }
@@ -39,6 +43,9 @@ serde_json = "1.0"
 serde_yml = "0.0.12"
 toml = "0.8"
 quick-xml = { version = "0.37", features = ["serialize"] }
+
+# Database (chat history persistence)
+sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 
 # Utils
 jiff = { version = "0.2", features = ["serde"] }
@@ -90,6 +97,7 @@ itertools = "0.14.0"
 tempfile = "3.24.0"
 git2 = "0.20.3"
 mime_guess = "2"
+rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

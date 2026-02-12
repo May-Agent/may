@@ -2,7 +2,7 @@
 
 use crate::MayConfig;
 use crate::ask_user::{AskUserRequest, Question};
-use crate::config::Provider;
+use crate::config::ProviderType;
 use crate::workspace_request::WorkspaceRequest;
 
 /// Application mode.
@@ -409,18 +409,18 @@ impl ConfigState {
 }
 
 /// Try to detect API key from environment variables for the given provider.
-pub fn detect_api_key_from_env(provider: Provider) -> Option<(String, &'static str)> {
+pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'static str)> {
     let env_vars = match provider {
-        Provider::Anthropic => &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"][..],
-        Provider::OpenAI => &["OPENAI_API_KEY"][..],
-        Provider::Google => &["GOOGLE_API_KEY", "GEMINI_API_KEY"][..],
-        Provider::OpenRouter => &["OPENROUTER_API_KEY"][..],
-        Provider::DeepSeek => &["DEEPSEEK_API_KEY"][..],
-        Provider::Groq => &["GROQ_API_KEY"][..],
-        Provider::Together => &["TOGETHER_API_KEY"][..],
-        Provider::Mistral => &["MISTRAL_API_KEY"][..],
-        Provider::XAI => &["XAI_API_KEY", "GROK_API_KEY"][..],
-        Provider::Copilot | Provider::Ollama | Provider::Custom => return None,
+        ProviderType::Anthropic => &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"][..],
+        ProviderType::OpenAI => &["OPENAI_API_KEY"][..],
+        ProviderType::Google => &["GOOGLE_API_KEY", "GEMINI_API_KEY"][..],
+        ProviderType::OpenRouter => &["OPENROUTER_API_KEY"][..],
+        ProviderType::DeepSeek => &["DEEPSEEK_API_KEY"][..],
+        ProviderType::Groq => &["GROQ_API_KEY"][..],
+        ProviderType::Together => &["TOGETHER_API_KEY"][..],
+        ProviderType::Mistral => &["MISTRAL_API_KEY"][..],
+        ProviderType::XAI => &["XAI_API_KEY", "GROK_API_KEY"][..],
+        ProviderType::Copilot | ProviderType::Ollama | ProviderType::Custom => return None,
     };
 
     for var_name in env_vars {
