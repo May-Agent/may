@@ -30,13 +30,18 @@ impl RuntimeDeps {
         worker: &mut Option<AgentWorker>,
     ) -> anyhow::Result<()> {
         let model = app.config.last_model.clone();
-        let session = app
-            .session_manager
-            .create_session_with_model(model.clone())?;
+        let (sandbox_dir, session_id, messages) = {
+            let session = app
+                .session_manager
+                .create_session_with_model(model.clone())?;
+            (
+                session.sandbox_dir.clone(),
+                session.id.clone(),
+                session.history.messages().to_vec(),
+            )
+        };
 
-        let sandbox_dir = session.sandbox_dir.clone();
-        let session_id = session.id.clone();
-        let messages: Vec<_> = session.history.messages().to_vec();
+        app.session_manager.ensure_persisted().await?;
         app.init_session(&session_id, &messages, model.as_deref());
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
