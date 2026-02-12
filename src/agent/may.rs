@@ -11,7 +11,7 @@ use aither_agent::specialized::TaskTool;
 use aither_agent::webfetch::WebFetchTool;
 use aither_agent::websearch::WebSearchTool;
 use aither_agent::{
-    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, BuiltinToolHint, ContextBlock,
+    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, ContextBlock,
     ContextBlockPriority, TodoTool,
 };
 use aither_cloud::{
@@ -338,14 +338,6 @@ impl MayAgent {
             .transcript(transcript_file)
             .context_block(build_workspace_context_block(&workspace))
             .context_block(build_memory_context_block(&memory_content))
-            .builtin_tool_hint(BuiltinToolHint::new(
-                "ask",
-                "Fast side-analysis for piped content; use `ask --help` for usage.",
-            ))
-            .builtin_tool_hint(BuiltinToolHint::new(
-                "task",
-                "Spawn a subagent for isolated complex work; use `task --help`.",
-            ))
             .max_iterations(config.max_iterations);
 
         // Get the actual working directory before building
