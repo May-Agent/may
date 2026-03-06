@@ -13,6 +13,8 @@ use blocking::unblock;
 use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use crate::fs_utils::copy_dir_contents_recursive;
+
 /// Skill management error.
 #[derive(Debug, thiserror::Error)]
 pub enum SkillError {
@@ -30,6 +32,12 @@ pub enum SkillError {
     InvalidRepoFormat,
     #[error("Skill not found: {0}")]
     NotFound(String),
+    #[error("Invalid skill path: {0}")]
+    InvalidPath(String),
+    #[error("Invalid skill definition: {0}")]
+    InvalidDefinition(String),
+    #[error("Skill already exists: {0}")]
+    AlreadyExists(String),
 }
 
 /// Origin of a skill.
@@ -40,6 +48,8 @@ pub enum SkillSource {
     Bundled,
     /// Installed from GitHub.
     GitHub { owner: String, repo: String },
+    /// Registered from a local project path.
+    LocalPath { path: String },
 }
 
 impl std::fmt::Display for SkillSource {
@@ -47,6 +57,7 @@ impl std::fmt::Display for SkillSource {
         match self {
             SkillSource::Bundled => write!(f, "bundled"),
             SkillSource::GitHub { owner, repo } => write!(f, "github:{}/{}", owner, repo),
+            SkillSource::LocalPath { path } => write!(f, "local:{}", path),
         }
     }
 }
@@ -100,9 +111,12 @@ pub struct SkillManager {
 impl SkillManager {
     /// Create a new skill manager.
     pub fn new(may_dir: &Path) -> Self {
-        Self {
-            skills_dir: may_dir.join("skills"),
-        }
+        Self::from_skills_dir(may_dir.join("skills"))
+    }
+
+    /// Create a manager rooted at an explicit skills directory.
+    pub fn from_skills_dir(skills_dir: PathBuf) -> Self {
+        Self { skills_dir }
     }
 
     /// Get the skills directory path.
@@ -228,7 +242,7 @@ impl SkillManager {
                     let dest = skills_dir.join(&skill_name);
 
                     // Copy skill directory recursively
-                    copy_dir_recursive(&src, &dest)?;
+                    copy_dir_contents_recursive(&src, &dest)?;
 
                     // Write source metadata
                     let metadata_path = dest.join(".source.json");
@@ -260,6 +274,65 @@ impl SkillManager {
         Ok(())
     }
 
+    /// Register a skill from an existing local directory.
+    ///
+    /// The source directory must contain a valid `SKILL.md` frontmatter block.
+    pub async fn register_from_local_path(&self, source: &Path) -> Result<SkillInfo, SkillError> {
+        let source = source.to_path_buf();
+        let skills_dir = self.skills_dir.clone();
+
+        unblock(move || -> Result<SkillInfo, SkillError> {
+            if !source.exists() || !source.is_dir() {
+                return Err(SkillError::InvalidPath(format!(
+                    "{} is not a directory",
+                    source.display()
+                )));
+            }
+
+            let source_canon = std::fs::canonicalize(&source)?;
+            let skill_md = source_canon.join("SKILL.md");
+            if !skill_md.exists() {
+                return Err(SkillError::InvalidDefinition(format!(
+                    "missing SKILL.md in {}",
+                    source_canon.display()
+                )));
+            }
+
+            let dir_name = source_canon
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    SkillError::InvalidPath(format!(
+                        "invalid skill directory name: {}",
+                        source_canon.display()
+                    ))
+                })?
+                .to_string();
+
+            std::fs::create_dir_all(&skills_dir)?;
+            let dest = skills_dir.join(&dir_name);
+            if dest.exists() {
+                return Err(SkillError::AlreadyExists(dir_name));
+            }
+
+            copy_dir_contents_recursive(&source_canon, &dest)?;
+            let source_meta = SkillSource::LocalPath {
+                path: source_canon.display().to_string(),
+            };
+            let metadata_path = dest.join(".source.json");
+            let metadata = serde_json::to_string_pretty(&source_meta)?;
+            std::fs::write(metadata_path, metadata)?;
+
+            parse_skill_sync(&dest, source_meta).ok_or_else(|| {
+                SkillError::InvalidDefinition(format!(
+                    "failed to parse SKILL.md in {}",
+                    dest.display()
+                ))
+            })
+        })
+        .await
+    }
+
     /// Parse a GitHub repo string in "owner/repo" format.
     pub fn parse_github_repo(input: &str) -> Result<(&str, &str), SkillError> {
         let input = input.trim();
@@ -268,25 +341,6 @@ impl SkillManager {
             _ => Err(SkillError::InvalidRepoFormat),
         }
     }
-}
-
-/// Copy a directory recursively (standalone for use in closures).
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), SkillError> {
-    std::fs::create_dir_all(dest)?;
-
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let entry_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-
-        if entry_path.is_dir() {
-            copy_dir_recursive(&entry_path, &dest_path)?;
-        } else {
-            std::fs::copy(&entry_path, &dest_path)?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Parse a skill from its directory (standalone for use in closures).
@@ -301,4 +355,41 @@ fn parse_skill_sync(skill_dir: &Path, source: SkillSource) -> Option<SkillInfo> 
         path: skill_dir.to_path_buf(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn register_skill_from_local_path_works() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let may_dir = temp.path().join(".may");
+        let source_root = temp.path().join("project");
+        let source = source_root.join("my-skill");
+        tokio::fs::create_dir_all(&source)
+            .await
+            .expect("create source dir");
+        tokio::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: Local Skill\ndescription: local test\n---\n\n# Local Skill",
+        )
+        .await
+        .expect("write SKILL.md");
+
+        let manager = SkillManager::new(&may_dir);
+        let info = manager
+            .register_from_local_path(&source)
+            .await
+            .expect("register local skill");
+
+        assert_eq!(info.dir_name, "my-skill");
+        assert!(
+            manager
+                .skills_dir()
+                .join("my-skill")
+                .join("SKILL.md")
+                .exists()
+        );
+    }
 }

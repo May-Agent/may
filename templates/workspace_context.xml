@@ -1,6 +1,11 @@
 <workspace>
+<environment>local-host</environment>
 <sandbox>{{ sandbox }}</sandbox>
 <cwd>{{ cwd }}</cwd>
+<description>
+You are operating on the user's local machine inside a managed sandbox.
+Network is enabled by default; request unsafe escalation for host-level side effects outside approved paths.
+</description>
 {% if !workdirs.is_empty() %}<approved_workdirs>
 {% for wd in workdirs %}<workdir path="{{ wd.path }}">{{ wd.description }}</workdir>
 {% endfor %}</approved_workdirs>

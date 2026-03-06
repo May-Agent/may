@@ -6,7 +6,9 @@ pub(crate) mod history;
 mod manager;
 mod store;
 
-pub use history::{ChatHistory, ChatHistoryError, ChatMessage, MessageRole, SessionMetadata};
+pub use history::{
+    ChatHistory, ChatHistoryError, ChatMessage, ChatMessageStats, MessageRole, SessionMetadata,
+};
 pub use manager::{
     Session, SessionError, SessionId, SessionManager, SessionSummary, list_summaries_from_db,
 };

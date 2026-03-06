@@ -116,6 +116,40 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
             }
             Ok(None)
         }
+        AppEvent::ProfilesLoaded(result) => {
+            match result {
+                Ok(profiles) => {
+                    app.profiles = profiles;
+                }
+                Err(e) => {
+                    app.chat
+                        .push_error(&format!("Failed to load profiles: {}", e));
+                }
+            }
+            Ok(None)
+        }
+        AppEvent::ProfileSessionsLoaded(result) => {
+            app.status = None;
+            match result {
+                Ok(ps) => {
+                    app.profile_sessions = Some(ps);
+                    app.build_session_list_from_profile();
+                    app.session_selected = 0;
+                    app.session_search.clear();
+                    app.session_scroll = 0;
+                    // Only switch to SessionSelect if not already in it
+                    // (refresh from pin/archive should keep current mode)
+                    if !matches!(app.mode, AppMode::SessionSelect) {
+                        app.mode = AppMode::SessionSelect;
+                    }
+                }
+                Err(e) => {
+                    app.chat
+                        .push_error(&format!("Failed to load profile sessions: {}", e));
+                }
+            }
+            Ok(None)
+        }
         AppEvent::ImageFetchResult { url, data } => {
             app.handle_image_fetch_result(url, data);
             Ok(None)

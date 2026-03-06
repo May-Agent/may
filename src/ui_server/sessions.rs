@@ -6,64 +6,109 @@ use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::session::SessionId;
 
-use super::helpers::{
-    bad_request_error, internal_error, map_db_messages, map_history_messages, persist_last_model,
-    preferred_advanced_model, resolve_default_model, truncate_preview,
+use super::error::{bad_request_error, internal_error};
+use super::helpers::truncate_preview;
+use super::message_mapping::map_db_messages;
+use super::model_resolution::{
+    persist_last_model, preferred_advanced_model, resolve_default_model,
 };
 use super::state::UiServerState;
-use super::types::{ApiHealth, ApiSession, CreateSessionRequest, UpdateSessionRequest};
+use super::types::{
+    ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, SessionContextDebugResponse,
+    UpdateSessionRequest,
+};
 
 pub(super) async fn list_sessions(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<ApiSession>>> {
-    // Grab DB handle and session summaries, then release the manager lock
-    let (summaries, db) = {
+    let summaries = {
         let manager = state.session_manager.lock().await;
-        let summaries = manager.list_sessions().await.map_err(internal_error)?;
-        let db = manager.db().clone();
-        (summaries, db)
+        manager.list_sessions().await.map_err(internal_error)?
     };
 
     let config = state.config.read().await;
     let mut sessions = Vec::with_capacity(summaries.len());
-
     for s in summaries {
-        let session_id = s.id.as_str().to_string();
-        let model = resolve_default_model(&config, s.model).unwrap_or_default();
-
-        // Load messages from DB for this session
-        let db_messages = db.get_messages(&session_id).await.map_err(internal_error)?;
-        let messages = map_db_messages(&db_messages);
-
-        let last_modified = s
-            .updated_at
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| jiff::Timestamp::now().to_string());
-
-        let preview = if s.content_preview.is_empty() {
-            "New conversation started".to_string()
-        } else {
-            s.content_preview
-        };
-
-        sessions.push(ApiSession {
-            id: session_id,
-            title: s.title.unwrap_or_else(|| "New Chat".to_string()),
-            last_modified,
-            preview,
-            messages,
-            model,
-            reasoning_effort: None,
-        });
+        let model = resolve_default_model(&config, s.model.clone())
+            .ok_or_else(|| internal_error(format!("no model resolved for session {}", s.id)))?;
+        sessions.push(ApiSession::from_summary(s, model, Vec::new()));
     }
 
     Ok(Json(sessions))
+}
+
+pub(super) async fn get_session(
+    params: Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiSession>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+
+    let db = {
+        let manager = state.session_manager.lock().await;
+        manager.db().clone()
+    };
+
+    let db_session = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            SkyError::msg(format!("Session {id} not found")).set_status(StatusCode::NOT_FOUND)
+        })?;
+
+    let summary = crate::session::SessionSummary::from_db_model(db_session);
+
+    let config = state.config.read().await;
+    let model = resolve_default_model(&config, summary.model.clone())
+        .ok_or_else(|| internal_error(format!("no model resolved for session {id}")))?;
+
+    let db_messages = db.get_messages(&id).await.map_err(internal_error)?;
+    let messages = map_db_messages(&db_messages);
+
+    Ok(Json(ApiSession::from_summary(summary, model, messages)))
+}
+
+pub(super) async fn get_session_context_debug(
+    params: Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<SessionContextDebugResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+
+    let db = {
+        let manager = state.session_manager.lock().await;
+        manager.db().clone()
+    };
+    let row = db
+        .get_context_debug_snapshot(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            SkyError::msg(format!("No context debug snapshot for session {id}"))
+                .set_status(StatusCode::NOT_FOUND)
+        })?;
+
+    let prompt_attachments: Vec<String> = serde_json::from_str(&row.prompt_attachments_json)
+        .map_err(|e| internal_error(format!("invalid prompt_attachments_json: {e}")))?;
+    let assembled_messages: Vec<ContextDebugMessage> =
+        serde_json::from_str(&row.assembled_messages_json)
+            .map_err(|e| internal_error(format!("invalid assembled_messages_json: {e}")))?;
+
+    Ok(Json(SessionContextDebugResponse {
+        session_id: row.session_id,
+        timestamp: row.timestamp,
+        model: row.model,
+        provider_id: row.provider_id,
+        prompt: row.prompt,
+        prompt_attachments,
+        assembled_messages,
+    }))
 }
 
 pub(super) async fn create_session(
     Json(req): Json<CreateSessionRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiSession>> {
+    let requested_profile_id = req.profile_id.clone();
     let model = {
         let config = state.config.read().await;
         req.model
@@ -73,9 +118,11 @@ pub(super) async fn create_session(
     };
 
     let mut manager = state.session_manager.lock().await;
+    let resolved_profile_id =
+        requested_profile_id.or_else(|| manager.current_profile_id().map(ToOwned::to_owned));
 
     let session = manager
-        .create_session_with_model(Some(model.clone()))
+        .create_session_in_profile(Some(model.clone()), resolved_profile_id)
         .map_err(internal_error)?;
     let id = session.id.as_str().to_string();
 
@@ -90,15 +137,7 @@ pub(super) async fn create_session(
         .await
         .map_err(internal_error)?;
 
-    Ok(Json(ApiSession {
-        id,
-        title: "New Chat".to_string(),
-        last_modified: jiff::Timestamp::now().to_string(),
-        preview: "New conversation started".to_string(),
-        messages: Vec::new(),
-        model,
-        reasoning_effort: None,
-    }))
+    Ok(Json(ApiSession::new_empty(id, model)))
 }
 
 pub(super) async fn update_session(
@@ -115,6 +154,8 @@ pub(super) async fn update_session(
         .await
         .map_err(internal_error)?;
 
+    let mut model_to_persist: Option<String> = None;
+
     if let Some(title) = req.title {
         manager
             .set_current_title(title)
@@ -126,33 +167,45 @@ pub(super) async fn update_session(
             .set_current_model(model.clone())
             .await
             .map_err(internal_error)?;
-        persist_last_model(&state, &model)
-            .await
-            .map_err(internal_error)?;
+        model_to_persist = Some(model);
     }
 
     let current = manager.current().ok_or_else(|| {
         SkyError::msg("No active session").set_status(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
+    let title = current
+        .title
+        .clone()
+        .unwrap_or_else(|| "New Chat".to_string());
+    let preview = current
+        .history
+        .messages()
+        .last()
+        .map(|m| truncate_preview(&m.content))
+        .unwrap_or_else(|| "New conversation started".to_string());
+    let current_model = current.model.clone();
+    let current_id = current.id.as_str().to_string();
+    drop(manager);
+
+    if let Some(model) = model_to_persist {
+        persist_last_model(&state, &model)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    let model = {
+        let cfg = state.config.read().await;
+        resolve_default_model(&cfg, current_model)
+            .ok_or_else(|| internal_error(format!("no model resolved for session {current_id}")))?
+    };
 
     Ok(Json(ApiSession {
         id,
-        title: current
-            .title
-            .clone()
-            .unwrap_or_else(|| "New Chat".to_string()),
+        title,
         last_modified: jiff::Timestamp::now().to_string(),
-        preview: current
-            .history
-            .messages()
-            .last()
-            .map(|m| truncate_preview(&m.content))
-            .unwrap_or_else(|| "New conversation started".to_string()),
-        messages: map_history_messages(current.history.messages()),
-        model: {
-            let cfg = state.config.read().await;
-            resolve_default_model(&cfg, current.model.clone()).unwrap_or_default()
-        },
+        preview,
+        messages: Vec::new(),
+        model,
         reasoning_effort: None,
     }))
 }
@@ -178,9 +231,9 @@ pub(super) async fn delete_all_sessions(
 
     // Clean up filesystem session directories
     let store = manager.store().clone();
-    let ids = store.list_sessions().await.unwrap_or_default();
+    let ids = store.list_sessions().await.map_err(internal_error)?;
     for id in ids {
-        let _ = store.delete_session(&id).await;
+        store.delete_session(&id).await.map_err(internal_error)?;
     }
 
     let _ = manager.create_session();

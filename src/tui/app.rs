@@ -9,8 +9,9 @@ use blocking::unblock;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use executor_core::spawn;
 
-use crate::config::{ModelTier, ProviderType};
+use crate::config::{ModelTier, ProviderType, get_model_tier};
 use crate::models::FetchedModel;
+use crate::profile::{PinnedItem, ProfileInfo, ProfileSessions};
 use crate::{ChatMessage, MayConfig, MessageRole, SessionId, SessionManager, SessionSummary};
 
 use super::agent_event_adapter::{ToolEndKind, ToolStartKind, parse_tool_end, parse_tool_start};
@@ -176,6 +177,18 @@ pub struct App {
     /// Skill search query
     pub skill_search: String,
 
+    // ── Profile state ─────────────────────────────────────────
+    /// Available profiles (loaded at startup)
+    pub profiles: Vec<ProfileInfo>,
+    /// Currently active profile ID
+    pub current_profile_id: Option<String>,
+    /// Profile sessions for the current profile (pinned/regular/archived)
+    pub profile_sessions: Option<ProfileSessions>,
+    /// Selected profile index in ProfileSelect mode
+    pub profile_selected: usize,
+    /// Whether the archived section is expanded in SessionSelect
+    pub archived_expanded: bool,
+
     /// Event sender for spawning background tasks
     pub event_tx: EventSender,
     /// Terminal image rendering support (None if terminal doesn't support graphics)
@@ -200,7 +213,7 @@ impl App {
         image_support: Option<super::ui::image::TerminalImageSupport>,
     ) -> anyhow::Result<Self> {
         let mut config = MayConfig::load().context("Failed to load config")?;
-        let session_manager = SessionManager::new().await?;
+        let mut session_manager = SessionManager::new().await?;
 
         // Auto-detect API keys from environment variables
         let mut env_providers_added = Vec::new();
@@ -240,6 +253,15 @@ impl App {
         // Initialize config state
         let mut config_state = ConfigState::default();
         config_state.load_providers(&config);
+
+        // Load profiles from database
+        let profiles = crate::profile::list_profiles(session_manager.db())
+            .await
+            .unwrap_or_default();
+        let current_profile_id = profiles.first().map(|p| p.id.clone());
+        if let Some(ref profile_id) = current_profile_id {
+            session_manager.set_current_profile(profile_id.clone());
+        }
 
         // Load input history
         let history = InputHistory::new(session_manager.may_dir());
@@ -326,6 +348,12 @@ impl App {
             skill_add_mode: SkillAddMode::None,
             skill_github_input: String::new(),
             skill_search: String::new(),
+
+            profiles,
+            current_profile_id,
+            profile_sessions: None,
+            profile_selected: 0,
+            archived_expanded: false,
 
             event_tx,
             image_support,
@@ -518,7 +546,7 @@ impl App {
         // Set context window from model info
         if let Some(model_name) = model {
             if let Some(info) = aither_models::lookup(model_name) {
-                self.context_window = Some(info.context_window);
+                self.context_window = info.max_input_tokens();
             } else {
                 self.context_window = None;
             }
@@ -726,6 +754,23 @@ impl App {
                     self.status = None;
                     return Ok(Some(SendAction::NewSession));
                 }
+                KeyCode::Char('p') => {
+                    self.quit_pending = false;
+                    self.status = None;
+                    if self.profiles.len() > 1 {
+                        // Open profile select popup
+                        self.profile_selected = self
+                            .profiles
+                            .iter()
+                            .position(|p| Some(p.id.as_str()) == self.current_profile_id.as_deref())
+                            .unwrap_or(0);
+                        self.mode = AppMode::ProfileSelect;
+                    } else {
+                        // Only one profile, open session list directly
+                        self.load_session_list();
+                    }
+                    return Ok(None);
+                }
                 _ => {}
             }
         }
@@ -755,6 +800,9 @@ impl App {
             AppMode::SshManage => super::reducer::manage::handle_ssh_key(self, code),
             AppMode::AskUser(_) => super::reducer::ask_user::handle_ask_user_key(self, code),
             AppMode::SkillManage => super::reducer::manage::handle_skill_key(self, code),
+            AppMode::ProfileSelect => {
+                super::reducer::navigation::handle_profile_select_key(self, code)
+            }
         }
     }
 
@@ -795,6 +843,93 @@ impl App {
                 })
                 .collect()
         }
+    }
+
+    /// Trigger async loading of session list for the session select popup.
+    /// Uses profile sessions when a profile is active, falls back to flat list.
+    pub fn load_session_list(&mut self) {
+        let tx = self.event_tx.clone();
+        let db = self.session_manager.db().clone();
+        let profile_id = self.current_profile_id.clone();
+
+        spawn(async move {
+            if let Some(pid) = profile_id {
+                let result = crate::profile::query_profile_sessions(&db, &pid).await;
+                let _ = tx
+                    .send(AppEvent::ProfileSessionsLoaded(
+                        result.map_err(anyhow::Error::from),
+                    ))
+                    .await;
+            } else {
+                let result = crate::session::list_summaries_from_db(&db).await;
+                let _ = tx
+                    .send(AppEvent::SessionsLoaded(
+                        result.map_err(anyhow::Error::from),
+                    ))
+                    .await;
+            }
+        })
+        .detach();
+        self.status = Some("Loading sessions...".to_string());
+    }
+
+    /// Build a flat session list from profile sessions for navigation.
+    /// Pinned items come first, then regular, then archived (if expanded).
+    pub fn build_session_list_from_profile(&mut self) {
+        let Some(ref ps) = self.profile_sessions else {
+            self.session_list.clear();
+            return;
+        };
+
+        let mut list = Vec::new();
+
+        // Pinned items
+        for item in &ps.pinned {
+            match item {
+                PinnedItem::Session(s) => list.push(s.clone()),
+                PinnedItem::Folder { sessions, .. } => {
+                    list.extend(sessions.iter().cloned());
+                }
+            }
+        }
+
+        // Regular sessions
+        list.extend(ps.regular.iter().cloned());
+
+        // Archived (only if expanded)
+        if self.archived_expanded {
+            list.extend(ps.archived.iter().cloned());
+        }
+
+        self.session_list = list;
+    }
+
+    /// Get the current profile name for display.
+    pub fn current_profile_name(&self) -> Option<&str> {
+        let pid = self.current_profile_id.as_deref()?;
+        self.profiles
+            .iter()
+            .find(|p| p.id == pid)
+            .map(|p| p.name.as_str())
+    }
+
+    /// Reload profile sessions asynchronously (used after pin/archive mutations).
+    pub fn refresh_profile_sessions(&mut self) {
+        let Some(pid) = self.current_profile_id.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        let db = self.session_manager.db().clone();
+
+        spawn(async move {
+            let result = crate::profile::query_profile_sessions(&db, &pid).await;
+            let _ = tx
+                .send(AppEvent::ProfileSessionsLoaded(
+                    result.map_err(anyhow::Error::from),
+                ))
+                .await;
+        })
+        .detach();
     }
 
     /// Start the Copilot OAuth device flow.
@@ -1102,21 +1237,23 @@ impl App {
     fn execute_slash_command(&mut self, cmd: &str) -> anyhow::Result<Option<SendAction>> {
         match cmd {
             "/session" => {
-                let tx = self.event_tx.clone();
-                let db = self.session_manager.db().clone();
-                spawn(async move {
-                    let result = crate::session::list_summaries_from_db(&db).await;
-                    let _ = tx
-                        .send(AppEvent::SessionsLoaded(
-                            result.map_err(anyhow::Error::from),
-                        ))
-                        .await;
-                })
-                .detach();
-                self.status = Some("Loading sessions...".to_string());
+                self.load_session_list();
                 Ok(None)
             }
             "/new" => Ok(Some(SendAction::NewSession)),
+            "/profile" => {
+                if self.profiles.len() > 1 {
+                    self.profile_selected = self
+                        .profiles
+                        .iter()
+                        .position(|p| Some(p.id.as_str()) == self.current_profile_id.as_deref())
+                        .unwrap_or(0);
+                    self.mode = AppMode::ProfileSelect;
+                } else {
+                    self.load_session_list();
+                }
+                Ok(None)
+            }
             "/sandbox" => {
                 if let Some(session) = self.session_manager.current() {
                     let sandbox_dir = &session.sandbox_dir;
@@ -1359,23 +1496,17 @@ impl App {
         // 2. Models in the database but not matching this tier
         // 3. Unknown models (not in database)
         let current_tier = self.tier_picker_tier;
-        let aither_tier = current_tier.map(|t| match t {
-            ModelTier::Advanced => aither_models::ModelTier::Flagship,
-            ModelTier::Balanced => aither_models::ModelTier::Balanced,
-            ModelTier::Fast => aither_models::ModelTier::Fast,
-            ModelTier::ImageGeneration => aither_models::ModelTier::Flagship,
-        });
 
         models.sort_by(|a, b| {
             let a_info = aither_models::lookup(&a.id);
             let b_info = aither_models::lookup(&b.id);
 
             // Check tier match
-            let a_tier_match = aither_tier
-                .and_then(|tier| a_info.map(|info| info.has_tier(tier)))
+            let a_tier_match = current_tier
+                .and_then(|tier| a_info.map(|info| get_model_tier(info.id()) == tier))
                 .unwrap_or(false);
-            let b_tier_match = aither_tier
-                .and_then(|tier| b_info.map(|info| info.has_tier(tier)))
+            let b_tier_match = current_tier
+                .and_then(|tier| b_info.map(|info| get_model_tier(info.id()) == tier))
                 .unwrap_or(false);
 
             // Priority: tier match > in database > unknown
@@ -1893,19 +2024,22 @@ impl App {
             }
 
             // Get models from aither-models
-            use aither_models::ModelTier as AitherTier;
-            for info in aither_models::models_for_provider(provider_str) {
-                if info.outdated {
+            for info in aither_models::all_models() {
+                if info.is_deprecated() {
                     continue;
                 }
-                let model_id = info.id.to_string();
-                if info.has_tier(AitherTier::Flagship) && self.config.models.advanced.is_empty() {
+                let model_id = info.id().to_string();
+                if !provider_type.can_serve_model(&model_id) {
+                    continue;
+                }
+                let tier = get_model_tier(&model_id);
+                if tier == ModelTier::Advanced && self.config.models.advanced.is_empty() {
                     self.config.models.advanced.push(model_id.clone());
                 }
-                if info.has_tier(AitherTier::Balanced) && self.config.models.balanced.is_empty() {
+                if tier == ModelTier::Balanced && self.config.models.balanced.is_empty() {
                     self.config.models.balanced.push(model_id.clone());
                 }
-                if info.has_tier(AitherTier::Fast) && self.config.models.fast.is_empty() {
+                if tier == ModelTier::Fast && self.config.models.fast.is_empty() {
                     self.config.models.fast.push(model_id);
                 }
             }
@@ -2226,7 +2360,7 @@ impl App {
         self.current_model = Some(model.to_string());
         // Also update context window from model info
         if let Some(info) = aither_models::lookup(model) {
-            self.context_window = Some(info.context_window);
+            self.context_window = info.max_input_tokens();
         }
     }
 

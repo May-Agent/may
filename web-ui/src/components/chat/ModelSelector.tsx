@@ -12,20 +12,33 @@ interface ModelSelectorProps {
   currentReasoningEffort?: string;
   onModelChange: (modelId: string) => void;
   onReasoningEffortChange: (effort?: string) => void;
+  disabled?: boolean;
+  isUpdating?: boolean;
 }
 
-export function ModelSelector({ currentModelId, currentReasoningEffort, onModelChange, onReasoningEffortChange }: ModelSelectorProps) {
+export function ModelSelector({
+  currentModelId,
+  currentReasoningEffort,
+  onModelChange,
+  onReasoningEffortChange,
+  disabled = false,
+  isUpdating = false,
+}: ModelSelectorProps) {
   const [open, setOpen] = useState(false);
   const { models, modelsLoaded, uiConfig } = useStore();
 
   const prioritizedModels = useMemo(() => {
     const tiers = uiConfig.fullConfig?.models;
-    if (!tiers) return [];
-
-    const orderedIds = [...tiers.advanced, ...tiers.balanced, ...tiers.fast];
+    const orderedIds = tiers
+      ? [...tiers.advanced, ...tiers.balanced, ...tiers.fast]
+      : models.map((model) => model.id);
     const uniqueOrderedIds = orderedIds.filter((id, i) => orderedIds.indexOf(id) === i);
+    const finalModelIds =
+      currentModelId && !uniqueOrderedIds.includes(currentModelId)
+        ? [...uniqueOrderedIds, currentModelId]
+        : uniqueOrderedIds;
 
-    return uniqueOrderedIds.map((id) => {
+    return finalModelIds.map((id) => {
       const existing = models.find((m) => m.id === id);
       return (
         existing ?? {
@@ -36,9 +49,9 @@ export function ModelSelector({ currentModelId, currentReasoningEffort, onModelC
         }
       );
     });
-  }, [models, uiConfig.fullConfig?.models]);
+  }, [models, uiConfig.fullConfig?.models, currentModelId]);
 
-  const selected = getModel(currentModelId, prioritizedModels);
+  const selected = getModel(currentModelId, prioritizedModels) ?? getModel(currentModelId, models);
 
   if (!modelsLoaded) {
     return (
@@ -49,22 +62,35 @@ export function ModelSelector({ currentModelId, currentReasoningEffort, onModelC
     );
   }
 
-  if (!selected) {
+  if (prioritizedModels.length === 0) {
     return (
       <Button variant="ghost" size="sm" className="h-8 gap-2 text-xs text-muted-foreground font-medium px-2" disabled>
-        <span>No model configured</span>
+        <span>No models available</span>
       </Button>
     );
   }
 
-  const SelectedIcon = PROVIDER_ICONS[selected.provider];
+  const fallbackModel = prioritizedModels[0];
+  const displayModel = selected ?? fallbackModel;
+  const SelectedIcon = PROVIDER_ICONS[displayModel.provider];
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open && !disabled}
+      onOpenChange={(nextOpen) => {
+        if (disabled) return;
+        setOpen(nextOpen);
+      }}
+    >
       <PopoverTrigger asChild>
-        <Button variant="ghost" size="sm" className="h-8 gap-2 text-xs text-muted-foreground hover:text-foreground font-medium px-2">
-          <SelectedIcon className="h-4 w-4" />
-          <span className="truncate">{selected.name}</span>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 gap-2 text-xs text-muted-foreground hover:text-foreground font-medium px-2"
+          disabled={disabled}
+        >
+          {isUpdating ? <Loader2 className="h-4 w-4 animate-spin" /> : <SelectedIcon className="h-4 w-4" />}
+          <span className="truncate">{selected?.name ?? 'Select model'}</span>
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-[320px] p-0" align="start">
@@ -80,6 +106,7 @@ export function ModelSelector({ currentModelId, currentReasoningEffort, onModelC
                     key={model.id}
                     value={`${model.name} ${model.id}`}
                     onSelect={() => {
+                      if (disabled) return;
                       onModelChange(model.id);
                       if (!model.reasoning) setOpen(false);
                     }}
@@ -94,11 +121,15 @@ export function ModelSelector({ currentModelId, currentReasoningEffort, onModelC
             </CommandGroup>
           </CommandList>
         </Command>
-        {selected.reasoning && (
+        {selected?.reasoning && (
           <div className="border-t p-3 bg-muted/30">
             <div className="flex items-center justify-between gap-2">
               <span className="text-xs font-medium text-muted-foreground">Reasoning Effort</span>
-              <Select value={currentReasoningEffort ?? 'off'} onValueChange={(v) => onReasoningEffortChange(v === 'off' ? undefined : v)}>
+              <Select
+                value={currentReasoningEffort ?? 'off'}
+                onValueChange={(v) => onReasoningEffortChange(v === 'off' ? undefined : v)}
+                disabled={disabled}
+              >
                 <SelectTrigger className="h-7 w-[120px] text-xs"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="off">Off</SelectItem>

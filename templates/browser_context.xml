@@ -1,0 +1,15 @@
+<browser>
+<capability>Web browser automation via playwright-cli connected to host Chromium over CDP</capability>
+{% if let Some(endpoint) = cdp_endpoint %}
+<cdp_endpoint>{{ endpoint }}</cdp_endpoint>
+{% endif %}
+<instructions>
+A headless Chromium browser is running on the host, accessible via CDP.
+Use the `pw` command (a pre-configured wrapper for playwright-cli) for browser automation.
+Run `pw --help` for available commands (open, goto, snapshot, click, type, fill, etc.).
+
+IMPORTANT:
+- Always use `pw`, never bare `playwright-cli` (which lacks the CDP config).
+- NEVER install or launch Chromium inside this container.
+</instructions>
+</browser>

@@ -3,11 +3,28 @@ import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 're
 import { Sidebar } from '@/components/layout/Sidebar';
 import { SettingsPage } from '@/components/layout/SettingsPage';
 import { ChatInterface } from '@/components/chat/ChatInterface';
+import { sendChat, subscribeUiEvents } from '@/lib/api';
 import { Menu } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
 import { useStore } from '@/lib/store';
 import { FONTS } from '@/lib/constants';
+import type { ProfileSessions } from '@/types';
+
+function profileHasSession(profileSessions: ProfileSessions | null, sessionId: string): boolean {
+  if (!profileSessions) return false;
+  if (profileSessions.regular.some((session) => session.id === sessionId)) return true;
+  if (profileSessions.archived.some((session) => session.id === sessionId)) return true;
+  for (const item of profileSessions.pinned) {
+    if (item.type === 'session' && item.id === sessionId) {
+      return true;
+    }
+    if (item.type === 'folder' && item.sessions.some((session) => session.id === sessionId)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function AppScaffold({
   isSidebarOpen,
@@ -25,7 +42,7 @@ function AppScaffold({
   const navigate = useNavigate();
 
   return (
-    <div className="flex h-screen bg-background text-foreground overflow-hidden">
+    <div className="flex h-full min-h-0 bg-background text-foreground overflow-hidden">
       <div className="md:hidden fixed top-4 left-4 z-50">
         <Sheet open={isSidebarOpen} onOpenChange={setSidebarOpen}>
           <SheetTrigger asChild>
@@ -43,7 +60,9 @@ function AppScaffold({
         </Sheet>
       </div>
 
-      <div className={`${isDesktopSidebarOpen ? 'w-64' : 'w-0'} hidden md:block h-full transition-all duration-300 ease-in-out overflow-hidden border-r`}>
+      <div
+        className={`${isDesktopSidebarOpen ? 'w-64' : 'w-0'} hidden h-full flex-shrink-0 overflow-hidden transition-all duration-300 ease-in-out md:block`}
+      >
         <Sidebar
           className="w-64"
           onOpenSettings={onOpenSettings}
@@ -52,7 +71,7 @@ function AppScaffold({
         />
       </div>
 
-      <main className="flex-1 flex flex-col h-full relative">{children}</main>
+      <main className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">{children}</main>
     </div>
   );
 }
@@ -71,7 +90,15 @@ function ChatRouteView({
   onOpenSettings: () => void;
 }) {
   const { sessionId } = useParams();
-  const { loaded, sessions, currentSessionId, setCurrentSession } = useStore();
+  const navigate = useNavigate();
+  const {
+    loaded,
+    currentSessionId,
+    currentProfileId,
+    profileSessions,
+    profileSessionsLoading,
+    setCurrentSession,
+  } = useStore();
 
   useEffect(() => {
     if (!sessionId || sessionId === 'new') {
@@ -81,20 +108,29 @@ function ChatRouteView({
       return;
     }
 
-    if (!loaded) return;
+    if (!loaded || profileSessionsLoading) return;
 
-    const exists = sessions.some((s) => s.id === sessionId);
-    if (!exists) {
+    const existsInProfile = profileHasSession(profileSessions, sessionId);
+    if (!existsInProfile) {
       if (currentSessionId !== null) {
         setCurrentSession(null);
       }
+      navigate('/chat/new', { replace: true });
       return;
     }
 
     if (currentSessionId !== sessionId) {
       setCurrentSession(sessionId);
     }
-  }, [loaded, sessionId, sessions, currentSessionId, setCurrentSession]);
+  }, [
+    loaded,
+    sessionId,
+    currentSessionId,
+    profileSessions,
+    profileSessionsLoading,
+    setCurrentSession,
+    navigate,
+  ]);
 
   return (
     <AppScaffold
@@ -104,6 +140,7 @@ function ChatRouteView({
       onOpenSettings={onOpenSettings}
     >
       <ChatInterface
+        key={`${currentProfileId ?? 'none'}:${sessionId ?? 'new'}`}
         onToggleSidebar={() => setDesktopSidebarOpen(!isDesktopSidebarOpen)}
         isSidebarOpen={isDesktopSidebarOpen}
       />
@@ -113,7 +150,7 @@ function ChatRouteView({
 
 function SettingsRouteView() {
   return (
-    <div className="h-screen bg-background text-foreground overflow-auto">
+    <div className="h-full min-h-0 bg-background text-foreground overflow-auto">
       <SettingsPage />
     </div>
   );
@@ -132,7 +169,8 @@ function AppShell() {
     refreshFullConfig,
     refreshMcpServers,
     refreshSkills,
-    updateSettings,
+    markBackendUnavailable,
+    clearBackendUnavailable,
   } = useStore();
 
   useEffect(() => {
@@ -149,72 +187,120 @@ function AppShell() {
   }, [location.pathname, refreshRuntimeSettings, refreshFullConfig, refreshMcpServers, refreshSkills]);
 
   useEffect(() => {
-    let source: EventSource | null = null;
-    let reconnectTimer: number | null = null;
+    if (!('serviceWorker' in navigator)) {
+      return;
+    }
 
-    const setReconnect = (reconnecting: boolean) => {
-      const id = 'config-reconnect-banner';
-      const exists = document.getElementById(id);
-      if (reconnecting) {
-        if (!exists) {
-          const div = document.createElement('div');
-          div.id = id;
-          div.textContent = 'Reconnecting to config stream...';
-          div.style.cssText =
-            'position:fixed;bottom:12px;right:12px;z-index:9999;background:#111827;color:#f9fafb;padding:6px 10px;border-radius:8px;font-size:12px;opacity:0.95';
-          document.body.appendChild(div);
-        }
-      } else if (exists) {
-        exists.remove();
+    const handleServiceWorkerMessage = (event: MessageEvent) => {
+      const data = event.data as
+        | {
+            type?: string;
+            payload?: {
+              sessionId?: unknown;
+              callbackContextXml?: unknown;
+              callbackMessage?: unknown;
+            };
+          }
+        | undefined;
+
+      if (!data || data.type !== 'may-notification-click') {
+        return;
       }
-    };
 
-    const connect = () => {
-      source = new EventSource('/api/config/stream');
-
-      source.addEventListener('config', (ev) => {
+      void (async () => {
+        const store = useStore.getState();
         try {
-          const data = JSON.parse((ev as MessageEvent).data) as {
-            ui_font?: string;
-            ui_theme?: 'light' | 'dark' | 'system';
-          };
-          useStore.getState().updateSettings({
-            font: data.ui_font ?? useStore.getState().settings.font,
-            theme: data.ui_theme ?? useStore.getState().settings.theme,
+          const payload = data.payload ?? {};
+          const requestedSessionId =
+            typeof payload.sessionId === 'string' && payload.sessionId.trim().length > 0
+              ? payload.sessionId
+              : undefined;
+          const callbackMessage =
+            typeof payload.callbackMessage === 'string' ? payload.callbackMessage.trim() : '';
+          const callbackContextXml =
+            typeof payload.callbackContextXml === 'string'
+              ? payload.callbackContextXml.trim()
+              : '';
+
+          const existingSession = requestedSessionId
+            ? store.sessions.find((s) => s.id === requestedSessionId)
+            : undefined;
+          const targetSessionId = existingSession?.id ?? (await store.createSession());
+
+          store.setCurrentSession(targetSessionId);
+          navigate(`/chat/${encodeURIComponent(targetSessionId)}`);
+
+          if (!callbackMessage) {
+            return;
+          }
+
+          store.addMessage(targetSessionId, callbackMessage, 'user');
+          const assistant = await sendChat({
+            sessionId: targetSessionId,
+            content: callbackMessage,
+            hiddenContextXml: callbackContextXml || undefined,
+            attachments: [],
           });
-          setReconnect(false);
-        } catch {
-          // ignore malformed event
+          store.addMessage(targetSessionId, assistant.content, 'assistant');
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          store.markBackendUnavailable(reason);
+          console.error('failed to process notification click callback', error);
         }
-      });
-
-      source.addEventListener('heartbeat', () => {
-        setReconnect(false);
-      });
-
-      source.onerror = () => {
-        setReconnect(true);
-        source?.close();
-        source = null;
-        if (reconnectTimer == null) {
-          reconnectTimer = window.setTimeout(() => {
-            reconnectTimer = null;
-            connect();
-          }, 1200);
-        }
-      };
+      })();
     };
 
-    connect();
+    navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+    return () => {
+      navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+    };
+  }, [navigate]);
+
+  useEffect(() => {
+    const unsubscribeEvents = subscribeUiEvents({
+      onOpen: () => {},
+      onConfig: (data) => {
+        clearBackendUnavailable();
+        useStore.setState((state) => {
+          const nextFullConfig = data.fullConfig ?? state.uiConfig.fullConfig;
+          const nextFont =
+            data.uiFont ??
+            nextFullConfig?.appearance.font ??
+            state.settings.font;
+          const nextTheme =
+            data.uiTheme ??
+            nextFullConfig?.appearance.theme ??
+            state.settings.theme;
+          return {
+            settings: {
+              ...state.settings,
+              font: nextFont,
+              theme: nextTheme,
+            },
+            uiConfig: {
+              ...state.uiConfig,
+              sshServers: data.sshServers ?? state.uiConfig.sshServers,
+              maxIterations:
+                data.maxIterations ?? state.uiConfig.maxIterations,
+              fullConfig: nextFullConfig,
+            },
+          };
+        });
+      },
+      onContainerPrepare: (payload) => {
+        clearBackendUnavailable();
+        useStore.getState().setContainerPrepareStatuses(payload.statuses);
+      },
+      onHeartbeat: () => {},
+      onError: () => {
+        markBackendUnavailable('Backend event stream disconnected');
+      },
+    });
 
     return () => {
-      if (reconnectTimer != null) {
-        window.clearTimeout(reconnectTimer);
-      }
-      source?.close();
-      setReconnect(false);
+      unsubscribeEvents();
     };
-  }, [updateSettings]);
+  }, [clearBackendUnavailable, markBackendUnavailable]);
 
   useEffect(() => {
     if (settings.font && !settings.font.startsWith('Source Han')) {
@@ -246,7 +332,7 @@ function AppShell() {
   );
 
   return (
-    <div style={{ fontFamily }}>
+    <div style={{ fontFamily }} className="h-dvh min-h-0">
       <Routes>
         <Route
           path="/chat/new"

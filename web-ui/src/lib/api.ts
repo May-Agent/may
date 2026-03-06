@@ -1,77 +1,22 @@
-import type { Session, Message, Attachment, Artifact } from '@/types';
-
-interface ApiAttachment {
-  id: string;
-  name: string;
-  type: string;
-  url: string;
-  upload_data_url?: string;
-  text_content?: string;
-}
-
-interface ApiBashExecution {
-  id: string;
-  input: string;
-  output?: string;
-  status: 'running' | 'done' | 'failed';
-  mode: 'sandboxed' | 'network' | 'unsafe' | string;
-}
-
-interface ApiMessage {
-  id: string;
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-  timestamp: string;
-  attachments?: ApiAttachment[];
-  thinking?: string;
-  is_streaming?: boolean;
-  is_thinking?: boolean;
-  tool_event?: {
-    id: string;
-    stage: 'start' | 'end';
-    name?: string;
-    arguments?: unknown;
-    result?: unknown;
-  };
-  bash_executions?: ApiBashExecution[];
-  stats?: {
-    provider_id?: string;
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
-    context_window?: number;
-    elapsed_ms?: number;
-  };
-}
-
-interface ApiSession {
-  id: string;
-  title: string;
-  last_modified: string;
-  preview: string;
-  messages: ApiMessage[];
-  model: string;
-  reasoning_effort?: string;
-}
-
-interface ChatResponse {
-  session_id: string;
-  assistant: ApiMessage;
-}
-
-interface ApiArtifact {
-  path: string;
-  name: string;
-  size: number;
-  is_html: boolean;
-  fingerprint?: string;
-}
+import type {
+  Session,
+  Message,
+  Attachment,
+  Artifact,
+  TimelineSegment,
+  BashExecution,
+  ProfileInfo,
+  ProfileSessions,
+  FolderInfo,
+  ScheduledTask,
+  VapidKeyInfo,
+} from '@/types';
 
 export interface PermissionRequest {
   id: string;
-  mode: 'sandboxed' | 'network' | 'unsafe';
+  mode: 'default' | 'unsafe' | 'ssh';
   script: string;
-  session_id?: string;
+  sessionId?: string;
 }
 
 export interface PermissionPollResult {
@@ -87,12 +32,49 @@ export interface AskUserQuestion {
   section: string;
   question: string;
   option: string[];
-  multi_select: boolean;
+  multiSelect: boolean;
 }
 
 export interface ArtifactStreamEvent {
   count: number;
   signature: string;
+}
+
+export interface UiConfigEventPayload {
+  uiFont?: string;
+  uiTheme?: 'light' | 'dark' | 'system';
+  sshServers?: Array<{ name: string; target: string }>;
+  maxIterations?: number;
+  fullConfig?: UiFullConfig;
+}
+
+export type ContainerPrepareStage =
+  | 'checking'
+  | 'building'
+  | 'ready'
+  | 'failed';
+
+export interface ContainerPrepareStatus {
+  profileId: string;
+  stage: ContainerPrepareStage;
+  summary: string;
+  recentLogs: string[];
+}
+
+export interface ContainerPrepareEventPayload {
+  statuses: ContainerPrepareStatus[];
+}
+
+export interface UiEventsSubscription {
+  sessionId?: string;
+  onOpen?: () => void;
+  onConfig?: (payload: UiConfigEventPayload) => void;
+  onContainerPrepare?: (payload: ContainerPrepareEventPayload) => void;
+  onRequestLogs?: (payload: { logs: RequestLogEntry[] }) => void;
+  onPermission?: (payload: PermissionPollResult) => void;
+  onAskUser?: (payload: { request: AskUserRequest | null }) => void;
+  onHeartbeat?: () => void;
+  onError?: () => void;
 }
 
 export type AskUserAnswerValue = string[] | string | null;
@@ -108,10 +90,10 @@ export interface AskUserRequest {
 }
 
 export interface UiConfig {
-  ssh_servers: Array<{ name: string; target: string }>;
-  max_iterations: number;
-  ui_font: string;
-  ui_theme: 'light' | 'dark' | 'system';
+  sshServers: Array<{ name: string; target: string }>;
+  maxIterations: number;
+  uiFont: string;
+  uiTheme: 'light' | 'dark' | 'system';
 }
 
 export type ProviderType =
@@ -130,52 +112,154 @@ export type ProviderType =
 
 export interface UiProviderConfig {
   id: string;
-  provider_type: ProviderType;
-  api_key: string | null;
-  base_url: string | null;
-  display_name: string | null;
+  providerType: ProviderType;
+  apiKey: string | null;
+  baseUrl: string | null;
+  displayName: string | null;
   enabled: boolean;
 }
 
 export interface ModelDetailsItem {
   id: string;
   nickname: string;
-  context_window?: number;
+  contextWindow?: number;
   abilities: string[];
 }
 
 export interface ProviderModelsItem {
-  provider_id: string;
+  providerId: string;
   models: string[];
   details?: ModelDetailsItem[];
 }
 
 export interface RequestLogEntry {
-  session_id: string;
+  sessionId: string;
   timestamp: string;
   model: string;
-  provider_id: string;
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  total_tokens?: number;
-  elapsed_ms: number;
+  providerId: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  contextWindow?: number;
+  elapsedMs: number;
   ok: boolean;
   error?: string | null;
+}
+
+export interface ContextDebugMessage {
+  role: string;
+  content: string;
+  attachments: string[];
+  toolCallId?: string;
+  toolCallNames: string[];
+}
+
+export interface SessionContextDebugSnapshot {
+  sessionId: string;
+  timestamp: string;
+  model: string;
+  providerId: string;
+  prompt: string;
+  promptAttachments: string[];
+  assembledMessages: ContextDebugMessage[];
+}
+
+export interface SessionContextDebugPayload {
+  snapshot: SessionContextDebugSnapshot;
+  rawJson: string;
+}
+
+function requireObject(value: unknown, field: string): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Invalid context debug payload: ${field} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== 'string') {
+    throw new Error(`Invalid context debug payload: ${field} must be a string`);
+  }
+  return value;
+}
+
+function requireOptionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    throw new Error(`Invalid context debug payload: ${field} must be a string when present`);
+  }
+  return value;
+}
+
+function requireStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`Invalid context debug payload: ${field} must be an array`);
+  }
+  const result: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const item = value[index];
+    if (typeof item !== 'string') {
+      throw new Error(`Invalid context debug payload: ${field}[${index}] must be a string`);
+    }
+    result.push(item);
+  }
+  return result;
+}
+
+function parseContextDebugMessage(value: unknown, index: number): ContextDebugMessage {
+  const record = requireObject(value, `assembledMessages[${index}]`);
+  return {
+    role: requireString(record.role, `assembledMessages[${index}].role`),
+    content: requireString(record.content, `assembledMessages[${index}].content`),
+    attachments: requireStringArray(record.attachments, `assembledMessages[${index}].attachments`),
+    toolCallId: requireOptionalString(record.toolCallId, `assembledMessages[${index}].toolCallId`),
+    toolCallNames: requireStringArray(record.toolCallNames, `assembledMessages[${index}].toolCallNames`),
+  };
+}
+
+function parseSessionContextDebugSnapshot(value: unknown): SessionContextDebugSnapshot {
+  const record = requireObject(value, 'root');
+  const assembledMessagesValue = record.assembledMessages;
+  if (!Array.isArray(assembledMessagesValue)) {
+    throw new Error('Invalid context debug payload: assembledMessages must be an array');
+  }
+
+  return {
+    sessionId: requireString(record.sessionId, 'sessionId'),
+    timestamp: requireString(record.timestamp, 'timestamp'),
+    model: requireString(record.model, 'model'),
+    providerId: requireString(record.providerId, 'providerId'),
+    prompt: requireString(record.prompt, 'prompt'),
+    promptAttachments: requireStringArray(record.promptAttachments, 'promptAttachments'),
+    assembledMessages: assembledMessagesValue.map((item, index) =>
+      parseContextDebugMessage(item, index),
+    ),
+  };
 }
 
 export interface UiModelsConfig {
   advanced: string[];
   balanced: string[];
   fast: string[];
-  image_generation: string[];
-  model_providers: Record<string, string>;
+  imageGeneration: string[];
+  modelProviders: Record<string, string>;
 }
 
 export interface UiPreferencesConfig {
-  load_balance_strategy: 'round_robin' | 'failover_only' | 'random';
-  warn_on_model_change: boolean;
-  show_token_usage: boolean;
-  strict_model_matching: boolean;
+  loadBalanceStrategy: 'round_robin' | 'failover_only' | 'random';
+  warnOnModelChange: boolean;
+  showTokenUsage: boolean;
+  strictModelMatching: boolean;
+}
+
+export interface UiPlaywrightConfig {
+  enabled: boolean;
+  browser: 'local_chrome' | 'chromium';
+  port: number;
+  screencastQuality: number;
+  screencastMaxWidth: number;
 }
 
 export interface UiFullConfig {
@@ -186,173 +270,369 @@ export interface UiFullConfig {
     font: string;
     theme: 'light' | 'dark' | 'system';
   };
-  last_model: string | null;
-  max_iterations: number;
+  lastModel: string | null;
+  maxIterations: number;
+  playwright: UiPlaywrightConfig;
 }
 
 export interface McpServerInfo {
   name: string;
   source: string;
   status: string;
-  is_connected: boolean;
-  tool_count: number;
+  isConnected: boolean;
+  toolCount: number;
 }
 
 export interface SkillInfo {
   name: string;
   description: string;
-  dir_name: string;
+  dirName: string;
   source: string;
 }
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-function mapAttachment(a: ApiAttachment): Attachment {
+// ── Typed API Error ──────────────────────────────────────
+
+/**
+ * Typed API error carrying a machine-readable `code` when the backend provides one.
+ *
+ * Error codes from the backend (e.g. `container_preparing`, `container_build_failed`)
+ * allow the frontend to distinguish error categories without string-matching messages.
+ * Network-level errors (connection refused, proxy 502/503/504) are assigned the
+ * synthetic code `backend_unavailable`.
+ */
+export class ApiError extends Error {
+  readonly code: string | null;
+  readonly statusCode: number;
+
+  constructor(message: string, statusCode: number, code: string | null = null) {
+    super(message);
+    this.name = 'ApiError';
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
+// ── Enrichment helpers ───────────────────────────────────
+// The backend sends camelCase JSON matching our types directly.
+// These helpers add client-side computed fields.
+
+function enrichAttachment(a: Attachment): Attachment {
   return {
-    id: a.id,
-    name: a.name,
-    type: (a.type as Attachment['type']) || 'file',
-    url: a.url,
-    textContent: a.text_content,
-    textPreview: a.text_content?.slice(0, 200),
+    ...a,
+    textPreview: a.textContent?.slice(0, 200),
   };
 }
 
-function mapMessage(m: ApiMessage): Message {
+function buildTimelineSegments(m: Message): TimelineSegment[] {
+  const segments: TimelineSegment[] = [];
+  const anchorMs = Date.parse(m.timestamp);
+  const startedAt = Number.isFinite(anchorMs) ? anchorMs : undefined;
+
+  if (typeof m.thinking === 'string' && m.thinking.trim().length > 0) {
+    segments.push({
+      id: `${m.id}-thinking`,
+      kind: 'thinking',
+      offset: 0,
+      content: m.thinking,
+      isRunning: !!m.isThinking,
+      startedAt,
+      endedAt: m.isThinking ? undefined : startedAt,
+    });
+  }
+
+  if (Array.isArray(m.bashExecutions) && m.bashExecutions.length > 0) {
+    segments.push({
+      id: `${m.id}-bash`,
+      kind: 'bash',
+      offset: 0,
+      commands: m.bashExecutions,
+      startedAt,
+      endedAt: m.bashExecutions.some((x: BashExecution) => x.status === 'running')
+        ? undefined
+        : startedAt,
+    });
+  }
+
+  return segments;
+}
+
+function enrichMessage(m: Message): Message {
   return {
-    id: m.id,
-    role: m.role,
-    content: m.content,
-    timestamp: m.timestamp,
-    attachments: (m.attachments || []).map(mapAttachment),
-    thinking: m.thinking,
-    isStreaming: m.is_streaming,
-    isThinking: m.is_thinking,
-    bashExecutions: (m.bash_executions || []).map((x) => ({
-      id: x.id,
-      input: x.input,
-      output: x.output,
-      status: x.status,
-      mode: x.mode,
-    })),
-    toolEvent: m.tool_event,
-    stats: m.stats
-      ? {
-          providerId: m.stats.provider_id,
-          promptTokens: m.stats.prompt_tokens,
-          completionTokens: m.stats.completion_tokens,
-          totalTokens: m.stats.total_tokens,
-          contextWindow: m.stats.context_window,
-          elapsedMs: m.stats.elapsed_ms,
-        }
-      : undefined,
+    ...m,
+    attachments: (m.attachments || []).map(enrichAttachment),
+    timelineSegments: buildTimelineSegments(m),
   };
 }
 
-function mapSessionMessages(messages: ApiMessage[]): Message[] {
-  return messages.map(mapMessage);
+function enrichSession(s: Session): Session {
+  return {
+    ...s,
+    messages: s.messages.map(enrichMessage),
+  };
 }
 
-function mapSession(s: ApiSession): Session {
-  return {
-    id: s.id,
-    title: s.title,
-    lastModified: s.last_modified,
-    preview: s.preview,
-    messages: mapSessionMessages(s.messages),
-    model: s.model,
-    reasoningEffort: s.reasoning_effort,
+// ── SSE Helpers ──────────────────────────────────────────
+
+function buildSSEListener<T>(
+  eventName: string,
+  handler: ((data: T) => void) | undefined,
+  onError: (() => void) | undefined,
+): (ev: MessageEvent) => void {
+  return (ev) => {
+    if (!handler) return;
+    try {
+      const data = JSON.parse(ev.data) as T;
+      handler(data);
+    } catch (error) {
+      console.error(
+        `invalid ${eventName} event payload`,
+        error instanceof Error ? error.message : String(error),
+      );
+      onError?.();
+    }
   };
+}
+
+interface ReconnectingEventSourceHandlers {
+  onOpen?: () => void;
+  onError?: () => void;
+  listeners: Record<string, (ev: MessageEvent) => void>;
+}
+
+function createReconnectingEventSource(
+  url: string,
+  handlers: ReconnectingEventSourceHandlers,
+): () => void {
+  let source: EventSource | null = null;
+  let reconnectTimer: number | null = null;
+  let reconnectAttempt = 0;
+  let closed = false;
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimer != null) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  };
+
+  const scheduleReconnect = () => {
+    if (closed || reconnectTimer != null) return;
+    const delayMs = Math.min(1000 * 2 ** reconnectAttempt, 10000);
+    reconnectAttempt += 1;
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, delayMs);
+  };
+
+  const connect = () => {
+    if (closed) return;
+    const next = new EventSource(url);
+    source = next;
+
+    next.onopen = () => {
+      reconnectAttempt = 0;
+      clearReconnectTimer();
+      handlers.onOpen?.();
+    };
+
+    for (const [name, handler] of Object.entries(handlers.listeners)) {
+      next.addEventListener(name, handler);
+    }
+
+    next.onerror = () => {
+      handlers.onError?.();
+      next.close();
+      if (source === next) {
+        source = null;
+      }
+      scheduleReconnect();
+    };
+  };
+
+  connect();
+
+  return () => {
+    closed = true;
+    clearReconnectTimer();
+    if (source) {
+      source.close();
+      source = null;
+    }
+  };
+}
+
+// ── HTTP Helpers ─────────────────────────────────────────
+
+function buildRequestError(url: string, res: Response, text: string): ApiError {
+  let decodedMessage: string | null = null;
+  let errorCode: string | null = null;
+
+  if (text) {
+    try {
+      const parsed = JSON.parse(text) as { error?: unknown; message?: unknown; code?: unknown };
+      // Machine-readable error code from the backend (Phase 4 typed errors).
+      if (typeof parsed.code === 'string' && parsed.code.trim().length > 0) {
+        errorCode = parsed.code.trim();
+      }
+      if (typeof parsed.error === 'string' && parsed.error.trim().length > 0) {
+        decodedMessage = parsed.error.trim();
+      }
+      if (
+        !decodedMessage &&
+        typeof parsed.message === 'string' &&
+        parsed.message.trim().length > 0
+      ) {
+        decodedMessage = parsed.message.trim();
+      }
+    } catch {
+      decodedMessage = null;
+    }
+  }
+
+  // Detect proxy-level backend unavailability by HTTP status alone.
+  // When the backend is down, the Vite dev proxy (or any reverse proxy) returns
+  // 502/503/504 — no string matching needed.
+  const rawMessage = (decodedMessage ?? text ?? '').trim();
+  const normalized = rawMessage.toLowerCase();
+  const looksLikeHtmlBody =
+    normalized.startsWith('<!doctype html') || normalized.startsWith('<html');
+  const isProxyBackendUnavailable =
+    url.startsWith('/api/') &&
+    (res.status === 502 ||
+      res.status === 503 ||
+      res.status === 504 ||
+      (res.status >= 500 && rawMessage.length === 0) ||
+      looksLikeHtmlBody);
+
+  if (isProxyBackendUnavailable) {
+    const compact =
+      rawMessage.length > 0
+        ? rawMessage.replace(/\s+/g, ' ').slice(0, 220)
+        : `request ${url} failed with status ${res.status}`;
+    return new ApiError(`Backend unavailable: ${compact}`, res.status, 'backend_unavailable');
+  }
+
+  const message = decodedMessage || text || `Request failed: ${res.status}`;
+  return new ApiError(message, res.status, errorCode);
+}
+
+async function requestResponse(url: string, init?: RequestInit): Promise<Response> {
+  let res: Response;
+  try {
+    res = await fetch(url, init);
+  } catch (fetchError) {
+    // Network-level error: the request never reached the server (connection refused, DNS, etc.).
+    const detail = fetchError instanceof Error ? fetchError.message : String(fetchError);
+    throw new ApiError(`Backend unavailable: ${detail}`, 0, 'backend_unavailable');
+  }
+  if (!res.ok) {
+    const text = await res.text();
+    throw buildRequestError(url, res, text);
+  }
+  return res;
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `Request failed: ${res.status}`);
-  }
+  const res = await requestResponse(url, init);
   return (await res.json()) as T;
 }
 
+// ── Session API ──────────────────────────────────────────
+
 export async function fetchSessions(): Promise<Session[]> {
-  const data = await request<ApiSession[]>('/api/sessions');
-  return data.map(mapSession);
+  const data = await request<Session[]>('/api/sessions');
+  return data.map(enrichSession);
 }
 
-export async function createSession(model?: string): Promise<Session> {
-  const data = await request<ApiSession>('/api/sessions', {
+export async function fetchSession(id: string): Promise<Session> {
+  const data = await request<Session>(`/api/sessions/${id}`);
+  return enrichSession(data);
+}
+
+export async function createSession(model?: string, profileId?: string): Promise<Session> {
+  const data = await request<Session>('/api/sessions', {
     method: 'POST',
     headers: JSON_HEADERS,
-    body: JSON.stringify({ model }),
+    body: JSON.stringify({ model, profileId }),
   });
-  return mapSession(data);
+  return enrichSession(data);
 }
 
 export async function updateSession(id: string, payload: { title?: string; model?: string }): Promise<Session> {
-  const data = await request<ApiSession>(`/api/sessions/${id}`, {
+  const data = await request<Session>(`/api/sessions/${id}`, {
     method: 'PUT',
     headers: JSON_HEADERS,
     body: JSON.stringify(payload),
   });
-  return mapSession(data);
+  return enrichSession(data);
 }
 
 export async function removeSession(id: string): Promise<void> {
   await request<{ ok: boolean }>(`/api/sessions/${id}`, { method: 'DELETE' });
 }
 
+// ── Chat API ─────────────────────────────────────────────
+
 export async function sendChat(input: {
   sessionId: string;
   content: string;
   attachments: Attachment[];
+  hiddenContextXml?: string;
   signal?: AbortSignal;
 }): Promise<Message> {
   const payload = {
-    session_id: input.sessionId,
+    sessionId: input.sessionId,
     content: input.content,
+    hiddenContextXml: input.hiddenContextXml,
     attachments: input.attachments.map((a) => ({
       id: a.id,
       name: a.name,
       type: a.type,
       url: a.url,
-      upload_data_url: a.uploadDataUrl,
-      text_content: a.textContent,
+      uploadDataUrl: a.uploadDataUrl,
+      textContent: a.textContent,
     })),
   };
 
-  const data = await request<ChatResponse>('/api/chat', {
+  const data = await request<{ sessionId: string; assistant: Message }>('/api/chat', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify(payload),
     signal: input.signal,
   });
 
-  return mapMessage(data.assistant);
+  return enrichMessage(data.assistant);
 }
 
 export async function streamChat(input: {
   sessionId: string;
   content: string;
   attachments: Attachment[];
+  hiddenContextXml?: string;
   onStart?: (assistantId: string) => void;
   onReasoning?: (chunk: string) => void;
   onText?: (chunk: string) => void;
   onToolStart?: (tool: unknown) => void;
   onToolEnd?: (tool: unknown) => void;
+  onTodoUpdate?: (event: { items: Array<{ text: string; checked: boolean }>; total: number; completed: number }) => void;
   onDone?: (assistant: Message) => void;
   onError?: (message: string) => void;
   signal?: AbortSignal;
 }): Promise<void> {
   const payload = {
-    session_id: input.sessionId,
+    sessionId: input.sessionId,
     content: input.content,
+    hiddenContextXml: input.hiddenContextXml,
     attachments: input.attachments.map((a) => ({
       id: a.id,
       name: a.name,
       type: a.type,
       url: a.url,
-      upload_data_url: a.uploadDataUrl,
-      text_content: a.textContent,
+      uploadDataUrl: a.uploadDataUrl,
+      textContent: a.textContent,
     })),
   };
 
@@ -375,15 +655,22 @@ export async function streamChat(input: {
   const flushEvent = () => {
     if (!data) return;
     const parsed = JSON.parse(data);
+    const requireString = (value: unknown, field: string): string => {
+      if (typeof value !== 'string') {
+        throw new Error(`Invalid SSE payload: expected string field '${field}'`);
+      }
+      return value;
+    };
+
     switch (eventName) {
       case 'start':
-        input.onStart?.(parsed.assistant_id);
+        input.onStart?.(requireString(parsed.assistantId, 'assistantId'));
         break;
       case 'reasoning':
-        input.onReasoning?.(parsed.chunk || '');
+        input.onReasoning?.(requireString(parsed.chunk, 'chunk'));
         break;
       case 'text':
-        input.onText?.(parsed.chunk || '');
+        input.onText?.(requireString(parsed.chunk, 'chunk'));
         break;
       case 'tool_start':
         input.onToolStart?.(parsed);
@@ -391,8 +678,14 @@ export async function streamChat(input: {
       case 'tool_end':
         input.onToolEnd?.(parsed);
         break;
+      case 'todo_update':
+        input.onTodoUpdate?.(parsed);
+        break;
       case 'done':
-        input.onDone?.(mapMessage(parsed.assistant));
+        if (!parsed.assistant || typeof parsed.assistant !== 'object') {
+          throw new Error("Invalid SSE payload: missing 'assistant' in done event");
+        }
+        input.onDone?.(enrichMessage(parsed.assistant));
         break;
       case 'error':
         input.onError?.(parsed.message || 'Unknown stream error');
@@ -425,7 +718,14 @@ export async function streamChat(input: {
       }
     }
   }
+
+  // Process a trailing event when stream ends without a final blank line.
+  if (data) {
+    flushEvent();
+  }
 }
+
+// ── Models API ───────────────────────────────────────────
 
 export async function fetchModels(): Promise<{ models: string[]; details: ModelDetailsItem[] }> {
   const data = await request<{ models: string[]; details?: ModelDetailsItem[] }>('/api/models');
@@ -445,39 +745,58 @@ export async function fetchRequestLogs(): Promise<RequestLogEntry[]> {
   return data.logs;
 }
 
-export async function pollPermissionRequest(sessionId: string): Promise<PermissionPollResult> {
-  const data = await request<PermissionPollResult>(`/api/permissions/next?session_id=${encodeURIComponent(sessionId)}`);
-  return {
-    request: data.request ?? null,
-    state: data.state ?? null,
-  };
-}
-
 export async function fetchSessionRuntime(sessionId: string): Promise<SessionRuntimeStatus> {
   return request<SessionRuntimeStatus>(`/api/sessions/${encodeURIComponent(sessionId)}/runtime`);
 }
 
+export async function fetchSessionContextDebug(
+  sessionId: string,
+): Promise<SessionContextDebugPayload> {
+  const response = await requestResponse(
+    `/api/sessions/${encodeURIComponent(sessionId)}/context-debug`,
+    {
+      cache: 'no-store',
+    },
+  );
+  const rawJson = await response.text();
+  if (rawJson.trim().length === 0) {
+    throw new Error('Invalid context debug payload: empty response body');
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(rawJson);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid context debug payload: non-JSON response (${reason})`);
+  }
+  return {
+    snapshot: parseSessionContextDebugSnapshot(payload),
+    rawJson,
+  };
+}
+
+// ── Artifacts API ────────────────────────────────────────
+
 export async function fetchSessionArtifacts(sessionId: string): Promise<Artifact[]> {
-  const data = await request<{ artifacts: ApiArtifact[] }>(
+  const data = await request<{ artifacts: Artifact[] }>(
     `/api/sessions/${encodeURIComponent(sessionId)}/artifacts`,
   );
-  return data.artifacts.map((a) => ({
-    path: a.path,
-    name: a.name,
-    size: a.size,
-    isHtml: a.is_html,
-    fingerprint: a.fingerprint,
-  }));
+  return data.artifacts;
 }
 
 export async function fetchArtifactPreview(
   sessionId: string,
   path: string,
 ): Promise<Response> {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    throw new Error('artifact path is required');
+  }
+
   const res = await fetch(
-    `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/preview?path=${encodeURIComponent(path)}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/preview?path=${encodeURIComponent(trimmed)}`,
     {
-      cache: 'default',
+      cache: 'no-store',
     },
   );
 
@@ -489,17 +808,66 @@ export async function fetchArtifactPreview(
   return res;
 }
 
+export async function prepareSlidevPreview(
+  sessionId: string,
+  path: string,
+): Promise<string> {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    throw new Error('artifact path is required');
+  }
+  const data = await request<{ previewUrl: string }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/slidev/preview?path=${encodeURIComponent(trimmed)}`,
+    {
+      cache: 'no-store',
+    },
+  );
+  const previewUrl = data.previewUrl?.trim();
+  if (!previewUrl) {
+    throw new Error('slidev preview url is empty');
+  }
+  return previewUrl;
+}
+
+export function buildSessionOutputPreviewUrl(sessionId: string, path: string): string {
+  const safeSessionId = sessionId.trim();
+  const safePath = path.trim();
+  if (!safeSessionId) {
+    throw new Error('session id is required');
+  }
+  if (!safePath) {
+    throw new Error('output path is required');
+  }
+  return `/api/sessions/${encodeURIComponent(safeSessionId)}/outputs/preview?path=${encodeURIComponent(safePath)}`;
+}
+
+export async function mapContainerLocalArtifactUrl(
+  sessionId: string,
+  url: string,
+): Promise<string> {
+  const trimmed = url.trim();
+  if (!trimmed) {
+    throw new Error('local url is required');
+  }
+  const data = await request<{ mappedUrl: string }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/local-url-map`,
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ url: trimmed }),
+    },
+  );
+  return data.mappedUrl;
+}
+
+// ── Permission & Ask-User API ────────────────────────────
+
 export async function respondPermissionRequest(id: string, approved: boolean): Promise<void> {
   await request<{ ok: boolean }>('/api/permissions/respond', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ id, approved }),
   });
-}
-
-export async function pollAskUserRequest(): Promise<AskUserRequest | null> {
-  const data = await request<{ request: AskUserRequest | null }>('/api/ask-user/next');
-  return data.request;
 }
 
 export async function respondAskUserRequest(id: string, answers: AskUserAnswer[]): Promise<void> {
@@ -509,6 +877,8 @@ export async function respondAskUserRequest(id: string, answers: AskUserAnswer[]
     body: JSON.stringify({ id, answers }),
   });
 }
+
+// ── Config API ───────────────────────────────────────────
 
 export async function fetchUiConfig(): Promise<UiConfig> {
   return request<UiConfig>('/api/config');
@@ -526,6 +896,14 @@ export async function saveFullConfig(config: UiFullConfig): Promise<void> {
   });
 }
 
+export async function setLastModel(model: string): Promise<void> {
+  await request<{ ok: boolean }>('/api/config/last-model', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ model }),
+  });
+}
+
 export async function addSshServer(name: string, target: string): Promise<void> {
   await request<{ ok: boolean }>('/api/ssh', {
     method: 'POST',
@@ -539,6 +917,8 @@ export async function removeSshServer(name: string): Promise<void> {
     method: 'DELETE',
   });
 }
+
+// ── MCP API ──────────────────────────────────────────────
 
 export async function fetchMcpServers(): Promise<McpServerInfo[]> {
   return request<McpServerInfo[]>('/api/mcp');
@@ -569,6 +949,8 @@ export async function reconnectMcpServer(name: string): Promise<void> {
   });
 }
 
+// ── Skills API ───────────────────────────────────────────
+
 export async function fetchSkills(): Promise<SkillInfo[]> {
   return request<SkillInfo[]>('/api/skills');
 }
@@ -587,10 +969,12 @@ export async function deleteSkill(dirName: string): Promise<void> {
   });
 }
 
+// ── Copilot Auth API ─────────────────────────────────────
+
 export interface CopilotStartResponse {
-  device_code: string;
-  user_code: string;
-  verification_uri: string;
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
   interval: number;
 }
 
@@ -615,7 +999,7 @@ export async function pollCopilotAuth(deviceCode: string): Promise<CopilotPollRe
   return request<CopilotPollResponse>('/api/copilot/poll', {
     method: 'POST',
     headers: JSON_HEADERS,
-    body: JSON.stringify({ device_code: deviceCode }),
+    body: JSON.stringify({ deviceCode }),
   });
 }
 
@@ -627,6 +1011,8 @@ export async function logoutCopilot(): Promise<void> {
   });
 }
 
+// ── Memory API ───────────────────────────────────────────
+
 export async function fetchMemory(): Promise<string> {
   const data = await request<{ content: string }>('/api/memory');
   return data.content;
@@ -636,7 +1022,7 @@ export async function saveMemory(content: string): Promise<void> {
   await request<{ ok: boolean }>('/api/memory', {
     method: 'POST',
     headers: JSON_HEADERS,
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, explicitUserRequest: true }),
   });
 }
 
@@ -646,22 +1032,398 @@ export async function deleteAllSessions(): Promise<void> {
   });
 }
 
+// ── SSE Subscriptions ────────────────────────────────────
+
+export interface SessionArtifactsSubscription {
+  onArtifacts: (event: ArtifactStreamEvent) => void;
+  onOpen?: () => void;
+  onHeartbeat?: () => void;
+  onError?: () => void;
+}
+
 export function subscribeSessionArtifacts(
   sessionId: string,
-  onArtifacts: (event: ArtifactStreamEvent) => void,
+  options: SessionArtifactsSubscription,
 ): () => void {
-  const source = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts/stream`);
+  const streamUrl = `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/stream`;
 
-  source.addEventListener('artifacts', (ev) => {
-    try {
-      const data = JSON.parse((ev as MessageEvent).data) as ArtifactStreamEvent;
-      onArtifacts(data);
-    } catch {
-      // ignore malformed events
-    }
+  return createReconnectingEventSource(streamUrl, {
+    onOpen: options.onOpen,
+    onError: options.onError,
+    listeners: {
+      artifacts: (ev) => {
+        try {
+          const data = JSON.parse(ev.data) as ArtifactStreamEvent;
+          options.onArtifacts(data);
+        } catch (error) {
+          console.error(
+            'invalid artifacts stream payload',
+            error instanceof Error ? error.message : String(error),
+          );
+          options.onError?.();
+        }
+      },
+      heartbeat: () => {
+        options.onHeartbeat?.();
+      },
+    },
   });
+}
 
-  return () => {
-    source.close();
-  };
+export function subscribeUiEvents(options: UiEventsSubscription): () => void {
+  const params = new URLSearchParams();
+  if (options.sessionId && options.sessionId.trim()) {
+    params.set('sessionId', options.sessionId.trim());
+  }
+
+  const query = params.toString();
+  const url = query ? `/api/events?${query}` : '/api/events';
+
+  return createReconnectingEventSource(url, {
+    onOpen: options.onOpen,
+    onError: options.onError,
+    listeners: {
+      config: buildSSEListener<UiConfigEventPayload>(
+        'config',
+        options.onConfig,
+        options.onError,
+      ),
+      request_logs: buildSSEListener<{ logs?: RequestLogEntry[] }>(
+        'request_logs',
+        options.onRequestLogs
+          ? (data) => options.onRequestLogs!({ logs: data.logs ?? [] })
+          : undefined,
+        options.onError,
+      ),
+      container_prepare: buildSSEListener<ContainerPrepareEventPayload>(
+        'container_prepare',
+        options.onContainerPrepare
+          ? (data) => options.onContainerPrepare!({ statuses: data.statuses ?? [] })
+          : undefined,
+        options.onError,
+      ),
+      permission: buildSSEListener<PermissionPollResult>(
+        'permission',
+        options.onPermission
+          ? (data) =>
+              options.onPermission!({
+                request: data.request ?? null,
+                state: data.state ?? null,
+              })
+          : undefined,
+        options.onError,
+      ),
+      ask_user: buildSSEListener<{ request?: AskUserRequest | null }>(
+        'ask_user',
+        options.onAskUser
+          ? (data) => options.onAskUser!({ request: data.request ?? null })
+          : undefined,
+        options.onError,
+      ),
+      heartbeat: () => {
+        options.onHeartbeat?.();
+      },
+    },
+  });
+}
+
+// ── Browser Live View API ─────────────────────────────────
+
+export interface BrowserStatus {
+  running: boolean;
+  cdpEndpoint: string | null;
+  takeoverSessionId: string | null;
+}
+
+export async function fetchBrowserStatus(): Promise<BrowserStatus> {
+  return request<BrowserStatus>('/api/browser/status');
+}
+
+export async function startBrowser(): Promise<BrowserStatus> {
+  return request<BrowserStatus>('/api/browser/start', { method: 'POST' });
+}
+
+export async function stopBrowser(): Promise<BrowserStatus> {
+  return request<BrowserStatus>('/api/browser/stop', { method: 'POST' });
+}
+
+/** Send an SDP offer and receive the SDP answer for WebRTC browser streaming. */
+export async function browserOffer(sdp: string): Promise<string> {
+  const res = await request<{ sdp: string }>('/api/browser/offer', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ sdp }),
+  });
+  return res.sdp;
+}
+
+export async function browserTakeoverStart(sessionId: string): Promise<void> {
+  const value = sessionId.trim();
+  if (!value) {
+    throw new Error('browser takeover requires a non-empty session id');
+  }
+
+  await request<{ ok: boolean; sessionId: string }>('/api/browser/takeover/start', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ sessionId: value }),
+  });
+}
+
+export async function browserTakeoverStop(sessionId: string): Promise<void> {
+  const value = sessionId.trim();
+  if (!value) {
+    throw new Error('browser takeover requires a non-empty session id');
+  }
+
+  await request<{ ok: boolean; sessionId: string }>('/api/browser/takeover/stop', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ sessionId: value }),
+  });
+}
+
+// ── Profile API ──────────────────────────────────────────
+
+export async function fetchProfiles(): Promise<ProfileInfo[]> {
+  return request<ProfileInfo[]>('/api/profiles');
+}
+
+export async function createProfile(input: {
+  name: string;
+  icon?: string;
+  environment?: string;
+  containerImage?: string;
+  persona?: string;
+  preferences?: Record<string, unknown>;
+  locationAware?: boolean;
+}): Promise<ProfileInfo> {
+  return request<ProfileInfo>('/api/profiles', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateProfile(
+  id: string,
+  input: {
+    name?: string;
+    icon?: string;
+    environment?: string;
+    containerImage?: string;
+    sortOrder?: number;
+    persona?: string;
+    preferences?: Record<string, unknown>;
+    locationAware?: boolean;
+  },
+): Promise<ProfileInfo> {
+  return request<ProfileInfo>(`/api/profiles/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteProfile(id: string): Promise<void> {
+  await request<{ ok: boolean }>(`/api/profiles/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+export interface FetchProfileSessionsOptions {
+  allowManagedPodmanDownload?: boolean;
+}
+
+export async function fetchProfileSessions(
+  profileId: string,
+  options?: FetchProfileSessionsOptions,
+): Promise<ProfileSessions> {
+  const params = new URLSearchParams();
+  if (options?.allowManagedPodmanDownload) {
+    params.set('allowManagedPodmanDownload', 'true');
+  }
+  const query = params.toString();
+  const endpoint = query
+    ? `/api/profiles/${encodeURIComponent(profileId)}/sessions?${query}`
+    : `/api/profiles/${encodeURIComponent(profileId)}/sessions`;
+  return request<ProfileSessions>(endpoint);
+}
+
+// ── Folder API ───────────────────────────────────────────
+
+export async function createFolder(profileId: string, name: string): Promise<FolderInfo> {
+  return request<FolderInfo>(
+    `/api/profiles/${encodeURIComponent(profileId)}/folders`,
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ name }),
+    },
+  );
+}
+
+export async function updateFolder(
+  id: string,
+  input: { name?: string; sortOrder?: number },
+): Promise<void> {
+  await request<{ ok: boolean }>(`/api/folders/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteFolder(id: string): Promise<void> {
+  await request<{ ok: boolean }>(`/api/folders/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+// ── Session pin/archive/move API ─────────────────────────
+
+export async function pinSession(id: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/sessions/${encodeURIComponent(id)}/pin`,
+    { method: 'POST' },
+  );
+}
+
+export async function unpinSession(id: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/sessions/${encodeURIComponent(id)}/unpin`,
+    { method: 'POST' },
+  );
+}
+
+export async function archiveSession(id: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/sessions/${encodeURIComponent(id)}/archive`,
+    { method: 'POST' },
+  );
+}
+
+export async function unarchiveSession(id: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/sessions/${encodeURIComponent(id)}/unarchive`,
+    { method: 'POST' },
+  );
+}
+
+export async function moveSessionToFolder(
+  sessionId: string,
+  folderId: string | null,
+): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/move-to-folder`,
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ folderId }),
+    },
+  );
+}
+
+// ── Scheduled Task API ──────────────────────────────────
+
+export async function fetchTasks(): Promise<ScheduledTask[]> {
+  return request<ScheduledTask[]>('/api/tasks');
+}
+
+export async function createTask(input: {
+  profileId: string;
+  sessionId?: string;
+  name: string;
+  triggerKind: 'time';
+  triggerType: 'once' | 'cron';
+  cronExpression?: string;
+  runAt?: string;
+  scriptPath?: string;
+  scriptInline?: string;
+  needsNetwork?: boolean;
+}): Promise<ScheduledTask> {
+  return request<ScheduledTask>('/api/tasks', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(input),
+  });
+}
+
+export async function fetchTask(id: string): Promise<ScheduledTask> {
+  return request<ScheduledTask>(`/api/tasks/${encodeURIComponent(id)}`);
+}
+
+export async function updateTask(
+  id: string,
+  input: {
+    name?: string;
+    enabled?: boolean;
+    cronExpression?: string;
+    runAt?: string;
+    scriptPath?: string;
+    scriptInline?: string;
+  },
+): Promise<ScheduledTask> {
+  return request<ScheduledTask>(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteTask(id: string): Promise<void> {
+  await request<{ ok: boolean }>(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function approveTask(id: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/tasks/${encodeURIComponent(id)}/approve`,
+    { method: 'POST' },
+  );
+}
+
+export async function runTask(id: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/tasks/${encodeURIComponent(id)}/run`,
+    { method: 'POST' },
+  );
+}
+
+// ── Web Push Notification API ───────────────────────────
+
+export async function fetchVapidKey(): Promise<VapidKeyInfo> {
+  return request<VapidKeyInfo>('/api/push/vapid-key');
+}
+
+export async function subscribePush(input: {
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+}): Promise<void> {
+  await request<{ ok: boolean }>('/api/push/subscribe', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(input),
+  });
+}
+
+export async function unsubscribePush(endpoint: string): Promise<void> {
+  await request<{ ok: boolean }>('/api/push/unsubscribe', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ endpoint }),
+  });
+}
+
+export async function sendTestNotification(
+  title?: string,
+  body?: string,
+): Promise<{ ok: boolean; sent: number }> {
+  return request<{ ok: boolean; sent: number }>('/api/push/test', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ title, body }),
+  });
 }

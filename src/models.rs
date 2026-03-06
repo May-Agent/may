@@ -45,40 +45,50 @@ pub struct ProviderModelFetchResult {
 }
 
 /// Fetch models from all configured providers with per-provider status.
+///
+/// Providers are queried concurrently for maximum throughput.
 pub async fn fetch_models_by_provider(config: &MayConfig) -> Vec<ProviderModelFetchResult> {
-    let mut results = Vec::new();
+    let futures: Vec<_> = config
+        .provider
+        .iter()
+        .map(|(id, instance)| {
+            let id = id.clone();
+            let instance = instance.clone();
+            async move {
+                if !instance.is_valid(&id) {
+                    return ProviderModelFetchResult {
+                        provider_id: id,
+                        models: Vec::new(),
+                        error: Some(
+                            "provider is disabled or missing required credentials".to_string(),
+                        ),
+                    };
+                }
 
-    for (id, instance) in &config.provider {
-        if !instance.is_valid(id) {
-            results.push(ProviderModelFetchResult {
-                provider_id: id.clone(),
-                models: Vec::new(),
-                error: Some("provider is disabled or missing required credentials".to_string()),
-            });
-            continue;
-        }
-
-        match fetch_models_for_provider(id, instance).await {
-            Ok(mut provider_models) => {
-                provider_models.sort_by(|a, b| a.id.cmp(&b.id));
-                provider_models.dedup_by(|a, b| a.id == b.id);
-                results.push(ProviderModelFetchResult {
-                    provider_id: id.clone(),
-                    models: provider_models,
-                    error: None,
-                });
+                match fetch_models_for_provider(&id, &instance).await {
+                    Ok(mut provider_models) => {
+                        provider_models.sort_by(|a, b| a.id.cmp(&b.id));
+                        provider_models.dedup_by(|a, b| a.id == b.id);
+                        ProviderModelFetchResult {
+                            provider_id: id,
+                            models: provider_models,
+                            error: None,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch models from {id}: {e}");
+                        ProviderModelFetchResult {
+                            provider_id: id,
+                            models: Vec::new(),
+                            error: Some(e.to_string()),
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!("Failed to fetch models from {}: {}", id, e);
-                results.push(ProviderModelFetchResult {
-                    provider_id: id.clone(),
-                    models: Vec::new(),
-                    error: Some(e.to_string()),
-                });
-            }
-        }
-    }
+        })
+        .collect();
 
+    let mut results = futures_util::future::join_all(futures).await;
     results.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
     results
 }
@@ -105,6 +115,13 @@ pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
 }
 
 /// Fetch models from a single provider.
+pub(crate) async fn fetch_models_for_provider_instance(
+    id: &str,
+    instance: &ProviderInstance,
+) -> Result<Vec<FetchedModel>, ModelFetchError> {
+    fetch_models_for_provider(id, instance).await
+}
+
 async fn fetch_models_for_provider(
     id: &str,
     instance: &ProviderInstance,
@@ -164,7 +181,7 @@ async fn fetch_models_for_provider(
             let model_id = p.name;
             let provider_description = p.description.trim();
             let nickname = aither_models::lookup(&model_id)
-                .map(|info| info.name.to_string())
+                .map(|info| info.id().to_string())
                 .or_else(|| {
                     if provider_description.is_empty() {
                         None
@@ -183,7 +200,7 @@ async fn fetch_models_for_provider(
                 && let Some(info) = aither_models::lookup(&model_id)
             {
                 abilities = info
-                    .abilities
+                    .abilities()
                     .iter()
                     .map(|a| ability_to_label(*a))
                     .collect();
@@ -211,5 +228,6 @@ pub fn ability_to_label(ability: Ability) -> String {
         Ability::CodeExecution => "code_execution".to_string(),
         Ability::Reasoning => "reasoning".to_string(),
         Ability::ImageGeneration => "image_generation".to_string(),
+        _ => panic!("unsupported ability variant: {ability:?}"),
     }
 }

@@ -1,30 +1,17 @@
-import React, { memo, useState, useMemo, useEffect } from 'react';
+import React, { memo, useState, useMemo, useEffect, useRef } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
-import type { Message } from '@/types';
+import { buildSessionOutputPreviewUrl } from '@/lib/api';
+import type { ArtifactPreviewTarget, Message } from '@/types';
+import { extractArtifactPreviewTargets, stripArtifactPreviewTags } from './chatUtils';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { Copy, Check, FileText, File, ChevronRight, RotateCcw, Download, Terminal, Shield, Globe, AlertTriangle, Loader2 } from 'lucide-react';
+import { Copy, Check, FileText, File, ChevronRight, RotateCcw, Download, Terminal, Globe, Search, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
-import { ThinkingBlock } from './ThinkingBlock';
 import { FlowMarkdown } from './StreamingText';
-
-function extractPreviewPaths(content: string): string[] {
-  return Array.from(
-    content.matchAll(/<artifact\s+url=["']([^"']+)["']\s*\/?>/gi),
-  )
-    .map((m) => m[1]?.trim())
-    .filter((v): v is string => !!v);
-}
-
-function stripPreviewTags(content: string): string {
-  return content
-    .replace(/\s*<artifact\s+url=["'][^"']+["']\s*\/?>\s*/gi, '\n')
-    .trim();
-}
 
 const MemoMarkdown = memo(function MemoMarkdown({
   content,
@@ -93,15 +80,464 @@ function formatCodeText(text: string, language: 'bash' | 'json' | 'text'): strin
   }
 }
 
-function modeConfig(mode?: string) {
-  switch (mode) {
-    case 'network':
-      return { icon: Globe, color: 'text-blue-400', bg: 'bg-blue-500/10', border: 'border-blue-500/20', label: 'network' };
-    case 'unsafe':
-      return { icon: AlertTriangle, color: 'text-red-400', bg: 'bg-red-500/10', border: 'border-red-500/20', label: 'unsafe' };
-    default:
-      return { icon: Shield, color: 'text-emerald-400', bg: 'bg-emerald-500/10', border: 'border-emerald-500/20', label: 'sandboxed' };
+function formatDurationMs(durationMs: number): string {
+  const safeDuration = Math.max(0, Math.round(durationMs));
+  const totalSeconds = Math.max(1, Math.floor(safeDuration / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
   }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds.toString().padStart(2, '0')}s`;
+}
+
+interface ParsedCommandImage {
+  src: string;
+  mediaType: string;
+  source: 'inline' | 'stored';
+  storagePath?: string;
+}
+
+interface ParsedCommandOutput {
+  text?: string;
+  images: ParsedCommandImage[];
+  storagePaths: string[];
+}
+
+function parseDataUrlImage(value: string): ParsedCommandImage | null {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('data:image/')) {
+    return null;
+  }
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  const mediaType = match[1].toLowerCase();
+  const encoded = match[2].replace(/\s+/g, '');
+  if (!encoded) {
+    return null;
+  }
+  return {
+    src: `data:${mediaType};base64,${encoded}`,
+    mediaType,
+    source: 'inline',
+  };
+}
+
+function isLikelyBinaryTextPayload(text: string): boolean {
+  if (!text) {
+    return false;
+  }
+  const sample = text.slice(0, 4096);
+  const lowercaseSample = sample.toLowerCase();
+  if (
+    sample.length >= 64 &&
+    (
+      lowercaseSample.includes('jfif') ||
+      lowercaseSample.includes('exif') ||
+      lowercaseSample.includes('ihdr') ||
+      lowercaseSample.includes('png') ||
+      lowercaseSample.includes('webp') ||
+      lowercaseSample.includes('riff')
+    )
+  ) {
+    return true;
+  }
+  let suspiciousUnits = 0;
+  let symbolicUnits = 0;
+  let languageLikeUnits = 0;
+  for (const char of sample) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code === 0xfffd) {
+      suspiciousUnits += 2;
+      continue;
+    }
+    const isAsciiControl = code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d;
+    if (isAsciiControl || code === 0x7f || code === 0x00) {
+      suspiciousUnits += 1;
+    }
+    if (/[\[\]{}<>\\|`~^]/.test(char)) {
+      symbolicUnits += 1;
+    }
+    if (
+      (code >= 0x30 && code <= 0x39) ||
+      (code >= 0x41 && code <= 0x5a) ||
+      (code >= 0x61 && code <= 0x7a) ||
+      (code >= 0x4e00 && code <= 0x9fff)
+    ) {
+      languageLikeUnits += 1;
+    }
+  }
+  if (suspiciousUnits > 0 && suspiciousUnits / Math.max(1, sample.length) > 0.02) {
+    return true;
+  }
+  if (sample.length >= 320) {
+    const symbolicRatio = symbolicUnits / sample.length;
+    const languageLikeRatio = languageLikeUnits / sample.length;
+    if (symbolicRatio > 0.16 && languageLikeRatio < 0.52) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parseJsonLike(value: string): unknown {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return value;
+  }
+  const looksLikeJson =
+    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'));
+  if (!looksLikeJson) {
+    return value;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+
+function parseOutputEntry(
+  entry: unknown,
+  parsed: ParsedCommandOutput,
+  textChunks: string[],
+  sourcePath?: string,
+) {
+  if (entry === null || entry === undefined) {
+    return;
+  }
+  if (typeof entry === 'string') {
+    const inlineImage = parseDataUrlImage(entry);
+    if (inlineImage) {
+      parsed.images.push(inlineImage);
+      return;
+    }
+    if (isLikelyBinaryTextPayload(entry)) {
+      return;
+    }
+    if (entry.trim().length > 0) {
+      textChunks.push(entry);
+    }
+    return;
+  }
+  if (Array.isArray(entry)) {
+    for (const item of entry) {
+      parseOutputEntry(item, parsed, textChunks, sourcePath);
+    }
+    return;
+  }
+  if (typeof entry !== 'object') {
+    return;
+  }
+  const node = entry as Record<string, unknown>;
+  const pathCandidates = [
+    typeof node.url === 'string' ? node.url.trim() : '',
+    typeof node.path === 'string' ? node.path.trim() : '',
+    typeof node.storage_path === 'string' ? node.storage_path.trim() : '',
+    typeof node.storagePath === 'string' ? node.storagePath.trim() : '',
+    typeof node.output_path === 'string' ? node.output_path.trim() : '',
+  ].filter((value) => value.length > 0);
+  const effectiveSourcePath = pathCandidates[0] || sourcePath;
+  if (pathCandidates.length > 0) {
+    parsed.storagePaths.push(...pathCandidates);
+  }
+  const content = node.content;
+  const payload =
+    content && typeof content === 'object' && !Array.isArray(content)
+      ? (content as Record<string, unknown>)
+      : node;
+  const kind = typeof payload.type === 'string' ? payload.type.trim().toLowerCase() : '';
+  if (kind === 'text') {
+    const text = typeof payload.text === 'string' ? payload.text : '';
+    if (text.trim().length > 0) {
+      if (isLikelyBinaryTextPayload(text)) {
+        return;
+      }
+      textChunks.push(text);
+    }
+    return;
+  }
+  if (kind === 'image') {
+    const encoded = typeof payload.data === 'string' ? payload.data.trim() : '';
+    if (!encoded) {
+      return;
+    }
+    const mediaType =
+      typeof payload.media_type === 'string' && payload.media_type.trim().length > 0
+        ? payload.media_type.trim()
+        : 'image/png';
+    parsed.images.push({
+      src: `data:${mediaType};base64,${encoded}`,
+      mediaType,
+      source: 'inline',
+      storagePath: effectiveSourcePath || undefined,
+    });
+    return;
+  }
+
+  if (kind === 'image_url') {
+    const imageUrl =
+      typeof payload.image_url === 'string'
+        ? payload.image_url.trim()
+        : payload.image_url && typeof payload.image_url === 'object'
+          ? typeof (payload.image_url as Record<string, unknown>).url === 'string'
+            ? ((payload.image_url as Record<string, unknown>).url as string).trim()
+            : ''
+          : typeof payload.url === 'string'
+            ? payload.url.trim()
+            : '';
+    if (!imageUrl) {
+      return;
+    }
+    const inlineImage = parseDataUrlImage(imageUrl);
+    if (inlineImage) {
+      parsed.images.push(inlineImage);
+      return;
+    }
+    parsed.images.push({
+      src: imageUrl,
+      mediaType: 'image/*',
+      source: 'stored',
+      storagePath: effectiveSourcePath || undefined,
+    });
+    return;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(node, 'stdout') || Object.prototype.hasOwnProperty.call(node, 'stderr')) {
+    parseOutputEntry(node.stdout, parsed, textChunks, effectiveSourcePath);
+    parseOutputEntry(node.stderr, parsed, textChunks, effectiveSourcePath);
+    return;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(node, 'content')) {
+    parseOutputEntry(node.content, parsed, textChunks, effectiveSourcePath);
+  }
+  if (Object.prototype.hasOwnProperty.call(node, 'contents')) {
+    parseOutputEntry(node.contents, parsed, textChunks, effectiveSourcePath);
+  }
+  if (Object.prototype.hasOwnProperty.call(node, 'output')) {
+    parseOutputEntry(node.output, parsed, textChunks, effectiveSourcePath);
+  }
+  if (Object.prototype.hasOwnProperty.call(node, 'outputs')) {
+    parseOutputEntry(node.outputs, parsed, textChunks, effectiveSourcePath);
+  }
+  if (Object.prototype.hasOwnProperty.call(node, 'items')) {
+    parseOutputEntry(node.items, parsed, textChunks, effectiveSourcePath);
+  }
+}
+
+function parseCommandOutput(output?: string): ParsedCommandOutput {
+  const parsed: ParsedCommandOutput = {
+    images: [],
+    storagePaths: [],
+  };
+  if (!output || output.trim().length === 0) {
+    return parsed;
+  }
+
+  const interpreted = parseJsonLike(output);
+  const textChunks: string[] = [];
+
+  parseOutputEntry(interpreted, parsed, textChunks);
+
+  if (textChunks.length === 0 && parsed.images.length === 0 && parsed.storagePaths.length === 0) {
+    if (isLikelyBinaryTextPayload(output)) {
+      return parsed;
+    }
+    parsed.text = formatCodeText(output, detectCodeLanguage(output));
+  } else if (textChunks.length > 0) {
+    const merged = textChunks.join('\n\n').trim();
+    if (merged.length > 0) {
+      parsed.text = formatCodeText(merged, detectCodeLanguage(merged));
+    }
+  }
+
+  parsed.storagePaths = [...new Set(parsed.storagePaths)];
+  return parsed;
+}
+
+interface WebSearchResultEntry {
+  title: string;
+  url: string;
+  snippet: string;
+  host: string;
+}
+
+interface ThinkingTimelineDisplayItem {
+  id: string;
+  type: 'thinking';
+  summary: string;
+  detail: string;
+  isRunning: boolean;
+  isFailed: boolean;
+  startedAt?: number;
+  endedAt?: number;
+}
+
+interface CommandTimelineDisplayItem {
+  id: string;
+  type: 'command';
+  summary: string;
+  commandInput: string;
+  parsedOutput: ParsedCommandOutput;
+  outputText: string;
+  isRunning: boolean;
+  isFailed: boolean;
+  startedAt?: number;
+  endedAt?: number;
+}
+
+interface WebSearchTimelineDisplayItem {
+  id: string;
+  type: 'websearch';
+  summary: string;
+  query: string;
+  requestRaw?: string;
+  responseRaw?: string;
+  results: WebSearchResultEntry[];
+  isRunning: boolean;
+  isFailed: boolean;
+  startedAt?: number;
+  endedAt?: number;
+}
+
+interface WebFetchTimelineDisplayItem {
+  id: string;
+  type: 'webfetch';
+  summary: string;
+  url: string;
+  requestRaw?: string;
+  responseRaw?: string;
+  isRunning: boolean;
+  isFailed: boolean;
+  startedAt?: number;
+  endedAt?: number;
+}
+
+type TimelineDisplayItem =
+  | ThinkingTimelineDisplayItem
+  | CommandTimelineDisplayItem
+  | WebSearchTimelineDisplayItem
+  | WebFetchTimelineDisplayItem;
+
+function toSingleLineSummary(text: string, limit = 92): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return '';
+  }
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function normalizeToolName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+function isWebSearchToolName(name: string): boolean {
+  return (
+    name === 'websearch' ||
+    name.endsWith('.websearch') ||
+    name.endsWith('/websearch')
+  );
+}
+
+function isWebFetchToolName(name: string): boolean {
+  return (
+    name === 'webfetch' ||
+    name.endsWith('.webfetch') ||
+    name.endsWith('/webfetch')
+  );
+}
+
+function parseJsonRecord(raw: string | undefined): Record<string, unknown> | null {
+  if (!raw || raw.trim().length === 0) {
+    return null;
+  }
+  const parsed = parseJsonLike(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function parseWebSearchQuery(rawRequest: string | undefined): string {
+  const parsed = parseJsonRecord(rawRequest);
+  if (!parsed) {
+    return '';
+  }
+  const query = parsed.query;
+  return typeof query === 'string' ? query.trim() : '';
+}
+
+function parseWebFetchUrl(rawRequest: string | undefined): string {
+  const parsed = parseJsonRecord(rawRequest);
+  if (!parsed) {
+    return '';
+  }
+  const urlCandidate = parsed.url ?? parsed.uri ?? parsed.link;
+  return typeof urlCandidate === 'string' ? urlCandidate.trim() : '';
+}
+
+function extractHost(urlValue: string): string {
+  try {
+    return new URL(urlValue).hostname;
+  } catch {
+    return urlValue;
+  }
+}
+
+function parseWebSearchResults(rawResponse: string | undefined): WebSearchResultEntry[] {
+  if (!rawResponse || rawResponse.trim().length === 0) {
+    return [];
+  }
+  const parsed = parseJsonLike(rawResponse);
+  const candidates = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? Array.isArray((parsed as Record<string, unknown>).results)
+        ? ((parsed as Record<string, unknown>).results as unknown[])
+        : []
+      : [];
+
+  return candidates.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return [];
+    }
+    const record = entry as Record<string, unknown>;
+    const title = typeof record.title === 'string' ? record.title.trim() : '';
+    const url = typeof record.url === 'string' ? record.url.trim() : '';
+    const snippet = typeof record.snippet === 'string' ? record.snippet.trim() : '';
+    if (!title || !url) {
+      return [];
+    }
+    return [{
+      title,
+      url,
+      snippet,
+      host: extractHost(url),
+    }];
+  });
+}
+
+function StoredOutputImage({ src, alt }: { src: string; alt: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return null;
+  }
+  return (
+    <img
+      src={src}
+      alt={alt}
+      className="h-auto max-h-[420px] w-full max-w-full rounded-lg border border-zinc-800 bg-zinc-950/80 object-contain"
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  );
 }
 
 function makeComponents(isUser: boolean, isStreaming: boolean) {
@@ -132,38 +568,188 @@ function makeComponents(isUser: boolean, isStreaming: boolean) {
 
 export function MessageItem({
   message,
+  sessionId,
   onRetry,
   canRetry,
   onOpenPreview,
 }: {
   message: Message;
+  sessionId?: string;
   onRetry?: () => void;
   canRetry?: boolean;
-  onOpenPreview?: (path: string) => void;
+  onOpenPreview?: (target: ArtifactPreviewTarget) => void;
 }) {
   const isUser = message.role === 'user';
   const isStreaming = !!message.isStreaming;
-  const hasThinking = !!message.thinking;
   const bashExecutions = message.bashExecutions || [];
-  const [isBashOpen, setIsBashOpen] = useState(false);
+  const [isTimelineOpen, setIsTimelineOpen] = useState(false);
+  const [expandedTimelineItemIds, setExpandedTimelineItemIds] = useState<Record<string, boolean>>({});
+  const hasSeenRunningTimelineRef = useRef(false);
   const [showTyping, setShowTyping] = useState(false);
   const components = useMemo(
     () => makeComponents(isUser, isStreaming),
     [isUser, isStreaming]
   );
 
-  const previewPaths = useMemo(() => extractPreviewPaths(message.content || ''), [message.content]);
-  const displayContent = useMemo(() => stripPreviewTags(message.content || ''), [message.content]);
+  const previewTargets = useMemo(
+    () => extractArtifactPreviewTargets(message.content || ''),
+    [message.content],
+  );
+  const displayContent = useMemo(
+    () => stripArtifactPreviewTags(message.content || ''),
+    [message.content],
+  );
+  const timelineItems = useMemo<TimelineDisplayItem[]>(() => {
+    const timestampMs = Date.parse(message.timestamp);
+    const fallbackStartedAt = Number.isFinite(timestampMs) ? timestampMs : undefined;
+    const segments = message.timelineSegments ?? [];
+    const items: TimelineDisplayItem[] = [];
 
-  useEffect(() => {
-    setIsBashOpen(false);
-  }, [message.id]);
-
-  useEffect(() => {
-    if (!isStreaming && bashExecutions.length > 0 && !displayContent) {
-      setIsBashOpen(true);
+    if (segments.length === 0) {
+      if (typeof message.thinking === 'string' && message.thinking.trim().length > 0) {
+        items.push({
+          id: `${message.id}-thinking-fallback`,
+          type: 'thinking',
+          summary: toSingleLineSummary(message.thinking, 90) || 'Thinking',
+          detail: message.thinking,
+          isRunning: !!message.isThinking,
+          isFailed: false,
+          startedAt: fallbackStartedAt,
+          endedAt: message.isThinking ? undefined : fallbackStartedAt,
+        });
+      }
+      for (const command of bashExecutions) {
+        const parsedOutput = parseCommandOutput(command.output);
+        const outputLang = detectCodeLanguage(parsedOutput.text || '');
+        items.push({
+          id: command.id,
+          type: 'command',
+          summary: toSingleLineSummary(command.input, 96) || '(empty command)',
+          commandInput: command.input,
+          parsedOutput,
+          outputText: parsedOutput.text
+            ? formatCodeText(parsedOutput.text, outputLang)
+            : '',
+          isRunning: command.status === 'running',
+          isFailed: command.status === 'failed',
+          startedAt: command.startedAt ?? fallbackStartedAt,
+          endedAt: command.endedAt,
+        });
+      }
+      return items;
     }
-  }, [isStreaming, bashExecutions.length, displayContent]);
+
+    for (const segment of segments) {
+      if (segment.kind === 'thinking') {
+        items.push({
+          id: segment.id,
+          type: 'thinking',
+          summary: toSingleLineSummary(segment.content, 90) || 'Thinking',
+          detail: segment.content,
+          isRunning: segment.isRunning,
+          isFailed: false,
+          startedAt: segment.startedAt,
+          endedAt: segment.endedAt,
+        });
+        continue;
+      }
+      if (segment.kind === 'bash') {
+        for (const command of segment.commands) {
+          const parsedOutput = parseCommandOutput(command.output);
+          const outputLang = detectCodeLanguage(parsedOutput.text || '');
+          items.push({
+            id: command.id,
+            type: 'command',
+            summary: toSingleLineSummary(command.input, 96) || '(empty command)',
+            commandInput: command.input,
+            parsedOutput,
+            outputText: parsedOutput.text
+              ? formatCodeText(parsedOutput.text, outputLang)
+              : '',
+            isRunning: command.status === 'running',
+            isFailed: command.status === 'failed',
+            startedAt: command.startedAt ?? segment.startedAt,
+            endedAt: command.endedAt ?? segment.endedAt,
+          });
+        }
+        continue;
+      }
+      const toolName = normalizeToolName(segment.tool.name);
+      if (isWebSearchToolName(toolName)) {
+        const query = parseWebSearchQuery(segment.tool.request);
+        const results = parseWebSearchResults(segment.tool.response);
+        const summary = query
+          ? toSingleLineSummary(query, 96)
+          : 'Web search';
+        items.push({
+          id: segment.id,
+          type: 'websearch',
+          summary: summary || 'Web search',
+          query,
+          requestRaw: segment.tool.request,
+          responseRaw: segment.tool.response,
+          results,
+          isRunning: segment.tool.status === 'running',
+          isFailed: segment.tool.status === 'failed',
+          startedAt: segment.tool.startedAt,
+          endedAt: segment.tool.endedAt,
+        });
+      } else if (isWebFetchToolName(toolName)) {
+        const url = parseWebFetchUrl(segment.tool.request);
+        const summary = url
+          ? toSingleLineSummary(url, 96)
+          : 'Web fetch';
+        items.push({
+          id: segment.id,
+          type: 'webfetch',
+          summary: summary || 'Web fetch',
+          url,
+          requestRaw: segment.tool.request,
+          responseRaw: segment.tool.response,
+          isRunning: segment.tool.status === 'running',
+          isFailed: segment.tool.status === 'failed',
+          startedAt: segment.tool.startedAt,
+          endedAt: segment.tool.endedAt,
+        });
+      }
+    }
+    return items;
+  }, [
+    message.bashExecutions,
+    message.id,
+    message.isThinking,
+    message.thinking,
+    message.timelineSegments,
+    message.timestamp,
+    bashExecutions,
+  ]);
+  const hasImageLikeBashOutput = useMemo(
+    () => timelineItems.some((item) => item.type === 'command' && (item.parsedOutput.images.length > 0 || item.parsedOutput.storagePaths.length > 0)),
+    [timelineItems],
+  );
+  const suppressBinaryContent = useMemo(() => {
+    if (isUser || timelineItems.length === 0) {
+      return false;
+    }
+    const normalized = displayContent.trim();
+    if (!normalized) {
+      return false;
+    }
+    if (!isLikelyBinaryTextPayload(normalized)) {
+      return false;
+    }
+    if (hasImageLikeBashOutput) {
+      return true;
+    }
+    return normalized.length >= 256;
+  }, [displayContent, hasImageLikeBashOutput, isUser, timelineItems.length]);
+  const safeDisplayContent = suppressBinaryContent ? '' : displayContent;
+
+  useEffect(() => {
+    setIsTimelineOpen(false);
+    setExpandedTimelineItemIds({});
+    hasSeenRunningTimelineRef.current = false;
+  }, [message.id]);
 
   useEffect(() => {
     if (!isStreaming || message.content.length > 0 || !!message.error) {
@@ -176,21 +762,73 @@ export function MessageItem({
   }, [isStreaming, message.content, message.id, message.error]);
 
   useEffect(() => {
-    if (isUser || !onOpenPreview || previewPaths.length === 0) return;
-    onOpenPreview(previewPaths[previewPaths.length - 1]);
-  }, [isUser, onOpenPreview, previewPaths]);
+    if (isUser || !onOpenPreview || previewTargets.length === 0) return;
+    onOpenPreview(previewTargets[previewTargets.length - 1]);
+  }, [isUser, onOpenPreview, previewTargets]);
 
-  const runningBashCount = bashExecutions.filter((exec) => exec.status === 'running').length;
-  const doneBashCount = bashExecutions.filter((exec) => exec.status === 'done').length;
-  const failedBashCount = bashExecutions.filter((exec) => exec.status === 'failed').length;
+  const runningTimelineItemIds = timelineItems
+    .filter((item) => item.isRunning)
+    .map((item) => item.id);
+  const runningTimelineKey = runningTimelineItemIds.join('|');
+  const hasRunningTimelineItem = runningTimelineItemIds.length > 0;
+
+  useEffect(() => {
+    const runningIds = runningTimelineKey.length > 0
+      ? runningTimelineKey.split('|').filter((value) => value.length > 0)
+      : [];
+    if (runningIds.length > 0) {
+      hasSeenRunningTimelineRef.current = true;
+      setIsTimelineOpen(true);
+      setExpandedTimelineItemIds(
+        runningIds.reduce<Record<string, boolean>>((acc, id) => {
+          acc[id] = true;
+          return acc;
+        }, {}),
+      );
+      return;
+    }
+    if (hasSeenRunningTimelineRef.current) {
+      setIsTimelineOpen(false);
+      setExpandedTimelineItemIds({});
+      hasSeenRunningTimelineRef.current = false;
+    }
+  }, [runningTimelineKey]);
+
+  const commandCount = timelineItems.filter((item) => item.type === 'command').length;
+  const thinkingCount = timelineItems.filter((item) => item.type === 'thinking').length;
+  const webSearchCount = timelineItems.filter((item) => item.type === 'websearch').length;
+  const webFetchCount = timelineItems.filter((item) => item.type === 'webfetch').length;
+  const failedTimelineCount = timelineItems.filter((item) => item.isFailed).length;
+  const runningTimelineCount = runningTimelineItemIds.length;
   const nowMs = Date.now();
-  const bashElapsedMs = bashExecutions.reduce((sum, exec) => {
-    const startedAt = exec.startedAt ?? new Date(message.timestamp).getTime();
-    const endedAt = exec.endedAt ?? (exec.status === 'running' ? nowMs : startedAt);
+  const timelineElapsedMs = timelineItems.reduce((sum, item) => {
+    const startedAt = item.startedAt;
+    if (!startedAt) {
+      return sum;
+    }
+    const endedAt = item.endedAt ?? (item.isRunning ? nowMs : startedAt);
     const delta = Math.max(0, endedAt - startedAt);
     return sum + delta;
   }, 0);
-  const bashElapsedSeconds = Math.max(1, Math.round(bashElapsedMs / 1000));
+  const timelineElapsedText = formatDurationMs(timelineElapsedMs);
+  const summaryParts: string[] = [];
+  if (commandCount > 0) {
+    summaryParts.push(`Ran ${commandCount} command${commandCount > 1 ? 's' : ''}`);
+  }
+  if (webSearchCount > 0) {
+    summaryParts.push('searched the web');
+  }
+  if (webFetchCount > 0) {
+    summaryParts.push(`fetched ${webFetchCount} page${webFetchCount > 1 ? 's' : ''}`);
+  }
+  if (thinkingCount > 0 && commandCount === 0 && webSearchCount === 0 && webFetchCount === 0) {
+    summaryParts.push(`Thought ${thinkingCount} time${thinkingCount > 1 ? 's' : ''}`);
+  }
+  const timelineSummaryText =
+    summaryParts.length > 0
+      ? summaryParts.join(', ')
+      : `${timelineItems.length} step${timelineItems.length > 1 ? 's' : ''}`;
+  const effectiveTimelineOpen = hasRunningTimelineItem || isTimelineOpen;
 
   return (
     <motion.div
@@ -198,94 +836,238 @@ export function MessageItem({
       animate={{ opacity: 1, y: 0, scale: 1 }}
       transition={{ type: 'spring', stiffness: 500, damping: 30 }}
       className={cn('flex w-full gap-2 p-2 group/message', isUser ? 'flex-row-reverse' : 'flex-row')}>
-      <div className={cn('flex flex-col relative', isUser ? 'max-w-[75%] items-end' : 'max-w-[85%] items-start')}>
+      <div className={cn('flex flex-col relative', isUser ? 'max-w-[75%] items-end' : 'w-full max-w-[85%] items-start')}>
         <div className={cn(
           'prose prose-sm dark:prose-invert max-w-none break-words relative prose-pre:p-0 prose-pre:m-0 prose-pre:bg-transparent',
           isUser
             ? 'px-4 py-2.5 rounded-2xl bg-primary text-primary-foreground rounded-br-md'
             : 'py-1 text-foreground w-full'
         )}>
-          {!isUser && hasThinking && (
-            <ThinkingBlock thinking={message.thinking!} isThinking={!!message.isThinking} />
-          )}
-
-          {!isUser && bashExecutions.length > 0 && !message.toolEvent && (
+          {!isUser && timelineItems.length > 0 && !message.toolEvent && (
             <div className="mb-2 not-prose">
               <button
                 type="button"
-                className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[12px] text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-all duration-200"
-                onClick={() => setIsBashOpen((prev) => !prev)}
+                className="inline-flex w-full items-center gap-2 rounded-md px-1 py-1 text-left text-zinc-400 transition-colors hover:text-zinc-200"
+                onClick={() => {
+                  if (hasRunningTimelineItem) {
+                    return;
+                  }
+                  setIsTimelineOpen((prev) => !prev);
+                }}
+                aria-expanded={effectiveTimelineOpen}
               >
-                <Terminal className="h-3.5 w-3.5 shrink-0" />
-                <span className="font-medium">{bashElapsedSeconds}s</span>
-                <span className="text-muted-foreground/70">&middot;</span>
-                <span className="text-[11px]">
-                  {(() => {
-                    const parts: React.ReactNode[] = [];
-                    if (runningBashCount > 0) parts.push(<span key="r" className="text-blue-400">{runningBashCount} running</span>);
-                    if (doneBashCount > 0) parts.push(<span key="d" className="text-muted-foreground/70">{doneBashCount} done</span>);
-                    if (failedBashCount > 0) parts.push(<span key="f" className="text-red-400">{failedBashCount} failed</span>);
-                    if (parts.length === 0) return <span className="text-muted-foreground/70">{bashExecutions.length} cmd{bashExecutions.length > 1 ? 's' : ''}</span>;
-                    return parts.reduce<React.ReactNode[]>((acc, part, i) => {
-                      if (i > 0) acc.push(<span key={`sep-${i}`} className="text-muted-foreground/40 mx-0.5">&middot;</span>);
-                      acc.push(part);
-                      return acc;
-                    }, []);
-                  })()}
+                <span className="truncate text-[15px] font-medium text-zinc-300">{timelineSummaryText}</span>
+                <span className="ml-auto inline-flex items-center gap-2 text-[12px] text-zinc-500">
+                  {runningTimelineCount > 0 ? (
+                    <span className="text-cyan-300">{runningTimelineCount} running</span>
+                  ) : failedTimelineCount > 0 ? (
+                    <span className="text-red-300">{failedTimelineCount} failed</span>
+                  ) : (
+                    <span>done</span>
+                  )}
+                  <span>{timelineElapsedText}</span>
                 </span>
-                <motion.div
-                  animate={{ rotate: isBashOpen ? 90 : 0 }}
+                <motion.span
+                  animate={{ rotate: effectiveTimelineOpen ? 90 : 0 }}
                   transition={{ duration: 0.15, ease: 'easeOut' }}
+                  className="inline-flex h-4 w-4 items-center justify-center text-zinc-500"
                 >
-                  <ChevronRight className="h-3 w-3 text-muted-foreground/50" />
-                </motion.div>
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </motion.span>
               </button>
 
               <AnimatePresence initial={false}>
-                {isBashOpen && (
+                {effectiveTimelineOpen && (
                   <motion.div
                     initial={{ height: 0, opacity: 0 }}
                     animate={{ height: 'auto', opacity: 1 }}
                     exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                    transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
                     className="overflow-hidden"
                   >
-                    <div className="mt-1.5 rounded-xl bg-zinc-900/60 backdrop-blur-xl backdrop-saturate-150 border border-white/[0.06] max-h-[400px] overflow-y-auto scrollbar-none">
-                      <div className="divide-y divide-white/[0.04]">
-                        {bashExecutions.map((exec, index) => {
-                          const mode = modeConfig(exec.mode);
-                          const ModeIcon = mode.icon;
-                          const outputLang = detectCodeLanguage(exec.output || '');
-                          const formattedOutput = formatCodeText(exec.output || '', outputLang);
+                    <div className="mt-1 rounded-xl border border-zinc-700/60 bg-zinc-900/45 px-3 py-2">
+                      <div className="max-h-[420px] overflow-y-auto pr-1 scrollbar-none">
+                        <div className="space-y-2">
+                          {timelineItems.map((item, index) => {
+                            const isExpanded = item.isRunning || expandedTimelineItemIds[item.id] === true;
+                            const startedAt = item.startedAt ?? Date.parse(message.timestamp);
+                            const normalizedStartedAt = Number.isFinite(startedAt) ? startedAt : nowMs;
+                            const endedAt = item.endedAt ?? (item.isRunning ? nowMs : normalizedStartedAt);
+                            const durationText = formatDurationMs(Math.max(0, endedAt - normalizedStartedAt));
+                            const storedPreviewItems =
+                              item.type === 'command' && sessionId && item.parsedOutput.storagePaths.length > 0
+                                ? item.parsedOutput.storagePaths.map((storagePath) => {
+                                    try {
+                                      return {
+                                        storagePath,
+                                        src: buildSessionOutputPreviewUrl(sessionId, storagePath),
+                                      };
+                                    } catch {
+                                      return {
+                                        storagePath,
+                                        src: '',
+                                      };
+                                    }
+                                  })
+                                : [];
 
-                          return (
-                            <motion.div
-                              key={exec.id}
-                              initial={{ opacity: 0 }}
-                              animate={{ opacity: 1 }}
-                              transition={{ duration: 0.15, delay: index * 0.02 }}
-                              className="px-3 py-2"
-                            >
-                              <div className="flex items-center gap-2">
-                                <ModeIcon className={cn('h-3 w-3 shrink-0', mode.color)} />
-                                <span className="text-[11px] text-zinc-500 font-mono">$</span>
-                                <span className="text-[11px] text-zinc-300 font-mono flex-1 break-all">{exec.input}</span>
-                                {exec.status === 'running' ? (
-                                  <Loader2 className="h-3 w-3 text-blue-400 animate-spin shrink-0" />
-                                ) : exec.status === 'failed' ? (
-                                  <span className="h-1.5 w-1.5 rounded-full bg-red-400 shrink-0" />
-                                ) : (
-                                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" />
-                                )}
+                            return (
+                              <div key={item.id} className="rounded-lg border border-zinc-800 bg-zinc-900/70">
+                                <button
+                                  type="button"
+                                  className="flex w-full items-center gap-2 px-3 py-2 text-left"
+                                  onClick={() =>
+                                    setExpandedTimelineItemIds((previous) => ({
+                                      ...previous,
+                                      [item.id]: !isExpanded,
+                                    }))
+                                  }
+                                >
+                                  <span className="text-[11px] tabular-nums text-zinc-500">{index + 1}</span>
+                                  {item.type === 'command' && <Terminal className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
+                                  {item.type === 'thinking' && <FileText className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
+                                  {item.type === 'websearch' && <Search className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
+                                  {item.type === 'webfetch' && <Globe className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
+                                  <span className="min-w-0 flex-1 truncate text-[14px] text-zinc-200">{item.summary}</span>
+                                  {item.isRunning ? (
+                                    <span className="inline-flex items-center gap-1 text-[11px] text-cyan-300">
+                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                      running
+                                    </span>
+                                  ) : item.isFailed ? (
+                                    <span className="text-[11px] text-red-300">failed</span>
+                                  ) : (
+                                    <span className="text-[11px] text-zinc-500">{durationText}</span>
+                                  )}
+                                  <motion.span
+                                    animate={{ rotate: isExpanded ? 90 : 0 }}
+                                    transition={{ duration: 0.12 }}
+                                    className="inline-flex h-4 w-4 items-center justify-center text-zinc-500"
+                                  >
+                                    <ChevronRight className="h-3.5 w-3.5" />
+                                  </motion.span>
+                                </button>
+                                <AnimatePresence initial={false}>
+                                  {isExpanded && (
+                                    <motion.div
+                                      initial={{ height: 0, opacity: 0 }}
+                                      animate={{ height: 'auto', opacity: 1 }}
+                                      exit={{ height: 0, opacity: 0 }}
+                                      transition={{ duration: 0.14 }}
+                                      className="overflow-hidden border-t border-zinc-800"
+                                    >
+                                      <div className="space-y-2 px-3 py-2 text-xs text-zinc-300">
+                                        {item.type === 'thinking' && (
+                                          <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                            {item.detail}
+                                          </pre>
+                                        )}
+                                        {item.type === 'command' && (
+                                          <>
+                                            <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                              {item.commandInput}
+                                            </pre>
+                                            {item.outputText && (
+                                              <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                                {item.outputText}
+                                              </pre>
+                                            )}
+                                            {(item.parsedOutput.images.length > 0 || storedPreviewItems.length > 0) && (
+                                              <div className="grid gap-2">
+                                                {item.parsedOutput.images.map((image, imageIndex) => (
+                                                  <figure
+                                                    key={`${item.id}-inline-image-${imageIndex}`}
+                                                    className="space-y-1.5 rounded-md border border-zinc-800 bg-zinc-950/70 p-2"
+                                                  >
+                                                    <img
+                                                      src={image.src}
+                                                      alt={`Command output image (${image.mediaType})`}
+                                                      className="h-auto max-h-[360px] w-full max-w-full rounded object-contain"
+                                                      loading="lazy"
+                                                    />
+                                                    <figcaption className="break-all font-mono text-[10px] text-zinc-500">
+                                                      {image.mediaType}
+                                                    </figcaption>
+                                                  </figure>
+                                                ))}
+                                                {storedPreviewItems.map((previewItem, previewItemIndex) => (
+                                                  <div
+                                                    key={`${item.id}-stored-output-${previewItem.storagePath}-${previewItemIndex}`}
+                                                    className="space-y-1.5 rounded-md border border-zinc-800 bg-zinc-950/70 p-2"
+                                                  >
+                                                    {previewItem.src ? (
+                                                      <StoredOutputImage
+                                                        src={previewItem.src}
+                                                        alt={`Stored command output ${previewItem.storagePath}`}
+                                                      />
+                                                    ) : null}
+                                                    <div className="break-all font-mono text-[10px] text-zinc-500">
+                                                      {previewItem.storagePath}
+                                                    </div>
+                                                  </div>
+                                                ))}
+                                              </div>
+                                            )}
+                                          </>
+                                        )}
+                                        {item.type === 'websearch' && (
+                                          <div className="space-y-2">
+                                            {item.query && (
+                                              <div className="rounded-md border border-zinc-800 bg-zinc-950/80 px-2 py-1.5 font-mono text-[11px] text-zinc-200">
+                                                {item.query}
+                                              </div>
+                                            )}
+                                            {item.results.length > 0 ? (
+                                              <div className="space-y-1.5">
+                                                {item.results.map((result, resultIndex) => (
+                                                  <a
+                                                    key={`${item.id}-result-${resultIndex}`}
+                                                    href={result.url}
+                                                    target="_blank"
+                                                    rel="noreferrer"
+                                                    className="block rounded-md border border-zinc-800 bg-zinc-950/70 px-2 py-1.5 hover:border-zinc-700"
+                                                  >
+                                                    <div className="line-clamp-1 text-[12px] text-zinc-100">{result.title}</div>
+                                                    <div className="text-[11px] text-zinc-500">{result.host}</div>
+                                                    {result.snippet ? (
+                                                      <div className="line-clamp-2 text-[11px] text-zinc-400">{result.snippet}</div>
+                                                    ) : null}
+                                                  </a>
+                                                ))}
+                                              </div>
+                                            ) : item.responseRaw ? (
+                                              <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                                {item.responseRaw}
+                                              </pre>
+                                            ) : (
+                                              <div className="text-[11px] text-zinc-500">No search results</div>
+                                            )}
+                                          </div>
+                                        )}
+                                        {item.type === 'webfetch' && (
+                                          <div className="space-y-2">
+                                            {item.url && (
+                                              <div className="rounded-md border border-zinc-800 bg-zinc-950/80 px-2 py-1.5 font-mono text-[11px] text-zinc-200">
+                                                {item.url}
+                                              </div>
+                                            )}
+                                            {item.responseRaw ? (
+                                              <pre className="max-h-[260px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                                {item.responseRaw}
+                                              </pre>
+                                            ) : (
+                                              <div className="text-[11px] text-zinc-500">No response body</div>
+                                            )}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </motion.div>
+                                  )}
+                                </AnimatePresence>
                               </div>
-                              {formattedOutput && (
-                                <pre className="mt-1 text-[11px] leading-relaxed text-zinc-500 font-mono whitespace-pre-wrap break-all max-h-[150px] overflow-y-auto scrollbar-none pl-5">
-                                  {formattedOutput}
-                                </pre>
-                              )}
-                            </motion.div>
-                          );
-                        })}
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
                   </motion.div>
@@ -320,34 +1102,45 @@ export function MessageItem({
             </div>
           )}
 
-          {displayContent && (
+          {suppressBinaryContent && (
+            <div className="not-prose mb-2 rounded-xl border border-cyan-300/30 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100/95">
+              Binary text output hidden. Open the activity timeline to view structured output and images.
+            </div>
+          )}
+
+          {safeDisplayContent && (
             isUser ? (
-              <MemoMarkdown content={displayContent} components={components} />
+              <MemoMarkdown content={safeDisplayContent} components={components} />
             ) : (
-              <FlowMarkdown content={displayContent} isStreaming={isStreaming} />
+              <FlowMarkdown content={safeDisplayContent} isStreaming={isStreaming} />
             )
           )}
 
-          {!isUser && previewPaths.length > 0 && (
+          {!isUser && previewTargets.length > 0 && (
             <div className="not-prose mt-3 space-y-2">
-              {previewPaths.map((path) => (
-                <div key={path} className="group flex items-center justify-between rounded-xl border border-border/70 bg-card px-3 py-2">
+              {previewTargets.map((target, index) => (
+                <div
+                  key={`${target.path}:${target.viewer ?? 'default'}:${index}`}
+                  className="group flex items-center justify-between rounded-xl border border-border/70 bg-card px-3 py-2"
+                >
                   <button
                     type="button"
-                    onClick={() => onOpenPreview?.(path)}
+                    onClick={() => onOpenPreview?.(target)}
                     className="min-w-0 flex-1 text-left"
                   >
-                    <div className="truncate text-sm font-medium text-foreground">{path}</div>
-                    <div className="text-xs text-muted-foreground">Preview</div>
+                    <div className="truncate text-sm font-medium text-foreground">{target.path}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {target.viewer === 'slidev' ? 'Slidev preview' : 'Preview'}
+                    </div>
                   </button>
                   <a
-                    href={path.startsWith('http://') || path.startsWith('https://') ? path : '#'}
+                    href={target.path.startsWith('http://') || target.path.startsWith('https://') ? target.path : '#'}
                     target="_blank"
                     rel="noreferrer"
                     onClick={(e) => {
-                      if (!(path.startsWith('http://') || path.startsWith('https://'))) {
+                      if (!(target.path.startsWith('http://') || target.path.startsWith('https://'))) {
                         e.preventDefault();
-                        onOpenPreview?.(path);
+                        onOpenPreview?.(target);
                       }
                     }}
                     className="ml-3 inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"

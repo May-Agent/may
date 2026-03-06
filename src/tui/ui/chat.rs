@@ -491,6 +491,8 @@ pub struct StatusContext<'a> {
     pub processing: bool,
     /// Optional status message.
     pub status_message: Option<&'a str>,
+    /// Current profile name (shown in status bar).
+    pub profile_name: Option<&'a str>,
 }
 
 /// Queued message context for rendering queue indicator.
@@ -1094,7 +1096,16 @@ fn render_status_line<'a>(lines: &mut Vec<Line<'a>>, ctx: &StatusContext<'_>) {
         return;
     }
 
-    let mut parts = vec![ctx.model.to_string()];
+    let mut parts = Vec::new();
+
+    // Show profile name if not the default "Default"
+    if let Some(name) = ctx.profile_name
+        && name != "Default"
+    {
+        parts.push(name.to_string());
+    }
+
+    parts.push(ctx.model.to_string());
 
     // Add token usage info
     if let Some((prompt_tokens, context_window)) = ctx.usage {
@@ -1244,7 +1255,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             lines.push(Line::from(vec![
                 Span::raw(selection_marker),
                 Span::styled(
-                    format!("[task:{}] ", subagent),
+                    format!("[subagent:{}] ", subagent),
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(prompt_display, selection_style),
@@ -1353,7 +1364,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         ToolDisplay::Fetch { url, .. } => format!("Fetch: {}", url),
         ToolDisplay::Task {
             subagent, prompt, ..
-        } => format!("Task:{} - {}", subagent, prompt),
+        } => format!("Subagent:{} - {}", subagent, prompt),
         ToolDisplay::Bash { command, mode, .. } => {
             let mode_prefix = match mode {
                 BashMode::Unsafe => "[unsafe] ",

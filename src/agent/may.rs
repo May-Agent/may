@@ -1,39 +1,35 @@
 //! May agent wrapper around aither-agent.
 
-use std::{borrow::Cow, path::PathBuf};
-
-use async_channel::{Sender, bounded};
-
-use askama::Template;
+use std::{borrow::Cow, collections::HashSet, path::PathBuf, sync::Arc};
 
 use aither_agent::sandbox::builtin::AskCommand;
-use aither_agent::specialized::TaskTool;
+use aither_agent::specialized::{SubagentFileMount, SubagentTool};
 use aither_agent::webfetch::WebFetchTool;
 use aither_agent::websearch::WebSearchTool;
-use aither_agent::{
-    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, ContextBlock, ContextBlockPriority,
-};
+use aither_agent::{Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, BrowserBackend};
 use aither_cloud::{
     CloudProvider, claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI,
 };
 use aither_core::image::{ImageGenerator, Prompt, Size};
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{Message as LlmMessage, Tool, ToolOutput};
 use aither_sandbox::{
-    BashMode, BashTool, PermissionHandler, ShellRuntimeAvailability, SshServer,
-    permission::PermissionError,
+    BashMode, BashTool, ContainerExecHandle, ShellRuntimeAvailability, SshServer,
+    permission::{NoopPermissionHandler, PermissionError},
 };
 use executor_core::DefaultExecutor;
 use futures_lite::{Stream, StreamExt};
 
-use crate::agent::session_tool::SessionTool;
-use crate::ask_user::{AskUserBroker, AskUserTool};
-use crate::config::{
-    LoadBalanceStrategy, MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match,
+use crate::agent::notify_tool::NotifyTool;
+use crate::agent::register_tool::{
+    RegisterSkillsBroker, RegisterSkillsTool, RegisterSubagentsBroker, RegisterSubagentsTool,
 };
+use crate::agent::session_tool::SessionTool;
+use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
+use crate::ask_user::{AskUserBroker, AskUserTool};
+use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
 use crate::copilot::clear_copilot_credentials;
-use crate::models::fetch_models_by_provider;
 use crate::session::SessionId;
-use crate::workspace::{Workspace, WorkspaceDir};
+use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
 // Error message templates
@@ -45,6 +41,115 @@ fn err_no_provider(model: &str) -> String {
 
 fn err_api_key_required(provider: &str) -> String {
     format!("API key required for provider '{provider}'")
+}
+
+fn ordered_provider_ids_for_model(config: &MayConfig, model: &str) -> Vec<String> {
+    let strict = config.preferences.strict_model_matching;
+    let mapped_provider = config
+        .models
+        .provider_for_model(model, strict)
+        .map(str::to_string);
+
+    let mut explicit = Vec::new();
+    let mut generic = Vec::new();
+
+    for (id, instance) in &config.provider {
+        if !instance.can_serve_model(id, model) {
+            continue;
+        }
+        if instance.is_generic_model_proxy(id) {
+            generic.push(id.clone());
+        } else {
+            explicit.push(id.clone());
+        }
+    }
+
+    explicit.sort_unstable();
+    generic.sort_unstable();
+
+    let mut ordered = explicit;
+    ordered.extend(generic);
+
+    if let Some(mapped) = mapped_provider
+        && let Some(index) = ordered.iter().position(|id| id == &mapped)
+    {
+        let preferred = ordered.remove(index);
+        ordered.insert(0, preferred);
+    }
+
+    ordered
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderCandidate {
+    pub model: String,
+    pub provider_id: String,
+}
+
+pub fn provider_candidates_for_model(config: &MayConfig, model: &str) -> Vec<ProviderCandidate> {
+    ordered_provider_ids_for_model(config, model)
+        .into_iter()
+        .map(|provider_id| ProviderCandidate {
+            model: model.to_string(),
+            provider_id,
+        })
+        .collect()
+}
+
+pub fn provider_candidates_for_tiers(
+    config: &MayConfig,
+    tiers: &[crate::config::ModelTier],
+) -> Vec<ProviderCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::<(String, String)>::new();
+
+    for tier in tiers {
+        for model in config.models.models_for_tier(*tier) {
+            for candidate in provider_candidates_for_model(config, model) {
+                if seen.insert((candidate.model.clone(), candidate.provider_id.clone())) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+pub fn provider_candidate_count(config: &MayConfig, model: &str) -> usize {
+    provider_candidates_for_model(config, model).len()
+}
+
+async fn validate_generic_provider_model_support(
+    config: &MayConfig,
+    provider_id: &str,
+    instance: &ProviderInstance,
+    model: &str,
+) -> Result<(), MayAgentError> {
+    if !instance.is_generic_model_proxy(provider_id) {
+        return Ok(());
+    }
+
+    let fetched = crate::models::fetch_models_for_provider_instance(provider_id, instance)
+        .await
+        .map_err(|error| {
+            MayAgentError::Llm(format!(
+                "Failed to validate model '{model}' for provider '{provider_id}' via /models: {error}"
+            ))
+        })?;
+
+    let mode = MatchMode::from_strict_flag(config.preferences.strict_model_matching);
+    let has_match = fetched
+        .iter()
+        .any(|candidate| model_ids_match(candidate.id.as_str(), model, mode));
+
+    if !has_match {
+        return Err(MayAgentError::Llm(format!(
+            "Provider '{provider_id}' does not advertise model '{model}' in /models"
+        )));
+    }
+
+    Ok(())
 }
 
 /// May agent error.
@@ -68,86 +173,26 @@ pub enum MayAgentError {
     Workspace(#[from] crate::workspace::WorkspaceConfigError),
 }
 
-/// Permission handler for May agent.
-///
-/// Allows sandboxed mode by default, network mode with approval,
-/// and unsafe mode requires explicit user approval.
-#[derive(Debug, Clone)]
-pub struct MayPermissionHandler {
-    mode: PermissionMode,
-}
-
-impl MayPermissionHandler {
-    pub fn new() -> Self {
-        Self {
-            mode: PermissionMode::Tui,
-        }
-    }
-
-    pub fn with_webui(approver: PermissionApprover) -> Self {
-        Self {
-            mode: PermissionMode::WebUi(approver),
-        }
-    }
-}
-
-impl Default for MayPermissionHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PermissionHandler for MayPermissionHandler {
-    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
-        match (&self.mode, mode) {
-            (_, BashMode::Sandboxed) => Ok(true),
-            (PermissionMode::Tui, BashMode::Network) => Ok(true),
-            (PermissionMode::Tui, BashMode::Unsafe) => Ok(false),
-            (PermissionMode::WebUi(approver), BashMode::Network) => {
-                if approver.network_approved() {
-                    Ok(true)
-                } else {
-                    approver.request_and_wait(mode, script.to_string()).await
-                }
-            }
-            (PermissionMode::WebUi(approver), BashMode::Unsafe) => {
-                approver.request_and_wait(mode, script.to_string()).await
-            }
-        }
-    }
-
-    async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
-        true
-    }
-}
-
-#[derive(Debug, Clone)]
-enum PermissionMode {
-    Tui,
-    WebUi(PermissionApprover),
-}
-
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionRequestMode {
-    Sandboxed,
-    Network,
+    Default,
     Unsafe,
+    Ssh,
 }
 
 impl From<BashMode> for PermissionRequestMode {
     fn from(value: BashMode) -> Self {
         match value {
-            BashMode::Sandboxed => Self::Sandboxed,
-            BashMode::Network => Self::Network,
+            BashMode::Sandboxed | BashMode::Network => Self::Default,
             BashMode::Unsafe => Self::Unsafe,
         }
     }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PermissionRequest {
-    pub id: String,
     pub mode: PermissionRequestMode,
     pub script: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,38 +201,23 @@ pub struct PermissionRequest {
 
 #[derive(Debug, Clone)]
 pub struct PermissionApprover {
-    pending_queue:
-        std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<PermissionRequest>>>,
-    pending: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, (PermissionRequest, Sender<bool>)>>,
-    >,
-    pending_notify: std::sync::Arc<tokio::sync::Notify>,
-    network_approved: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    inner: std::sync::Arc<aither_agent::tool_request::RequestApprover<PermissionRequest, bool>>,
     session_id: Option<String>,
 }
 
 impl PermissionApprover {
     pub fn new() -> Self {
         Self {
-            pending_queue: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::VecDeque::new(),
-            )),
-            pending: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            pending_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-            network_approved: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inner: std::sync::Arc::new(aither_agent::tool_request::RequestApprover::new()),
             session_id: None,
         }
     }
 
     pub fn for_session(&self, session_id: impl Into<String>) -> Self {
-        let mut cloned = self.clone();
-        cloned.session_id = Some(session_id.into());
-        cloned
-    }
-
-    pub fn network_approved(&self) -> bool {
-        self.network_approved
-            .load(std::sync::atomic::Ordering::SeqCst)
+        Self {
+            inner: self.inner.clone(),
+            session_id: Some(session_id.into()),
+        }
     }
 
     pub async fn request_and_wait(
@@ -195,79 +225,40 @@ impl PermissionApprover {
         mode: BashMode,
         script: String,
     ) -> Result<bool, PermissionError> {
-        let request = PermissionRequest {
-            id: uuid::Uuid::new_v4().to_string(),
+        let payload = PermissionRequest {
             mode: mode.into(),
             script,
             session_id: self.session_id.clone(),
         };
-
-        let (tx, rx) = bounded(1);
-        self.pending
-            .lock()
-            .map_err(|_| PermissionError::Interrupted)?
-            .insert(request.id.clone(), (request.clone(), tx));
-
-        self.pending_queue.lock().await.push_back(request);
-        self.pending_notify.notify_waiters();
-
+        let (_id, rx) = self.inner.enqueue(payload);
         rx.recv().await.map_err(|_| PermissionError::Interrupted)
     }
 
-    pub async fn next_request_for_session(
+    pub fn respond(&self, request_id: &str, approved: bool) -> bool {
+        self.inner.respond(request_id, approved)
+    }
+
+    /// Returns the oldest pending request matching the session filter as `(id, payload)`.
+    pub fn snapshot_session_runtime(
         &self,
         session_id: Option<&str>,
-    ) -> Option<PermissionRequest> {
-        loop {
-            {
-                let mut queue = self.pending_queue.lock().await;
-                if let Some(index) =
-                    queue
-                        .iter()
-                        .position(|req| match (session_id, req.session_id.as_deref()) {
-                            (Some(expected), Some(actual)) => expected == actual,
-                            (None, Some(_)) => true,
-                            _ => false,
-                        })
-                {
-                    return queue.remove(index);
-                }
-            }
-
-            self.pending_notify.notified().await;
-        }
-    }
-
-    pub fn respond(&self, request_id: &str, approved: bool) -> bool {
-        let Some((request, tx)) = self
-            .pending
-            .lock()
-            .ok()
-            .and_then(|mut pending| pending.remove(request_id))
-        else {
-            return false;
-        };
-
-        if approved && matches!(request.mode, PermissionRequestMode::Network) {
-            self.network_approved
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        tx.try_send(approved).is_ok()
-    }
-
-    pub fn snapshot_session_runtime(&self, session_id: Option<&str>) -> Option<PermissionRequest> {
-        let pending = self.pending.lock().ok()?;
-        pending.values().find_map(|(request, _tx)| {
-            let belongs = match (session_id, request.session_id.as_deref()) {
+    ) -> Option<(String, PermissionRequest)> {
+        self.inner
+            .peek_filtered(|req| match (session_id, req.session_id.as_deref()) {
                 (Some(expected), Some(actual)) => expected == actual,
+                (None, Some(_)) => true,
                 _ => false,
-            };
-            if !belongs {
-                return None;
-            }
-            Some(request.clone())
-        })
+            })
+    }
+
+    pub fn session_id_for_request(&self, request_id: &str) -> Option<String> {
+        self.inner
+            .get_payload(request_id)
+            .and_then(|p| p.session_id)
+    }
+
+    pub fn listen(&self) -> event_listener::EventListener {
+        self.inner.listen()
     }
 }
 
@@ -275,6 +266,21 @@ impl Default for PermissionApprover {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Execution environment for a MayAgent.
+pub enum AgentEnvironment {
+    /// Native macOS sandbox via leash.
+    Local,
+    /// Docker container-based isolation.
+    Container {
+        /// Container ID from Docker.
+        container_id: String,
+        /// Executor for running commands inside the container.
+        container_exec: Arc<ContainerExecHandle>,
+        /// Optional browser backend that can provide a CDP endpoint.
+        browser_backend: Option<Arc<dyn BrowserBackend>>,
+    },
 }
 
 /// Configuration for creating a MayAgent.
@@ -299,10 +305,30 @@ pub struct MayAgentConfig {
     pub ask_user_broker: AskUserBroker,
     /// Image generation provider and model.
     pub image_generator: Option<ImageGeneratorConfig>,
-    /// Preconfigured SSH servers available for `open_shell` ssh backend.
+    /// Preconfigured SSH servers available for `bash` ssh mode and `open_ssh`.
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,
+    /// Execution environment (local leash sandbox or container).
+    pub environment: AgentEnvironment,
+    /// Optional profile persona overlay injected into the agent context.
+    pub profile_persona: Option<String>,
+    /// Optional profile memories (preference + recency) injected as read-only context.
+    pub profile_memories: Option<crate::memory::ProfileMemories>,
+    /// Optional location info for location-aware profiles.
+    pub location: Option<crate::location::LocationInfo>,
+    /// Optional broker for `task` command requests.
+    pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
+    /// Optional broker for `notify` command requests.
+    pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
+    /// Optional broker for `register-skills` command requests.
+    pub register_skills_broker: Option<RegisterSkillsBroker>,
+    /// Optional broker for `register-subagents` command requests.
+    pub register_subagents_broker: Option<RegisterSubagentsBroker>,
+    /// Whether this model/runtime pair supports native voice input.
+    pub native_voice_input: bool,
+    /// Model context window resolved from provider metadata.
+    pub model_context_window: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -459,32 +485,26 @@ pub struct MayAgent {
     session_id: SessionId,
     sandbox_dir: PathBuf,
     provider_id: String,
+    model_context_window: Option<u32>,
+    memory_path: PathBuf,
+    last_memory_content: String,
 }
 
 impl MayAgent {
     /// Create a new MayAgent.
     pub async fn new(config: MayAgentConfig) -> Result<Self, MayAgentError> {
-        // Create permission handler
-        let permission_handler = config
-            .permission_approver
-            .as_ref()
-            .map_or_else(MayPermissionHandler::new, |approver| {
-                MayPermissionHandler::with_webui(approver.clone())
-            });
+        let is_container = matches!(config.environment, AgentEnvironment::Container { .. });
 
         let executor = DefaultExecutor;
 
         // Create bash tool in sandbox dir (BashTool creates its own working directory inside)
-        let memory_file = global_memory_file_path(&config.may_dir);
-        let bash_tool: BashTool<MayPermissionHandler, DefaultExecutor> =
-            BashTool::new_exact(&config.sandbox_dir, permission_handler, executor)
+        let bash_tool: BashTool<NoopPermissionHandler, DefaultExecutor> =
+            BashTool::new_exact(&config.sandbox_dir, NoopPermissionHandler, executor)
                 .await
-                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
-                .with_auto_open_default_session(true)
-                .with_writable_paths([memory_file]);
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
 
-        // Create workspace with permissions
-        let workspace = Workspace::new(
+        // Create workspace with permissions (only used for local environment context)
+        let workspace = MayWorkspace::new(
             config.sandbox_dir.clone(),
             config.cwd.clone(),
             config.may_dir.clone(),
@@ -498,7 +518,7 @@ impl MayAgent {
                 target: s.target.clone(),
             })
             .collect();
-        let ssh_enabled = !ssh_servers.is_empty();
+        let ssh_enabled = !is_container && !ssh_servers.is_empty();
 
         // Read global memory from ~/.may/MEMORY.md.
         let memory_path = global_memory_file_path(&config.may_dir);
@@ -506,7 +526,7 @@ impl MayAgent {
 
         // Clone LLM for tools that need it before it's moved into the builder
         let fast_llm = config.llm.clone();
-        let task_llm = config.llm.clone();
+        let subagent_llm = config.llm.clone();
 
         // Create tools
         let websearch = WebSearchTool::default();
@@ -519,39 +539,83 @@ impl MayAgent {
             config.may_dir.clone(),
             config.session_id.as_str().to_string(),
         );
+        let task_tool = TaskTool::new(
+            config.session_id.as_str().to_string(),
+            if is_container {
+                TaskRuntimeKind::Container
+            } else {
+                TaskRuntimeKind::Local
+            },
+            config.task_broker,
+        );
         let imagine = ImagineTool {
             generator: config.image_generator,
             artifacts_dir: config.sandbox_dir.join("artifacts"),
         };
-        let task_tool = TaskTool::new(task_llm).with_builtins();
+        let notify_tool = NotifyTool::new(config.notify_broker);
+        let register_skills_tool = RegisterSkillsTool::new(
+            config.session_id.as_str().to_string(),
+            config.register_skills_broker,
+        );
+        let register_subagents_tool = RegisterSubagentsTool::new(
+            config.session_id.as_str().to_string(),
+            config.register_subagents_broker,
+        );
+        let subagent_tool = SubagentTool::new(subagent_llm).with_builtins();
 
         let transcript_file = config.sandbox_dir.join("transcript.md");
         let transcript_path = transcript_file.display().to_string();
 
-        let skills_dir = config.may_dir.join("skills");
-        let subagents_dir = config.may_dir.join("subagents");
+        let skills_dir = config.sandbox_dir.join(".skills");
+        let subagents_dir = config.sandbox_dir.join(".subagents");
+
+        // Shell runtime depends on the environment
+        let availability = if is_container {
+            ShellRuntimeAvailability {
+                local: false,
+                container: true,
+                ssh: false,
+            }
+        } else {
+            ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: ssh_enabled,
+            }
+        };
 
         // Build the agent using a minimal base prompt + structured context blocks.
         // Skills and subagents must be registered before with_default_prompt()
         // so they appear in the system prompt.
+        let effective_max_iterations = if config.max_iterations == 0 {
+            usize::MAX
+        } else {
+            config.max_iterations
+        };
         let mut builder = BashAgentBuilder::new(config.llm, bash_tool)
             .tool(websearch)
             .tool(webfetch)
             .tool(ask)
-            .tool(request_workspace)
             .tool(ask_user)
             .tool(session_tool)
+            .tool(task_tool)
             .tool(imagine)
-            .with_skills_async(&skills_dir)
-            .await
-            .with_subagents_async(&subagents_dir)
-            .await
+            .tool(notify_tool)
+            .tool(register_skills_tool)
+            .tool(register_subagents_tool);
+        if !is_container {
+            builder = builder.tool(request_workspace);
+        }
+        if is_container {
+            builder = builder.with_skills_readable_only(&skills_dir).await?;
+            builder = builder.with_subagents_readable_only(&subagents_dir).await?;
+        } else {
+            builder = builder.with_skills(&skills_dir).await?;
+            builder = builder.with_subagents(&subagents_dir).await?;
+        }
+        builder = builder
             .with_default_prompt()
-            .shell_runtime_availability(ShellRuntimeAvailability {
-                local: true,
-                container: false,
-                ssh: ssh_enabled,
-            })
+            .shell_runtime_availability(availability)
             .ssh_servers(ssh_servers)
             .ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
                 ssh_authorizer_broker,
@@ -560,17 +624,79 @@ impl MayAgent {
             .persona_prompt(include_str!("../../templates/system.md"))
             .transcript_path(transcript_path)
             .transcript(transcript_file)
-            .context_block(build_workspace_context_block(&workspace))
-            .context_block(build_memory_context_block(&memory_content))
-            .context_block(build_workflow_context_block())
-            .max_iterations(config.max_iterations);
+            .system(build_memory_context(&memory_content))
+            .max_iterations(effective_max_iterations);
+
+        if let Some(voice_hint) = build_native_voice_context(config.native_voice_input) {
+            builder = builder.system(voice_hint);
+        }
+
+        if let Some(ref persona) = config.profile_persona {
+            builder = builder.system(ProfilePersona {
+                content: persona.clone(),
+            });
+        }
+
+        if let Some(ref memories) = config.profile_memories
+            && !memories.is_empty()
+        {
+            builder = builder.system(ProfileMemories {
+                content: memories.to_context_string(),
+            });
+        }
+
+        if let Some(ref location) = config.location {
+            builder = builder.system(LocationContext {
+                content: location.to_context_string(),
+            });
+        }
+
+        // Environment-specific configuration
+        match config.environment {
+            AgentEnvironment::Container {
+                container_id,
+                container_exec,
+                browser_backend,
+            } => {
+                builder = builder
+                    .container_id(container_id)
+                    .container_exec(container_exec);
+                if let Some(browser_backend) = browser_backend {
+                    let endpoint = browser_backend.cdp_endpoint().await.map_err(|error| {
+                        MayAgentError::Sandbox(format!(
+                            "failed to resolve browser CDP endpoint from backend: {error}"
+                        ))
+                    })?;
+                    builder = builder.system(build_browser_context(Some(endpoint.as_str())));
+                }
+            }
+            AgentEnvironment::Local => {
+                builder = builder.system(build_workspace_context(&workspace));
+                if let Some(macos_hint) = build_macos_host_automation_context() {
+                    builder = builder.system(macos_hint);
+                }
+            }
+        }
 
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
 
-        // Configure TaskTool with the sandbox directory and add to builder
-        let task_tool = task_tool.with_base_dir(actual_sandbox_dir.clone());
-        builder = builder.tool(task_tool);
+        // Configure SubagentTool with explicit roots so file-based subagents resolve
+        // correctly in both local and container profiles.
+        let subagent_tool = subagent_tool
+            .with_base_dir(actual_sandbox_dir.clone())
+            .with_file_mounts([
+                SubagentFileMount::new(PathBuf::from("."), actual_sandbox_dir.clone()),
+                SubagentFileMount::new(
+                    PathBuf::from(".subagents"),
+                    actual_sandbox_dir.join(".subagents"),
+                ),
+                SubagentFileMount::new(
+                    PathBuf::from(".skills"),
+                    actual_sandbox_dir.join(".skills"),
+                ),
+            ]);
+        builder = builder.tool(subagent_tool);
 
         let agent = builder.build();
 
@@ -579,6 +705,9 @@ impl MayAgent {
             session_id: config.session_id,
             sandbox_dir: actual_sandbox_dir,
             provider_id: config.provider_id,
+            model_context_window: config.model_context_window,
+            memory_path,
+            last_memory_content: memory_content,
         })
     }
 
@@ -614,8 +743,9 @@ impl MayAgent {
 
     /// Create a MayAgent from config file with a specific model.
     ///
-    /// This first checks the stored model_providers mapping for a known provider,
-    /// falling back to resolver search if not found.
+    /// Provider selection uses an ordered candidate list:
+    /// model-mapped provider first (if configured), then explicit providers,
+    /// then generic proxy providers as fallback.
     pub async fn from_config_with_model(
         may_config: &MayConfig,
         sandbox_dir: PathBuf,
@@ -636,6 +766,15 @@ impl MayAgent {
             ask_user_broker,
             model,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            AgentEnvironment::Local,
+            0,
         )
         .await
     }
@@ -650,77 +789,75 @@ impl MayAgent {
         ask_user_broker: AskUserBroker,
         model: &str,
         permission_approver: Option<PermissionApprover>,
+        profile_persona: Option<String>,
+        profile_memories: Option<crate::memory::ProfileMemories>,
+        location: Option<crate::location::LocationInfo>,
+        task_broker: Option<crate::agent::task_tool::TaskBroker>,
+        notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
+        register_skills_broker: Option<RegisterSkillsBroker>,
+        register_subagents_broker: Option<RegisterSubagentsBroker>,
+        environment: AgentEnvironment,
+        provider_attempt: usize,
     ) -> Result<Self, MayAgentError> {
-        // First try exact provider-model matches from standard aither /models listing.
-        let provider_model_results = fetch_models_by_provider(may_config).await;
-        let successful_fetches = provider_model_results
-            .iter()
-            .filter(|row| row.error.is_none())
-            .count();
-        let exact_matches = provider_model_results
-            .iter()
-            .filter(|row| {
-                row.models.iter().any(|m| {
-                    model_ids_match(
-                        &m.id,
-                        model,
-                        MatchMode::from_strict_flag(may_config.preferences.strict_model_matching),
-                    )
-                })
-            })
-            .map(|row| row.provider_id.clone())
-            .collect::<Vec<_>>();
+        let provider_candidates = provider_candidates_for_model(may_config, model);
+        let candidate_count = provider_candidates.len();
+        if candidate_count == 0 {
+            return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
+        }
+        let start_index = provider_attempt % candidate_count;
+        let mut last_provider_error: Option<MayAgentError> = None;
 
-        let (llm, provider_id) = if !exact_matches.is_empty() {
-            let mut pool = exact_matches;
-            pool.sort();
-            pool.dedup();
-
-            let picked = match may_config.preferences.load_balance_strategy {
-                LoadBalanceStrategy::FailoverOnly => pool.first().cloned(),
-                LoadBalanceStrategy::Random => {
-                    use std::collections::hash_map::RandomState;
-                    use std::hash::{BuildHasher, Hasher};
-                    let idx = RandomState::new().build_hasher().finish() as usize % pool.len();
-                    pool.get(idx).cloned()
-                }
-                LoadBalanceStrategy::RoundRobin => {
-                    // Resolver is recreated per request; use session id hash to distribute consistently.
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    session_id.as_str().hash(&mut hasher);
-                    let idx = hasher.finish() as usize % pool.len();
-                    pool.get(idx).cloned()
-                }
+        let mut selected_provider: Option<(String, CloudProvider)> = None;
+        for offset in 0..candidate_count {
+            let index = (start_index + offset) % candidate_count;
+            let provider_id = provider_candidates[index].provider_id.clone();
+            let Some(provider_instance) = may_config.provider.get(&provider_id).cloned() else {
+                continue;
             };
 
-            if let Some(provider_id) = picked {
-                if let Some(instance) = may_config.provider.get(&provider_id) {
-                    (
-                        build_cloud_provider_from_instance(&provider_id, instance, model).await?,
-                        provider_id,
-                    )
-                } else {
-                    return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
-                }
-            } else {
-                return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
-            }
-        } else if successful_fetches > 0 {
-            // We have authoritative /models data from at least one provider.
-            // If none advertise this model, do not route by loose capability inference.
-            return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
-        } else {
-            // Fallback only when provider model listing is unavailable.
-            let resolver = may_config.create_resolver();
-            let selected = resolver
-                .select_provider(model)
-                .ok_or_else(|| MayAgentError::MissingApiKey(err_no_provider(model)))?;
-            (
-                build_cloud_provider_from_instance(selected.id, selected.instance, model).await?,
-                selected.id.to_string(),
+            if let Err(error) = validate_generic_provider_model_support(
+                may_config,
+                &provider_id,
+                &provider_instance,
+                model,
             )
+            .await
+            {
+                tracing::warn!(
+                    model,
+                    provider_id,
+                    error = %error,
+                    "provider candidate rejected during model support validation"
+                );
+                last_provider_error = Some(error);
+                continue;
+            }
+
+            match build_cloud_provider_from_instance(&provider_id, &provider_instance, model).await
+            {
+                Ok(llm) => {
+                    selected_provider = Some((provider_id, llm));
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        model,
+                        provider_id,
+                        error = %error,
+                        "failed to initialize provider candidate for model"
+                    );
+                    last_provider_error = Some(error);
+                }
+            }
+        }
+
+        let (provider_id, llm) = if let Some(selected) = selected_provider {
+            selected
+        } else {
+            return Err(last_provider_error
+                .unwrap_or_else(|| MayAgentError::MissingApiKey(err_no_provider(model))));
         };
+        let model_info = aither_models::lookup(model);
 
         let config = MayAgentConfig {
             llm,
@@ -735,6 +872,17 @@ impl MayAgent {
             image_generator: resolve_image_generator_config(may_config),
             ssh_servers: may_config.ssh_servers.clone(),
             permission_approver,
+            environment,
+            profile_persona,
+            profile_memories,
+            location,
+            task_broker,
+            notify_broker,
+            register_skills_broker,
+            register_subagents_broker,
+            native_voice_input: model_info
+                .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::Audio)),
+            model_context_window: model_info.and_then(|info| info.max_input_tokens()),
         };
 
         Self::new(config).await
@@ -746,12 +894,26 @@ impl MayAgent {
         prompt: &str,
         attachments: impl IntoIterator<Item = url::Url>,
     ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+        self.refresh_memory_context();
         self.inner.run(prompt, attachments)
     }
 
     /// One-shot query.
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
+        self.refresh_memory_context();
         self.inner.query(prompt).await
+    }
+
+    /// Preview the exact request message sequence for the next turn.
+    pub async fn preview_request_messages(
+        &mut self,
+        prompt: &str,
+        attachments: impl IntoIterator<Item = url::Url>,
+    ) -> Vec<LlmMessage> {
+        self.refresh_memory_context();
+        self.inner
+            .preview_request_messages(prompt, attachments)
+            .await
     }
 
     /// Get session ID.
@@ -769,8 +931,15 @@ impl MayAgent {
         &self.provider_id
     }
 
+    /// Model context window resolved for this agent.
+    pub const fn model_context_window(&self) -> Option<u32> {
+        self.model_context_window
+    }
+
     /// Get mutable reference to the inner agent.
-    pub fn inner_mut(&mut self) -> &mut Agent<CloudProvider, CloudProvider, CloudProvider, ()> {
+    pub(crate) fn inner_mut(
+        &mut self,
+    ) -> &mut Agent<CloudProvider, CloudProvider, CloudProvider, ()> {
         &mut self.inner
     }
 
@@ -779,10 +948,86 @@ impl MayAgent {
         self.inner.clear_history();
     }
 
-    /// Force-close shell sessions and terminate their running jobs.
-    pub async fn close_shell_sessions(&self) {
-        self.inner.close_shell_sessions().await;
+    fn refresh_memory_context(&mut self) {
+        // Static system blocks are populated lazily by aither-agent during the first turn.
+        // Before that point, memory is already present via the startup context block.
+        if !self.inner.context().has_system_block("knowledge_and_time") {
+            return;
+        }
+
+        let memory_content = std::fs::read_to_string(&self.memory_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read memory file at {}: {error}",
+                self.memory_path.display()
+            )
+        });
+        if memory_content == self.last_memory_content {
+            return;
+        }
+
+        self.last_memory_content = memory_content.clone();
+        self.inner.context_mut().insert_system(&Memory {
+            content: build_memory_context_content(&memory_content),
+        });
     }
+}
+
+/// Build a provider chain for fast-tier background memory extraction.
+///
+/// Uses all configured fast-tier models first, then balanced-tier models.
+/// For each model, tries explicit providers before generic proxy providers.
+pub async fn build_fast_provider_chain(
+    config: &MayConfig,
+) -> Result<Vec<crate::memory::MemoryExtractionProvider>, MayAgentError> {
+    let candidates = provider_candidates_for_tiers(
+        config,
+        &[
+            crate::config::ModelTier::Fast,
+            crate::config::ModelTier::Balanced,
+        ],
+    );
+
+    if candidates.is_empty() {
+        return Err(MayAgentError::MissingApiKey(
+            ERR_NO_MODELS.trim().to_string(),
+        ));
+    }
+    let first_model = candidates[0].model.clone();
+
+    let mut built = Vec::new();
+    let mut last_error: Option<MayAgentError> = None;
+
+    for candidate in candidates {
+        let Some(instance) = config.get_provider(&candidate.provider_id) else {
+            continue;
+        };
+
+        match build_cloud_provider_from_instance(&candidate.provider_id, instance, &candidate.model)
+            .await
+        {
+            Ok(llm) => built.push(crate::memory::MemoryExtractionProvider {
+                provider_id: candidate.provider_id.clone(),
+                model: candidate.model.clone(),
+                llm,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    provider_id = %candidate.provider_id,
+                    model = %candidate.model,
+                    error = %error,
+                    "failed to initialize memory extraction provider candidate"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    if built.is_empty() {
+        return Err(last_error
+            .unwrap_or_else(|| MayAgentError::MissingApiKey(err_no_provider(&first_model))));
+    }
+
+    Ok(built)
 }
 
 /// Build a CloudProvider from a ProviderInstance directly.
@@ -917,8 +1162,8 @@ pub async fn generate_session_title(
         .ok()?;
 
     // Truncate messages for prompt
-    let user_truncated: String = user_message.chars().take(200).collect();
-    let assistant_truncated: String = assistant_response.chars().take(300).collect();
+    let user_truncated = truncate_at_char_boundary(user_message, 200);
+    let assistant_truncated = truncate_at_char_boundary(assistant_response, 300);
 
     let prompt = format!(
         "Generate a short, descriptive title (3-6 words) for this conversation. Output ONLY the title, nothing else.\n\nUser: {}\n\nAssistant: {}",
@@ -947,83 +1192,161 @@ pub async fn generate_session_title(
     }
 }
 
-fn build_workspace_context_block(workspace: &Workspace) -> ContextBlock {
-    #[derive(askama::Template)]
-    #[template(path = "workspace_context.xml", escape = "none")]
-    struct WorkspaceBlockTemplate {
-        sandbox: String,
-        cwd: String,
-        workdirs: Vec<WorkspaceDirView>,
-    }
-
-    #[derive(Clone)]
-    struct WorkspaceDirView {
-        path: String,
-        description: String,
-    }
-
-    impl From<&WorkspaceDir> for WorkspaceDirView {
-        fn from(value: &WorkspaceDir) -> Self {
-            Self {
-                path: value.path.display().to_string(),
-                description: value
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| "User-approved directory".to_string()),
-            }
-        }
-    }
-
-    let workdirs = workspace
-        .config
-        .workdirs
-        .iter()
-        .map(WorkspaceDirView::from)
-        .collect::<Vec<_>>();
-
-    let template = WorkspaceBlockTemplate {
-        sandbox: workspace.sandbox.display().to_string(),
-        cwd: workspace.cwd.display().to_string(),
-        workdirs,
-    };
-
-    ContextBlock::new(
-        "workspace",
-        template
-            .render()
-            .unwrap_or_else(|e| panic!("failed to render workspace context block: {e}")),
-    )
-    .with_priority(ContextBlockPriority::High)
+fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
+    input
+        .char_indices()
+        .nth(max_chars)
+        .map_or(input, |(idx, _)| &input[..idx])
 }
 
 const MEMORY_CONTEXT_HINT: &str = include_str!("../texts/memory_context_hint.txt");
-const WORKFLOW_CONTEXT: &str = include_str!("../texts/workflow_context.txt");
+const MACOS_HOST_AUTOMATION_HINT: &str = include_str!("../texts/macos_host_hint.txt");
+const NATIVE_VOICE_AVAILABLE_HINT: &str = "Native voice input is available in this session. You may treat spoken input as first-class user messages.";
 
-fn build_memory_context_block(memory: &str) -> ContextBlock {
-    let with_hint = format!("{}\n\n{}", MEMORY_CONTEXT_HINT.trim(), memory);
-    ContextBlock::new("memory", with_hint).with_priority(ContextBlockPriority::High)
+#[derive(serde::Serialize)]
+struct Browser {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cdp_endpoint: Option<String>,
 }
 
-fn build_workflow_context_block() -> ContextBlock {
-    ContextBlock::new("workflow", WORKFLOW_CONTEXT.trim()).with_priority(ContextBlockPriority::High)
+#[derive(serde::Serialize)]
+struct Workspace {
+    sandbox: String,
+    cwd: String,
+    workdirs: Vec<WorkspaceDirEntry>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceDirEntry {
+    path: String,
+    description: String,
+}
+
+impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
+    fn from(value: &MayWorkspaceDir) -> Self {
+        Self {
+            path: value.path.display().to_string(),
+            description: value
+                .description
+                .clone()
+                .unwrap_or_else(|| "User-approved directory".to_string()),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct Memory {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct ProfilePersona {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct ProfileMemories {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct LocationContext {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct NativeVoiceInput {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct Platform {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+fn build_browser_context(cdp_endpoint: Option<&str>) -> Browser {
+    Browser {
+        cdp_endpoint: cdp_endpoint.map(str::to_string),
+    }
+}
+
+fn build_workspace_context(workspace: &MayWorkspace) -> Workspace {
+    Workspace {
+        sandbox: workspace.sandbox.display().to_string(),
+        cwd: workspace.cwd.display().to_string(),
+        workdirs: workspace
+            .config
+            .workdirs
+            .iter()
+            .map(WorkspaceDirEntry::from)
+            .collect(),
+    }
+}
+
+fn build_memory_context_content(memory: &str) -> String {
+    format!("{}\n\n{}", MEMORY_CONTEXT_HINT.trim(), memory)
+}
+
+fn build_memory_context(memory: &str) -> Memory {
+    Memory {
+        content: build_memory_context_content(memory),
+    }
+}
+
+fn build_native_voice_context(native_voice_input: bool) -> Option<NativeVoiceInput> {
+    if native_voice_input {
+        Some(NativeVoiceInput {
+            content: NATIVE_VOICE_AVAILABLE_HINT.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+fn build_macos_host_automation_context() -> Option<Platform> {
+    if cfg!(target_os = "macos") && !is_running_in_container() {
+        return Some(Platform {
+            content: MACOS_HOST_AUTOMATION_HINT.to_string(),
+        });
+    }
+    None
+}
+
+fn is_running_in_container() -> bool {
+    if std::env::var_os("container").is_some() {
+        return true;
+    }
+
+    if std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+    {
+        return true;
+    }
+
+    std::fs::read_to_string("/proc/1/cgroup")
+        .map(|content| {
+            let lower = content.to_ascii_lowercase();
+            lower.contains("docker")
+                || lower.contains("containerd")
+                || lower.contains("kubepods")
+                || lower.contains("podman")
+                || lower.contains("lxc")
+        })
+        .unwrap_or(false)
 }
 
 fn global_memory_file_path(may_dir: &std::path::Path) -> PathBuf {
     let upper = may_dir.join("MEMORY.md");
-    if upper.exists() {
-        return upper;
-    }
-
-    let lower = may_dir.join("memory.md");
-    if lower.exists() {
-        let _ = std::fs::rename(&lower, &upper);
-        if upper.exists() {
-            return upper;
-        }
-    }
-
     if !upper.exists() {
-        let _ = std::fs::write(&upper, "");
+        std::fs::write(&upper, "").unwrap_or_else(|e| {
+            panic!("failed to initialize MEMORY.md at {}: {e}", upper.display())
+        });
     }
     upper
 }

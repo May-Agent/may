@@ -7,6 +7,7 @@ use blocking::unblock;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEvent};
 use executor_core::spawn;
 
+use crate::profile::{ProfileInfo, ProfileSessions};
 use crate::{SessionSummary, SkillInfo};
 
 const ERR_TUI_EVENT_POLL: &str = include_str!("../texts/event_poll_failed.txt");
@@ -41,6 +42,12 @@ pub enum AppEvent {
     SkillInstalled(Result<Vec<SkillInfo>, anyhow::Error>),
     /// Skill deleted
     SkillDeleted(Result<Vec<SkillInfo>, anyhow::Error>),
+
+    // ─── Profile operation results ──────────────────────────────────
+    /// Profile list loaded (for ProfileSelect mode)
+    ProfilesLoaded(Result<Vec<ProfileInfo>, anyhow::Error>),
+    /// Profile sessions loaded (pinned/regular/archived groups)
+    ProfileSessionsLoaded(Result<ProfileSessions, anyhow::Error>),
 
     // ─── Image loading ────────────────────────────────────────────────
     /// Image fetch finished from URL (data=None means fetch failed)
