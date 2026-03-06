@@ -1,6 +1,6 @@
 ---
 name: slide
-description: "Create Markdown-based presentation slides using Slidev. Use when users ask to create slides, presentations, or slide decks."
+description: "MUST use for slide/presentation requests. Create Markdown-based Slidev decks. Trigger on slides, presentation, deck, PPT, slide deck, presentation file, briefing deck."
 ---
 
 # Slide Skill (Slidev)
@@ -18,13 +18,7 @@ Ask: **"Will you edit this in Keynote/PowerPoint later?"**
 If the topic needs research, use the builtin research subagent:
 
 ```bash
-task research --prompt "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights."
-```
-
-Use explicit flags to avoid positional argument ambiguity:
-
-```bash
-task --subagent research --prompt "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights."
+subagent --subagent "research" --prompt "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights."
 ```
 
 ### Phase 2: Requirements (Main Agent)
@@ -40,7 +34,7 @@ Gather from user:
 Launch art direction subagent to create design guide and outline:
 
 ```bash
-task --subagent .skills/slide/subagents/art_direction.md --prompt "Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]."
+subagent --subagent ".skills/slide/subagents/art_direction.md" --prompt "Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]."
 ```
 
 The subagent returns a YAML design guide containing:
@@ -61,9 +55,9 @@ Present the outline to the user:
 Launch one slide_creator subagent per slide **in parallel**:
 
 ```bash
-task --subagent .skills/slide/subagents/slide_creator.md --prompt "Slide 1: [SPEC]. Design: [DESIGN_GUIDE]"
-task --subagent .skills/slide/subagents/slide_creator.md --prompt "Slide 2: [SPEC]. Design: [DESIGN_GUIDE]"
-task --subagent .skills/slide/subagents/slide_creator.md --prompt "Slide 3: [SPEC]. Design: [DESIGN_GUIDE]"
+subagent --subagent ".skills/slide/subagents/slide_creator.md" --prompt "Slide 1: [SPEC]. Design: [DESIGN_GUIDE]"
+subagent --subagent ".skills/slide/subagents/slide_creator.md" --prompt "Slide 2: [SPEC]. Design: [DESIGN_GUIDE]"
+subagent --subagent ".skills/slide/subagents/slide_creator.md" --prompt "Slide 3: [SPEC]. Design: [DESIGN_GUIDE]"
 # ... one per slide
 ```
 
@@ -99,14 +93,25 @@ transition: [from design guide]
 EOF
 ```
 
-Clean up temp files and start preview server:
+Clean up temp files:
 
 ```bash
 rm -rf artifacts/temp
-cd artifacts && npx slidev slides.md --port 3030 &
 ```
 
-Tell user: **"Preview at http://localhost:3030"**
+Then return artifact tag for frontend-native Slidev rendering:
+
+```xml
+<artifact url="slides.md" slidev />
+```
+
+Strict output contract:
+- Final response MUST include `<artifact url="slides.md" slidev />` (with `slidev` attribute).
+- Do NOT output localhost preview URLs (for example `http://localhost:3030`).
+- Use Slidev markdown + artifact tag only.
+- Do not replace this with `<artifact url="slides.md" />` (missing `slidev` is invalid for this skill).
+
+Do not start a local preview server for normal preview flow. The frontend renders Slidev from the markdown artifact directly.
 
 ### Phase 7: Export (Optional)
 

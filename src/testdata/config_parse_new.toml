@@ -1,0 +1,16 @@
+max_iterations = 100
+
+[provider.anthropic]
+api_key = "sk-ant-test"
+
+[provider.openrouter]
+api_key = "or-test"
+
+[models]
+advanced = ["claude-opus-4"]
+balanced = ["claude-sonnet-4", "gpt-4o"]
+fast = ["claude-haiku-4"]
+
+[preferences]
+load_balance_strategy = "round_robin"
+warn_on_model_change = true

@@ -1,1 +1,0 @@
-Workflow note: task tracking should be file-system based. If tracking is needed, update TODO.md directly with normal file search/replace edits. For large scoped implementation planning, use plan/task flow to align with user before major execution.

@@ -57,23 +57,4 @@ impl SshSessionAuthorizer for MaySshAuthorizer {
             .await
         })
     }
-
-    fn authorize_unsafe_fallback(
-        &self,
-        target: &str,
-        reason: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
-        let target = target.to_string();
-        let reason = reason.to_string();
-        Box::pin(async move {
-            self.ask_permission(
-                format!(
-                    "{} Allow unsafe (no sandbox) execution on {}?",
-                    reason, target
-                ),
-                "Allow unsafe",
-            )
-            .await
-        })
-    }
 }

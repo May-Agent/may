@@ -48,6 +48,23 @@ pub struct SessionMetadata {
     pub model: Option<String>,
 }
 
+/// Token/context stats attached to an assistant message.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatMessageStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
 /// Role of a message in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +72,8 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
+    /// Hidden system context persisted for future turns but not shown in UI.
+    HiddenContext,
     Tool,
     /// Agent requests permission to run a command.
     PermissionRequest,
@@ -72,6 +91,7 @@ impl MessageRole {
             Self::User => "user",
             Self::Assistant => "assistant",
             Self::System => "system",
+            Self::HiddenContext => "hidden_context",
             Self::Tool => "tool",
             Self::PermissionRequest => "permission_request",
             Self::PermissionResponse => "permission_response",
@@ -85,6 +105,7 @@ impl MessageRole {
             "user" => Ok(Self::User),
             "assistant" => Ok(Self::Assistant),
             "system" => Ok(Self::System),
+            "hidden_context" => Ok(Self::HiddenContext),
             "tool" => Ok(Self::Tool),
             "permission_request" => Ok(Self::PermissionRequest),
             "permission_response" => Ok(Self::PermissionResponse),
@@ -104,6 +125,8 @@ pub struct ChatMessage {
     pub timestamp: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<ChatMessageStats>,
 }
 
 impl ChatMessage {
@@ -114,6 +137,7 @@ impl ChatMessage {
             content: content.into(),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
+            stats: None,
         }
     }
 
@@ -124,6 +148,18 @@ impl ChatMessage {
             content: content.into(),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
+            stats: None,
+        }
+    }
+
+    /// Create a new assistant message with usage stats.
+    pub fn assistant_with_stats(content: impl Into<String>, stats: ChatMessageStats) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: None,
+            stats: Some(stats),
         }
     }
 
@@ -134,6 +170,7 @@ impl ChatMessage {
             content: content.into(),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
+            stats: None,
         }
     }
 
@@ -144,6 +181,21 @@ impl ChatMessage {
             content: content.into(),
             timestamp: Some(Timestamp::now()),
             tool_call_id: Some(tool_call_id.into()),
+            stats: None,
+        }
+    }
+
+    /// Create a hidden context message.
+    ///
+    /// This message is treated as system context for the model but is not
+    /// surfaced in chat history APIs.
+    pub fn hidden_context(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::HiddenContext,
+            content: content.into(),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: None,
+            stats: None,
         }
     }
 
@@ -157,6 +209,7 @@ impl ChatMessage {
                 .expect("PermissionRequestData is always serializable"),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
+            stats: None,
         }
     }
 
@@ -170,6 +223,7 @@ impl ChatMessage {
                 .expect("PermissionResponseData is always serializable"),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
+            stats: None,
         }
     }
 
@@ -183,6 +237,7 @@ impl ChatMessage {
                 .expect("AskUserRequestData is always serializable"),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
+            stats: None,
         }
     }
 
@@ -196,6 +251,7 @@ impl ChatMessage {
                 .expect("AskUserResponseData is always serializable"),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
+            stats: None,
         }
     }
 
@@ -373,6 +429,7 @@ impl ChatHistory {
                     content,
                     timestamp: frontmatter.timestamp,
                     tool_call_id: frontmatter.tool_call_id,
+                    stats: None,
                 });
             } else if !found_metadata {
                 // This is the metadata block (first block without role)
@@ -463,7 +520,9 @@ impl ChatHistory {
                 match m.role {
                     MessageRole::User => Some(Message::user(&m.content)),
                     MessageRole::Assistant => Some(Message::assistant(&m.content)),
-                    MessageRole::System => Some(Message::system(&m.content)),
+                    MessageRole::System | MessageRole::HiddenContext => {
+                        Some(Message::system(&m.content))
+                    }
                     MessageRole::Tool => Some(Message::user(&m.content)),
                     // Interaction messages are metadata, not LLM context
                     MessageRole::PermissionRequest
@@ -549,10 +608,7 @@ mod tests {
 
     #[test]
     fn test_parse_single_message() {
-        let content = r#"---
-role: user
----
-Hello, May!"#;
+        let content = include_str!("testdata/history_parse_single_message.md");
 
         let history = ChatHistory::parse(content).unwrap();
         assert_eq!(history.len(), 1);
@@ -561,45 +617,8 @@ Hello, May!"#;
     }
 
     #[test]
-    fn test_parse_with_metadata() {
-        let content = r#"---
-title: My Session
-model: claude-3-sonnet
----
-
----
-role: user
-timestamp: 2024-01-15T10:30:00Z
----
-Hello!
-
----
-role: assistant
-timestamp: 2024-01-15T10:30:05Z
----
-Hi! How can I help?"#;
-
-        let history = ChatHistory::parse(content).unwrap();
-        assert_eq!(history.metadata.title.as_deref(), Some("My Session"));
-        assert_eq!(history.metadata.model.as_deref(), Some("claude-3-sonnet"));
-        assert_eq!(history.len(), 2);
-        assert_eq!(history.messages()[0].role, MessageRole::User);
-        assert_eq!(history.messages()[1].role, MessageRole::Assistant);
-    }
-
-    #[test]
     fn test_parse_conversation() {
-        let content = r#"---
-role: user
-timestamp: 2024-01-15T10:30:00Z
----
-Hello!
-
----
-role: assistant
-timestamp: 2024-01-15T10:30:05Z
----
-Hi! How can I help?"#;
+        let content = include_str!("testdata/history_parse_conversation.md");
 
         let history = ChatHistory::parse(content).unwrap();
         assert_eq!(history.len(), 2);
@@ -628,12 +647,7 @@ Hi! How can I help?"#;
 
     #[test]
     fn test_message_with_image() {
-        let content = r#"---
-role: user
----
-What's in this image?
-
-![](images/img_001.png)"#;
+        let content = include_str!("testdata/history_message_with_image.md");
 
         let history = ChatHistory::parse(content).unwrap();
         assert_eq!(history.len(), 1);
@@ -702,12 +716,8 @@ What's in this image?
     fn test_parse_corrupted_unescaped_separator() {
         // Simulate old/corrupted data where content contains unescaped ---
         // This would have been saved by an older version without proper escaping
-        let corrupted_content = r#"---
-role: assistant
----
-Beneath the sky, both warm and wide,
----
-Dreams and whispers gently glide."#;
+        let corrupted_content =
+            include_str!("testdata/history_parse_corrupted_unescaped_separator.md");
 
         // This should NOT fail with YAML parse error
         let history = ChatHistory::parse(corrupted_content).unwrap();

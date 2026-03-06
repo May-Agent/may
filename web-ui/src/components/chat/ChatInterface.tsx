@@ -1,15 +1,17 @@
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
+import { AnimatePresence, motion } from "framer-motion";
 import { useStore } from "@/lib/store";
 import {
   fetchArtifactPreview,
+  mapContainerLocalArtifactUrl,
+  prepareSlidevPreview,
   fetchSessionArtifacts,
   fetchSessionRuntime,
-  pollAskUserRequest,
-  pollPermissionRequest,
   respondAskUserRequest,
   respondPermissionRequest,
   streamChat,
+  subscribeUiEvents,
   subscribeSessionArtifacts,
   type AskUserAnswer,
   type AskUserRequest,
@@ -19,6 +21,24 @@ import { MessageItem } from "./MessageItem";
 import { ModelSelector } from "./ModelSelector";
 import { AttachmentPreview } from "./AttachmentPreview";
 import { ArtifactsSidebar } from "./ArtifactsSidebar";
+import { BrowserView } from "./BrowserView";
+import { ContextInspector } from "./ContextInspectorDialog";
+import {
+  createDisconnectBanner,
+  collectRetryBatch,
+  buildArtifactViewerHints,
+  parseToolResultPayload,
+  settleTimelineSegments,
+  summarizeTimelineSegments,
+  ARTIFACT_PANEL_MIN_WIDTH,
+  ARTIFACT_PANEL_DEFAULT_WIDTH,
+  ARTIFACT_PANEL_MIN_CHAT_WIDTH,
+  ARTIFACT_PANEL_MAX_VIEWPORT_RATIO,
+  LONG_TEXT_THRESHOLD,
+  type QueuedMessage,
+  type QueueMap,
+  type PreviewPaneState,
+} from "./chatUtils";
 
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
@@ -41,34 +61,24 @@ import {
   PanelLeft,
   Share2,
   Square,
-  Eye,
+  CircleX,
+  MoreHorizontal,
+  Clock3,
+  Paperclip,
 } from "lucide-react";
-import type { Artifact, Attachment, Message } from "@/types";
-import { v4 as uuidv4 } from "uuid";
+import type {
+  Artifact,
+  ArtifactPreviewTarget,
+  Attachment,
+  BashExecution,
+  ToolExecution,
+  TimelineSegment,
+} from "@/types";
 import { useRuntimeStore } from "@/lib/runtimeStore";
-
-interface QueuedMessage {
-  content: string;
-  attachments: Attachment[];
-}
-
-function collectRetryBatch(messages: Message[], assistantId: string): QueuedMessage[] {
-  const index = messages.findIndex((m) => m.id === assistantId);
-  if (index <= 0) return [];
-
-  const batch: QueuedMessage[] = [];
-  for (let i = index - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role !== "user") break;
-    batch.unshift({
-      content: msg.content,
-      attachments: msg.attachments ?? [],
-    });
-  }
-  return batch;
-}
-
-type QueueMap = Record<string, QueuedMessage[]>;
+import {
+  isManagedPodmanApprovalCode,
+  resolveWorkspaceSurfaceState,
+} from "@/lib/containerPrepare";
 
 interface AskUserState {
   request: AskUserRequest;
@@ -80,12 +90,29 @@ interface ChatInterfaceProps {
   isSidebarOpen: boolean;
 }
 
-type PreviewPaneState = {
-  kind: 'iframe' | 'image' | 'audio' | 'markdown' | 'text' | 'external';
-  url?: string;
-  markdown?: string;
-  text?: string;
-};
+function normalizeToolName(rawName: unknown): string {
+  if (typeof rawName !== "string") {
+    return "";
+  }
+  return rawName.trim().toLowerCase();
+}
+
+function isWebSearchToolName(normalizedName: string): boolean {
+  return (
+    normalizedName === "websearch" ||
+    normalizedName.endsWith(".websearch") ||
+    normalizedName.endsWith("/websearch")
+  );
+}
+
+function isWebFetchToolName(normalizedName: string): boolean {
+  return (
+    normalizedName === "webfetch" ||
+    normalizedName.endsWith(".webfetch") ||
+    normalizedName.endsWith("/webfetch")
+  );
+}
+
 
 export function ChatInterface({
   onToggleSidebar,
@@ -94,14 +121,23 @@ export function ChatInterface({
   const navigate = useNavigate();
   const {
     currentSessionId,
+    currentProfileId,
+    loaded,
+    profileSessionsLoading,
+    profileAccessBlockedReason,
+    profileAccessBlockedCode,
+    backendUnavailableReason,
+    containerPrepareStatuses,
+    profiles,
     sessions,
     createSession,
+    refreshProfileSessions,
     addMessage,
     replaceSessionMessages,
     updateSessionTitle,
     updateSessionModel,
     updateSessionReasoningEffort,
-    saveFullConfig,
+    setLastModel,
     uiConfig,
   } = useStore();
   const [inputValue, setInputValue] = useState("");
@@ -112,6 +148,8 @@ export function ChatInterface({
   const [newChatModelId, setNewChatModelId] = useState("");
   const [newChatReasoningEffort, setNewChatReasoningEffort] = useState<string | undefined>(undefined);
   const [isSending, setIsSending] = useState(false);
+  const [isStreamControllerActive, setIsStreamControllerActive] = useState(false);
+  const [isModelUpdating, setIsModelUpdating] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
   const [pendingPermission, setPendingPermission] =
     useState<PermissionRequest | null>(null);
@@ -120,43 +158,115 @@ export function ChatInterface({
   const [isAskUserSubmitting, setIsAskUserSubmitting] = useState(false);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [isArtifactsOpen, setIsArtifactsOpen] = useState(false);
+  const [isBrowserOpen, setIsBrowserOpen] = useState(false);
+  const [showArtifactHistory, setShowArtifactHistory] = useState(false);
   const [selectedPreviewPath, setSelectedPreviewPath] = useState<string | null>(null);
+  const [selectedPreviewViewer, setSelectedPreviewViewer] =
+    useState<ArtifactPreviewTarget["viewer"]>(undefined);
   const [previewPane, setPreviewPane] = useState<PreviewPaneState | null>(null);
+  const [artifactPanelWidth, setArtifactPanelWidth] = useState(ARTIFACT_PANEL_DEFAULT_WIDTH);
+  const [isArtifactPanelResizing, setIsArtifactPanelResizing] = useState(false);
+  const [todoProgress, setTodoProgress] = useState<{
+    items: Array<{ text: string; checked: boolean }>;
+    total: number;
+    completed: number;
+  } | null>(null);
   const previewBlobUrlRef = useRef<string | null>(null);
+  const selectedPreviewPathRef = useRef<string | null>(null);
+  const selectedPreviewViewerRef = useRef<ArtifactPreviewTarget["viewer"]>(undefined);
+  const artifactResizeStartRef = useRef<{ pointerId: number; x: number; width: number } | null>(
+    null,
+  );
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
+  const pendingInitialScrollRef = useRef(false);
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const streamingSessionIdRef = useRef<string | null>(null);
   const queuedBySessionRef = useRef<QueueMap>({});
-
+  const previewSessionRef = useRef<string | null>(null);
   const currentSession = sessions.find((s) => s.id === currentSessionId);
+  const currentProfile = profiles.find((profile) => profile.id === currentProfileId) ?? null;
+  const containerPrepareStatus = currentProfileId
+    ? containerPrepareStatuses[currentProfileId]
+    : undefined;
+  const workspaceSurface = resolveWorkspaceSurfaceState({
+    loaded,
+    profileSessionsLoading,
+    profile: currentProfile,
+    status: containerPrepareStatus,
+    blockedReason: profileAccessBlockedReason,
+    blockedCode: profileAccessBlockedCode,
+    backendUnavailableReason,
+  });
+  const containerPreparation = workspaceSurface.container;
+  const isContainerPrepareFailed = containerPreparation.isPrepareFailed;
+  const containerPrepareSummary = containerPreparation.summary;
+  const requiresManagedPodmanApproval = isManagedPodmanApprovalCode(profileAccessBlockedCode);
   const messages = currentSession?.messages || [];
+  const hasPendingAssistantMessage = [...messages]
+    .reverse()
+    .some((message) => message.role === "assistant" && (message.isStreaming || message.isThinking));
   const isNewChat = !currentSessionId || !currentSession;
   const shouldShowWelcome = isNewChat || messages.length === 0;
+  const chatSurfaceState =
+    workspaceSurface.state === 'ready'
+      ? shouldShowWelcome
+        ? 'welcome'
+        : 'chat'
+      : workspaceSurface.state;
+  const showComposer = chatSurfaceState === 'welcome' || chatSurfaceState === 'chat';
   const hasInput = inputValue.trim() || attachments.length > 0;
   const activeQueueKey = currentSessionId ?? '__new__';
   const queuedMessages = queuedBySession[activeQueueKey] ?? [];
-  const canSend = hasInput && (!isNewChat || !!newChatModelId);
-  const showTokenUsage = uiConfig.fullConfig?.preferences.show_token_usage ?? true;
+  const configuredModelIds = (() => {
+    const modelConfig = uiConfig.fullConfig?.models;
+    if (!modelConfig) {
+      return new Set<string>();
+    }
+    return new Set([
+      ...modelConfig.advanced,
+      ...modelConfig.balanced,
+      ...modelConfig.fast,
+    ]);
+  })();
+  const currentSessionModelId = currentSession?.model ?? "";
+  const hasSelectedModel = isNewChat
+    ? newChatModelId.trim().length > 0
+    : currentSessionModelId.trim().length > 0;
+  const isCurrentSessionModelConfigured = isNewChat
+    ? true
+    : configuredModelIds.size === 0 || configuredModelIds.has(currentSessionModelId);
+  const canSend = hasInput && hasSelectedModel && isCurrentSessionModelConfigured;
+  const showTokenUsage = uiConfig.fullConfig?.preferences.showTokenUsage ?? true;
   const latestAssistantWithStats = [...messages]
     .reverse()
     .find((m) => m.role === "assistant" && m.stats);
   const latestStats = latestAssistantWithStats?.stats;
   const contextWindow = latestStats?.contextWindow;
-  const totalTokens = latestStats?.totalTokens;
+  const totalTokens =
+    latestStats?.totalTokens ??
+    (typeof latestStats?.promptTokens === "number" &&
+    typeof latestStats?.completionTokens === "number"
+      ? latestStats.promptTokens + latestStats.completionTokens
+      : undefined);
+  const contextUsedTokens =
+    latestStats?.promptTokens ?? latestStats?.totalTokens ?? totalTokens;
   const contextUsagePercent =
-    contextWindow && typeof totalTokens === "number"
-      ? Math.max(0, Math.min(100, Math.round((totalTokens / contextWindow) * 100)))
+    contextWindow && typeof contextUsedTokens === "number"
+      ? Math.max(0, Math.min(100, Math.round((contextUsedTokens / contextWindow) * 100)))
       : null;
   const contextUsageTitle = latestStats
-    ? `Context usage\n${totalTokens ?? "-"}/${contextWindow ?? "-"} tokens (${contextUsagePercent ?? "-"}%)\nPrompt: ${latestStats.promptTokens ?? "-"}\nCompletion: ${latestStats.completionTokens ?? "-"}`
+    ? `Context usage\n${contextUsedTokens ?? "-"}/${contextWindow ?? "-"} tokens (${contextUsagePercent ?? "-"}%)\nPrompt: ${latestStats.promptTokens ?? "-"}\nCompletion: ${latestStats.completionTokens ?? "-"}\nTotal: ${totalTokens ?? "-"}`
     : "No context usage data yet";
-
   const runtimeSession = useRuntimeStore((state) =>
     currentSessionId ? state.sessions[currentSessionId] : undefined,
   );
   const isGenerating = runtimeSession?.state === 'streaming';
+  const showStopButton =
+    isGenerating || isSending || isStreamControllerActive || hasPendingAssistantMessage;
   const setRuntimeStreaming = useRuntimeStore((state) => state.setStreaming);
   const setRuntimeQueuedCount = useRuntimeStore((state) => state.setQueuedCount);
   const setRuntimeWaitingPermission = useRuntimeStore(
@@ -166,58 +276,219 @@ export function ChatInterface({
   const markRuntimeFirstToken = useRuntimeStore((state) => state.markFirstToken);
   const clearRuntimeSession = useRuntimeStore((state) => state.clearSessionRuntime);
 
-  const isPreviewUrl = useCallback((value: string): boolean => {
-    return value.startsWith('http://') || value.startsWith('https://');
+  const normalizePreviewUrl = useCallback((value: string): string | null => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        return parsed.toString();
+      }
+      return null;
+    } catch {
+      const localhostPattern =
+        /^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|::1|host\.docker\.internal|host\.containers\.internal)(:\d+)?(\/.*)?$/i;
+      if (!localhostPattern.test(trimmed)) {
+        return null;
+      }
+      try {
+        return new URL(`http://${trimmed}`).toString();
+      } catch {
+        return null;
+      }
+    }
   }, []);
 
-  const refreshArtifacts = useCallback(async () => {
+  const normalizeArtifactPath = useCallback((value: string): string => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return '';
+    }
+
+    const slashNormalized = trimmed.replace(/\\/g, '/');
+    const withoutDotPrefix = slashNormalized.replace(/^\.\/+/, '');
+    const lower = withoutDotPrefix.toLowerCase();
+    if (lower === 'artifacts') {
+      return '';
+    }
+    if (lower.startsWith('artifacts/')) {
+      return withoutDotPrefix.slice('artifacts/'.length);
+    }
+    return withoutDotPrefix;
+  }, []);
+
+  const isPreviewUrl = useCallback((value: string): boolean => {
+    return normalizePreviewUrl(value) !== null;
+  }, [normalizePreviewUrl]);
+
+  const artifactViewerHints = useMemo(
+    () => buildArtifactViewerHints(messages, normalizeArtifactPath),
+    [messages, normalizeArtifactPath],
+  );
+
+  const getArtifactViewerHint = useCallback(
+    (rawPath: string): ArtifactPreviewTarget["viewer"] => {
+      const normalized = normalizeArtifactPath(rawPath);
+      if (!normalized) {
+        return undefined;
+      }
+      return artifactViewerHints.get(normalized);
+    },
+    [artifactViewerHints, normalizeArtifactPath],
+  );
+
+  const pickPreferredArtifactTarget = useCallback(
+    (nextArtifacts: Artifact[]): ArtifactPreviewTarget | null => {
+      if (nextArtifacts.length === 0) {
+        return null;
+      }
+      const artifactPaths = new Set(nextArtifacts.map((artifact) => artifact.path));
+      const hintedEntries = Array.from(artifactViewerHints.entries());
+      for (let index = hintedEntries.length - 1; index >= 0; index -= 1) {
+        const [path, viewer] = hintedEntries[index];
+        if (artifactPaths.has(path)) {
+          return { path, viewer };
+        }
+      }
+      const fallbackPath = nextArtifacts[0].path;
+      return {
+        path: fallbackPath,
+        viewer: getArtifactViewerHint(fallbackPath),
+      };
+    },
+    [artifactViewerHints, getArtifactViewerHint],
+  );
+
+  const refreshArtifacts = useCallback(async (): Promise<Artifact[]> => {
     if (!currentSessionId) {
       setArtifacts([]);
-      return;
+      return [];
     }
     try {
       const next = await fetchSessionArtifacts(currentSessionId);
       setArtifacts(next);
       if (next.length === 0) {
-        setIsArtifactsOpen(false);
-        setSelectedPreviewPath(null);
-        return;
+        // Keep preview pane open to avoid flicker while artifacts index catches up.
+        return next;
       }
 
-      if (selectedPreviewPath && !isPreviewUrl(selectedPreviewPath)) {
-        const exists = next.some((a) => a.path === selectedPreviewPath);
+      const currentPreviewPath = selectedPreviewPathRef.current;
+      if (currentPreviewPath && !isPreviewUrl(currentPreviewPath)) {
+        const selectedArtifactPath = normalizeArtifactPath(currentPreviewPath);
+        const exists = next.some((a) => a.path === selectedArtifactPath);
         if (!exists) {
-          setSelectedPreviewPath(next[0].path);
+          const fallbackTarget = pickPreferredArtifactTarget(next);
+          if (!fallbackTarget) {
+            return next;
+          }
+          setSelectedPreviewPath(fallbackTarget.path);
+          setSelectedPreviewViewer(fallbackTarget.viewer);
+          selectedPreviewPathRef.current = fallbackTarget.path;
+          selectedPreviewViewerRef.current = fallbackTarget.viewer;
+          setIsArtifactsOpen(true);
+        } else {
+          const hintedViewer = getArtifactViewerHint(selectedArtifactPath);
+          if (selectedPreviewViewerRef.current !== hintedViewer) {
+            setSelectedPreviewViewer(hintedViewer);
+            selectedPreviewViewerRef.current = hintedViewer;
+          }
         }
-      } else if (!selectedPreviewPath) {
-        setSelectedPreviewPath(next[0].path);
+      } else if (!currentPreviewPath) {
+        const fallbackTarget = pickPreferredArtifactTarget(next);
+        if (fallbackTarget) {
+          setSelectedPreviewPath(fallbackTarget.path);
+          setSelectedPreviewViewer(fallbackTarget.viewer);
+          selectedPreviewPathRef.current = fallbackTarget.path;
+          selectedPreviewViewerRef.current = fallbackTarget.viewer;
+          setIsArtifactsOpen(true);
+        }
       }
-    } catch {
-      // keep UI stable on transient failures
+      return next;
+    } catch (error) {
+      setUiError(
+        `Failed to load artifacts: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return [];
     }
-  }, [currentSessionId, selectedPreviewPath, isPreviewUrl]);
+  }, [
+    currentSessionId,
+    getArtifactViewerHint,
+    isPreviewUrl,
+    normalizeArtifactPath,
+    pickPreferredArtifactTarget,
+  ]);
 
-  const openPreview = useCallback(async (path: string) => {
-    const target = path.trim();
-    if (!target || !currentSessionId) return;
+  const openPreview = useCallback(async (target: ArtifactPreviewTarget | string) => {
+    const request = typeof target === "string" ? { path: target } : target;
+    const rawPath = request.path.trim();
+    if (!rawPath || !currentSessionId) return;
 
-    setSelectedPreviewPath(target);
+    const normalizedUrl = normalizePreviewUrl(rawPath);
+    const previewPath = normalizedUrl ?? normalizeArtifactPath(rawPath);
+    if (!previewPath) {
+      setUiError('artifact path is required');
+      setPreviewPane({ kind: 'text', text: 'Preview failed: artifact path is required' });
+      return;
+    }
+
+    setSelectedPreviewPath(previewPath);
+    setSelectedPreviewViewer(request.viewer);
+    selectedPreviewPathRef.current = previewPath;
+    selectedPreviewViewerRef.current = request.viewer;
     setIsArtifactsOpen(true);
+    setShowArtifactHistory(false);
 
     if (previewBlobUrlRef.current) {
       URL.revokeObjectURL(previewBlobUrlRef.current);
       previewBlobUrlRef.current = null;
     }
 
-    if (isPreviewUrl(target)) {
-      setPreviewPane({ kind: 'external', url: target });
+    if (normalizedUrl) {
+      // For container profiles, delegate host detection to the backend by
+      // calling the local-url-map endpoint.  The backend is the single source of
+      // truth for what constitutes a mappable local host (eliminating the previous
+      // duplicated `isLocalPreviewHost` check on the frontend).
+      let resolvedUrl = normalizedUrl;
+      const isContainerProfile = currentProfile?.environment.type === 'container';
+      if (isContainerProfile && currentSessionId) {
+        try {
+          resolvedUrl = await mapContainerLocalArtifactUrl(currentSessionId, normalizedUrl);
+        } catch {
+          // Backend rejected the URL (not a local host, or missing port, etc.) —
+          // fall through to show the original URL directly.
+        }
+      }
+
+      if (request.viewer === "slidev") {
+        setPreviewPane({
+          kind: "slidev",
+          url: resolvedUrl,
+        });
+        return;
+      }
+
+      setPreviewPane({
+        kind: "external",
+        url: resolvedUrl,
+      });
       return;
     }
 
     try {
-      const response = await fetchArtifactPreview(currentSessionId, target);
+      if (request.viewer === "slidev") {
+        const previewUrl = await prepareSlidevPreview(currentSessionId, previewPath);
+        setPreviewPane({ kind: "slidev", url: previewUrl });
+        return;
+      }
+
+      const response = await fetchArtifactPreview(currentSessionId, previewPath);
       const contentType = (response.headers.get('content-type') || '').toLowerCase();
-      const ext = target.split('.').pop()?.toLowerCase() || '';
+      const ext = previewPath.split('.').pop()?.toLowerCase() || '';
       const arrayBuffer = await response.arrayBuffer();
       const bytes = new Uint8Array(arrayBuffer);
 
@@ -229,7 +500,8 @@ export function ChatInterface({
           ? new TextDecoder().decode(bytes)
           : '';
 
-      if (contentType.includes('markdown') || ['md', 'markdown'].includes(ext)) {
+      const isMarkdown = contentType.includes("markdown") || ["md", "markdown"].includes(ext);
+      if (isMarkdown) {
         setPreviewPane({ kind: 'markdown', markdown: text });
       } else if (contentType.startsWith('text/plain') || ['txt', 'log', 'csv', 'json', 'xml'].includes(ext)) {
         setPreviewPane({ kind: 'text', text });
@@ -253,18 +525,23 @@ export function ChatInterface({
           setPreviewPane({ kind: 'iframe', url: objectUrl });
         }
       }
-    } catch {
-      setPreviewPane({ kind: 'text', text: `Preview failed: artifact path must exist under artifacts/. Got: ${target}` });
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : String(error);
+      setUiError(
+        `Artifact preview failed: ${reason}`,
+      );
+      setPreviewPane({ kind: 'text', text: `Preview failed: ${reason}` });
     }
-  }, [currentSessionId, isPreviewUrl]);
+  }, [
+    currentProfile?.environment.type,
+    currentSessionId,
+    normalizeArtifactPath,
+    normalizePreviewUrl,
+  ]);
 
-  const reloadPreview = useCallback(async () => {
-    if (!selectedPreviewPath) return;
-    await openPreview(selectedPreviewPath);
-  }, [selectedPreviewPath, openPreview]);
-
-  const handleOpenPreview = useCallback((path: string) => {
-    void openPreview(path);
+  const handleOpenPreview = useCallback((target: ArtifactPreviewTarget) => {
+    void openPreview(target);
   }, [openPreview]);
 
   useEffect(() => {
@@ -272,7 +549,15 @@ export function ChatInterface({
   }, [queuedBySession]);
 
   useEffect(() => {
-    const persisted = uiConfig.fullConfig?.last_model;
+    selectedPreviewPathRef.current = selectedPreviewPath;
+  }, [selectedPreviewPath]);
+
+  useEffect(() => {
+    selectedPreviewViewerRef.current = selectedPreviewViewer;
+  }, [selectedPreviewViewer]);
+
+  useEffect(() => {
+    const persisted = uiConfig.fullConfig?.lastModel;
     if (persisted) {
       if (newChatModelId !== persisted) {
         setNewChatModelId(persisted);
@@ -293,7 +578,7 @@ export function ChatInterface({
     if (newChatModelId !== "") {
       setNewChatModelId("");
     }
-  }, [newChatModelId, uiConfig.fullConfig?.last_model, uiConfig.fullConfig?.models.advanced]);
+  }, [newChatModelId, uiConfig.fullConfig?.lastModel, uiConfig.fullConfig?.models.advanced]);
 
   useEffect(() => {
     if (currentSession) setTitleInput(currentSession.title);
@@ -301,6 +586,17 @@ export function ChatInterface({
   useEffect(() => {
     if (isEditingTitle) titleInputRef.current?.focus();
   }, [isEditingTitle]);
+
+  useEffect(() => {
+    setUiError(null);
+  }, [currentSessionId]);
+
+
+  useEffect(() => {
+    setUiError(null);
+    setPendingPermission(null);
+    setPendingAskUser(null);
+  }, [currentProfileId]);
 
   useEffect(() => {
     if (!currentSessionId) return;
@@ -311,95 +607,156 @@ export function ChatInterface({
         if (runtime.state === 'streaming' || runtime.state === 'waiting_permission') {
           setRuntimeServerState(currentSessionId, runtime.state);
         }
-      } catch {
-        // polling loop will self-heal
+      } catch (error) {
+        setUiError(
+          `Failed to fetch runtime state: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       }
     })();
   }, [currentSessionId, setRuntimeServerState]);
 
   useEffect(() => {
-    if (!currentSessionId) {
+    const nextPreviewSessionId = currentSessionId ?? null;
+    const isSessionChanged = previewSessionRef.current !== nextPreviewSessionId;
+    if (isSessionChanged) {
+      previewSessionRef.current = nextPreviewSessionId;
+      if (previewBlobUrlRef.current) {
+        URL.revokeObjectURL(previewBlobUrlRef.current);
+        previewBlobUrlRef.current = null;
+      }
       setArtifacts([]);
-      setIsArtifactsOpen(false);
+      setShowArtifactHistory(false);
       setSelectedPreviewPath(null);
+      setSelectedPreviewViewer(undefined);
+      selectedPreviewPathRef.current = null;
+      selectedPreviewViewerRef.current = undefined;
       setPreviewPane(null);
+      setIsArtifactsOpen(false);
+    }
+
+    if (!currentSessionId) {
       return;
     }
 
     void refreshArtifacts();
-    const unsubscribe = subscribeSessionArtifacts(currentSessionId, () => {
-      void refreshArtifacts();
+    const banner = createDisconnectBanner(setUiError, 'Artifacts stream disconnected; reconnecting...');
+
+    const unsubscribe = subscribeSessionArtifacts(currentSessionId, {
+      onArtifacts: () => {
+        banner.clear();
+        void (async () => {
+          const nextArtifacts = await refreshArtifacts();
+          const currentPreviewPath = selectedPreviewPathRef.current;
+          if (nextArtifacts.length === 0 || !currentPreviewPath) {
+            return;
+          }
+          if (isPreviewUrl(currentPreviewPath)) {
+            return;
+          }
+          const stillExists = nextArtifacts.some(
+            (artifact) => artifact.path === currentPreviewPath,
+          );
+          if (!stillExists) {
+            return;
+          }
+          await openPreview({
+            path: currentPreviewPath,
+            viewer: selectedPreviewViewerRef.current,
+          });
+        })();
+      },
+      onOpen: () => banner.clear(),
+      onHeartbeat: () => banner.clear(),
+      onError: () => banner.schedule(),
     });
 
     return () => {
+      banner.cleanup();
       unsubscribe();
     };
-  }, [currentSessionId, refreshArtifacts]);
+  }, [
+    currentSessionId,
+    isPreviewUrl,
+    openPreview,
+    refreshArtifacts,
+  ]);
+
+  useEffect(() => {
+    if (!currentSessionId || !selectedPreviewPath || previewPane !== null) {
+      return;
+    }
+    if (!isPreviewUrl(selectedPreviewPath)) {
+      const exists = artifacts.some((artifact) => artifact.path === selectedPreviewPath);
+      if (!exists) {
+        return;
+      }
+    }
+    void openPreview({
+      path: selectedPreviewPath,
+      viewer: selectedPreviewViewer,
+    });
+  }, [
+    artifacts,
+    currentSessionId,
+    isPreviewUrl,
+    openPreview,
+    previewPane,
+    selectedPreviewPath,
+    selectedPreviewViewer,
+  ]);
 
   useEffect(() => {
     if (!currentSessionId) {
       setPendingPermission(null);
+      setPendingAskUser(null);
       return;
     }
 
-    let cancelled = false;
+    const banner = createDisconnectBanner(setUiError, 'Events stream disconnected; reconnecting...');
 
-    const pollPermissions = async () => {
-      while (!cancelled) {
-        if (pendingAskUser) {
-          await new Promise((r) => setTimeout(r, 300));
-          continue;
+    const unsubscribe = subscribeUiEvents({
+      sessionId: currentSessionId,
+      onOpen: () => banner.clear(),
+      onPermission: ({ request, state }) => {
+        banner.clear();
+        if (request && request.sessionId && request.sessionId !== currentSessionId) {
+          setUiError(
+            `permission request session mismatch: expected ${currentSessionId}, got ${request.sessionId}`,
+          );
+          return;
         }
-        try {
-          const { request } = await pollPermissionRequest(currentSessionId);
-          if (cancelled) break;
-          if (request && request.session_id && request.session_id !== currentSessionId) {
-            throw new Error(`permission request session mismatch: expected ${currentSessionId}, got ${request.session_id}`);
-          }
-          setPendingPermission(request);
-          setRuntimeWaitingPermission(currentSessionId, request);
-        } catch {
-          // keep polling even if one request fails
+        const next = state === 'waiting_permission' ? request ?? null : null;
+        setPendingPermission(next);
+        setRuntimeWaitingPermission(currentSessionId, next);
+      },
+      onAskUser: ({ request }) => {
+        banner.clear();
+        if (!request) {
+          setPendingAskUser(null);
+          return;
         }
-      }
-    };
+        setPendingAskUser({
+          request,
+          answers: request.questions.map((q) => ({ section: q.section, answer: null })),
+        });
+      },
+      onError: () => banner.schedule(),
+      onHeartbeat: () => banner.clear(),
+    });
 
-    void pollPermissions();
     return () => {
-      cancelled = true;
+      banner.cleanup();
+      unsubscribe();
     };
-  }, [currentSessionId, pendingAskUser, setRuntimeServerState, setRuntimeWaitingPermission]);
+  }, [currentSessionId, setRuntimeWaitingPermission]);
 
   useEffect(() => {
-    let cancelled = false;
+    userScrolledUpRef.current = false;
+    pendingInitialScrollRef.current = currentSessionId != null;
+  }, [currentSessionId]);
 
-    const pollAskUser = async () => {
-      while (!cancelled) {
-        if (pendingPermission || pendingAskUser) {
-          await new Promise((r) => setTimeout(r, 300));
-          continue;
-        }
-        try {
-          const req = await pollAskUserRequest();
-          if (cancelled) break;
-          if (req) {
-            setPendingAskUser({
-              request: req,
-              answers: req.questions.map((q) => ({ section: q.section, answer: null })),
-            });
-          }
-        } catch {
-          // Keep polling after transient failures, but avoid tight retry loops.
-          await new Promise((r) => setTimeout(r, 500));
-        }
-      }
-    };
-
-    void pollAskUser();
-    return () => {
-      cancelled = true;
-    };
-  }, [pendingPermission, pendingAskUser]);
   // Auto-scroll: follow output unless user intentionally scrolled up.
   const contentRef = useRef<HTMLDivElement>(null);
 
@@ -408,6 +765,32 @@ export function ChatInterface({
     if (!container) return;
     container.scrollTop = container.scrollHeight;
   };
+
+  useEffect(() => {
+    if (!currentSessionId || chatSurfaceState !== "chat" || !pendingInitialScrollRef.current) {
+      return;
+    }
+
+    let rafA = 0;
+    let rafB = 0;
+    rafA = requestAnimationFrame(() => {
+      scrollToBottom();
+      rafB = requestAnimationFrame(() => {
+        scrollToBottom();
+        userScrolledUpRef.current = false;
+        pendingInitialScrollRef.current = false;
+      });
+    });
+
+    return () => {
+      if (rafA) {
+        cancelAnimationFrame(rafA);
+      }
+      if (rafB) {
+        cancelAnimationFrame(rafB);
+      }
+    };
+  }, [chatSurfaceState, currentSessionId, messages.length]);
 
   useEffect(() => {
     const container = scrollContainerRef.current;
@@ -421,6 +804,58 @@ export function ChatInterface({
     observer.observe(content);
     return () => observer.disconnect();
   }, [currentSessionId]);
+
+  useEffect(() => {
+    if (!currentSessionId || messages.length === 0) {
+      return;
+    }
+    if (isGenerating || isSending || isStreamControllerActive) {
+      return;
+    }
+
+    const settledAt = Date.now();
+    let changed = false;
+    const nextMessages = messages.map((message) => {
+      if (message.role !== "assistant") {
+        return message;
+      }
+
+      const timeline = message.timelineSegments ?? [];
+      const hasRunningTimeline = timeline.some((segment) =>
+        segment.kind === "thinking"
+          ? segment.isRunning
+          : segment.kind === "bash"
+            ? segment.commands.some((command) => command.status === "running")
+            : segment.tool.status === "running",
+      );
+      if (!message.isStreaming && !message.isThinking && !hasRunningTimeline) {
+        return message;
+      }
+
+      changed = true;
+      const settledTimeline = settleTimelineSegments(timeline, settledAt);
+      const { thinking, bashExecutions } = summarizeTimelineSegments(settledTimeline);
+      return {
+        ...message,
+        isStreaming: false,
+        isThinking: false,
+        timelineSegments: settledTimeline,
+        thinking,
+        bashExecutions,
+      };
+    });
+
+    if (changed) {
+      replaceSessionMessages(currentSessionId, nextMessages);
+    }
+  }, [
+    currentSessionId,
+    isGenerating,
+    isSending,
+    isStreamControllerActive,
+    messages,
+    replaceSessionMessages,
+  ]);
 
   const lastMessage = messages[messages.length - 1];
   useEffect(() => {
@@ -436,6 +871,9 @@ export function ChatInterface({
   ]);
 
   const handleScroll = () => {
+    if (pendingInitialScrollRef.current) {
+      return;
+    }
     const el = scrollContainerRef.current;
     if (!el) return;
     const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
@@ -445,6 +883,58 @@ export function ChatInterface({
       userScrolledUpRef.current = false;
     }
   };
+
+  const removeQueuedMessage = useCallback((queueKey: string, index: number) => {
+    let nextLength = 0;
+    setQueuedBySession((prev) => {
+      const list = prev[queueKey] ?? [];
+      const nextList = list.filter((_, idx) => idx !== index);
+      nextLength = nextList.length;
+      const next = { ...prev };
+      if (nextList.length > 0) {
+        next[queueKey] = nextList;
+      } else {
+        delete next[queueKey];
+      }
+      return next;
+    });
+    if (currentSessionId && queueKey === currentSessionId) {
+      setRuntimeQueuedCount(currentSessionId, nextLength);
+    }
+  }, [currentSessionId, setRuntimeQueuedCount]);
+
+  const steerQueuedMessage = useCallback((queueKey: string, index: number) => {
+    const queued = (queuedBySessionRef.current[queueKey] ?? [])[index];
+    if (!queued) {
+      return;
+    }
+
+    setInputValue((prev) =>
+      prev.trim().length > 0
+        ? `${queued.content}\n\n${prev}`
+        : queued.content,
+    );
+
+    if (queued.attachments.length > 0) {
+      const timestamp = Date.now();
+      const restored = queued.attachments.map((attachment, attachmentIndex) => ({
+        ...attachment,
+        id: `${attachment.id}-queued-${timestamp}-${index}-${attachmentIndex}`,
+      }));
+      setAttachments((prev) => [...restored, ...prev]);
+    }
+
+    removeQueuedMessage(queueKey, index);
+    window.setTimeout(() => {
+      composerInputRef.current?.focus();
+    }, 0);
+  }, [removeQueuedMessage]);
+
+  const composerPlaceholder = queuedMessages.length > 0
+    ? "Ask for follow-up changes"
+    : isNewChat
+      ? "How can I help you today?"
+      : "Type a message...";
 
 
   const handleSend = async (options?: {
@@ -457,6 +947,32 @@ export function ChatInterface({
     const includeComposerInput = options?.includeComposerInput ?? true;
     const composerHasInput = inputValue.trim().length > 0 || attachments.length > 0;
     if (includeComposerInput && !composerHasInput) return;
+
+    const requestedSessionId = options?.sessionIdHint ?? currentSessionId;
+    if (!requestedSessionId) {
+      const candidateModelId = newChatModelId.trim();
+      if (!candidateModelId) {
+        setUiError("No model configured. Please select a model before sending.");
+        return;
+      }
+      if (configuredModelIds.size > 0 && !configuredModelIds.has(candidateModelId)) {
+        setUiError("Selected model is not available in the current profile.");
+        return;
+      }
+    } else {
+      const targetSession = useStore
+        .getState()
+        .sessions.find((session) => session.id === requestedSessionId);
+      const targetModelId = targetSession?.model?.trim() ?? "";
+      if (!targetModelId) {
+        setUiError("No model configured for this session. Please select a model.");
+        return;
+      }
+      if (configuredModelIds.size > 0 && !configuredModelIds.has(targetModelId)) {
+        setUiError("Session model is no longer available. Please choose another model.");
+        return;
+      }
+    }
 
     setIsSending(true);
     setUiError(null);
@@ -476,31 +992,52 @@ export function ChatInterface({
 
     if (targetGenerating) {
       if (!includeComposerInput) { setIsSending(false); return; }
-      setQueuedBySession((prev) => {
-        const list = prev[queueSourceKey] ?? [];
-        const nextList = [...list, { content, attachments: atts }];
-        const runtimeSessionId = options?.sessionIdHint ?? currentSessionId;
-        if (runtimeSessionId) {
-          setRuntimeQueuedCount(runtimeSessionId, nextList.length);
-        }
-        return {
-          ...prev,
-          [queueSourceKey]: nextList,
-        };
-      });
+      const existingQueue = queuedBySessionRef.current[queueSourceKey] ?? [];
+      const nextList = [...existingQueue, { content, attachments: atts }];
+      setQueuedBySession((prev) => ({
+        ...prev,
+        [queueSourceKey]: nextList,
+      }));
+      const runtimeSessionId = options?.sessionIdHint ?? currentSessionId;
+      if (runtimeSessionId) {
+        setRuntimeQueuedCount(runtimeSessionId, nextList.length);
+      }
       setIsSending(false);
       return;
     }
 
     let sessionId = options?.sessionIdHint ?? currentSessionId;
     if (!sessionId) {
-      sessionId = await createSession(newChatModelId || undefined);
+      try {
+        sessionId = await createSession(newChatModelId || undefined);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setUiError(message);
+        setIsSending(false);
+        return;
+      }
       if (sessionId) {
         navigate(`/chat/${encodeURIComponent(sessionId)}`);
       }
     }
 
     if (!sessionId) { setIsSending(false); return; }
+
+    const resolvedSessionModelId = useStore
+      .getState()
+      .sessions.find((session) => session.id === sessionId)
+      ?.model
+      ?.trim() ?? "";
+    if (!resolvedSessionModelId) {
+      setIsSending(false);
+      setUiError("No model configured for this session. Please select a model.");
+      return;
+    }
+    if (configuredModelIds.size > 0 && !configuredModelIds.has(resolvedSessionModelId)) {
+      setIsSending(false);
+      setUiError("Session model is no longer available. Please choose another model.");
+      return;
+    }
 
     const existingQueue = queuedBySessionRef.current[queueSourceKey] ?? [];
     const pendingBatch = options?.overrideBatch
@@ -526,13 +1063,72 @@ export function ChatInterface({
     }
 
     userScrolledUpRef.current = false;
+    streamingSessionIdRef.current = sessionId;
     setRuntimeStreaming(sessionId);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
+    setIsStreamControllerActive(true);
     let completedNormally = false;
     const assistantId = options?.retryAssistantId ?? `assistant-${Date.now()}`;
     let textFlushTimer: number | null = null;
+    let streamedText = "";
+    let timelineSegments: TimelineSegment[] = [];
+    setTodoProgress(null);
+    let activeThinkingSegmentId: string | null = null;
+    const bashSegmentByToolId = new Map<string, string>();
+    const toolSegmentByToolId = new Map<string, string>();
+    let lastStreamEventKind: "reasoning" | "text" | "tool" | null = null;
+    let lastTextFlushAt = 0;
+
+    const cloneTimelineSegments = (segments: TimelineSegment[]): TimelineSegment[] =>
+      segments.map((segment) =>
+        segment.kind === "bash"
+          ? {
+              ...segment,
+              commands: segment.commands.map((command) => ({ ...command })),
+            }
+          : segment.kind === "tool"
+            ? {
+                ...segment,
+                tool: { ...segment.tool },
+              }
+          : { ...segment },
+      );
+
+    const collectBashExecutions = (segments: TimelineSegment[]): BashExecution[] =>
+      segments.flatMap((segment) =>
+        segment.kind === "bash"
+          ? segment.commands.map((command) => ({ ...command }))
+          : [],
+      );
+
+    const collectThinkingText = (segments: TimelineSegment[]): string =>
+      segments
+        .filter((segment): segment is Extract<TimelineSegment, { kind: "thinking" }> => segment.kind === "thinking")
+        .map((segment) => segment.content)
+        .join("\n\n")
+        .trim();
+
+    const isAnyThinkingRunning = (segments: TimelineSegment[]): boolean =>
+      segments.some((segment) => segment.kind === "thinking" && segment.isRunning);
+
+    const closeActiveThinkingSegment = () => {
+      if (!activeThinkingSegmentId) {
+        return;
+      }
+      const endedAt = Date.now();
+      timelineSegments = timelineSegments.map((segment) =>
+        segment.kind === "thinking" && segment.id === activeThinkingSegmentId
+          ? {
+              ...segment,
+              isRunning: false,
+              endedAt: segment.endedAt ?? endedAt,
+            }
+          : segment,
+      );
+      activeThinkingSegmentId = null;
+    };
 
     try {
 
@@ -566,6 +1162,8 @@ export function ChatInterface({
                   isStreaming: true,
                   isThinking: true,
                   thinking: "",
+                  timelineSegments: [],
+                  bashExecutions: [],
                 }
               : m,
           ),
@@ -582,21 +1180,11 @@ export function ChatInterface({
             isStreaming: true,
             isThinking: true,
             thinking: "",
+            timelineSegments: [],
+            bashExecutions: [],
           },
         ]);
       }
-
-      let streamedText = "";
-      let streamedReasoning = "";
-      let bashExecutions: Array<{
-        id: string;
-        input: string;
-        output?: string;
-        status: "running" | "done" | "failed";
-        startedAt?: number;
-        endedAt?: number;
-      }> = [];
-      let lastTextFlushAt = 0;
 
       const flushAssistantText = (force = false) => {
         const now = Date.now();
@@ -619,6 +1207,9 @@ export function ChatInterface({
         if (!latest) return;
 
         lastTextFlushAt = now;
+        const snapshotTimelineSegments = cloneTimelineSegments(timelineSegments);
+        const snapshotBashExecutions = collectBashExecutions(snapshotTimelineSegments);
+        const snapshotThinking = collectThinkingText(snapshotTimelineSegments);
         replaceSessionMessages(
           sessionId,
           latest.messages.map((m) =>
@@ -627,8 +1218,10 @@ export function ChatInterface({
                   ...m,
                   content: streamedText,
                   isStreaming: true,
-                  isThinking: false,
-                  bashExecutions,
+                  isThinking: isAnyThinkingRunning(snapshotTimelineSegments),
+                  thinking: snapshotThinking,
+                  timelineSegments: snapshotTimelineSegments,
+                  bashExecutions: snapshotBashExecutions,
                 }
               : m,
           ),
@@ -641,76 +1234,210 @@ export function ChatInterface({
         attachments: mergedAttachments,
         signal: controller.signal,
         onReasoning: (chunk) => {
-          streamedReasoning += chunk;
-          const latest = useStore
-            .getState()
-            .sessions.find((s) => s.id === sessionId);
-          if (!latest) return;
-          replaceSessionMessages(
-            sessionId,
-            latest.messages.map((m) =>
-              m.id === assistantId
+          const now = Date.now();
+          const shouldCreateSegment =
+            !activeThinkingSegmentId || lastStreamEventKind !== "reasoning";
+          if (shouldCreateSegment) {
+            const nextId = `thinking-${now}-${Math.random().toString(36).slice(2, 8)}`;
+            activeThinkingSegmentId = nextId;
+            timelineSegments = [
+              ...timelineSegments,
+              {
+                id: nextId,
+                kind: "thinking",
+                offset: streamedText.length,
+                content: chunk,
+                isRunning: true,
+                startedAt: now,
+              },
+            ];
+          } else {
+            timelineSegments = timelineSegments.map((segment) =>
+              segment.kind === "thinking" && segment.id === activeThinkingSegmentId
                 ? {
-                    ...m,
-                    thinking: streamedReasoning,
-                    isThinking: true,
-                    bashExecutions,
+                    ...segment,
+                    content: `${segment.content}${chunk}`,
+                    isRunning: true,
                   }
-                : m,
-            ),
-          );
+                : segment,
+            );
+          }
+          lastStreamEventKind = "reasoning";
+          flushAssistantText(true);
         },
         onToolStart: (tool: any) => {
-          const name = (tool.name ?? '').toLowerCase();
-          if (name === 'bash') {
-            let script = '(bash)';
-            let mode: string | undefined;
-            try {
-              const args = typeof tool.arguments === 'string' ? JSON.parse(tool.arguments) : tool.arguments;
-              script = args?.script ?? args?.command ?? '(bash)';
-              mode = args?.mode;
-            } catch { /* keep default */ }
-            bashExecutions.push({
-              id: tool.id ?? `tool-${Date.now()}`,
+          const name = normalizeToolName(tool.name);
+          const toolId = tool.id ?? `tool-${Date.now()}`;
+          const serializedArguments =
+            typeof tool.arguments === "string"
+              ? tool.arguments
+              : JSON.stringify(tool.arguments ?? {});
+          let script = '(bash)';
+          let mode: string | undefined;
+          try {
+            const args =
+              typeof tool.arguments === 'string'
+                ? JSON.parse(tool.arguments)
+                : tool.arguments;
+            script = args?.script ?? args?.command ?? '(bash)';
+            mode = typeof args?.mode === 'string' ? args.mode : undefined;
+          } catch (error) {
+            console.warn('Invalid tool arguments payload', error);
+          }
+          if (typeof script !== 'string') {
+            script = String(script);
+          }
+
+          const browserPattern = /\b(pw|playwright(?:-cli)?)\b/i;
+          if (name.includes('playwright') || browserPattern.test(script)) {
+            setIsBrowserOpen(true);
+          }
+
+          if (name === "bash") {
+            closeActiveThinkingSegment();
+            const startedAt = Date.now();
+            const nextExec: BashExecution = {
+              id: toolId,
               input: script,
               status: 'running',
-              mode: mode ?? 'sandboxed',
-              startedAt: Date.now(),
-            });
+              mode: mode ?? 'default',
+              startedAt,
+            };
+
+            const lastSegment = timelineSegments[timelineSegments.length - 1];
+            const canAppendToBatch =
+              lastStreamEventKind === "tool" &&
+              lastSegment?.kind === "bash" &&
+              lastSegment.offset === streamedText.length;
+
+            let segmentId: string;
+            if (canAppendToBatch && lastSegment.kind === "bash") {
+              segmentId = lastSegment.id;
+              timelineSegments = timelineSegments.map((segment) =>
+                segment.kind === "bash" && segment.id === segmentId
+                  ? {
+                      ...segment,
+                      startedAt: segment.startedAt ?? startedAt,
+                      endedAt: undefined,
+                      commands: [...segment.commands, nextExec],
+                    }
+                  : segment,
+              );
+            } else {
+              segmentId = `bash-${toolId}`;
+              timelineSegments = [
+                ...timelineSegments,
+                {
+                  id: segmentId,
+                  kind: "bash",
+                  offset: streamedText.length,
+                  commands: [nextExec],
+                  startedAt,
+                },
+              ];
+            }
+
+            bashSegmentByToolId.set(toolId, segmentId);
+            lastStreamEventKind = "tool";
+            flushAssistantText(true);
+            return;
+          }
+
+          if (isWebSearchToolName(name) || isWebFetchToolName(name)) {
+            closeActiveThinkingSegment();
+            const startedAt = Date.now();
+            const nextTool: ToolExecution = {
+              id: toolId,
+              name,
+              request: serializedArguments,
+              status: "running",
+              startedAt,
+            };
+            const segmentId = `tool-${toolId}`;
+            timelineSegments = [
+              ...timelineSegments,
+              {
+                id: segmentId,
+                kind: "tool",
+                offset: streamedText.length,
+                tool: nextTool,
+              },
+            ];
+            toolSegmentByToolId.set(toolId, segmentId);
+            lastStreamEventKind = "tool";
             flushAssistantText(true);
           }
         },
         onToolEnd: (tool: any) => {
-          const idx = bashExecutions.findIndex((e) => e.id === tool.id);
-          if (idx !== -1) {
-            let output: string | undefined;
-            let failed = false;
-            try {
-              const result = tool.result;
-              // Backend wraps in Ok/Err - Err at top level means the command failed
-              const errValue = result?.Err ?? result?.err;
-              const okValue = result?.Ok ?? result?.ok;
-              failed = errValue !== undefined && okValue === undefined;
-              const inner = okValue ?? errValue;
-              const parsed = typeof inner === 'string' ? JSON.parse(inner) : (inner ?? result);
-              output = parsed?.stdout?.content?.text ?? (typeof parsed === 'string' ? parsed : JSON.stringify(parsed));
-            } catch { /* ignore */ }
-            bashExecutions[idx] = {
-              ...bashExecutions[idx],
-              output,
-              status: failed ? 'failed' : 'done',
-              endedAt: Date.now(),
-            };
+          const toolId = typeof tool?.id === "string" ? tool.id : "";
+          if (!toolId) return;
+          const serializedArguments =
+            typeof tool?.arguments === "string"
+              ? tool.arguments
+              : JSON.stringify(tool?.arguments ?? {});
+          const endedAt = Date.now();
+          const { output, failed } = parseToolResultPayload(tool.result);
+          const bashSegmentId = bashSegmentByToolId.get(toolId);
+          if (bashSegmentId) {
+            timelineSegments = timelineSegments.map((segment) => {
+              if (segment.kind !== "bash" || segment.id !== bashSegmentId) {
+                return segment;
+              }
+              const nextCommands = segment.commands.map((command) =>
+                command.id === toolId
+                  ? {
+                      ...command,
+                      output,
+                      status: (failed ? "failed" : "done") as BashExecution["status"],
+                      endedAt,
+                    }
+                  : command,
+              );
+              const runningLeft = nextCommands.some((command) => command.status === "running");
+              return {
+                ...segment,
+                commands: nextCommands,
+                endedAt: runningLeft ? undefined : endedAt,
+              };
+            });
+            lastStreamEventKind = "tool";
             flushAssistantText(true);
+            return;
           }
+
+          const toolSegmentId = toolSegmentByToolId.get(toolId);
+          if (!toolSegmentId) {
+            return;
+          }
+          timelineSegments = timelineSegments.map((segment) =>
+            segment.kind === "tool" && segment.id === toolSegmentId
+              ? {
+                  ...segment,
+                  tool: {
+                    ...segment.tool,
+                    request: segment.tool.request ?? serializedArguments,
+                    response: output,
+                    status: failed ? "failed" : "done",
+                    endedAt,
+                  },
+                }
+              : segment,
+          );
+          lastStreamEventKind = "tool";
+          flushAssistantText(true);
+        },
+        onTodoUpdate: (event) => {
+          setTodoProgress(event);
         },
         onText: (chunk) => {
+          closeActiveThinkingSegment();
           streamedText += chunk;
+          lastStreamEventKind = "text";
           markRuntimeFirstToken(sessionId);
           flushAssistantText();
         },
         onDone: (assistant) => {
-          completedNormally = true;
+          closeActiveThinkingSegment();
           if (textFlushTimer != null) {
             window.clearTimeout(textFlushTimer);
             textFlushTimer = null;
@@ -719,10 +1446,20 @@ export function ChatInterface({
             .getState()
             .sessions.find((s) => s.id === sessionId);
           if (!latest) return;
-          // Use locally accumulated streamedText for content because the
-          // backend clears assistant_text after each tool call, so the
-          // server's done event only contains the final text segment.
-          // Stats and other metadata still come from the server response.
+          const finalContent =
+            streamedText.trim().length > 0 ? streamedText : assistant.content;
+          const finalTimelineSegments =
+            timelineSegments.length > 0
+              ? cloneTimelineSegments(timelineSegments)
+              : cloneTimelineSegments(assistant.timelineSegments ?? []);
+          const finalThinking = collectThinkingText(finalTimelineSegments);
+          const finalBashExecutions = collectBashExecutions(finalTimelineSegments);
+          const isEmptyResponse =
+            finalContent.trim().length === 0 &&
+            finalThinking.trim().length === 0 &&
+            finalTimelineSegments.length === 0;
+          completedNormally = !isEmptyResponse;
+
           replaceSessionMessages(
             sessionId,
             latest.messages.map((m) =>
@@ -730,27 +1467,36 @@ export function ChatInterface({
                 ? {
                     ...assistant,
                     id: assistantId,
-                    content: streamedText,
-                    thinking: streamedReasoning,
+                    content: finalContent,
+                    thinking: finalThinking,
+                    timelineSegments: finalTimelineSegments,
                     isStreaming: false,
                     isThinking: false,
-                    bashExecutions,
+                    bashExecutions: finalBashExecutions,
+                    error: isEmptyResponse
+                      ? "LLM endpoint error: empty assistant response"
+                      : undefined,
                   }
                 : m,
             ),
           );
         },
         onError: (message) => {
+          closeActiveThinkingSegment();
           const latest = useStore
             .getState()
             .sessions.find((s) => s.id === sessionId);
           if (latest) {
+            const snapshotTimelineSegments = cloneTimelineSegments(timelineSegments);
             replaceSessionMessages(
               sessionId,
               latest.messages.map((m) =>
                 m.id === assistantId
                   ? {
                       ...m,
+                      timelineSegments: snapshotTimelineSegments,
+                      thinking: collectThinkingText(snapshotTimelineSegments),
+                      bashExecutions: collectBashExecutions(snapshotTimelineSegments),
                       isStreaming: false,
                       isThinking: false,
                       error: `LLM endpoint error: ${message}`,
@@ -759,22 +1505,27 @@ export function ChatInterface({
               ),
             );
           }
-          setUiError(null);
+          setUiError(`LLM endpoint error: ${message}`);
         },
       });
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
+        closeActiveThinkingSegment();
         const errText = `LLM endpoint error: ${(error as Error).message}`;
         const latest = useStore
           .getState()
           .sessions.find((s) => s.id === sessionId);
         if (latest) {
+          const snapshotTimelineSegments = cloneTimelineSegments(timelineSegments);
           replaceSessionMessages(
             sessionId,
             latest.messages.map((m) =>
               m.id === assistantId
                 ? {
                     ...m,
+                    timelineSegments: snapshotTimelineSegments,
+                    thinking: collectThinkingText(snapshotTimelineSegments),
+                    bashExecutions: collectBashExecutions(snapshotTimelineSegments),
                     isStreaming: false,
                     isThinking: false,
                     error: errText,
@@ -783,7 +1534,7 @@ export function ChatInterface({
             ),
           );
         }
-        setUiError(null);
+        setUiError(errText);
       }
     } finally {
       if (textFlushTimer != null) {
@@ -795,6 +1546,10 @@ export function ChatInterface({
         .getState()
         .sessions.find((s) => s.id === sessionId);
       if (latest) {
+        const terminalError =
+          !completedNormally
+            ? "LLM endpoint error: stream terminated before a final assistant response"
+            : undefined;
         replaceSessionMessages(
           sessionId,
           latest.messages.map((m) =>
@@ -803,6 +1558,7 @@ export function ChatInterface({
                   ...m,
                   isStreaming: false,
                   isThinking: false,
+                  error: m.error ?? terminalError,
                 }
               : m,
           ),
@@ -810,8 +1566,13 @@ export function ChatInterface({
       }
 
       abortControllerRef.current = null;
+      setIsStreamControllerActive(false);
       setIsSending(false);
       clearRuntimeSession(sessionId);
+      if (streamingSessionIdRef.current === sessionId) {
+        streamingSessionIdRef.current = null;
+      }
+      setIsBrowserOpen(false);
 
       if (completedNormally) {
         const remaining = queuedBySessionRef.current[sessionId] ?? [];
@@ -823,17 +1584,21 @@ export function ChatInterface({
   };
 
   const handleStop = () => {
+    const runtimeSessionId = streamingSessionIdRef.current ?? currentSessionId;
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
+    setIsStreamControllerActive(false);
     setIsSending(false);
-    if (currentSessionId) {
+    setIsBrowserOpen(false);
+    if (runtimeSessionId) {
       const latest = useStore
         .getState()
-        .sessions.find((s) => s.id === currentSessionId);
+        .sessions.find((s) => s.id === runtimeSessionId);
       if (latest) {
         let stopped = false;
+        const endedAt = Date.now();
         replaceSessionMessages(
-          currentSessionId,
+          runtimeSessionId,
           latest.messages.map((m) => {
             if (
               !stopped &&
@@ -841,8 +1606,13 @@ export function ChatInterface({
               (m.isStreaming || m.isThinking)
             ) {
               stopped = true;
+              const timelineSegments = settleTimelineSegments(m.timelineSegments, endedAt);
+              const { thinking, bashExecutions } = summarizeTimelineSegments(timelineSegments);
               return {
                 ...m,
+                timelineSegments,
+                thinking,
+                bashExecutions,
                 isStreaming: false,
                 isThinking: false,
               };
@@ -852,8 +1622,9 @@ export function ChatInterface({
         );
       }
 
-      clearRuntimeSession(currentSessionId);
+      clearRuntimeSession(runtimeSessionId);
     }
+    streamingSessionIdRef.current = null;
   };
 
   const handlePermissionDecision = async (approved: boolean) => {
@@ -903,9 +1674,7 @@ export function ChatInterface({
   const permissionToneClass = pendingPermission
     ? pendingPermission.mode === "unsafe"
       ? "border-red-300 bg-red-100 text-red-900 dark:border-red-800 dark:bg-red-950/95 dark:text-red-100"
-      : pendingPermission.mode === "network"
-        ? "border-yellow-300 bg-yellow-100 text-yellow-900 dark:border-yellow-800 dark:bg-yellow-950/95 dark:text-yellow-100"
-        : "border-border bg-card text-foreground"
+      : "border-border bg-card text-foreground"
     : "";
 
   const handleTitleSubmit = () => {
@@ -934,14 +1703,16 @@ export function ChatInterface({
       setAttachments((prev) => [
         ...prev,
         {
-          id: uuidv4(),
+          id: crypto.randomUUID(),
           name: `screenshot-${Date.now()}.png`,
           type: "image",
           url: canvas.toDataURL("image/png"),
         },
       ]);
     } catch (e) {
-      console.error("Screenshot failed:", e);
+      setUiError(
+        `Screenshot failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   };
 
@@ -964,19 +1735,33 @@ export function ChatInterface({
   };
 
   const readTextFile = async (file: File): Promise<string> => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => resolve("");
+      reader.onerror = () =>
+        reject(
+          new Error(
+            `failed to read text file ${file.name}: ${
+              reader.error?.message ?? "unknown error"
+            }`,
+          ),
+        );
       reader.readAsText(file);
     });
   };
 
   const readFileAsDataUrl = async (file: File): Promise<string> => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
-      reader.onerror = () => resolve("");
+      reader.onerror = () =>
+        reject(
+          new Error(
+            `failed to read file ${file.name}: ${
+              reader.error?.message ?? "unknown error"
+            }`,
+          ),
+        );
       reader.readAsDataURL(file);
     });
   };
@@ -987,46 +1772,56 @@ export function ChatInterface({
       const arrayBuffer = await file.arrayBuffer();
       const result = await mammoth.default.extractRawText({ arrayBuffer });
       return result.value;
-    } catch {
-      return "";
+    } catch (error) {
+      throw new Error(
+        `failed to parse DOCX ${file.name}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   };
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files?.length) return;
-    const files = Array.from(e.target.files!);
-    const newAttachments: Attachment[] = [];
+    try {
+      const files = Array.from(e.target.files!);
+      const newAttachments: Attachment[] = [];
 
-    for (const f of files) {
-      const fileType = classifyFile(f);
-      const att: Attachment = {
-        id: uuidv4(),
-        name: f.name,
-        type: fileType,
-        url: URL.createObjectURL(f),
-        uploadDataUrl: await readFileAsDataUrl(f),
-      };
+      for (const f of files) {
+        const fileType = classifyFile(f);
+        const att: Attachment = {
+          id: crypto.randomUUID(),
+          name: f.name,
+          type: fileType,
+          url: URL.createObjectURL(f),
+          uploadDataUrl: await readFileAsDataUrl(f),
+        };
 
-      if (fileType === "document") {
-        if (f.name.endsWith(".docx")) {
-          const text = await processDocxFile(f);
-          att.textContent = text;
-          att.textPreview = text.slice(0, 200);
-        } else {
-          const text = await readTextFile(f);
-          att.textContent = text;
-          att.textPreview = text.slice(0, 200);
+        if (fileType === "document") {
+          if (f.name.endsWith(".docx")) {
+            const text = await processDocxFile(f);
+            att.textContent = text;
+            att.textPreview = text.slice(0, 200);
+          } else {
+            const text = await readTextFile(f);
+            att.textContent = text;
+            att.textPreview = text.slice(0, 200);
+          }
         }
+
+        newAttachments.push(att);
       }
 
-      newAttachments.push(att);
+      setAttachments((prev) => [...prev, ...newAttachments]);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    } catch (error) {
+      setUiError(
+        `Attachment processing failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
-
-    setAttachments((prev) => [...prev, ...newAttachments]);
-    if (fileInputRef.current) fileInputRef.current.value = "";
   };
-
-  const LONG_TEXT_THRESHOLD = 500;
 
   const handlePaste = async (e: React.ClipboardEvent) => {
     const items = Array.from(e.clipboardData.items);
@@ -1048,7 +1843,7 @@ export function ChatInterface({
 
       const fileType = classifyFile(file);
       const att: Attachment = {
-        id: uuidv4(),
+        id: crypto.randomUUID(),
         name: file.name || (fileType === "image" ? "Pasted Image" : "Pasted File"),
         type: fileType,
         url: URL.createObjectURL(file),
@@ -1060,7 +1855,7 @@ export function ChatInterface({
     if (shouldAttachLargeText) {
       const preview = text.slice(0, 200);
       newAttachments.push({
-        id: uuidv4(),
+        id: crypto.randomUUID(),
         name: "Pasted Text",
         type: "document",
         url: "",
@@ -1081,6 +1876,101 @@ export function ChatInterface({
     : currentSession.reasoningEffort;
 
   const canShowArtifactsPanel = artifacts.length > 0 || !!selectedPreviewPath;
+  const activeRightPanel = isBrowserOpen
+    ? "browser"
+    : isArtifactsOpen && canShowArtifactsPanel
+      ? "artifacts"
+      : null;
+
+  const clampArtifactPanelWidth = useCallback(
+    (rawWidth: number): number => {
+      if (typeof window === "undefined") {
+        return rawWidth;
+      }
+      const viewportWidth = window.innerWidth;
+      const desktopSidebarWidth = isSidebarOpen ? 256 : 0;
+      const maxByViewport = Math.floor(viewportWidth * ARTIFACT_PANEL_MAX_VIEWPORT_RATIO);
+      const maxByChat = viewportWidth - desktopSidebarWidth - ARTIFACT_PANEL_MIN_CHAT_WIDTH;
+      const maxWidth = Math.max(
+        ARTIFACT_PANEL_MIN_WIDTH,
+        Math.min(maxByViewport, maxByChat),
+      );
+      return Math.max(
+        ARTIFACT_PANEL_MIN_WIDTH,
+        Math.min(maxWidth, Math.round(rawWidth)),
+      );
+    },
+    [isSidebarOpen],
+  );
+
+  const handleArtifactResizerPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      artifactResizeStartRef.current = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        width: artifactPanelWidth,
+      };
+      setIsArtifactPanelResizing(true);
+    },
+    [artifactPanelWidth],
+  );
+
+  useEffect(() => {
+    const updateWidth = () => {
+      setArtifactPanelWidth((prev) => clampArtifactPanelWidth(prev));
+    };
+    updateWidth();
+    window.addEventListener("resize", updateWidth);
+    return () => {
+      window.removeEventListener("resize", updateWidth);
+    };
+  }, [clampArtifactPanelWidth]);
+
+  useEffect(() => {
+    if (!isArtifactPanelResizing) return;
+
+    const previousUserSelect = document.body.style.userSelect;
+    const previousCursor = document.body.style.cursor;
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const resizeState = artifactResizeStartRef.current;
+      if (!resizeState || event.pointerId !== resizeState.pointerId) {
+        return;
+      }
+      if ((event.buttons & 1) === 0) {
+        artifactResizeStartRef.current = null;
+        setIsArtifactPanelResizing(false);
+        return;
+      }
+      const delta = resizeState.x - event.clientX;
+      setArtifactPanelWidth(clampArtifactPanelWidth(resizeState.width + delta));
+    };
+
+    const stopResizing = (event: PointerEvent) => {
+      const resizeState = artifactResizeStartRef.current;
+      if (!resizeState || event.pointerId !== resizeState.pointerId) {
+        return;
+      }
+      artifactResizeStartRef.current = null;
+      setIsArtifactPanelResizing(false);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", stopResizing);
+    window.addEventListener("pointercancel", stopResizing);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopResizing);
+      window.removeEventListener("pointercancel", stopResizing);
+      document.body.style.userSelect = previousUserSelect;
+      document.body.style.cursor = previousCursor;
+    };
+  }, [clampArtifactPanelWidth, isArtifactPanelResizing]);
 
   useEffect(() => {
     return () => {
@@ -1092,8 +1982,8 @@ export function ChatInterface({
   }, []);
 
   return (
-    <div className="flex h-screen w-full relative">
-      <div className="flex min-w-0 flex-1 flex-col h-screen relative">
+    <div className="flex flex-1 min-h-0 w-full min-w-0">
+      <div className="relative flex flex-1 min-h-0 min-w-0 flex-col">
         <div className="flex items-center justify-between p-4 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 z-10">
           <div className="flex-1 flex justify-start">
             <Button
@@ -1134,7 +2024,7 @@ export function ChatInterface({
               </div>
             ))}
           </div>
-          <div className="flex-1 flex justify-end">
+          <div className="flex-1 flex justify-end gap-1">
             {!shouldShowWelcome && (
               <Button
                 variant="ghost"
@@ -1148,59 +2038,202 @@ export function ChatInterface({
           </div>
         </div>
 
-        {shouldShowWelcome ? (
-          <div className="flex-1 flex flex-col items-center justify-center px-4 -mt-20">
-            <div className="text-center mb-8">
-              <h1 className="text-3xl font-semibold tracking-tight mb-2">
-                What shall we think through?
-              </h1>
-              <p className="text-muted-foreground text-sm">
-                Ask anything. I'm here to help you think, create, and explore.
+        {chatSurfaceState === 'backend-down' ? (
+          <div className="flex-1 min-h-0 px-4 pt-12">
+            <div className="mx-auto w-full max-w-3xl rounded-2xl border border-red-500/45 bg-background/80 p-6 text-center">
+              <div className="mx-auto mb-4 flex w-fit items-center justify-center rounded-full bg-red-500/15 p-2.5">
+                <CircleX className="h-6 w-6 text-red-500" />
+              </div>
+              <h2 className="text-lg font-semibold">Backend unavailable</h2>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Unable to load chats because the server is unreachable.
               </p>
+              <div className="mt-4 rounded-lg bg-muted/50 px-3 py-2 text-left text-xs text-muted-foreground">
+                {backendUnavailableReason}
+              </div>
+              <Button
+                variant="secondary"
+                className="mt-4"
+                onClick={() => void refreshProfileSessions()}
+              >
+                Retry
+              </Button>
             </div>
           </div>
-        ) : (
-          <div
-            ref={scrollContainerRef}
-            onScroll={handleScroll}
-            className="flex-1 overflow-y-auto"
-          >
+        ) : chatSurfaceState === 'container-preparing' ? (
+            <div className="flex-1 min-h-0 px-4 pt-12">
+              <div className="mx-auto w-full max-w-3xl rounded-2xl border border-border/50 bg-background/70 p-6 text-center">
+                {isContainerPrepareFailed ? (
+                  <div className="mx-auto mb-4 flex w-fit items-center justify-center rounded-full bg-red-500/15 p-2.5">
+                    <CircleX className="h-6 w-6 text-red-500" />
+                  </div>
+                ) : (
+                  <div className="mx-auto mb-4 flex w-fit items-center gap-2">
+                    <span className="h-2.5 w-2.5 rounded-full bg-primary/70 animate-bounce [animation-delay:-240ms]" />
+                    <span className="h-2.5 w-2.5 rounded-full bg-primary/60 animate-bounce [animation-delay:-120ms]" />
+                    <span className="h-2.5 w-2.5 rounded-full bg-primary/50 animate-bounce" />
+                  </div>
+                )}
+                <h2 className="text-lg font-semibold">
+                  {isContainerPrepareFailed
+                    ? "Container workspace unavailable"
+                    : "Preparing container workspace"}
+                </h2>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  {isContainerPrepareFailed
+                    ? "Unable to open chat history right now. Fix the reported error and retry."
+                    : "This profile is not ready yet. New chat and chat history are temporarily unavailable."}
+                </p>
+                <div className="mt-4 rounded-lg bg-muted/50 px-3 py-2 text-left text-xs text-muted-foreground">
+                  {containerPrepareSummary}
+                </div>
+                {containerPrepareStatus?.recentLogs && containerPrepareStatus.recentLogs.length > 0 && (
+                  <div className="mt-3 max-h-40 overflow-auto rounded-lg border border-border/50 bg-background/50 px-3 py-2 text-left font-mono text-[11px] text-muted-foreground">
+                    {containerPrepareStatus.recentLogs.map((line: string, index: number) => (
+                      <div key={`${index}-${line}`} className="truncate">
+                        {line}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {isContainerPrepareFailed && !profileSessionsLoading && (
+                  <div className="mt-4 flex items-center justify-center gap-2">
+                    {requiresManagedPodmanApproval && (
+                      <Button
+                        onClick={() => {
+                          const allowed = window.confirm(
+                            "Allow May to download and install managed Podman for container profiles?",
+                          );
+                          if (!allowed) {
+                            return;
+                          }
+                          void refreshProfileSessions({
+                            allowManagedPodmanDownload: true,
+                          });
+                        }}
+                      >
+                        Allow Podman Download
+                      </Button>
+                    )}
+                    <Button
+                      variant="secondary"
+                      onClick={() => void refreshProfileSessions()}
+                    >
+                      Retry
+                    </Button>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : chatSurfaceState === 'profile-loading' ? (
+            <div className="flex-1 min-h-0 px-4 pt-10">
+              <div className="mx-auto w-full max-w-3xl space-y-4">
+                <div className="h-4 w-40 rounded-full bg-muted/70 animate-pulse" />
+                <div className="space-y-3 rounded-2xl border border-border/50 bg-background/70 p-4">
+                  <div className="h-3 w-3/4 rounded-full bg-muted/60 animate-pulse" />
+                  <div className="h-3 w-5/6 rounded-full bg-muted/50 animate-pulse [animation-delay:120ms]" />
+                  <div className="h-3 w-2/3 rounded-full bg-muted/40 animate-pulse [animation-delay:240ms]" />
+                </div>
+                <div className="space-y-3 rounded-2xl border border-border/40 bg-background/60 p-4">
+                  <div className="h-3 w-2/3 rounded-full bg-muted/60 animate-pulse [animation-delay:160ms]" />
+                  <div className="h-3 w-3/4 rounded-full bg-muted/50 animate-pulse [animation-delay:280ms]" />
+                </div>
+              </div>
+            </div>
+          ) : chatSurfaceState === 'welcome' ? (
+            <div className="flex-1 min-h-0 flex flex-col items-center justify-center px-4 -mt-20">
+              <div className="text-center mb-8">
+                <h1 className="text-3xl font-semibold tracking-tight mb-2">
+                  What shall we think through?
+                </h1>
+                <p className="text-muted-foreground text-sm">
+                  Ask anything. I'm here to help you think, create, and explore.
+                </p>
+              </div>
+            </div>
+          ) : (
             <div
-              ref={contentRef}
-              className="max-w-3xl mx-auto px-4 space-y-6 pb-[200px] pt-4"
+              ref={scrollContainerRef}
+              onScroll={handleScroll}
+              className="flex-1 min-h-0 overflow-y-auto"
             >
-              {messages.map((msg, index) => {
-                const isLast = index === messages.length - 1;
-                const retryFromUser = msg.role === "user" && isLast;
-                const retryFromAssistant = msg.role === "assistant" && !!msg.error;
+              <div
+                ref={contentRef}
+                className="max-w-3xl mx-auto px-4 space-y-6 pb-6 pt-4"
+              >
+                {messages.map((msg, index) => {
+                  const isLast = index === messages.length - 1;
+                  const retryFromUser = msg.role === "user" && isLast;
+                  const retryFromAssistant = msg.role === "assistant" && !!msg.error;
 
-                return (
-                  <MessageItem
-                    key={msg.id}
-                    message={msg}
-                    canRetry={retryFromUser || retryFromAssistant}
-                    onOpenPreview={handleOpenPreview}
-                    onRetry={() => {
-                      const batch = retryFromUser
-                        ? [{ content: msg.content, attachments: msg.attachments ?? [] }]
-                        : collectRetryBatch(messages, msg.id);
+                  return (
+                    <MessageItem
+                      key={msg.id}
+                      message={msg}
+                      sessionId={currentSessionId ?? undefined}
+                      canRetry={retryFromUser || retryFromAssistant}
+                      onOpenPreview={handleOpenPreview}
+                      onRetry={() => {
+                        const batch = retryFromUser
+                          ? [{ content: msg.content, attachments: msg.attachments ?? [] }]
+                          : collectRetryBatch(messages, msg.id);
 
-                      void handleSend({
-                        sessionIdHint: currentSessionId ?? undefined,
-                        includeComposerInput: false,
-                        retryAssistantId: retryFromAssistant ? msg.id : undefined,
-                        overrideBatch: batch,
-                        skipAppendUserMessages: true,
-                      });
-                    }}
-                  />
-                );
-              })}
+                        void handleSend({
+                          sessionIdHint: currentSessionId ?? undefined,
+                          includeComposerInput: false,
+                          retryAssistantId: retryFromAssistant ? msg.id : undefined,
+                          overrideBatch: batch,
+                          skipAppendUserMessages: true,
+                        });
+                      }}
+                    />
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        <div className="p-4 bg-transparent absolute bottom-0 left-0 right-0 w-full z-20 pointer-events-none">
+          {todoProgress && todoProgress.items.length > 0 && hasPendingAssistantMessage && (
+            <div className="shrink-0 px-4 pb-2">
+              <div className="max-w-3xl mx-auto">
+                <div className="rounded-lg border border-border/60 bg-card/80 px-3 py-2.5 text-sm">
+                  <div className="flex items-center gap-2 mb-2">
+                    <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                      <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                        <rect x="2" y="2" width="12" height="12" rx="2" />
+                        <path d="M5 8l2 2 4-4" />
+                      </svg>
+                      Progress
+                    </div>
+                    <span className="text-xs text-muted-foreground">
+                      {todoProgress.completed}/{todoProgress.total}
+                    </span>
+                    <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-primary/70 transition-all duration-300"
+                        style={{ width: `${todoProgress.total > 0 ? (todoProgress.completed / todoProgress.total) * 100 : 0}%` }}
+                      />
+                    </div>
+                  </div>
+                  <ul className="space-y-0.5">
+                    {todoProgress.items.map((item, i) => (
+                      <li key={i} className="flex items-start gap-1.5 text-xs leading-relaxed">
+                        <span className={`mt-0.5 shrink-0 ${item.checked ? 'text-primary' : 'text-muted-foreground/50'}`}>
+                          {item.checked ? '✓' : '○'}
+                        </span>
+                        <span className={item.checked ? 'text-muted-foreground line-through' : 'text-foreground'}>
+                          {item.text}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </div>
+          )}
+
+        {showComposer && (
+        <div className="shrink-0 px-4 pb-2 pt-2 bg-transparent w-full z-20 pointer-events-none">
           <div className="max-w-3xl mx-auto w-full pointer-events-auto">
             {pendingPermission && (
             <div className={`mb-3 rounded-lg border px-3 py-2 text-sm ${permissionToneClass}`}>
@@ -1264,7 +2297,7 @@ export function ChatInterface({
                                 className="h-8 w-full justify-start"
                                 disabled={isAskUserSubmitting}
                                 onClick={() => {
-                                  if (question.multi_select) {
+                                  if (question.multiSelect) {
                                     const next = active
                                       ? selected.filter((v) => v !== option)
                                       : [...selected, option];
@@ -1320,7 +2353,7 @@ export function ChatInterface({
             </div>
           )}
             {uiError && (
-            <div className="mb-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            <div className="mb-3 rounded-lg border border-destructive bg-destructive px-3 py-2 text-sm text-destructive-foreground">
               {uiError}
             </div>
           )}
@@ -1379,43 +2412,90 @@ export function ChatInterface({
             )}
 
             {queuedMessages.length > 0 && (
-              <div className="flex flex-col gap-1 px-3 pt-3 pb-1">
-                <span className="text-[10px] text-muted-foreground/60">
-                  queued ({queuedMessages.length})
-                </span>
-                {queuedMessages.map((msg, i) => (
-                  <div
-                    key={i}
-                    className="flex items-center justify-between gap-2 text-xs text-muted-foreground"
-                  >
-                    <span className="truncate">{msg.content}</span>
-                    <button
-                      onClick={() => {
-                        setQueuedBySession((prev) => {
-                          const list = prev[activeQueueKey] ?? [];
-                          const nextList = list.filter((_, idx) => idx !== i);
-                          const next = { ...prev, [activeQueueKey]: nextList };
-                          if (nextList.length === 0) {
-                            delete next[activeQueueKey];
-                          }
-                          return next;
-                        });
-                        if (currentSessionId) {
-                          const list = queuedBySessionRef.current[currentSessionId] ?? [];
-                          const nextLen = Math.max(0, list.length - 1);
-                          setRuntimeQueuedCount(currentSessionId, nextLen);
-                        }
-                      }}
-                      className="flex-shrink-0 hover:text-foreground transition-colors"
-                    >
-                      <X className="h-3 w-3" />
-                    </button>
+              <div className="px-3 pt-3 pb-2">
+                <div className="queued-shell rounded-[14px] border">
+                  <div className="queued-header flex items-center justify-between border-b px-4 py-3">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="queued-header-icon inline-flex h-6 w-6 items-center justify-center rounded-md text-cyan-200">
+                        <Clock3 className="h-3.5 w-3.5" />
+                      </span>
+                      <div className="min-w-0">
+                        <div className="queued-header-title text-[10px] uppercase tracking-[0.14em] text-zinc-200/90">
+                          Queued messages
+                        </div>
+                        <div className="queued-header-subtitle truncate text-[11px] text-zinc-500">
+                          Run after current response
+                        </div>
+                      </div>
+                    </div>
+                    <div className="queued-count-pill text-[10px] tabular-nums text-zinc-300">
+                      {queuedMessages.length}
+                    </div>
                   </div>
-                ))}
+                  <div className="queued-list space-y-2 p-2.5">
+                    {queuedMessages.map((msg, i) => (
+                      <div
+                        key={`${activeQueueKey}-${i}`}
+                        className="queued-item group grid grid-cols-[auto,1fr,auto] items-start gap-3.5 rounded-xl px-3 py-3"
+                      >
+                        <div className="queued-order mt-0.5 inline-flex h-6 min-w-6 items-center justify-center rounded-full text-[10px] font-semibold tabular-nums text-zinc-300">
+                          {i + 1}
+                        </div>
+                        <div className="min-w-0 flex-1 space-y-1">
+                          <div className="queued-message-content line-clamp-2 text-[12px] leading-snug text-zinc-100/95">
+                            {msg.content.trim().length > 0 ? msg.content : "Attachment-only message"}
+                          </div>
+                          <div className="queued-meta flex items-center gap-2 text-[10px]">
+                            <span className="inline-flex items-center gap-1">
+                              <Paperclip className="h-3 w-3" />
+                              {msg.attachments.length} attachment{msg.attachments.length > 1 ? "s" : ""}
+                            </span>
+                            <span className="queued-state-pill inline-flex items-center gap-1 rounded-full px-1.5 py-[1px] text-zinc-200">
+                              queued
+                            </span>
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 items-start gap-1.5 opacity-80 transition-opacity group-hover:opacity-100">
+                          <button
+                            type="button"
+                            onClick={() => steerQueuedMessage(activeQueueKey, i)}
+                            className="queued-steer h-6 rounded-md border px-2.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-zinc-200 transition-colors"
+                          >
+                            Steer
+                          </button>
+
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <button
+                                type="button"
+                                className="queued-more inline-flex h-6 w-6 items-center justify-center rounded-md border text-zinc-500 transition-colors hover:text-zinc-100"
+                                aria-label="More actions"
+                              >
+                                <MoreHorizontal className="h-4 w-4" />
+                              </button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="w-44">
+                              <DropdownMenuItem onClick={() => steerQueuedMessage(activeQueueKey, i)}>
+                                Steer to composer
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                className="text-destructive focus:text-destructive"
+                                onClick={() => removeQueuedMessage(activeQueueKey, i)}
+                              >
+                                Remove
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </div>
             )}
 
             <Textarea
+              ref={composerInputRef}
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onPaste={handlePaste}
@@ -1426,7 +2506,7 @@ export function ChatInterface({
                   void handleSend();
                 }
               }}
-              placeholder={isNewChat ? "How can I help you today?" : "Type a message..."}
+              placeholder={composerPlaceholder}
               className="min-h-[60px] max-h-[200px] w-full resize-none border-0 shadow-none focus-visible:ring-0 bg-transparent py-4 px-3 text-base"
               rows={1}
               autoFocus={isNewChat}
@@ -1478,12 +2558,35 @@ export function ChatInterface({
                   onModelChange={(id) => {
                     if (isNewChat) {
                       setNewChatModelId(id);
-                      if (uiConfig.fullConfig) {
-                        void saveFullConfig({ ...uiConfig.fullConfig, last_model: id });
-                      }
+                      setIsModelUpdating(true);
+                      void setLastModel(id)
+                        .catch((error) => {
+                          setUiError(
+                            `Failed to update default model: ${
+                              error instanceof Error ? error.message : String(error)
+                            }`,
+                          );
+                        })
+                        .finally(() => {
+                          setIsModelUpdating(false);
+                        });
                       return;
                     }
-                    void updateSessionModel(currentSessionId, id);
+                    if (!currentSessionId) {
+                      return;
+                    }
+                    setIsModelUpdating(true);
+                    void updateSessionModel(currentSessionId, id)
+                      .catch((error) => {
+                        setUiError(
+                          `Failed to update session model: ${
+                            error instanceof Error ? error.message : String(error)
+                          }`,
+                        );
+                      })
+                      .finally(() => {
+                        setIsModelUpdating(false);
+                      });
                   }}
                   onReasoningEffortChange={(e) => {
                     if (isNewChat) {
@@ -1492,17 +2595,20 @@ export function ChatInterface({
                       updateSessionReasoningEffort(currentSessionId, e);
                     }
                   }}
+                  disabled={isModelUpdating || isSending}
+                  isUpdating={isModelUpdating}
                 />
                 {showTokenUsage && (
-                  <div
-                    className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground hover:text-foreground"
-                    title={contextUsageTitle}
-                  >
-                    <Eye className="h-4 w-4" />
-                    <span>{contextUsagePercent != null ? `${contextUsagePercent}%` : "--"}</span>
-                  </div>
+                  <ContextInspector
+                    currentSessionId={currentSessionId}
+                    promptTokens={latestStats?.promptTokens}
+                    contextUsedTokens={contextUsedTokens}
+                    contextWindow={contextWindow}
+                    contextUsagePercent={contextUsagePercent}
+                    contextUsageTitle={contextUsageTitle}
+                  />
                 )}
-                {isGenerating || isSending ? (
+                {showStopButton ? (
                   <Button
                     onClick={handleStop}
                     size="icon"
@@ -1526,26 +2632,76 @@ export function ChatInterface({
                 )}
               </div>
             </div>
+            </div>
           </div>
         </div>
+        )}
       </div>
-    </div>
+      <AnimatePresence initial={false} mode="wait">
+        {activeRightPanel === "artifacts" && (
+          <>
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize artifacts panel"
+              className={`group relative h-full w-2 flex-shrink-0 touch-none cursor-col-resize ${
+                isArtifactPanelResizing ? "bg-primary/10" : ""
+              }`}
+              onPointerDown={handleArtifactResizerPointerDown}
+            >
+              <div
+                className={`absolute inset-y-0 left-1/2 w-px -translate-x-1/2 ${
+                  isArtifactPanelResizing
+                    ? "bg-primary"
+                    : "bg-border/80 group-hover:bg-primary/70"
+                }`}
+              />
+            </div>
+            <motion.aside
+              key="artifacts-panel"
+              initial={{ width: 0, opacity: 0 }}
+              animate={{ width: artifactPanelWidth, opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }}
+              transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+              className="h-full flex-shrink-0 overflow-hidden"
+            >
+              <ArtifactsSidebar
+                open
+                artifacts={artifacts}
+                selectedPath={selectedPreviewPath}
+                preview={previewPane}
+                showHistory={showArtifactHistory}
+                onToggleHistory={() => setShowArtifactHistory((prev) => !prev)}
+                onClose={() => {
+                  setIsArtifactsOpen(false);
+                  setShowArtifactHistory(false);
+                }}
+                getViewerForPath={getArtifactViewerHint}
+                onSelect={(target) => {
+                  void openPreview(target);
+                }}
+              />
+            </motion.aside>
+          </>
+        )}
 
-      {canShowArtifactsPanel && (
-        <ArtifactsSidebar
-          open={isArtifactsOpen}
-          artifacts={artifacts}
-          selectedPath={selectedPreviewPath}
-          preview={previewPane}
-          onClose={() => setIsArtifactsOpen(false)}
-          onReload={() => {
-            void reloadPreview();
-          }}
-          onSelect={(path) => {
-            void openPreview(path);
-          }}
-        />
-      )}
+        {activeRightPanel === "browser" && (
+          <motion.aside
+            key="browser-panel"
+            initial={{ width: 0, opacity: 0 }}
+            animate={{ width: 720, opacity: 1 }}
+            exit={{ width: 0, opacity: 0 }}
+            transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+            className="h-full flex-shrink-0 overflow-hidden"
+          >
+            <BrowserView
+              open
+              onClose={() => setIsBrowserOpen(false)}
+              sessionId={currentSessionId}
+            />
+          </motion.aside>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

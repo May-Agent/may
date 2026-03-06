@@ -31,6 +31,7 @@ pub enum CompletionMode {
 pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/session", "Switch or create sessions"),
     ("/new", "Start a new session"),
+    ("/profile", "Switch profile (Ctrl+P)"),
     ("/model", "Switch model for this session"),
     ("/sandbox", "Open sandbox folder in Finder"),
     ("/compact", "Compact conversation history"),

@@ -30,7 +30,6 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
-use may_agent::mcp::McpConfig;
 use may_agent::tui::runtime::{RuntimeDeps, TitleGenContext};
 use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
 use may_agent::workspace_request::{self, WorkspaceRequestQueue};
@@ -48,30 +47,42 @@ async fn main() -> anyhow::Result<()> {
     ensure_rustls_provider();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).is_some_and(|arg| arg == "ui") {
-        return may_agent::ui_server::run_ui_server(&args[2..]).await;
-    }
+    let is_ui_mode = args.get(1).is_some_and(|arg| arg == "ui");
 
-    // Initialize logging to file
+    // Initialize logging to file (shared by both UI server and TUI modes)
     let log_dir = dirs::home_dir()
         .context("Failed to determine home directory")?
         .join(".may")
         .join("logs");
-    let file_appender = tracing_appender::rolling::daily(log_dir, "may.log");
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(file_appender).with_ansi(false))
-        .with(
-            EnvFilter::from_default_env()
-                .add_directive("may=info".parse()?)
-                .add_directive("may_agent=debug".parse()?)
-                .add_directive("aither_agent=debug".parse()?)
-                .add_directive("aither_sandbox=info".parse()?)
-                .add_directive("aither_cloud=debug".parse()?)
-                .add_directive("aither_gemini=info".parse()?)
-                .add_directive("aither_claude=info".parse()?)
-                .add_directive("aither_openai=info".parse()?),
-        )
-        .init();
+    std::fs::create_dir_all(&log_dir).context("Failed to create ~/.may/logs directory")?;
+    let env_filter = EnvFilter::from_default_env()
+        .add_directive("may=info".parse()?)
+        .add_directive("may_agent=debug".parse()?)
+        .add_directive("aither_agent=debug".parse()?)
+        .add_directive("aither_sandbox=info".parse()?)
+        .add_directive("aither_cloud=debug".parse()?)
+        .add_directive("aither_gemini=info".parse()?)
+        .add_directive("aither_claude=info".parse()?)
+        .add_directive("aither_openai=info".parse()?);
+
+    if is_ui_mode {
+        let file_appender = tracing_appender::rolling::daily(log_dir, "may.log");
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_writer(file_appender).with_ansi(false))
+            .with(fmt::layer().with_writer(io::stderr).with_ansi(true))
+            .with(env_filter)
+            .init();
+    } else {
+        let file_appender = tracing_appender::rolling::daily(log_dir, "may.log");
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_writer(file_appender).with_ansi(false))
+            .with(env_filter)
+            .init();
+    }
+
+    if args.get(1).is_some_and(|arg| arg == "ui") {
+        return may_agent::ui_server::run_ui_server(&args[2..]).await;
+    }
 
     // Set up panic hook to restore terminal state before panicking
     let default_hook = panic::take_hook();
@@ -135,6 +146,9 @@ where
     let mut app = App::new(events.sender(), image_support).await?;
     let mut worker: Option<AgentWorker> = None;
 
+    // Spawn background auto-archive task
+    let _auto_archive = may_agent::tasks::spawn_auto_archive(app.session_manager.db().clone());
+
     // Create workspace request channel (runtime-agnostic)
     let (workspace_broker, workspace_queue) = workspace_request::channel();
 
@@ -143,10 +157,7 @@ where
     tracing::info!("=== MAY STARTUP - channels created ===");
 
     // Load MCP configuration and connect to servers
-    let mut mcp_manager = McpManager::load().unwrap_or_else(|e| {
-        tracing::warn!("Failed to load MCP config: {}", e);
-        McpManager::new(McpConfig::default())
-    });
+    let mut mcp_manager = McpManager::load().context("failed to load MCP config")?;
 
     // Connect to all configured MCP servers
     if mcp_manager.has_servers() {

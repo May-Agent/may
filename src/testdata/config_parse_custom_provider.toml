@@ -1,0 +1,6 @@
+[provider.my-ollama]
+type = "ollama"
+base_url = "http://192.168.1.100:11434/v1"
+
+[models]
+fast = ["llama3"]

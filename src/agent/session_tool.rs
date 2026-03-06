@@ -31,6 +31,12 @@ const INDEX_META_FILE: &str = "session_index.meta.json";
 /// - Default excludes current session so you can inspect other sessions.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SessionArgs {
+    /// Optional command-form input. Supported:
+    /// - `session <id> search <prompt>`
+    /// - `session <search>`
+    #[serde(default)]
+    pub command: Option<String>,
+
     /// Query string. Use `*` for filter-only listing.
     pub query: String,
 
@@ -153,7 +159,11 @@ impl SessionTool {
         self.may_dir.join(INDEX_META_FILE)
     }
 
-    fn normalize_args(&self, mut args: SessionArgs) -> SessionArgs {
+    fn normalize_args(&self, mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
+        if let Some(command) = args.command.take() {
+            apply_command_form(&mut args, &command)?;
+        }
+
         args.search_mode = args.search_mode.to_lowercase();
         args.output_mode = args.output_mode.to_lowercase();
         if args.search_mode.trim().is_empty() {
@@ -192,7 +202,7 @@ impl SessionTool {
             args.exclude_session_id = Some(self.current_session_id.clone());
         }
 
-        args
+        Ok(args)
     }
 }
 
@@ -204,7 +214,7 @@ impl Tool for SessionTool {
     type Arguments = SessionArgs;
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let args = self.normalize_args(arguments);
+        let args = self.normalize_args(arguments)?;
         let query_enabled = args.query.trim() != "*" && !args.query.trim().is_empty();
 
         if !matches!(args.output_mode.as_str(), "sessions" | "messages") {
@@ -364,6 +374,38 @@ impl Tool for SessionTool {
     }
 }
 
+fn apply_command_form(args: &mut SessionArgs, command: &str) -> aither_core::Result<()> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("session command must not be empty"));
+    }
+
+    let body = trimmed.strip_prefix("session ").unwrap_or(trimmed).trim();
+    if body.is_empty() {
+        return Err(anyhow::anyhow!(
+            "session command must include a search prompt"
+        ));
+    }
+
+    let mut tokens = body.split_whitespace();
+    if let (Some(session_id), Some(keyword)) = (tokens.next(), tokens.next()) {
+        if keyword == "search" {
+            let prompt = tokens.collect::<Vec<_>>().join(" ");
+            if prompt.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "invalid session command: missing prompt after 'search'"
+                ));
+            }
+            args.session_id = Some(session_id.to_string());
+            args.query = prompt;
+            return Ok(());
+        }
+    }
+
+    args.query = body.to_string();
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionIndexMeta {
     session_count: usize,
@@ -507,13 +549,12 @@ async fn ensure_index(
         let reader = rows_to_record_reader(&rows)?;
         let table = conn.create_table(TABLE_NAME, reader).execute().await?;
 
-        table
-            .create_index(
-                &["content", "title", "preview"],
-                Index::FTS(Default::default()),
-            )
-            .execute()
-            .await?;
+        for column in ["content", "title", "preview"] {
+            table
+                .create_index(&[column], Index::FTS(Default::default()))
+                .execute()
+                .await?;
+        }
         table
             .create_index(&["session_id"], Index::BTree(Default::default()))
             .execute()
@@ -550,6 +591,16 @@ async fn build_index_rows(db: &ChatDb) -> anyhow::Result<Vec<SessionIndexRow>> {
 
         let messages = db.get_messages(&session_id).await?;
         for msg in messages {
+            if matches!(
+                msg.role.as_str(),
+                "permission_request"
+                    | "permission_response"
+                    | "ask_user_request"
+                    | "ask_user_response"
+                    | "hidden_context"
+            ) {
+                continue;
+            }
             rows.push(SessionIndexRow {
                 session_id: session_id.clone(),
                 title: title.clone(),
@@ -922,4 +973,63 @@ fn finalize_rows_with_total(
     };
 
     Ok(ToolOutput::text(serde_json::to_string_pretty(&value)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args() -> SessionArgs {
+        SessionArgs {
+            command: None,
+            query: "*".to_string(),
+            search_mode: "hybrid".to_string(),
+            output_mode: "sessions".to_string(),
+            limit: 20,
+            offset: 0,
+            scan_limit: 2000,
+            session_id: None,
+            exclude_session_id: None,
+            model: None,
+            role: None,
+            since: None,
+            until: None,
+            title_contains: None,
+            case_sensitive: false,
+            regex: None,
+            fuzzy_distance: 1,
+            fields: Vec::new(),
+            include_content: false,
+            include_current: false,
+        }
+    }
+
+    #[test]
+    fn parses_scoped_session_command_form() {
+        let mut args = base_args();
+        apply_command_form(&mut args, "session abc123 search investigate failures")
+            .expect("command form should parse");
+        assert_eq!(args.session_id.as_deref(), Some("abc123"));
+        assert_eq!(args.query, "investigate failures");
+    }
+
+    #[test]
+    fn parses_global_session_command_form() {
+        let mut args = base_args();
+        apply_command_form(&mut args, "session recall onboarding decision")
+            .expect("global command form should parse");
+        assert_eq!(args.session_id, None);
+        assert_eq!(args.query, "recall onboarding decision");
+    }
+
+    #[test]
+    fn rejects_missing_prompt_in_scoped_command() {
+        let mut args = base_args();
+        let err = apply_command_form(&mut args, "session abc123 search")
+            .expect_err("missing prompt must fail");
+        assert!(
+            err.to_string().contains("missing prompt"),
+            "unexpected error: {err}"
+        );
+    }
 }

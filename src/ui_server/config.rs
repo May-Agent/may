@@ -1,8 +1,6 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use skyzen::Result as SkyResult;
-use skyzen::responder::Sse;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
@@ -11,13 +9,16 @@ use crate::copilot::{clear_copilot_credentials, has_copilot_token, save_copilot_
 use crate::mcp::MayMcpServerConfig;
 use crate::skill::SkillManager;
 
-use super::helpers::{bad_request_error, internal_error, map_skill, send_event};
+use super::error::{bad_request_error, internal_error};
+use super::helpers::save_config_to_disk;
+use super::message_mapping::map_skill;
+use super::model_resolution::persist_last_model;
 use super::state::UiServerState;
 use super::types::{
     ApiHealth, CopilotPollRequest, CopilotPollResponse, CopilotStartResponse,
-    CopilotStatusResponse, McpAddRequest, MemoryPayload, SkillInfoDto, SkillInstallRequest,
-    SshServerRequest, UiAppearanceConfig, UiConfigResponse, UiFullConfig, UiModelsConfig,
-    UiPreferencesConfig, UiProviderConfig,
+    CopilotStatusResponse, LastModelRequest, McpAddRequest, MemoryPayload, MemorySaveRequest,
+    SkillInfoDto, SkillInstallRequest, SshServerRequest, UiAppearanceConfig, UiConfigResponse,
+    UiFullConfig, UiModelsConfig, UiPlaywrightConfig, UiPreferencesConfig, UiProviderConfig,
 };
 
 pub(super) async fn get_ui_config(
@@ -32,52 +33,14 @@ pub(super) async fn get_ui_config(
     }))
 }
 
-pub(super) async fn config_stream(State(state): State<Arc<UiServerState>>) -> SkyResult<Sse> {
-    let (sender, sse) = Sse::channel();
-
-    tokio::spawn(async move {
-        let mut last_sig = String::new();
-        loop {
-            // Reload from disk to detect external changes (TUI, manual edits).
-            if let Ok(fresh) = MayConfig::load() {
-                *state.config.write().await = fresh;
-            }
-            let config = state.config.read().await;
-            let sig = format!(
-                "{}|{}|{}|{}|{}",
-                config.appearance.font,
-                config.appearance.theme,
-                config.max_iterations,
-                config.ssh_servers.len(),
-                config.last_model.clone().unwrap_or_default()
-            );
-
-            if sig != last_sig {
-                send_event(
-                    &sender,
-                    "config",
-                    &serde_json::json!({
-                        "ui_font": config.appearance.font,
-                        "ui_theme": config.appearance.theme,
-                    }),
-                )
-                .await;
-                last_sig = sig;
-            }
-
-            send_event(&sender, "heartbeat", &serde_json::json!({ "ok": true })).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
-
-    Ok(sse)
-}
-
 pub(super) async fn get_full_config(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<UiFullConfig>> {
     let config = state.config.read().await;
+    Ok(Json(build_ui_full_config(&config)))
+}
 
+pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
     let mut providers = config
         .provider
         .iter()
@@ -92,7 +55,7 @@ pub(super) async fn get_full_config(
         .collect::<Vec<_>>();
     providers.sort_by(|a, b| a.id.cmp(&b.id));
 
-    Ok(Json(UiFullConfig {
+    UiFullConfig {
         providers,
         models: UiModelsConfig {
             advanced: config.models.advanced.clone(),
@@ -113,41 +76,72 @@ pub(super) async fn get_full_config(
         },
         last_model: config.last_model.clone(),
         max_iterations: config.max_iterations,
-    }))
+        playwright: UiPlaywrightConfig {
+            enabled: config.playwright.enabled,
+            browser: config.playwright.browser,
+            port: config.playwright.port,
+            screencast_quality: config.playwright.screencast_quality,
+            screencast_max_width: config.playwright.screencast_max_width,
+        },
+    }
 }
 
 pub(super) async fn save_full_config(
     Json(req): Json<UiFullConfig>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let mut config = state.config.write().await;
+    let updated = {
+        let mut config = state.config.write().await;
 
-    let mut provider_map = std::collections::HashMap::new();
-    for p in req.providers {
-        let mut instance = ProviderInstance::new(p.provider_type);
-        instance.api_key = p.api_key.filter(|v| !v.trim().is_empty());
-        instance.base_url = p.base_url.filter(|v| !v.trim().is_empty());
-        instance.display_name = p.display_name.filter(|v| !v.trim().is_empty());
-        instance.enabled = p.enabled;
-        provider_map.insert(p.id, instance);
+        let mut provider_map = std::collections::HashMap::new();
+        for p in req.providers {
+            let mut instance = ProviderInstance::new(p.provider_type);
+            instance.api_key = p.api_key.filter(|v| !v.trim().is_empty());
+            instance.base_url = p.base_url.filter(|v| !v.trim().is_empty());
+            instance.display_name = p.display_name.filter(|v| !v.trim().is_empty());
+            instance.enabled = p.enabled;
+            provider_map.insert(p.id, instance);
+        }
+
+        config.provider = provider_map;
+        config.models.advanced = req.models.advanced;
+        config.models.balanced = req.models.balanced;
+        config.models.fast = req.models.fast;
+        config.models.image_generation = req.models.image_generation;
+        config.models.model_providers = req.models.model_providers;
+        config.preferences.load_balance_strategy = req.preferences.load_balance_strategy;
+        config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
+        config.preferences.show_token_usage = req.preferences.show_token_usage;
+        config.preferences.strict_model_matching = req.preferences.strict_model_matching;
+        config.appearance.font = req.appearance.font;
+        config.appearance.theme = req.appearance.theme;
+        config.last_model = req.last_model;
+        config.max_iterations = req.max_iterations;
+        config.playwright.enabled = req.playwright.enabled;
+        config.playwright.browser = req.playwright.browser;
+        config.playwright.port = req.playwright.port;
+        config.playwright.screencast_quality = req.playwright.screencast_quality;
+        config.playwright.screencast_max_width = req.playwright.screencast_max_width;
+        config.clone()
+    };
+
+    save_config_to_disk(updated).await.map_err(internal_error)?;
+    state.notify_ui_events();
+    Ok(Json(ApiHealth { ok: true }))
+}
+
+pub(super) async fn set_last_model(
+    Json(req): Json<LastModelRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let model = req.model.trim();
+    if model.is_empty() {
+        return Err(bad_request_error("model is required"));
     }
 
-    config.provider = provider_map;
-    config.models.advanced = req.models.advanced;
-    config.models.balanced = req.models.balanced;
-    config.models.fast = req.models.fast;
-    config.models.image_generation = req.models.image_generation;
-    config.models.model_providers = req.models.model_providers;
-    config.preferences.load_balance_strategy = req.preferences.load_balance_strategy;
-    config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
-    config.preferences.show_token_usage = req.preferences.show_token_usage;
-    config.preferences.strict_model_matching = req.preferences.strict_model_matching;
-    config.appearance.font = req.appearance.font;
-    config.appearance.theme = req.appearance.theme;
-    config.last_model = req.last_model;
-    config.max_iterations = req.max_iterations;
-
-    config.save().map_err(internal_error)?;
+    persist_last_model(&state, model)
+        .await
+        .map_err(internal_error)?;
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -157,14 +151,19 @@ pub(super) async fn get_memory(
     let memory_path = state.may_dir.join("MEMORY.md");
     let content = async_fs::read_to_string(memory_path)
         .await
-        .unwrap_or_default();
+        .map_err(internal_error)?;
     Ok(Json(MemoryPayload { content }))
 }
 
 pub(super) async fn save_memory(
-    Json(payload): Json<MemoryPayload>,
+    Json(payload): Json<MemorySaveRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
+    if !payload.explicit_user_request {
+        return Err(bad_request_error(
+            "memory updates require explicit user request confirmation",
+        ));
+    }
     let memory_path = state.may_dir.join("MEMORY.md");
     async_fs::write(memory_path, payload.content)
         .await
@@ -178,12 +177,16 @@ pub(super) async fn add_ssh_server(
     Json(req): Json<SshServerRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let mut config = state.config.write().await;
-    config.upsert_ssh_server(SshServerConfig {
-        name: req.name,
-        target: req.target,
-    });
-    config.save().map_err(internal_error)?;
+    let updated = {
+        let mut config = state.config.write().await;
+        config.upsert_ssh_server(SshServerConfig {
+            name: req.name,
+            target: req.target,
+        });
+        config.clone()
+    };
+    save_config_to_disk(updated).await.map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -192,9 +195,13 @@ pub(super) async fn remove_ssh_server(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
-    let mut config = state.config.write().await;
-    let _ = config.remove_ssh_server(name);
-    config.save().map_err(internal_error)?;
+    let updated = {
+        let mut config = state.config.write().await;
+        let _ = config.remove_ssh_server(name);
+        config.clone()
+    };
+    save_config_to_disk(updated).await.map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))
 }
 

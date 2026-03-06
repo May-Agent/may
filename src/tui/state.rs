@@ -36,6 +36,8 @@ pub enum AppMode {
     AskUser(AskUserState),
     /// Skill management popup
     SkillManage,
+    /// Profile switcher popup
+    ProfileSelect,
 }
 
 /// Per-question interaction state.

@@ -19,7 +19,7 @@
 //! # Example config
 //!
 //! ```toml
-//! max_iterations = 50
+//! max_iterations = 0
 //!
 //! [provider.anthropic]
 //! api_key = "sk-ant-..."
@@ -46,70 +46,88 @@
 //! warn_on_model_change = true
 //! ```
 
-use aither_models::ModelTier as AitherTier;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Get model tier from aither-models database.
-/// Returns the primary tier if found, otherwise returns Balanced as default.
+/// Infer model tier from aither-models metadata.
+///
+/// Uses model mode, pricing percentiles, and context window as signals.
 pub fn get_model_tier(model_id: &str) -> ModelTier {
+    let chat_price_breakpoints = chat_price_breakpoints();
     aither_models::lookup(model_id)
-        .and_then(|info| info.primary_tier())
-        .map(|tier| match tier {
-            AitherTier::Flagship => ModelTier::Advanced,
-            AitherTier::Balanced => ModelTier::Balanced,
-            AitherTier::Fast => ModelTier::Fast,
-        })
+        .map(|info| infer_model_tier(info, chat_price_breakpoints))
         .unwrap_or(ModelTier::Balanced)
 }
 
-fn strip_preview_suffix(id: &str) -> Option<String> {
-    id.strip_suffix("-preview").map(ToString::to_string)
-}
-
-fn strip_compact_date_suffix(id: &str) -> Option<String> {
-    let idx = id.rfind('-')?;
-    let tail = &id[idx + 1..];
-    if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) {
-        return Some(id[..idx].to_string());
-    }
-    None
-}
-
-fn strip_iso_date_suffix(id: &str) -> Option<String> {
-    if id.len() < 11 {
+fn chat_price_breakpoints() -> Option<(f64, f64)> {
+    let mut prices = aither_models::models_by_mode(aither_models::ModelMode::Chat)
+        .map(|info| info.pricing().output_per_token())
+        .filter(|price| price.is_finite() && *price > 0.0)
+        .collect::<Vec<_>>();
+    if prices.len() < 3 {
         return None;
     }
-    let idx = id.len() - 11;
-    if id.as_bytes().get(idx) != Some(&b'-') {
-        return None;
-    }
-    let tail = &id[idx + 1..];
-    let ok = tail.len() == 10
-        && tail.as_bytes().get(4) == Some(&b'-')
-        && tail.as_bytes().get(7) == Some(&b'-')
-        && tail
-            .bytes()
-            .enumerate()
-            .all(|(i, b)| (i == 4 || i == 7) || b.is_ascii_digit());
-    if ok {
-        return Some(id[..idx].to_string());
-    }
-    None
+
+    prices.sort_by(|a, b| a.total_cmp(b));
+    let low_index = prices.len() / 3;
+    let high_index = (prices.len() * 2) / 3;
+    Some((prices[low_index], prices[high_index]))
 }
 
+fn infer_model_tier(
+    info: &aither_models::ModelEntry,
+    chat_price_breakpoints: Option<(f64, f64)>,
+) -> ModelTier {
+    match info.mode() {
+        aither_models::ModelMode::ImageGeneration => return ModelTier::ImageGeneration,
+        aither_models::ModelMode::Chat => {}
+        _ => return ModelTier::Balanced,
+    }
+
+    let output_price = info.pricing().output_per_token();
+    if let Some((fast_ceiling, advanced_floor)) = chat_price_breakpoints
+        && output_price.is_finite()
+        && output_price > 0.0
+    {
+        if output_price <= fast_ceiling {
+            return ModelTier::Fast;
+        }
+        if output_price >= advanced_floor {
+            return ModelTier::Advanced;
+        }
+        return ModelTier::Balanced;
+    }
+
+    match info.max_input_tokens() {
+        Some(tokens) if tokens <= 32_768 => ModelTier::Fast,
+        Some(tokens) if tokens >= 200_000 => ModelTier::Advanced,
+        _ => ModelTier::Balanced,
+    }
+}
+
+fn normalize_base_url(url: &str) -> &str {
+    url.trim_end_matches('/')
+}
+
+/// Normalize a model ID for relaxed comparison by stripping trailing date and
+/// `-preview` suffixes.  Examples:
+///   `claude-3-5-sonnet-20241022` → `claude-3-5-sonnet`
+///   `o3-2025-04-16`              → `o3`
+///   `gpt-4o-2024-08-06-preview`  → `gpt-4o`
 pub fn normalize_model_id_for_relaxed_match(model_id: &str) -> String {
+    static SUFFIX_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"-(?:\d{8}|\d{4}-\d{2}-\d{2}|preview)$")
+            .expect("model suffix regex must be valid")
+    });
+
     let mut current = model_id.trim().to_ascii_lowercase();
     loop {
-        let next = strip_preview_suffix(&current)
-            .or_else(|| strip_compact_date_suffix(&current))
-            .or_else(|| strip_iso_date_suffix(&current));
-        match next {
-            Some(value) => current = value,
-            None => break,
-        }
+        let Some(m) = SUFFIX_RE.find(&current) else {
+            break;
+        };
+        current.truncate(m.start());
     }
     current
 }
@@ -189,6 +207,47 @@ pub enum ProviderType {
 }
 
 impl ProviderType {
+    fn catalog_provider(self) -> Option<aither_models::Provider> {
+        match self {
+            Self::Anthropic => Some(aither_models::Provider::Anthropic),
+            Self::OpenAI => Some(aither_models::Provider::OpenAI),
+            Self::Google => Some(aither_models::Provider::Google),
+            Self::DeepSeek => Some(aither_models::Provider::DeepSeek),
+            Self::Mistral => Some(aither_models::Provider::Mistral),
+            Self::XAI => Some(aither_models::Provider::XAI),
+            Self::Groq => Some(aither_models::Provider::Groq),
+            Self::Together => Some(aither_models::Provider::Together),
+            Self::OpenRouter | Self::Ollama | Self::Custom | Self::Copilot => None,
+        }
+    }
+
+    fn provider_matches_catalog(self, provider: &aither_models::Provider) -> bool {
+        match self {
+            Self::Copilot => matches!(
+                provider,
+                aither_models::Provider::OpenAI
+                    | aither_models::Provider::Anthropic
+                    | aither_models::Provider::Copilot
+            ),
+            _ => self
+                .catalog_provider()
+                .is_some_and(|expected| expected == *provider),
+        }
+    }
+
+    fn supports_canonical_model_id(self, canonical_model_id: &str) -> bool {
+        match self {
+            Self::Copilot => aither_models::all_models().any(|info| {
+                info.id().eq_ignore_ascii_case(canonical_model_id)
+                    && self.provider_matches_catalog(info.provider())
+            }),
+            _ => self.catalog_provider().is_some_and(|provider_kind| {
+                aither_models::models_for_provider(&provider_kind)
+                    .any(|info| info.id().eq_ignore_ascii_case(canonical_model_id))
+            }),
+        }
+    }
+
     /// All known provider types for UI display.
     pub const ALL: &'static [ProviderType] = &[
         ProviderType::Anthropic,
@@ -321,65 +380,20 @@ impl ProviderType {
 
     /// Check if this provider type can serve a given model.
     ///
-    /// OpenRouter can serve most models from other providers.
-    /// Native providers can only serve their own models.
+    /// Aggregator providers (OpenRouter, Ollama, Custom) accept any model.
+    /// Native providers consult the `aither_models` catalog as the single source
+    /// of truth. If the model is unknown (not in the catalog), it is not claimable
+    /// by any native provider.
     pub fn can_serve_model(self, model_id: &str) -> bool {
-        let model = model_id.to_ascii_lowercase();
-
-        // OpenRouter is an aggregator - it can serve most models.
-        if self == Self::OpenRouter {
+        if self == Self::OpenRouter || self == Self::Ollama || self == Self::Custom {
             return true;
         }
 
-        // Ollama can run any model that's been pulled locally.
-        if self == Self::Ollama {
-            return true;
-        }
+        let Some(canonical_model_id) = aither_models::lookup(model_id).map(|info| info.id()) else {
+            return false;
+        };
 
-        // Custom providers - user-defined compatibility.
-        if self == Self::Custom {
-            return true;
-        }
-
-        // Prefer authoritative catalog match when available.
-        if let Some(info) = aither_models::lookup(model_id) {
-            return match self {
-                Self::Copilot => {
-                    info.provider.eq_ignore_ascii_case("openai")
-                        || info.provider.eq_ignore_ascii_case("anthropic")
-                }
-                _ => info.provider.eq_ignore_ascii_case(self.aither_provider()),
-            };
-        }
-
-        // Fallback heuristics for newer/unknown model IDs.
-        match self {
-            Self::Anthropic => model.starts_with("claude"),
-            Self::OpenAI => {
-                model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3")
-            }
-            Self::Google => model.starts_with("gemini"),
-            Self::Copilot => {
-                model.starts_with("gpt")
-                    || model.starts_with("o1")
-                    || model.starts_with("o3")
-                    || model.starts_with("claude")
-            }
-            Self::DeepSeek => model.starts_with("deepseek"),
-            Self::Groq => {
-                model.starts_with("llama")
-                    || model.starts_with("mixtral")
-                    || model.starts_with("qwen")
-            }
-            Self::Together => {
-                model.starts_with("llama")
-                    || model.starts_with("qwen")
-                    || model.starts_with("mistral")
-            }
-            Self::Mistral => model.starts_with("mistral"),
-            Self::XAI => model.starts_with("grok"),
-            Self::OpenRouter | Self::Ollama | Self::Custom => true,
-        }
+        self.supports_canonical_model_id(canonical_model_id)
     }
 }
 
@@ -540,7 +554,50 @@ impl ProviderInstance {
 
     /// Check if this provider can serve a model.
     pub fn can_serve_model(&self, id: &str, model_id: &str) -> bool {
-        self.is_valid(id) && self.resolve_type(id).can_serve_model(model_id)
+        if !self.is_valid(id) {
+            return false;
+        }
+
+        if self.is_generic_model_proxy(id) {
+            return true;
+        }
+
+        self.resolve_type(id).can_serve_model(model_id)
+    }
+
+    /// Whether this instance should be treated as a generic model proxy.
+    ///
+    /// Generic proxies can serve arbitrary model IDs and should be appended
+    /// after explicit provider/model matches in fallback ordering.
+    pub fn is_generic_model_proxy(&self, id: &str) -> bool {
+        let provider_type = self.resolve_type(id);
+        if matches!(
+            provider_type,
+            ProviderType::OpenRouter | ProviderType::Ollama | ProviderType::Custom
+        ) {
+            return true;
+        }
+
+        if !matches!(
+            provider_type,
+            ProviderType::OpenAI
+                | ProviderType::DeepSeek
+                | ProviderType::Groq
+                | ProviderType::Together
+                | ProviderType::Mistral
+                | ProviderType::XAI
+        ) {
+            return false;
+        }
+
+        let Some(explicit_base_url) = self.base_url.as_deref() else {
+            return false;
+        };
+        let normalized_explicit = normalize_base_url(explicit_base_url);
+        provider_type
+            .base_url()
+            .map(|default_url| normalize_base_url(default_url) != normalized_explicit)
+            .unwrap_or(true)
     }
 }
 
@@ -714,10 +771,80 @@ fn default_ui_theme() -> String {
     "system".to_string()
 }
 
+/// Which browser to use for Playwright / browser automation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaywrightBrowser {
+    /// Use the system-installed Google Chrome.
+    #[default]
+    LocalChrome,
+    /// Use Playwright-managed Chromium (downloaded via `npx playwright install chromium`).
+    Chromium,
+}
+
+impl PlaywrightBrowser {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::LocalChrome => "Local Chrome",
+            Self::Chromium => "Chromium (Playwright)",
+        }
+    }
+}
+
+/// Playwright / browser automation configuration.
+///
+/// When enabled, May launches a browser on the host with a CDP debug port.
+/// The agent in a container connects via Playwright's `connect_over_cdp`,
+/// while the Web UI streams a live view via CDP screencast.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaywrightConfig {
+    /// Whether browser automation is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Which browser to use.
+    #[serde(default)]
+    pub browser: PlaywrightBrowser,
+    /// CDP remote debugging port on the host.
+    #[serde(default = "default_playwright_port")]
+    pub port: u16,
+    /// JPEG quality for screencast frames (1-100). Lower = less bandwidth.
+    #[serde(default = "default_screencast_quality")]
+    pub screencast_quality: u32,
+    /// Max width for screencast frames in pixels. Lower = less bandwidth.
+    #[serde(default = "default_screencast_max_width")]
+    pub screencast_max_width: u32,
+}
+
+fn default_playwright_port() -> u16 {
+    9222
+}
+
+fn default_screencast_quality() -> u32 {
+    60
+}
+
+fn default_screencast_max_width() -> u32 {
+    1280
+}
+
+impl Default for PlaywrightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            browser: PlaywrightBrowser::default(),
+            port: default_playwright_port(),
+            screencast_quality: default_screencast_quality(),
+            screencast_max_width: default_screencast_max_width(),
+        }
+    }
+}
+
 /// May agent configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MayConfig {
     /// Maximum iterations per query.
+    ///
+    /// `0` means unlimited.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
     /// Configured provider instances, keyed by ID.
@@ -733,6 +860,9 @@ pub struct MayConfig {
     /// UI appearance settings.
     #[serde(default)]
     pub appearance: Appearance,
+    /// Playwright / browser automation settings.
+    #[serde(default)]
+    pub playwright: PlaywrightConfig,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
@@ -742,7 +872,7 @@ pub struct MayConfig {
 }
 
 fn default_max_iterations() -> usize {
-    50
+    0
 }
 
 impl Default for MayConfig {
@@ -753,6 +883,7 @@ impl Default for MayConfig {
             models: ModelsConfig::default(),
             preferences: Preferences::default(),
             appearance: Appearance::default(),
+            playwright: PlaywrightConfig::default(),
             last_model: None,
             ssh_servers: Vec::new(),
         }
@@ -782,7 +913,14 @@ impl MayConfig {
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            Ok(toml::from_str(&content)?)
+            let mut config: Self = toml::from_str(&content)?;
+            if config.max_iterations == 50 {
+                tracing::info!(
+                    "Migrating legacy default max_iterations=50 to max_iterations=0 (unlimited)"
+                );
+                config.max_iterations = 0;
+            }
+            Ok(config)
         } else {
             Ok(Self::default())
         }
@@ -887,10 +1025,9 @@ impl MayConfig {
     /// For providers that can serve any model (openrouter, ollama, custom), includes
     /// all known models since they can proxy to multiple backends.
     pub fn available_models(&self) -> Vec<AvailableModel> {
-        use aither_models::ModelTier as AitherTier;
-
         let mut models = Vec::new();
         let mut has_any_model_provider = false;
+        let chat_price_breakpoints = chat_price_breakpoints();
 
         for (id, instance) in &self.provider {
             if !instance.is_valid(id) {
@@ -899,33 +1036,32 @@ impl MayConfig {
 
             let ptype = instance.resolve_type(id);
 
-            // Providers that can serve any model (proxies/aggregators)
-            if matches!(
-                ptype,
-                ProviderType::OpenRouter | ProviderType::Ollama | ProviderType::Custom
-            ) {
+            // Providers that can serve arbitrary models (proxies/aggregators)
+            if instance.is_generic_model_proxy(id) {
                 has_any_model_provider = true;
                 continue;
             }
 
-            let provider_str = ptype.aither_provider();
-            if provider_str == "unknown" {
-                continue;
-            }
+            let provider_models = match ptype {
+                ProviderType::Copilot => aither_models::all_models()
+                    .filter(|info| ptype.provider_matches_catalog(info.provider()))
+                    .collect::<Vec<_>>(),
+                _ => {
+                    let Some(provider_kind) = ptype.catalog_provider() else {
+                        continue;
+                    };
+                    aither_models::models_for_provider(&provider_kind).collect::<Vec<_>>()
+                }
+            };
 
-            for info in aither_models::models_for_provider(provider_str) {
-                if info.outdated {
+            for info in provider_models {
+                if info.is_deprecated() {
                     continue;
                 }
-                let tier = info.primary_tier().map(|t| match t {
-                    AitherTier::Flagship => ModelTier::Advanced,
-                    AitherTier::Balanced => ModelTier::Balanced,
-                    AitherTier::Fast => ModelTier::Fast,
-                });
                 models.push(AvailableModel {
-                    id: info.id.to_string(),
+                    id: info.id().to_string(),
                     provider_id: id.clone(),
-                    tier,
+                    tier: Some(infer_model_tier(info, chat_price_breakpoints)),
                 });
             }
         }
@@ -934,22 +1070,17 @@ impl MayConfig {
         // include ALL known models since they can potentially serve them
         if has_any_model_provider {
             for info in aither_models::all_models() {
-                if info.outdated {
+                if info.is_deprecated() {
                     continue;
                 }
                 // Skip if we already have this model from a direct provider
-                if models.iter().any(|m| m.id == info.id) {
+                if models.iter().any(|m| m.id == info.id()) {
                     continue;
                 }
-                let tier = info.primary_tier().map(|t| match t {
-                    AitherTier::Flagship => ModelTier::Advanced,
-                    AitherTier::Balanced => ModelTier::Balanced,
-                    AitherTier::Fast => ModelTier::Fast,
-                });
                 models.push(AvailableModel {
-                    id: info.id.to_string(),
+                    id: info.id().to_string(),
                     provider_id: String::new(), // Multiple providers could serve this
-                    tier,
+                    tier: Some(infer_model_tier(info, chat_price_breakpoints)),
                 });
             }
         }
@@ -1024,24 +1155,18 @@ impl ProviderResolver {
                 continue;
             }
 
-            match p.resolve_type(id) {
-                ProviderType::OpenRouter | ProviderType::Ollama | ProviderType::Custom => {
-                    generic.push(id.as_str())
-                }
-                _ => explicit.push(id.as_str()),
+            if p.is_generic_model_proxy(id) {
+                generic.push(id.as_str());
+            } else {
+                explicit.push(id.as_str());
             }
         }
 
-        // Prefer explicit provider-model matches first; use generic aggregators as fallback.
-        let mut ids = if explicit.is_empty() {
-            generic
-        } else {
-            explicit
-        };
-
-        // Keep provider ordering deterministic; HashMap iteration order is not stable.
-        ids.sort_unstable();
-        ids
+        // Prefer explicit provider-model matches first; keep generic aggregators as fallback.
+        explicit.sort_unstable();
+        generic.sort_unstable();
+        explicit.extend(generic);
+        explicit
     }
 
     /// Select the next provider for a model based on strategy.
@@ -1130,31 +1255,14 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = MayConfig::default();
-        assert_eq!(config.max_iterations, 50);
+        assert_eq!(config.max_iterations, 0);
         assert!(config.provider.is_empty());
         assert!(!config.is_configured());
     }
 
     #[test]
     fn test_parse_new_config() {
-        let toml = r#"
-max_iterations = 100
-
-[provider.anthropic]
-api_key = "sk-ant-test"
-
-[provider.openrouter]
-api_key = "or-test"
-
-[models]
-advanced = ["claude-opus-4"]
-balanced = ["claude-sonnet-4", "gpt-4o"]
-fast = ["claude-haiku-4"]
-
-[preferences]
-load_balance_strategy = "round_robin"
-warn_on_model_change = true
-"#;
+        let toml = include_str!("testdata/config_parse_new.toml");
         let config: MayConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.max_iterations, 100);
         assert_eq!(config.provider.len(), 2);
@@ -1169,15 +1277,29 @@ warn_on_model_change = true
     }
 
     #[test]
-    fn test_parse_custom_provider() {
-        let toml = r#"
-[provider.my-ollama]
-type = "ollama"
-base_url = "http://192.168.1.100:11434/v1"
+    fn test_load_migrates_legacy_default_max_iterations() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+max_iterations = 50
 
-[models]
-fast = ["llama3"]
-"#;
+[provider.custom]
+type = "custom"
+base_url = "http://localhost:1234/v1"
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let config = MayConfig::load_from(&path).unwrap();
+        assert_eq!(config.max_iterations, 0);
+    }
+
+    #[test]
+    fn test_parse_custom_provider() {
+        let toml = include_str!("testdata/config_parse_custom_provider.toml");
         let config: MayConfig = toml::from_str(toml).unwrap();
         let provider = config.get_provider("my-ollama").unwrap();
         assert_eq!(provider.resolve_type("my-ollama"), ProviderType::Ollama);
@@ -1230,35 +1352,55 @@ fast = ["llama3"]
 
     #[test]
     fn test_provider_can_serve_model() {
+        let anthropic_model = "claude-sonnet-4-20250514";
+
+        // OpenAI can serve GPT models even when catalog canonical IDs collide across providers.
+        assert!(ProviderType::OpenAI.can_serve_model("gpt-4o"));
+
         // Anthropic can serve claude models
-        assert!(ProviderType::Anthropic.can_serve_model("claude-sonnet-4"));
+        assert!(ProviderType::Anthropic.can_serve_model(anthropic_model));
 
         // OpenRouter can serve anything
-        assert!(ProviderType::OpenRouter.can_serve_model("claude-sonnet-4"));
+        assert!(ProviderType::OpenRouter.can_serve_model(anthropic_model));
         assert!(ProviderType::OpenRouter.can_serve_model("gpt-4o"));
 
         // Copilot can serve OpenAI and Anthropic models, but not Google models
         assert!(ProviderType::Copilot.can_serve_model("gpt-4o"));
-        assert!(ProviderType::Copilot.can_serve_model("claude-3-5-sonnet"));
+        assert!(ProviderType::Copilot.can_serve_model(anthropic_model));
         assert!(!ProviderType::Copilot.can_serve_model("gemini-3-flash-preview"));
     }
 
     #[test]
+    fn test_openai_custom_endpoint_treated_as_generic_proxy() {
+        let official = ProviderInstance::new(ProviderType::OpenAI).with_api_key("sk-openai");
+        assert!(!official.is_generic_model_proxy("openai"));
+        assert!(!official.can_serve_model("openai", "gemini-3-flash-preview"));
+
+        let proxy = ProviderInstance::new(ProviderType::OpenAI)
+            .with_api_key("sk-proxy")
+            .with_base_url("https://proxy.example.com/v1");
+        assert!(proxy.is_generic_model_proxy("proxy-openai"));
+        assert!(proxy.can_serve_model("proxy-openai", "gemini-3-flash-preview"));
+    }
+
+    #[test]
     fn test_providers_for_model() {
+        let anthropic_model = "claude-sonnet-4-20250514";
         let mut config = MayConfig::default();
         config.upsert_provider("anthropic", ProviderInstance::default().with_api_key("key"));
         config.upsert_provider(
             "openrouter",
             ProviderInstance::default().with_api_key("key"),
         );
-        config.models.balanced = vec!["claude-sonnet-4".to_string()];
+        config.models.balanced = vec![anthropic_model.to_string()];
 
-        let providers = config.providers_for_model("claude-sonnet-4");
+        let providers = config.providers_for_model(anthropic_model);
         assert_eq!(providers.len(), 2); // Both can serve it
     }
 
     #[test]
     fn test_resolver_failover() {
+        let anthropic_model = "claude-sonnet-4-20250514";
         let mut config = MayConfig::default();
         config.upsert_provider(
             "anthropic",
@@ -1268,27 +1410,27 @@ fast = ["llama3"]
             "openrouter",
             ProviderInstance::default().with_api_key("key2"),
         );
-        config.models.balanced = vec!["claude-sonnet-4".to_string()];
+        config.models.balanced = vec![anthropic_model.to_string()];
         config.preferences.load_balance_strategy = LoadBalanceStrategy::FailoverOnly;
 
         let resolver = config.create_resolver();
 
         // First selection should pick one of the providers
-        let first = resolver.select_provider("claude-sonnet-4");
+        let first = resolver.select_provider(anthropic_model);
         assert!(first.is_some());
         let first_id = first.unwrap().id;
 
         // Mark first as failed
-        resolver.mark_failed("claude-sonnet-4", first_id);
+        resolver.mark_failed(anthropic_model, first_id);
 
         // Now should select the other provider
-        let second = resolver.select_provider("claude-sonnet-4");
+        let second = resolver.select_provider(anthropic_model);
         assert!(second.is_some());
         assert_ne!(second.unwrap().id, first_id);
 
         // Clear failures
-        resolver.clear_failed("claude-sonnet-4");
-        assert!(resolver.select_provider("claude-sonnet-4").is_some());
+        resolver.clear_failed(anthropic_model);
+        assert!(resolver.select_provider(anthropic_model).is_some());
     }
 
     #[test]

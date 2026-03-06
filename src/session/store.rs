@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use futures_lite::StreamExt;
 
 use super::{ChatHistory, ChatHistoryError};
+use crate::fs_utils::copy_dir_contents_recursive;
 
 /// Session store error.
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +23,12 @@ pub enum StoreError {
 pub struct SessionStore {
     may_dir: PathBuf,
     sessions_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxResourceLayout {
+    Symlinked,
+    ContainerMountPoints,
 }
 
 impl SessionStore {
@@ -65,14 +72,42 @@ impl SessionStore {
     }
 
     /// Create session directory structure.
-    pub async fn create_session_dirs(&self, id: &str) -> Result<(), StoreError> {
+    pub async fn create_session_dirs(
+        &self,
+        id: &str,
+        layout: SandboxResourceLayout,
+    ) -> Result<(), StoreError> {
         let session_dir = self.session_dir(id);
         async_fs::create_dir_all(&session_dir).await?;
         async_fs::create_dir_all(self.images_dir(id)).await?;
 
-        // Create sandbox symlinks to global resources
-        crate::bundle::Bundle::create_sandbox_symlinks(&session_dir, &self.may_dir).await?;
+        match layout {
+            SandboxResourceLayout::Symlinked => {
+                // Create sandbox symlinks to global resources.
+                crate::bundle::Bundle::create_sandbox_symlinks(&session_dir, &self.may_dir).await?;
+            }
+            SandboxResourceLayout::ContainerMountPoints => {
+                Self::ensure_mount_point_dir(&session_dir, ".skills").await?;
+                Self::ensure_mount_point_dir(&session_dir, ".subagents").await?;
+                self.seed_session_scoped_resources(&session_dir).await?;
+                async_fs::create_dir_all(session_dir.join("artifacts")).await?;
+            }
+        }
 
+        Ok(())
+    }
+
+    pub async fn reconcile_container_mount_points(&self, id: &str) -> Result<(), StoreError> {
+        let session_dir = self.session_dir(id);
+        if async_fs::metadata(&session_dir).await.is_err() {
+            return Ok(());
+        }
+        tracing::debug!(session_id = %id, path = %session_dir.display(), "Reconciling container mount points for session");
+
+        Self::ensure_mount_point_dir(&session_dir, ".skills").await?;
+        Self::ensure_mount_point_dir(&session_dir, ".subagents").await?;
+        self.seed_session_scoped_resources(&session_dir).await?;
+        async_fs::create_dir_all(session_dir.join("artifacts")).await?;
         Ok(())
     }
 
@@ -122,5 +157,66 @@ impl SessionStore {
             async_fs::remove_dir_all(&path).await?;
         }
         Ok(())
+    }
+
+    async fn ensure_mount_point_dir(parent: &Path, name: &str) -> Result<(), StoreError> {
+        let target = parent.join(name);
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    tracing::debug!(path = %target.display(), "Removing stale symlink mount point");
+                    std::fs::remove_file(&target)?;
+                } else if meta.is_dir() {
+                    return Ok(());
+                } else {
+                    return Err(StoreError::Io(std::io::Error::other(format!(
+                        "invalid container mount point {}, expected directory",
+                        target.display()
+                    ))));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+
+        async_fs::create_dir_all(&target).await?;
+        Ok(())
+    }
+
+    async fn seed_session_scoped_resources(&self, session_dir: &Path) -> Result<(), StoreError> {
+        Self::copy_dir_contents_if_target_empty(
+            &self.may_dir.join("skills"),
+            &session_dir.join(".skills"),
+        )
+        .await?;
+        Self::copy_dir_contents_if_target_empty(
+            &self.may_dir.join("subagents"),
+            &session_dir.join(".subagents"),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn copy_dir_contents_if_target_empty(
+        source: &Path,
+        target: &Path,
+    ) -> Result<(), StoreError> {
+        if async_fs::metadata(source).await.is_err() {
+            return Ok(());
+        }
+        if !Self::is_dir_empty(target).await? {
+            return Ok(());
+        }
+        let source = source.to_path_buf();
+        let target = target.to_path_buf();
+        tokio::task::spawn_blocking(move || copy_dir_contents_recursive(&source, &target))
+            .await
+            .map_err(|error| StoreError::Io(std::io::Error::other(error.to_string())))??;
+        Ok(())
+    }
+
+    async fn is_dir_empty(path: &Path) -> Result<bool, StoreError> {
+        let mut entries = async_fs::read_dir(path).await?;
+        Ok(entries.next().await.is_none())
     }
 }

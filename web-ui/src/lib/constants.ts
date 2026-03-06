@@ -39,7 +39,7 @@ export function inferProvider(modelId: string): Provider {
 
 export function buildModelCatalog(
   modelIds: string[],
-  details?: Array<{ id: string; nickname: string; context_window?: number; abilities?: string[] }>,
+  details?: Array<{ id: string; nickname: string; contextWindow?: number; abilities?: string[] }>,
 ): Model[] {
   if (!modelIds.length) return [];
   const detailsMap = new Map((details ?? []).map((d) => [d.id, d]));
@@ -50,7 +50,7 @@ export function buildModelCatalog(
       id,
       name: meta?.nickname || id,
       provider: inferProvider(id),
-      contextWindow: meta?.context_window,
+      contextWindow: meta?.contextWindow,
       abilities,
       reasoning: abilities.includes('reasoning') || /o1|reason/i.test(id),
     };
