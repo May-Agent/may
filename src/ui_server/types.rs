@@ -576,6 +576,12 @@ pub(crate) struct SessionRuntimesEventPayload {
     pub(crate) sessions: Vec<SessionRuntimeSnapshotItem>,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProfileSessionsEventPayload {
+    pub(crate) profile_sessions: crate::profile::ProfileSessions,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArtifactEntry {

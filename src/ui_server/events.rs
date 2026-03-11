@@ -8,11 +8,14 @@ use skyzen::responder::Sse;
 use skyzen::utils::State;
 use tokio::time::MissedTickBehavior;
 
+use crate::profile::query_profile_sessions;
+
 use super::helpers::send_event;
 use super::state::UiServerState;
 use super::types::{
-    ConfigEventPayload, RequestLogsResponse, SessionRuntimeEventPayload,
-    SessionRuntimeSnapshotItem, SessionRuntimesEventPayload, SseHeartbeat,
+    ConfigEventPayload, ProfileSessionsEventPayload, RequestLogsResponse,
+    SessionRuntimeEventPayload, SessionRuntimeSnapshotItem, SessionRuntimesEventPayload,
+    SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -52,6 +55,7 @@ pub(super) async fn stream_events(
         let mut last_container_prepare_sig = String::new();
         let mut last_runtime_sig = String::new();
         let mut last_profile_runtime_sig = String::new();
+        let mut last_profile_sessions_sig = String::new();
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Ignore the first immediate tick; we emit initial state immediately below.
@@ -87,6 +91,16 @@ pub(super) async fn stream_events(
             &sender,
             profile_id.as_deref(),
             &mut last_profile_runtime_sig,
+        )
+        .await
+        {
+            return;
+        }
+        if !emit_profile_sessions_if_changed(
+            &state_cloned,
+            &sender,
+            profile_id.as_deref(),
+            &mut last_profile_sessions_sig,
         )
         .await
         {
@@ -136,6 +150,16 @@ pub(super) async fn stream_events(
                         &sender,
                         profile_id.as_deref(),
                         &mut last_profile_runtime_sig,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    if !emit_profile_sessions_if_changed(
+                        &state_cloned,
+                        &sender,
+                        profile_id.as_deref(),
+                        &mut last_profile_sessions_sig,
                     )
                     .await
                     {
@@ -277,6 +301,38 @@ async fn emit_session_runtimes_if_changed(
         && sig != *last_sig
     {
         if !send_event(sender, "session_runtimes", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
+    }
+    true
+}
+
+async fn emit_profile_sessions_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    profile_filter: Option<&str>,
+    last_sig: &mut String,
+) -> bool {
+    let Some(profile_id) = profile_filter else {
+        return true;
+    };
+    let db = {
+        let manager = state.session_manager.lock().await;
+        manager.db().clone()
+    };
+    let profile_sessions = match query_profile_sessions(&db, profile_id).await {
+        Ok(profile_sessions) => profile_sessions,
+        Err(error) => {
+            tracing::warn!(profile_id, error = %error, "failed to load profile sessions snapshot");
+            return true;
+        }
+    };
+    let payload = ProfileSessionsEventPayload { profile_sessions };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "profile_sessions", &payload).await {
             return false;
         }
         *last_sig = sig;

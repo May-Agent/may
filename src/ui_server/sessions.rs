@@ -136,6 +136,7 @@ pub(super) async fn create_session(
     persist_last_model(&state, &model)
         .await
         .map_err(internal_error)?;
+    state.notify_ui_events();
 
     Ok(Json(ApiSession::new_empty(id, model)))
 }
@@ -198,6 +199,7 @@ pub(super) async fn update_session(
         resolve_default_model(&cfg, current_model)
             .ok_or_else(|| internal_error(format!("no model resolved for session {current_id}")))?
     };
+    state.notify_ui_events();
 
     Ok(Json(ApiSession {
         id,
@@ -219,6 +221,7 @@ pub(super) async fn delete_session(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let mut manager = state.session_manager.lock().await;
     manager.delete_session(&id).await.map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -239,5 +242,6 @@ pub(super) async fn delete_all_sessions(
     }
 
     let _ = manager.create_session();
+    state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))
 }
