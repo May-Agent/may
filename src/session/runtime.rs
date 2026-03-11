@@ -85,6 +85,28 @@ impl Default for PendingUserMessageMode {
     }
 }
 
+impl PendingUserMessageMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Queue => "queue",
+        }
+    }
+}
+
+impl core::str::FromStr for PendingUserMessageMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "steer" => Ok(Self::Steer),
+            "queue" => Ok(Self::Queue),
+            other => Err(format!("unknown pending user message mode: {other}")),
+        }
+    }
+}
+
 /// Persisted ask-user request visible after refresh.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

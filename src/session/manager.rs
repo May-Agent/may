@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::store::SandboxResourceLayout;
 use super::{ChatHistory, ChatMessage, ChatMessageStats, MessageRole, SessionStore};
-use super::{SessionRuntimeState, SessionRuntimeSummary};
+use super::SessionRuntimeSummary;
 use crate::bundle::Bundle;
 use crate::config::MayConfig;
 use crate::db::{ChatDb, ChatDbError};
@@ -118,7 +118,7 @@ impl SessionSummary {
         let created_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &s.created_at).ok();
         let updated_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &s.updated_at).ok();
 
-        let mut summary = Self {
+        Self {
             id: SessionId::from_string(s.id),
             title: s.title,
             model: s.model,
@@ -131,54 +131,8 @@ impl SessionSummary {
             created_at,
             updated_at,
             content_preview: s.preview.unwrap_or_default(),
-            runtime: SessionRuntimeSummary {
-                state: s
-                    .runtime_state
-                    .parse()
-                    .unwrap_or(SessionRuntimeState::Idle),
-                queued_count: s
-                    .queued_messages_json
-                    .as_deref()
-                    .and_then(|json| {
-                        serde_json::from_str::<Vec<crate::session::PendingUserMessage>>(json).ok()
-                    })
-                    .map_or(0, |messages| messages.len()),
-                pending_immediate: s
-                    .pending_immediate_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok()),
-                queued_messages: s
-                    .queued_messages_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok())
-                    .unwrap_or_default(),
-                waiting_permission: match (
-                    s.waiting_permission_request_id,
-                    s.waiting_permission_request_json,
-                ) {
-                    (Some(id), Some(json)) => serde_json::from_str::<
-                        crate::session::PersistedPermissionRequestPayload,
-                    >(&json)
-                    .ok()
-                    .map(|request| crate::session::PersistedPermissionRequest { id, request }),
-                    _ => None,
-                },
-                waiting_ask_user: match (
-                    s.waiting_ask_user_request_id,
-                    s.waiting_ask_user_request_json,
-                ) {
-                    (Some(id), Some(json)) => serde_json::from_str::<
-                        Vec<crate::session::PersistedAskUserQuestion>,
-                    >(&json)
-                    .ok()
-                    .map(|questions| crate::session::PersistedAskUserRequest { id, questions }),
-                    _ => None,
-                },
-                updated_at: s.runtime_updated_at,
-            },
-        };
-        summary.runtime.normalize_state();
-        summary
+            runtime: SessionRuntimeSummary::default(),
+        }
     }
 }
 
@@ -229,10 +183,16 @@ fn map_chat_stats_to_db_params(stats: &ChatMessageStats) -> crate::db::MessageSt
 /// useful for spawned tasks that only need a `ChatDb` clone.
 pub async fn list_summaries_from_db(db: &ChatDb) -> Result<Vec<SessionSummary>, SessionError> {
     let db_sessions = db.list_sessions().await?;
-    Ok(db_sessions
-        .into_iter()
-        .map(SessionSummary::from_db_model)
-        .collect())
+    let mut summaries = Vec::with_capacity(db_sessions.len());
+    for session in db_sessions {
+        let mut summary = SessionSummary::from_db_model(session);
+        summary.runtime = db
+            .get_session_runtime(summary.id.as_str())
+            .await?
+            .unwrap_or_default();
+        summaries.push(summary);
+    }
+    Ok(summaries)
 }
 
 /// Manages sessions and their lifecycle.

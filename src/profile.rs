@@ -134,7 +134,11 @@ pub async fn query_profile_sessions(
     let mut archived: Vec<SessionSummary> = Vec::new();
 
     for s in all_sessions {
-        let summary = SessionSummary::from_db_model(s.clone());
+        let mut summary = SessionSummary::from_db_model(s.clone());
+        summary.runtime = db
+            .get_session_runtime(summary.id.as_str())
+            .await?
+            .unwrap_or_default();
         if s.archived {
             archived.push(summary);
         } else if s.pinned {
