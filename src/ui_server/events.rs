@@ -6,15 +6,13 @@ use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
 use skyzen::responder::Sse;
 use skyzen::utils::State;
-use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
 use super::helpers::send_event;
-use super::state::{AskUserPollResponse, UiServerState};
+use super::state::UiServerState;
 use super::types::{
-    ConfigEventPayload, PermissionPollItem, PermissionPollResponse, RequestLogsResponse,
-    SessionRuntimeEventPayload, SessionRuntimeSnapshotItem, SessionRuntimesEventPayload,
-    SseHeartbeat,
+    ConfigEventPayload, RequestLogsResponse, SessionRuntimeEventPayload,
+    SessionRuntimeSnapshotItem, SessionRuntimesEventPayload, SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -49,8 +47,6 @@ pub(super) async fn stream_events(
     let state_cloned = state.clone();
 
     tokio::spawn(async move {
-        let mut last_permission_sig = String::new();
-        let mut last_ask_user_sig = String::new();
         let mut last_config_sig = String::new();
         let mut last_request_logs_sig = String::new();
         let mut last_container_prepare_sig = String::new();
@@ -61,26 +57,6 @@ pub(super) async fn stream_events(
         // Ignore the first immediate tick; we emit initial state immediately below.
         let _ = heartbeat.tick().await;
 
-        if !emit_permission_if_changed(
-            &state_cloned,
-            &sender,
-            session_id.as_deref(),
-            &mut last_permission_sig,
-        )
-        .await
-        {
-            return;
-        }
-        if !emit_ask_user_if_changed(
-            &state_cloned,
-            &sender,
-            session_id.as_deref(),
-            &mut last_ask_user_sig,
-        )
-        .await
-        {
-            return;
-        }
         if !emit_config_if_changed(&state_cloned, &sender, &mut last_config_sig).await {
             return;
         }
@@ -119,27 +95,7 @@ pub(super) async fn stream_events(
 
         loop {
             tokio::select! {
-                _ = state_cloned.permission_approver.listen() => {
-                    if !emit_permission_if_changed(
-                        &state_cloned,
-                        &sender,
-                        session_id.as_deref(),
-                        &mut last_permission_sig,
-                    ).await {
-                        break;
-                    }
-                }
-                _ = state_cloned.ask_user_approver.listen() => {
-                    if !emit_ask_user_if_changed(
-                        &state_cloned,
-                        &sender,
-                        session_id.as_deref(),
-                        &mut last_ask_user_sig,
-                    ).await {
-                        break;
-                    }
-                }
-                _ = wait_for_notify(&state_cloned.ui_events_notify) => {
+                _ = state_cloned.ui_events_notify.notified() => {
                     if !emit_config_if_changed(
                         &state_cloned,
                         &sender,
@@ -196,55 +152,6 @@ pub(super) async fn stream_events(
     });
 
     Ok(sse)
-}
-
-async fn wait_for_notify(notify: &Arc<Notify>) {
-    notify.notified().await;
-}
-
-async fn emit_permission_if_changed(
-    state: &Arc<UiServerState>,
-    sender: &skyzen::responder::sse::Sender,
-    session_filter: Option<&str>,
-    last_permission_sig: &mut String,
-) -> bool {
-    let permission = state
-        .permission_approver
-        .snapshot_session_runtime(session_filter)
-        .map(|(id, request)| PermissionPollItem { id, request });
-    let permission_payload = PermissionPollResponse {
-        state: permission.as_ref().map(|_| "waiting_permission"),
-        request: permission,
-    };
-    if let Ok(sig) = serde_json::to_string(&permission_payload)
-        && sig != *last_permission_sig
-    {
-        if !send_event(sender, "permission", &permission_payload).await {
-            return false;
-        }
-        *last_permission_sig = sig;
-    }
-    true
-}
-
-async fn emit_ask_user_if_changed(
-    state: &Arc<UiServerState>,
-    sender: &skyzen::responder::sse::Sender,
-    session_filter: Option<&str>,
-    last_ask_user_sig: &mut String,
-) -> bool {
-    let ask_user_payload = AskUserPollResponse {
-        request: state.ask_user_approver.snapshot_pending(session_filter),
-    };
-    if let Ok(sig) = serde_json::to_string(&ask_user_payload)
-        && sig != *last_ask_user_sig
-    {
-        if !send_event(sender, "ask_user", &ask_user_payload).await {
-            return false;
-        }
-        *last_ask_user_sig = sig;
-    }
-    true
 }
 
 async fn emit_config_if_changed(

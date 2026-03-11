@@ -498,13 +498,6 @@ pub(crate) struct PermissionPollItem {
     pub(crate) request: crate::agent::PermissionRequest,
 }
 
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PermissionPollResponse {
-    pub(crate) request: Option<PermissionPollItem>,
-    pub(crate) state: Option<&'static str>,
-}
-
 impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
     fn from(summary: crate::session::SessionRuntimeSummary) -> Self {
         Self {

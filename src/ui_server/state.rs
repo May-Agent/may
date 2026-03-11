@@ -131,20 +131,6 @@ pub(crate) struct UiServerState {
     pub(crate) may_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AskUserRequestPayload {
-    pub(crate) id: String,
-    pub(crate) questions: Vec<Question>,
-    pub(crate) session_id: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AskUserPollResponse {
-    pub(crate) request: Option<AskUserRequestPayload>,
-}
-
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UiQuestionAnswer {
@@ -162,7 +148,6 @@ pub(crate) struct AskUserRespondRequest {
 /// Pending ask-user entry: response channel + session_id for persistence.
 #[derive(Debug, Clone)]
 struct AskUserPendingPayload {
-    questions: Vec<Question>,
     session_id: Option<String>,
 }
 
@@ -242,7 +227,6 @@ impl AskUserApprover {
     pub(crate) async fn enqueue(&self, request: AskUserRequest, session_id: Option<String>) {
         let questions = request.args.clone().into_questions();
         let (id, rx) = self.inner.enqueue(AskUserPendingPayload {
-            questions: questions.clone(),
             session_id: session_id.clone(),
         });
         if let Some(session_id) = session_id {
@@ -277,29 +261,6 @@ impl AskUserApprover {
         self.inner
             .get_payload(request_id)
             .and_then(|payload| payload.session_id)
-    }
-
-    pub(crate) fn snapshot_pending(
-        &self,
-        session_filter: Option<&str>,
-    ) -> Option<AskUserRequestPayload> {
-        self.inner
-            .peek_filtered(|payload| {
-                if let Some(expected) = session_filter {
-                    payload.session_id.as_deref() == Some(expected)
-                } else {
-                    true
-                }
-            })
-            .map(|(id, payload)| AskUserRequestPayload {
-                id,
-                questions: payload.questions,
-                session_id: payload.session_id,
-            })
-    }
-
-    pub(crate) fn listen(&self) -> event_listener::EventListener {
-        self.inner.listen()
     }
 }
 
