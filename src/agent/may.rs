@@ -192,6 +192,19 @@ impl PermissionRequestMode {
     }
 }
 
+impl core::str::FromStr for PermissionRequestMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "unsafe" => Ok(Self::Unsafe),
+            "ssh" => Ok(Self::Ssh),
+            other => Err(format!("unknown permission request mode: {other}")),
+        }
+    }
+}
+
 impl From<BashMode> for PermissionRequestMode {
     fn from(value: BashMode) -> Self {
         match value {
@@ -282,10 +295,7 @@ impl PermissionApprover {
         if let Some(session_id) = payload.session_id.clone() {
             if let Some(db) = self.runtime_db.clone() {
                 if let Err(error) = db
-                    .set_waiting_permission(
-                        &session_id,
-                        Some(Self::persisted_request(id, payload)),
-                    )
+                    .set_waiting_permission(&session_id, Some(Self::persisted_request(id, payload)))
                     .await
                 {
                     tracing::warn!(session_id = %session_id, error = %error, "failed to persist permission runtime state");

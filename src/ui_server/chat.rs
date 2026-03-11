@@ -16,8 +16,8 @@ use crate::db::CreateScheduledTaskParams;
 use crate::notification::{NotificationManager, NotificationPayload};
 use crate::scheduler::TaskScheduler;
 use crate::session::{
-    ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage, PersistedAttachment,
-    SessionId, SessionRuntimeState,
+    ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage, PersistedAttachment, SessionId,
+    SessionRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 use crate::{ask_user, workspace_request};
@@ -33,10 +33,9 @@ use super::state::UiServerState;
 use super::title_generation;
 use super::types::{
     ApiMessage, BashStateSnapshot, ChatRequest, ChatResponse, ContextDebugMessage,
-    EnqueueChatResponse, PendingMessageKind, RemovePendingMessageRequest, RequestLogEntry,
-    RequestStats, SseChunkEvent, SseDoneEvent,
-    SseErrorEvent, SseStartEvent, SseTodoUpdateEvent, SseToolEndEvent, SseToolStartEvent,
-    ToolEventRecord,
+    PendingMessageKind, RemovePendingMessageRequest, RequestLogEntry, RequestStats,
+    SessionRuntimeResponse, SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent,
+    SseTodoUpdateEvent, SseToolEndEvent, SseToolStartEvent, ToolEventRecord,
 };
 
 // ── ChatSink trait ──────────────────────────────────────────
@@ -151,7 +150,9 @@ struct AgentRunResult {
     elapsed_ms: u64,
 }
 
-fn persisted_attachments(attachments: Vec<super::types::ApiAttachment>) -> Vec<PersistedAttachment> {
+fn persisted_attachments(
+    attachments: Vec<super::types::ApiAttachment>,
+) -> Vec<PersistedAttachment> {
     attachments
         .into_iter()
         .map(|attachment| PersistedAttachment {
@@ -291,7 +292,7 @@ pub(super) async fn chat(
 pub(super) async fn enqueue_chat(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Json<EnqueueChatResponse>> {
+) -> SkyResult<Json<SessionRuntimeResponse>> {
     let pending = pending_user_message_from_request(req.clone());
     let runtime = state
         .runtime_service
@@ -299,21 +300,18 @@ pub(super) async fn enqueue_chat(
         .await
         .map_err(internal_error)?;
 
-    Ok(Json(EnqueueChatResponse {
-        session_id: req.session_id,
-        runtime_state: runtime.state,
-        queued_count: runtime.queued_count,
-        pending_immediate: runtime.pending_immediate,
-        queued_messages: runtime.queued_messages,
-    }))
+    Ok(Json(runtime.into()))
 }
 
 pub(super) async fn remove_pending_message(
     params: skyzen::routing::Params,
     Json(req): Json<RemovePendingMessageRequest>,
     State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Json<EnqueueChatResponse>> {
-    let session_id = params.get("id").map_err(super::error::bad_request_error)?.to_string();
+) -> SkyResult<Json<SessionRuntimeResponse>> {
+    let session_id = params
+        .get("id")
+        .map_err(super::error::bad_request_error)?
+        .to_string();
     let runtime = match req.kind {
         PendingMessageKind::PendingImmediate => state
             .runtime_service
@@ -324,19 +322,14 @@ pub(super) async fn remove_pending_message(
             .runtime_service
             .remove_queued_at(
                 &session_id,
-                req.index
-                    .ok_or_else(|| super::error::bad_request_error("index is required for queued removal"))?,
+                req.index.ok_or_else(|| {
+                    super::error::bad_request_error("index is required for queued removal")
+                })?,
             )
             .await
             .map_err(internal_error)?,
     };
-    Ok(Json(EnqueueChatResponse {
-        session_id,
-        runtime_state: runtime.state,
-        queued_count: runtime.queued_count,
-        pending_immediate: runtime.pending_immediate,
-        queued_messages: runtime.queued_messages,
-    }))
+    Ok(Json(runtime.into()))
 }
 
 pub(super) async fn chat_stream(

@@ -38,7 +38,6 @@ import {
   ARTIFACT_PANEL_MAX_VIEWPORT_RATIO,
   LONG_TEXT_THRESHOLD,
   type QueuedMessage,
-  type QueueMap,
   type PreviewPaneState,
 } from "./chatUtils";
 
@@ -146,15 +145,12 @@ export function ChatInterface({
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleInput, setTitleInput] = useState("");
-  const [queuedBySession, setQueuedBySession] = useState<QueueMap>({});
   const [newChatModelId, setNewChatModelId] = useState("");
   const [newChatReasoningEffort, setNewChatReasoningEffort] = useState<string | undefined>(undefined);
   const [isSending, setIsSending] = useState(false);
   const [isStreamControllerActive, setIsStreamControllerActive] = useState(false);
   const [isModelUpdating, setIsModelUpdating] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
-  const [pendingPermission, setPendingPermission] =
-    useState<PermissionRequest | null>(null);
   const [isPermissionSubmitting, setIsPermissionSubmitting] = useState(false);
   const [pendingAskUser, setPendingAskUser] = useState<AskUserState | null>(null);
   const [isAskUserSubmitting, setIsAskUserSubmitting] = useState(false);
@@ -187,7 +183,6 @@ export function ChatInterface({
   const titleInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const streamingSessionIdRef = useRef<string | null>(null);
-  const queuedBySessionRef = useRef<QueueMap>({});
   const previewSessionRef = useRef<string | null>(null);
   const currentSession = sessions.find((s) => s.id === currentSessionId);
   const currentProfile = profiles.find((profile) => profile.id === currentProfileId) ?? null;
@@ -264,26 +259,22 @@ export function ChatInterface({
   const runtimeSession = useRuntimeStore((state) =>
     currentSessionId ? state.sessions[currentSessionId] : undefined,
   );
-  const activeQueueKey = currentSessionId ?? '__new__';
-  const queuedMessages =
-    currentSessionId && runtimeSession
-      ? [
-          ...(runtimeSession.pendingImmediate ? [runtimeSession.pendingImmediate] : []),
-          ...(runtimeSession.queuedMessages ?? []),
-        ]
-      : queuedBySession[activeQueueKey] ?? [];
+  const queuedMessages = runtimeSession
+    ? [
+        ...(runtimeSession.pendingImmediate ? [runtimeSession.pendingImmediate] : []),
+        ...(runtimeSession.queuedMessages ?? []),
+      ]
+    : [];
+  const pendingPermission: PermissionRequest | null =
+    runtimeSession?.waitingPermission ?? null;
+  const pendingAskUserRequest: AskUserRequest | null =
+    runtimeSession?.waitingAskUser ?? null;
   const isGenerating = runtimeSession?.state === 'running';
   const showStopButton =
     isGenerating || isSending || isStreamControllerActive || hasPendingAssistantMessage;
-  const setRuntimeStreaming = useRuntimeStore((state) => state.setStreaming);
-  const setRuntimeQueuedCount = useRuntimeStore((state) => state.setQueuedCount);
-  const setRuntimeQueuedMessages = useRuntimeStore((state) => state.setQueuedMessages);
-  const setRuntimeWaitingPermission = useRuntimeStore(
-    (state) => state.setWaitingPermission,
-  );
-  const setRuntimeServerState = useRuntimeStore((state) => state.setServerState);
+  const markRuntimeRunning = useRuntimeStore((state) => state.markRunning);
+  const applyRuntime = useRuntimeStore((state) => state.applyRuntime);
   const markRuntimeFirstToken = useRuntimeStore((state) => state.markFirstToken);
-  const clearRuntimeSession = useRuntimeStore((state) => state.clearSessionRuntime);
 
   const normalizePreviewUrl = useCallback((value: string): string | null => {
     const trimmed = value.trim();
@@ -554,10 +545,6 @@ export function ChatInterface({
   }, [openPreview]);
 
   useEffect(() => {
-    queuedBySessionRef.current = queuedBySession;
-  }, [queuedBySession]);
-
-  useEffect(() => {
     selectedPreviewPathRef.current = selectedPreviewPath;
   }, [selectedPreviewPath]);
 
@@ -603,7 +590,6 @@ export function ChatInterface({
 
   useEffect(() => {
     setUiError(null);
-    setPendingPermission(null);
     setPendingAskUser(null);
   }, [currentProfileId]);
 
@@ -613,12 +599,7 @@ export function ChatInterface({
     void (async () => {
       try {
         const runtime = await fetchSessionRuntime(currentSessionId);
-        setRuntimeServerState(currentSessionId, runtime.state);
-        setRuntimeQueuedMessages(
-          currentSessionId,
-          runtime.pendingImmediate ?? null,
-          runtime.queuedMessages ?? [],
-        );
+        applyRuntime(currentSessionId, runtime);
       } catch (error) {
         setUiError(
           `Failed to fetch runtime state: ${
@@ -627,7 +608,26 @@ export function ChatInterface({
         );
       }
     })();
-  }, [currentSessionId, setRuntimeQueuedMessages, setRuntimeServerState]);
+  }, [applyRuntime, currentSessionId]);
+
+  useEffect(() => {
+    if (!pendingAskUserRequest) {
+      setPendingAskUser(null);
+      return;
+    }
+    setPendingAskUser((previous) => {
+      if (previous?.request.id === pendingAskUserRequest.id) {
+        return previous;
+      }
+      return {
+        request: pendingAskUserRequest,
+        answers: pendingAskUserRequest.questions.map((question) => ({
+          section: question.section,
+          answer: null,
+        })),
+      };
+    });
+  }, [pendingAskUserRequest]);
 
   useEffect(() => {
     const nextPreviewSessionId = currentSessionId ?? null;
@@ -721,7 +721,6 @@ export function ChatInterface({
 
   useEffect(() => {
     if (!currentSessionId) {
-      setPendingPermission(null);
       setPendingAskUser(null);
       return;
     }
@@ -731,40 +730,12 @@ export function ChatInterface({
     const unsubscribe = subscribeUiEvents({
       sessionId: currentSessionId,
       onOpen: () => banner.clear(),
-      onPermission: ({ request, state }) => {
-        banner.clear();
-        if (request && request.sessionId && request.sessionId !== currentSessionId) {
-          setUiError(
-            `permission request session mismatch: expected ${currentSessionId}, got ${request.sessionId}`,
-          );
-          return;
-        }
-        const next = state === 'waiting_permission' ? request ?? null : null;
-        setPendingPermission(next);
-        setRuntimeWaitingPermission(currentSessionId, next);
-      },
-      onAskUser: ({ request }) => {
-        banner.clear();
-        if (!request) {
-          setPendingAskUser(null);
-          return;
-        }
-        setPendingAskUser({
-          request,
-          answers: request.questions.map((q) => ({ section: q.section, answer: null })),
-        });
-      },
       onSessionRuntime: ({ sessionId, runtime }) => {
         banner.clear();
         if (sessionId !== currentSessionId) {
           return;
         }
-        setRuntimeServerState(sessionId, runtime.state);
-        setRuntimeQueuedMessages(
-          sessionId,
-          runtime.pendingImmediate ?? null,
-          runtime.queuedMessages ?? [],
-        );
+        applyRuntime(sessionId, runtime);
       },
       onError: () => banner.schedule(),
       onHeartbeat: () => banner.clear(),
@@ -774,7 +745,7 @@ export function ChatInterface({
       banner.cleanup();
       unsubscribe();
     };
-  }, [currentSessionId, setRuntimeWaitingPermission]);
+  }, [applyRuntime, currentSessionId]);
 
   useEffect(() => {
     userScrolledUpRef.current = false;
@@ -908,8 +879,11 @@ export function ChatInterface({
     }
   };
 
-  const removeQueuedMessage = useCallback(async (queueKey: string, index: number) => {
-    if (currentSessionId && queueKey === currentSessionId) {
+  const removeQueuedMessage = useCallback(async (index: number) => {
+    if (!currentSessionId) {
+      return;
+    }
+    try {
       const hasPendingImmediate = runtimeSession?.pendingImmediate != null;
       const kind = hasPendingImmediate && index === 0 ? 'pending_immediate' : 'queued';
       const queuedIndex = hasPendingImmediate ? index - 1 : index;
@@ -918,45 +892,18 @@ export function ChatInterface({
         kind,
         index: kind === 'queued' ? queuedIndex : undefined,
       });
-      setRuntimeServerState(currentSessionId, runtime.state);
-      setRuntimeQueuedMessages(
-        currentSessionId,
-        runtime.pendingImmediate ?? null,
-        runtime.queuedMessages ?? [],
+      applyRuntime(currentSessionId, runtime);
+    } catch (error) {
+      setUiError(
+        `Failed to remove queued message: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
       );
-      return;
     }
+  }, [applyRuntime, currentSessionId, runtimeSession]);
 
-    let nextLength = 0;
-    setQueuedBySession((prev) => {
-      const list = prev[queueKey] ?? [];
-      const nextList = list.filter((_, idx) => idx !== index);
-      nextLength = nextList.length;
-      const next = { ...prev };
-      if (nextList.length > 0) {
-        next[queueKey] = nextList;
-      } else {
-        delete next[queueKey];
-      }
-      return next;
-    });
-    if (currentSessionId && queueKey === currentSessionId) {
-      setRuntimeQueuedCount(currentSessionId, nextLength);
-    }
-  }, [
-    currentSessionId,
-    removePendingSessionMessage,
-    runtimeSession,
-    setRuntimeQueuedCount,
-    setRuntimeQueuedMessages,
-    setRuntimeServerState,
-  ]);
-
-  const steerQueuedMessage = useCallback((queueKey: string, index: number) => {
-    const queued =
-      currentSessionId && queueKey === currentSessionId
-        ? queuedMessages[index]
-        : (queuedBySessionRef.current[queueKey] ?? [])[index];
+  const steerQueuedMessage = useCallback((index: number) => {
+    const queued = queuedMessages[index];
     if (!queued) {
       return;
     }
@@ -976,17 +923,22 @@ export function ChatInterface({
       setAttachments((prev) => [...restored, ...prev]);
     }
 
-    void removeQueuedMessage(queueKey, index);
+    void removeQueuedMessage(index);
     window.setTimeout(() => {
       composerInputRef.current?.focus();
     }, 0);
-  }, [currentSessionId, queuedMessages, removeQueuedMessage]);
+  }, [queuedMessages, removeQueuedMessage]);
 
   const composerPlaceholder = queuedMessages.length > 0
     ? "Ask for follow-up changes"
     : isNewChat
       ? "How can I help you today?"
       : "Type a message...";
+
+  const syncSessionRuntime = useCallback(async (sessionId: string) => {
+    const runtime = await fetchSessionRuntime(sessionId);
+    applyRuntime(sessionId, runtime);
+  }, [applyRuntime]);
 
 
   const handleSend = async (options?: {
@@ -1037,7 +989,6 @@ export function ChatInterface({
       setAttachments([]);
     }
 
-    const queueSourceKey = options?.sessionIdHint ?? currentSessionId ?? '__new__';
     const targetRuntime = options?.sessionIdHint
       ? useRuntimeStore.getState().sessions[options.sessionIdHint]
       : runtimeSession;
@@ -1055,13 +1006,7 @@ export function ChatInterface({
             attachments: atts,
             deliveryMode,
           });
-          setRuntimeServerState(runtimeSessionId, runtime.state);
-          setRuntimeQueuedMessages(
-            runtimeSessionId,
-            runtime.pendingImmediate ?? null,
-            runtime.queuedMessages ?? [],
-          );
-          void refreshProfileSessions();
+          applyRuntime(runtimeSessionId, runtime);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           setUiError(message);
@@ -1112,17 +1057,6 @@ export function ChatInterface({
 
     if (pendingBatch.length === 0) { setIsSending(false); return; }
 
-    if (queueSourceKey !== '__new__') {
-      setQueuedBySession((prev) => {
-        const next = { ...prev };
-        delete next[queueSourceKey];
-        delete next[sessionId];
-        return next;
-      });
-    }
-    setRuntimeQueuedMessages(sessionId, null, []);
-    void refreshProfileSessions();
-
     if (!options?.skipAppendUserMessages) {
       for (const queued of pendingBatch) {
         addMessage(sessionId, queued.content, "user", queued.attachments);
@@ -1131,7 +1065,7 @@ export function ChatInterface({
 
     userScrolledUpRef.current = false;
     streamingSessionIdRef.current = sessionId;
-    setRuntimeStreaming(sessionId);
+    markRuntimeRunning(sessionId);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -1635,21 +1569,20 @@ export function ChatInterface({
       abortControllerRef.current = null;
       setIsStreamControllerActive(false);
       setIsSending(false);
-      clearRuntimeSession(sessionId);
       if (streamingSessionIdRef.current === sessionId) {
         streamingSessionIdRef.current = null;
       }
       setIsBrowserOpen(false);
 
+      void syncSessionRuntime(sessionId).catch((error) => {
+        setUiError(
+          `Failed to sync runtime state: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
       if (completedNormally) {
         void (async () => {
-          const runtime = await fetchSessionRuntime(sessionId);
-          setRuntimeServerState(sessionId, runtime.state);
-          setRuntimeQueuedMessages(
-            sessionId,
-            runtime.pendingImmediate ?? null,
-            runtime.queuedMessages ?? [],
-          );
           await refreshProfileSessions();
         })();
       }
@@ -1694,8 +1627,13 @@ export function ChatInterface({
           }),
         );
       }
-
-      clearRuntimeSession(runtimeSessionId);
+      void syncSessionRuntime(runtimeSessionId).catch((error) => {
+        setUiError(
+          `Failed to sync runtime state: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
     }
     streamingSessionIdRef.current = null;
   };
@@ -1704,9 +1642,14 @@ export function ChatInterface({
     if (!pendingPermission || !currentSessionId) return;
     setIsPermissionSubmitting(true);
     try {
-      await respondPermissionRequest(pendingPermission.id, approved);
-      setPendingPermission(null);
-      setRuntimeWaitingPermission(currentSessionId, null);
+      const runtime = await respondPermissionRequest(pendingPermission.id, approved);
+      applyRuntime(currentSessionId, runtime);
+    } catch (error) {
+      setUiError(
+        `permission submit failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     } finally {
       setIsPermissionSubmitting(false);
     }
@@ -1727,22 +1670,23 @@ export function ChatInterface({
     });
   };
 
-  const handleAskUserSubmit = async (answersOverride?: AskUserAnswer[]) => {
-    if (!pendingAskUser) return;
+  const handleAskUserSubmit = useCallback(async (answersOverride?: AskUserAnswer[]) => {
+    if (!pendingAskUser || !currentSessionId) return;
     setIsAskUserSubmitting(true);
     setUiError(null);
     try {
-      await respondAskUserRequest(
+      const runtime = await respondAskUserRequest(
         pendingAskUser.request.id,
         answersOverride ?? pendingAskUser.answers,
       );
+      applyRuntime(currentSessionId, runtime);
       setPendingAskUser(null);
     } catch (error) {
       setUiError(`ask_user submit failed: ${(error as Error).message}`);
     } finally {
       setIsAskUserSubmitting(false);
     }
-  };
+  }, [applyRuntime, currentSessionId, pendingAskUser]);
 
   const permissionToneClass = pendingPermission
     ? pendingPermission.mode === "unsafe"
@@ -2508,7 +2452,7 @@ export function ChatInterface({
                   <div className="queued-list space-y-2 p-2.5">
                     {queuedMessages.map((msg, i) => (
                       <div
-                        key={`${activeQueueKey}-${i}`}
+                        key={`${currentSessionId ?? 'session'}-${i}`}
                         className="queued-item group grid grid-cols-[auto,1fr,auto] items-start gap-3.5 rounded-xl px-3 py-3"
                       >
                         <div className="queued-order mt-0.5 inline-flex h-6 min-w-6 items-center justify-center rounded-full text-[10px] font-semibold tabular-nums text-zinc-300">
@@ -2533,7 +2477,7 @@ export function ChatInterface({
                         <div className="flex shrink-0 items-start gap-1.5 opacity-80 transition-opacity group-hover:opacity-100">
                           <button
                             type="button"
-                            onClick={() => steerQueuedMessage(activeQueueKey, i)}
+                            onClick={() => steerQueuedMessage(i)}
                             className="queued-steer h-6 rounded-md border px-2.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-zinc-200 transition-colors"
                           >
                             Steer
@@ -2550,12 +2494,12 @@ export function ChatInterface({
                               </button>
                             </DropdownMenuTrigger>
                             <DropdownMenuContent align="end" className="w-44">
-                              <DropdownMenuItem onClick={() => steerQueuedMessage(activeQueueKey, i)}>
+                              <DropdownMenuItem onClick={() => steerQueuedMessage(i)}>
                                 Steer to composer
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 className="text-destructive focus:text-destructive"
-                                onClick={() => removeQueuedMessage(activeQueueKey, i)}
+                                onClick={() => removeQueuedMessage(i)}
                               >
                                 Remove
                               </DropdownMenuItem>

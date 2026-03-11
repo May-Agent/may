@@ -5,9 +5,9 @@ use petname::{Generator, Petnames};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::SessionRuntimeSummary;
 use super::store::SandboxResourceLayout;
 use super::{ChatHistory, ChatMessage, ChatMessageStats, MessageRole, SessionStore};
-use super::SessionRuntimeSummary;
 use crate::bundle::Bundle;
 use crate::config::MayConfig;
 use crate::db::{ChatDb, ChatDbError};

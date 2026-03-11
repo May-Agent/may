@@ -14,8 +14,8 @@ pub use manager::{
     Session, SessionError, SessionId, SessionManager, SessionSummary, list_summaries_from_db,
 };
 pub use runtime::{
-    PendingUserMessage, PersistedAskUserQuestion, PersistedAskUserRequest,
+    PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion, PersistedAskUserRequest,
     PersistedAttachment, PersistedPermissionRequest, PersistedPermissionRequestPayload,
-    PendingUserMessageMode, SessionRuntimeState, SessionRuntimeSummary,
+    SessionRuntimeState, SessionRuntimeSummary,
 };
 pub use store::SessionStore;

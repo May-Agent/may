@@ -417,18 +417,6 @@ pub(crate) struct ChatResponse {
     pub(crate) assistant: ApiMessage,
 }
 
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct EnqueueChatResponse {
-    pub(crate) session_id: String,
-    pub(crate) runtime_state: SessionRuntimeState,
-    pub(crate) queued_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) pending_immediate: Option<PendingUserMessage>,
-    #[serde(default)]
-    pub(crate) queued_messages: Vec<PendingUserMessage>,
-}
-
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemovePendingMessageRequest {
@@ -517,6 +505,32 @@ pub(crate) struct PermissionPollResponse {
     pub(crate) state: Option<&'static str>,
 }
 
+impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
+    fn from(summary: crate::session::SessionRuntimeSummary) -> Self {
+        Self {
+            state: summary.state,
+            queued_count: summary.queued_count,
+            pending_immediate: summary.pending_immediate,
+            queued_messages: summary.queued_messages,
+            waiting_permission: summary
+                .waiting_permission
+                .map(|request| PermissionPollItem {
+                    id: request.id,
+                    request: crate::agent::PermissionRequest {
+                        mode: request
+                            .request
+                            .mode
+                            .parse()
+                            .expect("persisted permission request mode must be valid"),
+                        script: request.request.script,
+                        session_id: request.request.session_id,
+                    },
+                }),
+            waiting_ask_user: summary.waiting_ask_user,
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PermissionRespondRequest {
@@ -543,6 +557,10 @@ pub(crate) struct SessionRuntimeResponse {
     pub(crate) pending_immediate: Option<PendingUserMessage>,
     #[serde(default)]
     pub(crate) queued_messages: Vec<PendingUserMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting_permission: Option<PermissionPollItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting_ask_user: Option<crate::session::PersistedAskUserRequest>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -550,6 +568,19 @@ pub(crate) struct SessionRuntimeResponse {
 pub(crate) struct SessionRuntimeEventPayload {
     pub(crate) session_id: String,
     pub(crate) runtime: SessionRuntimeResponse,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionRuntimeSnapshotItem {
+    pub(crate) session_id: String,
+    pub(crate) runtime: SessionRuntimeResponse,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionRuntimesEventPayload {
+    pub(crate) sessions: Vec<SessionRuntimeSnapshotItem>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

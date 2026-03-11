@@ -16,7 +16,8 @@ pub(crate) struct SessionRuntimeService {
 
 impl std::fmt::Debug for SessionRuntimeService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionRuntimeService").finish_non_exhaustive()
+        f.debug_struct("SessionRuntimeService")
+            .finish_non_exhaustive()
     }
 }
 
@@ -33,7 +34,11 @@ impl SessionRuntimeService {
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
-        Ok(self.db.get_session_runtime(session_id).await?.unwrap_or_default())
+        Ok(self
+            .db
+            .get_session_runtime(session_id)
+            .await?
+            .unwrap_or_default())
     }
 
     pub(crate) async fn set_state(
@@ -55,10 +60,30 @@ impl SessionRuntimeService {
         let summary = if mode == PendingUserMessageMode::Queue {
             self.db.push_queued_message(session_id, message).await?
         } else {
-            self.db.set_pending_immediate_message(session_id, message).await?
+            self.db
+                .set_pending_immediate_message(session_id, message)
+                .await?
         };
         self.notify_ui();
         Ok(summary)
+    }
+
+    pub(crate) async fn list_for_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<(String, SessionRuntimeSummary)>, crate::db::ChatDbError> {
+        let sessions = self.db.list_sessions_for_profile(profile_id).await?;
+        let mut runtimes = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let session_id = session.id;
+            let runtime = self
+                .db
+                .get_session_runtime(&session_id)
+                .await?
+                .unwrap_or_default();
+            runtimes.push((session_id, runtime));
+        }
+        Ok(runtimes)
     }
 
     pub(crate) async fn take_next_pending(
@@ -115,7 +140,8 @@ impl SessionRuntimeService {
     ) -> Result<(), crate::db::ChatDbError> {
         let runtime = self.get(session_id).await?;
         if runtime.state == SessionRuntimeState::Running {
-            self.set_state(session_id, SessionRuntimeState::Idle).await?;
+            self.set_state(session_id, SessionRuntimeState::Idle)
+                .await?;
         }
         Ok(())
     }

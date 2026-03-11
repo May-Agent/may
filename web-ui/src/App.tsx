@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
 import { useStore } from '@/lib/store';
 import { FONTS } from '@/lib/constants';
+import { useRuntimeStore } from '@/lib/runtimeStore';
 import type { ProfileSessions } from '@/types';
 
 function profileHasSession(profileSessions: ProfileSessions | null, sessionId: string): boolean {
@@ -169,6 +170,7 @@ function AppShell() {
     refreshFullConfig,
     refreshMcpServers,
     refreshSkills,
+    currentProfileId,
     markBackendUnavailable,
     clearBackendUnavailable,
   } = useStore();
@@ -258,6 +260,7 @@ function AppShell() {
 
   useEffect(() => {
     const unsubscribeEvents = subscribeUiEvents({
+      profileId: currentProfileId ?? undefined,
       onOpen: () => {},
       onConfig: (data) => {
         clearBackendUnavailable();
@@ -291,6 +294,10 @@ function AppShell() {
         clearBackendUnavailable();
         useStore.getState().setContainerPrepareStatuses(payload.statuses);
       },
+      onSessionRuntimes: ({ sessions }) => {
+        clearBackendUnavailable();
+        useRuntimeStore.getState().applyRuntimes(sessions);
+      },
       onHeartbeat: () => {},
       onError: () => {
         markBackendUnavailable('Backend event stream disconnected');
@@ -300,7 +307,7 @@ function AppShell() {
     return () => {
       unsubscribeEvents();
     };
-  }, [clearBackendUnavailable, markBackendUnavailable]);
+  }, [clearBackendUnavailable, currentProfileId, markBackendUnavailable]);
 
   useEffect(() => {
     if (settings.font && !settings.font.startsWith('Source Han')) {
