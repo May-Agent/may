@@ -26,23 +26,6 @@ pub struct Model {
     pub folder_id: Option<String>,
     /// Display order within the pinned section.
     pub pin_sort_order: Option<i32>,
-    /// Persisted runtime state for UI/runtime recovery.
-    #[sea_orm(default_value = "idle")]
-    pub runtime_state: String,
-    /// Pending immediate user message payload.
-    pub pending_immediate_json: Option<String>,
-    /// Queued user message payloads.
-    pub queued_messages_json: Option<String>,
-    /// Pending permission request id.
-    pub waiting_permission_request_id: Option<String>,
-    /// Pending permission request payload.
-    pub waiting_permission_request_json: Option<String>,
-    /// Pending ask-user request id.
-    pub waiting_ask_user_request_id: Option<String>,
-    /// Pending ask-user request payload.
-    pub waiting_ask_user_request_json: Option<String>,
-    /// Last runtime-state update timestamp.
-    pub runtime_updated_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

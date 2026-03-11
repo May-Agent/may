@@ -39,32 +39,13 @@ pub(super) async fn get_session_runtime(
         return Err(bad_request_error("session id is required"));
     }
 
-    if state
-        .permission_approver
-        .snapshot_session_runtime(Some(session_id.as_str()))
-        .is_some()
-    {
-        return Ok(Json(SessionRuntimeResponse {
-            state: crate::session::SessionRuntimeState::WaitingPermission,
-            queued_count: 0,
-            pending_immediate: None,
-            queued_messages: Vec::new(),
-        }));
-    }
-
     let runtime = state
         .runtime_service
         .get(&session_id)
         .await
-        .map_err(internal_error)?
-        ;
+        .map_err(internal_error)?;
 
-    Ok(Json(SessionRuntimeResponse {
-        state: runtime.state,
-        queued_count: runtime.queued_count,
-        pending_immediate: runtime.pending_immediate,
-        queued_messages: runtime.queued_messages,
-    }))
+    Ok(Json(runtime.into()))
 }
 
 async fn collect_session_artifacts(

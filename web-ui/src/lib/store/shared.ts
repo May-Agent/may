@@ -1,6 +1,7 @@
-import type { Session, ProfileInfo } from '@/types';
+import type { ProfileInfo, ProfileSessions, Session, SessionSummary } from '@/types';
 import { ApiError } from '@/lib/api';
 import * as api from '@/lib/api';
+import { useRuntimeStore } from '@/lib/runtimeStore';
 import type { AppState } from './index';
 
 export const PREVIEW_MAX_LENGTH = 100;
@@ -55,6 +56,16 @@ export function isContainerProfile(
   return profile?.environment.type === 'container';
 }
 
+function collectProfileSessions(profileSessions: ProfileSessions): SessionSummary[] {
+  const pinnedSessions = profileSessions.pinned.flatMap((item): SessionSummary[] => {
+    if (item.type === 'session') {
+      return [item];
+    }
+    return item.sessions;
+  });
+  return [...pinnedSessions, ...profileSessions.regular, ...profileSessions.archived];
+}
+
 export async function fetchAndApplyProfileSessions(
   profileId: string,
   get: () => AppState,
@@ -66,6 +77,19 @@ export async function fetchAndApplyProfileSessions(
     const ps = await api.fetchProfileSessions(profileId, options);
     if (requestId !== profileSessionsRequestSequence) return;
     if (get().currentProfileId !== profileId) return;
+    useRuntimeStore.getState().applyRuntimes(
+      collectProfileSessions(ps).map((session) => ({
+        sessionId: session.id,
+        runtime: {
+          state: session.runtimeState,
+          queuedCount: session.queuedCount,
+          pendingImmediate: null,
+          queuedMessages: [],
+          waitingPermission: null,
+          waitingAskUser: null,
+        },
+      })),
+    );
     set({
       profileSessions: ps,
       profileAccessBlockedReason: null,

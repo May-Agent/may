@@ -32,6 +32,13 @@ export interface SessionRuntimeStatus {
   queuedCount: number;
   pendingImmediate?: PendingUserMessage | null;
   queuedMessages: PendingUserMessage[];
+  waitingPermission?: PermissionRequest | null;
+  waitingAskUser?: AskUserRequest | null;
+}
+
+export interface SessionRuntimeSnapshot {
+  sessionId: string;
+  runtime: SessionRuntimeStatus;
 }
 
 export interface AskUserQuestion {
@@ -73,6 +80,7 @@ export interface ContainerPrepareEventPayload {
 
 export interface UiEventsSubscription {
   sessionId?: string;
+  profileId?: string;
   onOpen?: () => void;
   onConfig?: (payload: UiConfigEventPayload) => void;
   onContainerPrepare?: (payload: ContainerPrepareEventPayload) => void;
@@ -80,6 +88,7 @@ export interface UiEventsSubscription {
   onPermission?: (payload: PermissionPollResult) => void;
   onAskUser?: (payload: { request: AskUserRequest | null }) => void;
   onSessionRuntime?: (payload: { sessionId: string; runtime: SessionRuntimeStatus }) => void;
+  onSessionRuntimes?: (payload: { sessions: SessionRuntimeSnapshot[] }) => void;
   onHeartbeat?: () => void;
   onError?: () => void;
 }
@@ -918,16 +927,22 @@ export async function mapContainerLocalArtifactUrl(
 
 // ── Permission & Ask-User API ────────────────────────────
 
-export async function respondPermissionRequest(id: string, approved: boolean): Promise<void> {
-  await request<{ ok: boolean }>('/api/permissions/respond', {
+export async function respondPermissionRequest(
+  id: string,
+  approved: boolean,
+): Promise<SessionRuntimeStatus> {
+  return request<SessionRuntimeStatus>('/api/permissions/respond', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ id, approved }),
   });
 }
 
-export async function respondAskUserRequest(id: string, answers: AskUserAnswer[]): Promise<void> {
-  await request<{ ok: boolean }>('/api/ask-user/respond', {
+export async function respondAskUserRequest(
+  id: string,
+  answers: AskUserAnswer[],
+): Promise<SessionRuntimeStatus> {
+  return request<SessionRuntimeStatus>('/api/ask-user/respond', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ id, answers }),
@@ -1131,6 +1146,9 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
   if (options.sessionId && options.sessionId.trim()) {
     params.set('sessionId', options.sessionId.trim());
   }
+  if (options.profileId && options.profileId.trim()) {
+    params.set('profileId', options.profileId.trim());
+  }
 
   const query = params.toString();
   const url = query ? `/api/events?${query}` : '/api/events';
@@ -1187,6 +1205,13 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
                 sessionId: data.sessionId,
                 runtime: data.runtime,
               })
+          : undefined,
+        options.onError,
+      ),
+      session_runtimes: buildSSEListener<{ sessions?: SessionRuntimeSnapshot[] }>(
+        'session_runtimes',
+        options.onSessionRuntimes
+          ? (data) => options.onSessionRuntimes!({ sessions: data.sessions ?? [] })
           : undefined,
         options.onError,
       ),

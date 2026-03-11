@@ -14,8 +14,6 @@ export interface QueuedMessage {
   attachments: import("@/types").Attachment[];
 }
 
-export type QueueMap = Record<string, QueuedMessage[]>;
-
 export interface PreviewPaneState {
   kind: 'iframe' | 'image' | 'audio' | 'markdown' | 'text' | 'external' | 'slidev';
   url?: string;

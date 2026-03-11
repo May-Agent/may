@@ -13,7 +13,8 @@ use super::helpers::send_event;
 use super::state::{AskUserPollResponse, UiServerState};
 use super::types::{
     ConfigEventPayload, PermissionPollItem, PermissionPollResponse, RequestLogsResponse,
-    SessionRuntimeEventPayload, SessionRuntimeResponse, SseHeartbeat,
+    SessionRuntimeEventPayload, SessionRuntimeSnapshotItem, SessionRuntimesEventPayload,
+    SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -23,6 +24,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub(super) struct EventsQuery {
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
 pub(super) async fn stream_events(
@@ -31,6 +34,12 @@ pub(super) async fn stream_events(
 ) -> SkyResult<Sse> {
     let session_id = query
         .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let profile_id = query
+        .profile_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -46,6 +55,7 @@ pub(super) async fn stream_events(
         let mut last_request_logs_sig = String::new();
         let mut last_container_prepare_sig = String::new();
         let mut last_runtime_sig = String::new();
+        let mut last_profile_runtime_sig = String::new();
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Ignore the first immediate tick; we emit initial state immediately below.
@@ -91,6 +101,16 @@ pub(super) async fn stream_events(
             &sender,
             session_id.as_deref(),
             &mut last_runtime_sig,
+        )
+        .await
+        {
+            return;
+        }
+        if !emit_session_runtimes_if_changed(
+            &state_cloned,
+            &sender,
+            profile_id.as_deref(),
+            &mut last_profile_runtime_sig,
         )
         .await
         {
@@ -150,6 +170,16 @@ pub(super) async fn stream_events(
                         &sender,
                         session_id.as_deref(),
                         &mut last_runtime_sig,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    if !emit_session_runtimes_if_changed(
+                        &state_cloned,
+                        &sender,
+                        profile_id.as_deref(),
+                        &mut last_profile_runtime_sig,
                     )
                     .await
                     {
@@ -300,17 +330,46 @@ async fn emit_session_runtime_if_changed(
     };
     let payload = SessionRuntimeEventPayload {
         session_id: session_id.to_string(),
-        runtime: SessionRuntimeResponse {
-            state: runtime.state,
-            queued_count: runtime.queued_count,
-            pending_immediate: runtime.pending_immediate,
-            queued_messages: runtime.queued_messages,
-        },
+        runtime: runtime.into(),
     };
     if let Ok(sig) = serde_json::to_string(&payload)
         && sig != *last_sig
     {
         if !send_event(sender, "session_runtime", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
+    }
+    true
+}
+
+async fn emit_session_runtimes_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    profile_filter: Option<&str>,
+    last_sig: &mut String,
+) -> bool {
+    let Some(profile_id) = profile_filter else {
+        return true;
+    };
+    let sessions = match state.runtime_service.list_for_profile(profile_id).await {
+        Ok(runtimes) => runtimes
+            .into_iter()
+            .map(|(session_id, runtime)| SessionRuntimeSnapshotItem {
+                session_id,
+                runtime: runtime.into(),
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::warn!(profile_id, error = %error, "failed to load profile runtime snapshot");
+            return true;
+        }
+    };
+    let payload = SessionRuntimesEventPayload { sessions };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "session_runtimes", &payload).await {
             return false;
         }
         *last_sig = sig;

@@ -8,20 +8,21 @@ use std::path::Path;
 
 use sea_orm::ConnectionTrait;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, ConnectOptions, Database,
-    DatabaseConnection, DbErr,
-    EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, Schema, Set,
+    ActiveModelTrait,
+    ActiveValue::NotSet,
+    ColumnTrait, ConnectOptions, Database, DatabaseConnection, DbErr, EntityTrait, Order,
+    PaginatorTrait, QueryFilter, QueryOrder, Schema, Set,
     sea_query::{Expr, Query, SqliteQueryBuilder},
 };
 
+use crate::session::{
+    PendingUserMessage, PersistedAskUserRequest, PersistedPermissionRequest, SessionRuntimeState,
+    SessionRuntimeSummary,
+};
 use entity::{
     context_debug_snapshots, folders, messages, profile_memories, profiles, push_subscriptions,
     scheduled_tasks, session_pending_ask_user, session_pending_messages,
     session_pending_permissions, session_runtimes, sessions,
-};
-use crate::session::{
-    PendingUserMessage, PersistedAskUserRequest, PersistedPermissionRequest, SessionRuntimeState,
-    SessionRuntimeSummary,
 };
 
 /// Error type for database operations.
@@ -183,7 +184,8 @@ impl ChatDb {
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
 
-        let pending_messages_stmt = schema.create_table_from_entity(session_pending_messages::Entity);
+        let pending_messages_stmt =
+            schema.create_table_from_entity(session_pending_messages::Entity);
         let create_sql = pending_messages_stmt
             .to_string(SqliteQueryBuilder)
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
@@ -273,24 +275,6 @@ impl ChatDb {
         Self::migrate_add_column(&conn, "messages", "total_tokens", "INTEGER").await?;
         Self::migrate_add_column(&conn, "messages", "context_window", "INTEGER").await?;
         Self::migrate_add_column(&conn, "messages", "elapsed_ms", "INTEGER").await?;
-        Self::migrate_add_column(
-            &conn,
-            "sessions",
-            "runtime_state",
-            "TEXT NOT NULL DEFAULT 'idle'",
-        )
-        .await?;
-        Self::migrate_add_column(&conn, "sessions", "pending_immediate_json", "TEXT").await?;
-        Self::migrate_add_column(&conn, "sessions", "queued_messages_json", "TEXT").await?;
-        Self::migrate_add_column(&conn, "sessions", "waiting_permission_request_id", "TEXT")
-            .await?;
-        Self::migrate_add_column(&conn, "sessions", "waiting_permission_request_json", "TEXT")
-            .await?;
-        Self::migrate_add_column(&conn, "sessions", "waiting_ask_user_request_id", "TEXT")
-            .await?;
-        Self::migrate_add_column(&conn, "sessions", "waiting_ask_user_request_json", "TEXT")
-            .await?;
-        Self::migrate_add_column(&conn, "sessions", "runtime_updated_at", "TEXT").await?;
         Self::migrate_default_profile_slugs(&conn).await?;
 
         // Enable WAL mode for better concurrent read/write performance
@@ -378,14 +362,6 @@ impl ChatDb {
             archived: Set(false),
             folder_id: Set(None),
             pin_sort_order: Set(None),
-            runtime_state: Set(SessionRuntimeState::Idle.as_str().to_string()),
-            pending_immediate_json: Set(None),
-            queued_messages_json: Set(None),
-            waiting_permission_request_id: Set(None),
-            waiting_permission_request_json: Set(None),
-            waiting_ask_user_request_id: Set(None),
-            waiting_ask_user_request_json: Set(None),
-            runtime_updated_at: Set(None),
             created_at: Set(now.clone()),
             updated_at: Set(now),
         };
@@ -548,9 +524,10 @@ impl ChatDb {
                 session_id: Set(session_id.to_string()),
                 mode: Set(request.request.mode.clone()),
                 script: Set(request.request.script.clone()),
-                created_at: Set(summary.updated_at.clone().unwrap_or_else(|| {
-                    jiff::Timestamp::now().to_string()
-                })),
+                created_at: Set(summary
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| jiff::Timestamp::now().to_string())),
             }
             .insert(&self.conn)
             .await?;
@@ -565,9 +542,10 @@ impl ChatDb {
                 request_id: Set(request.id.clone()),
                 session_id: Set(session_id.to_string()),
                 questions_json: Set(serde_json::to_string(&request.questions)?),
-                created_at: Set(summary.updated_at.clone().unwrap_or_else(|| {
-                    jiff::Timestamp::now().to_string()
-                })),
+                created_at: Set(summary
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| jiff::Timestamp::now().to_string())),
             }
             .insert(&self.conn)
             .await?;
@@ -582,12 +560,15 @@ impl ChatDb {
         state: SessionRuntimeState,
     ) -> Result<(), ChatDbError> {
         let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!("Session not found: {session_id}")))
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
         })?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.state = state;
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary).await
+        self.write_session_runtime_summary(session_id, &summary)
+            .await
     }
 
     /// Enqueue a pending-immediate message, replacing any previous pending-immediate payload.
@@ -597,12 +578,15 @@ impl ChatDb {
         message: PendingUserMessage,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!("Session not found: {session_id}")))
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
         })?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.pending_immediate = Some(message);
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary).await?;
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
         Ok(summary)
     }
 
@@ -613,12 +597,15 @@ impl ChatDb {
         message: PendingUserMessage,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!("Session not found: {session_id}")))
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
         })?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.queued_messages.push(message);
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary).await?;
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
         Ok(summary)
     }
 
@@ -628,7 +615,9 @@ impl ChatDb {
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, ChatDbError> {
         let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!("Session not found: {session_id}")))
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
         })?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         let next = if summary.pending_immediate.is_some() {
@@ -639,7 +628,8 @@ impl ChatDb {
             None
         };
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary).await?;
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
         Ok(next)
     }
 
@@ -649,12 +639,15 @@ impl ChatDb {
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!("Session not found: {session_id}")))
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
         })?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.pending_immediate = None;
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary).await?;
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
         Ok(summary)
     }
 
@@ -665,7 +658,9 @@ impl ChatDb {
         index: usize,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!("Session not found: {session_id}")))
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
         })?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         if index >= summary.queued_messages.len() {
@@ -675,7 +670,8 @@ impl ChatDb {
         }
         summary.queued_messages.remove(index);
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary).await?;
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
         Ok(summary)
     }
 
@@ -686,7 +682,9 @@ impl ChatDb {
         request: Option<PersistedPermissionRequest>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!("Session not found: {session_id}")))
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
         })?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.waiting_permission = request;
@@ -694,7 +692,8 @@ impl ChatDb {
             summary.state = SessionRuntimeState::Running;
         }
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary).await?;
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
         Ok(summary)
     }
 
@@ -705,7 +704,9 @@ impl ChatDb {
         request: Option<PersistedAskUserRequest>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!("Session not found: {session_id}")))
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
         })?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.waiting_ask_user = request;
@@ -713,7 +714,8 @@ impl ChatDb {
             summary.state = SessionRuntimeState::Running;
         }
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary).await?;
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
         Ok(summary)
     }
 
@@ -787,12 +789,15 @@ impl ChatDb {
             let original_state = summary.state;
 
             summary.normalize_state();
-            if matches!(original_state, SessionRuntimeState::Running) && summary.state == SessionRuntimeState::Running {
+            if matches!(original_state, SessionRuntimeState::Running)
+                && summary.state == SessionRuntimeState::Running
+            {
                 summary.state = SessionRuntimeState::Idle;
             }
 
             if summary.state != original_state {
-                self.write_session_runtime_summary(&session_id, &summary).await?;
+                self.write_session_runtime_summary(&session_id, &summary)
+                    .await?;
             }
         }
         Ok(())
