@@ -103,6 +103,8 @@ export interface Session {
   projectId?: string;
   model: string;
   reasoningEffort?: string;
+  runtimeState?: SessionRuntimeState;
+  queuedCount?: number;
 }
 
 export interface Artifact {
@@ -154,7 +156,28 @@ export interface SessionSummary {
   createdAt: string | null;
   updatedAt: string | null;
   contentPreview: string;
+  runtimeState: SessionRuntimeState;
+  queuedCount: number;
 }
+
+export type SessionRuntimeState =
+  | 'idle'
+  | 'running'
+  | 'waiting_permission'
+  | 'waiting_ask_user'
+  | 'waiting_terminal_input'
+  | 'pending_immediate'
+  | 'queued';
+
+export interface PendingUserMessage {
+  content: string;
+  attachments: Attachment[];
+  hiddenContextXml?: string | null;
+  createdAt: string;
+  deliveryMode: PendingUserMessageMode;
+}
+
+export type PendingUserMessageMode = 'steer' | 'queue';
 
 export type PinnedItem =
   | { type: 'session' } & SessionSummary

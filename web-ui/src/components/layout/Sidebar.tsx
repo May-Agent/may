@@ -47,6 +47,7 @@ import {
   type DragStartEvent,
 } from '@dnd-kit/core';
 import type { SessionSummary, PinnedItem, ProfileInfo } from '@/types';
+import type { SessionRuntimeState } from '@/types';
 
 interface SidebarProps {
   className?: string;
@@ -126,6 +127,25 @@ function StreamingDots() {
       <span className="h-1.5 w-1.5 rounded-full bg-foreground/45 animate-pulse [animation-delay:300ms]" />
     </span>
   );
+}
+
+function sessionStatusLabel(state: SessionRuntimeState | undefined, queuedCount: number | undefined): string | null {
+  switch (state) {
+    case 'running':
+      return 'Running';
+    case 'waiting_permission':
+      return 'Waiting permission';
+    case 'waiting_ask_user':
+      return 'Waiting user';
+    case 'waiting_terminal_input':
+      return 'Waiting input';
+    case 'pending_immediate':
+      return 'Pending send';
+    case 'queued':
+      return queuedCount && queuedCount > 0 ? `Queued ${queuedCount}` : 'Queued';
+    default:
+      return null;
+  }
 }
 
 // ── DnD types and helpers ────────────────────────────────
@@ -293,7 +313,11 @@ function DraggableSessionRow({
   });
 
   const runtimeSessions = useRuntimeStore((state) => state.sessions);
-  const isStreaming = runtimeSessions[session.id]?.state === 'streaming';
+  const runtime = runtimeSessions[session.id];
+  const state = runtime?.state ?? session.runtimeState;
+  const queuedCount = runtime?.queuedCount ?? session.queuedCount;
+  const isStreaming = state === 'running';
+  const statusLabel = sessionStatusLabel(state, queuedCount);
 
   return (
     <div
@@ -315,6 +339,11 @@ function DraggableSessionRow({
         <span className="block min-w-0 flex-1 truncate">
           {session.title || 'New Chat'}
         </span>
+        {statusLabel && (
+          <span className="shrink-0 rounded-full border border-border/60 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+            {statusLabel}
+          </span>
+        )}
       </div>
 
       <SessionContextMenu session={session}>

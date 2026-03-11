@@ -28,6 +28,12 @@ pub(super) async fn respond_permission_request(
 
     // Persist the permission response to chat history
     if let Some(sid) = session_id {
+        state
+            .runtime_service
+            .set_waiting_permission(&sid, None)
+            .await
+            .map_err(internal_error)?;
+
         let data = PermissionResponseData {
             id: req.id.clone(),
             approved: req.approved,
@@ -66,6 +72,12 @@ pub(super) async fn respond_ask_user_request(
 
     // Persist the ask-user response to chat history
     if let Some(sid) = session_id {
+        state
+            .runtime_service
+            .set_waiting_ask_user(&sid, None)
+            .await
+            .map_err(internal_error)?;
+
         let answers_json = serde_json::to_value(&answers).map_err(internal_error)?;
         let data = AskUserResponseData {
             id: req.id.clone(),

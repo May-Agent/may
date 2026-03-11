@@ -207,6 +207,8 @@ pub(super) async fn update_session(
         messages: Vec::new(),
         model,
         reasoning_effort: None,
+        runtime_state: crate::session::SessionRuntimeState::Idle,
+        queued_count: 0,
     }))
 }
 

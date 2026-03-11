@@ -13,7 +13,7 @@ use super::helpers::send_event;
 use super::state::{AskUserPollResponse, UiServerState};
 use super::types::{
     ConfigEventPayload, PermissionPollItem, PermissionPollResponse, RequestLogsResponse,
-    SseHeartbeat,
+    SessionRuntimeEventPayload, SessionRuntimeResponse, SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -45,6 +45,7 @@ pub(super) async fn stream_events(
         let mut last_config_sig = String::new();
         let mut last_request_logs_sig = String::new();
         let mut last_container_prepare_sig = String::new();
+        let mut last_runtime_sig = String::new();
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Ignore the first immediate tick; we emit initial state immediately below.
@@ -80,6 +81,16 @@ pub(super) async fn stream_events(
             &state_cloned,
             &sender,
             &mut last_container_prepare_sig,
+        )
+        .await
+        {
+            return;
+        }
+        if !emit_session_runtime_if_changed(
+            &state_cloned,
+            &sender,
+            session_id.as_deref(),
+            &mut last_runtime_sig,
         )
         .await
         {
@@ -129,6 +140,16 @@ pub(super) async fn stream_events(
                         &state_cloned,
                         &sender,
                         &mut last_container_prepare_sig,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    if !emit_session_runtime_if_changed(
+                        &state_cloned,
+                        &sender,
+                        session_id.as_deref(),
+                        &mut last_runtime_sig,
                     )
                     .await
                     {
@@ -254,6 +275,42 @@ async fn emit_container_prepare_if_changed(
         && sig != *last_sig
     {
         if !send_event(sender, "container_prepare", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
+    }
+    true
+}
+
+async fn emit_session_runtime_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    session_filter: Option<&str>,
+    last_sig: &mut String,
+) -> bool {
+    let Some(session_id) = session_filter else {
+        return true;
+    };
+    let runtime = match state.runtime_service.get(session_id).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::warn!(session_id, error = %error, "failed to load session runtime");
+            return true;
+        }
+    };
+    let payload = SessionRuntimeEventPayload {
+        session_id: session_id.to_string(),
+        runtime: SessionRuntimeResponse {
+            state: runtime.state,
+            queued_count: runtime.queued_count,
+            pending_immediate: runtime.pending_immediate,
+            queued_messages: runtime.queued_messages,
+        },
+    };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "session_runtime", &payload).await {
             return false;
         }
         *last_sig = sig;

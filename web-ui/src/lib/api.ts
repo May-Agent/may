@@ -10,6 +10,9 @@ import type {
   FolderInfo,
   ScheduledTask,
   VapidKeyInfo,
+  PendingUserMessage,
+  PendingUserMessageMode,
+  SessionRuntimeState,
 } from '@/types';
 
 export interface PermissionRequest {
@@ -25,7 +28,10 @@ export interface PermissionPollResult {
 }
 
 export interface SessionRuntimeStatus {
-  state: 'idle' | 'streaming' | 'waiting_permission';
+  state: SessionRuntimeState;
+  queuedCount: number;
+  pendingImmediate?: PendingUserMessage | null;
+  queuedMessages: PendingUserMessage[];
 }
 
 export interface AskUserQuestion {
@@ -73,6 +79,7 @@ export interface UiEventsSubscription {
   onRequestLogs?: (payload: { logs: RequestLogEntry[] }) => void;
   onPermission?: (payload: PermissionPollResult) => void;
   onAskUser?: (payload: { request: AskUserRequest | null }) => void;
+  onSessionRuntime?: (payload: { sessionId: string; runtime: SessionRuntimeStatus }) => void;
   onHeartbeat?: () => void;
   onError?: () => void;
 }
@@ -725,6 +732,37 @@ export async function streamChat(input: {
   }
 }
 
+export async function enqueueChat(input: {
+  sessionId: string;
+  content: string;
+  attachments: Attachment[];
+  hiddenContextXml?: string;
+  deliveryMode?: PendingUserMessageMode;
+  signal?: AbortSignal;
+}): Promise<SessionRuntimeStatus> {
+  const payload = {
+    sessionId: input.sessionId,
+    content: input.content,
+    hiddenContextXml: input.hiddenContextXml,
+    deliveryMode: input.deliveryMode ?? 'steer',
+    attachments: input.attachments.map((a) => ({
+      id: a.id,
+      name: a.name,
+      type: a.type,
+      url: a.url,
+      uploadDataUrl: a.uploadDataUrl,
+      textContent: a.textContent,
+    })),
+  };
+
+  return request<SessionRuntimeStatus>('/api/chat/enqueue', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+    signal: input.signal,
+  });
+}
+
 // ── Models API ───────────────────────────────────────────
 
 export async function fetchModels(): Promise<{ models: string[]; details: ModelDetailsItem[] }> {
@@ -747,6 +785,24 @@ export async function fetchRequestLogs(): Promise<RequestLogEntry[]> {
 
 export async function fetchSessionRuntime(sessionId: string): Promise<SessionRuntimeStatus> {
   return request<SessionRuntimeStatus>(`/api/sessions/${encodeURIComponent(sessionId)}/runtime`);
+}
+
+export async function removePendingSessionMessage(input: {
+  sessionId: string;
+  kind: 'pending_immediate' | 'queued';
+  index?: number;
+}): Promise<SessionRuntimeStatus> {
+  return request<SessionRuntimeStatus>(
+    `/api/sessions/${encodeURIComponent(input.sessionId)}/runtime/pending`,
+    {
+      method: 'DELETE',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        kind: input.kind,
+        index: input.index,
+      }),
+    },
+  );
 }
 
 export async function fetchSessionContextDebug(
@@ -1117,6 +1173,20 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
         'ask_user',
         options.onAskUser
           ? (data) => options.onAskUser!({ request: data.request ?? null })
+          : undefined,
+        options.onError,
+      ),
+      session_runtime: buildSSEListener<{
+        sessionId: string;
+        runtime: SessionRuntimeStatus;
+      }>(
+        'session_runtime',
+        options.onSessionRuntime
+          ? (data) =>
+              options.onSessionRuntime!({
+                sessionId: data.sessionId,
+                runtime: data.runtime,
+              })
           : undefined,
         options.onError,
       ),

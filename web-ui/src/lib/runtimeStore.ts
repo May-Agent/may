@@ -1,12 +1,13 @@
 import { create } from 'zustand';
 import type { PermissionRequest } from '@/lib/api';
-
-type RuntimeState = 'idle' | 'streaming' | 'waiting_permission';
+import type { PendingUserMessage, SessionRuntimeState } from '@/types';
 
 interface SessionRuntime {
-  state: RuntimeState;
+  state: SessionRuntimeState;
   queuedCount: number;
   waitingPermission: PermissionRequest | null;
+  pendingImmediate: PendingUserMessage | null;
+  queuedMessages: PendingUserMessage[];
   firstTokenAt?: number;
 }
 
@@ -15,8 +16,13 @@ interface RuntimeStoreState {
   ensureSession: (sessionId: string) => void;
   setStreaming: (sessionId: string) => void;
   setQueuedCount: (sessionId: string, count: number) => void;
+  setQueuedMessages: (
+    sessionId: string,
+    pendingImmediate: PendingUserMessage | null,
+    queuedMessages: PendingUserMessage[],
+  ) => void;
   setWaitingPermission: (sessionId: string, request: PermissionRequest | null) => void;
-  setServerState: (sessionId: string, state: RuntimeState) => void;
+  setServerState: (sessionId: string, state: SessionRuntimeState) => void;
   markFirstToken: (sessionId: string) => void;
   clearSessionRuntime: (sessionId: string) => void;
 }
@@ -25,6 +31,8 @@ const defaultRuntime = (): SessionRuntime => ({
   state: 'idle',
   queuedCount: 0,
   waitingPermission: null,
+  pendingImmediate: null,
+  queuedMessages: [],
 });
 
 export const useRuntimeStore = create<RuntimeStoreState>((set, get) => ({
@@ -47,7 +55,7 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => ({
         ...state.sessions,
         [sessionId]: {
           ...(state.sessions[sessionId] ?? defaultRuntime()),
-          state: 'streaming',
+          state: 'running',
           waitingPermission: null,
         },
       },
@@ -62,6 +70,26 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => ({
         [sessionId]: {
           ...(state.sessions[sessionId] ?? defaultRuntime()),
           queuedCount: Math.max(0, count),
+        },
+      },
+    }));
+  },
+
+  setQueuedMessages: (sessionId, pendingImmediate, queuedMessages) => {
+    if (!sessionId) return;
+    set((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sessionId]: {
+          ...(state.sessions[sessionId] ?? defaultRuntime()),
+          pendingImmediate,
+          queuedMessages,
+          queuedCount: queuedMessages.length,
+          state: pendingImmediate
+            ? 'pending_immediate'
+            : queuedMessages.length > 0
+              ? 'queued'
+              : (state.sessions[sessionId]?.state ?? 'idle'),
         },
       },
     }));

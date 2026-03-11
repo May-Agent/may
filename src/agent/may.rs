@@ -181,6 +181,17 @@ pub enum PermissionRequestMode {
     Ssh,
 }
 
+impl PermissionRequestMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Unsafe => "unsafe",
+            Self::Ssh => "ssh",
+        }
+    }
+}
+
 impl From<BashMode> for PermissionRequestMode {
     fn from(value: BashMode) -> Self {
         match value {
@@ -203,6 +214,8 @@ pub struct PermissionRequest {
 pub struct PermissionApprover {
     inner: std::sync::Arc<aither_agent::tool_request::RequestApprover<PermissionRequest, bool>>,
     session_id: Option<String>,
+    runtime_db: Option<crate::db::ChatDb>,
+    ui_events_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl PermissionApprover {
@@ -210,6 +223,8 @@ impl PermissionApprover {
         Self {
             inner: std::sync::Arc::new(aither_agent::tool_request::RequestApprover::new()),
             session_id: None,
+            runtime_db: None,
+            ui_events_notify: None,
         }
     }
 
@@ -217,6 +232,39 @@ impl PermissionApprover {
         Self {
             inner: self.inner.clone(),
             session_id: Some(session_id.into()),
+            runtime_db: self.runtime_db.clone(),
+            ui_events_notify: self.ui_events_notify.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_runtime_sync(
+        mut self,
+        db: crate::db::ChatDb,
+        notify: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.runtime_db = Some(db);
+        self.ui_events_notify = Some(notify);
+        self
+    }
+
+    fn notify_ui_events(&self) {
+        if let Some(notify) = &self.ui_events_notify {
+            notify.notify_waiters();
+        }
+    }
+
+    fn persisted_request(
+        request_id: String,
+        payload: PermissionRequest,
+    ) -> crate::session::PersistedPermissionRequest {
+        crate::session::PersistedPermissionRequest {
+            id: request_id,
+            request: crate::session::PersistedPermissionRequestPayload {
+                mode: payload.mode.as_str().to_string(),
+                script: payload.script,
+                session_id: payload.session_id,
+            },
         }
     }
 
@@ -230,12 +278,33 @@ impl PermissionApprover {
             script,
             session_id: self.session_id.clone(),
         };
-        let (_id, rx) = self.inner.enqueue(payload);
+        let (id, rx) = self.inner.enqueue(payload.clone());
+        if let Some(session_id) = payload.session_id.clone() {
+            if let Some(db) = self.runtime_db.clone() {
+                if let Err(error) = db
+                    .set_waiting_permission(
+                        &session_id,
+                        Some(Self::persisted_request(id, payload)),
+                    )
+                    .await
+                {
+                    tracing::warn!(session_id = %session_id, error = %error, "failed to persist permission runtime state");
+                } else {
+                    self.notify_ui_events();
+                }
+            }
+        } else {
+            self.notify_ui_events();
+        }
         rx.recv().await.map_err(|_| PermissionError::Interrupted)
     }
 
     pub fn respond(&self, request_id: &str, approved: bool) -> bool {
-        self.inner.respond(request_id, approved)
+        let responded = self.inner.respond(request_id, approved);
+        if responded {
+            self.notify_ui_events();
+        }
+        responded
     }
 
     /// Returns the oldest pending request matching the session filter as `(id, payload)`.
