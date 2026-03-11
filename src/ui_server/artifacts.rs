@@ -45,18 +45,25 @@ pub(super) async fn get_session_runtime(
         .is_some()
     {
         return Ok(Json(SessionRuntimeResponse {
-            state: "waiting_permission",
+            state: crate::session::SessionRuntimeState::WaitingPermission,
+            queued_count: 0,
+            pending_immediate: None,
+            queued_messages: Vec::new(),
         }));
     }
 
-    let is_streaming = state
-        .active_streaming_sessions
-        .lock()
+    let runtime = state
+        .runtime_service
+        .get(&session_id)
         .await
-        .contains(session_id.as_str());
+        .map_err(internal_error)?
+        ;
 
     Ok(Json(SessionRuntimeResponse {
-        state: if is_streaming { "streaming" } else { "idle" },
+        state: runtime.state,
+        queued_count: runtime.queued_count,
+        pending_immediate: runtime.pending_immediate,
+        queued_messages: runtime.queued_messages,
     }))
 }
 

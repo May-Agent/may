@@ -13,6 +13,7 @@ mod message_mapping;
 mod model_resolution;
 mod notifications;
 mod profiles;
+mod runtime;
 mod sessions;
 mod state;
 mod tasks;
@@ -74,8 +75,6 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         let _ = mcp_manager.connect_all().await;
     }
 
-    let permission_approver = crate::agent::PermissionApprover::new();
-    let ask_user_approver = AskUserApprover::new();
     let (register_subagents_broker, register_subagents_queue) =
         crate::agent::register_tool::subagents_channel();
 
@@ -116,8 +115,21 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
 
     let session_manager = SessionManager::new().await?;
     let db_for_archive = session_manager.db().clone();
+    db_for_archive
+        .recover_session_runtimes_after_restart()
+        .await
+        .context("failed to reconcile persisted session runtime state after restart")?;
     let (title_generation_queue, title_generation_rx) =
         crate::ui_server::state::TitleGenerationQueue::new();
+    let ui_events_notify = Arc::new(tokio::sync::Notify::new());
+    let runtime_service = Arc::new(runtime::SessionRuntimeService::new(
+        db_for_archive.clone(),
+        ui_events_notify.clone(),
+    ));
+    let permission_approver = crate::agent::PermissionApprover::new()
+        .with_runtime_sync(db_for_archive.clone(), ui_events_notify.clone());
+    let ask_user_approver =
+        AskUserApprover::new().with_runtime_sync(db_for_archive.clone(), ui_events_notify.clone());
 
     // Initialize memory processor with fast-tier provider chain
     let memory_processor = match crate::agent::build_fast_provider_chain(&config).await {
@@ -152,7 +164,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         provider_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         config: tokio::sync::RwLock::new(config),
-        ui_events_notify: Arc::new(tokio::sync::Notify::new()),
+        ui_events_notify,
         container_prepare_statuses: Mutex::new(HashMap::new()),
         container_prepare_inflight: Mutex::new(HashSet::new()),
         container_manager,
@@ -165,6 +177,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         title_generation_queue,
         register_subagents_broker,
         location_provider: crate::location::LocationProvider::new(),
+        runtime_service,
         cwd,
         may_dir,
     });
@@ -230,7 +243,10 @@ fn api_routes() -> Route {
                         "".at(get_session),
                         "".put(update_session),
                         "".delete(delete_session),
-                        "/runtime".at(get_session_runtime),
+                        "/runtime".route(Route::new((
+                            "".at(get_session_runtime),
+                            "/pending".delete(remove_pending_message),
+                        ))),
                         "/context-debug".at(get_session_context_debug),
                         "/artifacts".at(list_session_artifacts),
                         "/artifacts/preview".at(get_artifact_preview),
@@ -263,7 +279,11 @@ fn api_routes() -> Route {
                 "/{id}".put(update_folder),
                 "/{id}".delete(delete_folder),
             ))),
-            "/chat".route(Route::new(("".post(chat), "/stream".post(chat_stream)))),
+            "/chat".route(Route::new((
+                "".post(chat),
+                "/stream".post(chat_stream),
+                "/enqueue".post(enqueue_chat),
+            ))),
             "/permissions".route(Route::new(("/respond".post(respond_permission_request),))),
             "/ask-user".route(Route::new(("/respond".post(respond_ask_user_request),))),
             "/config".route(Route::new((

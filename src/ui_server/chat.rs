@@ -15,7 +15,10 @@ use crate::agent::MayAgent;
 use crate::db::CreateScheduledTaskParams;
 use crate::notification::{NotificationManager, NotificationPayload};
 use crate::scheduler::TaskScheduler;
-use crate::session::{ChatMessage, ChatMessageStats, MessageRole, SessionId};
+use crate::session::{
+    ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage, PersistedAttachment,
+    SessionId, SessionRuntimeState,
+};
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 use crate::{ask_user, workspace_request};
 
@@ -29,9 +32,11 @@ use super::model_resolution::resolve_default_model;
 use super::state::UiServerState;
 use super::title_generation;
 use super::types::{
-    ApiMessage, BashStateSnapshot, ChatRequest, ChatResponse, ContextDebugMessage, RequestLogEntry,
-    RequestStats, SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent,
-    SseToolEndEvent, SseToolStartEvent, ToolEventRecord,
+    ApiMessage, BashStateSnapshot, ChatRequest, ChatResponse, ContextDebugMessage,
+    EnqueueChatResponse, PendingMessageKind, RemovePendingMessageRequest, RequestLogEntry,
+    RequestStats, SseChunkEvent, SseDoneEvent,
+    SseErrorEvent, SseStartEvent, SseTodoUpdateEvent, SseToolEndEvent, SseToolStartEvent,
+    ToolEventRecord,
 };
 
 // ── ChatSink trait ──────────────────────────────────────────
@@ -146,6 +151,119 @@ struct AgentRunResult {
     elapsed_ms: u64,
 }
 
+fn persisted_attachments(attachments: Vec<super::types::ApiAttachment>) -> Vec<PersistedAttachment> {
+    attachments
+        .into_iter()
+        .map(|attachment| PersistedAttachment {
+            id: attachment.id,
+            name: attachment.name,
+            attachment_type: attachment.attachment_type,
+            url: attachment.url,
+            upload_data_url: attachment.upload_data_url,
+            text_content: attachment.text_content,
+        })
+        .collect()
+}
+
+fn pending_user_message_from_request(req: ChatRequest) -> PendingUserMessage {
+    PendingUserMessage {
+        content: req.content,
+        attachments: persisted_attachments(req.attachments),
+        hidden_context_xml: req.hidden_context_xml,
+        created_at: jiff::Timestamp::now().to_string(),
+        delivery_mode: req.delivery_mode,
+    }
+}
+
+fn api_attachments_from_persisted(
+    attachments: Vec<PersistedAttachment>,
+) -> Vec<super::types::ApiAttachment> {
+    attachments
+        .into_iter()
+        .map(|attachment| super::types::ApiAttachment {
+            id: attachment.id,
+            name: attachment.name,
+            attachment_type: attachment.attachment_type,
+            url: attachment.url,
+            upload_data_url: attachment.upload_data_url,
+            text_content: attachment.text_content,
+        })
+        .collect()
+}
+
+async fn set_session_runtime_state(
+    state: &Arc<UiServerState>,
+    session_id: &str,
+    runtime_state: SessionRuntimeState,
+) -> anyhow::Result<()> {
+    state
+        .runtime_service
+        .set_state(session_id, runtime_state)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+async fn clear_running_state_if_needed(
+    state: &Arc<UiServerState>,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    state
+        .runtime_service
+        .clear_running_if_needed(session_id)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
+    tokio::spawn(async move {
+        let inserted = {
+            let mut active = state.active_streaming_sessions.lock().await;
+            active.insert(session_id.clone())
+        };
+        if !inserted {
+            return;
+        }
+
+        loop {
+            let next = match state.runtime_service.take_next_pending(&session_id).await {
+                Ok(next) => next,
+                Err(error) => {
+                    tracing::warn!(session_id = %session_id, error = %error, "failed to load next pending message");
+                    break;
+                }
+            };
+            let Some(next) = next else {
+                break;
+            };
+
+            let request = ChatRequest {
+                session_id: session_id.clone(),
+                content: next.content,
+                attachments: api_attachments_from_persisted(next.attachments),
+                hidden_context_xml: next.hidden_context_xml,
+                delivery_mode: next.delivery_mode,
+            };
+            if let Err(error) =
+                set_session_runtime_state(&state, &session_id, SessionRuntimeState::Running).await
+            {
+                tracing::warn!(session_id = %session_id, error = %error, "failed to mark follow-up run as running");
+                break;
+            }
+
+            if let Err(error) = run_chat_collect(state.clone(), request).await {
+                tracing::warn!(session_id = %session_id, error = %error, "follow-up run failed");
+                break;
+            }
+        }
+
+        {
+            let mut active = state.active_streaming_sessions.lock().await;
+            active.remove(session_id.as_str());
+        }
+        let _ = clear_running_state_if_needed(&state, &session_id).await;
+    });
+}
+
 const BROWSER_TAKEOVER_ALERT_XML: &str = include_str!("../texts/browser_takeover_alert.xml");
 
 async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) {
@@ -163,8 +281,62 @@ pub(super) async fn chat(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ChatResponse>> {
+    set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running)
+        .await
+        .map_err(internal_error)?;
     let response = run_chat_collect(state, req).await?;
     Ok(Json(response))
+}
+
+pub(super) async fn enqueue_chat(
+    Json(req): Json<ChatRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<EnqueueChatResponse>> {
+    let pending = pending_user_message_from_request(req.clone());
+    let runtime = state
+        .runtime_service
+        .enqueue(&req.session_id, pending, req.delivery_mode)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(EnqueueChatResponse {
+        session_id: req.session_id,
+        runtime_state: runtime.state,
+        queued_count: runtime.queued_count,
+        pending_immediate: runtime.pending_immediate,
+        queued_messages: runtime.queued_messages,
+    }))
+}
+
+pub(super) async fn remove_pending_message(
+    params: skyzen::routing::Params,
+    Json(req): Json<RemovePendingMessageRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<EnqueueChatResponse>> {
+    let session_id = params.get("id").map_err(super::error::bad_request_error)?.to_string();
+    let runtime = match req.kind {
+        PendingMessageKind::PendingImmediate => state
+            .runtime_service
+            .remove_pending_immediate(&session_id)
+            .await
+            .map_err(internal_error)?,
+        PendingMessageKind::Queued => state
+            .runtime_service
+            .remove_queued_at(
+                &session_id,
+                req.index
+                    .ok_or_else(|| super::error::bad_request_error("index is required for queued removal"))?,
+            )
+            .await
+            .map_err(internal_error)?,
+    };
+    Ok(Json(EnqueueChatResponse {
+        session_id,
+        runtime_state: runtime.state,
+        queued_count: runtime.queued_count,
+        pending_immediate: runtime.pending_immediate,
+        queued_messages: runtime.queued_messages,
+    }))
 }
 
 pub(super) async fn chat_stream(
@@ -445,11 +617,18 @@ async fn stream_chat_events(
     req: ChatRequest,
     sender: skyzen::responder::sse::Sender,
 ) -> anyhow::Result<()> {
+    set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
     let mut sink = SseSink(sender.clone());
-    match run_agent_loop(&state, &req, &mut sink).await {
+    let result = run_agent_loop(&state, &req, &mut sink).await;
+    {
+        let mut active = state.active_streaming_sessions.lock().await;
+        active.remove(req.session_id.as_str());
+    }
+    let response_session_id = req.session_id.clone();
+    match result {
         Ok(result) => {
             let done_event = SseDoneEvent {
-                session_id: req.session_id,
+                session_id: response_session_id.clone(),
                 assistant: ApiMessage {
                     id: result.assistant_id,
                     role: "assistant".to_string(),
@@ -476,10 +655,15 @@ async fn stream_chat_events(
                 },
             };
             send_event(&sender, "done", &done_event).await;
+            spawn_follow_up_runs(state.clone(), response_session_id.clone());
+            clear_running_state_if_needed(&state, &response_session_id).await?;
             Ok(())
         }
         // Errors are already sent to the sink via on_error in run_agent_loop.
-        Err(_) => Ok(()),
+        Err(_) => {
+            clear_running_state_if_needed(&state, &response_session_id).await?;
+            Ok(())
+        }
     }
 }
 
@@ -488,6 +672,11 @@ async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyRes
     let result = run_agent_loop(&state, &req, &mut sink)
         .await
         .map_err(|e| internal_error(e))?;
+
+    spawn_follow_up_runs(state.clone(), req.session_id.clone());
+    clear_running_state_if_needed(&state, &req.session_id)
+        .await
+        .map_err(internal_error)?;
 
     Ok(ChatResponse {
         session_id: req.session_id,

@@ -8,6 +8,8 @@ import {
   prepareSlidevPreview,
   fetchSessionArtifacts,
   fetchSessionRuntime,
+  enqueueChat,
+  removePendingSessionMessage,
   respondAskUserRequest,
   respondPermissionRequest,
   streamChat,
@@ -219,8 +221,6 @@ export function ChatInterface({
       : workspaceSurface.state;
   const showComposer = chatSurfaceState === 'welcome' || chatSurfaceState === 'chat';
   const hasInput = inputValue.trim() || attachments.length > 0;
-  const activeQueueKey = currentSessionId ?? '__new__';
-  const queuedMessages = queuedBySession[activeQueueKey] ?? [];
   const configuredModelIds = (() => {
     const modelConfig = uiConfig.fullConfig?.models;
     if (!modelConfig) {
@@ -264,11 +264,20 @@ export function ChatInterface({
   const runtimeSession = useRuntimeStore((state) =>
     currentSessionId ? state.sessions[currentSessionId] : undefined,
   );
-  const isGenerating = runtimeSession?.state === 'streaming';
+  const activeQueueKey = currentSessionId ?? '__new__';
+  const queuedMessages =
+    currentSessionId && runtimeSession
+      ? [
+          ...(runtimeSession.pendingImmediate ? [runtimeSession.pendingImmediate] : []),
+          ...(runtimeSession.queuedMessages ?? []),
+        ]
+      : queuedBySession[activeQueueKey] ?? [];
+  const isGenerating = runtimeSession?.state === 'running';
   const showStopButton =
     isGenerating || isSending || isStreamControllerActive || hasPendingAssistantMessage;
   const setRuntimeStreaming = useRuntimeStore((state) => state.setStreaming);
   const setRuntimeQueuedCount = useRuntimeStore((state) => state.setQueuedCount);
+  const setRuntimeQueuedMessages = useRuntimeStore((state) => state.setQueuedMessages);
   const setRuntimeWaitingPermission = useRuntimeStore(
     (state) => state.setWaitingPermission,
   );
@@ -604,9 +613,12 @@ export function ChatInterface({
     void (async () => {
       try {
         const runtime = await fetchSessionRuntime(currentSessionId);
-        if (runtime.state === 'streaming' || runtime.state === 'waiting_permission') {
-          setRuntimeServerState(currentSessionId, runtime.state);
-        }
+        setRuntimeServerState(currentSessionId, runtime.state);
+        setRuntimeQueuedMessages(
+          currentSessionId,
+          runtime.pendingImmediate ?? null,
+          runtime.queuedMessages ?? [],
+        );
       } catch (error) {
         setUiError(
           `Failed to fetch runtime state: ${
@@ -615,7 +627,7 @@ export function ChatInterface({
         );
       }
     })();
-  }, [currentSessionId, setRuntimeServerState]);
+  }, [currentSessionId, setRuntimeQueuedMessages, setRuntimeServerState]);
 
   useEffect(() => {
     const nextPreviewSessionId = currentSessionId ?? null;
@@ -741,6 +753,18 @@ export function ChatInterface({
           request,
           answers: request.questions.map((q) => ({ section: q.section, answer: null })),
         });
+      },
+      onSessionRuntime: ({ sessionId, runtime }) => {
+        banner.clear();
+        if (sessionId !== currentSessionId) {
+          return;
+        }
+        setRuntimeServerState(sessionId, runtime.state);
+        setRuntimeQueuedMessages(
+          sessionId,
+          runtime.pendingImmediate ?? null,
+          runtime.queuedMessages ?? [],
+        );
       },
       onError: () => banner.schedule(),
       onHeartbeat: () => banner.clear(),
@@ -884,7 +908,25 @@ export function ChatInterface({
     }
   };
 
-  const removeQueuedMessage = useCallback((queueKey: string, index: number) => {
+  const removeQueuedMessage = useCallback(async (queueKey: string, index: number) => {
+    if (currentSessionId && queueKey === currentSessionId) {
+      const hasPendingImmediate = runtimeSession?.pendingImmediate != null;
+      const kind = hasPendingImmediate && index === 0 ? 'pending_immediate' : 'queued';
+      const queuedIndex = hasPendingImmediate ? index - 1 : index;
+      const runtime = await removePendingSessionMessage({
+        sessionId: currentSessionId,
+        kind,
+        index: kind === 'queued' ? queuedIndex : undefined,
+      });
+      setRuntimeServerState(currentSessionId, runtime.state);
+      setRuntimeQueuedMessages(
+        currentSessionId,
+        runtime.pendingImmediate ?? null,
+        runtime.queuedMessages ?? [],
+      );
+      return;
+    }
+
     let nextLength = 0;
     setQueuedBySession((prev) => {
       const list = prev[queueKey] ?? [];
@@ -901,10 +943,20 @@ export function ChatInterface({
     if (currentSessionId && queueKey === currentSessionId) {
       setRuntimeQueuedCount(currentSessionId, nextLength);
     }
-  }, [currentSessionId, setRuntimeQueuedCount]);
+  }, [
+    currentSessionId,
+    removePendingSessionMessage,
+    runtimeSession,
+    setRuntimeQueuedCount,
+    setRuntimeQueuedMessages,
+    setRuntimeServerState,
+  ]);
 
   const steerQueuedMessage = useCallback((queueKey: string, index: number) => {
-    const queued = (queuedBySessionRef.current[queueKey] ?? [])[index];
+    const queued =
+      currentSessionId && queueKey === currentSessionId
+        ? queuedMessages[index]
+        : (queuedBySessionRef.current[queueKey] ?? [])[index];
     if (!queued) {
       return;
     }
@@ -924,11 +976,11 @@ export function ChatInterface({
       setAttachments((prev) => [...restored, ...prev]);
     }
 
-    removeQueuedMessage(queueKey, index);
+    void removeQueuedMessage(queueKey, index);
     window.setTimeout(() => {
       composerInputRef.current?.focus();
     }, 0);
-  }, [removeQueuedMessage]);
+  }, [currentSessionId, queuedMessages, removeQueuedMessage]);
 
   const composerPlaceholder = queuedMessages.length > 0
     ? "Ask for follow-up changes"
@@ -943,6 +995,7 @@ export function ChatInterface({
     retryAssistantId?: string;
     overrideBatch?: QueuedMessage[];
     skipAppendUserMessages?: boolean;
+    deliveryMode?: "steer" | "queue";
   }) => {
     const includeComposerInput = options?.includeComposerInput ?? true;
     const composerHasInput = inputValue.trim().length > 0 || attachments.length > 0;
@@ -988,19 +1041,31 @@ export function ChatInterface({
     const targetRuntime = options?.sessionIdHint
       ? useRuntimeStore.getState().sessions[options.sessionIdHint]
       : runtimeSession;
-    const targetGenerating = targetRuntime?.state === 'streaming';
+    const targetGenerating = targetRuntime?.state === 'running';
+    const deliveryMode = options?.deliveryMode ?? "steer";
 
     if (targetGenerating) {
       if (!includeComposerInput) { setIsSending(false); return; }
-      const existingQueue = queuedBySessionRef.current[queueSourceKey] ?? [];
-      const nextList = [...existingQueue, { content, attachments: atts }];
-      setQueuedBySession((prev) => ({
-        ...prev,
-        [queueSourceKey]: nextList,
-      }));
       const runtimeSessionId = options?.sessionIdHint ?? currentSessionId;
       if (runtimeSessionId) {
-        setRuntimeQueuedCount(runtimeSessionId, nextList.length);
+        try {
+          const runtime = await enqueueChat({
+            sessionId: runtimeSessionId,
+            content,
+            attachments: atts,
+            deliveryMode,
+          });
+          setRuntimeServerState(runtimeSessionId, runtime.state);
+          setRuntimeQueuedMessages(
+            runtimeSessionId,
+            runtime.pendingImmediate ?? null,
+            runtime.queuedMessages ?? [],
+          );
+          void refreshProfileSessions();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          setUiError(message);
+        }
       }
       setIsSending(false);
       return;
@@ -1039,22 +1104,24 @@ export function ChatInterface({
       return;
     }
 
-    const existingQueue = queuedBySessionRef.current[queueSourceKey] ?? [];
     const pendingBatch = options?.overrideBatch
       ? [...options.overrideBatch]
       : includeComposerInput
-        ? [{ content, attachments: atts }, ...existingQueue]
-        : [...existingQueue];
+        ? [{ content, attachments: atts }]
+        : [];
 
     if (pendingBatch.length === 0) { setIsSending(false); return; }
 
-    setQueuedBySession((prev) => {
-      const next = { ...prev };
-      delete next[queueSourceKey];
-      delete next[sessionId];
-      return next;
-    });
-    setRuntimeQueuedCount(sessionId, 0);
+    if (queueSourceKey !== '__new__') {
+      setQueuedBySession((prev) => {
+        const next = { ...prev };
+        delete next[queueSourceKey];
+        delete next[sessionId];
+        return next;
+      });
+    }
+    setRuntimeQueuedMessages(sessionId, null, []);
+    void refreshProfileSessions();
 
     if (!options?.skipAppendUserMessages) {
       for (const queued of pendingBatch) {
@@ -1575,10 +1642,16 @@ export function ChatInterface({
       setIsBrowserOpen(false);
 
       if (completedNormally) {
-        const remaining = queuedBySessionRef.current[sessionId] ?? [];
-        if (remaining.length > 0) {
-          void handleSend({ sessionIdHint: sessionId, includeComposerInput: false });
-        }
+        void (async () => {
+          const runtime = await fetchSessionRuntime(sessionId);
+          setRuntimeServerState(sessionId, runtime.state);
+          setRuntimeQueuedMessages(
+            sessionId,
+            runtime.pendingImmediate ?? null,
+            runtime.queuedMessages ?? [],
+          );
+          await refreshProfileSessions();
+        })();
       }
     }
   };
@@ -2451,7 +2524,9 @@ export function ChatInterface({
                               {msg.attachments.length} attachment{msg.attachments.length > 1 ? "s" : ""}
                             </span>
                             <span className="queued-state-pill inline-flex items-center gap-1 rounded-full px-1.5 py-[1px] text-zinc-200">
-                              queued
+                              {currentSessionId && runtimeSession?.pendingImmediate && i === 0
+                                ? "steer"
+                                : "queued"}
                             </span>
                           </div>
                         </div>
@@ -2500,10 +2575,16 @@ export function ChatInterface({
               onChange={(e) => setInputValue(e.target.value)}
               onPaste={handlePaste}
               onKeyDown={(e) => {
+                if (e.key === "Tab" && isGenerating) {
+                  e.preventDefault();
+                  if (!canSend) return;
+                  void handleSend({ deliveryMode: "queue" });
+                  return;
+                }
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   if (!canSend) return;
-                  void handleSend();
+                  void handleSend({ deliveryMode: "steer" });
                 }
               }}
               placeholder={composerPlaceholder}

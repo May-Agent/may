@@ -1,4 +1,5 @@
 use crate::config::{LoadBalanceStrategy, PlaywrightBrowser, ProviderType, SshServerConfig};
+use crate::session::{PendingUserMessage, PendingUserMessageMode, SessionRuntimeState};
 
 // ── Typed API Errors ────────────────────────────────────────
 
@@ -328,6 +329,9 @@ pub(crate) struct ApiSession {
     pub(crate) model: String,
     #[serde(default)]
     pub(crate) reasoning_effort: Option<String>,
+    pub(crate) runtime_state: SessionRuntimeState,
+    #[serde(default)]
+    pub(crate) queued_count: usize,
 }
 
 impl ApiSession {
@@ -354,6 +358,8 @@ impl ApiSession {
             messages,
             model,
             reasoning_effort: None,
+            runtime_state: summary.runtime.state,
+            queued_count: summary.runtime.queued_count,
         }
     }
 
@@ -367,6 +373,8 @@ impl ApiSession {
             messages: Vec::new(),
             model,
             reasoning_effort: None,
+            runtime_state: SessionRuntimeState::Idle,
+            queued_count: 0,
         }
     }
 }
@@ -389,7 +397,7 @@ pub(crate) struct UpdateSessionRequest {
     pub(crate) model: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChatRequest {
     pub(crate) session_id: String,
@@ -398,6 +406,8 @@ pub(crate) struct ChatRequest {
     pub(crate) attachments: Vec<ApiAttachment>,
     #[serde(default)]
     pub(crate) hidden_context_xml: Option<String>,
+    #[serde(default)]
+    pub(crate) delivery_mode: PendingUserMessageMode,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -405,6 +415,33 @@ pub(crate) struct ChatRequest {
 pub(crate) struct ChatResponse {
     pub(crate) session_id: String,
     pub(crate) assistant: ApiMessage,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EnqueueChatResponse {
+    pub(crate) session_id: String,
+    pub(crate) runtime_state: SessionRuntimeState,
+    pub(crate) queued_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_immediate: Option<PendingUserMessage>,
+    #[serde(default)]
+    pub(crate) queued_messages: Vec<PendingUserMessage>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemovePendingMessageRequest {
+    pub(crate) kind: PendingMessageKind,
+    #[serde(default)]
+    pub(crate) index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PendingMessageKind {
+    PendingImmediate,
+    Queued,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -499,7 +536,20 @@ pub(crate) struct UiConfigResponse {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionRuntimeResponse {
-    pub(crate) state: &'static str,
+    pub(crate) state: SessionRuntimeState,
+    #[serde(default)]
+    pub(crate) queued_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_immediate: Option<PendingUserMessage>,
+    #[serde(default)]
+    pub(crate) queued_messages: Vec<PendingUserMessage>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionRuntimeEventPayload {
+    pub(crate) session_id: String,
+    pub(crate) runtime: SessionRuntimeResponse,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -12,6 +12,7 @@ use crate::agent::register_tool::RegisterSubagentsBroker;
 use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
 use crate::mcp::McpManager;
+use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::session::SessionManager;
 use crate::skill::SkillManager;
 
@@ -125,6 +126,7 @@ pub(crate) struct UiServerState {
     pub(crate) title_generation_queue: TitleGenerationQueue,
     pub(crate) register_subagents_broker: RegisterSubagentsBroker,
     pub(crate) location_provider: crate::location::LocationProvider,
+    pub(crate) runtime_service: Arc<super::runtime::SessionRuntimeService>,
     pub(crate) cwd: PathBuf,
     pub(crate) may_dir: PathBuf,
 }
@@ -169,6 +171,8 @@ pub(crate) struct AskUserApprover {
     inner: Arc<
         aither_agent::tool_request::RequestApprover<AskUserPendingPayload, Vec<QuestionAnswer>>,
     >,
+    runtime_db: Option<crate::db::ChatDb>,
+    ui_events_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Generate skipped answers for all questions in the request.
@@ -186,15 +190,73 @@ impl AskUserApprover {
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(aither_agent::tool_request::RequestApprover::new()),
+            runtime_db: None,
+            ui_events_notify: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_sync(
+        mut self,
+        db: crate::db::ChatDb,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.runtime_db = Some(db);
+        self.ui_events_notify = Some(notify);
+        self
+    }
+
+    fn notify_ui_events(&self) {
+        if let Some(notify) = &self.ui_events_notify {
+            notify.notify_waiters();
+        }
+    }
+
+    async fn persist_ask_user_runtime_state(
+        &self,
+        session_id: &str,
+        request: Option<PersistedAskUserRequest>,
+    ) {
+        let Some(db) = self.runtime_db.clone() else {
+            return;
+        };
+        if let Err(error) = db.set_waiting_ask_user(session_id, request).await {
+            tracing::warn!(session_id = %session_id, error = %error, "failed to persist ask-user runtime state");
+            return;
+        }
+        self.notify_ui_events();
+    }
+
+    fn persisted_questions(questions: &[Question]) -> Vec<PersistedAskUserQuestion> {
+        questions
+            .iter()
+            .map(|question| PersistedAskUserQuestion {
+                section: question.section.clone(),
+                question: question.question.clone(),
+                option: question.option.clone(),
+                multi_select: question.multi_select,
+            })
+            .collect()
     }
 
     pub(crate) async fn enqueue(&self, request: AskUserRequest, session_id: Option<String>) {
         let questions = request.args.clone().into_questions();
-        let (_id, rx) = self.inner.enqueue(AskUserPendingPayload {
+        let (id, rx) = self.inner.enqueue(AskUserPendingPayload {
             questions: questions.clone(),
-            session_id,
+            session_id: session_id.clone(),
         });
+        if let Some(session_id) = session_id {
+            self.persist_ask_user_runtime_state(
+                &session_id,
+                Some(PersistedAskUserRequest {
+                    id,
+                    questions: Self::persisted_questions(&questions),
+                }),
+            )
+            .await;
+        } else {
+            self.notify_ui_events();
+        }
 
         let answers = rx
             .recv()
@@ -204,7 +266,11 @@ impl AskUserApprover {
     }
 
     pub(crate) fn respond(&self, request_id: &str, answers: Vec<QuestionAnswer>) -> bool {
-        self.inner.respond(request_id, answers)
+        let responded = self.inner.respond(request_id, answers);
+        if responded {
+            self.notify_ui_events();
+        }
+        responded
     }
 
     pub(crate) fn get_session_id(&self, request_id: &str) -> Option<String> {
