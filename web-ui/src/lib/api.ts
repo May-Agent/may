@@ -79,6 +79,7 @@ export interface UiEventsSubscription {
   onOpen?: () => void;
   onConfig?: (payload: UiConfigEventPayload) => void;
   onContainerPrepare?: (payload: ContainerPrepareEventPayload) => void;
+  onProfileSessions?: (payload: { profileSessions: ProfileSessions }) => void;
   onRequestLogs?: (payload: { logs: RequestLogEntry[] }) => void;
   onSessionRuntime?: (payload: { sessionId: string; runtime: SessionRuntimeStatus }) => void;
   onSessionRuntimes?: (payload: { sessions: SessionRuntimeSnapshot[] }) => void;
@@ -1166,6 +1167,13 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
         'container_prepare',
         options.onContainerPrepare
           ? (data) => options.onContainerPrepare!({ statuses: data.statuses ?? [] })
+          : undefined,
+        options.onError,
+      ),
+      profile_sessions: buildSSEListener<{ profileSessions: ProfileSessions }>(
+        'profile_sessions',
+        options.onProfileSessions
+          ? (data) => options.onProfileSessions!({ profileSessions: data.profileSessions })
           : undefined,
         options.onError,
       ),

@@ -27,6 +27,13 @@ function profileHasSession(profileSessions: ProfileSessions | null, sessionId: s
   return false;
 }
 
+function flattenProfileSessions(profileSessions: ProfileSessions) {
+  const pinnedSessions = profileSessions.pinned.flatMap((item) =>
+    item.type === 'session' ? [item] : item.sessions,
+  );
+  return [...pinnedSessions, ...profileSessions.regular, ...profileSessions.archived];
+}
+
 function AppScaffold({
   isSidebarOpen,
   setSidebarOpen,
@@ -293,6 +300,29 @@ function AppShell() {
       onContainerPrepare: (payload) => {
         clearBackendUnavailable();
         useStore.getState().setContainerPrepareStatuses(payload.statuses);
+      },
+      onProfileSessions: ({ profileSessions }) => {
+        clearBackendUnavailable();
+        useRuntimeStore.getState().applyRuntimes(
+          flattenProfileSessions(profileSessions).map((session) => ({
+            sessionId: session.id,
+            runtime: {
+              state: session.runtimeState,
+              queuedCount: session.queuedCount,
+              pendingImmediate: null,
+              queuedMessages: [],
+              waitingPermission: null,
+              waitingAskUser: null,
+            },
+          })),
+        );
+        useStore.setState({
+          profileSessions,
+          profileSessionsLoading: false,
+          profileAccessBlockedReason: null,
+          profileAccessBlockedCode: null,
+          backendUnavailableReason: null,
+        });
       },
       onSessionRuntimes: ({ sessions }) => {
         clearBackendUnavailable();

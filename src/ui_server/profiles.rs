@@ -322,6 +322,7 @@ pub(super) async fn create_profile(
         })
         .await
         .map_err(map_profile_error)?;
+    state.notify_ui_events();
 
     Ok(Json(
         ProfileInfo::from_db_model(model).map_err(map_profile_error)?,
@@ -368,6 +369,7 @@ pub(super) async fn update_profile(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Profile not found"))?;
+    state.notify_ui_events();
 
     Ok(Json(
         ProfileInfo::from_db_model(model).map_err(map_profile_error)?,
@@ -386,6 +388,7 @@ pub(super) async fn delete_profile(
     };
 
     db.delete_profile(&id).await.map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
 
@@ -456,6 +459,7 @@ pub(super) async fn create_folder(
         .create_folder(&folder_id, &profile_id, &req.name)
         .await
         .map_err(map_profile_error)?;
+    state.notify_ui_events();
 
     Ok(Json(FolderResponse {
         id: model.id,
@@ -485,6 +489,7 @@ pub(super) async fn update_folder(
             .await
             .map_err(internal_error)?;
     }
+    state.notify_ui_events();
 
     Ok(Json(super::types::API_OK))
 }
@@ -501,6 +506,7 @@ pub(super) async fn delete_folder(
     };
 
     db.delete_folder(&id).await.map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
 
@@ -518,6 +524,7 @@ pub(super) async fn pin_session(
     };
 
     db.pin_session(&id).await.map_err(map_profile_error)?;
+    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
 
@@ -533,6 +540,7 @@ pub(super) async fn unpin_session(
     };
 
     db.unpin_session(&id).await.map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
 
@@ -548,6 +556,7 @@ pub(super) async fn archive_session(
     };
 
     db.archive_session(&id).await.map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
 
@@ -563,6 +572,7 @@ pub(super) async fn unarchive_session(
     };
 
     db.unarchive_session(&id).await.map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
 
@@ -581,5 +591,6 @@ pub(super) async fn move_to_folder(
     db.move_session_to_folder(&id, req.folder_id.as_deref())
         .await
         .map_err(map_profile_error)?;
+    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
