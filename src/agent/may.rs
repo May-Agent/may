@@ -317,27 +317,10 @@ impl PermissionApprover {
         responded
     }
 
-    /// Returns the oldest pending request matching the session filter as `(id, payload)`.
-    pub fn snapshot_session_runtime(
-        &self,
-        session_id: Option<&str>,
-    ) -> Option<(String, PermissionRequest)> {
-        self.inner
-            .peek_filtered(|req| match (session_id, req.session_id.as_deref()) {
-                (Some(expected), Some(actual)) => expected == actual,
-                (None, Some(_)) => true,
-                _ => false,
-            })
-    }
-
     pub fn session_id_for_request(&self, request_id: &str) -> Option<String> {
         self.inner
             .get_payload(request_id)
             .and_then(|p| p.session_id)
-    }
-
-    pub fn listen(&self) -> event_listener::EventListener {
-        self.inner.listen()
     }
 }
 
@@ -384,7 +367,7 @@ pub struct MayAgentConfig {
     pub ask_user_broker: AskUserBroker,
     /// Image generation provider and model.
     pub image_generator: Option<ImageGeneratorConfig>,
-    /// Preconfigured SSH servers available for `bash` ssh mode and `open_ssh`.
+    /// Preconfigured SSH servers available for `bash` ssh mode.
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,

@@ -22,11 +22,6 @@ export interface PermissionRequest {
   sessionId?: string;
 }
 
-export interface PermissionPollResult {
-  request: PermissionRequest | null;
-  state: 'waiting_permission' | null;
-}
-
 export interface SessionRuntimeStatus {
   state: SessionRuntimeState;
   queuedCount: number;
@@ -85,8 +80,6 @@ export interface UiEventsSubscription {
   onConfig?: (payload: UiConfigEventPayload) => void;
   onContainerPrepare?: (payload: ContainerPrepareEventPayload) => void;
   onRequestLogs?: (payload: { logs: RequestLogEntry[] }) => void;
-  onPermission?: (payload: PermissionPollResult) => void;
-  onAskUser?: (payload: { request: AskUserRequest | null }) => void;
   onSessionRuntime?: (payload: { sessionId: string; runtime: SessionRuntimeStatus }) => void;
   onSessionRuntimes?: (payload: { sessions: SessionRuntimeSnapshot[] }) => void;
   onHeartbeat?: () => void;
@@ -1173,24 +1166,6 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
         'container_prepare',
         options.onContainerPrepare
           ? (data) => options.onContainerPrepare!({ statuses: data.statuses ?? [] })
-          : undefined,
-        options.onError,
-      ),
-      permission: buildSSEListener<PermissionPollResult>(
-        'permission',
-        options.onPermission
-          ? (data) =>
-              options.onPermission!({
-                request: data.request ?? null,
-                state: data.state ?? null,
-              })
-          : undefined,
-        options.onError,
-      ),
-      ask_user: buildSSEListener<{ request?: AskUserRequest | null }>(
-        'ask_user',
-        options.onAskUser
-          ? (data) => options.onAskUser!({ request: data.request ?? null })
           : undefined,
         options.onError,
       ),
