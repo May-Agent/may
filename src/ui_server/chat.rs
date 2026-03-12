@@ -265,6 +265,21 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     });
 }
 
+pub(super) async fn resume_pending_follow_up_runs(state: Arc<UiServerState>) -> anyhow::Result<()> {
+    let session_ids = {
+        let manager = state.session_manager.lock().await;
+        manager
+            .db()
+            .sessions_requiring_pending_dispatch()
+            .await
+            .map_err(anyhow::Error::from)?
+    };
+    for session_id in session_ids {
+        spawn_follow_up_runs(state.clone(), session_id);
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct BrowserTakeoverAlertXml {
     #[serde(rename = "@type")]
@@ -448,6 +463,7 @@ async fn run_agent_loop(
         let mut full_text = String::new(); // accumulated full assistant text
         let mut reasoning_text = String::new();
         let mut bash_snapshot = BashStateSnapshot::default();
+        let mut saw_tool_activity = false;
         let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut last_todo_hash: Option<u64> = None;
@@ -477,6 +493,7 @@ async fn run_agent_loop(
                         name,
                         arguments,
                     }) => {
+                        saw_tool_activity = true;
                         // Flush accumulated text as a history message before the tool call.
                         if !segment_text.trim().is_empty() {
                             append_history_message(
@@ -506,6 +523,7 @@ async fn run_agent_loop(
                         sink.on_tool_start(&id, &name, &arguments).await;
                     }
                     Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
+                        saw_tool_activity = true;
                         let record = ToolEventRecord::End {
                             id: id.clone(),
                             name: name.clone(),
@@ -589,7 +607,8 @@ async fn run_agent_loop(
 
         let has_assistant_text = !full_text.trim().is_empty();
         let has_bash_output = !bash_snapshot.executions.is_empty();
-        if !has_assistant_text && !has_bash_output {
+        let has_tool_activity = has_bash_output || saw_tool_activity;
+        if !has_assistant_text && !has_tool_activity {
             let err = "Model returned an empty assistant response";
             record_request_log(
                 state,
@@ -599,7 +618,7 @@ async fn run_agent_loop(
             sink.on_error(err).await;
             return Err(anyhow::anyhow!(err));
         }
-        if !has_assistant_text && has_bash_output {
+        if !has_assistant_text && has_tool_activity {
             append_history_message(state, &session_id, ChatMessage::assistant(String::new()))
                 .await?;
         }
@@ -1314,11 +1333,11 @@ async fn prepare_agent_for_request(
             .restore_context_json(context_snapshot_json)
             .map_err(anyhow::Error::from)?;
         for message in ctx.incremental_messages {
-            agent.inner_mut().push_message(message);
+            agent.push_message(message);
         }
     } else {
         for message in ctx.history_messages {
-            agent.inner_mut().push_message(message);
+            agent.push_message(message);
         }
     }
 

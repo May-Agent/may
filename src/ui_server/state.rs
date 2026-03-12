@@ -11,9 +11,10 @@ use crate::agent::PermissionApprover;
 use crate::agent::register_tool::RegisterSubagentsBroker;
 use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
+use crate::live_response::LiveResponseRegistry;
 use crate::mcp::McpManager;
 use crate::session::SessionManager;
-use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
+use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::skill::SkillManager;
 
 use super::local_url_mapper::LocalUrlPortMapper;
@@ -152,17 +153,9 @@ pub(crate) struct AskUserRespondRequest {
     pub(crate) answers: Vec<UiQuestionAnswer>,
 }
 
-/// Pending ask-user entry: response channel + session_id for persistence.
-#[derive(Debug, Clone)]
-struct AskUserPendingPayload {
-    session_id: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct AskUserApprover {
-    inner: Arc<
-        aither_agent::tool_request::RequestApprover<AskUserPendingPayload, Vec<QuestionAnswer>>,
-    >,
+    live_responses: Arc<LiveResponseRegistry<Vec<QuestionAnswer>>>,
     runtime_db: Option<crate::db::ChatDb>,
     ui_events_notify: Option<Arc<tokio::sync::Notify>>,
 }
@@ -181,7 +174,7 @@ fn skipped_answers(questions: &[Question]) -> Vec<QuestionAnswer> {
 impl AskUserApprover {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Arc::new(aither_agent::tool_request::RequestApprover::new()),
+            live_responses: Arc::new(LiveResponseRegistry::new()),
             runtime_db: None,
             ui_events_notify: None,
         }
@@ -233,18 +226,40 @@ impl AskUserApprover {
 
     pub(crate) async fn enqueue(&self, request: AskUserRequest, session_id: Option<String>) {
         let questions = request.args.clone().into_questions();
-        let (id, rx) = self.inner.enqueue(AskUserPendingPayload {
-            session_id: session_id.clone(),
-        });
-        if let Some(session_id) = session_id {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let rx = self.live_responses.open(request_id.clone());
+
+        if let Some(session_id) = session_id.as_deref()
+            && let Some(db) = self.runtime_db.clone()
+        {
             self.persist_ask_user_runtime_state(
-                &session_id,
+                session_id,
                 Some(PersistedAskUserRequest {
-                    id,
+                    id: request_id.clone(),
                     questions: Self::persisted_questions(&questions),
                 }),
             )
             .await;
+
+            let content = serde_json::to_string(&crate::session::history::AskUserRequestData {
+                id: request_id.clone(),
+                questions: serde_json::to_value(&questions)
+                    .expect("ask_user questions must serialize"),
+            })
+            .expect("ask_user request content must serialize");
+            if let Err(error) = db
+                .append_message(
+                    session_id,
+                    MessageRole::AskUserRequest,
+                    &content,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(session_id, error = %error, "failed to append ask-user request history");
+            }
         } else {
             self.notify_ui_events();
         }
@@ -257,17 +272,11 @@ impl AskUserApprover {
     }
 
     pub(crate) fn respond(&self, request_id: &str, answers: Vec<QuestionAnswer>) -> bool {
-        let responded = self.inner.respond(request_id, answers);
+        let responded = self.live_responses.resolve(request_id, answers);
         if responded {
             self.notify_ui_events();
         }
         responded
-    }
-
-    pub(crate) fn get_session_id(&self, request_id: &str) -> Option<String> {
-        self.inner
-            .get_payload(request_id)
-            .and_then(|payload| payload.session_id)
     }
 }
 

@@ -7,6 +7,8 @@ use aither_core::llm::{Tool, ToolOutput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::xml_fragment::XmlFragment;
+
 /// Send a push notification to subscribed clients.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct NotifyArgs {
@@ -19,7 +21,7 @@ pub struct NotifyArgs {
     pub session_id: Option<String>,
     /// Optional hidden XML context injected on notification click.
     #[serde(default)]
-    pub callback_context_xml: Option<String>,
+    pub callback_context_xml: Option<XmlFragment>,
     /// Optional user-visible message sent on notification click.
     #[serde(default)]
     pub callback_message: Option<String>,
@@ -57,12 +59,7 @@ impl NotifyTool {
             return Err(anyhow::anyhow!("notify body must not be empty"));
         }
 
-        let callback_context_xml = args
-            .callback_context_xml
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
+        let callback_context_xml = args.callback_context_xml;
         let callback_message = args
             .callback_message
             .as_deref()

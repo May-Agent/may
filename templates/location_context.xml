@@ -1,6 +1,0 @@
-<location>
-<city>{{ city }}</city>
-<region>{{ region }}</region>
-<country>{{ country }}</country>
-<timezone>{{ timezone }}</timezone>
-</location>

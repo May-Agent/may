@@ -11,15 +11,16 @@ use sea_orm::{
     ActiveModelTrait,
     ActiveValue::NotSet,
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, DbErr, EntityTrait, Order,
-    PaginatorTrait, QueryFilter, QueryOrder, Schema, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Set,
     sea_query::{Expr, Query, SqliteQueryBuilder},
 };
 
 use crate::session::{
-    PendingUserMessage, PersistedAskUserRequest, PersistedPermissionRequest, SessionRuntimeState,
-    SessionRuntimeSummary,
+    MessageRole, PendingUserMessage, PersistedAskUserRequest, PersistedPermissionRequest,
+    SessionRuntimeState, SessionRuntimeSummary,
 };
 use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
+use crate::xml_fragment::XmlFragment;
 use entity::{
     context_debug_snapshots, folders, messages, notification_mailbox, profile_memories,
     profile_memory_jobs, profiles, push_subscriptions, scheduled_tasks, session_context_snapshots,
@@ -34,6 +35,8 @@ pub enum ChatDbError {
     Db(#[from] DbErr),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Invalid XML fragment: {0}")]
+    InvalidXml(#[from] crate::xml_fragment::XmlFragmentError),
     #[error("Invalid profile environment: {0}")]
     InvalidProfileEnvironment(String),
     #[error(
@@ -92,6 +95,16 @@ pub struct AssistantCacheUsageSummary {
     pub prompt_tokens_total: u64,
     pub cache_read_tokens_total: u64,
     pub cache_write_tokens_total: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPermissionLookup {
+    pub(crate) session_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingAskUserLookup {
+    pub(crate) session_id: String,
 }
 
 struct DefaultProfile<'a> {
@@ -452,7 +465,7 @@ impl ChatDb {
             .await?;
         let message_rows = session_pending_messages::Entity::find()
             .filter(session_pending_messages::Column::SessionId.eq(session_id))
-            .order_by(session_pending_messages::Column::CreatedAt, Order::Asc)
+            .order_by(session_pending_messages::Column::Id, Order::Asc)
             .all(&self.conn)
             .await?;
         let permission_row = session_pending_permissions::Entity::find()
@@ -464,24 +477,28 @@ impl ChatDb {
             .one(&self.conn)
             .await?;
 
-        let mut pending_immediate = None;
+        let mut steer_messages = Vec::new();
         let mut queued_messages = Vec::new();
         for row in message_rows {
             let message = PendingUserMessage {
                 content: row.content,
                 attachments: serde_json::from_str(&row.attachments_json)?,
-                hidden_context_xml: row.hidden_context_xml,
+                hidden_context_xml: row.hidden_context_xml.map(XmlFragment::parse).transpose()?,
                 created_at: row.created_at,
                 delivery_mode: row.delivery_mode.parse().unwrap_or_default(),
             };
-            if message.delivery_mode == crate::session::PendingUserMessageMode::Steer
-                && pending_immediate.is_none()
-            {
-                pending_immediate = Some(message);
+            if message.delivery_mode == crate::session::PendingUserMessageMode::Steer {
+                steer_messages.push(message);
             } else {
                 queued_messages.push(message);
             }
         }
+        let pending_immediate = if steer_messages.is_empty() {
+            None
+        } else {
+            Some(steer_messages.remove(0))
+        };
+        queued_messages.splice(0..0, steer_messages);
 
         let mut summary = SessionRuntimeSummary {
             state: runtime_row
@@ -543,19 +560,6 @@ impl ChatDb {
             .exec(&self.conn)
             .await?;
 
-        if let Some(message) = &summary.pending_immediate {
-            session_pending_messages::ActiveModel {
-                id: NotSet,
-                session_id: Set(session_id.to_string()),
-                delivery_mode: Set(message.delivery_mode.as_str().to_string()),
-                content: Set(message.content.clone()),
-                attachments_json: Set(serde_json::to_string(&message.attachments)?),
-                hidden_context_xml: Set(message.hidden_context_xml.clone()),
-                created_at: Set(message.created_at.clone()),
-            }
-            .insert(&self.conn)
-            .await?;
-        }
         for message in &summary.queued_messages {
             session_pending_messages::ActiveModel {
                 id: NotSet,
@@ -563,7 +567,26 @@ impl ChatDb {
                 delivery_mode: Set(message.delivery_mode.as_str().to_string()),
                 content: Set(message.content.clone()),
                 attachments_json: Set(serde_json::to_string(&message.attachments)?),
-                hidden_context_xml: Set(message.hidden_context_xml.clone()),
+                hidden_context_xml: Set(message
+                    .hidden_context_xml
+                    .clone()
+                    .map(XmlFragment::into_inner)),
+                created_at: Set(message.created_at.clone()),
+            }
+            .insert(&self.conn)
+            .await?;
+        }
+        if let Some(message) = &summary.pending_immediate {
+            session_pending_messages::ActiveModel {
+                id: NotSet,
+                session_id: Set(session_id.to_string()),
+                delivery_mode: Set(message.delivery_mode.as_str().to_string()),
+                content: Set(message.content.clone()),
+                attachments_json: Set(serde_json::to_string(&message.attachments)?),
+                hidden_context_xml: Set(message
+                    .hidden_context_xml
+                    .clone()
+                    .map(XmlFragment::into_inner)),
                 created_at: Set(message.created_at.clone()),
             }
             .insert(&self.conn)
@@ -627,7 +650,7 @@ impl ChatDb {
             .await
     }
 
-    /// Enqueue a pending-immediate message, replacing any previous pending-immediate payload.
+    /// Enqueue a pending-immediate message while preserving older steer messages.
     pub async fn set_pending_immediate_message(
         &self,
         session_id: &str,
@@ -639,6 +662,9 @@ impl ChatDb {
             )))
         })?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
+        if let Some(previous) = summary.pending_immediate.take() {
+            summary.push_overflow_steer(previous);
+        }
         summary.pending_immediate = Some(message);
         summary.normalize_state();
         self.write_session_runtime_summary(session_id, &summary)
@@ -775,6 +801,72 @@ impl ChatDb {
         Ok(summary)
     }
 
+    pub(crate) async fn find_pending_permission_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PendingPermissionLookup>, ChatDbError> {
+        let Some(row) = session_pending_permissions::Entity::find_by_id(request_id)
+            .one(&self.conn)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(PendingPermissionLookup {
+            session_id: row.session_id,
+        }))
+    }
+
+    pub(crate) async fn find_pending_ask_user_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PendingAskUserLookup>, ChatDbError> {
+        let Some(row) = session_pending_ask_user::Entity::find_by_id(request_id)
+            .one(&self.conn)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(PendingAskUserLookup {
+            session_id: row.session_id,
+        }))
+    }
+
+    pub async fn session_has_approved_permission_mode(
+        &self,
+        session_id: &str,
+        mode: &str,
+    ) -> Result<bool, ChatDbError> {
+        let responded_ids = self
+            .get_messages_by_role(session_id, MessageRole::PermissionResponse.as_str())
+            .await?
+            .into_iter()
+            .map(|row| {
+                serde_json::from_str::<crate::session::history::PermissionResponseData>(
+                    &row.content,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|response| response.approved)
+            .map(|response| response.id)
+            .collect::<std::collections::HashSet<_>>();
+
+        let approved = self
+            .get_messages_by_role(session_id, MessageRole::PermissionRequest.as_str())
+            .await?
+            .into_iter()
+            .map(|row| {
+                serde_json::from_str::<crate::session::history::PermissionRequestData>(&row.content)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|request| request.mode == mode && responded_ids.contains(&request.id));
+
+        Ok(approved)
+    }
+
     /// Check if a session exists in the database.
     pub async fn session_exists(&self, id: &str) -> Result<bool, ChatDbError> {
         Ok(sessions::Entity::find_by_id(id)
@@ -849,7 +941,18 @@ impl ChatDb {
             let session_id = session.id.clone();
             let mut summary = self.load_session_runtime_summary(&session_id).await?;
             let original_state = summary.state;
+            let expired_interactive_wait = matches!(
+                original_state,
+                SessionRuntimeState::WaitingPermission
+                    | SessionRuntimeState::WaitingAskUser
+                    | SessionRuntimeState::WaitingTerminalInput
+            );
 
+            if expired_interactive_wait {
+                summary.waiting_permission = None;
+                summary.waiting_ask_user = None;
+                summary.state = SessionRuntimeState::Idle;
+            }
             summary.normalize_state();
             if matches!(original_state, SessionRuntimeState::Running)
                 && summary.state == SessionRuntimeState::Running
@@ -857,7 +960,7 @@ impl ChatDb {
                 summary.state = SessionRuntimeState::Idle;
             }
 
-            if summary.state != original_state {
+            if summary.state != original_state || expired_interactive_wait {
                 self.write_session_runtime_summary(&session_id, &summary)
                     .await?;
             }
@@ -865,18 +968,33 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Update session stats: updated_at, preview, and optionally increment message_count.
+    /// Return session ids that have persisted follow-up work ready to resume.
+    pub async fn sessions_requiring_pending_dispatch(&self) -> Result<Vec<String>, ChatDbError> {
+        let sessions = self.list_sessions().await?;
+        let mut session_ids = Vec::new();
+        for session in sessions {
+            let summary = self.load_session_runtime_summary(&session.id).await?;
+            if summary.has_pending_messages() {
+                session_ids.push(session.id);
+            }
+        }
+        Ok(session_ids)
+    }
+
+    /// Update session stats after inserting a message row.
     async fn update_session_stats(
         &self,
         session_id: &str,
         updated_at: &str,
-        preview: &str,
+        preview: Option<&str>,
         increment_count: bool,
     ) -> Result<(), ChatDbError> {
         let mut update = Query::update();
         update.table(sessions::Entity);
         update.value(sessions::Column::UpdatedAt, updated_at);
-        update.value(sessions::Column::Preview, preview);
+        if let Some(preview) = preview {
+            update.value(sessions::Column::Preview, preview);
+        }
 
         if increment_count {
             update.value(
@@ -898,7 +1016,7 @@ impl ChatDb {
     pub async fn append_message(
         &self,
         session_id: &str,
-        role: &str,
+        role: MessageRole,
         content: &str,
         timestamp: Option<&str>,
         tool_call_id: Option<&str>,
@@ -941,11 +1059,13 @@ impl ChatDb {
             .transpose()
             .map_err(|e| DbErr::Custom(format!("elapsed_ms overflow: {e}")))?;
         let provider_id = stats.and_then(|s| s.provider_id.clone());
+        let session_update = role.session_summary_update();
+        let role_str = role.as_str();
 
         // Insert the message
         let active = messages::ActiveModel {
             session_id: Set(session_id.to_string()),
-            role: Set(role.to_string()),
+            role: Set(role_str.to_string()),
             content: Set(content.to_string()),
             timestamp: Set(timestamp.map(String::from).or(Some(now.clone()))),
             tool_call_id: Set(tool_call_id.map(String::from)),
@@ -961,10 +1081,18 @@ impl ChatDb {
         };
         let model = active.insert(&self.conn).await?;
 
-        // Update session: touch updated_at, increment message_count, set preview
-        let preview = truncate_preview(content);
-        self.update_session_stats(session_id, &now, &preview, true)
+        if session_update.touch_updated_at {
+            let preview = session_update
+                .update_preview
+                .then(|| truncate_preview(content));
+            self.update_session_stats(
+                session_id,
+                &now,
+                preview.as_deref(),
+                session_update.increment_message_count,
+            )
             .await?;
+        }
 
         Ok(model)
     }
@@ -1215,7 +1343,10 @@ impl ChatDb {
             title: Set(payload.title.clone()),
             body: Set(payload.body.clone()),
             session_id: Set(payload.session_id.clone()),
-            callback_context_xml: Set(payload.callback_context_xml.clone()),
+            callback_context_xml: Set(payload
+                .callback_context_xml
+                .clone()
+                .map(XmlFragment::into_inner)),
             callback_message: Set(payload.callback_message.clone()),
             status: Set(status.to_string()),
             sent_count: Set(0),
@@ -1751,6 +1882,23 @@ impl ChatDb {
 
     /// Archive a session.
     pub async fn archive_session(&self, id: &str) -> Result<(), ChatDbError> {
+        let runtime = self.load_session_runtime_summary(id).await?;
+        if runtime.is_active() {
+            let reason = if runtime.state.is_active() {
+                ["runtime state is ", runtime.state.as_str()].concat()
+            } else {
+                "pending follow-up work exists".to_string()
+            };
+            return Err(ChatDbError::Db(DbErr::Custom(
+                [
+                    "cannot archive active session ",
+                    id,
+                    " while ",
+                    reason.as_str(),
+                ]
+                .concat(),
+            )));
+        }
         let mut update = Query::update();
         update.table(sessions::Entity);
         update.value(sessions::Column::Archived, true);
@@ -1884,13 +2032,34 @@ impl ChatDb {
         &self,
         cutoff: &str,
     ) -> Result<Vec<sessions::Model>, ChatDbError> {
-        let active_session_ids = session_runtimes::Entity::find()
+        let mut active_session_ids = session_runtimes::Entity::find()
             .filter(session_runtimes::Column::State.ne(SessionRuntimeState::Idle.as_str()))
             .all(&self.conn)
             .await?
             .into_iter()
             .map(|row| row.session_id)
-            .collect::<Vec<_>>();
+            .collect::<std::collections::BTreeSet<_>>();
+        active_session_ids.extend(
+            session_pending_messages::Entity::find()
+                .all(&self.conn)
+                .await?
+                .into_iter()
+                .map(|row| row.session_id),
+        );
+        active_session_ids.extend(
+            session_pending_permissions::Entity::find()
+                .all(&self.conn)
+                .await?
+                .into_iter()
+                .map(|row| row.session_id),
+        );
+        active_session_ids.extend(
+            session_pending_ask_user::Entity::find()
+                .all(&self.conn)
+                .await?
+                .into_iter()
+                .map(|row| row.session_id),
+        );
 
         let mut query = sessions::Entity::find()
             .filter(sessions::Column::Pinned.eq(false))
@@ -2283,7 +2452,11 @@ fn query_u64(row: &sea_orm::QueryResult, index: usize) -> Result<u64, ChatDbErro
         .map_err(ChatDbError::Db)?;
     u64::try_from(value).map_err(|error| {
         ChatDbError::Db(DbErr::Custom(
-            ["u64 aggregate conversion failed: ", error.to_string().as_str()].concat(),
+            [
+                "u64 aggregate conversion failed: ",
+                error.to_string().as_str(),
+            ]
+            .concat(),
         ))
     })
 }
@@ -2368,7 +2541,23 @@ pub struct AskUserResponsePayload {
 mod tests {
     use tempfile::tempdir;
 
+    use crate::session::{
+        PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
+        PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
+        SessionRuntimeState,
+    };
+
     use super::{ChatDb, CreateProfileParams};
+
+    fn test_pending_message(content: &str, mode: PendingUserMessageMode) -> PendingUserMessage {
+        PendingUserMessage {
+            content: content.to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            created_at: jiff::Timestamp::now().to_string(),
+            delivery_mode: mode,
+        }
+    }
 
     #[tokio::test]
     async fn archive_and_unarchive_reset_pin_state_and_capacity() {
@@ -2639,5 +2828,189 @@ mod tests {
         assert_eq!(local.icon.as_deref(), Some("\u{1F5A5}\u{FE0F}"));
         assert!(!local.location_aware);
         assert!(local.container_image.is_none());
+    }
+
+    #[tokio::test]
+    async fn preserves_older_steer_messages_when_new_steer_arrives() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let session_id = "session-test";
+        db.create_session(session_id, Some("Test session"), Some("test-model"))
+            .await
+            .expect("session should be created");
+
+        db.set_pending_immediate_message(
+            session_id,
+            test_pending_message("first steer", PendingUserMessageMode::Steer),
+        )
+        .await
+        .expect("first steer should persist");
+        db.set_pending_immediate_message(
+            session_id,
+            test_pending_message("second steer", PendingUserMessageMode::Steer),
+        )
+        .await
+        .expect("second steer should persist");
+
+        let runtime = db
+            .get_session_runtime(session_id)
+            .await
+            .expect("runtime should load")
+            .expect("runtime should exist");
+        assert_eq!(
+            runtime
+                .pending_immediate
+                .as_ref()
+                .map(|message| message.content.as_str()),
+            Some("second steer")
+        );
+        assert_eq!(runtime.queued_messages.len(), 1);
+        assert_eq!(runtime.queued_messages[0].content, "first steer");
+        assert_eq!(
+            runtime.queued_messages[0].delivery_mode,
+            PendingUserMessageMode::Steer
+        );
+
+        let first = db
+            .take_next_pending_message(session_id)
+            .await
+            .expect("first pending should load")
+            .expect("first pending should exist");
+        assert_eq!(first.content, "second steer");
+
+        let second = db
+            .take_next_pending_message(session_id)
+            .await
+            .expect("second pending should load")
+            .expect("second pending should exist");
+        assert_eq!(second.content, "first steer");
+        assert_eq!(second.delivery_mode, PendingUserMessageMode::Steer);
+    }
+
+    #[tokio::test]
+    async fn rejects_archiving_active_sessions() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let session_id = "session-test";
+        db.create_session(session_id, Some("Test session"), Some("test-model"))
+            .await
+            .expect("session should be created");
+        db.set_session_runtime_state(session_id, SessionRuntimeState::Running)
+            .await
+            .expect("runtime state should persist");
+
+        let error = db
+            .archive_session(session_id)
+            .await
+            .expect_err("active session must not archive");
+        assert!(
+            error.to_string().contains("cannot archive active session"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_archiving_sessions_with_pending_follow_up_work() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let session_id = "session-test";
+        db.create_session(session_id, Some("Test session"), Some("test-model"))
+            .await
+            .expect("session should be created");
+        db.set_pending_immediate_message(
+            session_id,
+            test_pending_message("steer me", PendingUserMessageMode::Steer),
+        )
+        .await
+        .expect("pending steer should persist");
+
+        let error = db
+            .archive_session(session_id)
+            .await
+            .expect_err("session with pending work must not archive");
+        assert!(
+            error.to_string().contains("pending follow-up work exists"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_expires_interactive_waits_but_preserves_pending_dispatch() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let session_id = "session-test";
+        db.create_session(session_id, Some("Test session"), Some("test-model"))
+            .await
+            .expect("session should be created");
+        db.set_pending_immediate_message(
+            session_id,
+            test_pending_message("steer me", PendingUserMessageMode::Steer),
+        )
+        .await
+        .expect("pending steer should persist");
+        db.set_waiting_permission(
+            session_id,
+            Some(PersistedPermissionRequest {
+                id: "perm-1".to_string(),
+                request: PersistedPermissionRequestPayload {
+                    mode: "default".to_string(),
+                    script: "echo hi".to_string(),
+                    session_id: Some(session_id.to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("waiting permission should persist");
+        db.set_waiting_ask_user(
+            session_id,
+            Some(PersistedAskUserRequest {
+                id: "ask-1".to_string(),
+                questions: vec![PersistedAskUserQuestion {
+                    section: "default".to_string(),
+                    question: "Proceed?".to_string(),
+                    option: vec!["yes".to_string()],
+                    multi_select: false,
+                }],
+            }),
+        )
+        .await
+        .expect("waiting ask-user should persist");
+
+        db.recover_session_runtimes_after_restart()
+            .await
+            .expect("runtime recovery should succeed");
+
+        let runtime = db
+            .get_session_runtime(session_id)
+            .await
+            .expect("runtime should load")
+            .expect("runtime should exist");
+        assert_eq!(runtime.state, SessionRuntimeState::Idle);
+        assert!(runtime.waiting_permission.is_none());
+        assert!(runtime.waiting_ask_user.is_none());
+        assert!(runtime.has_pending_immediate());
+        assert_eq!(runtime.queued_count, 1);
+
+        let resumable = db
+            .sessions_requiring_pending_dispatch()
+            .await
+            .expect("pending dispatch lookup should succeed");
+        assert_eq!(resumable, vec![session_id.to_string()]);
     }
 }

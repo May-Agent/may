@@ -15,9 +15,9 @@ use super::model_resolution::{
 };
 use super::state::UiServerState;
 use super::types::{
-    ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest,
-    SessionContextDebugResponse, SessionContextWindowMetricsResponse,
-    SessionContextWindowSnapshotResponse, UpdateSessionRequest,
+    ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, SessionContextDebugResponse,
+    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse,
+    UpdateSessionRequest,
 };
 
 #[derive(serde::Deserialize)]
@@ -131,7 +131,11 @@ fn build_window_snapshot(
         internal_error("session context snapshot is missing assembled_messages_json")
     })?;
     let assembled_messages: Vec<LlmMessage> = serde_json::from_str(&assembled_messages_json)
-        .map_err(|e| internal_error(format!("invalid session context assembled_messages_json: {e}")))?;
+        .map_err(|e| {
+            internal_error(format!(
+                "invalid session context assembled_messages_json: {e}"
+            ))
+        })?;
 
     Ok(SessionContextWindowSnapshotResponse {
         phase: stored.phase,
@@ -184,11 +188,12 @@ pub(super) async fn create_session(
     };
 
     let mut manager = state.session_manager.lock().await;
-    let resolved_profile_id =
-        requested_profile_id.or_else(|| manager.current_profile_id().map(ToOwned::to_owned));
+    let resolved_profile_id = requested_profile_id
+        .clone()
+        .or_else(|| manager.current_profile_id().map(ToOwned::to_owned));
 
     let session = manager
-        .create_session_in_profile(Some(model.clone()), resolved_profile_id)
+        .create_session_in_profile(Some(model.clone()), resolved_profile_id.clone())
         .map_err(internal_error)?;
     let id = session.id.as_str().to_string();
 
@@ -204,7 +209,7 @@ pub(super) async fn create_session(
         .map_err(internal_error)?;
     state.notify_ui_events();
 
-    Ok(Json(ApiSession::new_empty(id, model)))
+    Ok(Json(ApiSession::new_empty(id, model, resolved_profile_id)))
 }
 
 pub(super) async fn update_session(
@@ -252,6 +257,7 @@ pub(super) async fn update_session(
         .unwrap_or_else(|| "New conversation started".to_string());
     let current_model = current.model.clone();
     let current_id = current.id.as_str().to_string();
+    let profile_id = current.profile_id.clone();
     drop(manager);
 
     if let Some(model) = model_to_persist {
@@ -265,6 +271,11 @@ pub(super) async fn update_session(
         resolve_default_model(&cfg, current_model)
             .ok_or_else(|| internal_error(format!("no model resolved for session {current_id}")))?
     };
+    let runtime = state
+        .runtime_service
+        .get(&id)
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events();
 
     Ok(Json(ApiSession {
@@ -273,10 +284,11 @@ pub(super) async fn update_session(
         last_modified: jiff::Timestamp::now().to_string(),
         preview,
         messages: Vec::new(),
+        profile_id,
         model,
         reasoning_effort: None,
-        runtime_state: crate::session::SessionRuntimeState::Idle,
-        queued_count: 0,
+        runtime_state: runtime.state,
+        queued_count: runtime.queued_count,
     }))
 }
 

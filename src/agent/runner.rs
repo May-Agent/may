@@ -171,7 +171,7 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>) {
                 run_agent_prompt(&mut agent, &prompt, attachments, &command_rx, &event_tx).await;
             }
             WorkerCommand::Compact { focus, event_tx } => {
-                let result = agent.inner_mut().compact(focus.as_deref()).await;
+                let result = agent.compact(focus.as_deref()).await;
                 let _ = event_tx.send(TuiEvent::Compacted(result)).await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }

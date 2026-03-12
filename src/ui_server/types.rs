@@ -1,5 +1,6 @@
 use crate::config::{LoadBalanceStrategy, PlaywrightBrowser, ProviderType, SshServerConfig};
 use crate::session::{PendingUserMessage, PendingUserMessageMode, SessionRuntimeState};
+use crate::xml_fragment::XmlFragment;
 
 // ── Typed API Errors ────────────────────────────────────────
 
@@ -405,6 +406,7 @@ pub(crate) struct ApiSession {
     pub(crate) last_modified: String,
     pub(crate) preview: String,
     pub(crate) messages: Vec<ApiMessage>,
+    pub(crate) profile_id: Option<String>,
     pub(crate) model: String,
     #[serde(default)]
     pub(crate) reasoning_effort: Option<String>,
@@ -435,6 +437,7 @@ impl ApiSession {
             last_modified,
             preview,
             messages,
+            profile_id: summary.profile_id,
             model,
             reasoning_effort: None,
             runtime_state: summary.runtime.state,
@@ -443,13 +446,14 @@ impl ApiSession {
     }
 
     /// Build a fresh [`ApiSession`] for a newly created session.
-    pub(crate) fn new_empty(id: String, model: String) -> Self {
+    pub(crate) fn new_empty(id: String, model: String, profile_id: Option<String>) -> Self {
         Self {
             id,
             title: "New Chat".to_string(),
             last_modified: jiff::Timestamp::now().to_string(),
             preview: "New conversation started".to_string(),
             messages: Vec::new(),
+            profile_id,
             model,
             reasoning_effort: None,
             runtime_state: SessionRuntimeState::Idle,
@@ -484,7 +488,7 @@ pub(crate) struct ChatRequest {
     #[serde(default)]
     pub(crate) attachments: Vec<ApiAttachment>,
     #[serde(default)]
-    pub(crate) hidden_context_xml: Option<String>,
+    pub(crate) hidden_context_xml: Option<XmlFragment>,
     #[serde(default)]
     pub(crate) delivery_mode: PendingUserMessageMode,
 }

@@ -201,6 +201,10 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         may_dir,
     });
 
+    chat::resume_pending_follow_up_runs(state.clone())
+        .await
+        .context("failed to resume persisted pending session runs")?;
+
     // Spawn background tasks
     let _auto_archive = crate::tasks::spawn_auto_archive(db_for_archive.clone());
     if let Some(ref cm) = state.container_manager {
@@ -396,7 +400,10 @@ async fn get_request_logs(
         .await
         .map(RequestLogCacheSummary::from)
         .map_err(internal_error)?;
-    Ok(Json(RequestLogsResponse { logs, cache_summary }))
+    Ok(Json(RequestLogsResponse {
+        logs,
+        cache_summary,
+    }))
 }
 
 async fn models(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<ModelsResponse>> {

@@ -494,7 +494,7 @@ impl SessionManager {
         self.db
             .append_message(
                 &session_id,
-                message.role.as_str(),
+                message.role.clone(),
                 &message.content,
                 ts_string.as_deref(),
                 message.tool_call_id.as_deref(),

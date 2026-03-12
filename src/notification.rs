@@ -13,6 +13,7 @@ use web_push::{
 };
 
 use crate::db::ChatDb;
+use crate::xml_fragment::XmlFragment;
 
 /// Push notification payload delivered to browser service workers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -22,7 +23,7 @@ pub struct NotificationPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub callback_context_xml: Option<String>,
+    pub callback_context_xml: Option<XmlFragment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_message: Option<String>,
 }

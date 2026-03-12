@@ -3,7 +3,7 @@ import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 're
 import { Sidebar } from '@/components/layout/Sidebar';
 import { SettingsPage } from '@/components/layout/SettingsPage';
 import { ChatInterface } from '@/components/chat/ChatInterface';
-import { sendChat, subscribeUiEvents } from '@/lib/api';
+import { fetchSession, sendChat, subscribeUiEvents } from '@/lib/api';
 import { Menu } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
@@ -231,10 +231,28 @@ function AppShell() {
               ? payload.callbackContextXml.trim()
               : '';
 
+          let callbackProfileId: string | null = null;
+          if (requestedSessionId) {
+            const knownSession = store.sessions.find((session) => session.id === requestedSessionId);
+            callbackProfileId =
+              knownSession?.profileId ??
+              (await fetchSession(requestedSessionId)).profileId ??
+              null;
+          }
+
+          if (
+            callbackProfileId &&
+            callbackProfileId !== store.currentProfileId
+          ) {
+            await store.switchProfile(callbackProfileId);
+          }
+
           const existingSession = requestedSessionId
             ? store.sessions.find((s) => s.id === requestedSessionId)
             : undefined;
-          const targetSessionId = existingSession?.id ?? (await store.createSession());
+          const targetSessionId = callbackMessage
+            ? await store.createSession(undefined, callbackProfileId)
+            : existingSession?.id ?? (await store.createSession(undefined, callbackProfileId));
 
           store.setCurrentSession(targetSessionId);
           navigate(`/chat/${encodeURIComponent(targetSessionId)}`);

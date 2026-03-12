@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::db::ChatDb;
 use crate::notification::{NotificationManager, NotificationPayload};
+use crate::xml_fragment::XmlFragment;
 
 const MAILBOX_STATUS_PENDING: &str = "pending";
 const MAILBOX_STATUS_DELIVERED: &str = "delivered";
@@ -113,7 +114,10 @@ impl NotificationService {
                 title: item.title,
                 body: item.body,
                 session_id: item.session_id,
-                callback_context_xml: item.callback_context_xml,
+                callback_context_xml: item
+                    .callback_context_xml
+                    .map(XmlFragment::parse)
+                    .transpose()?,
                 callback_message: item.callback_message,
             };
             let send_result = self.manager.send_payload(payload).await;
@@ -166,6 +170,8 @@ impl NotificationService {
 pub enum NotificationServiceError {
     #[error("database error: {0}")]
     Db(#[from] crate::db::ChatDbError),
+    #[error("invalid XML fragment: {0}")]
+    InvalidXml(#[from] crate::xml_fragment::XmlFragmentError),
     #[error("notification transport error: {0}")]
     Notification(#[from] crate::notification::NotificationError),
 }

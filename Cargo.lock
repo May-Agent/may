@@ -6862,6 +6862,7 @@ dependencies = [
  "chrono",
  "cron",
  "crossterm 0.28.1",
+ "dashmap",
  "dirs",
  "event-listener 5.4.1",
  "executor-core",

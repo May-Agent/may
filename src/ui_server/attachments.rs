@@ -70,8 +70,8 @@ struct SessionMentionsXml {
 
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> SkyResult<String> {
     let mut output = String::new();
-    let serializer = quick_xml::se::Serializer::with_root(&mut output, Some(tag))
-        .map_err(internal_error)?;
+    let serializer =
+        quick_xml::se::Serializer::with_root(&mut output, Some(tag)).map_err(internal_error)?;
     value.serialize(serializer).map_err(internal_error)?;
     Ok(output)
 }
@@ -122,7 +122,10 @@ pub(super) async fn build_prompt_and_attachments(
             ));
             if let Some(text) = &attachment.text_content {
                 prompt.push_str("\n\n");
-                prompt.push_str(&serialize_xml("offloaded_text", &TextXmlBlock { content: text })?);
+                prompt.push_str(&serialize_xml(
+                    "offloaded_text",
+                    &TextXmlBlock { content: text },
+                )?);
             }
             continue;
         }
@@ -150,7 +153,10 @@ pub(super) async fn build_prompt_and_attachments(
         if let Some(text) = &attachment.text_content {
             if text.chars().count() <= INLINE_PASTED_TEXT_THRESHOLD {
                 prompt.push_str("\n\n");
-                prompt.push_str(&serialize_xml("pasted_text", &TextXmlBlock { content: text })?);
+                prompt.push_str(&serialize_xml(
+                    "pasted_text",
+                    &TextXmlBlock { content: text },
+                )?);
             } else {
                 let (saved_path, relative_path) =
                     save_large_pasted_text(state, &req.session_id, text).await?;
@@ -350,7 +356,11 @@ async fn build_session_mentions_xml(
         return Ok(None);
     }
 
-    serialize_xml("session_mentions", &SessionMentionsXml { sessions: entries }).map(Some)
+    serialize_xml(
+        "session_mentions",
+        &SessionMentionsXml { sessions: entries },
+    )
+    .map(Some)
 }
 
 fn extract_session_mention_ids(content: &str) -> Vec<String> {
