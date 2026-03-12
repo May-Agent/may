@@ -16,6 +16,8 @@ use skyzen::utils::{Json, State};
 use skyzen::{Result as SkyResult, StatusCode};
 use tokio::process::Command;
 
+use crate::session::SessionPaths;
+
 use super::error::{bad_request_error, internal_error};
 use super::helpers::send_event;
 use super::local_url_mapper::{
@@ -52,11 +54,7 @@ async fn collect_session_artifacts(
     state: &UiServerState,
     session_id: &str,
 ) -> SkyResult<Vec<ArtifactEntry>> {
-    let artifacts_dir = state
-        .may_dir
-        .join("sessions")
-        .join(session_id)
-        .join("artifacts");
+    let artifacts_dir = SessionPaths::from_may_dir(&state.may_dir, session_id).artifacts_dir();
 
     let mut entries = Vec::new();
 
@@ -599,8 +597,9 @@ pub(super) async fn prepare_slidev_preview(
         ));
     }
 
-    let session_dir = state.may_dir.join("sessions").join(&session_id);
-    let artifacts_dir = session_dir.join("artifacts");
+    let session_paths = SessionPaths::from_may_dir(&state.may_dir, &session_id);
+    let session_dir = session_paths.root().to_path_buf();
+    let artifacts_dir = session_paths.artifacts_dir();
     let full_path = artifacts_dir.join(&raw_rel);
 
     let canonical_artifacts = async_fs::canonicalize(&artifacts_dir)
@@ -764,7 +763,7 @@ pub(super) async fn stream_session_artifacts(
     let (sender, sse) = Sse::channel();
     let state_cloned = state.clone();
     let sessions_root = state.may_dir.join("sessions");
-    let artifacts_root = sessions_root.join(&session_id).join("artifacts");
+    let artifacts_root = SessionPaths::from_may_dir(&state.may_dir, &session_id).artifacts_dir();
 
     async_fs::create_dir_all(&sessions_root)
         .await
@@ -1049,8 +1048,8 @@ pub(super) async fn get_artifact_preview(
         }
     }
 
-    let session_dir = state.may_dir.join("sessions").join(&session_id);
-    let artifacts_dir = session_dir.join("artifacts");
+    let session_paths = SessionPaths::from_may_dir(&state.may_dir, &session_id);
+    let artifacts_dir = session_paths.artifacts_dir();
 
     let full = artifacts_dir.join(&raw_rel);
 
@@ -1215,9 +1214,9 @@ pub(super) async fn get_output_preview(
         return Err(bad_request_error("output path must be under outputs/"));
     }
 
-    let session_dir = state.may_dir.join("sessions").join(&session_id);
-    let outputs_dir = session_dir.join("outputs");
-    let full = session_dir.join(&raw_rel);
+    let session_paths = SessionPaths::from_may_dir(&state.may_dir, &session_id);
+    let outputs_dir = session_paths.outputs_dir();
+    let full = session_paths.root().join(&raw_rel);
 
     let canonical_outputs = async_fs::canonicalize(&outputs_dir)
         .await

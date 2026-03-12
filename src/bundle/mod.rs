@@ -12,6 +12,8 @@ use async_fs;
 
 use include_dir::{Dir, include_dir};
 
+use crate::session::SessionPaths;
+
 // Embed the skills and subagents directories at compile time
 static SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
 static SUBAGENTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/bundle/subagents");
@@ -69,14 +71,19 @@ impl Bundle {
         sandbox_dir: &Path,
         may_dir: &Path,
     ) -> Result<(), BundleError> {
+        let session_paths = SessionPaths::new(sandbox_dir.to_path_buf());
         let subagents_target = may_dir.join("subagents");
         let skills_target = may_dir.join("skills");
 
-        Self::create_dir_symlink(sandbox_dir, &subagents_target, ".subagents").await?;
-        Self::create_dir_symlink(sandbox_dir, &skills_target, ".skills").await?;
+        Self::create_dir_symlink(sandbox_dir, &subagents_target, "subagents").await?;
+        Self::create_dir_symlink(sandbox_dir, &skills_target, "skills").await?;
 
-        // Also create artifacts directory in sandbox
-        async_fs::create_dir_all(sandbox_dir.join("artifacts")).await?;
+        async_fs::create_dir_all(session_paths.tmp_dir()).await?;
+        async_fs::create_dir_all(session_paths.data_dir()).await?;
+        async_fs::create_dir_all(session_paths.files_dir()).await?;
+        async_fs::create_dir_all(session_paths.images_dir()).await?;
+        async_fs::create_dir_all(session_paths.outputs_dir()).await?;
+        async_fs::create_dir_all(session_paths.artifacts_dir()).await?;
 
         Ok(())
     }

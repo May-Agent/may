@@ -7,6 +7,7 @@ use base64::Engine;
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::agent::generate_session_title;
+use crate::session::SessionPaths;
 
 use super::error::{bad_request_error, internal_error};
 use super::state::UiServerState;
@@ -397,11 +398,7 @@ async fn allocate_upload_path(
     base_name: &str,
     ext: &str,
 ) -> SkyResult<(PathBuf, String)> {
-    let uploads_dir = state
-        .may_dir
-        .join("sessions")
-        .join(session_id)
-        .join("uploads");
+    let uploads_dir = SessionPaths::from_may_dir(&state.may_dir, session_id).files_dir();
 
     async_fs::create_dir_all(&uploads_dir)
         .await
@@ -420,7 +417,7 @@ async fn allocate_upload_path(
         path = uploads_dir.join(&file_name);
     }
 
-    Ok((path, format!("uploads/{}", file_name)))
+    Ok((path, ["files/", file_name.as_str()].concat()))
 }
 
 fn guess_extension(data_url_header: &str, fallback_name: &str) -> String {

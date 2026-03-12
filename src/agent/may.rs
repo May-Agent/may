@@ -28,7 +28,7 @@ use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
 use crate::copilot::clear_copilot_credentials;
-use crate::session::SessionId;
+use crate::session::{SessionId, SessionPaths};
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
@@ -610,9 +610,10 @@ impl MayAgent {
             },
             config.task_broker,
         );
+        let session_paths = SessionPaths::new(config.sandbox_dir.clone());
         let imagine = ImagineTool {
             generator: config.image_generator,
-            artifacts_dir: config.sandbox_dir.join("artifacts"),
+            artifacts_dir: session_paths.artifacts_dir(),
         };
         let notify_tool = NotifyTool::new(config.notify_broker);
         let register_skills_tool = RegisterSkillsTool::new(
@@ -625,11 +626,11 @@ impl MayAgent {
         );
         let subagent_tool = SubagentTool::new(subagent_llm).with_builtins();
 
-        let transcript_file = config.sandbox_dir.join("transcript.md");
+        let transcript_file = session_paths.transcript_path();
         let transcript_path = transcript_file.display().to_string();
 
-        let skills_dir = config.sandbox_dir.join(".skills");
-        let subagents_dir = config.sandbox_dir.join(".subagents");
+        let skills_dir = config.sandbox_dir.join("skills");
+        let subagents_dir = config.sandbox_dir.join("subagents");
 
         // Shell runtime depends on the environment
         let availability = if is_container {
@@ -750,13 +751,10 @@ impl MayAgent {
             .with_file_mounts([
                 SubagentFileMount::new(PathBuf::from("."), actual_sandbox_dir.clone()),
                 SubagentFileMount::new(
-                    PathBuf::from(".subagents"),
-                    actual_sandbox_dir.join(".subagents"),
+                    PathBuf::from("subagents"),
+                    actual_sandbox_dir.join("subagents"),
                 ),
-                SubagentFileMount::new(
-                    PathBuf::from(".skills"),
-                    actual_sandbox_dir.join(".skills"),
-                ),
+                SubagentFileMount::new(PathBuf::from("skills"), actual_sandbox_dir.join("skills")),
             ]);
         builder = builder.tool(subagent_tool);
 

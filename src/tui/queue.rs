@@ -14,7 +14,7 @@ pub const PASTE_TRUNCATE_LIMIT: usize = 2000;
 /// An attachment to a message.
 #[derive(Debug, Clone)]
 pub enum Attachment {
-    /// Pasted image (saved to session/images/)
+    /// Pasted image (saved to session `files/images/`)
     Image { path: PathBuf, data: Vec<u8> },
     /// File reference (@file mention)
     FileReference { path: PathBuf },
