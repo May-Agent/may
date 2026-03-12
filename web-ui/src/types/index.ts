@@ -88,6 +88,8 @@ export interface Message {
     promptTokens?: number;
     completionTokens?: number;
     totalTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
     contextWindow?: number;
     elapsedMs?: number;
   };
