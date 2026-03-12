@@ -215,9 +215,8 @@ pub(super) async fn build_prompt_and_attachments(
         .map(str::trim)
         .filter(|xml| !xml.is_empty())
     {
-        prompt.push_str("\n\n<injected_context source=\"notification_callback\">");
+        prompt.push_str("\n\n");
         prompt.push_str(context_xml);
-        prompt.push_str("</injected_context>");
     }
 
     if let Some(session_mentions_xml) = build_session_mentions_xml(state, req).await? {
