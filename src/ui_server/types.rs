@@ -153,6 +153,46 @@ pub(crate) struct NotificationSentResponse {
     pub(crate) sent: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NotificationMailboxEntryResponse {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) status: String,
+    pub(crate) sent_count: i32,
+    pub(crate) last_error: Option<String>,
+    pub(crate) delivered_at: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) has_callback: bool,
+}
+
+impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailboxEntryResponse {
+    fn from(value: crate::db::entity::notification_mailbox::Model) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            body: value.body,
+            session_id: value.session_id,
+            status: value.status,
+            sent_count: value.sent_count,
+            last_error: value.last_error,
+            delivered_at: value.delivered_at,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            has_callback: value.callback_context_xml.is_some() || value.callback_message.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NotificationMailboxResponse {
+    pub(crate) items: Vec<NotificationMailboxEntryResponse>,
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ApiHealth {

@@ -13,7 +13,8 @@ use crate::profile::query_profile_sessions;
 use super::helpers::send_event;
 use super::state::UiServerState;
 use super::types::{
-    ConfigEventPayload, ProfileSessionsEventPayload, RequestLogsResponse,
+    ConfigEventPayload, NotificationMailboxEntryResponse, NotificationMailboxResponse,
+    ProfileSessionsEventPayload, RequestLogsResponse,
     SessionRuntimeEventPayload, SessionRuntimeSnapshotItem, SessionRuntimesEventPayload,
     SseHeartbeat,
 };
@@ -52,6 +53,7 @@ pub(super) async fn stream_events(
     tokio::spawn(async move {
         let mut last_config_sig = String::new();
         let mut last_request_logs_sig = String::new();
+        let mut last_notification_mailbox_sig = String::new();
         let mut last_container_prepare_sig = String::new();
         let mut last_runtime_sig = String::new();
         let mut last_profile_runtime_sig = String::new();
@@ -65,6 +67,15 @@ pub(super) async fn stream_events(
             return;
         }
         if !emit_request_logs_if_changed(&state_cloned, &sender, &mut last_request_logs_sig).await {
+            return;
+        }
+        if !emit_notification_mailbox_if_changed(
+            &state_cloned,
+            &sender,
+            &mut last_notification_mailbox_sig,
+        )
+        .await
+        {
             return;
         }
         if !emit_container_prepare_if_changed(
@@ -121,6 +132,15 @@ pub(super) async fn stream_events(
                         &state_cloned,
                         &sender,
                         &mut last_request_logs_sig,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    if !emit_notification_mailbox_if_changed(
+                        &state_cloned,
+                        &sender,
+                        &mut last_notification_mailbox_sig,
                     )
                     .await
                     {
@@ -231,6 +251,34 @@ async fn emit_request_logs_if_changed(
             return false;
         }
         *last_logs_sig = sig;
+    }
+    true
+}
+
+async fn emit_notification_mailbox_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    last_sig: &mut String,
+) -> bool {
+    let items = match state.db().await.list_notification_mailbox_entries(100).await {
+        Ok(items) => items
+            .into_iter()
+            .map(NotificationMailboxEntryResponse::from)
+            .collect(),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load notification mailbox");
+            return true;
+        }
+    };
+    let payload = NotificationMailboxResponse { items };
+
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        *last_sig = sig;
+        if !send_event(sender, "notification_mailbox", &payload).await {
+            return false;
+        }
     }
     true
 }
