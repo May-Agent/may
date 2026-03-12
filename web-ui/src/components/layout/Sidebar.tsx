@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -550,12 +551,15 @@ export function Sidebar({ className, onOpenSettings, onSelectSession, onNewChat 
     profileSessions,
     switchProfile,
     createFolder,
+    uiConfig,
   } = useStore();
 
   const [searchQuery] = useState('');
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [showNewProfile, setShowNewProfile] = useState(false);
   const [newProfileName, setNewProfileName] = useState('');
+  const [newProfileEnvironment, setNewProfileEnvironment] = useState<'local' | 'remote'>('local');
+  const [newProfileSshServer, setNewProfileSshServer] = useState('');
   const [activeDragSession, setActiveDragSession] = useState<SessionSummary | null>(null);
 
   const sensors = useSensors(
@@ -574,12 +578,26 @@ export function Sidebar({ className, onOpenSettings, onSelectSession, onNewChat 
 
   const handleCreateProfile = useCallback(async () => {
     if (!newProfileName.trim()) return;
+    if (newProfileEnvironment === 'remote' && !newProfileSshServer.trim()) return;
     const { createProfile: create, switchProfile: sw } = useStore.getState();
-    const profile = await create({ name: newProfileName.trim() });
+    const profile = await create({
+      name: newProfileName.trim(),
+      environment: newProfileEnvironment,
+      preferences:
+        newProfileEnvironment === 'remote'
+          ? {
+              remote: {
+                ssh_server_id: newProfileSshServer.trim(),
+              },
+            }
+          : undefined,
+    });
     setNewProfileName('');
+    setNewProfileEnvironment('local');
+    setNewProfileSshServer('');
     setShowNewProfile(false);
     await sw(profile.id);
-  }, [newProfileName]);
+  }, [newProfileEnvironment, newProfileName, newProfileSshServer]);
 
   const filterSessions = useCallback(
     (sessions: SessionSummary[]): SessionSummary[] => {
@@ -680,30 +698,71 @@ export function Sidebar({ className, onOpenSettings, onSelectSession, onNewChat 
           onNewChat?.();
           void switchProfile(id);
         }}
-        onCreateProfile={() => setShowNewProfile(true)}
+        onCreateProfile={() => {
+          setNewProfileName('');
+          setNewProfileEnvironment('local');
+          setNewProfileSshServer(uiConfig.sshServers[0]?.name ?? '');
+          setShowNewProfile(true);
+        }}
       />
 
       {/* New profile inline form */}
       {showNewProfile && (
-        <div className="px-3 py-2 border-b flex gap-2">
-          <Input
-            value={newProfileName}
-            onChange={(e) => setNewProfileName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') void handleCreateProfile();
-              if (e.key === 'Escape') setShowNewProfile(false);
-            }}
-            placeholder="Profile name..."
-            className="h-7 text-xs"
-            autoFocus
-          />
-          <Button
-            size="sm"
-            className="h-7 text-xs px-2"
-            onClick={() => void handleCreateProfile()}
-          >
-            Add
-          </Button>
+        <div className="border-b px-3 py-2">
+          <div className="flex gap-2">
+            <Input
+              value={newProfileName}
+              onChange={(e) => setNewProfileName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void handleCreateProfile();
+                if (e.key === 'Escape') setShowNewProfile(false);
+              }}
+              placeholder="Profile name..."
+              className="h-7 text-xs"
+              autoFocus
+            />
+            <Button
+              size="sm"
+              className="h-7 text-xs px-2"
+              onClick={() => void handleCreateProfile()}
+              disabled={
+                !newProfileName.trim()
+                || (newProfileEnvironment === 'remote' && !newProfileSshServer.trim())
+              }
+            >
+              Add
+            </Button>
+          </div>
+          <div className="mt-2 flex gap-2">
+            <Select value={newProfileEnvironment} onValueChange={(value: 'local' | 'remote') => setNewProfileEnvironment(value)}>
+              <SelectTrigger className="h-7 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="local">Local</SelectItem>
+                <SelectItem value="remote">Remote SSH</SelectItem>
+              </SelectContent>
+            </Select>
+            {newProfileEnvironment === 'remote' && (
+              <Select value={newProfileSshServer} onValueChange={setNewProfileSshServer}>
+                <SelectTrigger className="h-7 text-xs">
+                  <SelectValue placeholder="SSH server" />
+                </SelectTrigger>
+                <SelectContent>
+                  {uiConfig.sshServers.map((server) => (
+                    <SelectItem key={server.name} value={server.name}>
+                      {server.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
+          {newProfileEnvironment === 'remote' && uiConfig.sshServers.length === 0 && (
+            <div className="mt-2 text-[11px] text-muted-foreground">
+              Add an SSH server in settings before creating a remote profile.
+            </div>
+          )}
         </div>
       )}
 
