@@ -102,3 +102,18 @@ pub(super) async fn test_notification(
         sent,
     }))
 }
+
+pub(super) async fn list_notification_mailbox(
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<super::types::NotificationMailboxResponse>> {
+    let items = state
+        .db()
+        .await
+        .list_notification_mailbox_entries(100)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(super::types::NotificationMailboxEntryResponse::from)
+        .collect();
+    Ok(Json(super::types::NotificationMailboxResponse { items }))
+}

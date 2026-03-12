@@ -1267,6 +1267,18 @@ impl ChatDb {
             .map_err(Into::into)
     }
 
+    pub async fn list_notification_mailbox_entries(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<notification_mailbox::Model>, ChatDbError> {
+        notification_mailbox::Entity::find()
+            .order_by_desc(notification_mailbox::Column::CreatedAt)
+            .limit(limit)
+            .all(&self.conn)
+            .await
+            .map_err(Into::into)
+    }
+
     // ── Permission / AskUser Queries ─────────────────────────────
 
     /// Check if network permission was ever approved in a session.

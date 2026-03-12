@@ -1056,4 +1056,30 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    #[test]
+    fn sql_filter_ast_builds_expected_predicates() {
+        let mut args = base_args();
+        args.session_id = Some("session-1".to_string());
+        args.model = Some("gpt-5".to_string());
+        args.since = Some("2026-03-12T00:00:00Z".to_string());
+
+        let filter = build_sql_filter(&args).expect("filter should be built");
+
+        assert!(filter.contains("session_id = 'session-1'"));
+        assert!(filter.contains("model = 'gpt-5'"));
+        assert!(filter.contains("timestamp >= '2026-03-12T00:00:00Z'"));
+        assert!(filter.contains(" AND "));
+    }
+
+    #[test]
+    fn sql_filter_ast_quotes_embedded_single_quotes() {
+        let mut args = base_args();
+        args.title_contains = Some("owner's update".to_string());
+
+        let filter = build_sql_filter(&args).expect("title filter should be built");
+
+        assert!(filter.contains("title LIKE '%owner''s update%'"));
+        assert!(!filter.contains("owner's update%' OR"));
+    }
 }

@@ -80,6 +80,7 @@ export interface UiEventsSubscription {
   onOpen?: () => void;
   onConfig?: (payload: UiConfigEventPayload) => void;
   onContainerPrepare?: (payload: ContainerPrepareEventPayload) => void;
+  onNotificationMailbox?: (payload: NotificationMailboxPayload) => void;
   onProfileSessions?: (payload: { profileSessions: ProfileSessions }) => void;
   onRequestLogs?: (payload: RequestLogsPayload) => void;
   onSessionRuntime?: (payload: { sessionId: string; runtime: SessionRuntimeStatus }) => void;
@@ -171,6 +172,24 @@ export interface RequestLogCacheSummary {
 export interface RequestLogsPayload {
   logs: RequestLogEntry[];
   cacheSummary: RequestLogCacheSummary;
+}
+
+export interface NotificationMailboxEntry {
+  id: string;
+  title: string;
+  body: string;
+  sessionId?: string | null;
+  status: string;
+  sentCount: number;
+  lastError?: string | null;
+  deliveredAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  hasCallback: boolean;
+}
+
+export interface NotificationMailboxPayload {
+  items: NotificationMailboxEntry[];
 }
 
 export interface ContextDebugMessage {
@@ -879,6 +898,10 @@ export async function fetchRequestLogs(): Promise<RequestLogsPayload> {
   return request<RequestLogsPayload>('/api/logs/requests');
 }
 
+export async function fetchNotificationMailbox(): Promise<NotificationMailboxPayload> {
+  return request<NotificationMailboxPayload>('/api/notifications/mailbox');
+}
+
 export async function fetchSessionRuntime(sessionId: string): Promise<SessionRuntimeStatus> {
   return request<SessionRuntimeStatus>(`/api/sessions/${encodeURIComponent(sessionId)}/runtime`);
 }
@@ -1252,6 +1275,11 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
       request_logs: buildSSEListener<RequestLogsPayload>(
         'request_logs',
         options.onRequestLogs,
+        options.onError,
+      ),
+      notification_mailbox: buildSSEListener<NotificationMailboxPayload>(
+        'notification_mailbox',
+        options.onNotificationMailbox,
         options.onError,
       ),
       container_prepare: buildSSEListener<ContainerPrepareEventPayload>(

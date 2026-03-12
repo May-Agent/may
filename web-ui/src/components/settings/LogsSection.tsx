@@ -1,11 +1,16 @@
 import { useEffect, useState } from 'react';
 import { BookOpen } from 'lucide-react';
 import * as api from '@/lib/api';
-import type { RequestLogCacheSummary, RequestLogEntry } from '@/lib/api';
+import type {
+  NotificationMailboxEntry,
+  RequestLogCacheSummary,
+  RequestLogEntry,
+} from '@/lib/api';
 
 export function LogsSection() {
   const [requestLogs, setRequestLogs] = useState<RequestLogEntry[]>([]);
   const [cacheSummary, setCacheSummary] = useState<RequestLogCacheSummary | null>(null);
+  const [mailbox, setMailbox] = useState<NotificationMailboxEntry[]>([]);
   const [requestLogsError, setRequestLogsError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -25,9 +30,11 @@ export function LogsSection() {
     const loadLogs = async () => {
       try {
         const payload = await api.fetchRequestLogs();
+        const mailboxPayload = await api.fetchNotificationMailbox();
         if (!cancelled) {
           setRequestLogs(payload.logs);
           setCacheSummary(payload.cacheSummary);
+          setMailbox(mailboxPayload.items);
           setRequestLogsError(null);
           clearDisconnectError();
         }
@@ -47,6 +54,11 @@ export function LogsSection() {
         setRequestLogs(payload.logs);
         setCacheSummary(payload.cacheSummary);
         setRequestLogsError(null);
+        clearDisconnectError();
+      },
+      onNotificationMailbox: (payload) => {
+        if (cancelled) return;
+        setMailbox(payload.items);
         clearDisconnectError();
       },
       onError: () => {
@@ -101,6 +113,34 @@ export function LogsSection() {
             {log.error && <div className="text-red-500 break-all">{log.error}</div>}
           </div>
         ))}
+      </div>
+      <div className="space-y-2">
+        <div className="text-sm font-medium uppercase text-muted-foreground tracking-wide">
+          Notification Mailbox
+        </div>
+        <div className="rounded border divide-y max-h-[320px] overflow-auto">
+          {mailbox.length === 0 && (
+            <div className="px-3 py-3 text-sm text-muted-foreground">No notifications yet.</div>
+          )}
+          {mailbox.map((item) => (
+            <div key={item.id} className="px-3 py-2 text-xs space-y-1">
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-medium">{item.title}</span>
+                <span className="text-muted-foreground">{item.status}</span>
+              </div>
+              <div>{item.body}</div>
+              <div className="text-muted-foreground">
+                created={item.createdAt} sent={item.sentCount} callback={item.hasCallback ? 'yes' : 'no'}
+              </div>
+              {item.sessionId && (
+                <div className="text-muted-foreground">session={item.sessionId}</div>
+              )}
+              {item.lastError && (
+                <div className="text-destructive break-all">{item.lastError}</div>
+              )}
+            </div>
+          ))}
+        </div>
       </div>
     </section>
   );
