@@ -1,15 +1,19 @@
 //! Scheduled task REST API.
 
-use std::str::FromStr;
+use std::collections::BTreeMap;
+use std::mem;
 use std::sync::Arc;
 
-use skyzen::Result as SkyResult;
+use base64::Engine;
+use skyzen::extract::PeerAddr;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
+use skyzen::{Body, Request, Result as SkyResult, StatusCode};
 
 use crate::db::{CreateScheduledTaskParams, UpdateScheduledTaskParams};
 use crate::task_trigger::{
-    TRIGGER_TYPE_CRON, TRIGGER_TYPE_ONCE, TaskTriggerKind, normalize_event_name,
+    NormalizedTaskTrigger, TRIGGER_KIND_WEBHOOK, TaskTriggerInput, TaskTriggerKind,
+    TaskWebhookRequest, normalize_trigger, webhook_path,
 };
 
 use super::error::{bad_request_error, internal_error};
@@ -36,12 +40,19 @@ pub(super) struct ScheduledTaskResponse {
     pub last_run_at: Option<String>,
     pub last_run_status: Option<String>,
     pub last_run_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 impl ScheduledTaskResponse {
     fn from_model(m: crate::db::entity::scheduled_tasks::Model) -> Self {
+        let webhook_path = if m.trigger_kind == TRIGGER_KIND_WEBHOOK {
+            Some(webhook_path(m.trigger_type.as_str()))
+        } else {
+            None
+        };
         Self {
             id: m.id,
             profile_id: m.profile_id,
@@ -59,6 +70,7 @@ impl ScheduledTaskResponse {
             last_run_at: m.last_run_at,
             last_run_status: m.last_run_status,
             last_run_output: m.last_run_output,
+            webhook_path,
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
@@ -75,7 +87,10 @@ pub(super) struct CreateTaskRequest {
     pub session_id: Option<String>,
     pub name: String,
     pub trigger_kind: String,
-    pub trigger_type: String,
+    #[serde(default)]
+    pub trigger_type: Option<String>,
+    #[serde(default)]
+    pub event_name: Option<String>,
     #[serde(default)]
     pub cron_expression: Option<String>,
     #[serde(default)]
@@ -105,89 +120,107 @@ pub(super) struct UpdateTaskRequest {
     pub script_inline: Option<String>,
 }
 
-fn parse_trigger_kind(value: &str) -> SkyResult<TaskTriggerKind> {
-    value
-        .trim()
-        .parse::<TaskTriggerKind>()
-        .map_err(bad_request_error)
+#[derive(Debug, Clone)]
+pub(super) struct WebhookInvocationRequest(TaskWebhookRequest);
+
+#[skyzen::error(status = StatusCode::BAD_REQUEST)]
+pub(super) enum WebhookInvocationRequestError {
+    #[error("failed to read webhook request body")]
+    InvalidBody,
+    #[error("webhook request contains a non-UTF8 header value")]
+    InvalidHeaderValue,
 }
 
-fn normalize_trigger_type(kind: TaskTriggerKind, value: &str) -> SkyResult<String> {
-    let trigger_type = value.trim().to_lowercase();
-    if trigger_type.is_empty() {
-        return Err(bad_request_error("trigger_type must not be empty"));
-    }
-    match kind {
-        TaskTriggerKind::Time => match trigger_type.as_str() {
-            TRIGGER_TYPE_CRON | TRIGGER_TYPE_ONCE => Ok(trigger_type),
-            other => Err(bad_request_error(format!(
-                "Unsupported trigger_type '{other}' for time trigger, expected one of: {TRIGGER_TYPE_CRON}, {TRIGGER_TYPE_ONCE}"
-            ))),
-        },
-        TaskTriggerKind::Event => normalize_event_name(&trigger_type).map_err(bad_request_error),
-    }
-}
+impl skyzen::extract::Extractor for WebhookInvocationRequest {
+    type Error = WebhookInvocationRequestError;
 
-fn parse_utc_run_at(run_at: &str) -> SkyResult<String> {
-    let value = run_at.trim();
-    if !value.ends_with('Z') {
-        return Err(bad_request_error(
-            "run_at must be an ISO 8601 UTC timestamp ending with 'Z'",
-        ));
-    }
-    let parsed = jiff::Timestamp::from_str(value)
-        .map_err(|e| bad_request_error(format!("Invalid UTC timestamp for run_at: {e}")))?;
-    Ok(parsed.to_string())
-}
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        let method = request.method().as_str().to_string();
+        let path = request.uri().path().to_string();
+        let query = request.uri().query().map(ToOwned::to_owned);
+        let remote_addr = request
+            .extensions()
+            .get::<PeerAddr>()
+            .map(|addr| addr.to_string());
 
-fn validate_trigger_fields(
-    trigger_kind: TaskTriggerKind,
-    trigger_type: &str,
-    cron_expression: Option<&str>,
-    run_at: Option<&str>,
-) -> SkyResult<()> {
-    match trigger_kind {
-        TaskTriggerKind::Time => match trigger_type {
-            TRIGGER_TYPE_CRON => {
-                let expr = cron_expression
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| bad_request_error("cron trigger requires cron_expression"))?;
-                cron::Schedule::from_str(expr)
-                    .map_err(|e| bad_request_error(format!("Invalid cron expression: {e}")))?;
-                if run_at.is_some() {
-                    return Err(bad_request_error(
-                        "cron trigger must not include run_at; use cron_expression only",
-                    ));
-                }
-            }
-            TRIGGER_TYPE_ONCE => {
-                let ts = run_at
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| bad_request_error("once trigger requires run_at in UTC"))?;
-                let _ = parse_utc_run_at(ts)?;
-                if cron_expression.is_some() {
-                    return Err(bad_request_error(
-                        "once trigger must not include cron_expression",
-                    ));
-                }
-            }
-            other => {
-                return Err(bad_request_error(format!(
-                    "Unsupported time trigger_type '{other}'"
-                )));
-            }
-        },
-        TaskTriggerKind::Event => {
-            if run_at.is_some() || cron_expression.is_some() {
-                return Err(bad_request_error(
-                    "event trigger must not include run_at or cron_expression",
-                ));
-            }
+        let mut headers = BTreeMap::new();
+        for (name, value) in request.headers() {
+            let value = value
+                .to_str()
+                .map_err(|_| WebhookInvocationRequestError::InvalidHeaderValue)?
+                .to_string();
+            headers
+                .entry(name.as_str().to_string())
+                .or_insert_with(Vec::new)
+                .push(value);
         }
+
+        let body = mem::replace(request.body_mut(), Body::empty());
+        let body = body
+            .into_bytes()
+            .await
+            .map_err(|_| WebhookInvocationRequestError::InvalidBody)?;
+        let body_size_bytes = body.len();
+        let body_text = std::str::from_utf8(body.as_ref())
+            .ok()
+            .map(ToOwned::to_owned);
+        let body_json = headers
+            .get(skyzen::header::CONTENT_TYPE.as_str())
+            .and_then(|values| values.first())
+            .filter(|value| value.starts_with("application/json"))
+            .and_then(|_| serde_json::from_slice(body.as_ref()).ok());
+
+        Ok(Self(TaskWebhookRequest {
+            method,
+            path,
+            query,
+            headers,
+            body_base64: base64::engine::general_purpose::STANDARD.encode(body.as_ref()),
+            body_text,
+            body_json,
+            remote_addr,
+            body_size_bytes,
+        }))
     }
-    Ok(())
+}
+
+fn normalize_create_trigger(request: &CreateTaskRequest) -> SkyResult<NormalizedTaskTrigger> {
+    normalize_trigger(TaskTriggerInput {
+        kind: &request.trigger_kind,
+        trigger_type: request.trigger_type.as_deref(),
+        run_at_utc: request.run_at.as_deref(),
+        cron_utc: request.cron_expression.as_deref(),
+        event_name: request.event_name.as_deref(),
+    })
+    .map_err(bad_request_error)
+}
+
+fn validate_existing_trigger(
+    current: &crate::db::entity::scheduled_tasks::Model,
+    next_cron: Option<&str>,
+    next_run_at: Option<&str>,
+) -> SkyResult<TaskTriggerKind> {
+    let current_kind = current
+        .trigger_kind
+        .parse::<TaskTriggerKind>()
+        .map_err(bad_request_error)?;
+    normalize_trigger(TaskTriggerInput {
+        kind: current_kind.as_str(),
+        trigger_type: if current_kind == TaskTriggerKind::Time {
+            Some(current.trigger_type.as_str())
+        } else {
+            None
+        },
+        run_at_utc: next_run_at,
+        cron_utc: next_cron,
+        event_name: if current_kind == TaskTriggerKind::Event {
+            Some(current.trigger_type.as_str())
+        } else {
+            None
+        },
+    })
+    .map_err(bad_request_error)?;
+    Ok(current_kind)
 }
 
 fn validate_script_fields(script_path: Option<&str>, script_inline: Option<&str>) -> SkyResult<()> {
@@ -213,12 +246,9 @@ fn validate_script_fields(script_path: Option<&str>, script_inline: Option<&str>
 pub(super) async fn list_tasks(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<ScheduledTaskResponse>>> {
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
-    let tasks = db
+    let tasks = state
+        .db()
+        .await
         .list_scheduled_tasks(None)
         .await
         .map_err(internal_error)?;
@@ -234,20 +264,8 @@ pub(super) async fn create_task(
     Json(req): Json<CreateTaskRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ScheduledTaskResponse>> {
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
     let id = uuid::Uuid::new_v4().to_string();
-    let trigger_kind = parse_trigger_kind(&req.trigger_kind)?;
-    let trigger_type = normalize_trigger_type(trigger_kind, &req.trigger_type)?;
-    let normalized_run_at = req.run_at.as_deref().map(parse_utc_run_at).transpose()?;
-    let normalized_cron = req
-        .cron_expression
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let trigger = normalize_create_trigger(&req)?;
     let normalized_script_path = req
         .script_path
         .as_deref()
@@ -258,12 +276,6 @@ pub(super) async fn create_task(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    validate_trigger_fields(
-        trigger_kind,
-        &trigger_type,
-        normalized_cron,
-        normalized_run_at.as_deref(),
-    )?;
     validate_script_fields(normalized_script_path, normalized_script_inline)?;
     state
         .task_runtime
@@ -275,16 +287,19 @@ pub(super) async fn create_task(
         .await
         .map_err(bad_request_error)?;
 
-    let model = db
+    let trigger_type = trigger.storage_trigger_type();
+    let model = state
+        .db()
+        .await
         .create_scheduled_task(CreateScheduledTaskParams {
             id: &id,
             profile_id: &req.profile_id,
             session_id: req.session_id.as_deref(),
             name: &req.name,
-            trigger_kind: trigger_kind.as_str(),
+            trigger_kind: trigger.kind_str(),
             trigger_type: &trigger_type,
-            cron_expression: normalized_cron,
-            run_at: normalized_run_at.as_deref(),
+            cron_expression: trigger.cron_expression(),
+            run_at: trigger.run_at(),
             script_path: normalized_script_path,
             script_inline: normalized_script_inline,
             needs_network: req.needs_network,
@@ -307,12 +322,9 @@ pub(super) async fn get_task(
 ) -> SkyResult<Json<ScheduledTaskResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
-    let model = db
+    let model = state
+        .db()
+        .await
         .get_scheduled_task(&id)
         .await
         .map_err(internal_error)?
@@ -328,23 +340,19 @@ pub(super) async fn update_task(
 ) -> SkyResult<Json<ScheduledTaskResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
+    let db = state.db().await;
     let current = db
         .get_scheduled_task(&id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Task not found"))?;
 
-    let current_kind = current
-        .trigger_kind
-        .parse::<TaskTriggerKind>()
-        .map_err(|e| bad_request_error(format!("invalid trigger_kind stored in task: {e}")))?;
-
-    let normalized_run_at = req.run_at.as_deref().map(parse_utc_run_at).transpose()?;
+    let normalized_run_at = req
+        .run_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let next_cron = req
         .cron_expression
         .as_deref()
@@ -353,12 +361,8 @@ pub(super) async fn update_task(
         .map(ToString::to_string)
         .or_else(|| current.cron_expression.clone());
     let next_run_at = normalized_run_at.clone().or_else(|| current.run_at.clone());
-    validate_trigger_fields(
-        current_kind,
-        &current.trigger_type,
-        next_cron.as_deref(),
-        next_run_at.as_deref(),
-    )?;
+    let current_kind =
+        validate_existing_trigger(&current, next_cron.as_deref(), next_run_at.as_deref())?;
 
     let next_script_path = req
         .script_path
@@ -395,25 +399,19 @@ pub(super) async fn update_task(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let normalized_cron_update = match current_kind {
-        TaskTriggerKind::Time => req
-            .cron_expression
+    let normalized_cron_update = if current_kind == TaskTriggerKind::Time {
+        req.cron_expression
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(Some),
-        TaskTriggerKind::Event => {
-            if req.cron_expression.is_some() || req.run_at.is_some() {
-                return Err(bad_request_error(
-                    "event trigger fields (run_at/cron_expression) cannot be updated",
-                ));
-            }
-            None
-        }
+            .map(Some)
+    } else {
+        None
     };
     let normalized_run_at_update = match current_kind {
         TaskTriggerKind::Time => normalized_run_at.as_deref().map(Some),
         TaskTriggerKind::Event => None,
+        TaskTriggerKind::Webhook => None,
     };
 
     db.update_scheduled_task(
@@ -452,12 +450,10 @@ pub(super) async fn delete_task(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
-    db.delete_scheduled_task(&id)
+    state
+        .db()
+        .await
+        .delete_scheduled_task(&id)
         .await
         .map_err(internal_error)?;
     state
@@ -475,12 +471,10 @@ pub(super) async fn approve_task(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
-    db.approve_scheduled_task(&id)
+    state
+        .db()
+        .await
+        .approve_scheduled_task(&id)
         .await
         .map_err(internal_error)?;
     state
@@ -498,25 +492,41 @@ pub(super) async fn run_task(
 ) -> SkyResult<Json<super::types::TaskTriggerResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
-    let task = db
+    let task = state
+        .db()
+        .await
         .get_scheduled_task(&id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Task not found"))?;
 
-    // Execute inline
-    let task_runtime = state.task_runtime.clone();
-    tokio::spawn(async move {
-        task_runtime.execute_task_by_model(&task).await;
-    });
+    state.task_runtime.run_manual_task(task);
 
     Ok(Json(super::types::TaskTriggerResponse {
         ok: true,
         status: "triggered",
+        triggered: 1,
+    }))
+}
+
+pub(super) async fn invoke_webhook_task(
+    params: Params,
+    webhook_request: WebhookInvocationRequest,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<super::types::TaskTriggerResponse>> {
+    let token = params.get("token").map_err(bad_request_error)?.to_string();
+    let triggered = state
+        .task_runtime
+        .dispatch_webhook(token, webhook_request.0)
+        .await
+        .map_err(internal_error)?;
+    if triggered == 0 {
+        return Err(bad_request_error("Webhook task not found"));
+    }
+
+    Ok(Json(super::types::TaskTriggerResponse {
+        ok: true,
+        status: "triggered",
+        triggered,
     }))
 }

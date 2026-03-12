@@ -6,10 +6,10 @@ import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
 import { useStore } from '@/lib/store';
+import type { CreateTaskInput, ScheduledTask, TaskTriggerKind, TimeTriggerType } from '@/types';
 import {
   TASK_TRIGGER_KINDS,
-  type TaskTriggerKind,
-  type TimeTriggerType,
+  TIME_TRIGGER_TYPES,
 } from './constants';
 
 export function TasksSection() {
@@ -28,6 +28,7 @@ export function TasksSection() {
   const [taskName, setTaskName] = useState('');
   const [taskTriggerKind, setTaskTriggerKind] = useState<TaskTriggerKind>('time');
   const [taskTriggerType, setTaskTriggerType] = useState<TimeTriggerType>('once');
+  const [taskEventName, setTaskEventName] = useState('');
   const [taskRunAt, setTaskRunAt] = useState('');
   const [taskCron, setTaskCron] = useState('0 6 * * *');
   const [taskScriptPath, setTaskScriptPath] = useState('');
@@ -60,23 +61,30 @@ export function TasksSection() {
     [scheduledTasks],
   );
 
-  const describeTaskTrigger = (task: (typeof scheduledTasks)[number]): string => {
-    if (task.triggerKind !== 'time') {
-      return `${task.triggerKind}:${task.triggerType}`;
-    }
-    switch (task.triggerType) {
-      case 'cron':
-        return task.cronExpression ?? 'cron';
-      case 'once':
-        return task.runAt ?? 'once';
-      default:
+  const describeTaskTrigger = (task: ScheduledTask): string => {
+    switch (task.triggerKind) {
+      case 'time':
+        switch (task.triggerType) {
+          case 'cron':
+            return task.cronExpression ?? 'cron';
+          case 'once':
+            return task.runAt ?? 'once';
+          default:
+            return task.triggerType;
+        }
+      case 'event':
         return task.triggerType;
+      case 'webhook':
+        return task.webhookPath ?? task.triggerType;
+      default:
+        return `${task.triggerKind}:${task.triggerType}`;
     }
   };
 
   const clearTaskForm = () => {
     setTaskName('');
     setTaskTriggerKind('time');
+    setTaskEventName('');
     setTaskRunAt('');
     setTaskCron('0 6 * * *');
     setTaskScriptPath('');
@@ -113,19 +121,38 @@ export function TasksSection() {
       setTaskFormError('Cron tasks must have a cron expression');
       return;
     }
+    if (taskTriggerKind === 'event' && !taskEventName.trim()) {
+      setTaskFormError('Event-triggered tasks must have an event name');
+      return;
+    }
 
     try {
-      await createTask({
+      const baseInput = {
         profileId: taskProfileId,
         name: taskName.trim(),
-        triggerKind: taskTriggerKind,
-        triggerType: taskTriggerType,
-        runAt: taskTriggerType === 'once' ? taskRunAt.trim() : undefined,
-        cronExpression: taskTriggerType === 'cron' ? taskCron.trim() : undefined,
         scriptPath: taskScriptPath.trim() || undefined,
         scriptInline: taskScriptInline.trim() || undefined,
         needsNetwork: taskNeedsNetwork,
-      });
+      };
+      const taskInput: CreateTaskInput = taskTriggerKind === 'time'
+        ? {
+            ...baseInput,
+            triggerKind: 'time',
+            triggerType: taskTriggerType,
+            runAt: taskTriggerType === 'once' ? taskRunAt.trim() : undefined,
+            cronExpression: taskTriggerType === 'cron' ? taskCron.trim() : undefined,
+          }
+        : taskTriggerKind === 'event'
+          ? {
+              ...baseInput,
+              triggerKind: 'event',
+              eventName: taskEventName.trim(),
+            }
+          : {
+              ...baseInput,
+              triggerKind: 'webhook',
+            };
+      await createTask(taskInput);
       clearTaskForm();
     } catch (e) {
       setTaskFormError((e as Error).message);
@@ -184,23 +211,28 @@ export function TasksSection() {
             </Select>
           </div>
 
-          <div className="space-y-1">
-            <Label>Trigger</Label>
-            <Select
-              value={taskTriggerType}
-              onValueChange={(v) => setTaskTriggerType(v as TimeTriggerType)}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="once">Once (UTC)</SelectItem>
-                <SelectItem value="cron">Cron (UTC)</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          {taskTriggerKind === 'time' && (
+            <div className="space-y-1">
+              <Label>Trigger</Label>
+              <Select
+                value={taskTriggerType}
+                onValueChange={(v) => setTaskTriggerType(v as TimeTriggerType)}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {TIME_TRIGGER_TYPES.map((kind) => (
+                    <SelectItem key={kind.value} value={kind.value}>
+                      {kind.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
 
-          {taskTriggerType === 'once' ? (
+          {taskTriggerKind === 'time' && taskTriggerType === 'once' && (
             <div className="space-y-1">
               <Label>Run At (UTC ISO8601)</Label>
               <Input
@@ -209,7 +241,9 @@ export function TasksSection() {
                 placeholder="2026-02-15T06:00:00Z"
               />
             </div>
-          ) : (
+          )}
+
+          {taskTriggerKind === 'time' && taskTriggerType === 'cron' && (
             <div className="space-y-1">
               <Label>Cron Expression</Label>
               <Input
@@ -217,6 +251,24 @@ export function TasksSection() {
                 onChange={(e) => setTaskCron(e.target.value)}
                 placeholder="0 6 * * *"
               />
+            </div>
+          )}
+
+          {taskTriggerKind === 'event' && (
+            <div className="space-y-1">
+              <Label>Event Name</Label>
+              <Input
+                value={taskEventName}
+                onChange={(e) => setTaskEventName(e.target.value)}
+                placeholder="chat.turn.completed"
+              />
+            </div>
+          )}
+
+          {taskTriggerKind === 'webhook' && (
+            <div className="rounded border bg-muted/20 px-3 py-2 text-xs text-muted-foreground md:col-span-2">
+              Creating a webhook task generates a private trigger URL. After creation, send a POST
+              request to that path to run the task.
             </div>
           )}
 
@@ -291,6 +343,11 @@ export function TasksSection() {
             <div className="text-xs text-muted-foreground">
               profile={task.profileId} · updated={task.updatedAt}
             </div>
+            {task.webhookPath && (
+              <div className="rounded border bg-muted/20 p-2 text-xs font-mono break-all">
+                POST {task.webhookPath}
+              </div>
+            )}
             {task.lastRunStatus && (
               <div className="text-xs">
                 last run: {task.lastRunStatus} {task.lastRunAt ? `(${task.lastRunAt})` : ''}

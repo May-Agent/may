@@ -1,5 +1,5 @@
 import type { StateCreator } from 'zustand';
-import type { ScheduledTask } from '@/types';
+import type { CreateTaskInput, ScheduledTask } from '@/types';
 import * as api from '@/lib/api';
 import type { AppState } from './index';
 import { TASK_REFRESH_DELAY_MS } from './shared';
@@ -24,18 +24,7 @@ export interface ServicesSlice {
   sendTestNotification: () => Promise<void>;
 
   refreshTasks: () => Promise<void>;
-  createTask: (input: {
-    profileId: string;
-    sessionId?: string;
-    name: string;
-    triggerKind: 'time';
-    triggerType: 'once' | 'cron';
-    cronExpression?: string;
-    runAt?: string;
-    scriptPath?: string;
-    scriptInline?: string;
-    needsNetwork?: boolean;
-  }) => Promise<ScheduledTask>;
+  createTask: (input: CreateTaskInput) => Promise<ScheduledTask>;
   updateTask: (id: string, input: {
     name?: string;
     enabled?: boolean;

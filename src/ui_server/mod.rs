@@ -324,6 +324,7 @@ fn api_routes() -> Route {
             "/tasks".route(Route::new((
                 "".at(list_tasks),
                 "".post(create_task),
+                "/webhook/{token}".post(invoke_webhook_task),
                 "/{id}".at(get_task),
                 "/{id}".put(update_task),
                 "/{id}".delete(delete_task),

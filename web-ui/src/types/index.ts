@@ -205,19 +205,40 @@ export interface FolderInfo {
 
 // ── Scheduled task types ─────────────────────────────────
 
-// ── Web Push notification types ──────────────────────────
+export type TaskTriggerKind = 'time' | 'event' | 'webhook';
+export type TimeTriggerType = 'cron' | 'once';
 
-export interface VapidKeyInfo {
-  publicKey: string;
+interface TaskCreateInputBase {
+  profileId: string;
+  sessionId?: string;
+  name: string;
+  scriptPath?: string;
+  scriptInline?: string;
+  needsNetwork?: boolean;
 }
+
+export type CreateTaskInput =
+  | (TaskCreateInputBase & {
+      triggerKind: 'time';
+      triggerType: TimeTriggerType;
+      cronExpression?: string;
+      runAt?: string;
+    })
+  | (TaskCreateInputBase & {
+      triggerKind: 'event';
+      eventName: string;
+    })
+  | (TaskCreateInputBase & {
+      triggerKind: 'webhook';
+    });
 
 export interface ScheduledTask {
   id: string;
   profileId: string;
   sessionId: string | null;
   name: string;
-  triggerKind: 'time' | string;
-  triggerType: 'cron' | 'once';
+  triggerKind: TaskTriggerKind;
+  triggerType: string;
   cronExpression: string | null;
   runAt: string | null;
   scriptPath: string | null;
@@ -228,6 +249,13 @@ export interface ScheduledTask {
   lastRunAt: string | null;
   lastRunStatus: string | null;
   lastRunOutput: string | null;
+  webhookPath?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+// ── Web Push notification types ──────────────────────────
+
+export interface VapidKeyInfo {
+  publicKey: string;
 }

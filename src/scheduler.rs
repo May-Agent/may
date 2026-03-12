@@ -19,6 +19,7 @@ use askama::Template;
 use base64::Engine;
 use executor_core::DefaultExecutor;
 use sea_orm::DbErr;
+use serde::Serialize;
 use shell_escape::escape as shell_escape;
 
 use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKind};
@@ -29,8 +30,8 @@ use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
 use crate::profile::{ProfileEnvironment, ProfileInfo};
 use crate::task_trigger::{
-    TRIGGER_KIND_EVENT, TRIGGER_KIND_TIME, TRIGGER_TYPE_CRON, TRIGGER_TYPE_ONCE,
-    normalize_event_name,
+    TRIGGER_KIND_EVENT, TRIGGER_KIND_TIME, TRIGGER_KIND_WEBHOOK, TRIGGER_TYPE_CRON,
+    TRIGGER_TYPE_ONCE, TaskInvocation, TaskWebhookRequest, normalize_event_name, webhook_path,
 };
 
 /// Shared task execution facility used by the scheduler, REST API, and agent tools.
@@ -55,6 +56,14 @@ struct TaskValidationScriptTemplate<'a> {
     encoded_script: &'a str,
 }
 
+#[derive(Template)]
+#[template(path = "task_execute_script.sh", escape = "none")]
+struct TaskExecutionScriptTemplate<'a> {
+    trigger_file: &'a str,
+    trigger_kind: &'a str,
+    script_file: &'a str,
+}
+
 #[derive(Debug, Default)]
 struct TaskCatalog {
     tasks: Vec<scheduled_tasks::Model>,
@@ -70,6 +79,44 @@ impl TaskCatalog {
 struct TaskScript {
     content: String,
     host_working_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct MaterializedTaskExecution {
+    command: String,
+    cleanup_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TaskExecutionEnvelope {
+    task: TaskExecutionTask,
+    invocation: TaskInvocation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TaskExecutionTask {
+    id: String,
+    name: String,
+    profile_id: String,
+    session_id: Option<String>,
+    trigger_kind: String,
+    trigger_type: String,
+}
+
+impl TaskExecutionEnvelope {
+    fn new(task: &scheduled_tasks::Model, invocation: TaskInvocation) -> Self {
+        Self {
+            task: TaskExecutionTask {
+                id: task.id.clone(),
+                name: task.name.clone(),
+                profile_id: task.profile_id.clone(),
+                session_id: task.session_id.clone(),
+                trigger_kind: task.trigger_kind.clone(),
+                trigger_type: task.trigger_type.clone(),
+            },
+            invocation,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +229,7 @@ impl TaskRuntime {
         .await?;
 
         let task_id = uuid::Uuid::new_v4().to_string();
+        let trigger_type = normalized.trigger.storage_trigger_type();
         let model = self
             .db
             .create_scheduled_task(crate::db::CreateScheduledTaskParams {
@@ -190,9 +238,9 @@ impl TaskRuntime {
                 session_id: Some(normalized.session_id.as_str()),
                 name: &normalized.name,
                 trigger_kind: &normalized.trigger_kind,
-                trigger_type: normalized.trigger.trigger_type.as_str(),
-                cron_expression: normalized.trigger.cron_expression.as_deref(),
-                run_at: normalized.trigger.run_at.as_deref(),
+                trigger_type: &trigger_type,
+                cron_expression: normalized.trigger.cron_expression(),
+                run_at: normalized.trigger.run_at(),
                 script_path: normalized.script.script_path.as_deref(),
                 script_inline: normalized.script.script_inline.as_deref(),
                 needs_network: normalized.needs_network,
@@ -202,6 +250,11 @@ impl TaskRuntime {
         self.reload_active_tasks()
             .await
             .map_err(|e| e.to_string())?;
+        let webhook_path = if model.trigger_kind == TRIGGER_KIND_WEBHOOK {
+            Some(webhook_path(model.trigger_type.as_str()))
+        } else {
+            None
+        };
 
         Ok(TaskCreateResult {
             task_id: model.id,
@@ -210,9 +263,14 @@ impl TaskRuntime {
             trigger_type: model.trigger_type,
             run_at: model.run_at,
             cron_expression: model.cron_expression,
+            webhook_path,
             approved: model.approved,
             enabled: model.enabled,
         })
+    }
+
+    pub fn run_manual_task(&self, task: scheduled_tasks::Model) {
+        self.spawn_task(task, TaskInvocation::Manual);
     }
 
     /// Check for due tasks and execute them.
@@ -224,7 +282,13 @@ impl TaskRuntime {
             let is_due = self.is_due(task, now)?;
 
             if is_due {
-                self.execute_task(task).await;
+                self.execute_task(
+                    task,
+                    TaskInvocation::Time {
+                        trigger_type: task.trigger_type.clone(),
+                    },
+                )
+                .await;
             }
         }
 
@@ -260,10 +324,36 @@ impl TaskRuntime {
                 continue;
             }
             dispatched += 1;
-            self.execute_task_by_model(task).await;
+            self.spawn_task(
+                task.clone(),
+                TaskInvocation::Event {
+                    event_name: event_name.clone(),
+                    profile_id: profile_id.map(ToOwned::to_owned),
+                    session_id: session_id.map(ToOwned::to_owned),
+                },
+            );
         }
 
         Ok(dispatched)
+    }
+
+    pub async fn dispatch_webhook(
+        &self,
+        token: String,
+        request: TaskWebhookRequest,
+    ) -> Result<usize, crate::db::ChatDbError> {
+        let tasks = self.db.list_tasks_for_webhook(&token).await?;
+        let triggered = tasks.len();
+        for task in tasks {
+            self.spawn_task(
+                task,
+                TaskInvocation::Webhook {
+                    token: token.clone(),
+                    request: request.clone(),
+                },
+            );
+        }
+        Ok(triggered)
     }
 
     fn is_due(
@@ -279,6 +369,7 @@ impl TaskRuntime {
                 task.id
             )))),
             (TRIGGER_KIND_EVENT, _) => Ok(false),
+            (TRIGGER_KIND_WEBHOOK, _) => Ok(false),
             (other_kind, _) => Err(crate::db::ChatDbError::Db(DbErr::Custom(format!(
                 "unsupported trigger_kind '{other_kind}' for task {}",
                 task.id
@@ -358,9 +449,11 @@ impl TaskRuntime {
         Ok(now >= target)
     }
 
-    /// Execute a task (run its script). Can be called externally for manual triggers.
-    pub async fn execute_task_by_model(&self, task: &scheduled_tasks::Model) {
-        self.execute_task(task).await;
+    fn spawn_task(&self, task: scheduled_tasks::Model, invocation: TaskInvocation) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.execute_task(&task, invocation).await;
+        });
     }
 
     async fn validate_task_script_for_profile_model(
@@ -382,7 +475,7 @@ impl TaskRuntime {
     }
 
     /// Execute a task (run its script).
-    async fn execute_task(&self, task: &scheduled_tasks::Model) {
+    async fn execute_task(&self, task: &scheduled_tasks::Model, invocation: TaskInvocation) {
         tracing::info!(
             task_id = %task.id,
             name = %task.name,
@@ -391,7 +484,7 @@ impl TaskRuntime {
             "Executing scheduled task"
         );
 
-        let result = self.execute_task_inner(task).await;
+        let result = self.execute_task_inner(task, invocation).await;
 
         match result {
             Ok(output) => {
@@ -453,7 +546,11 @@ impl TaskRuntime {
         }
     }
 
-    async fn execute_task_inner(&self, task: &scheduled_tasks::Model) -> Result<String, String> {
+    async fn execute_task_inner(
+        &self,
+        task: &scheduled_tasks::Model,
+        invocation: TaskInvocation,
+    ) -> Result<String, String> {
         let profile = self
             .db
             .get_profile(&task.profile_id)
@@ -464,11 +561,98 @@ impl TaskRuntime {
             .map_err(|e| format!("invalid profile {}: {e}", task.profile_id))?;
 
         let script = self.resolve_script(task).await?;
+        let materialized = self
+            .materialize_task_execution(task, &script, invocation)
+            .await?;
 
-        match profile_info.environment {
-            ProfileEnvironment::Local => self.execute_local(task, &script).await,
+        let result = match profile_info.environment {
+            ProfileEnvironment::Local => {
+                self.execute_local(task, &script, materialized.command.clone())
+                    .await
+            }
             ProfileEnvironment::Container { .. } => {
-                self.execute_container(task, &profile, &script).await
+                self.execute_container(task, &profile, materialized.command.clone())
+                    .await
+            }
+        };
+
+        self.cleanup_materialized_execution(materialized.cleanup_paths)
+            .await;
+        result
+    }
+
+    async fn materialize_task_execution(
+        &self,
+        task: &scheduled_tasks::Model,
+        script: &TaskScript,
+        invocation: TaskInvocation,
+    ) -> Result<MaterializedTaskExecution, String> {
+        let execution_id = uuid::Uuid::new_v4().to_string();
+        let script_path = script
+            .host_working_dir
+            .join([".may-task-script-", execution_id.as_str(), ".sh"].concat());
+        let trigger_path = script
+            .host_working_dir
+            .join([".may-task-trigger-", execution_id.as_str(), ".json"].concat());
+        let trigger_kind =
+            shell_escape(Cow::Borrowed(Self::invocation_kind(&invocation))).into_owned();
+        let trigger_payload = serde_json::to_vec(&TaskExecutionEnvelope::new(task, invocation))
+            .map_err(|error| {
+                let error = error.to_string();
+                ["failed to encode task trigger payload: ", error.as_str()].concat()
+            })?;
+
+        tokio::fs::write(&script_path, script.content.as_bytes())
+            .await
+            .map_err(|error| {
+                let display = script_path.display().to_string();
+                let error = error.to_string();
+                [
+                    "failed to write task script ",
+                    display.as_str(),
+                    ": ",
+                    error.as_str(),
+                ]
+                .concat()
+            })?;
+        tokio::fs::write(&trigger_path, trigger_payload)
+            .await
+            .map_err(|error| {
+                let _ = std::fs::remove_file(&script_path);
+                let display = trigger_path.display().to_string();
+                let error = error.to_string();
+                [
+                    "failed to write task trigger payload ",
+                    display.as_str(),
+                    ": ",
+                    error.as_str(),
+                ]
+                .concat()
+            })?;
+
+        let trigger_file =
+            shell_escape(Cow::Owned(trigger_path.display().to_string())).into_owned();
+        let script_file = shell_escape(Cow::Owned(script_path.display().to_string())).into_owned();
+        let command = TaskExecutionScriptTemplate {
+            trigger_file: &trigger_file,
+            trigger_kind: &trigger_kind,
+            script_file: &script_file,
+        }
+        .render()
+        .expect("task execution template must render");
+
+        Ok(MaterializedTaskExecution {
+            command,
+            cleanup_paths: vec![script_path, trigger_path],
+        })
+    }
+
+    async fn cleanup_materialized_execution(&self, cleanup_paths: Vec<PathBuf>) {
+        for path in cleanup_paths {
+            if let Err(error) = tokio::fs::remove_file(&path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), error = %error, "failed to remove materialized task file");
+                }
             }
         }
     }
@@ -521,6 +705,7 @@ impl TaskRuntime {
         &self,
         _task: &scheduled_tasks::Model,
         script: &TaskScript,
+        command: String,
     ) -> Result<String, String> {
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: true,
@@ -543,13 +728,7 @@ impl TaskRuntime {
             .with_readable_paths([script.host_working_dir.clone()])
             .with_registry(registry);
 
-        run_bash_script(
-            &bash_tool,
-            BashExecutionMode::Default,
-            None,
-            script.content.clone(),
-        )
-        .await
+        run_bash_script(&bash_tool, BashExecutionMode::Default, None, command).await
     }
 
     async fn validate_local(&self, script: &TaskScript) -> Result<(), String> {
@@ -587,7 +766,7 @@ impl TaskRuntime {
         &self,
         _task: &scheduled_tasks::Model,
         profile: &profiles::Model,
-        script: &TaskScript,
+        command: String,
     ) -> Result<String, String> {
         let container_manager = self.container_manager.as_ref().ok_or_else(|| {
             "container profile task cannot run: container runtime unavailable".to_string()
@@ -662,15 +841,19 @@ impl TaskRuntime {
                 .with_readable_paths([workspace_dir])
                 .with_registry(registry);
 
-        let result = run_bash_script(
-            &bash_tool,
-            BashExecutionMode::Default,
-            None,
-            script.content.clone(),
-        )
-        .await;
+        let result = run_bash_script(&bash_tool, BashExecutionMode::Default, None, command).await;
         container_manager.touch_activity(&container_id).await;
         result
+    }
+
+    #[must_use]
+    fn invocation_kind(invocation: &TaskInvocation) -> &'static str {
+        match invocation {
+            TaskInvocation::Time { .. } => "time",
+            TaskInvocation::Manual => "manual",
+            TaskInvocation::Event { .. } => "event",
+            TaskInvocation::Webhook { .. } => "webhook",
+        }
     }
 
     async fn validate_container(

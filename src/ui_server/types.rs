@@ -144,6 +144,7 @@ pub(crate) struct BrowserTakeoverResponse {
 pub(crate) struct TaskTriggerResponse {
     pub(crate) ok: bool,
     pub(crate) status: &'static str,
+    pub(crate) triggered: usize,
 }
 
 #[derive(Debug, serde::Serialize)]
