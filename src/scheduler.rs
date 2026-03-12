@@ -25,7 +25,7 @@ use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKi
 use crate::container::lifecycle::ContainerManager;
 use crate::db::ChatDb;
 use crate::db::entity::{profiles, scheduled_tasks};
-use crate::notification::NotificationManager;
+use crate::notification::{NotificationManager, NotificationPayload};
 use crate::profile::{ProfileEnvironment, ProfileInfo};
 use crate::task_trigger::{
     TRIGGER_KIND_EVENT, TRIGGER_KIND_TIME, TRIGGER_TYPE_CRON, TRIGGER_TYPE_ONCE,
@@ -404,8 +404,14 @@ impl TaskRuntime {
                 }
 
                 if let Some(ref notifier) = self.notifier {
-                    let title = format!("Task: {}", task.name);
-                    if let Err(e) = notifier.send(&title, "Completed successfully").await {
+                    let payload = NotificationPayload {
+                        title: ["Task: ", task.name.as_str()].concat(),
+                        body: "Completed successfully".to_string(),
+                        session_id: task.session_id.clone(),
+                        callback_context_xml: None,
+                        callback_message: None,
+                    };
+                    if let Err(e) = notifier.send_payload(payload).await {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
                     }
                 }
@@ -426,8 +432,14 @@ impl TaskRuntime {
                 }
 
                 if let Some(ref notifier) = self.notifier {
-                    let title = format!("Task: {}", task.name);
-                    if let Err(e) = notifier.send(&title, "Execution failed").await {
+                    let payload = NotificationPayload {
+                        title: ["Task: ", task.name.as_str()].concat(),
+                        body: "Execution failed".to_string(),
+                        session_id: task.session_id.clone(),
+                        callback_context_xml: None,
+                        callback_message: None,
+                    };
+                    if let Err(e) = notifier.send_payload(payload).await {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
                     }
                 }
