@@ -119,12 +119,14 @@ struct DefaultProfile<'a> {
 enum ProfileEnvironmentKind {
     Local,
     Container,
+    Remote,
 }
 
 fn parse_profile_environment(value: &str) -> Result<ProfileEnvironmentKind, ChatDbError> {
     match value {
         "local" => Ok(ProfileEnvironmentKind::Local),
         "container" => Ok(ProfileEnvironmentKind::Container),
+        "remote" => Ok(ProfileEnvironmentKind::Remote),
         other => Err(ChatDbError::InvalidProfileEnvironment(other.to_string())),
     }
 }
@@ -1519,7 +1521,7 @@ impl ChatDb {
             icon: Set(params.icon.map(String::from)),
             environment: Set(params.environment.to_string()),
             container_image: Set(match environment {
-                ProfileEnvironmentKind::Local => None,
+                ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote => None,
                 ProfileEnvironmentKind::Container => params.container_image.map(String::from),
             }),
             container_id: Set(None),
@@ -1578,7 +1580,10 @@ impl ChatDb {
         if let Some(container_image) = params.container_image {
             active.container_image = Set(container_image.map(String::from));
         }
-        if matches!(next_environment, Some(ProfileEnvironmentKind::Local)) {
+        if matches!(
+            next_environment,
+            Some(ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote)
+        ) {
             active.container_image = Set(None);
             active.container_id = Set(None);
         }
@@ -2542,6 +2547,7 @@ pub struct AskUserResponsePayload {
 mod tests {
     use tempfile::tempdir;
 
+    use crate::profile::ProfileEnvironment;
     use crate::session::{
         PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
         PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
@@ -2943,6 +2949,70 @@ mod tests {
             .expect_err("session with pending work must not archive");
         assert!(
             error.to_string().contains("pending follow-up work exists"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_remote_profile_with_typed_environment() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let model = db
+            .create_profile(CreateProfileParams {
+                id: "remote-profile",
+                name: "Remote",
+                environment: "remote",
+                container_image: None,
+                slug: None,
+                icon: None,
+                persona: None,
+                preferences_json: Some(r#"{"remote":{"ssh_server_id":"prod"}}"#),
+                location_aware: false,
+            })
+            .await
+            .expect("remote profile should be created");
+
+        let info = crate::profile::ProfileInfo::from_db_model(model)
+            .expect("remote profile should deserialize");
+        match info.environment {
+            ProfileEnvironment::Remote { ssh_server_id } => assert_eq!(ssh_server_id, "prod"),
+            other => panic!("expected remote environment, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_remote_profile_without_ssh_server_binding() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let model = db
+            .create_profile(CreateProfileParams {
+                id: "remote-profile",
+                name: "Remote",
+                environment: "remote",
+                container_image: None,
+                slug: None,
+                icon: None,
+                persona: None,
+                preferences_json: Some(r#"{"remote":{"ssh_server_id":"  "}}"#),
+                location_aware: false,
+            })
+            .await
+            .expect("remote profile row should be stored");
+
+        let error = crate::profile::ProfileInfo::from_db_model(model)
+            .expect_err("invalid remote preferences must fail fast");
+        assert!(
+            error
+                .to_string()
+                .contains("preferences.remote.ssh_server_id"),
             "unexpected error: {error}"
         );
     }

@@ -165,7 +165,8 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         crate::scheduler::TaskRuntime::load(db_for_archive.clone(), may_dir.clone())
             .await
             .context("failed to load task runtime state")?
-            .with_notifier(notification_service.clone());
+            .with_notifier(notification_service.clone())
+            .with_ssh_servers(config.ssh_servers.clone());
     if let Some(ref manager) = container_manager {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }

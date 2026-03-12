@@ -469,6 +469,11 @@ impl Hook for PendingSteerHook {
 pub enum AgentEnvironment {
     /// Native macOS sandbox via leash.
     Local,
+    /// Local home environment with one designated remote SSH target.
+    Remote {
+        /// The configured SSH target bound to this profile.
+        ssh_server: crate::config::SshServerConfig,
+    },
     /// Docker container-based isolation.
     Container {
         /// Container ID from Docker.
@@ -807,15 +812,21 @@ impl MayAgent {
             config.may_dir.clone(),
         )?;
 
-        let ssh_servers: Vec<SshServer> = config
-            .ssh_servers
-            .iter()
-            .map(|s| SshServer {
-                name: s.name.clone(),
-                target: s.target.clone(),
-            })
-            .collect();
-        let ssh_enabled = !is_container && !ssh_servers.is_empty();
+        let ssh_servers: Vec<SshServer> = match &config.environment {
+            AgentEnvironment::Local | AgentEnvironment::Container { .. } => config
+                .ssh_servers
+                .iter()
+                .map(|s| SshServer {
+                    name: s.name.clone(),
+                    target: s.target.clone(),
+                })
+                .collect(),
+            AgentEnvironment::Remote { ssh_server } => vec![SshServer {
+                name: ssh_server.name.clone(),
+                target: ssh_server.target.clone(),
+            }],
+        };
+        let ssh_enabled = !ssh_servers.is_empty();
 
         // Read global memory from ~/.may/MEMORY.md.
         let memory_path = global_memory_file_path(&config.may_dir);
@@ -840,10 +851,10 @@ impl MayAgent {
         );
         let task_tool = TaskTool::new(
             config.session_id.as_str().to_string(),
-            if is_container {
-                TaskRuntimeKind::Container
-            } else {
-                TaskRuntimeKind::Local
+            match &config.environment {
+                AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
+                AgentEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
+                AgentEnvironment::Local => TaskRuntimeKind::Local,
             },
             config.task_broker,
         );
@@ -877,18 +888,17 @@ impl MayAgent {
         let subagents_dir = config.sandbox_dir.join("subagents");
 
         // Shell runtime depends on the environment
-        let availability = if is_container {
-            ShellRuntimeAvailability {
+        let availability = match &config.environment {
+            AgentEnvironment::Container { .. } => ShellRuntimeAvailability {
                 local: false,
                 container: true,
                 ssh: false,
-            }
-        } else {
-            ShellRuntimeAvailability {
+            },
+            AgentEnvironment::Remote { .. } | AgentEnvironment::Local => ShellRuntimeAvailability {
                 local: true,
                 container: false,
                 ssh: ssh_enabled,
-            }
+            },
         };
 
         // Build the agent using a minimal base prompt + structured context blocks.
@@ -998,6 +1008,10 @@ impl MayAgent {
                     runtime_system_context = runtime_system_context.with_platform(macos_hint.clone());
                     builder = builder.system(macos_hint);
                 }
+            }
+            AgentEnvironment::Remote { ssh_server } => {
+                let remote_context = build_remote_environment_context(&workspace, &ssh_server);
+                builder = builder.system(remote_context);
             }
         }
 
@@ -1594,6 +1608,14 @@ struct Platform {
     content: String,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct RemoteEnvironmentContext {
+    sandbox: String,
+    cwd: String,
+    ssh_server_id: String,
+    ssh_target: String,
+}
+
 fn build_browser_context(cdp_endpoint: Option<&str>) -> Browser {
     Browser {
         cdp_endpoint: cdp_endpoint.map(str::to_string),
@@ -1610,6 +1632,18 @@ fn build_workspace_context(workspace: &MayWorkspace) -> Workspace {
             .iter()
             .map(WorkspaceDirEntry::from)
             .collect(),
+    }
+}
+
+fn build_remote_environment_context(
+    workspace: &MayWorkspace,
+    ssh_server: &crate::config::SshServerConfig,
+) -> RemoteEnvironmentContext {
+    RemoteEnvironmentContext {
+        sandbox: workspace.sandbox.display().to_string(),
+        cwd: workspace.cwd.display().to_string(),
+        ssh_server_id: ssh_server.name.clone(),
+        ssh_target: ssh_server.target.clone(),
     }
 }
 

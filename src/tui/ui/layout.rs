@@ -704,6 +704,7 @@ fn render_profile_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         let env_indicator = match &profile.environment {
             crate::profile::ProfileEnvironment::Local => "",
             crate::profile::ProfileEnvironment::Container { .. } => " [container]",
+            crate::profile::ProfileEnvironment::Remote { .. } => " [remote]",
         };
 
         let prefix = if selected { "> " } else { "  " };

@@ -18,6 +18,7 @@ pub mod models;
 pub mod notification;
 pub mod notification_service;
 pub mod profile;
+pub mod remote_profile;
 pub mod scheduler;
 pub mod session;
 pub mod skill;

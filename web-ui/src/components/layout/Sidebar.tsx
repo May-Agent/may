@@ -33,6 +33,7 @@ import {
   Monitor,
   Box,
   Laptop,
+  Server,
   type LucideIcon,
 } from 'lucide-react';
 import {
@@ -103,6 +104,7 @@ const SLUG_ICON: Record<string, LucideIcon> = {
 const ENV_ICON: Record<string, LucideIcon> = {
   container: Box,
   local: Laptop,
+  remote: Server,
 };
 
 function getProfileIcon(profile: ProfileInfo): LucideIcon {

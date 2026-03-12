@@ -128,9 +128,10 @@ export interface ArtifactPreviewTarget {
 // ── Profile system types ─────────────────────────────────
 
 export interface ProfileEnvironment {
-  type: 'local' | 'container';
+  type: 'local' | 'container' | 'remote';
   image?: string;
   containerId?: string;
+  sshServerId?: string;
 }
 
 export interface ProfileInfo {
@@ -204,7 +205,7 @@ export interface SessionRuntimeSummaryPayload {
   state: SessionRuntimeState;
   queuedCount: number;
   pendingImmediate?: PendingUserMessage | null;
-  queuedMessages?: PendingUserMessage[];
+  queuedMessages: PendingUserMessage[];
   waitingPermission?: RuntimePermissionRequest | null;
   waitingAskUser?: RuntimeAskUserRequest | null;
 }

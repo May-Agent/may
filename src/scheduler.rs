@@ -12,7 +12,7 @@ use aither_core::llm::Tool;
 use aither_sandbox::{
     BashArgs, BashExecutionMode, BashMode, BashResult, BashTool, BollardContainerExec, Configured,
     ContainerLaunchSpec, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, ToolRegistryBuilder, permission::PermissionError,
+    ShellSessionRegistry, SshServer, ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -23,6 +23,7 @@ use serde::Serialize;
 use shell_escape::escape as shell_escape;
 
 use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKind};
+use crate::config::SshServerConfig;
 use crate::container::lifecycle::ContainerManager;
 use crate::db::ChatDb;
 use crate::db::entity::{profiles, scheduled_tasks};
@@ -41,6 +42,7 @@ pub struct TaskRuntime {
     notifier: Option<Arc<NotificationService>>,
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
+    ssh_servers: Arc<ArcSwap<Vec<SshServerConfig>>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
 }
 
@@ -141,6 +143,7 @@ impl TaskRuntime {
             notifier: None,
             may_dir,
             container_manager: None,
+            ssh_servers: Arc::new(ArcSwap::from_pointee(Vec::new())),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
         };
         runtime.reload_active_tasks().await?;
@@ -157,6 +160,15 @@ impl TaskRuntime {
     pub fn with_container_manager(mut self, container_manager: Arc<ContainerManager>) -> Self {
         self.container_manager = Some(container_manager);
         self
+    }
+
+    pub fn with_ssh_servers(self, ssh_servers: Vec<SshServerConfig>) -> Self {
+        self.set_ssh_servers(ssh_servers);
+        self
+    }
+
+    pub fn set_ssh_servers(&self, ssh_servers: Vec<SshServerConfig>) {
+        self.ssh_servers.store(Arc::new(ssh_servers));
     }
 
     pub async fn reload_active_tasks(&self) -> Result<(), crate::db::ChatDbError> {
@@ -215,6 +227,7 @@ impl TaskRuntime {
         let actual_runtime = match profile_info.environment {
             ProfileEnvironment::Local => TaskRuntimeKind::Local,
             ProfileEnvironment::Container { .. } => TaskRuntimeKind::Container,
+            ProfileEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
         };
         if runtime_kind != actual_runtime {
             return Err(format!(
@@ -473,6 +486,7 @@ impl TaskRuntime {
         match profile_info.environment {
             ProfileEnvironment::Local => self.validate_local(&script).await,
             ProfileEnvironment::Container { .. } => self.validate_container(profile, &script).await,
+            ProfileEnvironment::Remote { .. } => self.validate_remote(profile, &script).await,
         }
     }
 
@@ -575,6 +589,9 @@ impl TaskRuntime {
             ProfileEnvironment::Container { .. } => {
                 self.execute_container(task, &profile, materialized.command.clone())
                     .await
+            }
+            ProfileEnvironment::Remote { .. } => {
+                self.execute_remote(&profile, materialized.command.clone()).await
             }
         };
 
@@ -753,6 +770,76 @@ impl TaskRuntime {
                 .with_readable_paths([script.host_working_dir.clone()])
                 .with_registry(registry)
         })
+    }
+
+    fn resolve_remote_server(&self, profile: &profiles::Model) -> Result<SshServerConfig, String> {
+        let configured_servers = self.ssh_servers.load();
+        crate::remote_profile::resolve_remote_profile_server(profile, configured_servers.as_slice())
+    }
+
+    async fn remote_bash_tool(
+        &self,
+        profile: &profiles::Model,
+        working_dir: &std::path::Path,
+    ) -> Result<BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
+        let ssh_server = self.resolve_remote_server(profile)?;
+        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: false,
+            ssh: true,
+        });
+        shell_sessions
+            .set_ssh_servers(vec![SshServer {
+                name: ssh_server.name,
+                target: ssh_server.target,
+            }])
+            .map_err(|error| format!("failed to configure remote ssh server: {error}"))?;
+        let registry = Arc::new(ToolRegistryBuilder::new().build(working_dir.join("outputs")));
+        BashTool::new_exact(
+            working_dir,
+            SchedulerPermissionHandler {
+                allow_network: true,
+            },
+            DefaultExecutor,
+        )
+        .await
+        .map_err(|e| format!("failed to initialize remote bash tool: {e}"))
+        .map(|tool| {
+            tool.with_shell_sessions(shell_sessions)
+                .with_writable_paths([working_dir.to_path_buf()])
+                .with_readable_paths([working_dir.to_path_buf()])
+                .with_registry(registry)
+        })
+    }
+
+    async fn execute_remote(
+        &self,
+        profile: &profiles::Model,
+        command: String,
+    ) -> Result<String, String> {
+        let working_dir = self.may_dir.join("tasks").join("remote").join(&profile.id);
+        std::fs::create_dir_all(working_dir.join("outputs"))
+            .map_err(|error| format!("failed to prepare remote task workspace: {error}"))?;
+        let bash_tool = self.remote_bash_tool(profile, &working_dir).await?;
+        run_bash_script(&bash_tool, BashExecutionMode::Ssh, None, command).await
+    }
+
+    async fn validate_remote(
+        &self,
+        profile: &profiles::Model,
+        script: &TaskScript,
+    ) -> Result<(), String> {
+        let bash_tool = self
+            .remote_bash_tool(profile, script.host_working_dir.as_path())
+            .await?;
+        run_bash_script(
+            &bash_tool,
+            BashExecutionMode::Ssh,
+            None,
+            build_validation_command(script),
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn execute_container(
