@@ -1003,6 +1003,17 @@ impl MayAgent {
         &mut self.inner
     }
 
+    pub(crate) fn export_context_json(&self) -> Result<String, serde_json::Error> {
+        self.inner.export_context_json()
+    }
+
+    pub(crate) fn restore_context_json(
+        &mut self,
+        context_json: &str,
+    ) -> Result<(), serde_json::Error> {
+        self.inner.restore_context_json(context_json)
+    }
+
     /// Clear conversation history.
     pub fn clear_history(&mut self) {
         self.inner.clear_history();
