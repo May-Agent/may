@@ -41,10 +41,11 @@ use crate::session::SessionManager;
 use crate::skill::SkillManager;
 use aither_models::lookup as lookup_model_info;
 
+use error::internal_error;
 use state::{AskUserApprover, UiServerState};
 use types::{
     ApiHealth, ModelInfoItem, ModelsResponse, ProviderModelsItem, ProviderModelsResponse,
-    RequestLogsResponse,
+    RequestLogCacheSummary, RequestLogsResponse,
 };
 
 #[cfg(feature = "ui")]
@@ -387,7 +388,14 @@ async fn get_request_logs(
         .iter()
         .cloned()
         .collect::<Vec<_>>();
-    Ok(Json(RequestLogsResponse { logs }))
+    let cache_summary = state
+        .db()
+        .await
+        .assistant_cache_usage_summary()
+        .await
+        .map(RequestLogCacheSummary::from)
+        .map_err(internal_error)?;
+    Ok(Json(RequestLogsResponse { logs, cache_summary }))
 }
 
 async fn models(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<ModelsResponse>> {

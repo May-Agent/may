@@ -81,7 +81,7 @@ export interface UiEventsSubscription {
   onConfig?: (payload: UiConfigEventPayload) => void;
   onContainerPrepare?: (payload: ContainerPrepareEventPayload) => void;
   onProfileSessions?: (payload: { profileSessions: ProfileSessions }) => void;
-  onRequestLogs?: (payload: { logs: RequestLogEntry[] }) => void;
+  onRequestLogs?: (payload: RequestLogsPayload) => void;
   onSessionRuntime?: (payload: { sessionId: string; runtime: SessionRuntimeStatus }) => void;
   onSessionRuntimes?: (payload: { sessions: SessionRuntimeSnapshot[] }) => void;
   onHeartbeat?: () => void;
@@ -157,6 +157,20 @@ export interface RequestLogEntry {
   elapsedMs: number;
   ok: boolean;
   error?: string | null;
+}
+
+export interface RequestLogCacheSummary {
+  assistantMessageCount: number;
+  cacheHitMessageCount: number;
+  promptTokensTotal: number;
+  cacheReadTokensTotal: number;
+  cacheWriteTokensTotal: number;
+  cacheReadHitRate?: number;
+}
+
+export interface RequestLogsPayload {
+  logs: RequestLogEntry[];
+  cacheSummary: RequestLogCacheSummary;
 }
 
 export interface ContextDebugMessage {
@@ -861,9 +875,8 @@ export async function fetchModelsByProvider(): Promise<ProviderModelsItem[]> {
   return data.providers;
 }
 
-export async function fetchRequestLogs(): Promise<RequestLogEntry[]> {
-  const data = await request<{ logs: RequestLogEntry[] }>('/api/logs/requests');
-  return data.logs;
+export async function fetchRequestLogs(): Promise<RequestLogsPayload> {
+  return request<RequestLogsPayload>('/api/logs/requests');
 }
 
 export async function fetchSessionRuntime(sessionId: string): Promise<SessionRuntimeStatus> {
@@ -1236,11 +1249,9 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
         options.onConfig,
         options.onError,
       ),
-      request_logs: buildSSEListener<{ logs?: RequestLogEntry[] }>(
+      request_logs: buildSSEListener<RequestLogsPayload>(
         'request_logs',
-        options.onRequestLogs
-          ? (data) => options.onRequestLogs!({ logs: data.logs ?? [] })
-          : undefined,
+        options.onRequestLogs,
         options.onError,
       ),
       container_prepare: buildSSEListener<ContainerPrepareEventPayload>(

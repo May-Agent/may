@@ -85,6 +85,15 @@ pub struct MessageStatsParams {
     pub elapsed_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AssistantCacheUsageSummary {
+    pub assistant_message_count: u64,
+    pub cache_hit_message_count: u64,
+    pub prompt_tokens_total: u64,
+    pub cache_read_tokens_total: u64,
+    pub cache_write_tokens_total: u64,
+}
+
 struct DefaultProfile<'a> {
     slug: &'static str,
     name: &'a str,
@@ -1053,6 +1062,39 @@ impl ChatDb {
             .all(&self.conn)
             .await?;
         Ok(msgs)
+    }
+
+    /// Summarize persisted cache-token usage across assistant messages.
+    pub async fn assistant_cache_usage_summary(
+        &self,
+    ) -> Result<AssistantCacheUsageSummary, ChatDbError> {
+        let row = self
+            .conn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                self.conn.get_database_backend(),
+                "SELECT \
+                    COUNT(*) AS assistant_message_count, \
+                    COALESCE(SUM(CASE WHEN COALESCE(cache_read_tokens, 0) > 0 THEN 1 ELSE 0 END), 0) AS cache_hit_message_count, \
+                    COALESCE(SUM(COALESCE(prompt_tokens, 0)), 0) AS prompt_tokens_total, \
+                    COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0) AS cache_read_tokens_total, \
+                    COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0) AS cache_write_tokens_total \
+                 FROM messages \
+                 WHERE role = ?",
+                ["assistant".into()],
+            ))
+            .await?;
+
+        let Some(row) = row else {
+            return Ok(AssistantCacheUsageSummary::default());
+        };
+
+        Ok(AssistantCacheUsageSummary {
+            assistant_message_count: query_u64(&row, 0)?,
+            cache_hit_message_count: query_u64(&row, 1)?,
+            prompt_tokens_total: query_u64(&row, 2)?,
+            cache_read_tokens_total: query_u64(&row, 3)?,
+            cache_write_tokens_total: query_u64(&row, 4)?,
+        })
     }
 
     // ── Context Debug Snapshot ────────────────────────────────
@@ -2221,6 +2263,17 @@ impl ChatDb {
             .and_then(|query_result| query_result.try_get_by_index::<i32>(0).ok())
             .unwrap_or(-1))
     }
+}
+
+fn query_u64(row: &sea_orm::QueryResult, index: usize) -> Result<u64, ChatDbError> {
+    let value = row
+        .try_get_by_index::<i64>(index)
+        .map_err(ChatDbError::Db)?;
+    u64::try_from(value).map_err(|error| {
+        ChatDbError::Db(DbErr::Custom(
+            ["u64 aggregate conversion failed: ", error.to_string().as_str()].concat(),
+        ))
+    })
 }
 
 /// Parameters for upserting a persisted session context snapshot.
