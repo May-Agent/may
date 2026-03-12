@@ -119,8 +119,10 @@ impl TaskExecutionEnvelope {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SchedulerPermissionHandler;
+#[derive(Debug, Clone, Copy)]
+struct SchedulerPermissionHandler {
+    allow_network: bool,
+}
 
 impl PermissionHandler for SchedulerPermissionHandler {
     async fn check(&self, _mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
@@ -128,7 +130,7 @@ impl PermissionHandler for SchedulerPermissionHandler {
     }
 
     async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
-        true
+        self.allow_network
     }
 }
 
@@ -703,54 +705,18 @@ impl TaskRuntime {
 
     async fn execute_local(
         &self,
-        _task: &scheduled_tasks::Model,
+        task: &scheduled_tasks::Model,
         script: &TaskScript,
         command: String,
     ) -> Result<String, String> {
-        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: true,
-            container: false,
-            ssh: false,
-        });
-
-        let registry =
-            Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
-        let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
-            BashTool::new_exact(
-                &script.host_working_dir,
-                SchedulerPermissionHandler,
-                DefaultExecutor,
-            )
-            .await
-            .map_err(|e| format!("failed to initialize local bash tool: {e}"))?
-            .with_shell_sessions(shell_sessions)
-            .with_writable_paths([script.host_working_dir.clone()])
-            .with_readable_paths([script.host_working_dir.clone()])
-            .with_registry(registry);
-
+        let bash_tool = self
+            .local_bash_tool(script, task.needs_network)
+            .await?;
         run_bash_script(&bash_tool, BashExecutionMode::Default, None, command).await
     }
 
     async fn validate_local(&self, script: &TaskScript) -> Result<(), String> {
-        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: true,
-            container: false,
-            ssh: false,
-        });
-        let registry =
-            Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
-        let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
-            BashTool::new_exact(
-                &script.host_working_dir,
-                SchedulerPermissionHandler,
-                DefaultExecutor,
-            )
-            .await
-            .map_err(|e| format!("failed to initialize local bash tool: {e}"))?
-            .with_shell_sessions(shell_sessions)
-            .with_writable_paths([script.host_working_dir.clone()])
-            .with_readable_paths([script.host_working_dir.clone()])
-            .with_registry(registry);
+        let bash_tool = self.local_bash_tool(script, false).await?;
 
         run_bash_script(
             &bash_tool,
@@ -760,6 +726,33 @@ impl TaskRuntime {
         )
         .await
         .map(|_| ())
+    }
+
+    async fn local_bash_tool(
+        &self,
+        script: &TaskScript,
+        allow_network: bool,
+    ) -> Result<BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
+        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: true,
+            container: false,
+            ssh: false,
+        });
+        let registry =
+            Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
+        BashTool::new_exact(
+            &script.host_working_dir,
+            SchedulerPermissionHandler { allow_network },
+            DefaultExecutor,
+        )
+        .await
+        .map_err(|e| format!("failed to initialize local bash tool: {e}"))
+        .map(|tool| {
+            tool.with_shell_sessions(shell_sessions)
+                .with_writable_paths([script.host_working_dir.clone()])
+                .with_readable_paths([script.host_working_dir.clone()])
+                .with_registry(registry)
+        })
     }
 
     async fn execute_container(
@@ -833,13 +826,19 @@ impl TaskRuntime {
         // /workspace inside container.
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
         let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
-            BashTool::new_exact(&workspace_dir, SchedulerPermissionHandler, DefaultExecutor)
-                .await
-                .map_err(|e| format!("failed to initialize container bash tool: {e}"))?
-                .with_shell_sessions(shell_sessions)
-                .with_writable_paths([workspace_dir.clone()])
-                .with_readable_paths([workspace_dir])
-                .with_registry(registry);
+            BashTool::new_exact(
+                &workspace_dir,
+                SchedulerPermissionHandler {
+                    allow_network: true,
+                },
+                DefaultExecutor,
+            )
+            .await
+            .map_err(|e| format!("failed to initialize container bash tool: {e}"))?
+            .with_shell_sessions(shell_sessions)
+            .with_writable_paths([workspace_dir.clone()])
+            .with_readable_paths([workspace_dir])
+            .with_registry(registry);
 
         let result = run_bash_script(&bash_tool, BashExecutionMode::Default, None, command).await;
         container_manager.touch_activity(&container_id).await;
@@ -923,13 +922,19 @@ impl TaskRuntime {
 
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
         let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
-            BashTool::new_exact(&workspace_dir, SchedulerPermissionHandler, DefaultExecutor)
-                .await
-                .map_err(|e| format!("failed to initialize container bash tool: {e}"))?
-                .with_shell_sessions(shell_sessions)
-                .with_writable_paths([workspace_dir.clone()])
-                .with_readable_paths([workspace_dir])
-                .with_registry(registry);
+            BashTool::new_exact(
+                &workspace_dir,
+                SchedulerPermissionHandler {
+                    allow_network: true,
+                },
+                DefaultExecutor,
+            )
+            .await
+            .map_err(|e| format!("failed to initialize container bash tool: {e}"))?
+            .with_shell_sessions(shell_sessions)
+            .with_writable_paths([workspace_dir.clone()])
+            .with_readable_paths([workspace_dir])
+            .with_registry(registry);
 
         let result = run_bash_script(
             &bash_tool,

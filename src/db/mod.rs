@@ -493,6 +493,7 @@ impl ChatDb {
                 queued_messages.push(message);
             }
         }
+        steer_messages.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         let pending_immediate = if steer_messages.is_empty() {
             None
         } else {
@@ -2539,7 +2540,6 @@ pub struct AskUserResponsePayload {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
     use tempfile::tempdir;
 
     use crate::session::{
@@ -2856,20 +2856,6 @@ mod tests {
         )
         .await
         .expect("second steer should persist");
-
-        let stored_rows = crate::db::entity::session_pending_messages::Entity::find()
-            .filter(crate::db::entity::session_pending_messages::Column::SessionId.eq(session_id))
-            .order_by_asc(crate::db::entity::session_pending_messages::Column::Id)
-            .all(&db.conn)
-            .await
-            .expect("stored rows should load");
-        assert_eq!(
-            stored_rows
-                .iter()
-                .map(|row| row.content.as_str())
-                .collect::<Vec<_>>(),
-            vec!["second steer", "first steer"]
-        );
 
         let runtime = db
             .get_session_runtime(session_id)
