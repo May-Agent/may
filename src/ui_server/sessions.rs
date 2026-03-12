@@ -5,6 +5,7 @@ use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::session::SessionId;
+use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error};
 use super::helpers::truncate_preview;
@@ -14,9 +15,16 @@ use super::model_resolution::{
 };
 use super::state::UiServerState;
 use super::types::{
-    ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, SessionContextDebugResponse,
-    UpdateSessionRequest,
+    ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest,
+    SessionContextDebugResponse, SessionContextWindowMetricsResponse,
+    SessionContextWindowSnapshotResponse, UpdateSessionRequest,
 };
+
+#[derive(serde::Deserialize)]
+struct StoredContextWindowMetadata {
+    phase: aither_agent::ContextWindowPhase,
+    metrics: aither_agent::ContextWindowMetrics,
+}
 
 pub(super) async fn list_sessions(
     State(state): State<Arc<UiServerState>>,
@@ -92,6 +100,12 @@ pub(super) async fn get_session_context_debug(
     let assembled_messages: Vec<ContextDebugMessage> =
         serde_json::from_str(&row.assembled_messages_json)
             .map_err(|e| internal_error(format!("invalid assembled_messages_json: {e}")))?;
+    let window_snapshot = db
+        .get_session_context_snapshot(&id)
+        .await
+        .map_err(internal_error)?
+        .map(|snapshot| build_window_snapshot(snapshot))
+        .transpose()?;
 
     Ok(Json(SessionContextDebugResponse {
         session_id: row.session_id,
@@ -101,7 +115,59 @@ pub(super) async fn get_session_context_debug(
         prompt: row.prompt,
         prompt_attachments,
         assembled_messages,
+        window_snapshot,
     }))
+}
+
+fn build_window_snapshot(
+    snapshot: crate::db::entity::session_context_snapshots::Model,
+) -> Result<SessionContextWindowSnapshotResponse, skyzen::Error> {
+    let metadata_json = snapshot
+        .metadata_json
+        .ok_or_else(|| internal_error("session context snapshot is missing metadata_json"))?;
+    let stored: StoredContextWindowMetadata = serde_json::from_str(&metadata_json)
+        .map_err(|e| internal_error(format!("invalid session context metadata_json: {e}")))?;
+    let assembled_messages_json = snapshot.assembled_messages_json.ok_or_else(|| {
+        internal_error("session context snapshot is missing assembled_messages_json")
+    })?;
+    let assembled_messages: Vec<LlmMessage> = serde_json::from_str(&assembled_messages_json)
+        .map_err(|e| internal_error(format!("invalid session context assembled_messages_json: {e}")))?;
+
+    Ok(SessionContextWindowSnapshotResponse {
+        phase: stored.phase,
+        metrics: SessionContextWindowMetricsResponse::from(stored.metrics),
+        assembled_messages: assembled_messages
+            .iter()
+            .map(map_context_window_message)
+            .collect(),
+    })
+}
+
+fn map_context_window_message(message: &LlmMessage) -> ContextDebugMessage {
+    ContextDebugMessage {
+        role: map_llm_role(message.role()).to_string(),
+        content: message.content().to_string(),
+        attachments: message
+            .attachments()
+            .iter()
+            .map(url::Url::to_string)
+            .collect(),
+        tool_call_id: message.tool_call_id().map(ToString::to_string),
+        tool_call_names: message
+            .tool_calls()
+            .iter()
+            .map(|call| call.name.clone())
+            .collect(),
+    }
+}
+
+fn map_llm_role(role: LlmRole) -> &'static str {
+    match role {
+        LlmRole::User => "user",
+        LlmRole::Assistant => "assistant",
+        LlmRole::System => "system",
+        LlmRole::Tool => "tool",
+    }
 }
 
 pub(super) async fn create_session(

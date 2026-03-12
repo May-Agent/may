@@ -465,6 +465,44 @@ pub(crate) struct SessionContextDebugResponse {
     #[serde(default)]
     pub(crate) prompt_attachments: Vec<String>,
     pub(crate) assembled_messages: Vec<ContextDebugMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) window_snapshot: Option<SessionContextWindowSnapshotResponse>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionContextWindowSnapshotResponse {
+    pub(crate) phase: aither_agent::ContextWindowPhase,
+    pub(crate) metrics: SessionContextWindowMetricsResponse,
+    pub(crate) assembled_messages: Vec<ContextDebugMessage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionContextWindowMetricsResponse {
+    pub(crate) usage_fraction: f32,
+    pub(crate) selected_model_context_window: Option<u32>,
+    pub(crate) fast_model_context_window: Option<u32>,
+    pub(crate) effective_context_window: usize,
+    pub(crate) system_block_count: usize,
+    pub(crate) reminder_count: usize,
+    pub(crate) recent_message_count: usize,
+    pub(crate) has_handoff: bool,
+}
+
+impl From<aither_agent::ContextWindowMetrics> for SessionContextWindowMetricsResponse {
+    fn from(value: aither_agent::ContextWindowMetrics) -> Self {
+        Self {
+            usage_fraction: value.usage_fraction,
+            selected_model_context_window: value.selected_model_context_window,
+            fast_model_context_window: value.fast_model_context_window,
+            effective_context_window: value.effective_context_window,
+            system_block_count: value.system_block_count,
+            reminder_count: value.reminder_count,
+            recent_message_count: value.recent_message_count,
+            has_handoff: value.has_handoff,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

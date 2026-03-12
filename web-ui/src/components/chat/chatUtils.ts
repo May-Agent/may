@@ -321,8 +321,10 @@ export function buildContextRoleTokenBreakdown(
   snapshot: SessionContextDebugSnapshot,
   promptTokens?: number,
 ): ContextRoleTokenBreakdown {
+  const assembledMessages =
+    snapshot.windowSnapshot?.assembledMessages ?? snapshot.assembledMessages;
   const roleBuckets = new Map<string, { role: string; tokens: number; messages: number }>();
-  for (const message of snapshot.assembledMessages) {
+  for (const message of assembledMessages) {
     const tokens = estimateMessageTokens(message);
     if (tokens <= 0) {
       continue;

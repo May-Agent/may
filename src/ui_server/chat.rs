@@ -715,7 +715,10 @@ async fn persist_context_snapshot(
     let context_json = agent.export_context_json().map_err(anyhow::Error::from)?;
     let window_snapshot = agent.snapshot_context_window().await;
     let assembled_messages_json = serde_json::to_string(&window_snapshot.messages)?;
-    let metadata_json = serde_json::to_string(&window_snapshot.metrics)?;
+    let metadata_json = serde_json::to_string(&serde_json::json!({
+        "phase": window_snapshot.phase,
+        "metrics": window_snapshot.metrics,
+    }))?;
     let db = {
         let manager = state.session_manager.lock().await;
         manager.db().clone()
