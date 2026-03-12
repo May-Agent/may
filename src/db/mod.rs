@@ -303,6 +303,15 @@ impl ChatDb {
             "TEXT NOT NULL DEFAULT 'time'",
         )
         .await?;
+        Self::migrate_add_column(
+            &conn,
+            "session_context_snapshots",
+            "assembled_messages_json",
+            "TEXT",
+        )
+        .await?;
+        Self::migrate_add_column(&conn, "session_context_snapshots", "metadata_json", "TEXT")
+            .await?;
         Self::migrate_add_column(&conn, "messages", "provider_id", "TEXT").await?;
         Self::migrate_add_column(&conn, "messages", "prompt_tokens", "INTEGER").await?;
         Self::migrate_add_column(&conn, "messages", "completion_tokens", "INTEGER").await?;
@@ -1073,12 +1082,14 @@ impl ChatDb {
     pub async fn upsert_session_context_snapshot(
         &self,
         session_id: &str,
-        context_json: &str,
+        snapshot: SessionContextSnapshotUpsert<'_>,
     ) -> Result<(), ChatDbError> {
         let updated_at = jiff::Timestamp::now().to_string();
         let active = session_context_snapshots::ActiveModel {
             session_id: Set(session_id.to_string()),
-            context_json: Set(context_json.to_string()),
+            context_json: Set(snapshot.context_json.to_string()),
+            assembled_messages_json: Set(snapshot.assembled_messages_json.map(ToOwned::to_owned)),
+            metadata_json: Set(snapshot.metadata_json.map(ToOwned::to_owned)),
             updated_at: Set(updated_at),
         };
         session_context_snapshots::Entity::insert(active)
@@ -1088,6 +1099,8 @@ impl ChatDb {
                 )
                 .update_columns([
                     session_context_snapshots::Column::ContextJson,
+                    session_context_snapshots::Column::AssembledMessagesJson,
+                    session_context_snapshots::Column::MetadataJson,
                     session_context_snapshots::Column::UpdatedAt,
                 ])
                 .to_owned(),
@@ -2180,6 +2193,13 @@ impl ChatDb {
             .and_then(|query_result| query_result.try_get_by_index::<i32>(0).ok())
             .unwrap_or(-1))
     }
+}
+
+/// Parameters for upserting a persisted session context snapshot.
+pub struct SessionContextSnapshotUpsert<'a> {
+    pub context_json: &'a str,
+    pub assembled_messages_json: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
 }
 
 /// Parameters for creating a scheduled task.
