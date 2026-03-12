@@ -6903,6 +6903,7 @@ dependencies = [
  "serde_yml",
  "shell-escape",
  "skyzen",
+ "sqlparser",
  "streamdown-parser",
  "syntect",
  "tar",
