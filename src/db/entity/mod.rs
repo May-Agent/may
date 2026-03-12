@@ -5,6 +5,7 @@ pub mod folders;
 pub mod messages;
 pub mod notification_mailbox;
 pub mod profile_memories;
+pub mod profile_memory_jobs;
 pub mod profiles;
 pub mod push_subscriptions;
 pub mod scheduled_tasks;

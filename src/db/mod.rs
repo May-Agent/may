@@ -20,9 +20,10 @@ use crate::session::{
     SessionRuntimeSummary,
 };
 use entity::{
-    context_debug_snapshots, folders, messages, notification_mailbox, profile_memories, profiles,
-    push_subscriptions, scheduled_tasks, session_context_snapshots, session_pending_ask_user,
-    session_pending_messages, session_pending_permissions, session_runtimes, sessions,
+    context_debug_snapshots, folders, messages, notification_mailbox, profile_memories,
+    profile_memory_jobs, profiles, push_subscriptions, scheduled_tasks, session_context_snapshots,
+    session_pending_ask_user, session_pending_messages, session_pending_permissions,
+    session_runtimes, sessions,
 };
 
 /// Error type for database operations.
@@ -171,6 +172,12 @@ impl ChatDb {
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
 
+        let memory_jobs_stmt = schema.create_table_from_entity(profile_memory_jobs::Entity);
+        let create_sql = memory_jobs_stmt
+            .to_string(SqliteQueryBuilder)
+            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        conn.execute_unprepared(&create_sql).await?;
+
         // Context debug snapshots table
         let context_debug_stmt = schema.create_table_from_entity(context_debug_snapshots::Entity);
         let create_sql = context_debug_stmt
@@ -246,6 +253,10 @@ impl ChatDb {
         .await?;
         conn.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_profile_memories_profile ON profile_memories(profile_id, memory_type)",
+        )
+        .await?;
+        conn.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_profile_memory_jobs_dirty_updated_at ON profile_memory_jobs(dirty, updated_at)",
         )
         .await?;
         conn.execute_unprepared(
@@ -2107,6 +2118,62 @@ impl ChatDb {
             model.insert(&self.conn).await?;
         }
 
+        Ok(())
+    }
+
+    /// Mark a profile memory refresh job dirty.
+    pub async fn mark_profile_memory_job_dirty(&self, profile_id: &str) -> Result<(), ChatDbError> {
+        let updated_at = jiff::Timestamp::now().to_string();
+        let active = profile_memory_jobs::ActiveModel {
+            profile_id: Set(profile_id.to_string()),
+            dirty: Set(true),
+            last_processed_at: Set(None),
+            updated_at: Set(updated_at),
+        };
+        profile_memory_jobs::Entity::insert(active)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(profile_memory_jobs::Column::ProfileId)
+                    .update_columns([
+                        profile_memory_jobs::Column::Dirty,
+                        profile_memory_jobs::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.conn)
+            .await?;
+        Ok(())
+    }
+
+    /// List profile memory jobs still marked dirty.
+    pub async fn list_dirty_profile_memory_jobs(
+        &self,
+    ) -> Result<Vec<profile_memory_jobs::Model>, ChatDbError> {
+        profile_memory_jobs::Entity::find()
+            .filter(profile_memory_jobs::Column::Dirty.eq(true))
+            .order_by_asc(profile_memory_jobs::Column::UpdatedAt)
+            .all(&self.conn)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Mark a profile memory refresh job processed.
+    pub async fn mark_profile_memory_job_processed(
+        &self,
+        profile_id: &str,
+        expected_updated_at: &str,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        profile_memory_jobs::Entity::update_many()
+            .col_expr(profile_memory_jobs::Column::Dirty, Expr::value(false))
+            .col_expr(
+                profile_memory_jobs::Column::LastProcessedAt,
+                Expr::value(Some(now.clone())),
+            )
+            .col_expr(profile_memory_jobs::Column::UpdatedAt, Expr::value(now))
+            .filter(profile_memory_jobs::Column::ProfileId.eq(profile_id))
+            .filter(profile_memory_jobs::Column::UpdatedAt.eq(expected_updated_at))
+            .exec(&self.conn)
+            .await?;
         Ok(())
     }
 }

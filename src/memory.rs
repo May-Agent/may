@@ -4,14 +4,12 @@
 //! conversations through a fast LLM. Processing happens asynchronously
 //! in a periodic background worker to avoid blocking the main chat flow.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use aither_cloud::CloudProvider;
 use aither_core::LanguageModel;
 use aither_core::llm::{LLMRequest, Message};
 use futures_lite::StreamExt;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::db::ChatDb;
 
@@ -24,10 +22,9 @@ const MAX_CONVERSATION_CHARS: usize = 30_000;
 
 /// Profile memory processor.
 ///
-/// Runs in the background, tracking dirty profiles and processing them on a
-/// fixed interval.
+/// Runs in the background, polling durable dirty jobs from the database.
 pub struct MemoryProcessor {
-    dirty_tx: UnboundedSender<String>,
+    db: ChatDb,
 }
 
 #[derive(Clone)]
@@ -43,63 +40,65 @@ impl MemoryProcessor {
     /// `llm` should be a fast model provider (e.g., Claude Haiku, GPT-4o-mini).
     /// Spawns a periodic background task that processes dirty profiles.
     pub fn new(db: ChatDb, providers: Vec<MemoryExtractionProvider>) -> Self {
-        let (dirty_tx, dirty_rx) = unbounded_channel::<String>();
-
+        let worker_db = db.clone();
         tokio::spawn(async move {
-            Self::worker(dirty_rx, db, providers).await;
+            Self::worker(worker_db, providers).await;
         });
 
-        Self { dirty_tx }
+        Self { db }
     }
 
     /// Mark a profile as dirty for background memory processing.
-    pub fn mark_profile_dirty(&self, profile_id: &str) {
-        if let Err(e) = self.dirty_tx.send(profile_id.to_string()) {
-            tracing::error!(error = %e, profile_id = %profile_id, "failed to queue profile memory update");
+    pub async fn mark_profile_dirty(&self, profile_id: &str) {
+        if let Err(error) = self.db.mark_profile_memory_job_dirty(profile_id).await {
+            tracing::error!(error = %error, profile_id = %profile_id, "failed to persist profile memory update");
         }
     }
 
-    async fn worker(
-        mut dirty_rx: UnboundedReceiver<String>,
-        db: ChatDb,
-        providers: Vec<MemoryExtractionProvider>,
-    ) {
-        let mut dirty_profiles = HashSet::new();
+    async fn worker(db: ChatDb, providers: Vec<MemoryExtractionProvider>) {
         let mut ticker = tokio::time::interval(MEMORY_PROCESS_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            tokio::select! {
-                maybe_profile_id = dirty_rx.recv() => {
-                    let Some(profile_id) = maybe_profile_id else {
-                        break;
-                    };
-                    dirty_profiles.insert(profile_id);
+            ticker.tick().await;
+
+            let dirty_jobs = match db.list_dirty_profile_memory_jobs().await {
+                Ok(dirty_jobs) => dirty_jobs,
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to load dirty profile memory jobs");
+                    continue;
                 }
-                _ = ticker.tick() => {
-                    if dirty_profiles.is_empty() {
+            };
+
+            for job in dirty_jobs {
+                let conversation = match Self::build_profile_conversation(&db, &job.profile_id)
+                    .await
+                {
+                    Ok(conversation) => conversation,
+                    Err(error) => {
+                        tracing::warn!(profile_id = %job.profile_id, error = %error, "failed to build profile conversation for memory");
                         continue;
                     }
+                };
 
-                    let mut batch = dirty_profiles.drain().collect::<Vec<_>>();
-                    batch.sort_unstable();
+                if conversation.is_empty() {
+                    let _ = db
+                        .mark_profile_memory_job_processed(&job.profile_id, &job.updated_at)
+                        .await;
+                    continue;
+                }
 
-                    for profile_id in batch {
-                        let conversation = match Self::build_profile_conversation(&db, &profile_id).await {
-                            Ok(conversation) => conversation,
-                            Err(e) => {
-                                tracing::warn!(profile_id = %profile_id, error = %e, "failed to build profile conversation for memory");
-                                continue;
-                            }
-                        };
-
-                        if conversation.is_empty() {
-                            continue;
+                match Self::process_request(&db, &providers, &job.profile_id, &conversation).await {
+                    Ok(()) => {
+                        if let Err(error) = db
+                            .mark_profile_memory_job_processed(&job.profile_id, &job.updated_at)
+                            .await
+                        {
+                            tracing::warn!(profile_id = %job.profile_id, error = %error, "failed to mark profile memory job processed");
                         }
-
-                        if let Err(e) = Self::process_request(&db, &providers, &profile_id, &conversation).await {
-                            tracing::warn!(profile_id = %profile_id, error = %e, "memory extraction failed");
-                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(profile_id = %job.profile_id, error = %error, "memory extraction failed");
                     }
                 }
             }
