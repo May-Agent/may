@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_lite::StreamExt;
+use serde::Serialize;
 use skyzen::Result as SkyResult;
 use skyzen::responder::Sse;
 use skyzen::utils::{Json, State};
@@ -264,7 +265,33 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     });
 }
 
-const BROWSER_TAKEOVER_ALERT_XML: &str = include_str!("../texts/browser_takeover_alert.xml");
+#[derive(Serialize)]
+struct BrowserTakeoverAlertXml {
+    #[serde(rename = "@type")]
+    alert_type: String,
+    event: String,
+    instruction: String,
+}
+
+fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> anyhow::Result<String> {
+    let mut output = String::new();
+    let serializer = quick_xml::se::Serializer::with_root(&mut output, Some(tag))?;
+    value.serialize(serializer)?;
+    Ok(output)
+}
+
+fn browser_takeover_alert_xml() -> anyhow::Result<String> {
+    serialize_xml(
+        "system_alert",
+        &BrowserTakeoverAlertXml {
+            alert_type: "browser_takeover".to_string(),
+            event: "browser_control_returned".to_string(),
+            instruction:
+                "User manually controlled the browser and just returned control. You must re-check current page state before continuing automation."
+                    .to_string(),
+        },
+    )
+}
 
 async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) {
     {
@@ -978,7 +1005,7 @@ async fn resolve_session_context(
     let mut incremental_messages = Vec::new();
     if persist_user_message {
         if take_over_alert_pending(state, &session_id).await {
-            let takeover_alert = BROWSER_TAKEOVER_ALERT_XML.trim().to_string();
+            let takeover_alert = browser_takeover_alert_xml()?;
             manager
                 .append_message(ChatMessage::hidden_context(takeover_alert.clone()))
                 .await

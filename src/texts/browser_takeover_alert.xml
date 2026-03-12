@@ -1,7 +1,0 @@
-<system_alert type="browser_takeover">
-  <event>browser_control_returned</event>
-  <instruction>
-    User manually controlled the browser and just returned control.
-    You must re-check current page state before continuing automation.
-  </instruction>
-</system_alert>
