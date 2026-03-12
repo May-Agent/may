@@ -8,6 +8,50 @@ pub struct SessionPaths {
     root: PathBuf,
 }
 
+/// Canonical paths for the current May home root.
+#[derive(Debug, Clone)]
+pub struct MayHomePaths {
+    root: PathBuf,
+}
+
+impl MayHomePaths {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join("skills")
+    }
+
+    pub fn subagents_dir(&self) -> PathBuf {
+        self.root.join("subagents")
+    }
+
+    pub fn memory_file(&self) -> PathBuf {
+        self.root.join("MEMORY.md")
+    }
+
+    pub fn workspace_config(&self) -> PathBuf {
+        self.root.join("workspace.toml")
+    }
+
+    pub fn db_file(&self) -> PathBuf {
+        self.root.join("history.db")
+    }
+
+    pub fn session_paths(&self, session_id: &str) -> SessionPaths {
+        SessionPaths::new(self.sessions_dir().join(session_id))
+    }
+}
+
 impl SessionPaths {
     /// Construct layout from an absolute session root directory.
     pub fn new(root: PathBuf) -> Self {
@@ -17,6 +61,11 @@ impl SessionPaths {
     /// Construct layout from the May directory and session id.
     pub fn from_may_dir(may_dir: &Path, session_id: &str) -> Self {
         Self::new(may_dir.join("sessions").join(session_id))
+    }
+
+    /// Construct layout from typed May home paths and session id.
+    pub fn from_home_paths(home_paths: &MayHomePaths, session_id: &str) -> Self {
+        home_paths.session_paths(session_id)
     }
 
     /// Session root directory.

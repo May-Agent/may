@@ -5,7 +5,7 @@ use petname::{Generator, Petnames};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::SessionRuntimeSummary;
+use super::{MayHomePaths, SessionRuntimeSummary};
 use super::store::SandboxResourceLayout;
 use super::{ChatHistory, ChatMessage, ChatMessageStats, MessageRole, SessionStore};
 use crate::bundle::Bundle;
@@ -215,7 +215,8 @@ impl SessionManager {
     /// Create a new SessionManager, initializing ~/.may/ structure if needed.
     pub async fn new() -> Result<Self, SessionError> {
         let may_dir = MayConfig::may_dir().map_err(|_| SessionError::NoHomeDir)?;
-        let sessions_dir = may_dir.join("sessions");
+        let home_paths = MayHomePaths::new(may_dir.clone());
+        let sessions_dir = home_paths.sessions_dir();
 
         // Create directory structure
         fs::create_dir_all(&sessions_dir)?;
@@ -224,15 +225,15 @@ impl SessionManager {
         Bundle::ensure_extracted(&may_dir)?;
 
         // Create MEMORY.md if it doesn't exist
-        let memory_path = may_dir.join("MEMORY.md");
+        let memory_path = home_paths.memory_file();
         if !memory_path.exists() {
             fs::write(&memory_path, "")?;
         }
 
-        let store = SessionStore::new(may_dir.clone(), sessions_dir);
+        let store = SessionStore::new(home_paths.clone());
 
         // Open the database
-        let db_path = may_dir.join("history.db");
+        let db_path = home_paths.db_file();
         let db = ChatDb::open(&db_path).await?;
 
         // Ensure default profiles (daily, work, local) exist and set first as current

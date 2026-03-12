@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 
 use super::{ContainerError, ContainerRuntime};
+use crate::session::MayHomePaths;
 
 const LABEL_MANAGED: &str = "may.managed";
 const LABEL_SPEC_FINGERPRINT: &str = "may.spec-fingerprint";
@@ -210,24 +211,24 @@ impl ContainerManager {
     }
 
     async fn ensure_shared_paths(&self) -> Result<SharedHostPaths, ContainerError> {
-        let may_dir = self.may_dir.clone();
-        let memory_file = may_dir.join("MEMORY.md");
+        let home_paths = MayHomePaths::new(self.may_dir.clone());
+        let memory_file = home_paths.memory_file();
         if tokio::fs::metadata(&memory_file).await.is_err() {
             tokio::fs::write(&memory_file, "").await?;
         }
 
-        let may_dir = tokio::fs::canonicalize(&may_dir).await.map_err(|error| {
+        tokio::fs::canonicalize(home_paths.root()).await.map_err(|error| {
             ContainerError::Bootstrap(format!(
                 "failed to canonicalize may dir {}: {error}",
                 self.may_dir.display()
             ))
         })?;
-        let memory_file = tokio::fs::canonicalize(may_dir.join("MEMORY.md"))
+        let memory_file = tokio::fs::canonicalize(home_paths.memory_file())
             .await
             .map_err(|error| {
                 ContainerError::Bootstrap(format!(
                     "failed to canonicalize global memory file {}: {error}",
-                    may_dir.join("MEMORY.md").display()
+                    home_paths.memory_file().display()
                 ))
             })?;
         Ok(SharedHostPaths { memory_file })

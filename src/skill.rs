@@ -14,6 +14,7 @@ use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::fs_utils::copy_dir_contents_recursive;
+use crate::session::MayHomePaths;
 
 /// Skill management error.
 #[derive(Debug, thiserror::Error)]
@@ -111,7 +112,7 @@ pub struct SkillManager {
 impl SkillManager {
     /// Create a new skill manager.
     pub fn new(may_dir: &Path) -> Self {
-        Self::from_skills_dir(may_dir.join("skills"))
+        Self::from_skills_dir(MayHomePaths::new(may_dir.to_path_buf()).skills_dir())
     }
 
     /// Create a manager rooted at an explicit skills directory.

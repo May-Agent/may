@@ -42,8 +42,8 @@ pub use db::ChatDb;
 pub use mcp::{MayMcpServerConfig, McpConfig, McpManager, McpServerInfo};
 pub use profile::{PinnedItem, ProfileEnvironment, ProfileInfo, ProfileSessions};
 pub use session::{
-    ChatHistory, ChatMessage, MessageRole, Session, SessionId, SessionManager, SessionMetadata,
-    SessionStore, SessionSummary,
+    ChatHistory, ChatMessage, MayHomePaths, MessageRole, Session, SessionId, SessionManager,
+    SessionMetadata, SessionStore, SessionSummary,
 };
 pub use skill::{SkillInfo, SkillManager, SkillSource};
 pub use subagent::{SubagentInfo, SubagentManager};

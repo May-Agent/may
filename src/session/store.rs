@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use futures_lite::StreamExt;
 
-use super::{ChatHistory, ChatHistoryError, SessionPaths};
+use super::{ChatHistory, ChatHistoryError, MayHomePaths, SessionPaths};
 use crate::fs_utils::copy_dir_contents_recursive;
 
 /// Session store error.
@@ -21,7 +21,7 @@ pub enum StoreError {
 /// Handles persistence of sessions to filesystem.
 #[derive(Clone)]
 pub struct SessionStore {
-    may_dir: PathBuf,
+    home_paths: MayHomePaths,
     sessions_dir: PathBuf,
 }
 
@@ -33,9 +33,10 @@ pub enum SandboxResourceLayout {
 
 impl SessionStore {
     /// Create a new session store.
-    pub fn new(may_dir: PathBuf, sessions_dir: PathBuf) -> Self {
+    pub fn new(home_paths: MayHomePaths) -> Self {
+        let sessions_dir = home_paths.sessions_dir();
         Self {
-            may_dir,
+            home_paths,
             sessions_dir,
         }
     }
@@ -94,7 +95,11 @@ impl SessionStore {
         match layout {
             SandboxResourceLayout::Symlinked => {
                 // Create sandbox symlinks to global resources.
-                crate::bundle::Bundle::create_sandbox_symlinks(paths.root(), &self.may_dir).await?;
+                crate::bundle::Bundle::create_sandbox_symlinks(
+                    paths.root(),
+                    self.home_paths.root(),
+                )
+                .await?;
             }
             SandboxResourceLayout::ContainerMountPoints => {
                 Self::ensure_mount_point_dir(paths.root(), "skills").await?;
@@ -198,10 +203,10 @@ impl SessionStore {
     }
 
     async fn seed_session_scoped_resources(&self, paths: &SessionPaths) -> Result<(), StoreError> {
-        Self::copy_dir_contents_if_target_empty(&self.may_dir.join("skills"), &paths.skills_dir())
+        Self::copy_dir_contents_if_target_empty(&self.home_paths.skills_dir(), &paths.skills_dir())
             .await?;
         Self::copy_dir_contents_if_target_empty(
-            &self.may_dir.join("subagents"),
+            &self.home_paths.subagents_dir(),
             &paths.subagents_dir(),
         )
         .await?;
