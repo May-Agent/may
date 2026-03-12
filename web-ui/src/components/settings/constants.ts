@@ -1,5 +1,6 @@
 import { OpenAI, Anthropic, Google } from '@lobehub/icons';
 import type { UiProviderConfig, UiFullConfig } from '@/lib/api';
+import type { TaskTriggerKind, TimeTriggerType } from '@/types';
 
 export type SettingsSection =
   | 'appearance'
@@ -69,11 +70,15 @@ export const PROVIDER_TYPE_LABEL: Record<UiProviderConfig['providerType'], strin
   custom: 'Custom',
 };
 
-export type TaskTriggerKind = 'time';
-export type TimeTriggerType = 'once' | 'cron';
-
 export const TASK_TRIGGER_KINDS: ReadonlyArray<{ value: TaskTriggerKind; label: string }> = [
   { value: 'time', label: 'Time' },
+  { value: 'event', label: 'Event' },
+  { value: 'webhook', label: 'Webhook' },
+];
+
+export const TIME_TRIGGER_TYPES: ReadonlyArray<{ value: TimeTriggerType; label: string }> = [
+  { value: 'once', label: 'Once (UTC)' },
+  { value: 'cron', label: 'Cron (UTC)' },
 ];
 
 export function providerIcon(provider: UiProviderConfig) {

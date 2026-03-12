@@ -132,6 +132,12 @@ pub(crate) struct UiServerState {
     pub(crate) may_dir: PathBuf,
 }
 
+impl UiServerState {
+    pub(crate) async fn db(&self) -> crate::db::ChatDb {
+        self.session_manager.lock().await.db().clone()
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UiQuestionAnswer {

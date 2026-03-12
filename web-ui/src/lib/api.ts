@@ -8,6 +8,7 @@ import type {
   ProfileInfo,
   ProfileSessions,
   FolderInfo,
+  CreateTaskInput,
   ScheduledTask,
   VapidKeyInfo,
   PendingUserMessage,
@@ -1408,18 +1409,7 @@ export async function fetchTasks(): Promise<ScheduledTask[]> {
   return request<ScheduledTask[]>('/api/tasks');
 }
 
-export async function createTask(input: {
-  profileId: string;
-  sessionId?: string;
-  name: string;
-  triggerKind: 'time';
-  triggerType: 'once' | 'cron';
-  cronExpression?: string;
-  runAt?: string;
-  scriptPath?: string;
-  scriptInline?: string;
-  needsNetwork?: boolean;
-}): Promise<ScheduledTask> {
+export async function createTask(input: CreateTaskInput): Promise<ScheduledTask> {
   return request<ScheduledTask>('/api/tasks', {
     method: 'POST',
     headers: JSON_HEADERS,

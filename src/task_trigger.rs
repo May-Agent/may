@@ -1,17 +1,23 @@
+use std::collections::BTreeMap;
 use std::str::FromStr;
+
+use serde::Serialize;
 
 pub const TRIGGER_KIND_TIME: &str = "time";
 pub const TRIGGER_KIND_EVENT: &str = "event";
+pub const TRIGGER_KIND_WEBHOOK: &str = "webhook";
 
 pub const TRIGGER_TYPE_ONCE: &str = "once";
 pub const TRIGGER_TYPE_CRON: &str = "cron";
 
 pub const EVENT_CHAT_TURN_COMPLETED: &str = "chat.turn.completed";
+const WEBHOOK_ROUTE_PREFIX: &str = "/api/tasks/webhook/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskTriggerKind {
     Time,
     Event,
+    Webhook,
 }
 
 impl TaskTriggerKind {
@@ -20,6 +26,45 @@ impl TaskTriggerKind {
         match self {
             Self::Time => TRIGGER_KIND_TIME,
             Self::Event => TRIGGER_KIND_EVENT,
+            Self::Webhook => TRIGGER_KIND_WEBHOOK,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeTriggerType {
+    Once,
+    Cron,
+}
+
+impl TimeTriggerType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => TRIGGER_TYPE_ONCE,
+            Self::Cron => TRIGGER_TYPE_CRON,
+        }
+    }
+}
+
+impl FromStr for TimeTriggerType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let trigger_type = value.trim().to_lowercase();
+        match trigger_type.as_str() {
+            TRIGGER_TYPE_ONCE => Ok(Self::Once),
+            TRIGGER_TYPE_CRON => Ok(Self::Cron),
+            other => Err([
+                "unsupported time trigger_type '",
+                other,
+                "', expected '",
+                TRIGGER_TYPE_ONCE,
+                "' or '",
+                TRIGGER_TYPE_CRON,
+                "'",
+            ]
+            .concat()),
         }
     }
 }
@@ -32,11 +77,164 @@ impl FromStr for TaskTriggerKind {
         match kind.as_str() {
             TRIGGER_KIND_TIME => Ok(Self::Time),
             TRIGGER_KIND_EVENT => Ok(Self::Event),
-            other => Err(format!(
-                "unsupported task trigger_kind '{other}', expected '{TRIGGER_KIND_TIME}' or '{TRIGGER_KIND_EVENT}'"
-            )),
+            TRIGGER_KIND_WEBHOOK => Ok(Self::Webhook),
+            other => Err([
+                "unsupported task trigger_kind '",
+                other,
+                "', expected '",
+                TRIGGER_KIND_TIME,
+                "', '",
+                TRIGGER_KIND_EVENT,
+                "', or '",
+                TRIGGER_KIND_WEBHOOK,
+                "'",
+            ]
+            .concat()),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskTriggerInput<'a> {
+    pub kind: &'a str,
+    pub trigger_type: Option<&'a str>,
+    pub run_at_utc: Option<&'a str>,
+    pub cron_utc: Option<&'a str>,
+    pub event_name: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizedTaskTrigger {
+    kind: TaskTriggerKind,
+    time_trigger_type: Option<TimeTriggerType>,
+    event_name: Option<String>,
+    run_at: Option<String>,
+    cron_expression: Option<String>,
+}
+
+impl NormalizedTaskTrigger {
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        self.kind.as_str()
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> TaskTriggerKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn run_at(&self) -> Option<&str> {
+        self.run_at.as_deref()
+    }
+
+    #[must_use]
+    pub fn cron_expression(&self) -> Option<&str> {
+        self.cron_expression.as_deref()
+    }
+
+    #[must_use]
+    pub fn storage_trigger_type(&self) -> String {
+        match (
+            self.time_trigger_type,
+            self.event_name.as_deref(),
+            self.kind,
+        ) {
+            (Some(trigger_type), None, TaskTriggerKind::Time) => trigger_type.as_str().to_string(),
+            (None, Some(event_name), TaskTriggerKind::Event) => event_name.to_string(),
+            (None, None, TaskTriggerKind::Webhook) => new_webhook_token(),
+            _ => panic!("invalid normalized task trigger invariant"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskWebhookRequest {
+    pub method: String,
+    pub path: String,
+    pub query: Option<String>,
+    pub headers: BTreeMap<String, Vec<String>>,
+    pub body_base64: String,
+    pub body_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_json: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    pub body_size_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskInvocation {
+    Time {
+        trigger_type: String,
+    },
+    Manual,
+    Event {
+        event_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    Webhook {
+        token: String,
+        request: TaskWebhookRequest,
+    },
+}
+
+#[must_use]
+pub fn new_webhook_token() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+#[must_use]
+pub fn webhook_path(token: &str) -> String {
+    [WEBHOOK_ROUTE_PREFIX, token].concat()
+}
+
+pub fn normalize_trigger(input: TaskTriggerInput<'_>) -> Result<NormalizedTaskTrigger, String> {
+    let kind = TaskTriggerKind::from_str(input.kind)?;
+    let trigger_type = normalize_optional(input.trigger_type);
+    let run_at = normalize_optional(input.run_at_utc);
+    let cron_expression = normalize_optional(input.cron_utc);
+    let event_name = normalize_optional(input.event_name);
+
+    match kind {
+        TaskTriggerKind::Time => normalize_time_trigger(trigger_type, run_at, cron_expression),
+        TaskTriggerKind::Event => {
+            normalize_event_trigger(trigger_type, run_at, cron_expression, event_name)
+        }
+        TaskTriggerKind::Webhook => {
+            if trigger_type.is_some()
+                || run_at.is_some()
+                || cron_expression.is_some()
+                || event_name.is_some()
+            {
+                return Err(
+                    "webhook trigger must not set trigger_type, run_at_utc, cron_utc, or event_name"
+                        .to_string(),
+                );
+            }
+            Ok(NormalizedTaskTrigger {
+                kind,
+                time_trigger_type: None,
+                event_name: None,
+                run_at: None,
+                cron_expression: None,
+            })
+        }
+    }
+}
+
+pub fn normalize_utc_timestamp(value: &str) -> Result<String, String> {
+    let timestamp = value.trim();
+    if !timestamp.ends_with('Z') {
+        return Err("timestamp must be an ISO 8601 UTC value ending with 'Z'".to_string());
+    }
+    jiff::Timestamp::from_str(timestamp)
+        .map(|parsed| parsed.to_string())
+        .map_err(|error| ["invalid UTC timestamp: ", error.to_string().as_str()].concat())
 }
 
 pub fn normalize_event_name(value: &str) -> Result<String, String> {
@@ -48,25 +246,115 @@ pub fn normalize_event_name(value: &str) -> Result<String, String> {
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'));
     if !valid {
-        return Err(format!(
-            "invalid event name '{raw}': only [a-z0-9._-] are allowed"
-        ));
+        return Err([
+            "invalid event name '",
+            raw.as_str(),
+            "': only [a-z0-9._-] are allowed",
+        ]
+        .concat());
     }
     Ok(raw)
+}
+
+fn normalize_time_trigger(
+    trigger_type: Option<&str>,
+    run_at: Option<&str>,
+    cron_expression: Option<&str>,
+) -> Result<NormalizedTaskTrigger, String> {
+    if trigger_type.is_none() {
+        return match (run_at, cron_expression) {
+            (Some(run_at), None) => {
+                normalize_time_trigger(Some(TRIGGER_TYPE_ONCE), Some(run_at), None)
+            }
+            (None, Some(cron_expression)) => {
+                normalize_time_trigger(Some(TRIGGER_TYPE_CRON), None, Some(cron_expression))
+            }
+            (Some(_), Some(_)) => {
+                Err("time trigger requires exactly one of run_at_utc or cron_utc".to_string())
+            }
+            (None, None) => {
+                Err("time trigger requires trigger_type or one of run_at_utc/cron_utc".to_string())
+            }
+        };
+    }
+
+    match TimeTriggerType::from_str(trigger_type.expect("trigger_type checked above"))? {
+        TimeTriggerType::Once => {
+            if cron_expression.is_some() {
+                return Err("once trigger must not include cron_utc".to_string());
+            }
+            let run_at = run_at.ok_or_else(|| "once trigger requires run_at_utc".to_string())?;
+            Ok(NormalizedTaskTrigger {
+                kind: TaskTriggerKind::Time,
+                time_trigger_type: Some(TimeTriggerType::Once),
+                event_name: None,
+                run_at: Some(normalize_utc_timestamp(run_at)?),
+                cron_expression: None,
+            })
+        }
+        TimeTriggerType::Cron => {
+            if run_at.is_some() {
+                return Err("cron trigger must not include run_at_utc".to_string());
+            }
+            let cron_expression =
+                cron_expression.ok_or_else(|| "cron trigger requires cron_utc".to_string())?;
+            cron::Schedule::from_str(cron_expression).map_err(|error| {
+                ["invalid cron_utc expression: ", error.to_string().as_str()].concat()
+            })?;
+            Ok(NormalizedTaskTrigger {
+                kind: TaskTriggerKind::Time,
+                time_trigger_type: Some(TimeTriggerType::Cron),
+                event_name: None,
+                run_at: None,
+                cron_expression: Some(cron_expression.to_string()),
+            })
+        }
+    }
+}
+
+fn normalize_event_trigger(
+    trigger_type: Option<&str>,
+    run_at: Option<&str>,
+    cron_expression: Option<&str>,
+    event_name: Option<&str>,
+) -> Result<NormalizedTaskTrigger, String> {
+    if run_at.is_some() || cron_expression.is_some() {
+        return Err("event trigger must not include run_at_utc or cron_utc".to_string());
+    }
+    if trigger_type.is_some() {
+        return Err("trigger_type is only valid when trigger_kind is 'time'".to_string());
+    }
+    let event_name = event_name.ok_or_else(|| "event trigger requires event_name".to_string())?;
+    Ok(NormalizedTaskTrigger {
+        kind: TaskTriggerKind::Event,
+        time_trigger_type: None,
+        event_name: Some(normalize_event_name(event_name)?),
+        run_at: None,
+        cron_expression: None,
+    })
+}
+
+fn normalize_optional(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
-    use super::{TaskTriggerKind, normalize_event_name};
+    use super::{
+        TaskTriggerInput, TaskTriggerKind, TimeTriggerType, normalize_event_name,
+        normalize_trigger, normalize_utc_timestamp, webhook_path,
+    };
 
     #[test]
     fn task_trigger_kind_parses_case_insensitive_values() {
         let time = TaskTriggerKind::from_str(" Time ").expect("time kind should parse");
         let event = TaskTriggerKind::from_str("EVENT").expect("event kind should parse");
+        let webhook = TaskTriggerKind::from_str("webhook").expect("webhook kind should parse");
         assert_eq!(time, TaskTriggerKind::Time);
         assert_eq!(event, TaskTriggerKind::Event);
+        assert_eq!(webhook, TaskTriggerKind::Webhook);
     }
 
     #[test]
@@ -92,5 +380,68 @@ mod tests {
             err.contains("only [a-z0-9._-] are allowed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn webhook_path_uses_public_task_route() {
+        assert_eq!(webhook_path("abc123"), "/api/tasks/webhook/abc123");
+    }
+
+    #[test]
+    fn normalize_trigger_derives_once_from_run_at() {
+        let normalized = normalize_trigger(TaskTriggerInput {
+            kind: "time",
+            trigger_type: None,
+            run_at_utc: Some("2026-03-12T01:02:03Z"),
+            cron_utc: None,
+            event_name: None,
+        })
+        .expect("run_at should normalize");
+        assert_eq!(normalized.kind(), TaskTriggerKind::Time);
+        assert_eq!(
+            normalized.storage_trigger_type(),
+            TimeTriggerType::Once.as_str()
+        );
+        assert_eq!(normalized.run_at(), Some("2026-03-12T01:02:03Z"));
+    }
+
+    #[test]
+    fn normalize_trigger_requires_event_name_field() {
+        let normalized = normalize_trigger(TaskTriggerInput {
+            kind: "event",
+            trigger_type: None,
+            run_at_utc: None,
+            cron_utc: None,
+            event_name: Some("chat.turn.completed"),
+        })
+        .expect("event should normalize");
+        assert_eq!(normalized.kind(), TaskTriggerKind::Event);
+        assert_eq!(normalized.storage_trigger_type(), "chat.turn.completed");
+    }
+
+    #[test]
+    fn normalize_trigger_generates_webhook_token_on_storage() {
+        let normalized = normalize_trigger(TaskTriggerInput {
+            kind: "webhook",
+            trigger_type: None,
+            run_at_utc: None,
+            cron_utc: None,
+            event_name: None,
+        })
+        .expect("webhook should normalize");
+        let token = normalized.storage_trigger_type();
+        assert_eq!(normalized.kind(), TaskTriggerKind::Webhook);
+        assert!(!token.is_empty());
+        assert_eq!(
+            webhook_path(&token),
+            ["/api/tasks/webhook/", token.as_str()].concat()
+        );
+    }
+
+    #[test]
+    fn normalize_utc_timestamp_rejects_non_utc_suffix() {
+        let err = normalize_utc_timestamp("2026-03-12T01:02:03+08:00")
+            .expect_err("non-utc timestamp should fail");
+        assert!(err.contains("ending with 'Z'"), "unexpected error: {err}");
     }
 }

@@ -19,6 +19,7 @@ use crate::session::{
     PendingUserMessage, PersistedAskUserRequest, PersistedPermissionRequest, SessionRuntimeState,
     SessionRuntimeSummary,
 };
+use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 use entity::{
     context_debug_snapshots, folders, messages, notification_mailbox, profile_memories,
     profile_memory_jobs, profiles, push_subscriptions, scheduled_tasks, session_context_snapshots,
@@ -1512,17 +1513,12 @@ impl ChatDb {
     }
 
     async fn max_profile_sort_order(&self) -> Result<i32, ChatDbError> {
-        let row = self
-            .conn
-            .query_one(sea_orm::Statement::from_string(
-                self.conn.get_database_backend(),
-                "SELECT COALESCE(MAX(sort_order), -1) as max_order FROM profiles".to_string(),
-            ))
-            .await?;
-        let max_order = row
-            .and_then(|r| r.try_get_by_index::<i32>(0).ok())
-            .unwrap_or(-1);
-        Ok(max_order)
+        self.query_optional_i32_scalar(sea_orm::Statement::from_sql_and_values(
+            self.conn.get_database_backend(),
+            "SELECT COALESCE(MAX(sort_order), -1) FROM profiles",
+            [],
+        ))
+        .await
     }
 
     // ── Folder CRUD ─────────────────────────────────────────────
@@ -1602,20 +1598,12 @@ impl ChatDb {
     }
 
     async fn max_folder_sort_order(&self, profile_id: &str) -> Result<i32, ChatDbError> {
-        let row = self
-            .conn
-            .query_one(sea_orm::Statement::from_string(
-                self.conn.get_database_backend(),
-                format!(
-                    "SELECT COALESCE(MAX(sort_order), -1) as max_order FROM folders WHERE profile_id = '{}'",
-                    profile_id.replace('\'', "''")
-                ),
-            ))
-            .await?;
-        let max_order = row
-            .and_then(|r| r.try_get_by_index::<i32>(0).ok())
-            .unwrap_or(-1);
-        Ok(max_order)
+        self.query_optional_i32_scalar(sea_orm::Statement::from_sql_and_values(
+            self.conn.get_database_backend(),
+            "SELECT COALESCE(MAX(sort_order), -1) FROM folders WHERE profile_id = ?",
+            [profile_id.into()],
+        ))
+        .await
     }
 
     // ── Session Profile Operations ──────────────────────────────
@@ -1856,20 +1844,12 @@ impl ChatDb {
     }
 
     async fn max_pin_sort_order(&self, profile_id: &str) -> Result<i32, ChatDbError> {
-        let row = self
-            .conn
-            .query_one(sea_orm::Statement::from_string(
-                self.conn.get_database_backend(),
-                format!(
-                    "SELECT COALESCE(MAX(pin_sort_order), -1) FROM sessions WHERE profile_id = '{}' AND pinned = 1",
-                    profile_id.replace('\'', "''")
-                ),
-            ))
-            .await?;
-        let max_order = row
-            .and_then(|r| r.try_get_by_index::<i32>(0).ok())
-            .unwrap_or(-1);
-        Ok(max_order)
+        self.query_optional_i32_scalar(sea_orm::Statement::from_sql_and_values(
+            self.conn.get_database_backend(),
+            "SELECT COALESCE(MAX(pin_sort_order), -1) FROM sessions WHERE profile_id = ? AND pinned = 1",
+            [profile_id.into()],
+        ))
+        .await
     }
 
     // ── Scheduled Task CRUD ─────────────────────────────────
@@ -2018,6 +1998,20 @@ impl ChatDb {
             .all(&self.conn)
             .await?;
         Ok(rows)
+    }
+
+    pub async fn list_tasks_for_webhook(
+        &self,
+        token: &str,
+    ) -> Result<Vec<scheduled_tasks::Model>, ChatDbError> {
+        scheduled_tasks::Entity::find()
+            .filter(scheduled_tasks::Column::Enabled.eq(true))
+            .filter(scheduled_tasks::Column::Approved.eq(true))
+            .filter(scheduled_tasks::Column::TriggerKind.eq(TRIGGER_KIND_WEBHOOK))
+            .filter(scheduled_tasks::Column::TriggerType.eq(token))
+            .all(&self.conn)
+            .await
+            .map_err(Into::into)
     }
 
     // ── Push subscriptions ────────────────────────────────
@@ -2175,6 +2169,16 @@ impl ChatDb {
             .exec(&self.conn)
             .await?;
         Ok(())
+    }
+
+    async fn query_optional_i32_scalar(
+        &self,
+        statement: sea_orm::Statement,
+    ) -> Result<i32, ChatDbError> {
+        let row: Option<sea_orm::QueryResult> = self.conn.query_one(statement).await?;
+        Ok(row
+            .and_then(|query_result| query_result.try_get_by_index::<i32>(0).ok())
+            .unwrap_or(-1))
     }
 }
 
