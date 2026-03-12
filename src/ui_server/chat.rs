@@ -590,7 +590,7 @@ async fn run_agent_loop(
         record_request_log(state, log_base.success(elapsed_ms)).await;
 
         // Post-completion hooks
-        schedule_profile_memory_processing(state, profile_id.as_deref());
+        schedule_profile_memory_processing(state, profile_id.as_deref()).await;
         title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
         enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
         persist_context_snapshot(state, &session_id, &agent).await?;
@@ -718,14 +718,14 @@ async fn persist_context_snapshot(
         .map_err(anyhow::Error::from)
 }
 
-fn schedule_profile_memory_processing(state: &Arc<UiServerState>, profile_id: Option<&str>) {
+async fn schedule_profile_memory_processing(state: &Arc<UiServerState>, profile_id: Option<&str>) {
     let Some(profile_id) = profile_id else {
         return;
     };
     let Some(processor) = state.memory_processor.as_ref() else {
         return;
     };
-    processor.mark_profile_dirty(profile_id);
+    processor.mark_profile_dirty(profile_id).await;
 }
 
 async fn persist_latest_assistant_stats(
