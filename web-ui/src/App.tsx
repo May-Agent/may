@@ -324,7 +324,7 @@ function AppShell() {
         useRuntimeStore.getState().applyRuntimes(
           flattenProfileSessions(profileSessions).map((session) => ({
             sessionId: session.id,
-            runtime: {
+            runtime: session.runtime ?? {
               state: session.runtimeState,
               queuedCount: session.queuedCount,
               pendingImmediate: null,

@@ -161,6 +161,7 @@ export interface SessionSummary {
   contentPreview: string;
   runtimeState: SessionRuntimeState;
   queuedCount: number;
+  runtime?: SessionRuntimeSummaryPayload;
 }
 
 export type SessionRuntimeState =
@@ -179,6 +180,34 @@ export interface PendingUserMessage {
 }
 
 export type PendingUserMessageMode = 'steer' | 'queue';
+
+export interface RuntimePermissionRequest {
+  id: string;
+  mode: 'default' | 'unsafe' | 'ssh';
+  script: string;
+  sessionId?: string;
+}
+
+export interface RuntimeAskUserQuestion {
+  section: string;
+  question: string;
+  option: string[];
+  multiSelect: boolean;
+}
+
+export interface RuntimeAskUserRequest {
+  id: string;
+  questions: RuntimeAskUserQuestion[];
+}
+
+export interface SessionRuntimeSummaryPayload {
+  state: SessionRuntimeState;
+  queuedCount: number;
+  pendingImmediate?: PendingUserMessage | null;
+  queuedMessages?: PendingUserMessage[];
+  waitingPermission?: RuntimePermissionRequest | null;
+  waitingAskUser?: RuntimeAskUserRequest | null;
+}
 
 export type PinnedItem =
   | { type: 'session' } & SessionSummary

@@ -80,7 +80,7 @@ export async function fetchAndApplyProfileSessions(
     useRuntimeStore.getState().applyRuntimes(
       collectProfileSessions(ps).map((session) => ({
         sessionId: session.id,
-        runtime: {
+        runtime: session.runtime ?? {
           state: session.runtimeState,
           queuedCount: session.queuedCount,
           pendingImmediate: null,
