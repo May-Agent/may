@@ -1,9 +1,9 @@
-//! Markdown checklist parser for TODO.md files.
+//! Markdown checklist parser for `tasks.md`.
 //!
 //! Extracts structured checklist items from standard Markdown checkbox syntax
 //! (`- [ ]`, `- [x]`, `* [ ]`, `* [x]`).
 
-/// A parsed TODO.md checklist.
+/// A parsed checklist document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TodoChecklist {
     pub items: Vec<TodoChecklistItem>,

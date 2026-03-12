@@ -10,6 +10,8 @@ use image::ImageFormat as ImgFormat;
 use url::Url;
 use zenwave::ResponseExt;
 
+use crate::session::SessionPaths;
+
 /// Image format.
 #[derive(Debug, Clone, Copy)]
 pub enum ImageFormat {
@@ -141,7 +143,7 @@ impl ImageManager {
     /// Create a new image manager.
     pub fn new(session_dir: &Path) -> Self {
         Self {
-            session_images_dir: session_dir.join("images"),
+            session_images_dir: SessionPaths::new(session_dir.to_path_buf()).images_dir(),
             counter: 0,
         }
     }

@@ -3,6 +3,7 @@
 //! Each session has its own sandbox directory and chat history.
 
 pub(crate) mod history;
+pub mod layout;
 mod manager;
 pub mod runtime;
 mod store;
@@ -10,6 +11,7 @@ mod store;
 pub use history::{
     ChatHistory, ChatHistoryError, ChatMessage, ChatMessageStats, MessageRole, SessionMetadata,
 };
+pub use layout::SessionPaths;
 pub use manager::{
     Session, SessionError, SessionId, SessionManager, SessionSummary, list_summaries_from_db,
 };

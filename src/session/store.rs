@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use futures_lite::StreamExt;
 
-use super::{ChatHistory, ChatHistoryError};
+use super::{ChatHistory, ChatHistoryError, SessionPaths};
 use crate::fs_utils::copy_dir_contents_recursive;
 
 /// Session store error.
@@ -50,14 +50,19 @@ impl SessionStore {
         self.sessions_dir.join(id)
     }
 
+    /// Get typed layout for a session.
+    pub fn session_paths(&self, id: &str) -> SessionPaths {
+        SessionPaths::new(self.session_dir(id))
+    }
+
     /// Get path for a session's chat history.
     pub fn chat_path(&self, id: &str) -> PathBuf {
-        self.session_dir(id).join("chat.txt")
+        self.session_paths(id).chat_backup_path()
     }
 
     /// Get path for a session's images directory.
     pub fn images_dir(&self, id: &str) -> PathBuf {
-        self.session_dir(id).join("images")
+        self.session_paths(id).images_dir()
     }
 
     /// Get path for a session's sandbox directory.
@@ -77,20 +82,24 @@ impl SessionStore {
         id: &str,
         layout: SandboxResourceLayout,
     ) -> Result<(), StoreError> {
-        let session_dir = self.session_dir(id);
-        async_fs::create_dir_all(&session_dir).await?;
-        async_fs::create_dir_all(self.images_dir(id)).await?;
+        let paths = self.session_paths(id);
+        async_fs::create_dir_all(paths.root()).await?;
+        async_fs::create_dir_all(paths.tmp_dir()).await?;
+        async_fs::create_dir_all(paths.data_dir()).await?;
+        async_fs::create_dir_all(paths.files_dir()).await?;
+        async_fs::create_dir_all(paths.images_dir()).await?;
+        async_fs::create_dir_all(paths.outputs_dir()).await?;
+        async_fs::create_dir_all(paths.artifacts_dir()).await?;
 
         match layout {
             SandboxResourceLayout::Symlinked => {
                 // Create sandbox symlinks to global resources.
-                crate::bundle::Bundle::create_sandbox_symlinks(&session_dir, &self.may_dir).await?;
+                crate::bundle::Bundle::create_sandbox_symlinks(paths.root(), &self.may_dir).await?;
             }
             SandboxResourceLayout::ContainerMountPoints => {
-                Self::ensure_mount_point_dir(&session_dir, ".skills").await?;
-                Self::ensure_mount_point_dir(&session_dir, ".subagents").await?;
-                self.seed_session_scoped_resources(&session_dir).await?;
-                async_fs::create_dir_all(session_dir.join("artifacts")).await?;
+                Self::ensure_mount_point_dir(paths.root(), "skills").await?;
+                Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
+                self.seed_session_scoped_resources(&paths).await?;
             }
         }
 
@@ -98,16 +107,21 @@ impl SessionStore {
     }
 
     pub async fn reconcile_container_mount_points(&self, id: &str) -> Result<(), StoreError> {
-        let session_dir = self.session_dir(id);
-        if async_fs::metadata(&session_dir).await.is_err() {
+        let paths = self.session_paths(id);
+        if async_fs::metadata(paths.root()).await.is_err() {
             return Ok(());
         }
-        tracing::debug!(session_id = %id, path = %session_dir.display(), "Reconciling container mount points for session");
+        tracing::debug!(session_id = %id, path = %paths.root().display(), "Reconciling container mount points for session");
 
-        Self::ensure_mount_point_dir(&session_dir, ".skills").await?;
-        Self::ensure_mount_point_dir(&session_dir, ".subagents").await?;
-        self.seed_session_scoped_resources(&session_dir).await?;
-        async_fs::create_dir_all(session_dir.join("artifacts")).await?;
+        async_fs::create_dir_all(paths.tmp_dir()).await?;
+        async_fs::create_dir_all(paths.data_dir()).await?;
+        async_fs::create_dir_all(paths.files_dir()).await?;
+        async_fs::create_dir_all(paths.images_dir()).await?;
+        async_fs::create_dir_all(paths.outputs_dir()).await?;
+        async_fs::create_dir_all(paths.artifacts_dir()).await?;
+        Self::ensure_mount_point_dir(paths.root(), "skills").await?;
+        Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
+        self.seed_session_scoped_resources(&paths).await?;
         Ok(())
     }
 
@@ -183,15 +197,12 @@ impl SessionStore {
         Ok(())
     }
 
-    async fn seed_session_scoped_resources(&self, session_dir: &Path) -> Result<(), StoreError> {
-        Self::copy_dir_contents_if_target_empty(
-            &self.may_dir.join("skills"),
-            &session_dir.join(".skills"),
-        )
-        .await?;
+    async fn seed_session_scoped_resources(&self, paths: &SessionPaths) -> Result<(), StoreError> {
+        Self::copy_dir_contents_if_target_empty(&self.may_dir.join("skills"), &paths.skills_dir())
+            .await?;
         Self::copy_dir_contents_if_target_empty(
             &self.may_dir.join("subagents"),
-            &session_dir.join(".subagents"),
+            &paths.subagents_dir(),
         )
         .await?;
         Ok(())

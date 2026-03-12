@@ -423,7 +423,7 @@ async fn run_agent_loop(
         let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut last_todo_hash: Option<u64> = None;
-        let todo_md_path = agent.sandbox_dir().join("TODO.md");
+        let tasks_md_path = agent.sandbox_dir().join("tasks.md");
 
         sink.on_start(&req.session_id, &assistant_id).await;
 
@@ -495,8 +495,9 @@ async fn run_agent_loop(
                     sink.on_tool_end(&id, &name, arguments.as_deref(), &result)
                         .await;
 
-                    // Check if TODO.md changed after tool execution.
-                    if let Some(event) = check_todo_update(&todo_md_path, &mut last_todo_hash).await
+                    // Check if tasks.md changed after tool execution.
+                    if let Some(event) =
+                        check_tasks_update(&tasks_md_path, &mut last_todo_hash).await
                     {
                         sink.on_todo_update(&event).await;
                     }
@@ -1254,8 +1255,8 @@ async fn prepare_agent_for_request(
     })
 }
 
-/// Read TODO.md and return an SSE event if its content changed since the last check.
-async fn check_todo_update(
+/// Read tasks.md and return an SSE event if its content changed since the last check.
+async fn check_tasks_update(
     path: &std::path::Path,
     last_hash: &mut Option<u64>,
 ) -> Option<SseTodoUpdateEvent> {
@@ -1329,9 +1330,9 @@ async fn handle_register_skills_request(
 ) -> Result<crate::agent::register_tool::RegisterResult, String> {
     let source = resolve_registration_source_path(state, &request.path).await?;
     let session_root = resolve_session_root(state, request.session_id.as_str()).await?;
-    let skills_dir = session_root.join(".skills");
+    let skills_dir = session_root.join("skills");
     let approval_message = format!(
-        "Session {} requests registering skill from {} into this session's .skills. Approve?",
+        "Session {} requests registering skill from {} into this session's skills. Approve?",
         request.session_id,
         source.display()
     );
@@ -1354,9 +1355,9 @@ async fn handle_register_subagents_request(
 ) -> Result<crate::agent::register_tool::RegisterResult, String> {
     let source = resolve_registration_source_path(state, &request.path).await?;
     let session_root = resolve_session_root(state, request.session_id.as_str()).await?;
-    let subagents_dir = session_root.join(".subagents");
+    let subagents_dir = session_root.join("subagents");
     let approval_message = format!(
-        "Session {} requests registering subagent definitions from {} into this session's .subagents. Approve?",
+        "Session {} requests registering subagent definitions from {} into this session's subagents. Approve?",
         request.session_id,
         source.display()
     );

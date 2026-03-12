@@ -267,14 +267,14 @@ impl ContainerManager {
             // Session-scoped skill/subagent roots mapped into container ~/.may.
             Mount {
                 target: Some("/root/.may/skills".to_string()),
-                source: Some(spec.workspace.join(".skills").display().to_string()),
+                source: Some(spec.workspace.join("skills").display().to_string()),
                 typ: Some(MountTypeEnum::BIND),
                 read_only: Some(false),
                 ..Default::default()
             },
             Mount {
                 target: Some("/root/.may/subagents".to_string()),
-                source: Some(spec.workspace.join(".subagents").display().to_string()),
+                source: Some(spec.workspace.join("subagents").display().to_string()),
                 typ: Some(MountTypeEnum::BIND),
                 read_only: Some(false),
                 ..Default::default()
