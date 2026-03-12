@@ -61,6 +61,8 @@ petname = "2"
 hostname = "0.4"
 cron = "0.15"
 chrono = "0.4"
+shell-escape = "0.1"
+arc-swap = "1"
 
 # Web Push notifications
 web-push = "0.11"

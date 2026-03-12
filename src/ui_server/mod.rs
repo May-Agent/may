@@ -152,6 +152,15 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
             .map_err(|e| anyhow!("failed to initialize web push notifications: {e}"))?;
     let notification_manager = Arc::new(notification_manager);
     tracing::info!("Web Push notifications enabled");
+    let mut task_runtime =
+        crate::scheduler::TaskRuntime::load(db_for_archive.clone(), may_dir.clone())
+            .await
+            .context("failed to load task runtime state")?
+            .with_notifier(notification_manager.clone());
+    if let Some(ref manager) = container_manager {
+        task_runtime = task_runtime.with_container_manager(manager.clone());
+    }
+    let task_runtime = Arc::new(task_runtime);
 
     let state = Arc::new(UiServerState {
         session_manager: Mutex::new(session_manager),
@@ -178,6 +187,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         register_subagents_broker,
         location_provider: crate::location::LocationProvider::new(),
         runtime_service,
+        task_runtime: task_runtime.clone(),
         cwd,
         may_dir,
     });
@@ -189,14 +199,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     }
     chat::spawn_register_subagents_worker(state.clone(), register_subagents_queue);
     title_generation::spawn_worker(state.clone(), title_generation_rx);
-    let scheduler =
-        crate::scheduler::TaskScheduler::new(db_for_archive.clone(), state.may_dir.clone());
-    let scheduler = if let Some(ref manager) = state.container_manager {
-        scheduler.with_container_manager(manager.clone())
-    } else {
-        scheduler
-    };
-    let scheduler = scheduler.with_notifier(notification_manager.clone());
+    let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
 
     let state_for_server = state.clone();

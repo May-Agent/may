@@ -12,9 +12,7 @@ use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec};
 
 use crate::agent::MayAgent;
-use crate::db::CreateScheduledTaskParams;
 use crate::notification::{NotificationManager, NotificationPayload};
-use crate::scheduler::TaskScheduler;
 use crate::session::{
     ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage, PersistedAttachment, SessionId,
     SessionRuntimeState,
@@ -820,18 +818,8 @@ fn enqueue_event_triggered_tasks(
     let profile_id = profile_id.map(ToOwned::to_owned);
 
     tokio::spawn(async move {
-        let db = {
-            let manager = state.session_manager.lock().await;
-            manager.db().clone()
-        };
-
-        let mut scheduler = TaskScheduler::new(db, state.may_dir.clone())
-            .with_notifier(state.notification_manager.clone());
-        if let Ok(manager) = state.resolve_container_manager(false).await {
-            scheduler = scheduler.with_container_manager(manager);
-        }
-
-        if let Err(e) = scheduler
+        if let Err(e) = state
+            .task_runtime
             .dispatch_event(
                 EVENT_CHAT_TURN_COMPLETED,
                 profile_id.as_deref(),
@@ -1306,53 +1294,14 @@ async fn handle_task_request(
     state: &Arc<UiServerState>,
     request: crate::agent::task_tool::TaskCreateRequest,
 ) -> Result<crate::agent::task_tool::TaskCreateResult, String> {
-    let normalized = request.normalize()?;
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
-    let session = db
-        .get_session(&normalized.session_id)
-        .await
-        .map_err(|e| format!("failed to load session {}: {e}", normalized.session_id))?
-        .ok_or_else(|| format!("session not found: {}", normalized.session_id))?;
-
-    let profile_id = session.profile_id.ok_or_else(|| {
-        format!(
-            "session {} is not attached to a profile",
-            normalized.session_id
-        )
-    })?;
-
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let model = db
-        .create_scheduled_task(CreateScheduledTaskParams {
-            id: &task_id,
-            profile_id: &profile_id,
-            session_id: Some(normalized.session_id.as_str()),
-            name: &normalized.name,
-            trigger_kind: &normalized.trigger_kind,
-            trigger_type: normalized.trigger.trigger_type.as_str(),
-            cron_expression: normalized.trigger.cron_expression.as_deref(),
-            run_at: normalized.trigger.run_at.as_deref(),
-            script_path: normalized.script.script_path.as_deref(),
-            script_inline: normalized.script.script_inline.as_deref(),
-            needs_network: normalized.needs_network,
-        })
-        .await
-        .map_err(|e| format!("failed to create scheduled task: {e}"))?;
-
-    Ok(crate::agent::task_tool::TaskCreateResult {
-        task_id: model.id,
-        profile_id: model.profile_id,
-        trigger_kind: model.trigger_kind,
-        trigger_type: model.trigger_type,
-        run_at: model.run_at,
-        cron_expression: model.cron_expression,
-        approved: model.approved,
-        enabled: model.enabled,
-    })
+    let result = state
+        .task_runtime
+        .create_task_from_tool_request(request)
+        .await;
+    if result.is_ok() {
+        state.notify_ui_events();
+    }
+    result
 }
 
 async fn handle_notify_request(

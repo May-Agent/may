@@ -265,6 +265,15 @@ pub(super) async fn create_task(
         normalized_run_at.as_deref(),
     )?;
     validate_script_fields(normalized_script_path, normalized_script_inline)?;
+    state
+        .task_runtime
+        .validate_task_script_for_profile(
+            &req.profile_id,
+            normalized_script_path,
+            normalized_script_inline,
+        )
+        .await
+        .map_err(bad_request_error)?;
 
     let model = db
         .create_scheduled_task(CreateScheduledTaskParams {
@@ -282,6 +291,12 @@ pub(super) async fn create_task(
         })
         .await
         .map_err(internal_error)?;
+    state
+        .task_runtime
+        .reload_active_tasks()
+        .await
+        .map_err(internal_error)?;
+    state.notify_ui_events();
 
     Ok(Json(ScheduledTaskResponse::from_model(model)))
 }
@@ -360,6 +375,15 @@ pub(super) async fn update_task(
         .map(ToString::to_string)
         .or_else(|| current.script_inline.clone());
     validate_script_fields(next_script_path.as_deref(), next_script_inline.as_deref())?;
+    state
+        .task_runtime
+        .validate_task_script_for_profile(
+            &current.profile_id,
+            next_script_path.as_deref(),
+            next_script_inline.as_deref(),
+        )
+        .await
+        .map_err(bad_request_error)?;
 
     let normalized_script_path_update = req
         .script_path
@@ -406,6 +430,12 @@ pub(super) async fn update_task(
     )
     .await
     .map_err(internal_error)?;
+    state
+        .task_runtime
+        .reload_active_tasks()
+        .await
+        .map_err(internal_error)?;
+    state.notify_ui_events();
 
     let model = db
         .get_scheduled_task(&id)
@@ -430,6 +460,12 @@ pub(super) async fn delete_task(
     db.delete_scheduled_task(&id)
         .await
         .map_err(internal_error)?;
+    state
+        .task_runtime
+        .reload_active_tasks()
+        .await
+        .map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
 
@@ -447,6 +483,12 @@ pub(super) async fn approve_task(
     db.approve_scheduled_task(&id)
         .await
         .map_err(internal_error)?;
+    state
+        .task_runtime
+        .reload_active_tasks()
+        .await
+        .map_err(internal_error)?;
+    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
 
@@ -467,18 +509,10 @@ pub(super) async fn run_task(
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Task not found"))?;
 
-    let may_dir = state.may_dir.clone();
-    let state_for_task = state.clone();
-    let notification_manager = state.notification_manager.clone();
-
     // Execute inline
+    let task_runtime = state.task_runtime.clone();
     tokio::spawn(async move {
-        let mut scheduler =
-            crate::scheduler::TaskScheduler::new(db, may_dir).with_notifier(notification_manager);
-        if let Ok(manager) = state_for_task.resolve_container_manager(false).await {
-            scheduler = scheduler.with_container_manager(manager);
-        }
-        scheduler.execute_task_by_model(&task).await;
+        task_runtime.execute_task_by_model(&task).await;
     });
 
     Ok(Json(super::types::TaskTriggerResponse {
