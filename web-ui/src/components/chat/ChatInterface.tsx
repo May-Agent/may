@@ -992,7 +992,11 @@ export function ChatInterface({
     const targetRuntime = options?.sessionIdHint
       ? useRuntimeStore.getState().sessions[options.sessionIdHint]
       : runtimeSession;
-    const targetGenerating = targetRuntime?.state === 'running';
+    const targetGenerating =
+      !!targetRuntime &&
+      (targetRuntime.state !== 'idle'
+        || targetRuntime.pendingImmediate != null
+        || (targetRuntime.queuedMessages?.length ?? 0) > 0);
     const deliveryMode = options?.deliveryMode ?? "steer";
 
     if (targetGenerating) {
@@ -2468,9 +2472,7 @@ export function ChatInterface({
                               {msg.attachments.length} attachment{msg.attachments.length > 1 ? "s" : ""}
                             </span>
                             <span className="queued-state-pill inline-flex items-center gap-1 rounded-full px-1.5 py-[1px] text-zinc-200">
-                              {currentSessionId && runtimeSession?.pendingImmediate && i === 0
-                                ? "steer"
-                                : "queued"}
+                              {msg.deliveryMode === "steer" ? "steer" : "queued"}
                             </span>
                           </div>
                         </div>

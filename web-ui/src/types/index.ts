@@ -102,6 +102,7 @@ export interface Session {
   lastModified: string;
   preview: string;
   messages: Message[];
+  profileId?: string | null;
   projectId?: string;
   model: string;
   reasoningEffort?: string;
@@ -167,9 +168,7 @@ export type SessionRuntimeState =
   | 'running'
   | 'waiting_permission'
   | 'waiting_ask_user'
-  | 'waiting_terminal_input'
-  | 'pending_immediate'
-  | 'queued';
+  | 'waiting_terminal_input';
 
 export interface PendingUserMessage {
   content: string;

@@ -139,13 +139,13 @@ function sessionStatusLabel(state: SessionRuntimeState | undefined, queuedCount:
       return 'Waiting user';
     case 'waiting_terminal_input':
       return 'Waiting input';
-    case 'pending_immediate':
-      return 'Pending send';
-    case 'queued':
-      return queuedCount && queuedCount > 0 ? `Queued ${queuedCount}` : 'Queued';
     default:
-      return null;
+      return (queuedCount ?? 0) > 0 ? `Queued ${queuedCount}` : null;
   }
+}
+
+function isActiveRuntimeState(state: SessionRuntimeState | undefined): boolean {
+  return state !== undefined && state !== 'idle';
 }
 
 // ── DnD types and helpers ────────────────────────────────
@@ -193,6 +193,8 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
   const sessionId = sourceData.session.id;
   const sourceZone = sourceData.zone;
   const store = useStore.getState();
+  const runtime = useRuntimeStore.getState().sessions[sessionId];
+  const runtimeState = runtime?.state ?? sourceData.session.runtimeState;
 
   // Dropped on a folder → move into folder (pin if needed)
   if (targetId.startsWith('folder-')) {
@@ -226,6 +228,7 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
 
   // Dropped on archive zone
   if (targetId === 'archive-zone' && sourceZone !== 'archive') {
+    if (isActiveRuntimeState(runtimeState)) return;
     if (sourceData.folderId) await store.moveSessionToFolder(sessionId, null);
     if (sourceZone === 'pinned') await store.unpinSession(sessionId);
     await store.archiveSession(sessionId);

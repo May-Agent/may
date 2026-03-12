@@ -10,26 +10,14 @@ use zenwave::ResponseExt;
 
 const IPINFO_URL: &str = "https://ipinfo.io/json";
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
-const LOCATION_TEMPLATE: &str = include_str!("../templates/location_context.xml");
 
 /// Approximate geographic location derived from IP.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct LocationInfo {
     pub city: String,
     pub region: String,
     pub country: String,
     pub timezone: String,
-}
-
-impl LocationInfo {
-    /// Format as XML context string for agent injection.
-    pub fn to_context_string(&self) -> String {
-        LOCATION_TEMPLATE
-            .replace("{{ city }}", &self.city)
-            .replace("{{ region }}", &self.region)
-            .replace("{{ country }}", &self.country)
-            .replace("{{ timezone }}", &self.timezone)
-    }
 }
 
 /// Cached location provider with automatic refresh.

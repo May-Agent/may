@@ -16,24 +16,30 @@ pub(super) async fn respond_permission_request(
     Json(req): Json<PermissionRespondRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
-    // Get session_id from the target pending request before responding.
-    let session_id = state
-        .permission_approver
-        .session_id_for_request(&req.id)
-        .ok_or_else(|| bad_request_error("permission request missing session id"))?;
+    let pending = state
+        .db()
+        .await
+        .find_pending_permission_request(&req.id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("permission request not found or already resolved"))?;
+    let session_id = pending.session_id;
 
     let responded = state.permission_approver.respond(&req.id, req.approved);
-    if !responded {
-        return Err(bad_request_error(
-            "permission request not found or already resolved",
-        ));
-    }
 
     let runtime = state
         .runtime_service
         .set_waiting_permission(&session_id, None)
         .await
         .map_err(internal_error)?;
+    if !responded {
+        state
+            .runtime_service
+            .clear_running_if_needed(&session_id)
+            .await
+            .map_err(internal_error)?;
+        tracing::warn!(request_id = %req.id, session_id = %session_id, "permission response arrived without a live waiter");
+    }
 
     let data = PermissionResponseData {
         id: req.id.clone(),
@@ -50,11 +56,14 @@ pub(super) async fn respond_ask_user_request(
     Json(req): Json<AskUserRespondRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
-    // Capture session_id from the pending request before responding
-    let session_id = state
-        .ask_user_approver
-        .get_session_id(&req.id)
-        .ok_or_else(|| bad_request_error("ask_user request missing session id"))?;
+    let pending = state
+        .db()
+        .await
+        .find_pending_ask_user_request(&req.id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("ask_user request not found or already resolved"))?;
+    let session_id = pending.session_id;
 
     let answers = req
         .answers
@@ -66,17 +75,20 @@ pub(super) async fn respond_ask_user_request(
         .collect::<Vec<_>>();
 
     let responded = state.ask_user_approver.respond(&req.id, answers.clone());
-    if !responded {
-        return Err(bad_request_error(
-            "ask_user request not found or already resolved",
-        ));
-    }
 
     let runtime = state
         .runtime_service
         .set_waiting_ask_user(&session_id, None)
         .await
         .map_err(internal_error)?;
+    if !responded {
+        state
+            .runtime_service
+            .clear_running_if_needed(&session_id)
+            .await
+            .map_err(internal_error)?;
+        tracing::warn!(request_id = %req.id, session_id = %session_id, "ask-user response arrived without a live waiter");
+    }
 
     let answers_json = serde_json::to_value(&answers).map_err(internal_error)?;
     let data = AskUserResponseData {

@@ -6,7 +6,10 @@ use aither_agent::sandbox::builtin::AskCommand;
 use aither_agent::specialized::{SubagentFileMount, SubagentTool};
 use aither_agent::webfetch::WebFetchTool;
 use aither_agent::websearch::WebSearchTool;
-use aither_agent::{Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, BrowserBackend};
+use aither_agent::{
+    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, BrowserBackend, CompactResult,
+    HCons, Hook, TurnBoundaryAction, TurnBoundaryContext,
+};
 use aither_cloud::{
     CloudProvider, claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI,
 };
@@ -14,7 +17,7 @@ use aither_core::image::{ImageGenerator, Prompt, Size};
 use aither_core::llm::{Message as LlmMessage, Tool, ToolOutput};
 use aither_sandbox::{
     BashMode, BashTool, ContainerExecHandle, ShellRuntimeAvailability, SshServer,
-    permission::{NoopPermissionHandler, PermissionError},
+    permission::{NoopPermissionHandler, PermissionError, PermissionHandler},
 };
 use executor_core::DefaultExecutor;
 use futures_lite::{Stream, StreamExt};
@@ -28,7 +31,8 @@ use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
 use crate::copilot::clear_copilot_credentials;
-use crate::session::{SessionId, SessionPaths};
+use crate::live_response::LiveResponseRegistry;
+use crate::session::{MessageRole, SessionId, SessionPaths};
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
@@ -225,7 +229,7 @@ pub struct PermissionRequest {
 
 #[derive(Debug, Clone)]
 pub struct PermissionApprover {
-    inner: std::sync::Arc<aither_agent::tool_request::RequestApprover<PermissionRequest, bool>>,
+    live_responses: Arc<LiveResponseRegistry<bool>>,
     session_id: Option<String>,
     runtime_db: Option<crate::db::ChatDb>,
     ui_events_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
@@ -234,7 +238,7 @@ pub struct PermissionApprover {
 impl PermissionApprover {
     pub fn new() -> Self {
         Self {
-            inner: std::sync::Arc::new(aither_agent::tool_request::RequestApprover::new()),
+            live_responses: Arc::new(LiveResponseRegistry::new()),
             session_id: None,
             runtime_db: None,
             ui_events_notify: None,
@@ -243,7 +247,7 @@ impl PermissionApprover {
 
     pub fn for_session(&self, session_id: impl Into<String>) -> Self {
         Self {
-            inner: self.inner.clone(),
+            live_responses: self.live_responses.clone(),
             session_id: Some(session_id.into()),
             runtime_db: self.runtime_db.clone(),
             ui_events_notify: self.ui_events_notify.clone(),
@@ -281,52 +285,183 @@ impl PermissionApprover {
         }
     }
 
+    fn history_mode(mode: BashMode) -> &'static str {
+        match mode {
+            BashMode::Sandboxed => "sandboxed",
+            BashMode::Network => "network",
+            BashMode::Unsafe => "unsafe",
+        }
+    }
+
+    async fn append_request_history(
+        db: &crate::db::ChatDb,
+        session_id: &str,
+        request_id: &str,
+        mode: BashMode,
+        script: &str,
+    ) -> Result<(), PermissionError> {
+        let content = serde_json::to_string(&crate::session::history::PermissionRequestData {
+            id: request_id.to_string(),
+            mode: Self::history_mode(mode).to_string(),
+            script: script.to_string(),
+        })
+        .map_err(anyhow::Error::from)
+        .map_err(PermissionError::Internal)?;
+
+        db.append_message(
+            session_id,
+            MessageRole::PermissionRequest,
+            &content,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(PermissionError::Internal)?;
+        Ok(())
+    }
+
     pub async fn request_and_wait(
         &self,
         mode: BashMode,
         script: String,
     ) -> Result<bool, PermissionError> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Err(PermissionError::Internal(anyhow::anyhow!(
+                "permission approval requires a bound session id"
+            )));
+        };
+
+        if mode == BashMode::Network
+            && let Some(db) = &self.runtime_db
+            && db
+                .session_has_approved_permission_mode(&session_id, Self::history_mode(mode))
+                .await
+                .map_err(anyhow::Error::from)
+                .map_err(PermissionError::Internal)?
+        {
+            return Ok(true);
+        }
+
         let payload = PermissionRequest {
             mode: mode.into(),
             script,
-            session_id: self.session_id.clone(),
+            session_id: Some(session_id.clone()),
         };
-        let (id, rx) = self.inner.enqueue(payload.clone());
-        if let Some(session_id) = payload.session_id.clone() {
-            if let Some(db) = self.runtime_db.clone() {
-                if let Err(error) = db
-                    .set_waiting_permission(&session_id, Some(Self::persisted_request(id, payload)))
-                    .await
-                {
-                    tracing::warn!(session_id = %session_id, error = %error, "failed to persist permission runtime state");
-                } else {
-                    self.notify_ui_events();
-                }
-            }
-        } else {
-            self.notify_ui_events();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let rx = self.live_responses.open(request_id.clone());
+
+        if let Some(db) = self.runtime_db.clone() {
+            db.set_waiting_permission(
+                &session_id,
+                Some(Self::persisted_request(request_id.clone(), payload.clone())),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)?;
+            Self::append_request_history(&db, &session_id, &request_id, mode, &payload.script)
+                .await?;
         }
+
+        self.notify_ui_events();
+
         rx.recv().await.map_err(|_| PermissionError::Interrupted)
     }
 
     pub fn respond(&self, request_id: &str, approved: bool) -> bool {
-        let responded = self.inner.respond(request_id, approved);
+        let responded = self.live_responses.resolve(request_id, approved);
         if responded {
             self.notify_ui_events();
         }
         responded
-    }
-
-    pub fn session_id_for_request(&self, request_id: &str) -> Option<String> {
-        self.inner
-            .get_payload(request_id)
-            .and_then(|p| p.session_id)
     }
 }
 
 impl Default for PermissionApprover {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl PermissionHandler for PermissionApprover {
+    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
+        match mode {
+            BashMode::Sandboxed => Ok(true),
+            BashMode::Network | BashMode::Unsafe => {
+                let approved = self.request_and_wait(mode, script.to_string()).await?;
+                if approved {
+                    Ok(true)
+                } else {
+                    Err(PermissionError::Denied(
+                        [mode.description(), " mode denied for script"].concat(),
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MayPermissionHandler {
+    approver: Option<PermissionApprover>,
+}
+
+impl MayPermissionHandler {
+    const fn new(approver: Option<PermissionApprover>) -> Self {
+        Self { approver }
+    }
+}
+
+impl PermissionHandler for MayPermissionHandler {
+    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
+        match &self.approver {
+            Some(approver) => approver.check(mode, script).await,
+            None => NoopPermissionHandler.check(mode, script).await,
+        }
+    }
+
+    async fn check_domain(&self, domain: &str, port: u16) -> bool {
+        match &self.approver {
+            Some(approver) => approver.check_domain(domain, port).await,
+            None => NoopPermissionHandler.check_domain(domain, port).await,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSteerHook {
+    db: Option<crate::db::ChatDb>,
+    session_id: String,
+}
+
+impl PendingSteerHook {
+    fn new(db: Option<crate::db::ChatDb>, session_id: &SessionId) -> Self {
+        Self {
+            db,
+            session_id: session_id.as_str().to_string(),
+        }
+    }
+}
+
+impl Hook for PendingSteerHook {
+    async fn on_turn_boundary(&self, _ctx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
+        let Some(db) = &self.db else {
+            return TurnBoundaryAction::Continue;
+        };
+        let Ok(runtime) = db.get_session_runtime(&self.session_id).await else {
+            tracing::warn!(session_id = %self.session_id, "failed to inspect runtime for steer boundary");
+            return TurnBoundaryAction::Continue;
+        };
+        if runtime.is_some_and(|summary| summary.has_pending_immediate()) {
+            TurnBoundaryAction::EndTurn
+        } else {
+            TurnBoundaryAction::Continue
+        }
     }
 }
 
@@ -543,7 +678,7 @@ fn resolve_image_generator_config(may_config: &MayConfig) -> Option<ImageGenerat
 
 /// The May agent.
 pub struct MayAgent {
-    inner: Agent<CloudProvider, CloudProvider, CloudProvider, ()>,
+    inner: Agent<CloudProvider, CloudProvider, CloudProvider, HCons<PendingSteerHook, ()>>,
     session_id: SessionId,
     sandbox_dir: PathBuf,
     provider_id: String,
@@ -560,10 +695,13 @@ impl MayAgent {
         let executor = DefaultExecutor;
 
         // Create bash tool in sandbox dir (BashTool creates its own working directory inside)
-        let bash_tool: BashTool<NoopPermissionHandler, DefaultExecutor> =
-            BashTool::new_exact(&config.sandbox_dir, NoopPermissionHandler, executor)
-                .await
-                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
+        let bash_tool: BashTool<MayPermissionHandler, DefaultExecutor> = BashTool::new_exact(
+            &config.sandbox_dir,
+            MayPermissionHandler::new(config.permission_approver.clone()),
+            executor,
+        )
+        .await
+        .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
 
         // Create workspace with permissions (only used for local environment context)
         let workspace = MayWorkspace::new(
@@ -625,6 +763,13 @@ impl MayAgent {
             config.register_subagents_broker,
         );
         let subagent_tool = SubagentTool::new(subagent_llm).with_builtins();
+        let pending_steer_hook = PendingSteerHook::new(
+            config
+                .permission_approver
+                .as_ref()
+                .and_then(|approver| approver.runtime_db.clone()),
+            &config.session_id,
+        );
 
         let transcript_file = session_paths.transcript_path();
         let transcript_path = transcript_file.display().to_string();
@@ -665,7 +810,8 @@ impl MayAgent {
             .tool(imagine)
             .tool(notify_tool)
             .tool(register_skills_tool)
-            .tool(register_subagents_tool);
+            .tool(register_subagents_tool)
+            .hook(pending_steer_hook);
         if !is_container {
             builder = builder.tool(request_workspace);
         }
@@ -709,9 +855,7 @@ impl MayAgent {
         }
 
         if let Some(ref location) = config.location {
-            builder = builder.system(LocationContext {
-                content: location.to_context_string(),
-            });
+            builder = builder.system(build_location_context(location));
         }
 
         // Environment-specific configuration
@@ -996,15 +1140,19 @@ impl MayAgent {
         self.model_context_window
     }
 
-    /// Get mutable reference to the inner agent.
-    pub(crate) fn inner_mut(
-        &mut self,
-    ) -> &mut Agent<CloudProvider, CloudProvider, CloudProvider, ()> {
-        &mut self.inner
-    }
-
     pub(crate) fn export_context_json(&self) -> Result<String, serde_json::Error> {
         self.inner.export_context_json()
+    }
+
+    pub(crate) fn push_message(&mut self, message: aither_core::llm::Message) {
+        self.inner.push_message(message);
+    }
+
+    pub(crate) async fn compact(
+        &mut self,
+        focus: Option<&str>,
+    ) -> Result<Option<CompactResult>, AgentError> {
+        self.inner.compact(focus).await
     }
 
     pub(crate) async fn snapshot_context_window(&mut self) -> aither_agent::ContextWindowSnapshot {
@@ -1329,8 +1477,10 @@ struct ProfileMemories {
 
 #[derive(serde::Serialize)]
 struct LocationContext {
-    #[serde(rename = "$text")]
-    content: String,
+    city: String,
+    region: String,
+    country: String,
+    timezone: String,
 }
 
 #[derive(serde::Serialize)]
@@ -1361,6 +1511,15 @@ fn build_workspace_context(workspace: &MayWorkspace) -> Workspace {
             .iter()
             .map(WorkspaceDirEntry::from)
             .collect(),
+    }
+}
+
+fn build_location_context(location: &crate::location::LocationInfo) -> LocationContext {
+    LocationContext {
+        city: location.city.clone(),
+        region: location.region.clone(),
+        country: location.country.clone(),
+        timezone: location.timezone.clone(),
     }
 }
 

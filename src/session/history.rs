@@ -89,6 +89,13 @@ pub enum MessageRole {
     AskUserResponse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionSummaryUpdate {
+    pub(crate) touch_updated_at: bool,
+    pub(crate) update_preview: bool,
+    pub(crate) increment_message_count: bool,
+}
+
 impl MessageRole {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -101,6 +108,27 @@ impl MessageRole {
             Self::PermissionResponse => "permission_response",
             Self::AskUserRequest => "ask_user_request",
             Self::AskUserResponse => "ask_user_response",
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn session_summary_update(&self) -> SessionSummaryUpdate {
+        match self {
+            Self::User | Self::Assistant | Self::System => SessionSummaryUpdate {
+                touch_updated_at: true,
+                update_preview: true,
+                increment_message_count: true,
+            },
+            Self::HiddenContext
+            | Self::Tool
+            | Self::PermissionRequest
+            | Self::PermissionResponse
+            | Self::AskUserRequest
+            | Self::AskUserResponse => SessionSummaryUpdate {
+                touch_updated_at: true,
+                update_preview: false,
+                increment_message_count: false,
+            },
         }
     }
 

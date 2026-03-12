@@ -19,7 +19,7 @@ export interface SessionsSlice {
   loaded: boolean;
 
   loadInitialData: () => Promise<void>;
-  createSession: (model?: string) => Promise<string>;
+  createSession: (model?: string, profileIdOverride?: string | null) => Promise<string>;
   setCurrentSession: (sessionId: string | null) => void;
   addMessage: (
     sessionId: string,
@@ -136,8 +136,8 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
     }
   },
 
-  createSession: async (model) => {
-    const profileId = get().currentProfileId;
+  createSession: async (model, profileIdOverride) => {
+    const profileId = profileIdOverride ?? get().currentProfileId;
     const blockedReason = get().profileAccessBlockedReason;
     const backendUnavailableReason = get().backendUnavailableReason;
     if (backendUnavailableReason) {

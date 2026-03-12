@@ -1,5 +1,7 @@
 //! Persisted session runtime state and server-owned pending messages.
 
+use crate::xml_fragment::XmlFragment;
+
 /// Persisted runtime state for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -9,8 +11,6 @@ pub enum SessionRuntimeState {
     WaitingPermission,
     WaitingAskUser,
     WaitingTerminalInput,
-    PendingImmediate,
-    Queued,
 }
 
 impl SessionRuntimeState {
@@ -23,8 +23,6 @@ impl SessionRuntimeState {
             Self::WaitingPermission => "waiting_permission",
             Self::WaitingAskUser => "waiting_ask_user",
             Self::WaitingTerminalInput => "waiting_terminal_input",
-            Self::PendingImmediate => "pending_immediate",
-            Self::Queued => "queued",
         }
     }
 
@@ -51,8 +49,6 @@ impl core::str::FromStr for SessionRuntimeState {
             "waiting_permission" => Ok(Self::WaitingPermission),
             "waiting_ask_user" => Ok(Self::WaitingAskUser),
             "waiting_terminal_input" => Ok(Self::WaitingTerminalInput),
-            "pending_immediate" => Ok(Self::PendingImmediate),
-            "queued" => Ok(Self::Queued),
             other => Err(format!("unknown session runtime state: {other}")),
         }
     }
@@ -66,7 +62,7 @@ pub struct PendingUserMessage {
     #[serde(default)]
     pub attachments: Vec<PersistedAttachment>,
     #[serde(default)]
-    pub hidden_context_xml: Option<String>,
+    pub hidden_context_xml: Option<XmlFragment>,
     pub created_at: String,
     pub delivery_mode: PendingUserMessageMode,
 }
@@ -157,22 +153,46 @@ pub struct PersistedPermissionRequest {
 }
 
 impl SessionRuntimeSummary {
-    /// Recompute the authoritative state from queued/pending/waiting payloads.
+    /// Keep overflow steer messages ahead of regular queued work.
+    pub fn push_overflow_steer(&mut self, message: PendingUserMessage) {
+        self.queued_messages.insert(0, message);
+    }
+
+    /// Recompute derived runtime fields from persisted payloads.
     pub fn normalize_state(&mut self) {
-        self.queued_count = self.queued_messages.len();
+        self.queued_count =
+            self.queued_messages.len() + usize::from(self.pending_immediate.is_some());
         self.state = if self.waiting_permission.is_some() {
             SessionRuntimeState::WaitingPermission
         } else if self.waiting_ask_user.is_some() {
             SessionRuntimeState::WaitingAskUser
-        } else if self.pending_immediate.is_some() {
-            SessionRuntimeState::PendingImmediate
-        } else if !self.queued_messages.is_empty() {
-            SessionRuntimeState::Queued
+        } else if matches!(
+            self.state,
+            SessionRuntimeState::WaitingPermission | SessionRuntimeState::WaitingAskUser
+        ) {
+            SessionRuntimeState::Idle
+        } else if self.state == SessionRuntimeState::WaitingTerminalInput {
+            SessionRuntimeState::WaitingTerminalInput
         } else if self.state == SessionRuntimeState::Running {
             SessionRuntimeState::Running
         } else {
             SessionRuntimeState::Idle
         };
+    }
+
+    #[must_use]
+    pub const fn has_pending_immediate(&self) -> bool {
+        self.pending_immediate.is_some()
+    }
+
+    #[must_use]
+    pub fn has_pending_messages(&self) -> bool {
+        self.pending_immediate.is_some() || !self.queued_messages.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.state.is_active() || self.has_pending_messages()
     }
 }
 

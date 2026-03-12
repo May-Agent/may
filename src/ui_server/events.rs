@@ -14,9 +14,8 @@ use super::helpers::send_event;
 use super::state::UiServerState;
 use super::types::{
     ConfigEventPayload, NotificationMailboxEntryResponse, NotificationMailboxResponse,
-    ProfileSessionsEventPayload, RequestLogsResponse,
-    SessionRuntimeEventPayload, SessionRuntimeSnapshotItem, SessionRuntimesEventPayload,
-    SseHeartbeat,
+    ProfileSessionsEventPayload, RequestLogsResponse, SessionRuntimeEventPayload,
+    SessionRuntimeSnapshotItem, SessionRuntimesEventPayload, SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -260,7 +259,12 @@ async fn emit_notification_mailbox_if_changed(
     sender: &skyzen::responder::sse::Sender,
     last_sig: &mut String,
 ) -> bool {
-    let items = match state.db().await.list_notification_mailbox_entries(100).await {
+    let items = match state
+        .db()
+        .await
+        .list_notification_mailbox_entries(100)
+        .await
+    {
         Ok(items) => items
             .into_iter()
             .map(NotificationMailboxEntryResponse::from)

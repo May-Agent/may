@@ -685,11 +685,19 @@ fn build_sql_filter(args: &SessionArgs) -> Option<String> {
     let mut filters = Vec::new();
 
     if let Some(session_id) = &args.session_id {
-        filters.push(binary_sql_expr("session_id", BinaryOperator::Eq, session_id));
+        filters.push(binary_sql_expr(
+            "session_id",
+            BinaryOperator::Eq,
+            session_id,
+        ));
     }
 
     if let Some(excluded) = &args.exclude_session_id {
-        filters.push(binary_sql_expr("session_id", BinaryOperator::NotEq, excluded));
+        filters.push(binary_sql_expr(
+            "session_id",
+            BinaryOperator::NotEq,
+            excluded,
+        ));
     }
 
     if let Some(model) = &args.model {
