@@ -73,9 +73,12 @@ export function ContextInspector({
     snapshotForCurrentSession
       ? buildContextRoleTokenBreakdown(snapshotForCurrentSession, promptTokens)
       : null;
-  const messageCount = snapshotForCurrentSession
-    ? snapshotForCurrentSession.assembledMessages.length
-    : 0;
+  const effectiveWindowSnapshot = snapshotForCurrentSession?.windowSnapshot;
+  const displayedMessages =
+    effectiveWindowSnapshot?.assembledMessages ??
+    snapshotForCurrentSession?.assembledMessages ??
+    [];
+  const messageCount = displayedMessages.length;
 
   const loadSnapshot = useCallback(async (): Promise<ContextDebugSnapshotLoadResult> => {
     if (!currentSessionId) {
@@ -247,7 +250,7 @@ export function ContextInspector({
             <DialogHeader className="border-b px-5 py-4 text-left">
               <DialogTitle>Context Inspector</DialogTitle>
               <DialogDescription>
-                Exact context payload plus role-level message/token breakdown.
+                Exact context payload plus role-level message/token breakdown and current assembled window state.
               </DialogDescription>
             </DialogHeader>
             {loading ? (
@@ -280,8 +283,10 @@ export function ContextInspector({
                     <div className="font-medium">{messageCount}</div>
                   </div>
                   <div className="rounded-lg border bg-muted/30 px-3 py-2">
-                    <div className="text-[11px] uppercase text-muted-foreground">Prompt tokens</div>
-                    <div className="font-medium">{roleTokenBreakdown?.total ?? "-"}</div>
+                    <div className="text-[11px] uppercase text-muted-foreground">Window phase</div>
+                    <div className="font-medium">
+                      {effectiveWindowSnapshot?.phase ?? "request_preview"}
+                    </div>
                   </div>
                 </div>
                 <div className="grid grid-cols-1 gap-3 border-b px-4 py-3 text-xs md:grid-cols-2">
@@ -319,10 +324,21 @@ export function ContextInspector({
                     )}
                   </div>
                   <div className="rounded-lg border p-3">
-                    <div className="mb-2 text-sm font-medium">Prompt</div>
-                    <pre className="max-h-28 overflow-auto whitespace-pre-wrap rounded border bg-muted/30 p-2 font-mono text-[11px] leading-4">
-                      {snapshotForCurrentSession.prompt}
-                    </pre>
+                    <div className="mb-2 text-sm font-medium">Window metrics</div>
+                    {effectiveWindowSnapshot ? (
+                      <div className="space-y-1 text-[11px]">
+                        <div>usage={effectiveWindowSnapshot.metrics.usageFraction.toFixed(3)}</div>
+                        <div>effective window={effectiveWindowSnapshot.metrics.effectiveContextWindow}</div>
+                        <div>selected model window={effectiveWindowSnapshot.metrics.selectedModelContextWindow ?? "-"}</div>
+                        <div>fast model window={effectiveWindowSnapshot.metrics.fastModelContextWindow ?? "-"}</div>
+                        <div>system blocks={effectiveWindowSnapshot.metrics.systemBlockCount} reminders={effectiveWindowSnapshot.metrics.reminderCount}</div>
+                        <div>recent messages={effectiveWindowSnapshot.metrics.recentMessageCount} handoff={effectiveWindowSnapshot.metrics.hasHandoff ? "yes" : "no"}</div>
+                      </div>
+                    ) : (
+                      <pre className="max-h-28 overflow-auto whitespace-pre-wrap rounded border bg-muted/30 p-2 font-mono text-[11px] leading-4">
+                        {snapshotForCurrentSession.prompt}
+                      </pre>
+                    )}
                   </div>
                 </div>
                 <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 p-4 md:grid-cols-2">
@@ -331,7 +347,7 @@ export function ContextInspector({
                       Assembled messages ({messageCount})
                     </div>
                     <div className="min-h-0 flex-1 space-y-2 overflow-auto p-3">
-                      {snapshotForCurrentSession.assembledMessages.map((message, index) => {
+                      {displayedMessages.map((message, index) => {
                         const role = normalizeContextRole(message.role);
                         return (
                           <div key={`${role}-${index}`} className="rounded-lg border bg-muted/10 p-2.5">

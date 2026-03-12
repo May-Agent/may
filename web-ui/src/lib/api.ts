@@ -167,6 +167,29 @@ export interface ContextDebugMessage {
   toolCallNames: string[];
 }
 
+export type ContextWindowPhase =
+  | "stable"
+  | "compression_due"
+  | "handoff_due"
+  | "handoff_active";
+
+export interface SessionContextWindowMetrics {
+  usageFraction: number;
+  selectedModelContextWindow?: number;
+  fastModelContextWindow?: number;
+  effectiveContextWindow: number;
+  systemBlockCount: number;
+  reminderCount: number;
+  recentMessageCount: number;
+  hasHandoff: boolean;
+}
+
+export interface SessionContextWindowSnapshot {
+  phase: ContextWindowPhase;
+  metrics: SessionContextWindowMetrics;
+  assembledMessages: ContextDebugMessage[];
+}
+
 export interface SessionContextDebugSnapshot {
   sessionId: string;
   timestamp: string;
@@ -175,6 +198,7 @@ export interface SessionContextDebugSnapshot {
   prompt: string;
   promptAttachments: string[];
   assembledMessages: ContextDebugMessage[];
+  windowSnapshot?: SessionContextWindowSnapshot;
 }
 
 export interface SessionContextDebugPayload {
@@ -221,6 +245,27 @@ function requireStringArray(value: unknown, field: string): string[] {
   return result;
 }
 
+function requireNumber(value: unknown, field: string): number {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    throw new Error(`Invalid context debug payload: ${field} must be a number`);
+  }
+  return value;
+}
+
+function requireBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new Error(`Invalid context debug payload: ${field} must be a boolean`);
+  }
+  return value;
+}
+
+function requireOptionalNumber(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  return requireNumber(value, field);
+}
+
 function parseContextDebugMessage(value: unknown, index: number): ContextDebugMessage {
   const record = requireObject(value, `assembledMessages[${index}]`);
   return {
@@ -229,6 +274,34 @@ function parseContextDebugMessage(value: unknown, index: number): ContextDebugMe
     attachments: requireStringArray(record.attachments, `assembledMessages[${index}].attachments`),
     toolCallId: requireOptionalString(record.toolCallId, `assembledMessages[${index}].toolCallId`),
     toolCallNames: requireStringArray(record.toolCallNames, `assembledMessages[${index}].toolCallNames`),
+  };
+}
+
+function parseSessionContextWindowSnapshot(
+  value: unknown,
+): SessionContextWindowSnapshot {
+  const record = requireObject(value, "windowSnapshot");
+  const metrics = requireObject(record.metrics, "windowSnapshot.metrics");
+  const assembledMessagesValue = record.assembledMessages;
+  if (!Array.isArray(assembledMessagesValue)) {
+    throw new Error("Invalid context debug payload: windowSnapshot.assembledMessages must be an array");
+  }
+
+  return {
+    phase: requireString(record.phase, "windowSnapshot.phase") as ContextWindowPhase,
+    metrics: {
+      usageFraction: requireNumber(metrics.usageFraction, "windowSnapshot.metrics.usageFraction"),
+      selectedModelContextWindow: requireOptionalNumber(metrics.selectedModelContextWindow, "windowSnapshot.metrics.selectedModelContextWindow"),
+      fastModelContextWindow: requireOptionalNumber(metrics.fastModelContextWindow, "windowSnapshot.metrics.fastModelContextWindow"),
+      effectiveContextWindow: requireNumber(metrics.effectiveContextWindow, "windowSnapshot.metrics.effectiveContextWindow"),
+      systemBlockCount: requireNumber(metrics.systemBlockCount, "windowSnapshot.metrics.systemBlockCount"),
+      reminderCount: requireNumber(metrics.reminderCount, "windowSnapshot.metrics.reminderCount"),
+      recentMessageCount: requireNumber(metrics.recentMessageCount, "windowSnapshot.metrics.recentMessageCount"),
+      hasHandoff: requireBoolean(metrics.hasHandoff, "windowSnapshot.metrics.hasHandoff"),
+    },
+    assembledMessages: assembledMessagesValue.map((item, index) =>
+      parseContextDebugMessage(item, index),
+    ),
   };
 }
 
@@ -249,6 +322,10 @@ function parseSessionContextDebugSnapshot(value: unknown): SessionContextDebugSn
     assembledMessages: assembledMessagesValue.map((item, index) =>
       parseContextDebugMessage(item, index),
     ),
+    windowSnapshot:
+      record.windowSnapshot === undefined || record.windowSnapshot === null
+        ? undefined
+        : parseSessionContextWindowSnapshot(record.windowSnapshot),
   };
 }
 
