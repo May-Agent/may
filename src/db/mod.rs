@@ -332,7 +332,6 @@ impl ChatDb {
         Self::migrate_add_column(&conn, "messages", "context_window", "INTEGER").await?;
         Self::migrate_add_column(&conn, "messages", "elapsed_ms", "INTEGER").await?;
         Self::migrate_default_profile_slugs(&conn).await?;
-        Self::migrate_session_context_snapshot_metadata(&conn).await?;
 
         // Enable WAL mode for better concurrent read/write performance
         conn.execute_unprepared("PRAGMA journal_mode=WAL").await?;
@@ -362,39 +361,6 @@ impl ChatDb {
             }
             Err(e) => Err(e.into()),
         }
-    }
-
-    async fn migrate_session_context_snapshot_metadata(
-        conn: &DatabaseConnection,
-    ) -> Result<(), ChatDbError> {
-        #[derive(serde::Deserialize, serde::Serialize)]
-        struct StoredContextWindowMetadata {
-            phase: aither_agent::ContextWindowPhase,
-            metrics: aither_agent::ContextWindowMetrics,
-        }
-
-        let rows = session_context_snapshots::Entity::find().all(conn).await?;
-        for row in rows {
-            let Some(metadata_json) = row.metadata_json.as_deref() else {
-                continue;
-            };
-            if serde_json::from_str::<StoredContextWindowMetadata>(metadata_json).is_ok() {
-                continue;
-            }
-            let metrics = serde_json::from_str::<aither_agent::ContextWindowMetrics>(metadata_json)?;
-            let upgraded = StoredContextWindowMetadata {
-                phase: if metrics.has_handoff {
-                    aither_agent::ContextWindowPhase::HandoffActive
-                } else {
-                    aither_agent::ContextWindowPhase::Stable
-                },
-                metrics,
-            };
-            let mut active: session_context_snapshots::ActiveModel = row.into();
-            active.metadata_json = Set(Some(serde_json::to_string(&upgraded)?));
-            active.update(conn).await?;
-        }
-        Ok(())
     }
 
     async fn migrate_default_profile_slugs(conn: &DatabaseConnection) -> Result<(), ChatDbError> {
