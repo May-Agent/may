@@ -1709,7 +1709,7 @@ fn is_running_in_container() -> bool {
 }
 
 fn global_memory_file_path(may_dir: &std::path::Path) -> PathBuf {
-    let upper = may_dir.join("MEMORY.md");
+    let upper = crate::session::MayHomePaths::new(may_dir.to_path_buf()).memory_file();
     if !upper.exists() {
         std::fs::write(&upper, "").unwrap_or_else(|e| {
             panic!("failed to initialize MEMORY.md at {}: {e}", upper.display())

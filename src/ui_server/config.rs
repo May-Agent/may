@@ -7,6 +7,7 @@ use skyzen::utils::{Json, State};
 use crate::config::{MayConfig, ProviderInstance, SshServerConfig};
 use crate::copilot::{clear_copilot_credentials, has_copilot_token, save_copilot_token};
 use crate::mcp::MayMcpServerConfig;
+use crate::session::MayHomePaths;
 use crate::skill::SkillManager;
 
 use super::error::{bad_request_error, internal_error};
@@ -150,7 +151,7 @@ pub(super) async fn set_last_model(
 pub(super) async fn get_memory(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<MemoryPayload>> {
-    let memory_path = state.may_dir.join("MEMORY.md");
+    let memory_path = MayHomePaths::new(state.may_dir.clone()).memory_file();
     let content = async_fs::read_to_string(memory_path)
         .await
         .map_err(internal_error)?;
@@ -166,7 +167,7 @@ pub(super) async fn save_memory(
             "memory updates require explicit user request confirmation",
         ));
     }
-    let memory_path = state.may_dir.join("MEMORY.md");
+    let memory_path = MayHomePaths::new(state.may_dir.clone()).memory_file();
     async_fs::write(memory_path, payload.content)
         .await
         .map_err(internal_error)?;
