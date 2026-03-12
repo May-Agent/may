@@ -1300,99 +1300,108 @@ async fn setup_agent_environment(
     crate::agent::AgentEnvironment,
     Option<crate::location::LocationInfo>,
 )> {
-    let environment = if matches!(
-        ctx.profile_environment,
-        Some(crate::profile::ProfileEnvironment::Container { .. })
-    ) {
-        let profile = ctx
-            .profile_model
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("container profile model is missing"))?;
-        {
-            let manager = state.session_manager.lock().await;
-            manager
-                .reconcile_container_layout_for_session(&ctx.session_id)
+    let environment = match ctx.profile_environment.as_ref() {
+        Some(crate::profile::ProfileEnvironment::Container { .. }) => {
+            let profile = ctx
+                .profile_model
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("container profile model is missing"))?;
+            {
+                let manager = state.session_manager.lock().await;
+                manager
+                    .reconcile_container_layout_for_session(&ctx.session_id)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("Failed to reconcile container session layout: {error}")
+                    })?;
+            }
+            let container_manager = state
+                .resolve_container_manager(false)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!("Failed to reconcile container session layout: {error}")
+                    anyhow::anyhow!("No container runtime available for container profile: {error}")
                 })?;
-        }
-        let container_manager = state
-            .resolve_container_manager(false)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("No container runtime available for container profile: {error}")
-            })?;
-        let default_image_tag =
-            crate::container::profile::default_image_tag(&state.may_dir, profile)
-                .map_err(|e| anyhow::anyhow!("Invalid container profile image tag: {e}"))?;
+            let default_image_tag =
+                crate::container::profile::default_image_tag(&state.may_dir, profile)
+                    .map_err(|e| anyhow::anyhow!("Invalid container profile image tag: {e}"))?;
 
-        let image_spec = crate::container::profile::image_spec_for_profile(
-            &state.may_dir,
-            profile,
-            &default_image_tag,
-        )
-        .map_err(|e| anyhow::anyhow!("Invalid container profile configuration: {e}"))?;
-        let extra_mounts = crate::container::profile::mounts_for_profile(profile)
-            .map_err(|e| anyhow::anyhow!("Invalid container mount configuration: {e}"))?;
+            let image_spec = crate::container::profile::image_spec_for_profile(
+                &state.may_dir,
+                profile,
+                &default_image_tag,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid container profile configuration: {e}"))?;
+            let extra_mounts = crate::container::profile::mounts_for_profile(profile)
+                .map_err(|e| anyhow::anyhow!("Invalid container mount configuration: {e}"))?;
 
-        crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
-            .await
-            .map_err(|e| anyhow::anyhow!("Container image build failed: {e}"))?;
+            crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
+                .await
+                .map_err(|e| anyhow::anyhow!("Container image build failed: {e}"))?;
 
-        let container_name =
-            crate::container::profile::container_name_for_profile_session(profile, &ctx.session_id);
+            let container_name =
+                crate::container::profile::container_name_for_profile_session(profile, &ctx.session_id);
 
-        let mut extra_env = Vec::new();
-        let browser_backend: Option<Arc<dyn BrowserBackend>> = if let Some(ref bm) =
-            state.browser_manager
-        {
-            if let Err(e) = bm.start().await {
-                tracing::warn!(error = %e, "Failed to auto-start browser for container session");
-                None
+            let mut extra_env = Vec::new();
+            let browser_backend: Option<Arc<dyn BrowserBackend>> = if let Some(ref bm) =
+                state.browser_manager
+            {
+                if let Err(e) = bm.start().await {
+                    tracing::warn!(error = %e, "Failed to auto-start browser for container session");
+                    None
+                } else {
+                    let host_gateway = container_manager.runtime().host_gateway();
+                    let config = state.config.read().await;
+                    let endpoint = format!("http://{}:{}", host_gateway, config.playwright.port);
+                    extra_env.push(format!("BROWSER_CDP_ENDPOINT={endpoint}"));
+                    Some(Arc::new(StaticCdpBrowser::new(endpoint)))
+                }
             } else {
-                let host_gateway = container_manager.runtime().host_gateway();
-                let config = state.config.read().await;
-                let endpoint = format!("http://{}:{}", host_gateway, config.playwright.port);
-                extra_env.push(format!("BROWSER_CDP_ENDPOINT={endpoint}"));
-                Some(Arc::new(StaticCdpBrowser::new(endpoint)))
+                None
+            };
+
+            let ipc_socket_path = ctx.sandbox_dir.join("leash-ipc.sock");
+            let mut launch_spec = ContainerLaunchSpec::new(
+                container_name,
+                image_spec.tag.clone(),
+                ctx.sandbox_dir.clone(),
+            )
+            .with_ipc_socket(ipc_socket_path);
+            for mount in extra_mounts {
+                launch_spec = launch_spec.with_mount(mount);
             }
-        } else {
-            None
-        };
+            for env in extra_env {
+                launch_spec = launch_spec.with_env(env);
+            }
 
-        let ipc_socket_path = ctx.sandbox_dir.join("leash-ipc.sock");
-        let mut launch_spec = ContainerLaunchSpec::new(
-            container_name,
-            image_spec.tag.clone(),
-            ctx.sandbox_dir.clone(),
-        )
-        .with_ipc_socket(ipc_socket_path);
-        for mount in extra_mounts {
-            launch_spec = launch_spec.with_mount(mount);
+            let container_id = container_manager
+                .ensure_running(&launch_spec)
+                .await
+                .map_err(|e| anyhow::anyhow!("Container start failed: {e}"))?;
+
+            let container_exec = std::sync::Arc::new(ContainerExecHandle::new(std::sync::Arc::new(
+                BollardContainerExec::new(std::sync::Arc::new(
+                    container_manager.runtime().client.clone(),
+                )),
+            )));
+
+            crate::agent::AgentEnvironment::Container {
+                container_id,
+                container_exec,
+                browser_backend,
+            }
         }
-        for env in extra_env {
-            launch_spec = launch_spec.with_env(env);
+        Some(crate::profile::ProfileEnvironment::Remote { .. }) => {
+            let profile = ctx
+                .profile_model
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("remote profile model is missing"))?;
+            let config = state.config.read().await;
+            let ssh_server =
+                crate::remote_profile::resolve_remote_profile_server(profile, &config.ssh_servers)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            crate::agent::AgentEnvironment::Remote { ssh_server }
         }
-
-        let container_id = container_manager
-            .ensure_running(&launch_spec)
-            .await
-            .map_err(|e| anyhow::anyhow!("Container start failed: {e}"))?;
-
-        let container_exec = std::sync::Arc::new(ContainerExecHandle::new(std::sync::Arc::new(
-            BollardContainerExec::new(std::sync::Arc::new(
-                container_manager.runtime().client.clone(),
-            )),
-        )));
-
-        crate::agent::AgentEnvironment::Container {
-            container_id,
-            container_exec,
-            browser_backend,
-        }
-    } else {
-        crate::agent::AgentEnvironment::Local
+        _ => crate::agent::AgentEnvironment::Local,
     };
 
     let location = if ctx.profile_model.as_ref().is_some_and(|p| p.location_aware) {

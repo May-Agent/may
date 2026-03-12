@@ -13,6 +13,7 @@ use crate::task_trigger::{NormalizedTaskTrigger, TaskTriggerInput, normalize_tri
 pub enum TaskRuntimeKind {
     Local,
     Container,
+    Remote,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -105,7 +106,7 @@ impl TaskCreateRequest {
             TaskRuntimeKind::Local => self.args.needs_network.ok_or_else(|| {
                 "local(leash) task must explicitly set needs_network to true or false".to_string()
             })?,
-            TaskRuntimeKind::Container => false,
+            TaskRuntimeKind::Container | TaskRuntimeKind::Remote => false,
         };
 
         Ok(NormalizedTaskCreateRequest {

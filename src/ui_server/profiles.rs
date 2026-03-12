@@ -77,6 +77,14 @@ async fn ensure_profile_environment_ready(
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Profile not found"))?;
 
+    if profile.environment == "remote" {
+        let config = state.config.read().await;
+        crate::remote_profile::resolve_remote_profile_server(&profile, &config.ssh_servers)
+            .map_err(bad_request_error)?;
+        state.clear_container_prepare_status(profile_id).await;
+        return Ok(());
+    }
+
     if profile.environment != "container" {
         state.clear_container_prepare_status(profile_id).await;
         return Ok(());

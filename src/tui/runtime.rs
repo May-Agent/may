@@ -354,11 +354,20 @@ async fn resolve_agent_environment_for_tui(
     sandbox_dir: &std::path::Path,
     session_id: &SessionId,
 ) -> anyhow::Result<crate::agent::AgentEnvironment> {
-    if !matches!(
-        profile_environment,
-        Some(crate::profile::ProfileEnvironment::Container { .. })
-    ) {
-        return Ok(crate::agent::AgentEnvironment::Local);
+    match profile_environment {
+        Some(crate::profile::ProfileEnvironment::Container { .. }) => {}
+        Some(crate::profile::ProfileEnvironment::Remote { .. }) => {
+            let profile =
+                profile_model.ok_or_else(|| anyhow::anyhow!("remote profile model is missing"))?;
+            let config_path = may_dir.join("config.toml");
+            let config = crate::config::MayConfig::load_from(&config_path)
+                .map_err(|error| anyhow::anyhow!("failed to load config.toml for remote profile: {error}"))?;
+            let ssh_server =
+                crate::remote_profile::resolve_remote_profile_server(profile, &config.ssh_servers)
+                    .map_err(anyhow::Error::msg)?;
+            return Ok(crate::agent::AgentEnvironment::Remote { ssh_server });
+        }
+        _ => return Ok(crate::agent::AgentEnvironment::Local),
     }
 
     let profile =

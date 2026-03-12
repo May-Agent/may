@@ -35,12 +35,27 @@ pub struct ProfileInfo {
 
 impl ProfileInfo {
     pub fn from_db_model(m: profiles::Model) -> Result<Self, crate::db::ChatDbError> {
+        let remote_config = crate::remote_profile::parse_remote_profile_config(&m).map_err(
+            crate::db::ChatDbError::InvalidProfileEnvironment,
+        )?;
         let environment = match m.environment.as_str() {
             "container" => ProfileEnvironment::Container {
                 image: m.container_image,
                 container_id: m.container_id,
             },
             "local" => ProfileEnvironment::Local,
+            "remote" => {
+                let config = remote_config.ok_or_else(|| {
+                    crate::db::ChatDbError::InvalidProfileEnvironment(
+                        "remote profile requires preferences.remote.ssh_server_id".to_string(),
+                    )
+                })?;
+                ProfileEnvironment::Remote {
+                    ssh_server_id: config.normalized_ssh_server_id().map(str::to_string).map_err(
+                        crate::db::ChatDbError::InvalidProfileEnvironment,
+                    )?,
+                }
+            }
             other => {
                 return Err(crate::db::ChatDbError::InvalidProfileEnvironment(
                     other.to_string(),
@@ -76,6 +91,9 @@ pub enum ProfileEnvironment {
         image: Option<String>,
         container_id: Option<String>,
     },
+    Remote {
+        ssh_server_id: String,
+    },
 }
 
 impl ProfileEnvironment {
@@ -84,6 +102,7 @@ impl ProfileEnvironment {
         match self {
             Self::Local => "local",
             Self::Container { .. } => "container",
+            Self::Remote { .. } => "remote",
         }
     }
 }
