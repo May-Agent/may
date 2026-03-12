@@ -42,7 +42,7 @@ use crate::skill::SkillManager;
 use aither_models::lookup as lookup_model_info;
 
 use error::internal_error;
-use state::{AskUserApprover, UiServerState};
+use state::{AskUserApprover, SessionRunCancellationRegistry, UiServerState};
 use types::{
     ApiHealth, ModelInfoItem, ModelsResponse, ProviderModelsItem, ProviderModelsResponse,
     RequestLogCacheSummary, RequestLogsResponse,
@@ -177,6 +177,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         skill_manager: SkillManager::new(&may_dir),
         permission_approver,
         ask_user_approver,
+        run_cancellation_registry: SessionRunCancellationRegistry::new(),
         active_streaming_sessions: Mutex::new(HashSet::new()),
         request_logs: Mutex::new(VecDeque::new()),
         models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
@@ -259,6 +260,7 @@ fn api_routes() -> Route {
                         "".at(get_session),
                         "".put(update_session),
                         "".delete(delete_session),
+                        "/stop".post(stop_session_run),
                         "/runtime".route(Route::new((
                             "".at(get_session_runtime),
                             "/pending".delete(remove_pending_message),

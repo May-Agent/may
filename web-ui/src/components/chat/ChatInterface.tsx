@@ -12,6 +12,7 @@ import {
   removePendingSessionMessage,
   respondAskUserRequest,
   respondPermissionRequest,
+  stopSessionRun,
   streamChat,
   subscribeUiEvents,
   subscribeSessionArtifacts,
@@ -1601,6 +1602,17 @@ export function ChatInterface({
     setIsSending(false);
     setIsBrowserOpen(false);
     if (runtimeSessionId) {
+      void stopSessionRun(runtimeSessionId)
+        .then((runtime) => {
+          applyRuntime(runtimeSessionId, runtime);
+        })
+        .catch((error) => {
+          setUiError(
+            `Failed to stop session: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
       const latest = useStore
         .getState()
         .sessions.find((s) => s.id === runtimeSessionId);

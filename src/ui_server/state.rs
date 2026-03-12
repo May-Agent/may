@@ -109,6 +109,7 @@ pub(crate) struct UiServerState {
     pub(crate) skill_manager: SkillManager,
     pub(crate) permission_approver: PermissionApprover,
     pub(crate) ask_user_approver: AskUserApprover,
+    pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,
     pub(crate) active_streaming_sessions: Mutex<HashSet<String>>,
     pub(crate) request_logs: Mutex<VecDeque<RequestLogEntry>>,
     pub(crate) models_cache: RefreshableCache<ModelsResponse>,
@@ -158,6 +159,32 @@ pub(crate) struct AskUserApprover {
     live_responses: Arc<LiveResponseRegistry<Vec<QuestionAnswer>>>,
     runtime_db: Option<crate::db::ChatDb>,
     ui_events_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionRunCancellationRegistry {
+    live_responses: Arc<LiveResponseRegistry<()>>,
+}
+
+impl SessionRunCancellationRegistry {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            live_responses: Arc::new(LiveResponseRegistry::new()),
+        }
+    }
+
+    pub(crate) fn open(&self, session_id: impl Into<String>) -> async_channel::Receiver<()> {
+        self.live_responses.open(session_id.into())
+    }
+
+    pub(crate) fn cancel(&self, session_id: &str) -> bool {
+        self.live_responses.resolve(session_id, ())
+    }
+
+    pub(crate) fn close(&self, session_id: &str) -> bool {
+        self.live_responses.discard(session_id)
+    }
 }
 
 /// Generate skipped answers for all questions in the request.

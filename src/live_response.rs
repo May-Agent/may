@@ -25,4 +25,8 @@ impl<Response> LiveResponseRegistry<Response> {
             .remove(request_id)
             .is_some_and(|(_, tx)| tx.try_send(response).is_ok())
     }
+
+    pub(crate) fn discard(&self, request_id: &str) -> bool {
+        self.senders.remove(request_id).is_some()
+    }
 }
