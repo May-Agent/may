@@ -54,7 +54,7 @@ pub(super) async fn get_vapid_key(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<VapidKeyResponse>> {
     Ok(Json(VapidKeyResponse {
-        public_key: state.notification_manager.public_key().to_string(),
+        public_key: state.notification_service.public_key().to_string(),
     }))
 }
 
@@ -63,13 +63,9 @@ pub(super) async fn subscribe(
     Json(req): Json<SubscribeRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
-    let id = uuid::Uuid::new_v4().to_string();
-    db.add_push_subscription(&id, &req.endpoint, &req.p256dh, &req.auth)
+    state
+        .notification_service
+        .subscribe(&req.endpoint, &req.p256dh, &req.auth)
         .await
         .map_err(internal_error)?;
 
@@ -81,12 +77,9 @@ pub(super) async fn unsubscribe(
     Json(req): Json<UnsubscribeRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-
-    db.remove_push_subscription(&req.endpoint)
+    state
+        .notification_service
+        .unsubscribe(&req.endpoint)
         .await
         .map_err(internal_error)?;
 
@@ -99,7 +92,7 @@ pub(super) async fn test_notification(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<super::types::NotificationSentResponse>> {
     let sent = state
-        .notification_manager
+        .notification_service
         .send(&req.title, &req.body)
         .await
         .map_err(internal_error)?;

@@ -12,7 +12,8 @@ use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec};
 
 use crate::agent::MayAgent;
-use crate::notification::{NotificationManager, NotificationPayload};
+use crate::notification::NotificationPayload;
+use crate::notification_service::NotificationService;
 use crate::session::{
     ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage, PersistedAttachment, SessionId,
     SessionRuntimeState,
@@ -449,59 +450,59 @@ async fn run_agent_loop(
                         name,
                         arguments,
                     }) => {
-                    // Flush accumulated text as a history message before the tool call.
-                    if !segment_text.trim().is_empty() {
-                        append_history_message(
-                            state,
-                            &session_id,
-                            ChatMessage::assistant(segment_text.clone()),
-                        )
-                        .await?;
-                        segment_text.clear();
-                    }
+                        // Flush accumulated text as a history message before the tool call.
+                        if !segment_text.trim().is_empty() {
+                            append_history_message(
+                                state,
+                                &session_id,
+                                ChatMessage::assistant(segment_text.clone()),
+                            )
+                            .await?;
+                            segment_text.clear();
+                        }
 
-                    let record = ToolEventRecord::Start {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    };
-                    if let Ok(serialized) = serde_json::to_string(&record) {
-                        append_history_message(
-                            state,
-                            &session_id,
-                            ChatMessage::tool(id.clone(), serialized),
-                        )
-                        .await?;
-                    }
-                    update_bash_snapshot_from_tool_event(&mut bash_snapshot, &record);
-                    tool_arguments_by_id.insert(id.clone(), arguments.clone());
-                    sink.on_tool_start(&id, &name, &arguments).await;
+                        let record = ToolEventRecord::Start {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        };
+                        if let Ok(serialized) = serde_json::to_string(&record) {
+                            append_history_message(
+                                state,
+                                &session_id,
+                                ChatMessage::tool(id.clone(), serialized),
+                            )
+                            .await?;
+                        }
+                        update_bash_snapshot_from_tool_event(&mut bash_snapshot, &record);
+                        tool_arguments_by_id.insert(id.clone(), arguments.clone());
+                        sink.on_tool_start(&id, &name, &arguments).await;
                     }
                     Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
-                    let record = ToolEventRecord::End {
-                        id: id.clone(),
-                        name: name.clone(),
-                        result: result.clone(),
-                    };
-                    if let Ok(serialized) = serde_json::to_string(&record) {
-                        append_history_message(
-                            state,
-                            &session_id,
-                            ChatMessage::tool(id.clone(), serialized),
-                        )
-                        .await?;
-                    }
-                    update_bash_snapshot_from_tool_event(&mut bash_snapshot, &record);
-                    let arguments = tool_arguments_by_id.remove(&id);
-                    sink.on_tool_end(&id, &name, arguments.as_deref(), &result)
-                        .await;
+                        let record = ToolEventRecord::End {
+                            id: id.clone(),
+                            name: name.clone(),
+                            result: result.clone(),
+                        };
+                        if let Ok(serialized) = serde_json::to_string(&record) {
+                            append_history_message(
+                                state,
+                                &session_id,
+                                ChatMessage::tool(id.clone(), serialized),
+                            )
+                            .await?;
+                        }
+                        update_bash_snapshot_from_tool_event(&mut bash_snapshot, &record);
+                        let arguments = tool_arguments_by_id.remove(&id);
+                        sink.on_tool_end(&id, &name, arguments.as_deref(), &result)
+                            .await;
 
-                    // Check if tasks.md changed after tool execution.
-                    if let Some(event) =
-                        check_tasks_update(&tasks_md_path, &mut last_todo_hash).await
-                    {
-                        sink.on_todo_update(&event).await;
-                    }
+                        // Check if tasks.md changed after tool execution.
+                        if let Some(event) =
+                            check_tasks_update(&tasks_md_path, &mut last_todo_hash).await
+                        {
+                            sink.on_todo_update(&event).await;
+                        }
                     }
                     Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
                         terminal_error = Some(err);
@@ -1196,11 +1197,11 @@ fn wire_tool_channels(state: &Arc<UiServerState>, session_id: &SessionId) -> Too
         }
     });
 
-    let notification_manager = state.notification_manager.clone();
+    let notification_service = state.notification_service.clone();
     tokio::spawn(async move {
         while let Some(request) = notify_queue.next().await {
             let result =
-                handle_notify_request(notification_manager.clone(), request.args.clone()).await;
+                handle_notify_request(notification_service.clone(), request.args.clone()).await;
             let _ = request.respond(result);
         }
     });
@@ -1357,7 +1358,7 @@ async fn handle_task_request(
 }
 
 async fn handle_notify_request(
-    notification_manager: Arc<NotificationManager>,
+    notification_service: Arc<NotificationService>,
     args: crate::agent::notify_tool::NotifyArgs,
 ) -> Result<crate::agent::notify_tool::NotifyResult, String> {
     let payload = NotificationPayload {
@@ -1367,7 +1368,7 @@ async fn handle_notify_request(
         callback_context_xml: args.callback_context_xml,
         callback_message: args.callback_message,
     };
-    let sent = notification_manager
+    let sent = notification_service
         .send_payload(payload)
         .await
         .map_err(|e| format!("failed to send notification payload: {e}"))?;

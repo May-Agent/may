@@ -152,11 +152,19 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
             .map_err(|e| anyhow!("failed to initialize web push notifications: {e}"))?;
     let notification_manager = Arc::new(notification_manager);
     tracing::info!("Web Push notifications enabled");
+    let notification_service = Arc::new(crate::notification_service::NotificationService::new(
+        db_for_archive.clone(),
+        notification_manager.clone(),
+    ));
+    notification_service
+        .redeliver_pending()
+        .await
+        .map_err(|e| anyhow!(e.to_string()))?;
     let mut task_runtime =
         crate::scheduler::TaskRuntime::load(db_for_archive.clone(), may_dir.clone())
             .await
             .context("failed to load task runtime state")?
-            .with_notifier(notification_manager.clone());
+            .with_notifier(notification_service.clone());
     if let Some(ref manager) = container_manager {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
@@ -178,7 +186,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         container_prepare_inflight: Mutex::new(HashSet::new()),
         container_manager,
         browser_manager,
-        notification_manager: notification_manager.clone(),
+        notification_service: notification_service.clone(),
         browser_takeover_session: Mutex::new(None),
         browser_takeover_alert_pending: Mutex::new(HashSet::new()),
         memory_processor,

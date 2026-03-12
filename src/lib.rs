@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod memory;
 pub mod models;
 pub mod notification;
+pub mod notification_service;
 pub mod profile;
 pub mod scheduler;
 pub mod session;

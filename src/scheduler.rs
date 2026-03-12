@@ -25,7 +25,8 @@ use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKi
 use crate::container::lifecycle::ContainerManager;
 use crate::db::ChatDb;
 use crate::db::entity::{profiles, scheduled_tasks};
-use crate::notification::{NotificationManager, NotificationPayload};
+use crate::notification::NotificationPayload;
+use crate::notification_service::NotificationService;
 use crate::profile::{ProfileEnvironment, ProfileInfo};
 use crate::task_trigger::{
     TRIGGER_KIND_EVENT, TRIGGER_KIND_TIME, TRIGGER_TYPE_CRON, TRIGGER_TYPE_ONCE,
@@ -36,7 +37,7 @@ use crate::task_trigger::{
 #[derive(Clone)]
 pub struct TaskRuntime {
     db: ChatDb,
-    notifier: Option<Arc<NotificationManager>>,
+    notifier: Option<Arc<NotificationService>>,
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
@@ -98,7 +99,7 @@ impl TaskRuntime {
     }
 
     /// Attach a notification manager for sending push notifications on task completion.
-    pub fn with_notifier(mut self, notifier: Arc<NotificationManager>) -> Self {
+    pub fn with_notifier(mut self, notifier: Arc<NotificationService>) -> Self {
         self.notifier = Some(notifier);
         self
     }

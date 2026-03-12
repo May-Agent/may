@@ -20,8 +20,8 @@ use crate::session::{
     SessionRuntimeSummary,
 };
 use entity::{
-    context_debug_snapshots, folders, messages, profile_memories, profiles, push_subscriptions,
-    scheduled_tasks, session_context_snapshots, session_pending_ask_user,
+    context_debug_snapshots, folders, messages, notification_mailbox, profile_memories, profiles,
+    push_subscriptions, scheduled_tasks, session_context_snapshots, session_pending_ask_user,
     session_pending_messages, session_pending_permissions, session_runtimes, sessions,
 };
 
@@ -178,7 +178,15 @@ impl ChatDb {
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
 
-        let session_context_stmt = schema.create_table_from_entity(session_context_snapshots::Entity);
+        let notification_mailbox_stmt =
+            schema.create_table_from_entity(notification_mailbox::Entity);
+        let create_sql = notification_mailbox_stmt
+            .to_string(SqliteQueryBuilder)
+            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        conn.execute_unprepared(&create_sql).await?;
+
+        let session_context_stmt =
+            schema.create_table_from_entity(session_context_snapshots::Entity);
         let create_sql = session_context_stmt
             .to_string(SqliteQueryBuilder)
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
@@ -242,6 +250,10 @@ impl ChatDb {
         .await?;
         conn.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_context_debug_snapshots_timestamp ON context_debug_snapshots(timestamp)",
+        )
+        .await?;
+        conn.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_notification_mailbox_status_created_at ON notification_mailbox(status, created_at)",
         )
         .await?;
         conn.execute_unprepared(
@@ -1059,12 +1071,14 @@ impl ChatDb {
         };
         session_context_snapshots::Entity::insert(active)
             .on_conflict(
-                sea_orm::sea_query::OnConflict::column(session_context_snapshots::Column::SessionId)
-                    .update_columns([
-                        session_context_snapshots::Column::ContextJson,
-                        session_context_snapshots::Column::UpdatedAt,
-                    ])
-                    .to_owned(),
+                sea_orm::sea_query::OnConflict::column(
+                    session_context_snapshots::Column::SessionId,
+                )
+                .update_columns([
+                    session_context_snapshots::Column::ContextJson,
+                    session_context_snapshots::Column::UpdatedAt,
+                ])
+                .to_owned(),
             )
             .exec(&self.conn)
             .await?;
@@ -1091,6 +1105,71 @@ impl ChatDb {
             .exec(&self.conn)
             .await?;
         Ok(())
+    }
+
+    /// Insert a new mailbox notification entry.
+    pub async fn create_notification_mailbox_entry(
+        &self,
+        id: &str,
+        payload: &crate::notification::NotificationPayload,
+        status: &str,
+    ) -> Result<notification_mailbox::Model, ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        notification_mailbox::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(payload.title.clone()),
+            body: Set(payload.body.clone()),
+            session_id: Set(payload.session_id.clone()),
+            callback_context_xml: Set(payload.callback_context_xml.clone()),
+            callback_message: Set(payload.callback_message.clone()),
+            status: Set(status.to_string()),
+            sent_count: Set(0),
+            last_error: Set(None),
+            delivered_at: Set(None),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+        }
+        .insert(&self.conn)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Update mailbox delivery state after a send attempt.
+    pub async fn update_notification_mailbox_delivery(
+        &self,
+        id: &str,
+        status: &str,
+        sent_count: usize,
+        last_error: Option<&str>,
+        delivered_at: Option<&str>,
+    ) -> Result<(), ChatDbError> {
+        let mut active: notification_mailbox::ActiveModel =
+            notification_mailbox::Entity::find_by_id(id)
+                .one(&self.conn)
+                .await?
+                .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?
+                .into();
+        active.status = Set(status.to_string());
+        active.sent_count = Set(i32::try_from(sent_count).map_err(|error| {
+            DbErr::Custom(["notification sent_count overflow: ", &error.to_string()].concat())
+        })?);
+        active.last_error = Set(last_error.map(ToOwned::to_owned));
+        active.delivered_at = Set(delivered_at.map(ToOwned::to_owned));
+        active.updated_at = Set(jiff::Timestamp::now().to_string());
+        active.update(&self.conn).await?;
+        Ok(())
+    }
+
+    /// Return notifications that still need delivery attempts.
+    pub async fn list_pending_notification_mailbox_entries(
+        &self,
+    ) -> Result<Vec<notification_mailbox::Model>, ChatDbError> {
+        notification_mailbox::Entity::find()
+            .filter(notification_mailbox::Column::Status.eq("pending"))
+            .order_by_asc(notification_mailbox::Column::CreatedAt)
+            .all(&self.conn)
+            .await
+            .map_err(Into::into)
     }
 
     // ── Permission / AskUser Queries ─────────────────────────────
