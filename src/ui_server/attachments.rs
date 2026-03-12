@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use aither_models::{Ability, lookup as lookup_model_info};
 use base64::Engine;
+use serde::Serialize;
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::agent::generate_session_title;
@@ -15,8 +16,64 @@ use super::types::{ApiAttachment, ChatRequest};
 
 pub(super) const INLINE_PASTED_TEXT_THRESHOLD: usize = 1200;
 
-fn xml_escape(value: &str) -> String {
-    quick_xml::escape::escape(value).into_owned()
+#[derive(Serialize)]
+struct TextXmlBlock<'a> {
+    #[serde(rename = "$text")]
+    content: &'a str,
+}
+
+#[derive(Serialize)]
+struct AttachmentXml {
+    #[serde(rename = "@name")]
+    name: String,
+    #[serde(rename = "@type")]
+    attachment_type: String,
+    #[serde(rename = "@path", skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(rename = "@offloaded", skip_serializing_if = "Option::is_none")]
+    offloaded: Option<bool>,
+    #[serde(rename = "@required_modality", skip_serializing_if = "Option::is_none")]
+    required_modality: Option<String>,
+    #[serde(rename = "@reason", skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AttachmentsXml {
+    #[serde(rename = "attachment")]
+    attachments: Vec<AttachmentXml>,
+}
+
+#[derive(Serialize)]
+struct UnsupportedModalityAlertXml {
+    #[serde(rename = "@type")]
+    alert_type: String,
+    message: String,
+    offloaded_attachments: AttachmentsXml,
+}
+
+#[derive(Serialize)]
+struct SessionMentionXml {
+    #[serde(rename = "@id")]
+    id: String,
+    #[serde(rename = "@title")]
+    title: String,
+    #[serde(rename = "@model")]
+    model: String,
+}
+
+#[derive(Serialize)]
+struct SessionMentionsXml {
+    #[serde(rename = "session")]
+    sessions: Vec<SessionMentionXml>,
+}
+
+fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> SkyResult<String> {
+    let mut output = String::new();
+    let serializer = quick_xml::se::Serializer::with_root(&mut output, Some(tag))
+        .map_err(internal_error)?;
+    value.serialize(serializer).map_err(internal_error)?;
+    Ok(output)
 }
 
 pub(super) async fn build_prompt_and_attachments(
@@ -55,7 +112,7 @@ pub(super) async fn build_prompt_and_attachments(
             .map(|(_, relative_path)| relative_path.clone());
 
         if !supported {
-            offloaded_xml_items.push(render_offloaded_attachment_xml(
+            offloaded_xml_items.push(build_offloaded_attachment_xml(
                 attachment,
                 required_modality
                     .as_ref()
@@ -64,20 +121,21 @@ pub(super) async fn build_prompt_and_attachments(
                 model_id,
             ));
             if let Some(text) = &attachment.text_content {
-                prompt.push_str("\n\n<offloaded_text>");
-                prompt.push_str(&xml_escape(text));
-                prompt.push_str("</offloaded_text>");
+                prompt.push_str("\n\n");
+                prompt.push_str(&serialize_xml("offloaded_text", &TextXmlBlock { content: text })?);
             }
             continue;
         }
 
         if let Some((saved_path, relative_path)) = uploaded {
-            xml_items.push(format!(
-                "<attachment name=\"{}\" type=\"{}\" path=\"{}\" />",
-                xml_escape(&attachment.name),
-                xml_escape(&attachment.attachment_type),
-                xml_escape(&relative_path),
-            ));
+            xml_items.push(AttachmentXml {
+                name: attachment.name.clone(),
+                attachment_type: attachment.attachment_type.clone(),
+                path: Some(relative_path),
+                offloaded: None,
+                required_modality: None,
+                reason: None,
+            });
 
             if attachment.attachment_type == "image" {
                 let url = url::Url::from_file_path(saved_path).map_err(|_| {
@@ -91,17 +149,19 @@ pub(super) async fn build_prompt_and_attachments(
 
         if let Some(text) = &attachment.text_content {
             if text.chars().count() <= INLINE_PASTED_TEXT_THRESHOLD {
-                prompt.push_str("\n\n<pasted_text>");
-                prompt.push_str(&xml_escape(text));
-                prompt.push_str("</pasted_text>");
+                prompt.push_str("\n\n");
+                prompt.push_str(&serialize_xml("pasted_text", &TextXmlBlock { content: text })?);
             } else {
                 let (saved_path, relative_path) =
                     save_large_pasted_text(state, &req.session_id, text).await?;
-                xml_items.push(format!(
-                    "<attachment name=\"{}\" type=\"document\" path=\"{}\" />",
-                    xml_escape(&attachment.name),
-                    xml_escape(&relative_path),
-                ));
+                xml_items.push(AttachmentXml {
+                    name: attachment.name.clone(),
+                    attachment_type: "document".to_string(),
+                    path: Some(relative_path),
+                    offloaded: None,
+                    required_modality: None,
+                    reason: None,
+                });
 
                 if attachment.attachment_type == "image" {
                     let url = url::Url::from_file_path(saved_path).map_err(|_| {
@@ -114,27 +174,39 @@ pub(super) async fn build_prompt_and_attachments(
             continue;
         }
 
-        xml_items.push(format!(
-            "<attachment name=\"{}\" type=\"{}\" />",
-            xml_escape(&attachment.name),
-            xml_escape(&attachment.attachment_type),
-        ));
+        xml_items.push(AttachmentXml {
+            name: attachment.name.clone(),
+            attachment_type: attachment.attachment_type.clone(),
+            path: None,
+            offloaded: None,
+            required_modality: None,
+            reason: None,
+        });
     }
 
     if !xml_items.is_empty() {
-        prompt.push_str("\n\n<attachments>\n");
-        prompt.push_str(&xml_items.join("\n"));
-        prompt.push_str("\n</attachments>");
+        prompt.push_str("\n\n");
+        prompt.push_str(&serialize_xml(
+            "attachments",
+            &AttachmentsXml {
+                attachments: xml_items,
+            },
+        )?);
     }
 
     if !offloaded_xml_items.is_empty() {
-        prompt.push_str("\n\n<system_alert type=\"unsupported_modality_offload\">");
-        prompt.push_str("Some attachments were offloaded because the current model does not support their modality. ");
-        prompt.push_str("Inspect the referenced files with tools before answering.\n");
-        prompt.push_str("<offloaded_attachments>\n");
-        prompt.push_str(&offloaded_xml_items.join("\n"));
-        prompt.push_str("\n</offloaded_attachments>");
-        prompt.push_str("</system_alert>");
+        prompt.push_str("\n\n");
+        prompt.push_str(&serialize_xml(
+            "system_alert",
+            &UnsupportedModalityAlertXml {
+                alert_type: "unsupported_modality_offload".to_string(),
+                message:
+                    "Some attachments were offloaded because the current model does not support their modality. Inspect the referenced files with tools before answering.".to_string(),
+                offloaded_attachments: AttachmentsXml {
+                    attachments: offloaded_xml_items,
+                },
+            },
+        )?);
     }
 
     if let Some(context_xml) = req
@@ -230,27 +302,20 @@ impl ModelModalitySupport {
 
 // ── XML rendering ────────────────────────────────────────────
 
-fn render_offloaded_attachment_xml(
+fn build_offloaded_attachment_xml(
     attachment: &ApiAttachment,
     modality: &AttachmentModality,
     relative_path: Option<&str>,
     model_id: &str,
-) -> String {
-    let mut xml = format!(
-        "<attachment name=\"{}\" type=\"{}\" offloaded=\"true\" required_modality=\"{}\" reason=\"model:{} lacks {}\"",
-        xml_escape(&attachment.name),
-        xml_escape(&attachment.attachment_type),
-        modality.label(),
-        xml_escape(model_id),
-        modality.label(),
-    );
-    if let Some(path) = relative_path {
-        xml.push_str(" path=\"");
-        xml.push_str(&xml_escape(path));
-        xml.push('"');
+) -> AttachmentXml {
+    AttachmentXml {
+        name: attachment.name.clone(),
+        attachment_type: attachment.attachment_type.clone(),
+        path: relative_path.map(ToOwned::to_owned),
+        offloaded: Some(true),
+        required_modality: Some(modality.label().to_string()),
+        reason: Some(["model:", model_id, " lacks ", modality.label()].concat()),
     }
-    xml.push_str(" />");
-    xml
 }
 
 // ── Session mentions ─────────────────────────────────────────
@@ -274,12 +339,11 @@ async fn build_session_mentions_xml(
         if let Some(session) = db.get_session(&session_id).await.map_err(internal_error)? {
             let title = session.title.unwrap_or_else(|| "Untitled".to_string());
             let model = session.model.unwrap_or_else(|| "unknown".to_string());
-            entries.push(format!(
-                "  <session id=\"{}\" title=\"{}\" model=\"{}\" />",
-                xml_escape(&session.id),
-                xml_escape(&title),
-                xml_escape(&model),
-            ));
+            entries.push(SessionMentionXml {
+                id: session.id,
+                title,
+                model,
+            });
         }
     }
 
@@ -287,13 +351,7 @@ async fn build_session_mentions_xml(
         return Ok(None);
     }
 
-    let mut block = String::from("<session_mentions>");
-    for line in entries {
-        block.push('\n');
-        block.push_str(&line);
-    }
-    block.push_str("\n</session_mentions>");
-    Ok(Some(block))
+    serialize_xml("session_mentions", &SessionMentionsXml { sessions: entries }).map(Some)
 }
 
 fn extract_session_mention_ids(content: &str) -> Vec<String> {
