@@ -10,7 +10,10 @@ use skyzen::utils::{Json, State};
 use aither_agent::{BrowserBackend, StaticCdpBrowser};
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole, Usage};
 use aither_models::lookup as lookup_model_info;
-use aither_sandbox::{BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec};
+use aither_sandbox::{
+    BashResult, BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, ContainerExecHandle,
+    ContainerLaunchSpec, Content, OutputEntry,
+};
 
 use crate::agent::MayAgent;
 use crate::notification::NotificationPayload;
@@ -260,6 +263,30 @@ async fn clear_running_state_if_needed(
         .clear_running_if_needed(session_id)
         .await
         .map_err(anyhow::Error::from)
+}
+
+fn output_contains_terminal_wait_notice(output: &OutputEntry) -> bool {
+    let content = match output {
+        OutputEntry::Inline { content } | OutputEntry::Loaded { content, .. } => Some(content),
+        OutputEntry::Stored { content, .. } => content.as_ref(),
+        OutputEntry::Empty => None,
+    };
+    content
+        .and_then(|content| match content {
+            Content::Text { text, .. } => Some(text.as_str()),
+            Content::Image { .. } => None,
+        })
+        .is_some_and(|text| text.starts_with(CONTAINER_STDIN_BLOCKED_NOTICE))
+}
+
+fn result_waits_for_terminal_input(result: &Result<String, String>) -> bool {
+    let Ok(serialized) = result else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<BashResult>(serialized) else {
+        return false;
+    };
+    parsed.status.as_deref() == Some("running") && output_contains_terminal_wait_notice(&parsed.stdout)
 }
 
 fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
@@ -600,6 +627,17 @@ async fn run_agent_loop(
                         arguments,
                     }) => {
                         saw_tool_activity = true;
+                        if matches!(
+                            name.as_str(),
+                            "bash" | "input_terminal" | "kill_terminal" | "read_terminal_delta"
+                        ) {
+                            set_session_runtime_state(
+                                state,
+                                session_id.as_str(),
+                                SessionRuntimeState::Running,
+                            )
+                            .await?;
+                        }
                         // Flush accumulated text as a history message before the tool call.
                         if !segment_text.trim().is_empty() {
                             append_history_message(
@@ -633,6 +671,14 @@ async fn run_agent_loop(
                     }
                     Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
                         saw_tool_activity = true;
+                        if name == "bash" && result_waits_for_terminal_input(&result) {
+                            set_session_runtime_state(
+                                state,
+                                session_id.as_str(),
+                                SessionRuntimeState::WaitingTerminalInput,
+                            )
+                            .await?;
+                        }
                         let record = ToolEventRecord::End {
                             id: id.clone(),
                             name: name.clone(),
