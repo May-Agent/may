@@ -150,6 +150,8 @@ fn map_db_message_stats(row: &crate::db::entity::messages::Model) -> Option<Chat
         prompt_tokens: map_i32_to_u32(row.prompt_tokens),
         completion_tokens: map_i32_to_u32(row.completion_tokens),
         total_tokens: map_i32_to_u32(row.total_tokens),
+        cache_read_tokens: map_i32_to_u32(row.cache_read_tokens),
+        cache_write_tokens: map_i32_to_u32(row.cache_write_tokens),
         context_window: map_i32_to_u32(row.context_window),
         elapsed_ms: map_i64_to_u64(row.elapsed_ms),
     };
@@ -157,6 +159,8 @@ fn map_db_message_stats(row: &crate::db::entity::messages::Model) -> Option<Chat
         && stats.prompt_tokens.is_none()
         && stats.completion_tokens.is_none()
         && stats.total_tokens.is_none()
+        && stats.cache_read_tokens.is_none()
+        && stats.cache_write_tokens.is_none()
         && stats.context_window.is_none()
         && stats.elapsed_ms.is_none()
     {
@@ -172,6 +176,8 @@ fn map_chat_stats_to_db_params(stats: &ChatMessageStats) -> crate::db::MessageSt
         prompt_tokens: stats.prompt_tokens,
         completion_tokens: stats.completion_tokens,
         total_tokens: stats.total_tokens,
+        cache_read_tokens: stats.cache_read_tokens,
+        cache_write_tokens: stats.cache_write_tokens,
         context_window: stats.context_window,
         elapsed_ms: stats.elapsed_ms,
     }

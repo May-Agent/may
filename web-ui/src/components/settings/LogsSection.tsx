@@ -86,7 +86,9 @@ export function LogsSection() {
             </div>
             <div className="text-muted-foreground">session={log.sessionId}</div>
             <div>model=<span className="font-mono">{log.model}</span> · provider=<span className="font-mono">{log.providerId}</span></div>
-            <div>tokens: prompt={log.promptTokens ?? '-'} completion={log.completionTokens ?? '-'} total={log.totalTokens ?? '-'} window={log.contextWindow ?? '-'}</div>
+            <div>
+              tokens: prompt={log.promptTokens ?? '-'} completion={log.completionTokens ?? '-'} total={log.totalTokens ?? '-'} cache_read={log.cacheReadTokens ?? '-'} cache_write={log.cacheWriteTokens ?? '-'} window={log.contextWindow ?? '-'}
+            </div>
             <div>latency: {log.elapsedMs}ms</div>
             {log.error && <div className="text-red-500 break-all">{log.error}</div>}
           </div>

@@ -73,6 +73,8 @@ fn map_db_message_stats(msg: &crate::db::entity::messages::Model) -> Option<Requ
         .total_tokens
         .and_then(|v| u32::try_from(v).ok())
         .or_else(|| prompt_tokens.zip(completion_tokens).map(|(p, c)| p + c));
+    let cache_read_tokens = msg.cache_read_tokens.and_then(|v| u32::try_from(v).ok());
+    let cache_write_tokens = msg.cache_write_tokens.and_then(|v| u32::try_from(v).ok());
     let context_window = msg.context_window.and_then(|v| u32::try_from(v).ok());
     let elapsed_ms = msg.elapsed_ms.and_then(|v| u64::try_from(v).ok());
     let provider_id = msg.provider_id.clone();
@@ -81,6 +83,8 @@ fn map_db_message_stats(msg: &crate::db::entity::messages::Model) -> Option<Requ
         && prompt_tokens.is_none()
         && completion_tokens.is_none()
         && total_tokens.is_none()
+        && cache_read_tokens.is_none()
+        && cache_write_tokens.is_none()
         && context_window.is_none()
         && elapsed_ms.is_none()
     {
@@ -92,6 +96,8 @@ fn map_db_message_stats(msg: &crate::db::entity::messages::Model) -> Option<Requ
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         context_window,
         elapsed_ms,
     })

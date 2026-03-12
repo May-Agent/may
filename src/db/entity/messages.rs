@@ -16,6 +16,8 @@ pub struct Model {
     pub prompt_tokens: Option<i32>,
     pub completion_tokens: Option<i32>,
     pub total_tokens: Option<i32>,
+    pub cache_read_tokens: Option<i32>,
+    pub cache_write_tokens: Option<i32>,
     pub context_window: Option<i32>,
     pub elapsed_ms: Option<i64>,
 }

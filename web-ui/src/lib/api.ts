@@ -151,6 +151,8 @@ export interface RequestLogEntry {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   contextWindow?: number;
   elapsedMs: number;
   ok: boolean;

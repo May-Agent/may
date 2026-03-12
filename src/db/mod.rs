@@ -79,6 +79,8 @@ pub struct MessageStatsParams {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+    pub cache_read_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
     pub context_window: Option<u32>,
     pub elapsed_ms: Option<u64>,
 }
@@ -316,6 +318,8 @@ impl ChatDb {
         Self::migrate_add_column(&conn, "messages", "prompt_tokens", "INTEGER").await?;
         Self::migrate_add_column(&conn, "messages", "completion_tokens", "INTEGER").await?;
         Self::migrate_add_column(&conn, "messages", "total_tokens", "INTEGER").await?;
+        Self::migrate_add_column(&conn, "messages", "cache_read_tokens", "INTEGER").await?;
+        Self::migrate_add_column(&conn, "messages", "cache_write_tokens", "INTEGER").await?;
         Self::migrate_add_column(&conn, "messages", "context_window", "INTEGER").await?;
         Self::migrate_add_column(&conn, "messages", "elapsed_ms", "INTEGER").await?;
         Self::migrate_default_profile_slugs(&conn).await?;
@@ -907,6 +911,16 @@ impl ChatDb {
             .map(i32::try_from)
             .transpose()
             .map_err(|e| DbErr::Custom(format!("total_tokens overflow: {e}")))?;
+        let cache_read_tokens = stats
+            .and_then(|s| s.cache_read_tokens)
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|e| DbErr::Custom(format!("cache_read_tokens overflow: {e}")))?;
+        let cache_write_tokens = stats
+            .and_then(|s| s.cache_write_tokens)
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|e| DbErr::Custom(format!("cache_write_tokens overflow: {e}")))?;
         let context_window = stats
             .and_then(|s| s.context_window)
             .map(i32::try_from)
@@ -930,6 +944,8 @@ impl ChatDb {
             prompt_tokens: Set(prompt_tokens),
             completion_tokens: Set(completion_tokens),
             total_tokens: Set(total_tokens),
+            cache_read_tokens: Set(cache_read_tokens),
+            cache_write_tokens: Set(cache_write_tokens),
             context_window: Set(context_window),
             elapsed_ms: Set(elapsed_ms),
             ..Default::default()
@@ -977,6 +993,16 @@ impl ChatDb {
             .map(i32::try_from)
             .transpose()
             .map_err(|e| DbErr::Custom(format!("total_tokens overflow: {e}")))?;
+        let cache_read_tokens = stats
+            .cache_read_tokens
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|e| DbErr::Custom(format!("cache_read_tokens overflow: {e}")))?;
+        let cache_write_tokens = stats
+            .cache_write_tokens
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|e| DbErr::Custom(format!("cache_write_tokens overflow: {e}")))?;
         let context_window = stats
             .context_window
             .map(i32::try_from)
@@ -993,6 +1019,8 @@ impl ChatDb {
         active.prompt_tokens = Set(prompt_tokens);
         active.completion_tokens = Set(completion_tokens);
         active.total_tokens = Set(total_tokens);
+        active.cache_read_tokens = Set(cache_read_tokens);
+        active.cache_write_tokens = Set(cache_write_tokens);
         active.context_window = Set(context_window);
         active.elapsed_ms = Set(elapsed_ms);
         active.update(&self.conn).await?;

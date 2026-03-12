@@ -173,6 +173,10 @@ pub(crate) struct RequestStats {
     #[serde(default)]
     pub(crate) total_tokens: Option<u32>,
     #[serde(default)]
+    pub(crate) cache_read_tokens: Option<u32>,
+    #[serde(default)]
+    pub(crate) cache_write_tokens: Option<u32>,
+    #[serde(default)]
     pub(crate) context_window: Option<u32>,
     #[serde(default)]
     pub(crate) elapsed_ms: Option<u64>,
@@ -188,6 +192,8 @@ pub(crate) struct RequestLogEntry {
     pub(crate) prompt_tokens: Option<u32>,
     pub(crate) completion_tokens: Option<u32>,
     pub(crate) total_tokens: Option<u32>,
+    pub(crate) cache_read_tokens: Option<u32>,
+    pub(crate) cache_write_tokens: Option<u32>,
     pub(crate) context_window: Option<u32>,
     pub(crate) elapsed_ms: u64,
     pub(crate) ok: bool,
@@ -216,6 +222,8 @@ impl RequestLogEntry {
                     .zip(usage.completion_tokens)
                     .map(|(p, c)| p + c)
             }),
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
             context_window,
             elapsed_ms: 0,
             ok: false,
