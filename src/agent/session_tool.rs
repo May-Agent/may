@@ -17,6 +17,7 @@ use lancedb::{Table, connect};
 use regex::RegexBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
 
 use crate::db::ChatDb;
 
@@ -680,42 +681,67 @@ fn rows_to_record_reader(
     Ok(Box::new(iter))
 }
 
-fn build_sql_filter(args: &SessionArgs) -> String {
+fn build_sql_filter(args: &SessionArgs) -> Option<String> {
     let mut filters = Vec::new();
 
     if let Some(session_id) = &args.session_id {
-        filters.push(format!("session_id = '{}'", escape_sql(session_id)));
+        filters.push(binary_sql_expr("session_id", BinaryOperator::Eq, session_id));
     }
 
     if let Some(excluded) = &args.exclude_session_id {
-        filters.push(format!("session_id != '{}'", escape_sql(excluded)));
+        filters.push(binary_sql_expr("session_id", BinaryOperator::NotEq, excluded));
     }
 
     if let Some(model) = &args.model {
-        filters.push(format!("model = '{}'", escape_sql(model)));
+        filters.push(binary_sql_expr("model", BinaryOperator::Eq, model));
     }
 
     if let Some(role) = &args.role {
-        filters.push(format!("role = '{}'", escape_sql(role)));
+        filters.push(binary_sql_expr("role", BinaryOperator::Eq, role));
     }
 
     if let Some(since) = &args.since {
-        filters.push(format!("timestamp >= '{}'", escape_sql(since)));
+        filters.push(binary_sql_expr("timestamp", BinaryOperator::GtEq, since));
     }
 
     if let Some(until) = &args.until {
-        filters.push(format!("timestamp <= '{}'", escape_sql(until)));
+        filters.push(binary_sql_expr("timestamp", BinaryOperator::LtEq, until));
     }
 
     if let Some(title_contains) = &args.title_contains {
-        filters.push(format!("title LIKE '%{}%'", escape_sql(title_contains)));
+        filters.push(SqlExpr::Like {
+            negated: false,
+            any: false,
+            expr: Box::new(identifier_sql_expr("title")),
+            pattern: Box::new(string_sql_expr(["%", title_contains, "%"].concat())),
+            escape_char: None,
+        });
     }
 
-    filters.join(" AND ")
+    filters
+        .into_iter()
+        .reduce(|left, right| SqlExpr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::And,
+            right: Box::new(right),
+        })
+        .map(|expr| expr.to_string())
 }
 
-fn escape_sql(input: &str) -> String {
-    input.replace('\'', "''")
+fn identifier_sql_expr(column: &str) -> SqlExpr {
+    SqlExpr::Identifier(Ident::new(column))
+}
+
+fn string_sql_expr(value: String) -> SqlExpr {
+    SqlExpr::value(SqlValue::SingleQuotedString(value))
+}
+
+fn binary_sql_expr(column: &str, op: BinaryOperator, value: &str) -> SqlExpr {
+    SqlExpr::BinaryOp {
+        left: Box::new(identifier_sql_expr(column)),
+        op,
+        right: Box::new(string_sql_expr(value.to_string())),
+    }
 }
 
 async fn run_plain_query(
@@ -738,8 +764,7 @@ async fn run_plain_query(
         ]))
         .limit(args.scan_limit);
 
-    let filter = build_sql_filter(args);
-    if !filter.is_empty() {
+    if let Some(filter) = build_sql_filter(args) {
         query = query.only_if(filter);
     }
 
@@ -790,8 +815,7 @@ async fn run_full_text_query(
         ]))
         .limit(args.scan_limit);
 
-    let filter = build_sql_filter(args);
-    if !filter.is_empty() {
+    if let Some(filter) = build_sql_filter(args) {
         query = query.only_if(filter);
     }
 
