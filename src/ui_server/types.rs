@@ -200,6 +200,35 @@ pub(crate) struct RequestLogEntry {
     pub(crate) error: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RequestLogCacheSummary {
+    pub(crate) assistant_message_count: u64,
+    pub(crate) cache_hit_message_count: u64,
+    pub(crate) prompt_tokens_total: u64,
+    pub(crate) cache_read_tokens_total: u64,
+    pub(crate) cache_write_tokens_total: u64,
+    pub(crate) cache_read_hit_rate: Option<f64>,
+}
+
+impl From<crate::db::AssistantCacheUsageSummary> for RequestLogCacheSummary {
+    fn from(value: crate::db::AssistantCacheUsageSummary) -> Self {
+        let cache_read_hit_rate = if value.prompt_tokens_total == 0 {
+            None
+        } else {
+            Some(value.cache_read_tokens_total as f64 / value.prompt_tokens_total as f64)
+        };
+        Self {
+            assistant_message_count: value.assistant_message_count,
+            cache_hit_message_count: value.cache_hit_message_count,
+            prompt_tokens_total: value.prompt_tokens_total,
+            cache_read_tokens_total: value.cache_read_tokens_total,
+            cache_write_tokens_total: value.cache_write_tokens_total,
+            cache_read_hit_rate,
+        }
+    }
+}
+
 impl RequestLogEntry {
     /// Create a base request-log entry; finalize via `success`/`failure`.
     pub(crate) fn new(
@@ -249,6 +278,7 @@ impl RequestLogEntry {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RequestLogsResponse {
     pub(crate) logs: Vec<RequestLogEntry>,
+    pub(crate) cache_summary: RequestLogCacheSummary,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

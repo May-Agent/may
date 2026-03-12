@@ -208,11 +208,20 @@ async fn emit_request_logs_if_changed(
     sender: &skyzen::responder::sse::Sender,
     last_logs_sig: &mut String,
 ) -> bool {
-    let payload = {
+    let logs = {
         let logs = state.request_logs.lock().await;
-        RequestLogsResponse {
-            logs: logs.iter().cloned().collect(),
+        logs.iter().cloned().collect()
+    };
+    let cache_summary = match state.db().await.assistant_cache_usage_summary().await {
+        Ok(summary) => super::types::RequestLogCacheSummary::from(summary),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to build request log cache summary");
+            return true;
         }
+    };
+    let payload = RequestLogsResponse {
+        logs,
+        cache_summary,
     };
 
     if let Ok(sig) = serde_json::to_string(&payload)

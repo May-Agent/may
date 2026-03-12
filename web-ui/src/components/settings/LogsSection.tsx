@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { BookOpen } from 'lucide-react';
 import * as api from '@/lib/api';
-import type { RequestLogEntry } from '@/lib/api';
+import type { RequestLogCacheSummary, RequestLogEntry } from '@/lib/api';
 
 export function LogsSection() {
   const [requestLogs, setRequestLogs] = useState<RequestLogEntry[]>([]);
+  const [cacheSummary, setCacheSummary] = useState<RequestLogCacheSummary | null>(null);
   const [requestLogsError, setRequestLogsError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -23,9 +24,10 @@ export function LogsSection() {
 
     const loadLogs = async () => {
       try {
-        const logs = await api.fetchRequestLogs();
+        const payload = await api.fetchRequestLogs();
         if (!cancelled) {
-          setRequestLogs(logs);
+          setRequestLogs(payload.logs);
+          setCacheSummary(payload.cacheSummary);
           setRequestLogsError(null);
           clearDisconnectError();
         }
@@ -43,6 +45,7 @@ export function LogsSection() {
       onRequestLogs: (payload) => {
         if (cancelled) return;
         setRequestLogs(payload.logs);
+        setCacheSummary(payload.cacheSummary);
         setRequestLogsError(null);
         clearDisconnectError();
       },
@@ -73,6 +76,11 @@ export function LogsSection() {
       </div>
       {requestLogsError && (
         <div className="text-xs text-destructive">{requestLogsError}</div>
+      )}
+      {cacheSummary && (
+        <div className="rounded border px-3 py-2 text-xs text-muted-foreground">
+          cache summary: assistant_messages={cacheSummary.assistantMessageCount} cache_hit_messages={cacheSummary.cacheHitMessageCount} prompt_tokens={cacheSummary.promptTokensTotal} cache_read={cacheSummary.cacheReadTokensTotal} cache_write={cacheSummary.cacheWriteTokensTotal} hit_rate={cacheSummary.cacheReadHitRate != null ? `${(cacheSummary.cacheReadHitRate * 100).toFixed(1)}%` : '-'}
+        </div>
       )}
       <div className="rounded border divide-y max-h-[560px] overflow-auto">
         {requestLogs.length === 0 && (
