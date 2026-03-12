@@ -8,6 +8,8 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub session_id: String,
     pub context_json: String,
+    pub assembled_messages_json: Option<String>,
+    pub metadata_json: Option<String>,
     pub updated_at: String,
 }
 

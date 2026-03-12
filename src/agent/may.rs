@@ -1007,6 +1007,10 @@ impl MayAgent {
         self.inner.export_context_json()
     }
 
+    pub(crate) async fn snapshot_context_window(&mut self) -> aither_agent::ContextWindowSnapshot {
+        self.inner.snapshot_context_window().await
+    }
+
     pub(crate) fn restore_context_json(
         &mut self,
         context_json: &str,

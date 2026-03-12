@@ -593,7 +593,7 @@ async fn run_agent_loop(
         schedule_profile_memory_processing(state, profile_id.as_deref()).await;
         title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
         enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
-        persist_context_snapshot(state, &session_id, &agent).await?;
+        persist_context_snapshot(state, &session_id, &mut agent).await?;
 
         return Ok(AgentRunResult {
             assistant_id,
@@ -706,16 +706,26 @@ async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyRes
 async fn persist_context_snapshot(
     state: &Arc<UiServerState>,
     session_id: &SessionId,
-    agent: &MayAgent,
+    agent: &mut MayAgent,
 ) -> anyhow::Result<()> {
     let context_json = agent.export_context_json().map_err(anyhow::Error::from)?;
+    let window_snapshot = agent.snapshot_context_window().await;
+    let assembled_messages_json = serde_json::to_string(&window_snapshot.messages)?;
+    let metadata_json = serde_json::to_string(&window_snapshot.metrics)?;
     let db = {
         let manager = state.session_manager.lock().await;
         manager.db().clone()
     };
-    db.upsert_session_context_snapshot(session_id.as_str(), &context_json)
-        .await
-        .map_err(anyhow::Error::from)
+    db.upsert_session_context_snapshot(
+        session_id.as_str(),
+        crate::db::SessionContextSnapshotUpsert {
+            context_json: &context_json,
+            assembled_messages_json: Some(&assembled_messages_json),
+            metadata_json: Some(&metadata_json),
+        },
+    )
+    .await
+    .map_err(anyhow::Error::from)
 }
 
 async fn schedule_profile_memory_processing(state: &Arc<UiServerState>, profile_id: Option<&str>) {
