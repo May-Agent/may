@@ -21,8 +21,8 @@ use crate::session::{
 };
 use entity::{
     context_debug_snapshots, folders, messages, profile_memories, profiles, push_subscriptions,
-    scheduled_tasks, session_pending_ask_user, session_pending_messages,
-    session_pending_permissions, session_runtimes, sessions,
+    scheduled_tasks, session_context_snapshots, session_pending_ask_user,
+    session_pending_messages, session_pending_permissions, session_runtimes, sessions,
 };
 
 /// Error type for database operations.
@@ -178,6 +178,12 @@ impl ChatDb {
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
 
+        let session_context_stmt = schema.create_table_from_entity(session_context_snapshots::Entity);
+        let create_sql = session_context_stmt
+            .to_string(SqliteQueryBuilder)
+            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        conn.execute_unprepared(&create_sql).await?;
+
         let session_runtime_stmt = schema.create_table_from_entity(session_runtimes::Entity);
         let create_sql = session_runtime_stmt
             .to_string(SqliteQueryBuilder)
@@ -236,6 +242,10 @@ impl ChatDb {
         .await?;
         conn.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_context_debug_snapshots_timestamp ON context_debug_snapshots(timestamp)",
+        )
+        .await?;
+        conn.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_session_context_snapshots_updated_at ON session_context_snapshots(updated_at)",
         )
         .await?;
         conn.execute_unprepared(
@@ -757,6 +767,9 @@ impl ChatDb {
             .filter(messages::Column::SessionId.eq(id))
             .exec(&self.conn)
             .await?;
+        session_context_snapshots::Entity::delete_by_id(id)
+            .exec(&self.conn)
+            .await?;
         sessions::Entity::delete_by_id(id).exec(&self.conn).await?;
         Ok(())
     }
@@ -764,8 +777,11 @@ impl ChatDb {
     /// Delete all sessions.
     pub async fn delete_all_sessions(&self) -> Result<u64, ChatDbError> {
         let result = messages::Entity::delete_many().exec(&self.conn).await?;
+        let snapshot_result = session_context_snapshots::Entity::delete_many()
+            .exec(&self.conn)
+            .await?;
         let session_result = sessions::Entity::delete_many().exec(&self.conn).await?;
-        Ok(result.rows_affected + session_result.rows_affected)
+        Ok(result.rows_affected + snapshot_result.rows_affected + session_result.rows_affected)
     }
 
     /// List all sessions ordered by updated_at descending.
@@ -1027,6 +1043,54 @@ impl ChatDb {
             .one(&self.conn)
             .await?;
         Ok(row)
+    }
+
+    /// Upsert the latest serialized agent context snapshot for a session.
+    pub async fn upsert_session_context_snapshot(
+        &self,
+        session_id: &str,
+        context_json: &str,
+    ) -> Result<(), ChatDbError> {
+        let updated_at = jiff::Timestamp::now().to_string();
+        let active = session_context_snapshots::ActiveModel {
+            session_id: Set(session_id.to_string()),
+            context_json: Set(context_json.to_string()),
+            updated_at: Set(updated_at),
+        };
+        session_context_snapshots::Entity::insert(active)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(session_context_snapshots::Column::SessionId)
+                    .update_columns([
+                        session_context_snapshots::Column::ContextJson,
+                        session_context_snapshots::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Load the serialized agent context snapshot for a session.
+    pub async fn get_session_context_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<session_context_snapshots::Model>, ChatDbError> {
+        session_context_snapshots::Entity::find_by_id(session_id)
+            .one(&self.conn)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Delete a persisted context snapshot for a session.
+    pub async fn delete_session_context_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<(), ChatDbError> {
+        session_context_snapshots::Entity::delete_by_id(session_id)
+            .exec(&self.conn)
+            .await?;
+        Ok(())
     }
 
     // ── Permission / AskUser Queries ─────────────────────────────

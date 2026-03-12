@@ -428,26 +428,27 @@ async fn run_agent_loop(
         sink.on_start(&req.session_id, &assistant_id).await;
 
         let mut terminal_error: Option<aither_agent::AgentError> = None;
-        let mut stream = std::pin::pin!(agent.run(&prompt, attachments));
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(aither_agent::AgentEvent::Reasoning(text)) => {
-                    reasoning_text.push_str(&text);
-                    sink.on_reasoning(&text).await;
-                }
-                Ok(aither_agent::AgentEvent::Text(text)) => {
-                    segment_text.push_str(&text);
-                    full_text.push_str(&text);
-                    sink.on_text(&text).await;
-                }
-                Ok(aither_agent::AgentEvent::Usage(u)) => {
-                    usage = u;
-                }
-                Ok(aither_agent::AgentEvent::ToolCallStart {
-                    id,
-                    name,
-                    arguments,
-                }) => {
+        {
+            let mut stream = std::pin::pin!(agent.run(&prompt, attachments));
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(aither_agent::AgentEvent::Reasoning(text)) => {
+                        reasoning_text.push_str(&text);
+                        sink.on_reasoning(&text).await;
+                    }
+                    Ok(aither_agent::AgentEvent::Text(text)) => {
+                        segment_text.push_str(&text);
+                        full_text.push_str(&text);
+                        sink.on_text(&text).await;
+                    }
+                    Ok(aither_agent::AgentEvent::Usage(u)) => {
+                        usage = u;
+                    }
+                    Ok(aither_agent::AgentEvent::ToolCallStart {
+                        id,
+                        name,
+                        arguments,
+                    }) => {
                     // Flush accumulated text as a history message before the tool call.
                     if !segment_text.trim().is_empty() {
                         append_history_message(
@@ -475,8 +476,8 @@ async fn run_agent_loop(
                     update_bash_snapshot_from_tool_event(&mut bash_snapshot, &record);
                     tool_arguments_by_id.insert(id.clone(), arguments.clone());
                     sink.on_tool_start(&id, &name, &arguments).await;
-                }
-                Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
+                    }
+                    Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
                     let record = ToolEventRecord::End {
                         id: id.clone(),
                         name: name.clone(),
@@ -501,20 +502,21 @@ async fn run_agent_loop(
                     {
                         sink.on_todo_update(&event).await;
                     }
+                    }
+                    Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
+                        terminal_error = Some(err);
+                        break;
+                    }
+                    Ok(_) => {}
                 }
-                Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
-                    terminal_error = Some(err);
+
+                if is_takeover_active_for_session(state, &session_id).await {
+                    terminal_error = Some(aither_agent::AgentError::Config(
+                        "Browser takeover is active for this session; model execution paused"
+                            .to_string(),
+                    ));
                     break;
                 }
-                Ok(_) => {}
-            }
-
-            if is_takeover_active_for_session(state, &session_id).await {
-                terminal_error = Some(aither_agent::AgentError::Config(
-                    "Browser takeover is active for this session; model execution paused"
-                        .to_string(),
-                ));
-                break;
             }
         }
 
@@ -590,6 +592,7 @@ async fn run_agent_loop(
         schedule_profile_memory_processing(state, profile_id.as_deref());
         title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
         enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
+        persist_context_snapshot(state, &session_id, &agent).await?;
 
         return Ok(AgentRunResult {
             assistant_id,
@@ -697,6 +700,21 @@ async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyRes
             }),
         },
     })
+}
+
+async fn persist_context_snapshot(
+    state: &Arc<UiServerState>,
+    session_id: &SessionId,
+    agent: &MayAgent,
+) -> anyhow::Result<()> {
+    let context_json = agent.export_context_json().map_err(anyhow::Error::from)?;
+    let db = {
+        let manager = state.session_manager.lock().await;
+        manager.db().clone()
+    };
+    db.upsert_session_context_snapshot(session_id.as_str(), &context_json)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 fn schedule_profile_memory_processing(state: &Arc<UiServerState>, profile_id: Option<&str>) {
@@ -841,6 +859,8 @@ struct SessionContext {
     provider_candidate_count: usize,
     sandbox_dir: std::path::PathBuf,
     history_messages: Vec<LlmMessage>,
+    context_snapshot_json: Option<String>,
+    incremental_messages: Vec<LlmMessage>,
     profile_persona: Option<String>,
     profile_memories: Option<crate::memory::ProfileMemories>,
     profile_model: Option<crate::db::entity::profiles::Model>,
@@ -935,14 +955,15 @@ async fn resolve_session_context(
         None
     };
 
+    let mut incremental_messages = Vec::new();
     if persist_user_message {
         if take_over_alert_pending(state, &session_id).await {
+            let takeover_alert = BROWSER_TAKEOVER_ALERT_XML.trim().to_string();
             manager
-                .append_message(ChatMessage::hidden_context(
-                    BROWSER_TAKEOVER_ALERT_XML.trim().to_string(),
-                ))
+                .append_message(ChatMessage::hidden_context(takeover_alert.clone()))
                 .await
                 .map_err(anyhow::Error::from)?;
+            incremental_messages.push(LlmMessage::system(takeover_alert));
         }
 
         if let Some(hidden_context_xml) = req
@@ -962,6 +983,7 @@ async fn resolve_session_context(
                     .append_message(ChatMessage::hidden_context(hidden_context_xml.to_string()))
                     .await
                     .map_err(anyhow::Error::from)?;
+                incremental_messages.push(LlmMessage::system(hidden_context_xml.to_string()));
             }
         }
 
@@ -984,6 +1006,24 @@ async fn resolve_session_context(
         .current()
         .map(|s| s.history.to_aither_messages())
         .unwrap_or_default();
+    let history_messages = if persist_user_message {
+        let mut history_messages = history_messages;
+        let should_pop = history_messages.last().is_some_and(|message| {
+            message.role() == LlmRole::User && message.content() == req.content
+        });
+        if should_pop {
+            let _ = history_messages.pop();
+        }
+        history_messages
+    } else {
+        history_messages
+    };
+    let context_snapshot_json = manager
+        .db()
+        .get_session_context_snapshot(session_id.as_str())
+        .await
+        .map_err(anyhow::Error::from)?
+        .map(|snapshot| snapshot.context_json);
 
     let sandbox_dir = manager
         .current()
@@ -996,6 +1036,8 @@ async fn resolve_session_context(
         provider_candidate_count,
         sandbox_dir,
         history_messages,
+        context_snapshot_json,
+        incremental_messages,
         profile_persona,
         profile_memories,
         profile_model,
@@ -1220,8 +1262,17 @@ async fn prepare_agent_for_request(
     .await
     .map_err(anyhow::Error::from)?;
 
-    for message in ctx.history_messages {
-        agent.inner_mut().push_message(message);
+    if let Some(context_snapshot_json) = ctx.context_snapshot_json.as_deref() {
+        agent
+            .restore_context_json(context_snapshot_json)
+            .map_err(anyhow::Error::from)?;
+        for message in ctx.incremental_messages {
+            agent.inner_mut().push_message(message);
+        }
+    } else {
+        for message in ctx.history_messages {
+            agent.inner_mut().push_message(message);
+        }
     }
 
     let provider_id = agent.provider_id().to_string();
