@@ -906,6 +906,13 @@ export async function fetchSessionRuntime(sessionId: string): Promise<SessionRun
   return request<SessionRuntimeStatus>(`/api/sessions/${encodeURIComponent(sessionId)}/runtime`);
 }
 
+export async function stopSessionRun(sessionId: string): Promise<SessionRuntimeStatus> {
+  return request<SessionRuntimeStatus>(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+  });
+}
+
 export async function removePendingSessionMessage(input: {
   sessionId: string;
   kind: 'pending_immediate' | 'queued';

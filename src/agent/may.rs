@@ -549,6 +549,104 @@ struct ImagineTool {
     artifacts_dir: PathBuf,
 }
 
+#[derive(Clone)]
+struct RuntimeSystemContext {
+    memory_path: PathBuf,
+    last_memory_content: String,
+    workspace: Option<Workspace>,
+    browser: Option<Browser>,
+    profile_persona: Option<ProfilePersona>,
+    profile_memories: Option<ProfileMemories>,
+    location: Option<LocationContext>,
+    native_voice_input: Option<NativeVoiceInput>,
+    platform: Option<Platform>,
+}
+
+impl RuntimeSystemContext {
+    fn new(memory_path: PathBuf, memory_content: String) -> Self {
+        Self {
+            memory_path,
+            last_memory_content: memory_content,
+            workspace: None,
+            browser: None,
+            profile_persona: None,
+            profile_memories: None,
+            location: None,
+            native_voice_input: None,
+            platform: None,
+        }
+    }
+
+    fn with_workspace(mut self, workspace: Workspace) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    fn with_browser(mut self, browser: Browser) -> Self {
+        self.browser = Some(browser);
+        self
+    }
+
+    fn with_profile_persona(mut self, profile_persona: ProfilePersona) -> Self {
+        self.profile_persona = Some(profile_persona);
+        self
+    }
+
+    fn with_profile_memories(mut self, profile_memories: ProfileMemories) -> Self {
+        self.profile_memories = Some(profile_memories);
+        self
+    }
+
+    fn with_location(mut self, location: LocationContext) -> Self {
+        self.location = Some(location);
+        self
+    }
+
+    fn with_native_voice_input(mut self, native_voice_input: NativeVoiceInput) -> Self {
+        self.native_voice_input = Some(native_voice_input);
+        self
+    }
+
+    fn with_platform(mut self, platform: Platform) -> Self {
+        self.platform = Some(platform);
+        self
+    }
+
+    fn reconcile(&mut self, context: &mut aither_agent::Context) {
+        self.refresh_memory_file();
+        let memory = build_memory_context(&self.last_memory_content);
+        reconcile_system_block(context, Some(&memory));
+        reconcile_system_block(context, self.workspace.as_ref());
+        reconcile_system_block(context, self.browser.as_ref());
+        reconcile_system_block(context, self.profile_persona.as_ref());
+        reconcile_system_block(context, self.profile_memories.as_ref());
+        reconcile_system_block(context, self.location.as_ref());
+        reconcile_system_block(context, self.native_voice_input.as_ref());
+        reconcile_system_block(context, self.platform.as_ref());
+    }
+
+    fn refresh_memory_file(&mut self) {
+        let memory_content =
+            std::fs::read_to_string(&self.memory_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read memory file at {}: {error}",
+                    self.memory_path.display()
+                )
+            });
+        self.last_memory_content = memory_content;
+    }
+}
+
+fn reconcile_system_block<T: serde::Serialize>(
+    context: &mut aither_agent::Context,
+    value: Option<&T>,
+) {
+    match value {
+        Some(value) => context.insert_system(value),
+        None => context.remove_system::<T>(),
+    }
+}
+
 impl Tool for ImagineTool {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("imagine")
@@ -683,8 +781,7 @@ pub struct MayAgent {
     sandbox_dir: PathBuf,
     provider_id: String,
     model_context_window: Option<u32>,
-    memory_path: PathBuf,
-    last_memory_content: String,
+    runtime_system_context: RuntimeSystemContext,
 }
 
 impl MayAgent {
@@ -723,6 +820,8 @@ impl MayAgent {
         // Read global memory from ~/.may/MEMORY.md.
         let memory_path = global_memory_file_path(&config.may_dir);
         let memory_content = async_fs::read_to_string(&memory_path).await?;
+        let mut runtime_system_context =
+            RuntimeSystemContext::new(memory_path.clone(), memory_content.clone());
 
         // Clone LLM for tools that need it before it's moved into the builder
         let fast_llm = config.llm.clone();
@@ -837,25 +936,35 @@ impl MayAgent {
             .max_iterations(effective_max_iterations);
 
         if let Some(voice_hint) = build_native_voice_context(config.native_voice_input) {
+            runtime_system_context =
+                runtime_system_context.with_native_voice_input(voice_hint.clone());
             builder = builder.system(voice_hint);
         }
 
         if let Some(ref persona) = config.profile_persona {
-            builder = builder.system(ProfilePersona {
+            let profile_persona = ProfilePersona {
                 content: persona.clone(),
-            });
+            };
+            runtime_system_context =
+                runtime_system_context.with_profile_persona(profile_persona.clone());
+            builder = builder.system(profile_persona);
         }
 
         if let Some(ref memories) = config.profile_memories
             && !memories.is_empty()
         {
-            builder = builder.system(ProfileMemories {
+            let profile_memories = ProfileMemories {
                 content: memories.to_context_string(),
-            });
+            };
+            runtime_system_context =
+                runtime_system_context.with_profile_memories(profile_memories.clone());
+            builder = builder.system(profile_memories);
         }
 
         if let Some(ref location) = config.location {
-            builder = builder.system(build_location_context(location));
+            let location_context = build_location_context(location);
+            runtime_system_context = runtime_system_context.with_location(location_context.clone());
+            builder = builder.system(location_context);
         }
 
         // Environment-specific configuration
@@ -874,12 +983,19 @@ impl MayAgent {
                             "failed to resolve browser CDP endpoint from backend: {error}"
                         ))
                     })?;
-                    builder = builder.system(build_browser_context(Some(endpoint.as_str())));
+                    let browser_context = build_browser_context(Some(endpoint.as_str()));
+                    runtime_system_context =
+                        runtime_system_context.with_browser(browser_context.clone());
+                    builder = builder.system(browser_context);
                 }
             }
             AgentEnvironment::Local => {
-                builder = builder.system(build_workspace_context(&workspace));
+                let workspace_context = build_workspace_context(&workspace);
+                runtime_system_context =
+                    runtime_system_context.with_workspace(workspace_context.clone());
+                builder = builder.system(workspace_context);
                 if let Some(macos_hint) = build_macos_host_automation_context() {
+                    runtime_system_context = runtime_system_context.with_platform(macos_hint.clone());
                     builder = builder.system(macos_hint);
                 }
             }
@@ -910,8 +1026,7 @@ impl MayAgent {
             sandbox_dir: actual_sandbox_dir,
             provider_id: config.provider_id,
             model_context_window: config.model_context_window,
-            memory_path,
-            last_memory_content: memory_content,
+            runtime_system_context,
         })
     }
 
@@ -1098,13 +1213,13 @@ impl MayAgent {
         prompt: &str,
         attachments: impl IntoIterator<Item = url::Url>,
     ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
-        self.refresh_memory_context();
+        self.refresh_runtime_context();
         self.inner.run(prompt, attachments)
     }
 
     /// One-shot query.
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
-        self.refresh_memory_context();
+        self.refresh_runtime_context();
         self.inner.query(prompt).await
     }
 
@@ -1114,7 +1229,7 @@ impl MayAgent {
         prompt: &str,
         attachments: impl IntoIterator<Item = url::Url>,
     ) -> Vec<LlmMessage> {
-        self.refresh_memory_context();
+        self.refresh_runtime_context();
         self.inner
             .preview_request_messages(prompt, attachments)
             .await
@@ -1163,7 +1278,9 @@ impl MayAgent {
         &mut self,
         context_json: &str,
     ) -> Result<(), serde_json::Error> {
-        self.inner.restore_context_json(context_json)
+        self.inner.restore_context_json(context_json)?;
+        self.refresh_runtime_context();
+        Ok(())
     }
 
     /// Clear conversation history.
@@ -1171,27 +1288,9 @@ impl MayAgent {
         self.inner.clear_history();
     }
 
-    fn refresh_memory_context(&mut self) {
-        // Static system blocks are populated lazily by aither-agent during the first turn.
-        // Before that point, memory is already present via the startup context block.
-        if !self.inner.context().has_system_block("knowledge_and_time") {
-            return;
-        }
-
-        let memory_content = std::fs::read_to_string(&self.memory_path).unwrap_or_else(|error| {
-            panic!(
-                "failed to read memory file at {}: {error}",
-                self.memory_path.display()
-            )
-        });
-        if memory_content == self.last_memory_content {
-            return;
-        }
-
-        self.last_memory_content = memory_content.clone();
-        self.inner.context_mut().insert_system(&Memory {
-            content: build_memory_context_content(&memory_content),
-        });
+    fn refresh_runtime_context(&mut self) {
+        self.runtime_system_context
+            .reconcile(self.inner.context_mut());
     }
 }
 
@@ -1426,20 +1525,20 @@ const MEMORY_CONTEXT_HINT: &str = include_str!("../texts/memory_context_hint.txt
 const MACOS_HOST_AUTOMATION_HINT: &str = include_str!("../texts/macos_host_hint.txt");
 const NATIVE_VOICE_AVAILABLE_HINT: &str = "Native voice input is available in this session. You may treat spoken input as first-class user messages.";
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct Browser {
     #[serde(skip_serializing_if = "Option::is_none")]
     cdp_endpoint: Option<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct Workspace {
     sandbox: String,
     cwd: String,
     workdirs: Vec<WorkspaceDirEntry>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct WorkspaceDirEntry {
     path: String,
     description: String,
@@ -1457,25 +1556,25 @@ impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct Memory {
     #[serde(rename = "$text")]
     content: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct ProfilePersona {
     #[serde(rename = "$text")]
     content: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct ProfileMemories {
     #[serde(rename = "$text")]
     content: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct LocationContext {
     city: String,
     region: String,
@@ -1483,13 +1582,13 @@ struct LocationContext {
     timezone: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct NativeVoiceInput {
     #[serde(rename = "$text")]
     content: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct Platform {
     #[serde(rename = "$text")]
     content: String,
@@ -1583,4 +1682,74 @@ fn global_memory_file_path(may_dir: &std::path::Path) -> PathBuf {
         });
     }
     upper
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::{
+        ProfilePersona, RuntimeSystemContext, Workspace, WorkspaceDirEntry,
+        build_memory_context_content,
+    };
+
+    #[test]
+    fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
+        let dir = tempdir().expect("temp dir should be created");
+        let memory_path = dir.path().join("MEMORY.md");
+        std::fs::write(&memory_path, "remember this")
+            .expect("memory file should be written");
+
+        let mut runtime_context =
+            RuntimeSystemContext::new(memory_path, "remember this".to_string());
+        let mut context = aither_agent::Context::default();
+        context.insert_system(&ProfilePersona {
+            content: "stale persona".to_string(),
+        });
+        context.insert_system(&Workspace {
+            sandbox: "/tmp/old".to_string(),
+            cwd: "/tmp/old".to_string(),
+            workdirs: vec![WorkspaceDirEntry {
+                path: "/tmp/old".to_string(),
+                description: "stale".to_string(),
+            }],
+        });
+
+        runtime_context.reconcile(&mut context);
+
+        assert!(context.has_system_block("memory"));
+        let memory = context
+            .system_blocks()
+            .get("memory")
+            .expect("memory block should be present");
+        assert!(
+            memory.contains(&build_memory_context_content("remember this")),
+            "unexpected memory block: {memory}"
+        );
+        assert!(!context.has_system_block("profile_persona"));
+        assert!(!context.has_system_block("workspace"));
+    }
+
+    #[test]
+    fn runtime_system_context_refreshes_memory_from_disk() {
+        let dir = tempdir().expect("temp dir should be created");
+        let memory_path = dir.path().join("MEMORY.md");
+        std::fs::write(&memory_path, "before").expect("memory file should be written");
+
+        let mut runtime_context = RuntimeSystemContext::new(memory_path.clone(), "before".to_string());
+        let mut context = aither_agent::Context::default();
+        runtime_context.reconcile(&mut context);
+
+        std::fs::write(&memory_path, "after").expect("memory file should be updated");
+        runtime_context.reconcile(&mut context);
+
+        let memory = context
+            .system_blocks()
+            .get("memory")
+            .expect("memory block should be present");
+        assert!(
+            memory.contains(&build_memory_context_content("after")),
+            "unexpected memory block: {memory}"
+        );
+    }
 }

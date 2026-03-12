@@ -44,25 +44,25 @@ use super::types::{
 /// `SseSink` streams events to the browser; `CollectSink` is a no-op
 /// (data is accumulated in the shared loop and returned as a result).
 trait ChatSink {
-    async fn on_start(&mut self, session_id: &str, assistant_id: &str);
-    async fn on_text(&mut self, chunk: &str);
-    async fn on_reasoning(&mut self, chunk: &str);
-    async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str);
+    async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool;
+    async fn on_text(&mut self, chunk: &str) -> bool;
+    async fn on_reasoning(&mut self, chunk: &str) -> bool;
+    async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool;
     async fn on_tool_end(
         &mut self,
         id: &str,
         name: &str,
         arguments: Option<&str>,
         result: &Result<String, String>,
-    );
-    async fn on_todo_update(&mut self, event: &SseTodoUpdateEvent);
-    async fn on_error(&mut self, message: &str);
+    ) -> bool;
+    async fn on_todo_update(&mut self, event: &SseTodoUpdateEvent) -> bool;
+    async fn on_error(&mut self, message: &str) -> bool;
 }
 
 struct SseSink(skyzen::responder::sse::Sender);
 
 impl ChatSink for SseSink {
-    async fn on_start(&mut self, session_id: &str, assistant_id: &str) {
+    async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool {
         send_event(
             &self.0,
             "start",
@@ -71,18 +71,18 @@ impl ChatSink for SseSink {
                 assistant_id,
             },
         )
-        .await;
+        .await
     }
 
-    async fn on_text(&mut self, chunk: &str) {
-        send_event(&self.0, "text", &SseChunkEvent { chunk }).await;
+    async fn on_text(&mut self, chunk: &str) -> bool {
+        send_event(&self.0, "text", &SseChunkEvent { chunk }).await
     }
 
-    async fn on_reasoning(&mut self, chunk: &str) {
-        send_event(&self.0, "reasoning", &SseChunkEvent { chunk }).await;
+    async fn on_reasoning(&mut self, chunk: &str) -> bool {
+        send_event(&self.0, "reasoning", &SseChunkEvent { chunk }).await
     }
 
-    async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) {
+    async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool {
         send_event(
             &self.0,
             "tool_start",
@@ -92,7 +92,7 @@ impl ChatSink for SseSink {
                 arguments,
             },
         )
-        .await;
+        .await
     }
 
     async fn on_tool_end(
@@ -101,7 +101,7 @@ impl ChatSink for SseSink {
         name: &str,
         arguments: Option<&str>,
         result: &Result<String, String>,
-    ) {
+    ) -> bool {
         send_event(
             &self.0,
             "tool_end",
@@ -112,15 +112,15 @@ impl ChatSink for SseSink {
                 result,
             },
         )
-        .await;
+        .await
     }
 
-    async fn on_todo_update(&mut self, event: &SseTodoUpdateEvent) {
-        send_event(&self.0, "todo_update", event).await;
+    async fn on_todo_update(&mut self, event: &SseTodoUpdateEvent) -> bool {
+        send_event(&self.0, "todo_update", event).await
     }
 
-    async fn on_error(&mut self, message: &str) {
-        send_event(&self.0, "error", &SseErrorEvent { message }).await;
+    async fn on_error(&mut self, message: &str) -> bool {
+        send_event(&self.0, "error", &SseErrorEvent { message }).await
     }
 }
 
@@ -128,14 +128,33 @@ impl ChatSink for SseSink {
 struct CollectSink;
 
 impl ChatSink for CollectSink {
-    async fn on_start(&mut self, _: &str, _: &str) {}
-    async fn on_text(&mut self, _: &str) {}
-    async fn on_reasoning(&mut self, _: &str) {}
-    async fn on_tool_start(&mut self, _: &str, _: &str, _: &str) {}
-    async fn on_tool_end(&mut self, _: &str, _: &str, _: Option<&str>, _: &Result<String, String>) {
+    async fn on_start(&mut self, _: &str, _: &str) -> bool {
+        true
     }
-    async fn on_todo_update(&mut self, _: &SseTodoUpdateEvent) {}
-    async fn on_error(&mut self, _: &str) {}
+    async fn on_text(&mut self, _: &str) -> bool {
+        true
+    }
+    async fn on_reasoning(&mut self, _: &str) -> bool {
+        true
+    }
+    async fn on_tool_start(&mut self, _: &str, _: &str, _: &str) -> bool {
+        true
+    }
+    async fn on_tool_end(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: &Result<String, String>,
+    ) -> bool {
+        true
+    }
+    async fn on_todo_update(&mut self, _: &SseTodoUpdateEvent) -> bool {
+        true
+    }
+    async fn on_error(&mut self, _: &str) -> bool {
+        true
+    }
 }
 
 /// Successful result from the shared agent loop.
@@ -148,6 +167,34 @@ struct AgentRunResult {
     provider_id: String,
     model_context_window: Option<u32>,
     elapsed_ms: u64,
+}
+
+struct SessionRunRegistration {
+    state: Arc<UiServerState>,
+    session_id: String,
+    receiver: async_channel::Receiver<()>,
+}
+
+impl SessionRunRegistration {
+    fn new(state: Arc<UiServerState>, session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        let receiver = state.run_cancellation_registry.open(session_id.clone());
+        Self {
+            state,
+            session_id,
+            receiver,
+        }
+    }
+
+    fn receiver(&self) -> &async_channel::Receiver<()> {
+        &self.receiver
+    }
+}
+
+impl Drop for SessionRunRegistration {
+    fn drop(&mut self) {
+        self.state.run_cancellation_registry.close(&self.session_id);
+    }
 }
 
 fn persisted_attachments(
@@ -373,6 +420,36 @@ pub(super) async fn remove_pending_message(
     Ok(Json(runtime.into()))
 }
 
+pub(super) async fn stop_session_run(
+    params: skyzen::routing::Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<SessionRuntimeResponse>> {
+    let session_id = params
+        .get("id")
+        .map_err(super::error::bad_request_error)?
+        .to_string();
+    let db = {
+        let manager = state.session_manager.lock().await;
+        manager.db().clone()
+    };
+    if !db.session_exists(&session_id).await.map_err(internal_error)? {
+        return Err(
+            skyzen::Error::msg(["Session ", session_id.as_str(), " not found"].concat())
+                .set_status(skyzen::StatusCode::NOT_FOUND),
+        );
+    }
+
+    let cancelled = state.run_cancellation_registry.cancel(&session_id);
+    tracing::info!(session_id = %session_id, cancelled, "received session stop request");
+
+    let runtime = state
+        .runtime_service
+        .get(&session_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(runtime.into()))
+}
+
 pub(super) async fn chat_stream(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<UiServerState>>,
@@ -428,6 +505,7 @@ async fn run_agent_loop(
     state: &Arc<UiServerState>,
     req: &ChatRequest,
     sink: &mut impl ChatSink,
+    cancel_rx: &async_channel::Receiver<()>,
 ) -> anyhow::Result<AgentRunResult> {
     let mut attempt = 0usize;
     let mut max_retries = 0usize;
@@ -445,7 +523,7 @@ async fn run_agent_loop(
         } = match prepare_agent_for_request(state, req, attempt == 0, attempt).await {
             Ok(prepared) => prepared,
             Err(error) => {
-                sink.on_error(&error.to_string()).await;
+                let _ = sink.on_error(&error.to_string()).await;
                 return Err(error);
             }
         };
@@ -469,21 +547,49 @@ async fn run_agent_loop(
         let mut last_todo_hash: Option<u64> = None;
         let tasks_md_path = agent.sandbox_dir().join("tasks.md");
 
-        sink.on_start(&req.session_id, &assistant_id).await;
+        if !sink.on_start(&req.session_id, &assistant_id).await {
+            return Err(anyhow::anyhow!("client disconnected before stream start"));
+        }
 
         let mut terminal_error: Option<aither_agent::AgentError> = None;
+        let mut cancellation_reason: Option<&'static str> = None;
         {
             let mut stream = std::pin::pin!(agent.run(&prompt, attachments));
-            while let Some(event) = stream.next().await {
+            loop {
+                let next_event = tokio::select! {
+                    biased;
+                    cancel = cancel_rx.recv() => {
+                        match cancel {
+                            Ok(()) => {
+                                cancellation_reason = Some("run cancelled by user");
+                                None
+                            }
+                            Err(_) => {
+                                cancellation_reason = Some("run cancellation channel closed unexpectedly");
+                                None
+                            }
+                        }
+                    }
+                    next = stream.next() => next,
+                };
+                let Some(event) = next_event else {
+                    break;
+                };
                 match event {
                     Ok(aither_agent::AgentEvent::Reasoning(text)) => {
                         reasoning_text.push_str(&text);
-                        sink.on_reasoning(&text).await;
+                        if !sink.on_reasoning(&text).await {
+                            cancellation_reason = Some("client disconnected during reasoning stream");
+                            break;
+                        }
                     }
                     Ok(aither_agent::AgentEvent::Text(text)) => {
                         segment_text.push_str(&text);
                         full_text.push_str(&text);
-                        sink.on_text(&text).await;
+                        if !sink.on_text(&text).await {
+                            cancellation_reason = Some("client disconnected during text stream");
+                            break;
+                        }
                     }
                     Ok(aither_agent::AgentEvent::Usage(u)) => {
                         usage = u;
@@ -520,7 +626,10 @@ async fn run_agent_loop(
                         }
                         update_bash_snapshot_from_tool_event(&mut bash_snapshot, &record);
                         tool_arguments_by_id.insert(id.clone(), arguments.clone());
-                        sink.on_tool_start(&id, &name, &arguments).await;
+                        if !sink.on_tool_start(&id, &name, &arguments).await {
+                            cancellation_reason = Some("client disconnected during tool stream");
+                            break;
+                        }
                     }
                     Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
                         saw_tool_activity = true;
@@ -539,14 +648,21 @@ async fn run_agent_loop(
                         }
                         update_bash_snapshot_from_tool_event(&mut bash_snapshot, &record);
                         let arguments = tool_arguments_by_id.remove(&id);
-                        sink.on_tool_end(&id, &name, arguments.as_deref(), &result)
-                            .await;
+                        if !sink
+                            .on_tool_end(&id, &name, arguments.as_deref(), &result)
+                            .await
+                        {
+                            cancellation_reason = Some("client disconnected during tool stream");
+                            break;
+                        }
 
                         // Check if tasks.md changed after tool execution.
                         if let Some(event) =
                             check_tasks_update(&tasks_md_path, &mut last_todo_hash).await
+                            && !sink.on_todo_update(&event).await
                         {
-                            sink.on_todo_update(&event).await;
+                            cancellation_reason = Some("client disconnected during todo update");
+                            break;
                         }
                     }
                     Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
@@ -591,8 +707,25 @@ async fn run_agent_loop(
                 log_base.failure(elapsed_ms_saturating(&started_at), &err_msg),
             )
             .await;
-            sink.on_error(&err_msg).await;
+            let _ = sink.on_error(&err_msg).await;
             return Err(anyhow::anyhow!(err));
+        }
+
+        if let Some(reason) = cancellation_reason {
+            if !segment_text.trim().is_empty() {
+                append_history_message(
+                    state,
+                    &session_id,
+                    ChatMessage::assistant(segment_text.clone()),
+                )
+                .await?;
+            }
+            record_request_log(
+                state,
+                log_base.failure(elapsed_ms_saturating(&started_at), reason),
+            )
+            .await;
+            return Err(anyhow::anyhow!(reason));
         }
 
         // Flush remaining text segment to history.
@@ -615,7 +748,7 @@ async fn run_agent_loop(
                 log_base.failure(elapsed_ms_saturating(&started_at), err),
             )
             .await;
-            sink.on_error(err).await;
+            let _ = sink.on_error(err).await;
             return Err(anyhow::anyhow!(err));
         }
         if !has_assistant_text && has_tool_activity {
@@ -660,8 +793,9 @@ async fn stream_chat_events(
     sender: skyzen::responder::sse::Sender,
 ) -> anyhow::Result<()> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
+    let run_registration = SessionRunRegistration::new(state.clone(), req.session_id.clone());
     let mut sink = SseSink(sender.clone());
-    let result = run_agent_loop(&state, &req, &mut sink).await;
+    let result = run_agent_loop(&state, &req, &mut sink, run_registration.receiver()).await;
     {
         let mut active = state.active_streaming_sessions.lock().await;
         active.remove(req.session_id.as_str());
@@ -712,8 +846,9 @@ async fn stream_chat_events(
 }
 
 async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyResult<ChatResponse> {
+    let run_registration = SessionRunRegistration::new(state.clone(), req.session_id.clone());
     let mut sink = CollectSink;
-    let result = run_agent_loop(&state, &req, &mut sink)
+    let result = run_agent_loop(&state, &req, &mut sink, run_registration.receiver())
         .await
         .map_err(|e| internal_error(e))?;
 
