@@ -3,6 +3,7 @@
 //! Background tokio task that ticks every 30 seconds, checks for due tasks
 //! (cron or one-time), and executes them through profile-specific runtimes.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -13,9 +14,14 @@ use aither_sandbox::{
     ContainerLaunchSpec, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
     ShellSessionRegistry, ToolRegistryBuilder, permission::PermissionError,
 };
+use arc_swap::ArcSwap;
+use askama::Template;
+use base64::Engine;
 use executor_core::DefaultExecutor;
 use sea_orm::DbErr;
+use shell_escape::escape as shell_escape;
 
+use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKind};
 use crate::container::lifecycle::ContainerManager;
 use crate::db::ChatDb;
 use crate::db::entity::{profiles, scheduled_tasks};
@@ -26,12 +32,37 @@ use crate::task_trigger::{
     normalize_event_name,
 };
 
-/// Task scheduler that runs in the background.
-pub struct TaskScheduler {
+/// Shared task execution facility used by the scheduler, REST API, and agent tools.
+#[derive(Clone)]
+pub struct TaskRuntime {
     db: ChatDb,
     notifier: Option<Arc<NotificationManager>>,
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
+    active_tasks: Arc<ArcSwap<TaskCatalog>>,
+}
+
+/// Time-based wrapper that periodically asks [`TaskRuntime`] to run due tasks.
+pub struct TaskScheduler {
+    runtime: Arc<TaskRuntime>,
+}
+
+#[derive(Template)]
+#[template(path = "task_validate_script.sh", escape = "none")]
+struct TaskValidationScriptTemplate<'a> {
+    validate_path: &'a str,
+    encoded_script: &'a str,
+}
+
+#[derive(Debug, Default)]
+struct TaskCatalog {
+    tasks: Vec<scheduled_tasks::Model>,
+}
+
+impl TaskCatalog {
+    fn from_tasks(tasks: Vec<scheduled_tasks::Model>) -> Self {
+        Self { tasks }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,14 +84,17 @@ impl PermissionHandler for SchedulerPermissionHandler {
     }
 }
 
-impl TaskScheduler {
-    pub fn new(db: ChatDb, may_dir: PathBuf) -> Self {
-        Self {
+impl TaskRuntime {
+    pub async fn load(db: ChatDb, may_dir: PathBuf) -> Result<Self, crate::db::ChatDbError> {
+        let runtime = Self {
             db,
             notifier: None,
             may_dir,
             container_manager: None,
-        }
+            active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
+        };
+        runtime.reload_active_tasks().await?;
+        Ok(runtime)
     }
 
     /// Attach a notification manager for sending push notifications on task completion.
@@ -75,29 +109,121 @@ impl TaskScheduler {
         self
     }
 
-    /// Spawn the scheduler as a background task.
-    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                if let Err(e) = self.tick().await {
-                    tracing::error!(error = %e, "Scheduler tick failed");
-                }
-            }
+    pub async fn reload_active_tasks(&self) -> Result<(), crate::db::ChatDbError> {
+        let tasks = self.db.list_due_tasks().await?;
+        self.active_tasks
+            .store(Arc::new(TaskCatalog::from_tasks(tasks)));
+        Ok(())
+    }
+
+    /// Validate that a task script can be parsed in the target profile runtime.
+    pub async fn validate_task_script_for_profile(
+        &self,
+        profile_id: &str,
+        script_path: Option<&str>,
+        script_inline: Option<&str>,
+    ) -> Result<(), String> {
+        let profile = self
+            .db
+            .get_profile(profile_id)
+            .await
+            .map_err(|e| format!("failed to load profile {profile_id}: {e}"))?
+            .ok_or_else(|| format!("profile {profile_id} not found"))?;
+        self.validate_task_script_for_profile_model(&profile, script_path, script_inline)
+            .await
+    }
+
+    /// Create a scheduled task requested by the in-chat `task` tool.
+    pub async fn create_task_from_tool_request(
+        &self,
+        request: TaskCreateRequest,
+    ) -> Result<TaskCreateResult, String> {
+        let runtime_kind = request.runtime;
+        let normalized = request.normalize()?;
+
+        let session = self
+            .db
+            .get_session(&normalized.session_id)
+            .await
+            .map_err(|e| format!("failed to load session {}: {e}", normalized.session_id))?
+            .ok_or_else(|| format!("session not found: {}", normalized.session_id))?;
+
+        let profile_id = session.profile_id.ok_or_else(|| {
+            format!(
+                "session {} is not attached to a profile",
+                normalized.session_id
+            )
+        })?;
+        let profile = self
+            .db
+            .get_profile(&profile_id)
+            .await
+            .map_err(|e| format!("failed to load profile {profile_id}: {e}"))?
+            .ok_or_else(|| format!("profile {profile_id} not found"))?;
+        let profile_info = ProfileInfo::from_db_model(profile.clone())
+            .map_err(|e| format!("invalid profile {profile_id}: {e}"))?;
+        let actual_runtime = match profile_info.environment {
+            ProfileEnvironment::Local => TaskRuntimeKind::Local,
+            ProfileEnvironment::Container { .. } => TaskRuntimeKind::Container,
+        };
+        if runtime_kind != actual_runtime {
+            return Err(format!(
+                "task runtime mismatch: session profile uses {:?}, request declared {:?}",
+                actual_runtime, runtime_kind
+            ));
+        }
+
+        self.validate_task_script_for_profile_model(
+            &profile,
+            normalized.script.script_path.as_deref(),
+            normalized.script.script_inline.as_deref(),
+        )
+        .await?;
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let model = self
+            .db
+            .create_scheduled_task(crate::db::CreateScheduledTaskParams {
+                id: &task_id,
+                profile_id: &profile_id,
+                session_id: Some(normalized.session_id.as_str()),
+                name: &normalized.name,
+                trigger_kind: &normalized.trigger_kind,
+                trigger_type: normalized.trigger.trigger_type.as_str(),
+                cron_expression: normalized.trigger.cron_expression.as_deref(),
+                run_at: normalized.trigger.run_at.as_deref(),
+                script_path: normalized.script.script_path.as_deref(),
+                script_inline: normalized.script.script_inline.as_deref(),
+                needs_network: normalized.needs_network,
+            })
+            .await
+            .map_err(|e| format!("failed to create scheduled task: {e}"))?;
+        self.reload_active_tasks()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(TaskCreateResult {
+            task_id: model.id,
+            profile_id: model.profile_id,
+            trigger_kind: model.trigger_kind,
+            trigger_type: model.trigger_type,
+            run_at: model.run_at,
+            cron_expression: model.cron_expression,
+            approved: model.approved,
+            enabled: model.enabled,
         })
     }
 
     /// Check for due tasks and execute them.
-    async fn tick(&self) -> Result<(), crate::db::ChatDbError> {
-        let tasks = self.db.list_due_tasks().await?;
+    pub async fn tick_due_tasks(&self) -> Result<(), crate::db::ChatDbError> {
+        let tasks = self.active_tasks.load();
         let now = jiff::Timestamp::now();
 
-        for task in tasks {
-            let is_due = self.is_due(&task, now)?;
+        for task in &tasks.tasks {
+            let is_due = self.is_due(task, now)?;
 
             if is_due {
-                self.execute_task(&task).await;
+                self.execute_task(task).await;
             }
         }
 
@@ -115,10 +241,10 @@ impl TaskScheduler {
     ) -> Result<usize, crate::db::ChatDbError> {
         let event_name = normalize_event_name(event_name)
             .map_err(|e| crate::db::ChatDbError::Db(DbErr::Custom(e)))?;
-        let tasks = self.db.list_due_tasks().await?;
+        let tasks = self.active_tasks.load();
         let mut dispatched = 0usize;
 
-        for task in tasks {
+        for task in &tasks.tasks {
             if task.trigger_kind != TRIGGER_KIND_EVENT || task.trigger_type != event_name {
                 continue;
             }
@@ -133,7 +259,7 @@ impl TaskScheduler {
                 continue;
             }
             dispatched += 1;
-            self.execute_task_by_model(&task).await;
+            self.execute_task_by_model(task).await;
         }
 
         Ok(dispatched)
@@ -236,6 +362,24 @@ impl TaskScheduler {
         self.execute_task(task).await;
     }
 
+    async fn validate_task_script_for_profile_model(
+        &self,
+        profile: &profiles::Model,
+        script_path: Option<&str>,
+        script_inline: Option<&str>,
+    ) -> Result<(), String> {
+        let profile_info = ProfileInfo::from_db_model(profile.clone())
+            .map_err(|e| format!("invalid profile {}: {e}", profile.id))?;
+        let script = self
+            .resolve_script_source(script_path, script_inline)
+            .await?;
+
+        match profile_info.environment {
+            ProfileEnvironment::Local => self.validate_local(&script).await,
+            ProfileEnvironment::Container { .. } => self.validate_container(profile, &script).await,
+        }
+    }
+
     /// Execute a task (run its script).
     async fn execute_task(&self, task: &scheduled_tasks::Model) {
         tracing::info!(
@@ -265,6 +409,9 @@ impl TaskScheduler {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
                     }
                 }
+                if let Err(error) = self.reload_active_tasks().await {
+                    tracing::error!(task_id = %task.id, error = %error, "Failed to refresh active task cache");
+                }
 
                 tracing::info!(task_id = %task.id, "Scheduled task completed");
             }
@@ -283,6 +430,9 @@ impl TaskScheduler {
                     if let Err(e) = notifier.send(&title, "Execution failed").await {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
                     }
+                }
+                if let Err(error) = self.reload_active_tasks().await {
+                    tracing::error!(task_id = %task.id, error = %error, "Failed to refresh active task cache");
                 }
 
                 tracing::error!(task_id = %task.id, error = %error_message, "Scheduled task execution failed");
@@ -310,10 +460,17 @@ impl TaskScheduler {
         }
     }
 
-    async fn resolve_script(&self, task: &scheduled_tasks::Model) -> Result<TaskScript, String> {
-        match (&task.script_inline, &task.script_path) {
+    async fn resolve_script_source(
+        &self,
+        script_path: Option<&str>,
+        script_inline: Option<&str>,
+    ) -> Result<TaskScript, String> {
+        match (
+            script_inline.map(str::trim).filter(|s| !s.is_empty()),
+            script_path.map(str::trim).filter(|s| !s.is_empty()),
+        ) {
             (Some(inline), None) => Ok(TaskScript {
-                content: inline.clone(),
+                content: inline.to_string(),
                 host_working_dir: self.may_dir.clone(),
             }),
             (None, Some(path)) => {
@@ -340,6 +497,11 @@ impl TaskScheduler {
             (Some(_), Some(_)) => Err("task has both script_inline and script_path".to_string()),
             (None, None) => Err("task has neither script_inline nor script_path".to_string()),
         }
+    }
+
+    async fn resolve_script(&self, task: &scheduled_tasks::Model) -> Result<TaskScript, String> {
+        self.resolve_script_source(task.script_path.as_deref(), task.script_inline.as_deref())
+            .await
     }
 
     async fn execute_local(
@@ -375,6 +537,37 @@ impl TaskScheduler {
             script.content.clone(),
         )
         .await
+    }
+
+    async fn validate_local(&self, script: &TaskScript) -> Result<(), String> {
+        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: true,
+            container: false,
+            ssh: false,
+        });
+        let registry =
+            Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
+        let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
+            BashTool::new_exact(
+                &script.host_working_dir,
+                SchedulerPermissionHandler,
+                DefaultExecutor,
+            )
+            .await
+            .map_err(|e| format!("failed to initialize local bash tool: {e}"))?
+            .with_shell_sessions(shell_sessions)
+            .with_writable_paths([script.host_working_dir.clone()])
+            .with_readable_paths([script.host_working_dir.clone()])
+            .with_registry(registry);
+
+        run_bash_script(
+            &bash_tool,
+            BashExecutionMode::Default,
+            None,
+            build_validation_command(script),
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn execute_container(
@@ -466,6 +659,112 @@ impl TaskScheduler {
         container_manager.touch_activity(&container_id).await;
         result
     }
+
+    async fn validate_container(
+        &self,
+        profile: &profiles::Model,
+        script: &TaskScript,
+    ) -> Result<(), String> {
+        let container_manager = self.container_manager.as_ref().ok_or_else(|| {
+            "container profile task cannot run: container runtime unavailable".to_string()
+        })?;
+
+        let default_image_tag =
+            crate::container::profile::default_image_tag(&self.may_dir, profile)
+                .map_err(|e| format!("invalid container profile image tag: {e}"))?;
+        let image_spec = crate::container::profile::image_spec_for_profile(
+            &self.may_dir,
+            profile,
+            &default_image_tag,
+        )
+        .map_err(|e| format!("invalid container profile image configuration: {e}"))?;
+        let extra_mounts = crate::container::profile::mounts_for_profile(profile)
+            .map_err(|e| format!("invalid container profile mount configuration: {e}"))?;
+
+        crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
+            .await
+            .map_err(|e| format!("container image check/build failed: {e}"))?;
+
+        let container_name = format!("may-{}", profile.slug.as_deref().unwrap_or(&profile.id));
+        let workspace_dir = self
+            .may_dir
+            .join("task-workspaces")
+            .join(profile.slug.as_deref().unwrap_or(&profile.id));
+        tokio::fs::create_dir_all(&workspace_dir)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to prepare container workspace {}: {e}",
+                    workspace_dir.display()
+                )
+            })?;
+
+        let ipc_socket = workspace_dir.join("leash-ipc.sock");
+        let mut launch_spec = ContainerLaunchSpec::new(
+            container_name,
+            image_spec.tag.clone(),
+            workspace_dir.clone(),
+        )
+        .with_ipc_socket(ipc_socket);
+        for mount in extra_mounts {
+            launch_spec = launch_spec.with_mount(mount);
+        }
+        let container_id = container_manager
+            .ensure_running(&launch_spec)
+            .await
+            .map_err(|e| format!("failed to start container: {e}"))?;
+        container_manager.touch_activity(&container_id).await;
+
+        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: true,
+            ssh: false,
+        });
+        shell_sessions.set_container_exec(Arc::new(BollardContainerExec::new(Arc::new(
+            container_manager.runtime().client.clone(),
+        ))));
+        shell_sessions.set_container_id(container_id.clone());
+
+        let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
+        let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
+            BashTool::new_exact(&workspace_dir, SchedulerPermissionHandler, DefaultExecutor)
+                .await
+                .map_err(|e| format!("failed to initialize container bash tool: {e}"))?
+                .with_shell_sessions(shell_sessions)
+                .with_writable_paths([workspace_dir.clone()])
+                .with_readable_paths([workspace_dir])
+                .with_registry(registry);
+
+        let result = run_bash_script(
+            &bash_tool,
+            BashExecutionMode::Default,
+            None,
+            build_validation_command(script),
+        )
+        .await
+        .map(|_| ());
+        container_manager.touch_activity(&container_id).await;
+        result
+    }
+}
+
+impl TaskScheduler {
+    pub fn new(runtime: Arc<TaskRuntime>) -> Self {
+        Self { runtime }
+    }
+
+    /// Spawn the scheduler as a background task.
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = self.runtime.tick_due_tasks().await {
+                    tracing::error!(error = %e, "Scheduler tick failed");
+                }
+            }
+        })
+    }
 }
 
 async fn run_bash_script(
@@ -530,6 +829,17 @@ fn truncate_output(output: &str) -> String {
     } else {
         output.to_string()
     }
+}
+
+fn build_validation_command(script: &TaskScript) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(script.content.as_bytes());
+    let encoded_script = shell_escape(Cow::Borrowed(encoded.as_str())).into_owned();
+    TaskValidationScriptTemplate {
+        validate_path: ".may-task-validate.sh",
+        encoded_script: &encoded_script,
+    }
+    .render()
+    .expect("task validation template must render")
 }
 
 /// Convert a jiff::Timestamp to chrono::DateTime<chrono::Utc> for cron compatibility.

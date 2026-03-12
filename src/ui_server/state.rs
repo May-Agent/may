@@ -127,6 +127,7 @@ pub(crate) struct UiServerState {
     pub(crate) register_subagents_broker: RegisterSubagentsBroker,
     pub(crate) location_provider: crate::location::LocationProvider,
     pub(crate) runtime_service: Arc<super::runtime::SessionRuntimeService>,
+    pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,
     pub(crate) cwd: PathBuf,
     pub(crate) may_dir: PathBuf,
 }
