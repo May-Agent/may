@@ -7,6 +7,7 @@
 //! - [`super::message_mapping`] — DB message → API message conversion
 //! - [`super::attachments`] — attachment processing & uploads
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -16,7 +17,7 @@ use crate::ask_user::AnswerValue;
 use crate::config::MayConfig;
 use crate::session::{ChatMessage, MayHomePaths, SessionId, SessionPaths};
 
-use super::error::internal_error;
+use super::error::{bad_request_error, internal_error};
 use super::state::UiServerState;
 
 pub(super) async fn send_event<T: Serialize>(
@@ -135,17 +136,44 @@ pub(super) fn elapsed_ms_saturating(started_at: &std::time::Instant) -> u64 {
 
 const PREVIEW_MAX_CHARS: usize = 100;
 
+pub(super) fn truncate_preview_with_limit(content: &str, max_chars: usize) -> String {
+    let trimmed = content.trim();
+    match trimmed.char_indices().nth(max_chars) {
+        Some((pos, _)) => {
+            let mut preview = String::with_capacity(pos + 3);
+            preview.push_str(&trimmed[..pos]);
+            preview.push_str("...");
+            preview
+        }
+        None => trimmed.to_string(),
+    }
+}
+
 pub(super) fn truncate_preview(content: &str) -> String {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return "New conversation started".to_string();
     }
 
-    // Single-pass truncation using char_indices for O(1) slicing.
-    match trimmed.char_indices().nth(PREVIEW_MAX_CHARS) {
-        Some((pos, _)) => format!("{}...", &trimmed[..pos]),
-        None => trimmed.to_string(),
+    truncate_preview_with_limit(trimmed, PREVIEW_MAX_CHARS)
+}
+
+pub(super) fn parse_safe_relative_path(raw: &str, label: &str) -> SkyResult<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(bad_request_error([label, " is required"].concat()));
     }
+
+    let rel = PathBuf::from(trimmed);
+    if rel.is_absolute() {
+        return Err(bad_request_error([label, " must be relative"].concat()));
+    }
+    for comp in rel.components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return Err(bad_request_error([label, " path traversal is not allowed"].concat()));
+        }
+    }
+    Ok(rel)
 }
 
 /// Backoff base duration for LLM retry attempts (multiplied by attempt number).
