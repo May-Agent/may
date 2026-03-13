@@ -332,7 +332,7 @@ export function ContextInspector({
                         <div>selected model window={effectiveWindowSnapshot.metrics.selectedModelContextWindow ?? "-"}</div>
                         <div>fast model window={effectiveWindowSnapshot.metrics.fastModelContextWindow ?? "-"}</div>
                         <div>system blocks={effectiveWindowSnapshot.metrics.systemBlockCount} reminders={effectiveWindowSnapshot.metrics.reminderCount}</div>
-                        <div>recent messages={effectiveWindowSnapshot.metrics.recentMessageCount} handoff={effectiveWindowSnapshot.metrics.hasHandoff ? "yes" : "no"}</div>
+                        <div>recent messages={effectiveWindowSnapshot.metrics.recentMessageCount} system messages={effectiveWindowSnapshot.metrics.recentSystemMessageCount} handoff={effectiveWindowSnapshot.metrics.hasHandoff ? "yes" : "no"}</div>
                       </div>
                     ) : (
                       <pre className="max-h-28 overflow-auto whitespace-pre-wrap rounded border bg-muted/30 p-2 font-mono text-[11px] leading-4">

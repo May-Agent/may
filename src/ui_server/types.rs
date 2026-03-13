@@ -561,6 +561,7 @@ pub(crate) struct SessionContextWindowMetricsResponse {
     pub(crate) system_block_count: usize,
     pub(crate) reminder_count: usize,
     pub(crate) recent_message_count: usize,
+    pub(crate) recent_system_message_count: usize,
     pub(crate) has_handoff: bool,
 }
 
@@ -574,6 +575,7 @@ impl From<aither_agent::ContextWindowMetrics> for SessionContextWindowMetricsRes
             system_block_count: value.system_block_count,
             reminder_count: value.reminder_count,
             recent_message_count: value.recent_message_count,
+            recent_system_message_count: value.recent_system_message_count,
             has_handoff: value.has_handoff,
         }
     }

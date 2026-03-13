@@ -202,6 +202,7 @@ export interface ContextDebugMessage {
 
 export type ContextWindowPhase =
   | "stable"
+  | "reassembly_due"
   | "compression_due"
   | "handoff_due"
   | "handoff_active";
@@ -214,6 +215,7 @@ export interface SessionContextWindowMetrics {
   systemBlockCount: number;
   reminderCount: number;
   recentMessageCount: number;
+  recentSystemMessageCount: number;
   hasHandoff: boolean;
 }
 
@@ -330,6 +332,7 @@ function parseSessionContextWindowSnapshot(
       systemBlockCount: requireNumber(metrics.systemBlockCount, "windowSnapshot.metrics.systemBlockCount"),
       reminderCount: requireNumber(metrics.reminderCount, "windowSnapshot.metrics.reminderCount"),
       recentMessageCount: requireNumber(metrics.recentMessageCount, "windowSnapshot.metrics.recentMessageCount"),
+      recentSystemMessageCount: requireNumber(metrics.recentSystemMessageCount, "windowSnapshot.metrics.recentSystemMessageCount"),
       hasHandoff: requireBoolean(metrics.hasHandoff, "windowSnapshot.metrics.hasHandoff"),
     },
     assembledMessages: assembledMessagesValue.map((item, index) =>
