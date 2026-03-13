@@ -431,12 +431,26 @@ pub(super) async fn resume_waiting_turn(
 }
 
 async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) {
+    let db = state.db().await;
+    if let Err(error) = db
+        .append_request_log(crate::db::RequestLogParams {
+            session_id: entry.session_id.as_str(),
+            timestamp: entry.timestamp.as_str(),
+            model: entry.model.as_str(),
+            provider_id: entry.provider_id.as_str(),
+            prompt_tokens: entry.prompt_tokens,
+            completion_tokens: entry.completion_tokens,
+            total_tokens: entry.total_tokens,
+            cache_read_tokens: entry.cache_read_tokens,
+            cache_write_tokens: entry.cache_write_tokens,
+            context_window: entry.context_window,
+            elapsed_ms: entry.elapsed_ms,
+            ok: entry.ok,
+            error: entry.error.as_deref(),
+        })
+        .await
     {
-        let mut logs = state.request_logs.lock().await;
-        logs.push_front(entry);
-        while logs.len() > 300 {
-            logs.pop_back();
-        }
+        tracing::warn!(error = %error, "failed to persist request log");
     }
     state.notify_ui_events();
 }

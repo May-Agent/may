@@ -24,7 +24,7 @@ use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 use crate::xml_fragment::XmlFragment;
 use entity::{
     context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox, profile_memories,
-    profile_memory_jobs, profiles, push_subscriptions, scheduled_tasks, session_context_snapshots,
+    profile_memory_jobs, profiles, push_subscriptions, request_logs, scheduled_tasks, session_context_snapshots,
     session_pending_ask_user, session_pending_messages, session_pending_permissions, session_plans,
     session_runtimes, sessions,
 };
@@ -99,6 +99,23 @@ pub struct NetworkAccessLogParams<'a> {
     pub port: u16,
     pub allowed: bool,
     pub reason: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestLogParams<'a> {
+    pub session_id: &'a str,
+    pub timestamp: &'a str,
+    pub model: &'a str,
+    pub provider_id: &'a str,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+    pub cache_read_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
+    pub context_window: Option<u32>,
+    pub elapsed_ms: u64,
+    pub ok: bool,
+    pub error: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -232,6 +249,12 @@ impl ChatDb {
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
 
+        let request_logs_stmt = schema.create_table_from_entity(request_logs::Entity);
+        let create_sql = request_logs_stmt
+            .to_string(SqliteQueryBuilder)
+            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        conn.execute_unprepared(&create_sql).await?;
+
         let network_access_logs_stmt =
             schema.create_table_from_entity(network_access_logs::Entity);
         let create_sql = network_access_logs_stmt
@@ -318,6 +341,14 @@ impl ChatDb {
         .await?;
         conn.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_notification_mailbox_status_created_at ON notification_mailbox(status, created_at)",
+        )
+        .await?;
+        conn.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_request_logs_timestamp ON request_logs(timestamp)",
+        )
+        .await?;
+        conn.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_request_logs_session_timestamp ON request_logs(session_id, timestamp)",
         )
         .await?;
         conn.execute_unprepared(
@@ -1504,6 +1535,69 @@ impl ChatDb {
     ) -> Result<Vec<notification_mailbox::Model>, ChatDbError> {
         notification_mailbox::Entity::find()
             .order_by_desc(notification_mailbox::Column::CreatedAt)
+            .limit(limit)
+            .all(&self.conn)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn append_request_log(
+        &self,
+        params: RequestLogParams<'_>,
+    ) -> Result<request_logs::Model, ChatDbError> {
+        request_logs::ActiveModel {
+            id: NotSet,
+            session_id: Set(params.session_id.to_string()),
+            timestamp: Set(params.timestamp.to_string()),
+            model: Set(params.model.to_string()),
+            provider_id: Set(params.provider_id.to_string()),
+            prompt_tokens: Set(params
+                .prompt_tokens
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|error| DbErr::Custom(["prompt_tokens overflow: ", &error.to_string()].concat()))?),
+            completion_tokens: Set(params
+                .completion_tokens
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|error| DbErr::Custom(["completion_tokens overflow: ", &error.to_string()].concat()))?),
+            total_tokens: Set(params
+                .total_tokens
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|error| DbErr::Custom(["total_tokens overflow: ", &error.to_string()].concat()))?),
+            cache_read_tokens: Set(params
+                .cache_read_tokens
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|error| DbErr::Custom(["cache_read_tokens overflow: ", &error.to_string()].concat()))?),
+            cache_write_tokens: Set(params
+                .cache_write_tokens
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|error| DbErr::Custom(["cache_write_tokens overflow: ", &error.to_string()].concat()))?),
+            context_window: Set(params
+                .context_window
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|error| DbErr::Custom(["context_window overflow: ", &error.to_string()].concat()))?),
+            elapsed_ms: Set(i64::try_from(params.elapsed_ms).map_err(|error| {
+                DbErr::Custom(["elapsed_ms overflow: ", &error.to_string()].concat())
+            })?),
+            ok: Set(params.ok),
+            error: Set(params.error.map(ToOwned::to_owned)),
+        }
+        .insert(&self.conn)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn list_request_logs(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<request_logs::Model>, ChatDbError> {
+        request_logs::Entity::find()
+            .order_by_desc(request_logs::Column::Timestamp)
             .limit(limit)
             .all(&self.conn)
             .await
@@ -3078,6 +3172,50 @@ mod tests {
                 .await
                 .expect("restart recovery should preserve takeover alert as pending")
         );
+    }
+
+    #[tokio::test]
+    async fn request_logs_persist_in_database() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        db.append_request_log(super::RequestLogParams {
+            session_id: "session-test",
+            timestamp: "2026-03-14T00:00:00Z",
+            model: "gpt-5",
+            provider_id: "openai",
+            prompt_tokens: Some(10),
+            completion_tokens: Some(20),
+            total_tokens: Some(30),
+            cache_read_tokens: Some(5),
+            cache_write_tokens: Some(0),
+            context_window: Some(200000),
+            elapsed_ms: 42,
+            ok: false,
+            error: Some("boom"),
+        })
+        .await
+        .expect("request log should persist");
+
+        let entries = db
+            .list_request_logs(10)
+            .await
+            .expect("request logs should load");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "session-test");
+        assert_eq!(entries[0].model, "gpt-5");
+        assert_eq!(entries[0].provider_id, "openai");
+        assert_eq!(entries[0].prompt_tokens, Some(10));
+        assert_eq!(entries[0].completion_tokens, Some(20));
+        assert_eq!(entries[0].total_tokens, Some(30));
+        assert_eq!(entries[0].cache_read_tokens, Some(5));
+        assert_eq!(entries[0].context_window, Some(200000));
+        assert_eq!(entries[0].elapsed_ms, 42);
+        assert!(!entries[0].ok);
+        assert_eq!(entries[0].error.as_deref(), Some("boom"));
     }
 
     #[tokio::test]
