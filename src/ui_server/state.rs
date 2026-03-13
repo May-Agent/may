@@ -152,8 +152,7 @@ pub(crate) struct AskUserRespondRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct AskUserApprover {
     live_responses: Arc<LiveResponseRegistry<Vec<QuestionAnswer>>>,
-    runtime_db: Option<crate::db::ChatDb>,
-    ui_events_notify: Option<Arc<tokio::sync::Notify>>,
+    runtime_service: Option<Arc<super::runtime::SessionRuntimeService>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -212,41 +211,17 @@ impl AskUserApprover {
     pub(crate) fn new() -> Self {
         Self {
             live_responses: Arc::new(LiveResponseRegistry::new()),
-            runtime_db: None,
-            ui_events_notify: None,
+            runtime_service: None,
         }
     }
 
     #[must_use]
-    pub(crate) fn with_runtime_sync(
+    pub(crate) fn with_runtime_service(
         mut self,
-        db: crate::db::ChatDb,
-        notify: Arc<tokio::sync::Notify>,
+        runtime_service: Arc<super::runtime::SessionRuntimeService>,
     ) -> Self {
-        self.runtime_db = Some(db);
-        self.ui_events_notify = Some(notify);
+        self.runtime_service = Some(runtime_service);
         self
-    }
-
-    fn notify_ui_events(&self) {
-        if let Some(notify) = &self.ui_events_notify {
-            notify.notify_waiters();
-        }
-    }
-
-    async fn persist_ask_user_runtime_state(
-        &self,
-        session_id: &str,
-        request: Option<PersistedAskUserRequest>,
-    ) {
-        let Some(db) = self.runtime_db.clone() else {
-            return;
-        };
-        if let Err(error) = db.set_waiting_ask_user(session_id, request).await {
-            tracing::warn!(session_id = %session_id, error = %error, "failed to persist ask-user runtime state");
-            return;
-        }
-        self.notify_ui_events();
     }
 
     fn persisted_questions(questions: &[Question]) -> Vec<PersistedAskUserQuestion> {
@@ -267,16 +242,18 @@ impl AskUserApprover {
         let rx = self.live_responses.open(request_id.clone());
 
         if let Some(session_id) = session_id.as_deref()
-            && let Some(db) = self.runtime_db.clone()
+            && let Some(runtime_service) = self.runtime_service.clone()
         {
-            self.persist_ask_user_runtime_state(
-                session_id,
-                Some(PersistedAskUserRequest {
-                    id: request_id.clone(),
-                    questions: Self::persisted_questions(&questions),
-                }),
-            )
-            .await;
+            let persisted_request = PersistedAskUserRequest {
+                id: request_id.clone(),
+                questions: Self::persisted_questions(&questions),
+            };
+            if let Err(error) = runtime_service
+                .set_waiting_ask_user(session_id, Some(persisted_request))
+                .await
+            {
+                tracing::warn!(session_id = %session_id, error = %error, "failed to persist ask-user runtime state");
+            }
 
             let content = serde_json::to_string(&crate::session::history::AskUserRequestData {
                 id: request_id.clone(),
@@ -284,7 +261,8 @@ impl AskUserApprover {
                     .expect("ask_user questions must serialize"),
             })
             .expect("ask_user request content must serialize");
-            if let Err(error) = db
+            if let Err(error) = runtime_service
+                .db()
                 .append_message(
                     session_id,
                     MessageRole::AskUserRequest,
@@ -297,8 +275,6 @@ impl AskUserApprover {
             {
                 tracing::warn!(session_id, error = %error, "failed to append ask-user request history");
             }
-        } else {
-            self.notify_ui_events();
         }
 
         let answers = rx
@@ -309,11 +285,7 @@ impl AskUserApprover {
     }
 
     pub(crate) fn respond(&self, request_id: &str, answers: Vec<QuestionAnswer>) -> bool {
-        let responded = self.live_responses.resolve(request_id, answers);
-        if responded {
-            self.notify_ui_events();
-        }
-        responded
+        self.live_responses.resolve(request_id, answers)
     }
 }
 

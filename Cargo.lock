@@ -335,6 +335,7 @@ version = "0.1.0"
 dependencies = [
  "aither-core",
  "anyhow",
+ "askama 0.14.0",
  "async-channel 2.5.0",
  "async-fs",
  "async-io 2.6.0",
