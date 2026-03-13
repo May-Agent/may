@@ -292,10 +292,7 @@ fn result_waits_for_terminal_input(result: &Result<String, String>) -> bool {
 
 fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     tokio::spawn(async move {
-        let inserted = {
-            let mut active = state.active_streaming_sessions.lock().await;
-            active.insert(session_id.clone())
-        };
+        let inserted = state.active_streaming_sessions.insert(session_id.clone()).await;
         if !inserted {
             return;
         }
@@ -332,10 +329,7 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
             }
         }
 
-        {
-            let mut active = state.active_streaming_sessions.lock().await;
-            active.remove(session_id.as_str());
-        }
+        state.active_streaming_sessions.remove(session_id.as_str()).await;
         let _ = clear_running_state_if_needed(&state, &session_id).await;
     });
 }
@@ -547,11 +541,7 @@ pub(super) async fn chat_stream(
 
     tokio::spawn(async move {
         let session_id = req.session_id.clone();
-        state
-            .active_streaming_sessions
-            .lock()
-            .await
-            .insert(session_id.clone());
+        state.active_streaming_sessions.insert(session_id.clone()).await;
 
         if let Err(err) = stream_chat_events(state.clone(), req, sender.clone()).await {
             send_event(
@@ -564,11 +554,7 @@ pub(super) async fn chat_stream(
             .await;
         }
 
-        state
-            .active_streaming_sessions
-            .lock()
-            .await
-            .remove(&session_id);
+        state.active_streaming_sessions.remove(&session_id).await;
     });
 
     Ok(sse)
@@ -922,10 +908,10 @@ async fn stream_chat_events(
             true,
         )
         .await;
-    {
-        let mut active = state.active_streaming_sessions.lock().await;
-        active.remove(req.session_id.as_str());
-    }
+    state
+        .active_streaming_sessions
+        .remove(req.session_id.as_str())
+        .await;
     let response_session_id = req.session_id.clone();
     match result {
         Ok(result) => {
