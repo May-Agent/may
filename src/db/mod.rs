@@ -153,9 +153,9 @@ pub struct ChatDb {
 }
 
 impl ChatDb {
-    /// Open (or create) the chat history database at the given path.
-    ///
-    /// Creates the schema if the tables don't exist. Applies migrations for new columns.
+/// Open (or create) the chat history database at the given path.
+///
+/// Creates the current schema if the tables don't exist.
     pub async fn open(db_path: &Path) -> Result<Self, ChatDbError> {
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let mut opts = ConnectOptions::new(url);
@@ -345,57 +345,6 @@ impl ChatDb {
         )
         .await?;
 
-        // Migrations: add new profile columns if missing
-        Self::migrate_add_column(&conn, "profiles", "slug", "TEXT").await?;
-        Self::migrate_add_column(&conn, "profiles", "persona", "TEXT").await?;
-        Self::migrate_add_column(&conn, "profiles", "preferences_json", "TEXT").await?;
-        Self::migrate_add_column(
-            &conn,
-            "profiles",
-            "location_aware",
-            "BOOLEAN NOT NULL DEFAULT 0",
-        )
-        .await?;
-        Self::migrate_add_column(
-            &conn,
-            "scheduled_tasks",
-            "trigger_kind",
-            "TEXT NOT NULL DEFAULT 'time'",
-        )
-        .await?;
-        Self::migrate_add_column(
-            &conn,
-            "session_runtimes",
-            "browser_takeover_active",
-            "BOOLEAN NOT NULL DEFAULT 0",
-        )
-        .await?;
-        Self::migrate_add_column(
-            &conn,
-            "session_runtimes",
-            "browser_takeover_alert_pending",
-            "BOOLEAN NOT NULL DEFAULT 0",
-        )
-        .await?;
-        Self::migrate_add_column(
-            &conn,
-            "session_context_snapshots",
-            "assembled_messages_json",
-            "TEXT",
-        )
-        .await?;
-        Self::migrate_add_column(&conn, "session_context_snapshots", "metadata_json", "TEXT")
-            .await?;
-        Self::migrate_add_column(&conn, "messages", "provider_id", "TEXT").await?;
-        Self::migrate_add_column(&conn, "messages", "prompt_tokens", "INTEGER").await?;
-        Self::migrate_add_column(&conn, "messages", "completion_tokens", "INTEGER").await?;
-        Self::migrate_add_column(&conn, "messages", "total_tokens", "INTEGER").await?;
-        Self::migrate_add_column(&conn, "messages", "cache_read_tokens", "INTEGER").await?;
-        Self::migrate_add_column(&conn, "messages", "cache_write_tokens", "INTEGER").await?;
-        Self::migrate_add_column(&conn, "messages", "context_window", "INTEGER").await?;
-        Self::migrate_add_column(&conn, "messages", "elapsed_ms", "INTEGER").await?;
-        Self::migrate_default_profile_slugs(&conn).await?;
-
         // Enable WAL mode for better concurrent read/write performance
         conn.execute_unprepared("PRAGMA journal_mode=WAL").await?;
 
@@ -405,48 +354,6 @@ impl ChatDb {
     /// Get the underlying database connection.
     pub fn connection(&self) -> &DatabaseConnection {
         &self.conn
-    }
-
-    /// Add a column to a table if it doesn't already exist (SQLite migration helper).
-    async fn migrate_add_column(
-        conn: &DatabaseConnection,
-        table: &str,
-        column: &str,
-        col_type: &str,
-    ) -> Result<(), ChatDbError> {
-        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
-        match conn.execute_unprepared(&sql).await {
-            Ok(_) => Ok(()),
-            Err(DbErr::Exec(ref runtime_err))
-                if runtime_err.to_string().contains("duplicate column") =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    async fn migrate_default_profile_slugs(conn: &DatabaseConnection) -> Result<(), ChatDbError> {
-        for (slug, name, environment) in [
-            ("daily", "daily", "container"),
-            ("work", "work", "container"),
-            ("local", "local", "local"),
-        ] {
-            let sql = format!(
-                "UPDATE profiles \
-                 SET slug = '{slug}' \
-                 WHERE id = (\
-                   SELECT id FROM profiles \
-                   WHERE slug IS NULL \
-                     AND lower(name) = '{name}' \
-                     AND environment = '{environment}' \
-                   ORDER BY created_at ASC \
-                   LIMIT 1\
-                 )"
-            );
-            conn.execute_unprepared(&sql).await?;
-        }
-        Ok(())
     }
 
     // ── Session CRUD ─────────────────────────────────────────────
