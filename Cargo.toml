@@ -21,6 +21,7 @@ aither-core = { path = "../aither/core" }
 aither-agent = { path = "../aither/agent", features = ["mcp", "websearch", "webfetch", "skills"] }
 aither-sandbox = { path = "../aither/sandbox" }
 aither-cloud = { path = "../aither/cloud" }
+aither-rag = { path = "../aither/rag" }
 aither-copilot = { path = "../aither/copilot" }
 aither-models = { path = "../aither/models" }
 aither-mcp = { path = "../aither/mcp" }

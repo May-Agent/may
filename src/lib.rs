@@ -9,6 +9,7 @@ pub mod config;
 pub mod container;
 pub mod copilot;
 pub mod db;
+mod embedding_provider;
 mod fs_utils;
 mod live_response;
 pub mod location;

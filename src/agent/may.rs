@@ -33,6 +33,7 @@ use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
 use crate::copilot::clear_copilot_credentials;
 use crate::db::NetworkAccessLogParams;
+use crate::embedding_provider::resolve_embedding_provider;
 use crate::live_response::LiveResponseRegistry;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{MessageRole, SessionId, SessionPaths, SessionPlanState};
@@ -541,6 +542,8 @@ pub struct MayAgentConfig {
     pub llm: CloudProvider,
     /// Provider ID selected for this request.
     pub provider_id: String,
+    /// Optional embedding provider used for semantic retrieval tools.
+    pub search_embedder: Option<aither_cloud::CloudEmbedder>,
     /// Session sandbox directory (BashTool creates working dir inside).
     pub sandbox_dir: PathBuf,
     /// May directory (~/.may/).
@@ -932,7 +935,7 @@ impl MayAgent {
             config.session_id.as_str().to_string(),
             config.profile_id.clone(),
         );
-        let search_tool = SearchTool::new(config.sandbox_dir.clone());
+        let search_tool = SearchTool::new(config.sandbox_dir.clone(), config.search_embedder.clone());
         let task_tool = TaskTool::new(
             config.session_id.as_str().to_string(),
             match &config.environment {
@@ -1294,9 +1297,28 @@ impl MayAgent {
         };
         let model_info = aither_models::lookup(model);
 
+        let search_embedder = match resolve_embedding_provider(may_config, Some(provider_id.as_str()))
+        {
+            Ok(resolved) => {
+                tracing::debug!(
+                    provider_id = %resolved.provider_id,
+                    "resolved embedding provider for semantic search"
+                );
+                Some(resolved.embedder)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "semantic search will remain lexical because no embedding provider resolved"
+                );
+                None
+            }
+        };
+
         let config = MayAgentConfig {
             llm,
             provider_id,
+            search_embedder,
             sandbox_dir,
             may_dir,
             cwd,

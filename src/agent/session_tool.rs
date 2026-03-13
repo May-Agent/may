@@ -30,6 +30,35 @@ const INDEX_META_FILE: &str = "session_index.meta.json";
 /// - Use `*` as query to disable text match and only apply filters.
 /// - `search_mode`: `hybrid` | `text` | `regex` | `fulltext` | `fuzzy`.
 /// - Default excludes current session so you can inspect other sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionSearchMode {
+    Hybrid,
+    Text,
+    Regex,
+    Fulltext,
+    Fuzzy,
+}
+
+impl SessionSearchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Text => "text",
+            Self::Regex => "regex",
+            Self::Fulltext => "fulltext",
+            Self::Fuzzy => "fuzzy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionOutputMode {
+    Sessions,
+    Messages,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SessionArgs {
     /// Optional command-form input. Supported:
@@ -43,11 +72,11 @@ pub struct SessionArgs {
 
     /// Search mode: `hybrid`, `text`, `regex`, `fulltext`, `fuzzy`.
     #[serde(default = "default_search_mode")]
-    pub search_mode: String,
+    pub search_mode: SessionSearchMode,
 
     /// Output mode: `sessions` (aggregated) or `messages`.
     #[serde(default = "default_output_mode")]
-    pub output_mode: String,
+    pub output_mode: SessionOutputMode,
 
     /// Max returned rows.
     #[serde(default = "default_limit")]
@@ -122,12 +151,12 @@ pub struct SessionArgs {
     pub include_archived: bool,
 }
 
-fn default_search_mode() -> String {
-    "hybrid".to_string()
+fn default_search_mode() -> SessionSearchMode {
+    SessionSearchMode::Hybrid
 }
 
-fn default_output_mode() -> String {
-    "sessions".to_string()
+fn default_output_mode() -> SessionOutputMode {
+    SessionOutputMode::Sessions
 }
 
 fn default_limit() -> usize {
@@ -281,14 +310,6 @@ fn apply_search_defaults(args: &mut SessionArgs, defaults: &SearchDefaults) {
 }
 
 fn normalize_common_args(mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
-    args.search_mode = args.search_mode.to_lowercase();
-    args.output_mode = args.output_mode.to_lowercase();
-    if args.search_mode.trim().is_empty() {
-        args.search_mode = "hybrid".to_string();
-    }
-    if args.output_mode.trim().is_empty() {
-        args.output_mode = "sessions".to_string();
-    }
     args.limit = args.limit.clamp(1, 200);
     args.scan_limit = args.scan_limit.clamp(args.limit, 50_000);
     args.fuzzy_distance = args.fuzzy_distance.min(3);
@@ -325,24 +346,17 @@ async fn execute_search(
 ) -> aither_core::Result<ToolOutput> {
     let query_enabled = args.query.trim() != "*" && !args.query.trim().is_empty();
 
-    if !matches!(args.output_mode.as_str(), "sessions" | "messages") {
-        return Err(anyhow::anyhow!(
-            "invalid output_mode '{}', expected one of: sessions,messages",
-            args.output_mode
-        ));
-    }
-
     let db = ChatDb::open(&db_path).await?;
     let fingerprint = compute_fingerprint(&db).await?;
 
     let table = ensure_index(&index_path, &index_meta_path, &db, &fingerprint).await?;
 
-    let mut candidates = match args.search_mode.as_str() {
-        "fulltext" => run_full_text_query(&table, &args, false).await?,
-        "fuzzy" => run_full_text_query(&table, &args, true).await?,
-        "regex" => run_plain_query(&table, &args).await?,
-        "text" => run_plain_query(&table, &args).await?,
-        "hybrid" => {
+    let mut candidates = match args.search_mode {
+        SessionSearchMode::Fulltext => run_full_text_query(&table, &args, false).await?,
+        SessionSearchMode::Fuzzy => run_full_text_query(&table, &args, true).await?,
+        SessionSearchMode::Regex => run_plain_query(&table, &args).await?,
+        SessionSearchMode::Text => run_plain_query(&table, &args).await?,
+        SessionSearchMode::Hybrid => {
             if !query_enabled {
                 run_plain_query(&table, &args).await?
             } else {
@@ -356,12 +370,6 @@ async fn execute_search(
                 merged
             }
         }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "invalid search_mode '{}', expected one of: hybrid,text,regex,fulltext,fuzzy",
-                args.search_mode
-            ));
-        }
     };
 
     let query_norm = if args.case_sensitive {
@@ -370,7 +378,8 @@ async fn execute_search(
         args.query.to_lowercase()
     };
 
-    let regex_enabled = args.search_mode == "regex" && (query_enabled || args.regex.is_some());
+    let regex_enabled =
+        args.search_mode == SessionSearchMode::Regex && (query_enabled || args.regex.is_some());
     let regex = if regex_enabled {
         let pattern = args
             .regex
@@ -389,7 +398,7 @@ async fn execute_search(
 
     for row in &mut candidates {
         if row.matched_by.is_empty() {
-            row.matched_by.push(args.search_mode.clone());
+            row.matched_by.push(args.search_mode.as_str().to_string());
         }
 
         let haystack = searchable_text(row, &args.fields);
@@ -399,7 +408,10 @@ async fn execute_search(
             haystack.to_lowercase()
         };
 
-        if query_enabled && args.search_mode != "fulltext" && args.search_mode != "fuzzy" {
+        if query_enabled
+            && args.search_mode != SessionSearchMode::Fulltext
+            && args.search_mode != SessionSearchMode::Fuzzy
+        {
             if haystack_norm.contains(&query_norm) {
                 row.score += 10.0;
                 if !row.matched_by.iter().any(|m| m == "text") {
@@ -421,7 +433,7 @@ async fn execute_search(
     candidates = candidates
         .into_iter()
         .filter(|row| {
-            if query_enabled && args.search_mode == "text" {
+            if query_enabled && args.search_mode == SessionSearchMode::Text {
                 let haystack = searchable_text(row, &args.fields);
                 let haystack = if args.case_sensitive {
                     haystack
@@ -1082,7 +1094,7 @@ fn finalize_rows_with_total(
     let end = (start + args.limit).min(rows.len());
     let rows = rows[start..end].to_vec();
 
-    let value = if args.output_mode == "messages" {
+    let value = if args.output_mode == SessionOutputMode::Messages {
         let items: Vec<MessageResult> = rows
             .into_iter()
             .map(|row| MessageResult::from_row(row, args.include_content))
@@ -1139,7 +1151,7 @@ fn finalize_rows_with_total(
         })
     };
 
-    Ok(ToolOutput::text(serde_json::to_string_pretty(&value)?))
+    ToolOutput::json(&value)
 }
 
 #[cfg(test)]
@@ -1150,8 +1162,8 @@ mod tests {
         SessionArgs {
             command: None,
             query: "*".to_string(),
-            search_mode: "hybrid".to_string(),
-            output_mode: "sessions".to_string(),
+            search_mode: SessionSearchMode::Hybrid,
+            output_mode: SessionOutputMode::Sessions,
             limit: 20,
             offset: 0,
             scan_limit: 2000,
