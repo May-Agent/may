@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use aither_agent::SubagentDefinition;
-use crate::session::MayHomePaths;
+use crate::session::{MayHomePaths, ProfileHomePaths};
 
 /// Subagent management error.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +40,11 @@ impl SubagentManager {
     /// Create a new manager rooted at `~/.may/subagents`.
     pub fn new(may_dir: &Path) -> Self {
         Self::from_subagents_dir(MayHomePaths::new(may_dir.to_path_buf()).subagents_dir())
+    }
+
+    /// Create a manager rooted at one profile home.
+    pub fn from_profile_home(profile_home: &ProfileHomePaths) -> Self {
+        Self::from_subagents_dir(profile_home.subagents_dir())
     }
 
     /// Create a manager rooted at an explicit subagents directory.

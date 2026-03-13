@@ -82,6 +82,7 @@ export async function fetchAndApplyProfileSessions(
         sessionId: session.id,
         runtime: session.runtime ?? {
           state: session.runtimeState,
+          planState: session.planState,
           queuedCount: session.queuedCount,
           pendingImmediate: null,
           queuedMessages: [],

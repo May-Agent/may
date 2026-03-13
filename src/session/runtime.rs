@@ -1,5 +1,6 @@
 //! Persisted session runtime state and server-owned pending messages.
 
+use super::SessionPlanState;
 use crate::xml_fragment::XmlFragment;
 
 /// Persisted runtime state for a session.
@@ -117,6 +118,8 @@ pub struct PersistedAskUserRequest {
 pub struct SessionRuntimeSummary {
     pub state: SessionRuntimeState,
     #[serde(default)]
+    pub plan_state: SessionPlanState,
+    #[serde(default)]
     pub queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_immediate: Option<PendingUserMessage>,
@@ -134,6 +137,7 @@ impl Default for SessionRuntimeSummary {
     fn default() -> Self {
         Self {
             state: SessionRuntimeState::Idle,
+            plan_state: SessionPlanState::Disabled,
             queued_count: 0,
             pending_immediate: None,
             queued_messages: Vec::new(),
@@ -192,7 +196,7 @@ impl SessionRuntimeSummary {
 
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.state.is_active() || self.has_pending_messages()
+        self.state.is_active() || self.has_pending_messages() || self.plan_state.blocks_auto_archive()
     }
 }
 

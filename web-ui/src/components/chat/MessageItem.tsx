@@ -3,7 +3,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
 import { buildSessionOutputPreviewUrl, fetchSessionTasks, saveSessionTasks } from '@/lib/api';
-import type { ArtifactPreviewTarget, Message } from '@/types';
+import type { ArtifactPreviewTarget, Message, SessionPlanState } from '@/types';
+import { useStore } from '@/lib/store';
 import { extractArtifactPreviewTargets, stripArtifactPreviewTags } from './chatUtils';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -598,6 +599,9 @@ export function MessageItem({
   const [tasksSaving, setTasksSaving] = useState(false);
   const [tasksEditing, setTasksEditing] = useState(false);
   const [tasksError, setTasksError] = useState<string | null>(null);
+  const [tasksPlanState, setTasksPlanState] = useState<SessionPlanState>('disabled');
+  const setSessionPlanState = useStore((state) => state.setSessionPlanState);
+  const refreshProfileSessions = useStore((state) => state.refreshProfileSessions);
   const components = useMemo(
     () => makeComponents(isUser, isStreaming),
     [isUser, isStreaming]
@@ -789,6 +793,7 @@ export function MessageItem({
         if (cancelled) return;
         setTasksContent(payload.content);
         setTasksDraft(payload.content);
+        setTasksPlanState(payload.planState);
       })
       .catch((error) => {
         if (cancelled) return;
@@ -803,6 +808,34 @@ export function MessageItem({
       cancelled = true;
     };
   }, [sessionId, showsTasksTag]);
+
+  const persistTasks = async (
+    content: string,
+    planState: SessionPlanState,
+    nextEditing: boolean,
+  ) => {
+    if (!sessionId) {
+      return;
+    }
+    setTasksSaving(true);
+    setTasksError(null);
+    try {
+      const payload = await saveSessionTasks(sessionId, {
+        content,
+        planState,
+      });
+      setTasksContent(payload.content);
+      setTasksDraft(payload.content);
+      setTasksPlanState(payload.planState);
+      setTasksEditing(nextEditing);
+      setSessionPlanState(sessionId, payload.planState);
+      void refreshProfileSessions();
+    } catch (error) {
+      setTasksError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setTasksSaving(false);
+    }
+  };
 
   useEffect(() => {
     if (isUser || !onOpenPreview || previewTargets.length === 0) return;
@@ -1162,11 +1195,55 @@ export function MessageItem({
           {!isUser && showsTasksTag && sessionId && (
             <div className="not-prose mt-3 rounded-xl border border-border/70 bg-card/80 px-3 py-3">
               <div className="mb-2 flex items-center justify-between gap-3">
-                <div>
+                  <div>
                   <div className="text-sm font-medium text-foreground">tasks.md</div>
                   <div className="text-xs text-muted-foreground">Session task plan exposed via `&lt;tasks /&gt;`</div>
+                  <div className="mt-1 text-[11px] uppercase tracking-[0.08em] text-muted-foreground">
+                    plan mode: {tasksPlanState}
+                  </div>
                 </div>
                 <div className="flex items-center gap-2">
+                  {tasksPlanState === "disabled" && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 px-2 text-xs"
+                      disabled={tasksLoading || tasksSaving}
+                      onClick={() => {
+                        void persistTasks(tasksDraft, "draft", tasksEditing);
+                      }}
+                    >
+                      Enter Plan
+                    </Button>
+                  )}
+                  {tasksPlanState === "draft" && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      disabled={tasksLoading || tasksSaving}
+                      onClick={() => {
+                        void persistTasks(tasksDraft, "approved", tasksEditing);
+                      }}
+                    >
+                      Approve
+                    </Button>
+                  )}
+                  {tasksPlanState === "approved" && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 px-2 text-xs"
+                      disabled={tasksLoading || tasksSaving}
+                      onClick={() => {
+                        void persistTasks(tasksDraft, "draft", tasksEditing);
+                      }}
+                    >
+                      Reopen Plan
+                    </Button>
+                  )}
                   <Button
                     type="button"
                     size="sm"
@@ -1186,18 +1263,8 @@ export function MessageItem({
                       size="sm"
                       className="h-7 px-2 text-xs"
                       disabled={tasksSaving}
-                      onClick={async () => {
-                        setTasksSaving(true);
-                        setTasksError(null);
-                        try {
-                          await saveSessionTasks(sessionId, tasksDraft);
-                          setTasksContent(tasksDraft);
-                          setTasksEditing(false);
-                        } catch (error) {
-                          setTasksError(error instanceof Error ? error.message : String(error));
-                        } finally {
-                          setTasksSaving(false);
-                        }
+                      onClick={() => {
+                        void persistTasks(tasksDraft, tasksPlanState, false);
                       }}
                     >
                       {tasksSaving ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : null}

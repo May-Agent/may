@@ -10,11 +10,13 @@
 use std::sync::Arc;
 
 use serde::Serialize;
+use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::ask_user::AnswerValue;
 use crate::config::MayConfig;
-use crate::session::{ChatMessage, SessionId};
+use crate::session::{ChatMessage, MayHomePaths, SessionId, SessionPaths};
 
+use super::error::internal_error;
 use super::state::UiServerState;
 
 pub(super) async fn send_event<T: Serialize>(
@@ -49,6 +51,28 @@ pub(super) async fn append_history_message(
         .append_message(message)
         .await
         .map_err(anyhow::Error::from)
+}
+
+pub(super) async fn load_session_paths(
+    state: &UiServerState,
+    session_id: &str,
+) -> SkyResult<SessionPaths> {
+    let session = state
+        .db()
+        .await
+        .get_session(session_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            SkyError::msg(["session ", session_id, " not found"].concat())
+                .set_status(StatusCode::NOT_FOUND)
+        })?;
+    let home_paths = MayHomePaths::new(state.may_dir.clone());
+    let paths = match session.profile_id.as_deref() {
+        Some(profile_id) => home_paths.profile_home(profile_id).session_paths(session_id),
+        None => home_paths.session_paths(session_id),
+    };
+    Ok(paths)
 }
 
 pub(super) async fn load_config_from_disk() -> anyhow::Result<MayConfig> {

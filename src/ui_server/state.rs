@@ -15,8 +15,6 @@ use crate::live_response::LiveResponseRegistry;
 use crate::mcp::McpManager;
 use crate::session::SessionManager;
 use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
-use crate::skill::SkillManager;
-
 use super::local_url_mapper::LocalUrlPortMapper;
 use super::types::{ModelsResponse, ProviderModelsResponse, RequestLogEntry};
 
@@ -106,7 +104,6 @@ impl<T: Clone> RefreshableCache<T> {
 pub(crate) struct UiServerState {
     pub(crate) session_manager: Mutex<SessionManager>,
     pub(crate) mcp_manager: Mutex<McpManager>,
-    pub(crate) skill_manager: SkillManager,
     pub(crate) permission_approver: PermissionApprover,
     pub(crate) ask_user_approver: AskUserApprover,
     pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,

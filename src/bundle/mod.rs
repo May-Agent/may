@@ -1,8 +1,8 @@
 //! Bundled resources extraction.
 //!
 //! Skills and subagents are embedded in the binary and extracted
-//! to ~/.may/skills/ and ~/.may/subagents/ on first run.
-//! Local/leash session sandboxes get symlinks pointing to these directories.
+//! to the canonical May home on first run.
+//! Local/leash session sandboxes get symlinks pointing to their home-scoped resources.
 //! Container sessions use mount points managed by container lifecycle code.
 
 use std::fs;
@@ -66,14 +66,14 @@ impl Bundle {
         may_dir.join("container")
     }
 
-    /// Create symlinks in a local/leash session sandbox pointing to global resources.
-    pub async fn create_sandbox_symlinks(
+    /// Create symlinks in a local/leash session sandbox pointing to its home-scoped resources.
+    pub async fn create_sandbox_home_symlinks(
         sandbox_dir: &Path,
-        may_dir: &Path,
+        home_root: &Path,
     ) -> Result<(), BundleError> {
         let session_paths = SessionPaths::new(sandbox_dir.to_path_buf());
-        let subagents_target = may_dir.join("subagents");
-        let skills_target = may_dir.join("skills");
+        let subagents_target = home_root.join("subagents");
+        let skills_target = home_root.join("skills");
 
         Self::create_dir_symlink(sandbox_dir, &subagents_target, "subagents").await?;
         Self::create_dir_symlink(sandbox_dir, &skills_target, "skills").await?;

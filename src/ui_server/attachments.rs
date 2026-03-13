@@ -8,9 +8,9 @@ use serde::Serialize;
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::agent::generate_session_title;
-use crate::session::SessionPaths;
 
 use super::error::{bad_request_error, internal_error};
+use super::helpers::load_session_paths;
 use super::state::UiServerState;
 use super::types::{ApiAttachment, ChatRequest};
 
@@ -465,7 +465,7 @@ async fn allocate_upload_path(
     base_name: &str,
     ext: &str,
 ) -> SkyResult<(PathBuf, String)> {
-    let uploads_dir = SessionPaths::from_may_dir(&state.may_dir, session_id).files_dir();
+    let uploads_dir = load_session_paths(state, session_id).await?.files_dir();
 
     async_fs::create_dir_all(&uploads_dir)
         .await

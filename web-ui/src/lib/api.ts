@@ -13,6 +13,7 @@ import type {
   VapidKeyInfo,
   PendingUserMessage,
   PendingUserMessageMode,
+  SessionPlanState,
   SessionRuntimeState,
 } from '@/types';
 
@@ -25,6 +26,7 @@ export interface PermissionRequest {
 
 export interface SessionRuntimeStatus {
   state: SessionRuntimeState;
+  planState: SessionPlanState;
   queuedCount: number;
   pendingImmediate?: PendingUserMessage | null;
   queuedMessages: PendingUserMessage[];
@@ -194,6 +196,7 @@ export interface NotificationMailboxPayload {
 
 export interface SessionTasksPayload {
   content: string;
+  planState: SessionPlanState;
 }
 
 export interface ContextDebugMessage {
@@ -1146,22 +1149,30 @@ export async function reconnectMcpServer(name: string): Promise<void> {
 
 // ── Skills API ───────────────────────────────────────────
 
-export async function fetchSkills(): Promise<SkillInfo[]> {
-  return request<SkillInfo[]>('/api/skills');
+export async function fetchSkills(profileId: string): Promise<SkillInfo[]> {
+  return request<SkillInfo[]>(
+    `/api/skills?profileId=${encodeURIComponent(profileId)}`,
+  );
 }
 
-export async function installSkill(repo: string): Promise<SkillInfo[]> {
-  return request<SkillInfo[]>('/api/skills/install', {
+export async function installSkill(repo: string, profileId: string): Promise<SkillInfo[]> {
+  return request<SkillInfo[]>(
+    `/api/skills/install?profileId=${encodeURIComponent(profileId)}`,
+    {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ repo }),
-  });
+    },
+  );
 }
 
-export async function deleteSkill(dirName: string): Promise<void> {
-  await request<{ ok: boolean }>(`/api/skills/${encodeURIComponent(dirName)}`, {
-    method: 'DELETE',
-  });
+export async function deleteSkill(dirName: string, profileId: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/skills/${encodeURIComponent(dirName)}?profileId=${encodeURIComponent(profileId)}`,
+    {
+      method: 'DELETE',
+    },
+  );
 }
 
 // ── Copilot Auth API ─────────────────────────────────────
@@ -1543,14 +1554,14 @@ export async function fetchSessionTasks(sessionId: string): Promise<SessionTasks
 
 export async function saveSessionTasks(
   sessionId: string,
-  content: string,
-): Promise<void> {
-  await request<{ ok: boolean }>(
+  payload: SessionTasksPayload,
+): Promise<SessionTasksPayload> {
+  return request<SessionTasksPayload>(
     `/api/sessions/${encodeURIComponent(sessionId)}/tasks`,
     {
       method: 'PUT',
       headers: JSON_HEADERS,
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(payload),
     },
   );
 }

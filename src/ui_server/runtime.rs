@@ -5,7 +5,7 @@ use tokio::sync::Notify;
 use crate::db::ChatDb;
 use crate::session::{
     PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
-    PersistedPermissionRequest, SessionRuntimeState, SessionRuntimeSummary,
+    PersistedPermissionRequest, SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
 };
 
 #[derive(Clone)]
@@ -49,6 +49,16 @@ impl SessionRuntimeService {
         self.db.set_session_runtime_state(session_id, state).await?;
         self.notify_ui();
         Ok(())
+    }
+
+    pub(crate) async fn set_plan_state(
+        &self,
+        session_id: &str,
+        plan_state: SessionPlanState,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self.db.set_session_plan_state(session_id, plan_state).await?;
+        self.notify_ui();
+        Ok(summary)
     }
 
     pub(crate) async fn enqueue(

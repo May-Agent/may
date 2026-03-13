@@ -38,7 +38,6 @@ use crate::config::MayConfig;
 use crate::mcp::McpManager;
 use crate::models::fetch_all_models;
 use crate::session::SessionManager;
-use crate::skill::SkillManager;
 use aither_models::lookup as lookup_model_info;
 
 use error::internal_error;
@@ -175,7 +174,6 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let state = Arc::new(UiServerState {
         session_manager: Mutex::new(session_manager),
         mcp_manager: Mutex::new(mcp_manager),
-        skill_manager: SkillManager::new(&may_dir),
         permission_approver,
         ask_user_approver,
         run_cancellation_registry: SessionRunCancellationRegistry::new(),

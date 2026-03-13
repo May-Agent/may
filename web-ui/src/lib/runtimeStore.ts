@@ -6,9 +6,11 @@ import type {
   SessionRuntimeStatus,
 } from '@/lib/api';
 import type { PendingUserMessage, SessionRuntimeState } from '@/types';
+import type { SessionPlanState } from '@/types';
 
 interface SessionRuntime {
   state: SessionRuntimeState;
+  planState: SessionPlanState;
   queuedCount: number;
   waitingPermission: PermissionRequest | null;
   waitingAskUser: AskUserRequest | null;
@@ -29,6 +31,7 @@ interface RuntimeStoreState {
 
 const defaultRuntime = (): SessionRuntime => ({
   state: 'idle',
+  planState: 'disabled',
   queuedCount: 0,
   waitingPermission: null,
   waitingAskUser: null,
@@ -44,6 +47,7 @@ function runtimeFromStatus(
     ...defaultRuntime(),
     firstTokenAt: current?.firstTokenAt,
     state: runtime.state,
+    planState: runtime.planState ?? current?.planState ?? 'disabled',
     queuedCount: Math.max(0, runtime.queuedCount ?? 0),
     waitingPermission: runtime.waitingPermission ?? null,
     waitingAskUser: runtime.waitingAskUser ?? null,

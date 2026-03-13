@@ -17,14 +17,14 @@ use sea_orm::{
 
 use crate::session::{
     MessageRole, PendingUserMessage, PersistedAskUserRequest, PersistedPermissionRequest,
-    SessionRuntimeState, SessionRuntimeSummary,
+    SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
 };
 use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 use crate::xml_fragment::XmlFragment;
 use entity::{
     context_debug_snapshots, folders, messages, notification_mailbox, profile_memories,
     profile_memory_jobs, profiles, push_subscriptions, scheduled_tasks, session_context_snapshots,
-    session_pending_ask_user, session_pending_messages, session_pending_permissions,
+    session_pending_ask_user, session_pending_messages, session_pending_permissions, session_plans,
     session_runtimes, sessions,
 };
 
@@ -228,6 +228,12 @@ impl ChatDb {
 
         let session_runtime_stmt = schema.create_table_from_entity(session_runtimes::Entity);
         let create_sql = session_runtime_stmt
+            .to_string(SqliteQueryBuilder)
+            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        conn.execute_unprepared(&create_sql).await?;
+
+        let session_plan_stmt = schema.create_table_from_entity(session_plans::Entity);
+        let create_sql = session_plan_stmt
             .to_string(SqliteQueryBuilder)
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
@@ -478,6 +484,9 @@ impl ChatDb {
             .filter(session_pending_ask_user::Column::SessionId.eq(session_id))
             .one(&self.conn)
             .await?;
+        let plan_row = session_plans::Entity::find_by_id(session_id)
+            .one(&self.conn)
+            .await?;
 
         let mut steer_messages = Vec::new();
         let mut queued_messages = Vec::new();
@@ -510,6 +519,12 @@ impl ChatDb {
                 .unwrap_or(SessionRuntimeState::Idle.as_str())
                 .parse()
                 .unwrap_or(SessionRuntimeState::Idle),
+            plan_state: plan_row
+                .as_ref()
+                .map(|row| row.plan_state.as_str())
+                .unwrap_or(SessionPlanState::Disabled.as_str())
+                .parse()
+                .unwrap_or(SessionPlanState::Disabled),
             pending_immediate,
             queued_messages,
             waiting_permission: permission_row.map(|row| PersistedPermissionRequest {
@@ -544,7 +559,7 @@ impl ChatDb {
         let active_runtime = session_runtimes::ActiveModel {
             session_id: Set(session_id.to_string()),
             state: Set(summary.state.as_str().to_string()),
-            updated_at: Set(now),
+            updated_at: Set(now.clone()),
         };
         session_runtimes::Entity::insert(active_runtime)
             .on_conflict(
@@ -552,6 +567,23 @@ impl ChatDb {
                     .update_columns([
                         session_runtimes::Column::State,
                         session_runtimes::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.conn)
+            .await?;
+
+        let active_plan = session_plans::ActiveModel {
+            session_id: Set(session_id.to_string()),
+            plan_state: Set(summary.plan_state.as_str().to_string()),
+            updated_at: Set(now),
+        };
+        session_plans::Entity::insert(active_plan)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(session_plans::Column::SessionId)
+                    .update_columns([
+                        session_plans::Column::PlanState,
+                        session_plans::Column::UpdatedAt,
                     ])
                     .to_owned(),
             )
@@ -651,6 +683,24 @@ impl ChatDb {
         summary.normalize_state();
         self.write_session_runtime_summary(session_id, &summary)
             .await
+    }
+
+    pub async fn set_session_plan_state(
+        &self,
+        session_id: &str,
+        plan_state: SessionPlanState,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let session = self.get_session(session_id).await?.ok_or_else(|| {
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
+        })?;
+        let mut summary = self.load_session_runtime_summary(&session.id).await?;
+        summary.plan_state = plan_state;
+        summary.normalize_state();
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
+        Ok(summary)
     }
 
     /// Enqueue a pending-immediate message while preserving older steer messages.

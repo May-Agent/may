@@ -48,8 +48,7 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from '@dnd-kit/core';
-import type { SessionSummary, PinnedItem, ProfileInfo } from '@/types';
-import type { SessionRuntimeState } from '@/types';
+import type { SessionPlanState, SessionRuntimeState, SessionSummary, PinnedItem, ProfileInfo } from '@/types';
 
 interface SidebarProps {
   className?: string;
@@ -147,8 +146,26 @@ function sessionStatusLabel(state: SessionRuntimeState | undefined, queuedCount:
   }
 }
 
+function sessionPlanLabel(planState: SessionPlanState | undefined): string | null {
+  switch (planState) {
+    case 'draft':
+      return 'Plan';
+    case 'approved':
+      return 'Planned';
+    default:
+      return null;
+  }
+}
+
 function isActiveRuntimeState(state: SessionRuntimeState | undefined): boolean {
   return state !== undefined && state !== 'idle';
+}
+
+function sessionBlocksArchive(
+  runtimeState: SessionRuntimeState | undefined,
+  planState: SessionPlanState | undefined,
+): boolean {
+  return isActiveRuntimeState(runtimeState) || planState === 'draft';
 }
 
 // ── DnD types and helpers ────────────────────────────────
@@ -198,6 +215,7 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
   const store = useStore.getState();
   const runtime = useRuntimeStore.getState().sessions[sessionId];
   const runtimeState = runtime?.state ?? sourceData.session.runtimeState;
+  const planState = runtime?.planState ?? sourceData.session.planState;
 
   // Dropped on a folder → move into folder (pin if needed)
   if (targetId.startsWith('folder-')) {
@@ -231,7 +249,7 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
 
   // Dropped on archive zone
   if (targetId === 'archive-zone' && sourceZone !== 'archive') {
-    if (isActiveRuntimeState(runtimeState)) return;
+    if (sessionBlocksArchive(runtimeState, planState)) return;
     if (sourceData.folderId) await store.moveSessionToFolder(sessionId, null);
     if (sourceZone === 'pinned') await store.unpinSession(sessionId);
     await store.archiveSession(sessionId);
@@ -321,9 +339,11 @@ function DraggableSessionRow({
   const runtimeSessions = useRuntimeStore((state) => state.sessions);
   const runtime = runtimeSessions[session.id];
   const state = runtime?.state ?? session.runtimeState;
+  const planState = runtime?.planState ?? session.planState;
   const queuedCount = runtime?.queuedCount ?? session.queuedCount;
   const isStreaming = state === 'running';
   const statusLabel = sessionStatusLabel(state, queuedCount);
+  const planLabel = sessionPlanLabel(planState);
 
   return (
     <div
@@ -345,6 +365,11 @@ function DraggableSessionRow({
         <span className="block min-w-0 flex-1 truncate">
           {session.title || 'New Chat'}
         </span>
+        {planLabel && (
+          <span className="shrink-0 rounded-full border border-amber-500/35 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-amber-200">
+            {planLabel}
+          </span>
+        )}
         {statusLabel && (
           <span className="shrink-0 rounded-full border border-border/60 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
             {statusLabel}

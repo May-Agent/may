@@ -22,7 +22,6 @@ pub enum StoreError {
 #[derive(Clone)]
 pub struct SessionStore {
     home_paths: MayHomePaths,
-    sessions_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,56 +33,51 @@ pub enum SandboxResourceLayout {
 impl SessionStore {
     /// Create a new session store.
     pub fn new(home_paths: MayHomePaths) -> Self {
-        let sessions_dir = home_paths.sessions_dir();
-        Self {
-            home_paths,
-            sessions_dir,
-        }
-    }
-
-    /// Get the sessions directory.
-    pub fn sessions_dir(&self) -> &Path {
-        &self.sessions_dir
+        Self { home_paths }
     }
 
     /// Get path for a session directory.
-    pub fn session_dir(&self, id: &str) -> PathBuf {
-        self.sessions_dir.join(id)
+    pub fn session_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
+        self.session_paths(id, profile_id).root().to_path_buf()
     }
 
     /// Get typed layout for a session.
-    pub fn session_paths(&self, id: &str) -> SessionPaths {
-        SessionPaths::new(self.session_dir(id))
+    pub fn session_paths(&self, id: &str, profile_id: Option<&str>) -> SessionPaths {
+        match profile_id {
+            Some(profile_id) => self.home_paths.profile_home(profile_id).session_paths(id),
+            None => self.home_paths.session_paths(id),
+        }
     }
 
     /// Get path for a session's chat history.
-    pub fn chat_path(&self, id: &str) -> PathBuf {
-        self.session_paths(id).chat_backup_path()
+    pub fn chat_path(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
+        self.session_paths(id, profile_id).chat_backup_path()
     }
 
     /// Get path for a session's images directory.
-    pub fn images_dir(&self, id: &str) -> PathBuf {
-        self.session_paths(id).images_dir()
+    pub fn images_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
+        self.session_paths(id, profile_id).images_dir()
     }
 
     /// Get path for a session's sandbox directory.
     /// BashTool will create its own working directory inside this.
-    pub fn sandbox_dir(&self, id: &str) -> PathBuf {
-        self.session_dir(id)
+    pub fn sandbox_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
+        self.session_dir(id, profile_id)
     }
 
     /// Check if a session exists.
-    pub fn exists(&self, id: &str) -> bool {
-        self.session_dir(id).exists()
+    pub fn exists(&self, id: &str, profile_id: Option<&str>) -> bool {
+        self.session_dir(id, profile_id).exists()
     }
 
     /// Create session directory structure.
     pub async fn create_session_dirs(
         &self,
         id: &str,
+        profile_id: Option<&str>,
         layout: SandboxResourceLayout,
     ) -> Result<(), StoreError> {
-        let paths = self.session_paths(id);
+        let paths = self.session_paths(id, profile_id);
         async_fs::create_dir_all(paths.root()).await?;
         async_fs::create_dir_all(paths.tmp_dir()).await?;
         async_fs::create_dir_all(paths.data_dir()).await?;
@@ -95,24 +89,36 @@ impl SessionStore {
         match layout {
             SandboxResourceLayout::Symlinked => {
                 // Create sandbox symlinks to global resources.
-                crate::bundle::Bundle::create_sandbox_symlinks(
-                    paths.root(),
-                    self.home_paths.root(),
-                )
-                .await?;
+                let symlink_root = match profile_id {
+                    Some(profile_id) => {
+                        let profile_home = self.home_paths.profile_home(profile_id);
+                        async_fs::create_dir_all(profile_home.root()).await?;
+                        async_fs::create_dir_all(profile_home.skills_dir()).await?;
+                        async_fs::create_dir_all(profile_home.subagents_dir()).await?;
+                        self.seed_profile_scoped_resources(profile_id).await?;
+                        profile_home.root().to_path_buf()
+                    }
+                    None => self.home_paths.root().to_path_buf(),
+                };
+                crate::bundle::Bundle::create_sandbox_home_symlinks(paths.root(), &symlink_root)
+                    .await?;
             }
             SandboxResourceLayout::ContainerMountPoints => {
                 Self::ensure_mount_point_dir(paths.root(), "skills").await?;
                 Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
-                self.seed_session_scoped_resources(&paths).await?;
+                self.seed_session_scoped_resources(&paths, profile_id).await?;
             }
         }
 
         Ok(())
     }
 
-    pub async fn reconcile_container_mount_points(&self, id: &str) -> Result<(), StoreError> {
-        let paths = self.session_paths(id);
+    pub async fn reconcile_container_mount_points(
+        &self,
+        id: &str,
+        profile_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let paths = self.session_paths(id, profile_id);
         if async_fs::metadata(paths.root()).await.is_err() {
             return Ok(());
         }
@@ -126,13 +132,13 @@ impl SessionStore {
         async_fs::create_dir_all(paths.artifacts_dir()).await?;
         Self::ensure_mount_point_dir(paths.root(), "skills").await?;
         Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
-        self.seed_session_scoped_resources(&paths).await?;
+        self.seed_session_scoped_resources(&paths, profile_id).await?;
         Ok(())
     }
 
     /// Read chat history from disk.
-    pub async fn read_history(&self, id: &str) -> Result<ChatHistory, StoreError> {
-        let path = self.chat_path(id);
+    pub async fn read_history(&self, id: &str, profile_id: Option<&str>) -> Result<ChatHistory, StoreError> {
+        let path = self.chat_path(id, profile_id);
         if async_fs::metadata(&path).await.is_err() {
             return Ok(ChatHistory::new());
         }
@@ -141,40 +147,49 @@ impl SessionStore {
     }
 
     /// Write chat history to disk.
-    pub async fn write_history(&self, id: &str, history: &ChatHistory) -> Result<(), StoreError> {
-        let path = self.chat_path(id);
+    pub async fn write_history(
+        &self,
+        id: &str,
+        profile_id: Option<&str>,
+        history: &ChatHistory,
+    ) -> Result<(), StoreError> {
+        let path = self.chat_path(id, profile_id);
         let content = history.serialize();
         async_fs::write(&path, content).await?;
         Ok(())
     }
 
-    /// List all session IDs.
-    pub async fn list_sessions(&self) -> Result<Vec<String>, StoreError> {
-        let mut sessions = Vec::new();
-
-        if !self.sessions_dir.exists() {
-            return Ok(sessions);
-        }
-
-        let mut entries = async_fs::read_dir(&self.sessions_dir).await?;
-        while let Some(entry) = entries.next().await {
-            let entry = entry?;
-            if entry.file_type().await?.is_dir()
-                && let Some(name) = entry.file_name().to_str()
-            {
-                sessions.push(name.to_string());
-            }
-        }
-
-        Ok(sessions)
-    }
-
     /// Delete a session.
-    pub async fn delete_session(&self, id: &str) -> Result<(), StoreError> {
-        let path = self.session_dir(id);
+    pub async fn delete_session(&self, id: &str, profile_id: Option<&str>) -> Result<(), StoreError> {
+        let path = self.session_dir(id, profile_id);
         if path.exists() {
             async_fs::remove_dir_all(&path).await?;
         }
+        Ok(())
+    }
+
+    /// Delete every session directory across the root home and all profile homes.
+    pub async fn delete_all_session_dirs(&self) -> Result<(), StoreError> {
+        let sessions_dir = self.home_paths.sessions_dir();
+        if sessions_dir.exists() {
+            async_fs::remove_dir_all(&sessions_dir).await?;
+            async_fs::create_dir_all(&sessions_dir).await?;
+        }
+
+        let profiles_dir = self.home_paths.profiles_dir();
+        if async_fs::metadata(&profiles_dir).await.is_ok() {
+            let mut entries = async_fs::read_dir(&profiles_dir).await?;
+            while let Some(entry) = entries.next().await {
+                let entry = entry?;
+                if entry.file_type().await?.is_dir() {
+                    let sessions_dir = entry.path().join("sessions");
+                    if async_fs::metadata(&sessions_dir).await.is_ok() {
+                        async_fs::remove_dir_all(&sessions_dir).await?;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -202,14 +217,36 @@ impl SessionStore {
         Ok(())
     }
 
-    async fn seed_session_scoped_resources(&self, paths: &SessionPaths) -> Result<(), StoreError> {
-        Self::copy_dir_contents_if_target_empty(&self.home_paths.skills_dir(), &paths.skills_dir())
-            .await?;
+    async fn seed_profile_scoped_resources(&self, profile_id: &str) -> Result<(), StoreError> {
+        let profile_home = self.home_paths.profile_home(profile_id);
         Self::copy_dir_contents_if_target_empty(
-            &self.home_paths.subagents_dir(),
-            &paths.subagents_dir(),
+            &self.home_paths.skills_dir(),
+            &profile_home.skills_dir(),
         )
         .await?;
+        Self::copy_dir_contents_if_target_empty(
+            &self.home_paths.subagents_dir(),
+            &profile_home.subagents_dir(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_session_scoped_resources(
+        &self,
+        paths: &SessionPaths,
+        profile_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let (skills_dir, subagents_dir) = match profile_id {
+            Some(profile_id) => {
+                self.seed_profile_scoped_resources(profile_id).await?;
+                let profile_home = self.home_paths.profile_home(profile_id);
+                (profile_home.skills_dir(), profile_home.subagents_dir())
+            }
+            None => (self.home_paths.skills_dir(), self.home_paths.subagents_dir()),
+        };
+        Self::copy_dir_contents_if_target_empty(&skills_dir, &paths.skills_dir()).await?;
+        Self::copy_dir_contents_if_target_empty(&subagents_dir, &paths.subagents_dir()).await?;
         Ok(())
     }
 

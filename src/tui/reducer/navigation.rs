@@ -136,6 +136,18 @@ pub(crate) fn handle_session_select_key(
                             let store = app.session_manager.store().clone();
                             executor_core::spawn(async move {
                                 // Delete from both DB and filesystem
+                                let profile_id = match db.get_session(&deleted_id).await {
+                                    Ok(session) => session.and_then(|session| session.profile_id),
+                                    Err(error) => {
+                                        let _ = tx
+                                            .send(crate::tui::event::AppEvent::SessionDeleted {
+                                                was_current,
+                                                result: Err(anyhow::Error::from(error)),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                };
                                 if let Err(e) = db.delete_session(&deleted_id).await {
                                     let _ = tx
                                         .send(crate::tui::event::AppEvent::SessionDeleted {
@@ -145,7 +157,9 @@ pub(crate) fn handle_session_select_key(
                                         .await;
                                     return;
                                 }
-                                let _ = store.delete_session(&deleted_id).await;
+                                let _ = store
+                                    .delete_session(&deleted_id, profile_id.as_deref())
+                                    .await;
                                 let result = crate::session::list_summaries_from_db(&db).await;
                                 let _ = tx
                                     .send(crate::tui::event::AppEvent::SessionDeleted {

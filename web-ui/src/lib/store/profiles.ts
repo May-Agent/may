@@ -114,6 +114,7 @@ export const createProfilesSlice: StateCreator<AppState, [], [], ProfilesSlice> 
       profileAccessBlockedReason: null,
       profileAccessBlockedCode: null,
     });
+    void get().refreshSkills();
     await fetchAndApplyProfileSessions(profileId, get, set);
   },
 
