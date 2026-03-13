@@ -164,8 +164,9 @@ function isActiveRuntimeState(state: SessionRuntimeState | undefined): boolean {
 function sessionBlocksArchive(
   runtimeState: SessionRuntimeState | undefined,
   planState: SessionPlanState | undefined,
+  browserTakeoverActive: boolean | undefined,
 ): boolean {
-  return isActiveRuntimeState(runtimeState) || planState === 'draft';
+  return isActiveRuntimeState(runtimeState) || planState === 'draft' || !!browserTakeoverActive;
 }
 
 // ── DnD types and helpers ────────────────────────────────
@@ -216,6 +217,7 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
   const runtime = useRuntimeStore.getState().sessions[sessionId];
   const runtimeState = runtime?.state ?? sourceData.session.runtimeState;
   const planState = runtime?.planState ?? sourceData.session.planState;
+  const browserTakeoverActive = runtime?.interactions?.browser.takeoverActive;
 
   // Dropped on a folder → move into folder (pin if needed)
   if (targetId.startsWith('folder-')) {
@@ -249,7 +251,7 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
 
   // Dropped on archive zone
   if (targetId === 'archive-zone' && sourceZone !== 'archive') {
-    if (sessionBlocksArchive(runtimeState, planState)) return;
+    if (sessionBlocksArchive(runtimeState, planState, browserTakeoverActive)) return;
     if (sourceData.folderId) await store.moveSessionToFolder(sessionId, null);
     if (sourceZone === 'pinned') await store.unpinSession(sessionId);
     await store.archiveSession(sessionId);

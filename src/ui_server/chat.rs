@@ -1699,15 +1699,31 @@ async fn check_tasks_update(
 }
 
 async fn is_takeover_active_for_session(state: &UiServerState, session_id: &SessionId) -> bool {
-    state.browser_takeover_session.lock().await.as_deref() == Some(session_id.as_str())
+    match state
+        .runtime_service
+        .has_browser_takeover(session_id.as_str())
+        .await
+    {
+        Ok(active) => active,
+        Err(error) => {
+            tracing::warn!(session_id = %session_id, error = %error, "failed to inspect browser takeover state");
+            false
+        }
+    }
 }
 
 async fn take_over_alert_pending(state: &UiServerState, session_id: &SessionId) -> bool {
-    state
-        .browser_takeover_alert_pending
-        .lock()
+    match state
+        .runtime_service
+        .take_browser_takeover_alert_pending(session_id.as_str())
         .await
-        .remove(session_id.as_str())
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(session_id = %session_id, error = %error, "failed to consume browser takeover alert state");
+            false
+        }
+    }
 }
 
 async fn handle_task_request(

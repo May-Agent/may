@@ -8,6 +8,8 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub session_id: String,
     pub state: String,
+    pub browser_takeover_active: bool,
+    pub browser_takeover_alert_pending: bool,
     pub updated_at: String,
 }
 

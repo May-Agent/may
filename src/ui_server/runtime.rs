@@ -155,4 +155,46 @@ impl SessionRuntimeService {
         }
         Ok(())
     }
+
+    pub(crate) async fn set_browser_takeover_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self.db.set_browser_takeover_owner(session_id).await?;
+        self.notify_ui();
+        Ok(summary)
+    }
+
+    pub(crate) async fn clear_browser_takeover_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self.db.clear_browser_takeover_owner(session_id).await?;
+        self.notify_ui();
+        Ok(summary)
+    }
+
+    pub(crate) async fn has_browser_takeover(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, crate::db::ChatDbError> {
+        self.db.session_has_browser_takeover(session_id).await
+    }
+
+    pub(crate) async fn find_browser_takeover_session(
+        &self,
+    ) -> Result<Option<String>, crate::db::ChatDbError> {
+        self.db.find_browser_takeover_session().await
+    }
+
+    pub(crate) async fn take_browser_takeover_alert_pending(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, crate::db::ChatDbError> {
+        let pending = self.db.take_browser_takeover_alert_pending(session_id).await?;
+        if pending {
+            self.notify_ui();
+        }
+        Ok(pending)
+    }
 }

@@ -27,6 +27,11 @@ export interface PermissionRequest {
 export interface SessionRuntimeStatus {
   state: SessionRuntimeState;
   planState: SessionPlanState;
+  interactions?: {
+    browser: {
+      takeoverActive: boolean;
+    };
+  };
   queuedCount: number;
   pendingImmediate?: PendingUserMessage | null;
   queuedMessages: PendingUserMessage[];
