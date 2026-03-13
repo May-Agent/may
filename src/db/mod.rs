@@ -944,16 +944,10 @@ impl ChatDb {
             let session_id = session.id.clone();
             let mut summary = self.load_session_runtime_summary(&session_id).await?;
             let original_state = summary.state;
-            let expired_interactive_wait = matches!(
-                original_state,
-                SessionRuntimeState::WaitingPermission
-                    | SessionRuntimeState::WaitingAskUser
-                    | SessionRuntimeState::WaitingTerminalInput
-            );
+            let expired_terminal_wait =
+                matches!(original_state, SessionRuntimeState::WaitingTerminalInput);
 
-            if expired_interactive_wait {
-                summary.waiting_permission = None;
-                summary.waiting_ask_user = None;
+            if expired_terminal_wait {
                 summary.state = SessionRuntimeState::Idle;
             }
             summary.normalize_state();
@@ -963,7 +957,7 @@ impl ChatDb {
                 summary.state = SessionRuntimeState::Idle;
             }
 
-            if summary.state != original_state || expired_interactive_wait {
+            if summary.state != original_state || expired_terminal_wait {
                 self.write_session_runtime_summary(&session_id, &summary)
                     .await?;
             }
@@ -3018,7 +3012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_recovery_expires_interactive_waits_but_preserves_pending_dispatch() {
+    async fn restart_recovery_preserves_waiting_requests_and_pending_dispatch() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
         let db = ChatDb::open(&db_path)
@@ -3072,9 +3066,9 @@ mod tests {
             .await
             .expect("runtime should load")
             .expect("runtime should exist");
-        assert_eq!(runtime.state, SessionRuntimeState::Idle);
-        assert!(runtime.waiting_permission.is_none());
-        assert!(runtime.waiting_ask_user.is_none());
+        assert_eq!(runtime.state, SessionRuntimeState::WaitingPermission);
+        assert!(runtime.waiting_permission.is_some());
+        assert!(runtime.waiting_ask_user.is_some());
         assert!(runtime.has_pending_immediate());
         assert_eq!(runtime.queued_count, 1);
 
@@ -3083,5 +3077,34 @@ mod tests {
             .await
             .expect("pending dispatch lookup should succeed");
         assert_eq!(resumable, vec![session_id.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_expires_terminal_wait_state() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let session_id = "session-test";
+        db.create_session(session_id, Some("Test session"), Some("test-model"))
+            .await
+            .expect("session should be created");
+        db.set_session_runtime_state(session_id, SessionRuntimeState::WaitingTerminalInput)
+            .await
+            .expect("waiting terminal input should persist");
+
+        db.recover_session_runtimes_after_restart()
+            .await
+            .expect("runtime recovery should succeed");
+
+        let runtime = db
+            .get_session_runtime(session_id)
+            .await
+            .expect("runtime should load")
+            .expect("runtime should exist");
+        assert_eq!(runtime.state, SessionRuntimeState::Idle);
+        assert!(!runtime.has_pending_messages());
     }
 }

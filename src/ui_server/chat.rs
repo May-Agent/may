@@ -362,6 +362,15 @@ struct BrowserTakeoverAlertXml {
     instruction: String,
 }
 
+#[derive(Serialize)]
+struct ResumeWaitingTurnXml<'a> {
+    #[serde(rename = "@type")]
+    alert_type: &'a str,
+    request_kind: &'a str,
+    resolution: &'a str,
+    instruction: &'a str,
+}
+
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> anyhow::Result<String> {
     let mut output = String::new();
     let serializer = quick_xml::se::Serializer::with_root(&mut output, Some(tag))?;
@@ -380,6 +389,44 @@ fn browser_takeover_alert_xml() -> anyhow::Result<String> {
                     .to_string(),
         },
     )
+}
+
+fn resume_waiting_turn_xml(
+    request_kind: &'static str,
+    resolution: &'static str,
+) -> anyhow::Result<crate::XmlFragment> {
+    let xml = serialize_xml(
+        "system_alert",
+        &ResumeWaitingTurnXml {
+            alert_type: "resume_waiting_turn",
+            request_kind,
+            resolution,
+            instruction:
+                "The previous run was interrupted while waiting for this response. Reassess the latest state, use the recorded response, and continue from the most sensible next action.",
+        },
+    )?;
+    crate::XmlFragment::parse(xml).map_err(anyhow::Error::from)
+}
+
+pub(super) async fn resume_waiting_turn(
+    state: Arc<UiServerState>,
+    session_id: String,
+    request_kind: &'static str,
+    resolution: &'static str,
+) -> anyhow::Result<()> {
+    set_session_runtime_state(&state, &session_id, SessionRuntimeState::Running).await?;
+    let hidden_context_xml = Some(resume_waiting_turn_xml(request_kind, resolution)?);
+    let request = ChatRequest {
+        session_id: session_id.clone(),
+        content: String::new(),
+        attachments: Vec::new(),
+        hidden_context_xml,
+        delivery_mode: crate::session::PendingUserMessageMode::Steer,
+    };
+    run_chat_collect_with_persistence(state.clone(), request, false, false)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(())
 }
 
 async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) {
@@ -533,6 +580,8 @@ async fn run_agent_loop(
     req: &ChatRequest,
     sink: &mut impl ChatSink,
     cancel_rx: &async_channel::Receiver<()>,
+    persist_user_message: bool,
+    use_persisted_context_snapshot: bool,
 ) -> anyhow::Result<AgentRunResult> {
     let mut attempt = 0usize;
     let mut max_retries = 0usize;
@@ -547,7 +596,15 @@ async fn run_agent_loop(
             prompt,
             attachments,
             provider_candidate_count,
-        } = match prepare_agent_for_request(state, req, attempt == 0, attempt).await {
+        } = match prepare_agent_for_request(
+            state,
+            req,
+            persist_user_message && attempt == 0,
+            use_persisted_context_snapshot,
+            attempt,
+        )
+        .await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 let _ = sink.on_error(&error.to_string()).await;
@@ -841,7 +898,15 @@ async fn stream_chat_events(
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
     let run_registration = SessionRunRegistration::new(state.clone(), req.session_id.clone());
     let mut sink = SseSink(sender.clone());
-    let result = run_agent_loop(&state, &req, &mut sink, run_registration.receiver()).await;
+        let result = run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            run_registration.receiver(),
+            true,
+            true,
+        )
+        .await;
     {
         let mut active = state.active_streaming_sessions.lock().await;
         active.remove(req.session_id.as_str());
@@ -891,47 +956,71 @@ async fn stream_chat_events(
     }
 }
 
-async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyResult<ChatResponse> {
+async fn run_chat_collect_with_persistence(
+    state: Arc<UiServerState>,
+    req: ChatRequest,
+    persist_user_message: bool,
+    use_persisted_context_snapshot: bool,
+) -> SkyResult<ChatResponse> {
     let run_registration = SessionRunRegistration::new(state.clone(), req.session_id.clone());
     let mut sink = CollectSink;
-    let result = run_agent_loop(&state, &req, &mut sink, run_registration.receiver())
-        .await
-        .map_err(|e| internal_error(e))?;
+    let result = run_agent_loop(
+        &state,
+        &req,
+        &mut sink,
+        run_registration.receiver(),
+        persist_user_message,
+        use_persisted_context_snapshot,
+    )
+    .await;
+    match result {
+        Ok(result) => {
+            spawn_follow_up_runs(state.clone(), req.session_id.clone());
+            clear_running_state_if_needed(&state, &req.session_id)
+                .await
+                .map_err(internal_error)?;
 
-    spawn_follow_up_runs(state.clone(), req.session_id.clone());
-    clear_running_state_if_needed(&state, &req.session_id)
-        .await
-        .map_err(internal_error)?;
+            Ok(ChatResponse {
+                session_id: req.session_id,
+                assistant: ApiMessage {
+                    id: result.assistant_id,
+                    role: "assistant".to_string(),
+                    content: result.full_text,
+                    timestamp: jiff::Timestamp::now().to_string(),
+                    attachments: Vec::new(),
+                    thinking: if result.reasoning_text.is_empty() {
+                        None
+                    } else {
+                        Some(result.reasoning_text)
+                    },
+                    is_streaming: Some(false),
+                    is_thinking: Some(false),
+                    tool_event: None,
+                    bash_executions: Vec::new(),
+                    stats: Some(RequestStats {
+                        provider_id: Some(result.provider_id),
+                        prompt_tokens: result.usage.prompt_tokens,
+                        completion_tokens: result.usage.completion_tokens,
+                        total_tokens: result.usage.total_tokens,
+                        cache_read_tokens: result.usage.cache_read_tokens,
+                        cache_write_tokens: result.usage.cache_write_tokens,
+                        context_window: result.model_context_window,
+                        elapsed_ms: Some(result.elapsed_ms),
+                    }),
+                },
+            })
+        }
+        Err(error) => {
+            clear_running_state_if_needed(&state, &req.session_id)
+                .await
+                .map_err(internal_error)?;
+            Err(internal_error(error))
+        }
+    }
+}
 
-    Ok(ChatResponse {
-        session_id: req.session_id,
-        assistant: ApiMessage {
-            id: result.assistant_id,
-            role: "assistant".to_string(),
-            content: result.full_text,
-            timestamp: jiff::Timestamp::now().to_string(),
-            attachments: Vec::new(),
-            thinking: if result.reasoning_text.is_empty() {
-                None
-            } else {
-                Some(result.reasoning_text)
-            },
-            is_streaming: Some(false),
-            is_thinking: Some(false),
-            tool_event: None,
-            bash_executions: Vec::new(),
-            stats: Some(RequestStats {
-                provider_id: Some(result.provider_id),
-                prompt_tokens: result.usage.prompt_tokens,
-                completion_tokens: result.usage.completion_tokens,
-                total_tokens: result.usage.total_tokens,
-                cache_read_tokens: result.usage.cache_read_tokens,
-                cache_write_tokens: result.usage.cache_write_tokens,
-                context_window: result.model_context_window,
-                elapsed_ms: Some(result.elapsed_ms),
-            }),
-        },
-    })
+async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyResult<ChatResponse> {
+    run_chat_collect_with_persistence(state, req, true, true).await
 }
 
 async fn persist_context_snapshot(
@@ -1141,6 +1230,7 @@ async fn resolve_session_context(
     state: &Arc<UiServerState>,
     req: &ChatRequest,
     persist_user_message: bool,
+    use_persisted_context_snapshot: bool,
 ) -> anyhow::Result<SessionContext> {
     let session_id = SessionId::from_string(req.session_id.clone());
 
@@ -1265,12 +1355,16 @@ async fn resolve_session_context(
     } else {
         history_messages
     };
-    let context_snapshot_json = manager
-        .db()
-        .get_session_context_snapshot(session_id.as_str())
-        .await
-        .map_err(anyhow::Error::from)?
-        .map(|snapshot| snapshot.context_json);
+    let context_snapshot_json = if use_persisted_context_snapshot {
+        manager
+            .db()
+            .get_session_context_snapshot(session_id.as_str())
+            .await
+            .map_err(anyhow::Error::from)?
+            .map(|snapshot| snapshot.context_json)
+    } else {
+        None
+    };
 
     let sandbox_dir = manager
         .current()
@@ -1484,9 +1578,16 @@ async fn prepare_agent_for_request(
     state: &Arc<UiServerState>,
     req: &ChatRequest,
     persist_user_message: bool,
+    use_persisted_context_snapshot: bool,
     provider_attempt: usize,
 ) -> anyhow::Result<PreparedAgent> {
-    let ctx = resolve_session_context(state, req, persist_user_message).await?;
+    let ctx = resolve_session_context(
+        state,
+        req,
+        persist_user_message,
+        use_persisted_context_snapshot,
+    )
+    .await?;
     let (environment, location) = setup_agent_environment(state, &ctx).await?;
     let brokers = wire_tool_channels(state, &ctx.session_id);
 
