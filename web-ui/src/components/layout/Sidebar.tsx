@@ -215,9 +215,12 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
   const sourceZone = sourceData.zone;
   const store = useStore.getState();
   const runtime = useRuntimeStore.getState().sessions[sessionId];
-  const runtimeState = runtime?.state ?? sourceData.session.runtimeState;
-  const planState = runtime?.planState ?? sourceData.session.planState;
-  const browserTakeoverActive = runtime?.interactions?.browser.takeoverActive;
+  const fallbackRuntime = sourceData.session.runtime;
+  const runtimeState = runtime?.state ?? fallbackRuntime.state;
+  const planState = runtime?.planState ?? fallbackRuntime.planState;
+  const browserTakeoverActive =
+    runtime?.interactions?.browser.takeoverActive
+    ?? fallbackRuntime.interactions?.browser.takeoverActive;
 
   // Dropped on a folder → move into folder (pin if needed)
   if (targetId.startsWith('folder-')) {
@@ -340,9 +343,10 @@ function DraggableSessionRow({
 
   const runtimeSessions = useRuntimeStore((state) => state.sessions);
   const runtime = runtimeSessions[session.id];
-  const state = runtime?.state ?? session.runtimeState;
-  const planState = runtime?.planState ?? session.planState;
-  const queuedCount = runtime?.queuedCount ?? session.queuedCount;
+  const fallbackRuntime = session.runtime;
+  const state = runtime?.state ?? fallbackRuntime.state;
+  const planState = runtime?.planState ?? fallbackRuntime.planState;
+  const queuedCount = runtime?.queuedCount ?? fallbackRuntime.queuedCount;
   const isStreaming = state === 'running';
   const statusLabel = sessionStatusLabel(state, queuedCount);
   const planLabel = sessionPlanLabel(planState);

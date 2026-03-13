@@ -159,9 +159,6 @@ export interface SessionSummary {
   createdAt: string | null;
   updatedAt: string | null;
   contentPreview: string;
-  planState: SessionPlanState;
-  runtimeState: SessionRuntimeState;
-  queuedCount: number;
   runtime: SessionRuntimeSummaryPayload;
 }
 
