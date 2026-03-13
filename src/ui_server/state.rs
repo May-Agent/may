@@ -107,7 +107,7 @@ pub(crate) struct UiServerState {
     pub(crate) permission_approver: PermissionApprover,
     pub(crate) ask_user_approver: AskUserApprover,
     pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,
-    pub(crate) active_streaming_sessions: Mutex<HashSet<String>>,
+    pub(crate) active_streaming_sessions: ActiveStreamingSessions,
     pub(crate) models_cache: RefreshableCache<ModelsResponse>,
     pub(crate) provider_models_cache: RefreshableCache<ProviderModelsResponse>,
     pub(crate) config: tokio::sync::RwLock<MayConfig>,
@@ -179,6 +179,21 @@ impl SessionRunCancellationRegistry {
 
     pub(crate) fn close(&self, session_id: &str) -> bool {
         self.live_responses.discard(session_id)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ActiveStreamingSessions {
+    sessions: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ActiveStreamingSessions {
+    pub(crate) async fn insert(&self, session_id: impl Into<String>) -> bool {
+        self.sessions.lock().await.insert(session_id.into())
+    }
+
+    pub(crate) async fn remove(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.remove(session_id)
     }
 }
 
