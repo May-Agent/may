@@ -24,7 +24,7 @@ use futures_lite::{Stream, StreamExt};
 
 use crate::agent::notify_tool::NotifyTool;
 use crate::agent::register_tool::{
-    RegisterSkillsBroker, RegisterSkillsTool, RegisterSubagentsBroker, RegisterSubagentsTool,
+    RegisterBroker, RegisterTool, Skills, Subagents,
 };
 use crate::agent::search_tool::SearchTool;
 use crate::agent::session_tool::{EnvironmentTool, SessionTool};
@@ -580,9 +580,9 @@ pub struct MayAgentConfig {
     /// Optional broker for `notify` command requests.
     pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
     /// Optional broker for `register-skills` command requests.
-    pub register_skills_broker: Option<RegisterSkillsBroker>,
+    pub register_skills_broker: Option<RegisterBroker>,
     /// Optional broker for `register-subagents` command requests.
-    pub register_subagents_broker: Option<RegisterSubagentsBroker>,
+    pub register_subagents_broker: Option<RegisterBroker>,
     /// Whether this model/runtime pair supports native voice input.
     pub native_voice_input: bool,
     /// Model context window resolved from provider metadata.
@@ -947,11 +947,11 @@ impl MayAgent {
             artifacts_dir: session_paths.artifacts_dir(),
         };
         let notify_tool = NotifyTool::new(config.notify_broker);
-        let register_skills_tool = RegisterSkillsTool::new(
+        let register_skills_tool = RegisterTool::<Skills>::new(
             config.session_id.as_str().to_string(),
             config.register_skills_broker,
         );
-        let register_subagents_tool = RegisterSubagentsTool::new(
+        let register_subagents_tool = RegisterTool::<Subagents>::new(
             config.session_id.as_str().to_string(),
             config.register_subagents_broker,
         );
@@ -1229,8 +1229,8 @@ impl MayAgent {
         location: Option<crate::location::LocationInfo>,
         task_broker: Option<crate::agent::task_tool::TaskBroker>,
         notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
-        register_skills_broker: Option<RegisterSkillsBroker>,
-        register_subagents_broker: Option<RegisterSubagentsBroker>,
+        register_skills_broker: Option<RegisterBroker>,
+        register_subagents_broker: Option<RegisterBroker>,
         environment: AgentEnvironment,
         provider_attempt: usize,
     ) -> Result<Self, MayAgentError> {

@@ -562,7 +562,7 @@ pub(super) async fn chat_stream(
 
 pub(super) fn spawn_register_subagents_worker(
     state: Arc<UiServerState>,
-    queue: crate::agent::register_tool::RegisterSubagentsQueue,
+    queue: crate::agent::register_tool::RegisterQueue,
 ) {
     tokio::spawn(async move {
         while let Some(request) = queue.next().await {
@@ -1222,8 +1222,8 @@ struct ToolBrokers {
     ask_user: ask_user::AskUserBroker,
     task: crate::agent::task_tool::TaskBroker,
     notify: crate::agent::notify_tool::NotifyBroker,
-    register_skills: crate::agent::register_tool::RegisterSkillsBroker,
-    register_subagents: crate::agent::register_tool::RegisterSubagentsBroker,
+    register_skills: crate::agent::register_tool::RegisterBroker,
+    register_subagents: crate::agent::register_tool::RegisterBroker,
 }
 
 // ── Agent preparation: decomposed steps ───────────────────
