@@ -80,15 +80,7 @@ export async function fetchAndApplyProfileSessions(
     useRuntimeStore.getState().applyRuntimes(
       collectProfileSessions(ps).map((session) => ({
         sessionId: session.id,
-        runtime: session.runtime ?? {
-          state: session.runtimeState,
-          planState: session.planState,
-          queuedCount: session.queuedCount,
-          pendingImmediate: null,
-          queuedMessages: [],
-          waitingPermission: null,
-          waitingAskUser: null,
-        },
+        runtime: session.runtime,
       })),
     );
     set({
@@ -110,10 +102,10 @@ export async function fetchAndApplyProfileSessions(
         backendUnavailableReason: backendReason,
       });
     } else {
-      console.error('failed to load profile sessions', error);
-      if (backendReason) {
-        set({ backendUnavailableReason: backendReason });
-      }
+      set({
+        profileSessions: null,
+        backendUnavailableReason: backendReason ?? errorMessage(error),
+      });
     }
   } finally {
     if (requestId === profileSessionsRequestSequence) {
