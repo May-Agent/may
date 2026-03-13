@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_LENGTH, HOST, HeaderName};
@@ -12,7 +12,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 use zenwave::Client;
 use zenwave::ResponseExt;
 
@@ -82,7 +82,7 @@ struct LocalUrlProxyEntry {
 
 #[derive(Debug, Default)]
 pub(crate) struct LocalUrlPortMapper {
-    entries: Mutex<HashMap<LocalUrlProxyKey, LocalUrlProxyEntry>>,
+    entries: DashMap<LocalUrlProxyKey, LocalUrlProxyEntry>,
 }
 
 impl LocalUrlPortMapper {
@@ -95,14 +95,14 @@ impl LocalUrlPortMapper {
         key: LocalUrlProxyKey,
         upstream: LocalUrlProxyUpstream,
     ) -> anyhow::Result<u16> {
-        let mut entries = self.entries.lock().await;
-
-        if let Some(existing) = entries.get(&key) {
+        if let Some(existing) = self.entries.get(&key) {
             if existing.upstream == upstream {
                 return Ok(existing.mapped_port);
             }
-            let _ = existing.shutdown_tx.send(true);
-            entries.remove(&key);
+            let shutdown_tx = existing.shutdown_tx.clone();
+            drop(existing);
+            let _ = shutdown_tx.send(true);
+            self.entries.remove(&key);
         }
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -114,10 +114,10 @@ impl LocalUrlPortMapper {
 
         tokio::spawn(async move {
             run_proxy_listener(listener, task_upstream, shutdown_rx).await;
-            manager.remove_entry(&task_key, mapped_port).await;
+            manager.remove_entry(&task_key, mapped_port);
         });
 
-        entries.insert(
+        self.entries.insert(
             key,
             LocalUrlProxyEntry {
                 mapped_port,
@@ -129,13 +129,12 @@ impl LocalUrlPortMapper {
         Ok(mapped_port)
     }
 
-    async fn remove_entry(self: &Arc<Self>, key: &LocalUrlProxyKey, mapped_port: u16) {
-        let mut entries = self.entries.lock().await;
-        if entries
-            .get(key)
-            .is_some_and(|entry| entry.mapped_port == mapped_port)
+    fn remove_entry(self: &Arc<Self>, key: &LocalUrlProxyKey, mapped_port: u16) {
+        if let Some(entry) = self.entries.get(key)
+            && entry.mapped_port == mapped_port
         {
-            entries.remove(key);
+            drop(entry);
+            self.entries.remove(key);
         }
     }
 }
@@ -148,12 +147,9 @@ async fn run_proxy_listener(
     let listen_addr = listener.local_addr().ok();
     tracing::info!(
         listen_addr = ?listen_addr,
-        upstream = %format!(
-            "{}://{}:{}",
-            upstream.scheme.as_str(),
-            upstream.container_ip,
-            upstream.target_port
-        ),
+        upstream_scheme = upstream.scheme.as_str(),
+        upstream_container_ip = %upstream.container_ip,
+        upstream_target_port = upstream.target_port,
         "local artifact url proxy started"
     );
 
