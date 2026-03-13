@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { useStore } from "@/lib/store";
 import {
+  ApiError,
   fetchArtifactPreview,
   mapContainerLocalArtifactUrl,
   prepareSlidevPreview,
@@ -1119,9 +1120,14 @@ export function ChatInterface({
     let lastTextFlushAt = 0;
     let shouldFallbackToSteer = false;
 
-    const isActiveSessionStreamError = (message: string): boolean =>
+    const isActiveSessionStreamMessage = (message: string): boolean =>
       message.includes("session is already active")
       || message.includes("session is already streaming");
+
+    const isActiveSessionStreamFailure = (error: unknown): boolean =>
+      error instanceof ApiError
+        ? error.statusCode === 409
+        : error instanceof Error && isActiveSessionStreamMessage(error.message);
 
     const fallbackToSteerQueue = async (): Promise<boolean> => {
       if (options?.retryAssistantId) {
@@ -1540,7 +1546,7 @@ export function ChatInterface({
           );
         },
         onError: (message) => {
-          if (isActiveSessionStreamError(message)) {
+          if (isActiveSessionStreamMessage(message)) {
             shouldFallbackToSteer = true;
             return;
           }
@@ -1579,7 +1585,7 @@ export function ChatInterface({
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
         const message = error instanceof Error ? error.message : String(error);
-        if (isActiveSessionStreamError(message)) {
+        if (isActiveSessionStreamFailure(error)) {
           const recovered = await fallbackToSteerQueue();
           if (recovered) {
             return;
