@@ -5,11 +5,11 @@ mod tests {
     fn base_args() -> SearchArgs {
         SearchArgs {
             command: None,
-            action: "query".to_string(),
+            action: SearchAction::Query,
             path: None,
             query: Some("hello".to_string()),
-            search_mode: "hybrid".to_string(),
-            output_mode: "files".to_string(),
+            search_mode: SearchMode::Hybrid,
+            output_mode: SearchOutputMode::Files,
             limit: 20,
             offset: 0,
             scan_limit: 2000,
@@ -24,7 +24,7 @@ mod tests {
     fn parses_index_command_form() {
         let mut args = base_args();
         apply_command_form(&mut args, "search index ./docs").expect("index command should parse");
-        assert_eq!(args.action, "index");
+        assert_eq!(args.action, SearchAction::Index);
         assert_eq!(args.path.as_deref(), Some("./docs"));
     }
 
@@ -32,7 +32,7 @@ mod tests {
     fn parses_query_command_form() {
         let mut args = base_args();
         apply_command_form(&mut args, "search query concurrency bug").expect("query command should parse");
-        assert_eq!(args.action, "query");
+        assert_eq!(args.action, SearchAction::Query);
         assert_eq!(args.query.as_deref(), Some("concurrency bug"));
     }
 
