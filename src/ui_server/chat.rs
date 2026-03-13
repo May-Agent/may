@@ -1610,6 +1610,7 @@ async fn prepare_agent_for_request(
         brokers.workspace,
         brokers.ask_user,
         &ctx.current_model,
+        ctx.profile_id.clone(),
         Some(
             state
                 .permission_approver
