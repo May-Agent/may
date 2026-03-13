@@ -29,11 +29,6 @@ pub struct RegisterResult {
 pub type RegisterBroker = ToolRequestBroker<RegisterRequest, Result<RegisterResult, String>>;
 pub type RegisterQueue = ToolRequestQueue<RegisterRequest, Result<RegisterResult, String>>;
 
-// Backward-compatible aliases.
-pub type RegisterSkillsBroker = RegisterBroker;
-pub type RegisterSubagentsBroker = RegisterBroker;
-pub type RegisterSubagentsQueue = RegisterQueue;
-
 const SUBAGENT_QUEUE_CAPACITY: usize = 64;
 
 #[must_use]
@@ -85,10 +80,6 @@ impl<K: RegisterKind> RegisterTool<K> {
         }
     }
 }
-
-// Backward-compatible type aliases.
-pub type RegisterSkillsTool = RegisterTool<Skills>;
-pub type RegisterSubagentsTool = RegisterTool<Subagents>;
 
 fn normalize_path(args: RegisterPathArgs) -> aither_core::Result<String> {
     let path = args.path.trim();

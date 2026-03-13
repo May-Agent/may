@@ -1896,8 +1896,6 @@ impl ChatDb {
         ];
 
         let mut first_id = None;
-        let mut daily_profile_id: Option<String> = None;
-
         for def in &defaults {
             let ensured = if let Some(existing) = self.get_profile_by_slug(def.slug).await? {
                 self.apply_default_profile_correction(existing, def).await?
@@ -1920,13 +1918,6 @@ impl ChatDb {
             if first_id.is_none() {
                 first_id = Some(ensured.id.clone());
             }
-            if def.slug == "daily" {
-                daily_profile_id = Some(ensured.id);
-            }
-        }
-
-        if let Some(ref daily_id) = daily_profile_id {
-            self.assign_legacy_sessions_to_daily(daily_id).await?;
         }
 
         // first_id is always set because we iterate at least one default profile
@@ -1952,20 +1943,6 @@ impl ChatDb {
         active.updated_at = Set(now);
         let model = active.update(&self.conn).await?;
         Ok(model)
-    }
-
-    async fn assign_legacy_sessions_to_daily(
-        &self,
-        daily_profile_id: &str,
-    ) -> Result<(), ChatDbError> {
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::ProfileId, daily_profile_id.to_string());
-        update.and_where(Expr::col(sessions::Column::ProfileId).is_null());
-        let stmt = update.to_owned();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
-        Ok(())
     }
 
     async fn max_profile_sort_order(&self) -> Result<i32, ChatDbError> {

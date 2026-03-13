@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
 
 use crate::agent::PermissionApprover;
-use crate::agent::register_tool::RegisterSubagentsBroker;
+use crate::agent::register_tool::RegisterBroker;
 use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
 use crate::live_response::LiveResponseRegistry;
@@ -122,7 +122,7 @@ pub(crate) struct UiServerState {
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
     pub(crate) local_url_port_mapper: Arc<LocalUrlPortMapper>,
     pub(crate) title_generation_queue: TitleGenerationQueue,
-    pub(crate) register_subagents_broker: RegisterSubagentsBroker,
+    pub(crate) register_subagents_broker: RegisterBroker,
     pub(crate) location_provider: crate::location::LocationProvider,
     pub(crate) runtime_service: Arc<super::runtime::SessionRuntimeService>,
     pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,

@@ -959,14 +959,7 @@ impl MayConfig {
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            let mut config: Self = toml::from_str(&content)?;
-            if config.max_iterations == 50 {
-                tracing::info!(
-                    "Migrating legacy default max_iterations=50 to max_iterations=0 (unlimited)"
-                );
-                config.max_iterations = 0;
-            }
-            Ok(config)
+            Ok(toml::from_str(&content)?)
         } else {
             Ok(Self::default())
         }
@@ -1320,27 +1313,6 @@ mod tests {
 
         assert_eq!(config.models.balanced.len(), 2);
         assert!(config.is_configured());
-    }
-
-    #[test]
-    fn test_load_migrates_legacy_default_max_iterations() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-max_iterations = 50
-
-[provider.custom]
-type = "custom"
-base_url = "http://localhost:1234/v1"
-enabled = true
-"#,
-        )
-        .unwrap();
-
-        let config = MayConfig::load_from(&path).unwrap();
-        assert_eq!(config.max_iterations, 0);
     }
 
     #[test]

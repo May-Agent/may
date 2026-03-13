@@ -115,20 +115,10 @@ impl Bundle {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
-                    let legacy_target = fs::read_link(path)?;
-                    let resolved_target = if legacy_target.is_absolute() {
-                        legacy_target
-                    } else {
-                        path.parent()
-                            .unwrap_or_else(|| Path::new("/"))
-                            .join(legacy_target)
-                    };
-                    fs::remove_file(path)?;
-                    fs::create_dir_all(path)?;
-                    if resolved_target.is_dir() {
-                        Self::copy_dir_contents(&resolved_target, path)?;
-                    }
-                    return Ok(());
+                    return Err(BundleError::Io(std::io::Error::other(format!(
+                        "symlinked bundle directory is no longer supported: {}",
+                        path.display()
+                    ))));
                 }
                 if metadata.is_dir() {
                     return Ok(());
@@ -144,27 +134,6 @@ impl Bundle {
             }
             Err(error) => return Err(BundleError::Io(error)),
         }
-    }
-
-    fn copy_dir_contents(src: &Path, dest: &Path) -> Result<(), BundleError> {
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            let src_path = entry.path();
-            let dst_path = dest.join(entry.file_name());
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                fs::create_dir_all(&dst_path)?;
-                Self::copy_dir_contents(&src_path, &dst_path)?;
-            } else if file_type.is_file() {
-                if let Some(parent) = dst_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                if !dst_path.exists() {
-                    fs::copy(&src_path, &dst_path)?;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Create directory symlink from parent/name to target.
