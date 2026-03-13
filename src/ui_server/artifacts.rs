@@ -17,7 +17,7 @@ use skyzen::{Result as SkyResult, StatusCode};
 use tokio::process::Command;
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::{load_session_paths, send_event};
+use super::helpers::{load_session_paths, parse_safe_relative_path, send_event};
 use super::local_url_mapper::{
     LocalUrlProxyKey, LocalUrlProxyUpstream, mapped_url_from_target, parse_local_proxy_target,
     target_host_header,
@@ -113,25 +113,6 @@ fn artifacts_signature(entries: &[ArtifactEntry]) -> String {
         .map(|e| format!("{}:{}:{}", e.path, e.fingerprint, e.is_html))
         .collect::<Vec<_>>()
         .join("|")
-}
-
-fn parse_safe_relative_path(raw: &str, label: &str) -> Result<PathBuf, skyzen::Error> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(bad_request_error(format!("{label} is required")));
-    }
-    let rel = PathBuf::from(trimmed);
-    if rel.is_absolute() {
-        return Err(bad_request_error(format!("{label} must be relative")));
-    }
-    for comp in rel.components() {
-        if matches!(comp, std::path::Component::ParentDir) {
-            return Err(bad_request_error(format!(
-                "{label} path traversal is not allowed"
-            )));
-        }
-    }
-    Ok(rel)
 }
 
 fn is_slidev_markdown_path(path: &Path) -> bool {
