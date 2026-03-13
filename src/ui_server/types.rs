@@ -320,6 +320,34 @@ pub(crate) struct RequestLogEntry {
     pub(crate) error: Option<String>,
 }
 
+impl From<crate::db::entity::request_logs::Model> for RequestLogEntry {
+    fn from(value: crate::db::entity::request_logs::Model) -> Self {
+        Self {
+            session_id: value.session_id,
+            timestamp: value.timestamp,
+            model: value.model,
+            provider_id: value.provider_id,
+            prompt_tokens: value.prompt_tokens.and_then(|entry| u32::try_from(entry).ok()),
+            completion_tokens: value
+                .completion_tokens
+                .and_then(|entry| u32::try_from(entry).ok()),
+            total_tokens: value.total_tokens.and_then(|entry| u32::try_from(entry).ok()),
+            cache_read_tokens: value
+                .cache_read_tokens
+                .and_then(|entry| u32::try_from(entry).ok()),
+            cache_write_tokens: value
+                .cache_write_tokens
+                .and_then(|entry| u32::try_from(entry).ok()),
+            context_window: value
+                .context_window
+                .and_then(|entry| u32::try_from(entry).ok()),
+            elapsed_ms: u64::try_from(value.elapsed_ms).unwrap_or(0),
+            ok: value.ok,
+            error: value.error,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RequestLogCacheSummary {

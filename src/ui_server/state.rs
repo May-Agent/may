@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use crate::mcp::McpManager;
 use crate::session::SessionManager;
 use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
 use super::local_url_mapper::LocalUrlPortMapper;
-use super::types::{ModelsResponse, ProviderModelsResponse, RequestLogEntry};
+use super::types::{ModelsResponse, ProviderModelsResponse};
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -108,7 +108,6 @@ pub(crate) struct UiServerState {
     pub(crate) ask_user_approver: AskUserApprover,
     pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,
     pub(crate) active_streaming_sessions: Mutex<HashSet<String>>,
-    pub(crate) request_logs: Mutex<VecDeque<RequestLogEntry>>,
     pub(crate) models_cache: RefreshableCache<ModelsResponse>,
     pub(crate) provider_models_cache: RefreshableCache<ProviderModelsResponse>,
     pub(crate) config: tokio::sync::RwLock<MayConfig>,

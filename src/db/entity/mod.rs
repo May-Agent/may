@@ -9,6 +9,7 @@ pub mod profile_memories;
 pub mod profile_memory_jobs;
 pub mod profiles;
 pub mod push_subscriptions;
+pub mod request_logs;
 pub mod scheduled_tasks;
 pub mod session_context_snapshots;
 pub mod session_pending_ask_user;

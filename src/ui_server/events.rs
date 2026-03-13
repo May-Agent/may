@@ -266,9 +266,15 @@ async fn emit_request_logs_if_changed(
     sender: &skyzen::responder::sse::Sender,
     last_logs_sig: &mut String,
 ) -> bool {
-    let logs = {
-        let logs = state.request_logs.lock().await;
-        logs.iter().cloned().collect()
+    let logs = match state.db().await.list_request_logs(300).await {
+        Ok(entries) => entries
+            .into_iter()
+            .map(super::types::RequestLogEntry::from)
+            .collect(),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to list request logs");
+            return true;
+        }
     };
     let cache_summary = match state.db().await.assistant_cache_usage_summary().await {
         Ok(summary) => super::types::RequestLogCacheSummary::from(summary),

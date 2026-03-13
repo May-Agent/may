@@ -21,7 +21,7 @@ mod tasks;
 mod title_generation;
 mod types;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +45,7 @@ use error::internal_error;
 use state::{AskUserApprover, SessionRunCancellationRegistry, UiServerState};
 use types::{
     ApiHealth, ModelInfoItem, ModelsResponse, ProviderModelsItem, ProviderModelsResponse,
-    RequestLogCacheSummary, RequestLogsResponse,
+    RequestLogCacheSummary, RequestLogEntry, RequestLogsResponse,
 };
 
 #[cfg(feature = "ui")]
@@ -184,7 +184,6 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         ask_user_approver,
         run_cancellation_registry: SessionRunCancellationRegistry::new(),
         active_streaming_sessions: Mutex::new(HashSet::new()),
-        request_logs: Mutex::new(VecDeque::new()),
         models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         provider_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         config: tokio::sync::RwLock::new(config),
@@ -407,11 +406,13 @@ async fn get_request_logs(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<RequestLogsResponse>> {
     let logs = state
-        .request_logs
-        .lock()
+        .db()
         .await
-        .iter()
-        .cloned()
+        .list_request_logs(300)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(RequestLogEntry::from)
         .collect::<Vec<_>>();
     let cache_summary = state
         .db()
