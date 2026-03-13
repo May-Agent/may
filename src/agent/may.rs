@@ -26,6 +26,7 @@ use crate::agent::notify_tool::NotifyTool;
 use crate::agent::register_tool::{
     RegisterSkillsBroker, RegisterSkillsTool, RegisterSubagentsBroker, RegisterSubagentsTool,
 };
+use crate::agent::search_tool::SearchTool;
 use crate::agent::session_tool::{EnvironmentTool, SessionTool};
 use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
 use crate::ask_user::{AskUserBroker, AskUserTool};
@@ -868,6 +869,7 @@ impl MayAgent {
             config.session_id.as_str().to_string(),
             config.profile_id.clone(),
         );
+        let search_tool = SearchTool::new(config.sandbox_dir.clone());
         let task_tool = TaskTool::new(
             config.session_id.as_str().to_string(),
             match &config.environment {
@@ -934,6 +936,7 @@ impl MayAgent {
             .tool(ask_user)
             .tool(session_tool)
             .tool(environment_tool)
+            .tool(search_tool)
             .tool(task_tool)
             .tool(imagine)
             .tool(notify_tool)
