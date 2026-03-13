@@ -16,6 +16,7 @@ import { McpSection } from '@/components/settings/McpSection';
 import { SkillsSection } from '@/components/settings/SkillsSection';
 import { TasksSection } from '@/components/settings/TasksSection';
 import { BrowserSection } from '@/components/settings/BrowserSection';
+import { RemoteAccessSection } from '@/components/settings/RemoteAccessSection';
 import { DangerSection } from '@/components/settings/DangerSection';
 
 export function SettingsPage() {
@@ -75,6 +76,7 @@ export function SettingsPage() {
             {activeSection === 'skills' && <SkillsSection />}
             {activeSection === 'tasks' && <TasksSection />}
             {activeSection === 'browser' && <BrowserSection {...configProps} />}
+            {activeSection === 'remoteAccess' && <RemoteAccessSection {...configProps} />}
             {activeSection === 'danger' && <DangerSection />}
             <Separator />
           </div>

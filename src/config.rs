@@ -839,6 +839,42 @@ impl Default for PlaywrightConfig {
     }
 }
 
+/// Cloudflare-based remote access configuration for the May UI server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteAccessConfig {
+    /// Whether the server should keep remote access enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cloudflared executable path or command name.
+    #[serde(default = "default_cloudflared_binary")]
+    pub cloudflared_binary: String,
+    /// Remotely managed Cloudflare tunnel token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_token: Option<String>,
+    /// Public HTTPS URL routed to this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+    /// Whether local-environment profiles may be exposed remotely.
+    #[serde(default)]
+    pub allow_local_environment: bool,
+}
+
+fn default_cloudflared_binary() -> String {
+    "cloudflared".to_string()
+}
+
+impl Default for RemoteAccessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cloudflared_binary: default_cloudflared_binary(),
+            tunnel_token: None,
+            public_url: None,
+            allow_local_environment: false,
+        }
+    }
+}
+
 /// May agent configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MayConfig {
@@ -863,6 +899,9 @@ pub struct MayConfig {
     /// Playwright / browser automation settings.
     #[serde(default)]
     pub playwright: PlaywrightConfig,
+    /// Remote access settings.
+    #[serde(default)]
+    pub remote_access: RemoteAccessConfig,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
@@ -884,6 +923,7 @@ impl Default for MayConfig {
             preferences: Preferences::default(),
             appearance: Appearance::default(),
             playwright: PlaywrightConfig::default(),
+            remote_access: RemoteAccessConfig::default(),
             last_model: None,
             ssh_servers: Vec::new(),
         }

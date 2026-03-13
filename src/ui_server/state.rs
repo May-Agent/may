@@ -117,6 +117,7 @@ pub(crate) struct UiServerState {
     pub(crate) container_prepare_inflight: Mutex<HashSet<String>>,
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
     pub(crate) browser_manager: Option<Arc<crate::container::playwright::BrowserManager>>,
+    pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
     pub(crate) notification_service: Arc<crate::notification_service::NotificationService>,
     pub(crate) browser_takeover_session: Mutex<Option<String>>,
     pub(crate) browser_takeover_alert_pending: Mutex<HashSet<String>>,

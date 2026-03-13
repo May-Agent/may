@@ -14,6 +14,7 @@ export type SettingsSection =
   | 'skills'
   | 'tasks'
   | 'browser'
+  | 'remoteAccess'
   | 'danger';
 
 export const SECTIONS: ReadonlyArray<{ id: SettingsSection; label: string }> = [
@@ -28,6 +29,7 @@ export const SECTIONS: ReadonlyArray<{ id: SettingsSection; label: string }> = [
   { id: 'skills', label: 'Skills' },
   { id: 'tasks', label: 'Tasks' },
   { id: 'browser', label: 'Browser' },
+  { id: 'remoteAccess', label: 'Remote Access' },
   { id: 'danger', label: 'Danger Zone' },
 ];
 

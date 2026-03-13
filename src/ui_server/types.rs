@@ -1,4 +1,6 @@
-use crate::config::{LoadBalanceStrategy, PlaywrightBrowser, ProviderType, SshServerConfig};
+use crate::config::{
+    LoadBalanceStrategy, PlaywrightBrowser, ProviderType, RemoteAccessConfig, SshServerConfig,
+};
 use crate::session::{
     PendingUserMessage, PendingUserMessageMode, SessionPlanState, SessionRuntimeState,
 };
@@ -194,6 +196,34 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NotificationMailboxResponse {
     pub(crate) items: Vec<NotificationMailboxEntryResponse>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteAccessState {
+    Disabled,
+    Starting,
+    Running,
+    Error,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteAccessStatusResponse {
+    pub(crate) state: RemoteAccessState,
+    pub(crate) enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) public_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_error: Option<String>,
+    #[serde(default)]
+    pub(crate) recent_logs: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteAccessEventPayload {
+    pub(crate) status: RemoteAccessStatusResponse,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -820,6 +850,28 @@ pub(crate) struct UiPlaywrightConfig {
     pub(crate) screencast_max_width: u32,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UiRemoteAccessConfig {
+    pub(crate) enabled: bool,
+    pub(crate) cloudflared_binary: String,
+    pub(crate) tunnel_token: Option<String>,
+    pub(crate) public_url: Option<String>,
+    pub(crate) allow_local_environment: bool,
+}
+
+impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
+    fn from(value: &RemoteAccessConfig) -> Self {
+        Self {
+            enabled: value.enabled,
+            cloudflared_binary: value.cloudflared_binary.clone(),
+            tunnel_token: value.tunnel_token.clone(),
+            public_url: value.public_url.clone(),
+            allow_local_environment: value.allow_local_environment,
+        }
+    }
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UiFullConfig {
@@ -830,6 +882,7 @@ pub(crate) struct UiFullConfig {
     pub(crate) last_model: Option<String>,
     pub(crate) max_iterations: usize,
     pub(crate) playwright: UiPlaywrightConfig,
+    pub(crate) remote_access: UiRemoteAccessConfig,
 }
 
 #[derive(Debug, serde::Deserialize)]

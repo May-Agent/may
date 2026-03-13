@@ -13,6 +13,7 @@ mod message_mapping;
 mod model_resolution;
 mod notifications;
 mod profiles;
+mod remote_access;
 mod runtime;
 mod sessions;
 mod state;
@@ -126,6 +127,9 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         db_for_archive.clone(),
         ui_events_notify.clone(),
     ));
+    let remote_access_manager = Arc::new(remote_access::RemoteAccessManager::new(
+        ui_events_notify.clone(),
+    ));
     let permission_approver = crate::agent::PermissionApprover::new()
         .with_runtime_sync(db_for_archive.clone(), ui_events_notify.clone());
     let ask_user_approver =
@@ -187,6 +191,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         container_prepare_inflight: Mutex::new(HashSet::new()),
         container_manager,
         browser_manager,
+        remote_access_manager,
         notification_service: notification_service.clone(),
         browser_takeover_session: Mutex::new(None),
         browser_takeover_alert_pending: Mutex::new(HashSet::new()),
@@ -214,6 +219,9 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     title_generation::spawn_worker(state.clone(), title_generation_rx);
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
+    remote_access::sync_remote_access_from_state(&state)
+        .await
+        .context("failed to sync remote access state")?;
 
     let state_for_server = state.clone();
     tokio::task::spawn_blocking(move || {
@@ -238,6 +246,7 @@ fn api_routes() -> Route {
     use interaction::*;
     use notifications::*;
     use profiles::*;
+    use remote_access::*;
     use sessions::*;
     use tasks::*;
 
@@ -352,6 +361,11 @@ fn api_routes() -> Route {
                 "/offer".post(browser_offer),
                 "/takeover/start".post(browser_takeover_start),
                 "/takeover/stop".post(browser_takeover_stop),
+            ))),
+            "/remote-access".route(Route::new((
+                "/status".at(get_remote_access_status),
+                "/start".post(start_remote_access),
+                "/stop".post(stop_remote_access),
             ))),
             "/push".route(Route::new((
                 "/vapid-key".at(get_vapid_key),
