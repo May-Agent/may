@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashSet;
 use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
 
@@ -183,16 +184,16 @@ impl SessionRunCancellationRegistry {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ActiveStreamingSessions {
-    sessions: Arc<Mutex<HashSet<String>>>,
+    sessions: Arc<DashSet<String>>,
 }
 
 impl ActiveStreamingSessions {
-    pub(crate) async fn insert(&self, session_id: impl Into<String>) -> bool {
-        self.sessions.lock().await.insert(session_id.into())
+    pub(crate) fn insert(&self, session_id: impl Into<String>) -> bool {
+        self.sessions.insert(session_id.into())
     }
 
-    pub(crate) async fn remove(&self, session_id: &str) -> bool {
-        self.sessions.lock().await.remove(session_id)
+    pub(crate) fn remove(&self, session_id: &str) -> bool {
+        self.sessions.remove(session_id).is_some()
     }
 }
 
