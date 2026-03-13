@@ -190,7 +190,7 @@ export function ChatInterface({
   const streamingSessionIdRef = useRef<string | null>(null);
   const previewSessionRef = useRef<string | null>(null);
   const currentSession = sessions.find((s) => s.id === currentSessionId);
-  const currentPlanState: SessionPlanState = currentSession?.planState ?? "disabled";
+  const currentPlanState: SessionPlanState = currentSession?.runtime.planState ?? "disabled";
   const currentProfile = profiles.find((profile) => profile.id === currentProfileId) ?? null;
   const containerPrepareStatus = currentProfileId
     ? containerPrepareStatuses[currentProfileId]

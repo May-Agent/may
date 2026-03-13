@@ -31,7 +31,7 @@ export const createSettingsSlice: StateCreator<AppState, [], [], SettingsSlice> 
   settings: { font: 'Inter', theme: 'system' },
   uiConfig: {
     sshServers: [],
-    maxIterations: 50,
+    maxIterations: 0,
     fullConfig: null,
   },
   memoryContent: '',
