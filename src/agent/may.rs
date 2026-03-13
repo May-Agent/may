@@ -26,7 +26,7 @@ use crate::agent::notify_tool::NotifyTool;
 use crate::agent::register_tool::{
     RegisterSkillsBroker, RegisterSkillsTool, RegisterSubagentsBroker, RegisterSubagentsTool,
 };
-use crate::agent::session_tool::SessionTool;
+use crate::agent::session_tool::{EnvironmentTool, SessionTool};
 use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
@@ -499,6 +499,8 @@ pub struct MayAgentConfig {
     pub cwd: PathBuf,
     /// Session ID.
     pub session_id: SessionId,
+    /// Profile this session belongs to.
+    pub profile_id: Option<String>,
     /// Maximum iterations.
     pub max_iterations: usize,
     /// Channel for workspace access requests.
@@ -861,6 +863,11 @@ impl MayAgent {
             config.may_dir.clone(),
             config.session_id.as_str().to_string(),
         );
+        let environment_tool = EnvironmentTool::new(
+            config.may_dir.clone(),
+            config.session_id.as_str().to_string(),
+            config.profile_id.clone(),
+        );
         let task_tool = TaskTool::new(
             config.session_id.as_str().to_string(),
             match &config.environment {
@@ -926,6 +933,7 @@ impl MayAgent {
             .tool(ask)
             .tool(ask_user)
             .tool(session_tool)
+            .tool(environment_tool)
             .tool(task_tool)
             .tool(imagine)
             .tool(notify_tool)
@@ -1117,6 +1125,7 @@ impl MayAgent {
             None,
             None,
             None,
+            None,
             SessionPlanState::Disabled,
             None,
             None,
@@ -1138,6 +1147,7 @@ impl MayAgent {
         workspace_request_broker: WorkspaceRequestBroker,
         ask_user_broker: AskUserBroker,
         model: &str,
+        profile_id: Option<String>,
         permission_approver: Option<PermissionApprover>,
         profile_persona: Option<String>,
         profile_memories: Option<crate::memory::ProfileMemories>,
@@ -1217,6 +1227,7 @@ impl MayAgent {
             may_dir,
             cwd,
             session_id,
+            profile_id,
             max_iterations: may_config.max_iterations,
             workspace_request_broker,
             ask_user_broker,

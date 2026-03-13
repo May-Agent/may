@@ -73,6 +73,10 @@ pub struct SessionArgs {
     #[serde(default)]
     pub model: Option<String>,
 
+    /// Filter by exact profile id.
+    #[serde(default)]
+    pub profile_id: Option<String>,
+
     /// Filter by message role.
     #[serde(default)]
     pub role: Option<String>,
@@ -112,6 +116,10 @@ pub struct SessionArgs {
     /// Include current session. Default false.
     #[serde(default)]
     pub include_current: bool,
+
+    /// Include archived sessions. Default false.
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
 fn default_search_mode() -> String {
@@ -140,6 +148,20 @@ pub struct SessionTool {
     current_session_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct EnvironmentTool {
+    may_dir: PathBuf,
+    current_session_id: String,
+    current_profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchDefaults {
+    current_session_id: String,
+    default_profile_id: Option<String>,
+    include_current_by_default: bool,
+}
+
 impl SessionTool {
     pub fn new(may_dir: PathBuf, current_session_id: String) -> Self {
         Self {
@@ -162,48 +184,46 @@ impl SessionTool {
 
     fn normalize_args(&self, mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
         if let Some(command) = args.command.take() {
-            apply_command_form(&mut args, &command)?;
+            apply_command_form(&mut args, &command, "session")?;
         }
+        apply_search_defaults(
+            &mut args,
+            &SearchDefaults {
+                current_session_id: self.current_session_id.clone(),
+                default_profile_id: None,
+                include_current_by_default: false,
+            },
+        );
+        normalize_common_args(args)
+    }
+}
 
-        args.search_mode = args.search_mode.to_lowercase();
-        args.output_mode = args.output_mode.to_lowercase();
-        if args.search_mode.trim().is_empty() {
-            args.search_mode = "hybrid".to_string();
+impl EnvironmentTool {
+    pub fn new(
+        may_dir: PathBuf,
+        current_session_id: String,
+        current_profile_id: Option<String>,
+    ) -> Self {
+        Self {
+            may_dir,
+            current_session_id,
+            current_profile_id,
         }
-        if args.output_mode.trim().is_empty() {
-            args.output_mode = "sessions".to_string();
-        }
-        args.limit = args.limit.clamp(1, 200);
-        args.scan_limit = args.scan_limit.clamp(args.limit, 50_000);
-        args.fuzzy_distance = args.fuzzy_distance.min(3);
-        if args.fields.is_empty() {
-            args.fields = vec![
-                "content".to_string(),
-                "title".to_string(),
-                "preview".to_string(),
-            ];
-        } else {
-            args.fields = args
-                .fields
-                .into_iter()
-                .map(|v| v.to_lowercase())
-                .filter(|f| {
-                    matches!(
-                        f.as_str(),
-                        "content" | "title" | "preview" | "session_id" | "model" | "role"
-                    )
-                })
-                .collect();
-            if args.fields.is_empty() {
-                args.fields = vec!["content".to_string()];
-            }
-        }
+    }
 
-        if !args.include_current && args.exclude_session_id.is_none() {
-            args.exclude_session_id = Some(self.current_session_id.clone());
+    fn normalize_args(&self, mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
+        if let Some(command) = args.command.take() {
+            apply_command_form(&mut args, &command, "environment")?;
         }
-
-        Ok(args)
+        apply_search_defaults(
+            &mut args,
+            &SearchDefaults {
+                current_session_id: self.current_session_id.clone(),
+                default_profile_id: self.current_profile_id.clone(),
+                include_current_by_default: true,
+            },
+        );
+        normalize_common_args(args)
     }
 }
 
@@ -216,175 +236,262 @@ impl Tool for SessionTool {
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         let args = self.normalize_args(arguments)?;
-        let query_enabled = args.query.trim() != "*" && !args.query.trim().is_empty();
-
-        if !matches!(args.output_mode.as_str(), "sessions" | "messages") {
-            return Err(anyhow::anyhow!(
-                "invalid output_mode '{}', expected one of: sessions,messages",
-                args.output_mode
-            ));
-        }
-
-        let db = ChatDb::open(&self.db_path()).await?;
-        let fingerprint = compute_fingerprint(&db).await?;
-
-        let table = ensure_index(
-            &self.index_path(),
-            &self.index_meta_path(),
-            &db,
-            &fingerprint,
-        )
-        .await?;
-
-        let mut candidates = match args.search_mode.as_str() {
-            "fulltext" => run_full_text_query(&table, &args, false).await?,
-            "fuzzy" => run_full_text_query(&table, &args, true).await?,
-            "regex" => run_plain_query(&table, &args).await?,
-            "text" => run_plain_query(&table, &args).await?,
-            "hybrid" => {
-                if !query_enabled {
-                    run_plain_query(&table, &args).await?
-                } else {
-                    let mut merged = Vec::new();
-                    let mut fts = run_full_text_query(&table, &args, false).await?;
-                    let mut fuzzy = run_full_text_query(&table, &args, true).await?;
-                    let mut plain = run_plain_query(&table, &args).await?;
-                    merged.append(&mut fts);
-                    merged.append(&mut fuzzy);
-                    merged.append(&mut plain);
-                    merged
-                }
-            }
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "invalid search_mode '{}', expected one of: hybrid,text,regex,fulltext,fuzzy",
-                    args.search_mode
-                ));
-            }
-        };
-
-        let query_norm = if args.case_sensitive {
-            args.query.clone()
-        } else {
-            args.query.to_lowercase()
-        };
-
-        let regex_enabled = args.search_mode == "regex" && (query_enabled || args.regex.is_some());
-        let regex = if regex_enabled {
-            let pattern = args
-                .regex
-                .as_deref()
-                .unwrap_or(args.query.as_str())
-                .to_string();
-            Some(
-                RegexBuilder::new(&pattern)
-                    .case_insensitive(!args.case_sensitive)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("invalid regex pattern: {e}"))?,
-            )
-        } else {
-            None
-        };
-
-        for row in &mut candidates {
-            if row.matched_by.is_empty() {
-                row.matched_by.push(args.search_mode.clone());
-            }
-
-            let haystack = searchable_text(row, &args.fields);
-            let haystack_norm = if args.case_sensitive {
-                haystack.clone()
-            } else {
-                haystack.to_lowercase()
-            };
-
-            if query_enabled && args.search_mode != "fulltext" && args.search_mode != "fuzzy" {
-                if haystack_norm.contains(&query_norm) {
-                    row.score += 10.0;
-                    if !row.matched_by.iter().any(|m| m == "text") {
-                        row.matched_by.push("text".to_string());
-                    }
-                }
-            }
-
-            if let Some(re) = &regex
-                && re.is_match(&haystack)
-            {
-                row.score += 15.0;
-                if !row.matched_by.iter().any(|m| m == "regex") {
-                    row.matched_by.push("regex".to_string());
-                }
-            }
-        }
-
-        candidates = candidates
-            .into_iter()
-            .filter(|row| {
-                if query_enabled && args.search_mode == "text" {
-                    let haystack = searchable_text(row, &args.fields);
-                    let haystack = if args.case_sensitive {
-                        haystack
-                    } else {
-                        haystack.to_lowercase()
-                    };
-                    return haystack.contains(&query_norm);
-                }
-
-                if regex_enabled {
-                    let Some(re) = &regex else {
-                        return false;
-                    };
-                    return re.is_match(&searchable_text(row, &args.fields));
-                }
-
-                true
-            })
-            .collect();
-
-        let mut deduped: HashMap<String, SessionMatchRow> = HashMap::new();
-        for row in candidates {
-            let key = format!("{}:{}", row.session_id, row.message_id);
-            match deduped.get_mut(&key) {
-                Some(existing) => {
-                    if row.score > existing.score {
-                        *existing = row;
-                    } else {
-                        for source in row.matched_by {
-                            if !existing.matched_by.iter().any(|s| s == &source) {
-                                existing.matched_by.push(source);
-                            }
-                        }
-                    }
-                }
-                None => {
-                    deduped.insert(key, row);
-                }
-            }
-        }
-
-        let mut rows: Vec<SessionMatchRow> = deduped.into_values().collect();
-        rows.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.timestamp.cmp(&a.timestamp))
-        });
-
-        let total_matches = rows.len();
-        finalize_rows_with_total(rows, total_matches, &args)
+        execute_search(self.db_path(), self.index_path(), self.index_meta_path(), args).await
     }
 }
 
-fn apply_command_form(args: &mut SessionArgs, command: &str) -> aither_core::Result<()> {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow::anyhow!("session command must not be empty"));
+impl Tool for EnvironmentTool {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("environment")
     }
 
-    let body = trimmed.strip_prefix("session ").unwrap_or(trimmed).trim();
+    type Arguments = SessionArgs;
+
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+        let args = self.normalize_args(arguments)?;
+        execute_search(self.db_path(), self.index_path(), self.index_meta_path(), args).await
+    }
+}
+
+impl EnvironmentTool {
+    fn db_path(&self) -> PathBuf {
+        self.may_dir.join("history.db")
+    }
+
+    fn index_path(&self) -> PathBuf {
+        self.may_dir.join("session_index.lancedb")
+    }
+
+    fn index_meta_path(&self) -> PathBuf {
+        self.may_dir.join(INDEX_META_FILE)
+    }
+}
+
+fn apply_search_defaults(args: &mut SessionArgs, defaults: &SearchDefaults) {
+    if args.profile_id.is_none() {
+        args.profile_id = defaults.default_profile_id.clone();
+    }
+
+    if !args.include_current
+        && !defaults.include_current_by_default
+        && args.exclude_session_id.is_none()
+    {
+        args.exclude_session_id = Some(defaults.current_session_id.clone());
+    }
+}
+
+fn normalize_common_args(mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
+    args.search_mode = args.search_mode.to_lowercase();
+    args.output_mode = args.output_mode.to_lowercase();
+    if args.search_mode.trim().is_empty() {
+        args.search_mode = "hybrid".to_string();
+    }
+    if args.output_mode.trim().is_empty() {
+        args.output_mode = "sessions".to_string();
+    }
+    args.limit = args.limit.clamp(1, 200);
+    args.scan_limit = args.scan_limit.clamp(args.limit, 50_000);
+    args.fuzzy_distance = args.fuzzy_distance.min(3);
+    if args.fields.is_empty() {
+        args.fields = vec![
+            "content".to_string(),
+            "title".to_string(),
+            "preview".to_string(),
+        ];
+    } else {
+        args.fields = args
+            .fields
+            .into_iter()
+            .map(|v| v.to_lowercase())
+            .filter(|f| {
+                matches!(
+                    f.as_str(),
+                    "content" | "title" | "preview" | "session_id" | "model" | "role"
+                )
+            })
+            .collect();
+        if args.fields.is_empty() {
+            args.fields = vec!["content".to_string()];
+        }
+    }
+    Ok(args)
+}
+
+async fn execute_search(
+    db_path: PathBuf,
+    index_path: PathBuf,
+    index_meta_path: PathBuf,
+    args: SessionArgs,
+) -> aither_core::Result<ToolOutput> {
+    let query_enabled = args.query.trim() != "*" && !args.query.trim().is_empty();
+
+    if !matches!(args.output_mode.as_str(), "sessions" | "messages") {
+        return Err(anyhow::anyhow!(
+            "invalid output_mode '{}', expected one of: sessions,messages",
+            args.output_mode
+        ));
+    }
+
+    let db = ChatDb::open(&db_path).await?;
+    let fingerprint = compute_fingerprint(&db).await?;
+
+    let table = ensure_index(&index_path, &index_meta_path, &db, &fingerprint).await?;
+
+    let mut candidates = match args.search_mode.as_str() {
+        "fulltext" => run_full_text_query(&table, &args, false).await?,
+        "fuzzy" => run_full_text_query(&table, &args, true).await?,
+        "regex" => run_plain_query(&table, &args).await?,
+        "text" => run_plain_query(&table, &args).await?,
+        "hybrid" => {
+            if !query_enabled {
+                run_plain_query(&table, &args).await?
+            } else {
+                let mut merged = Vec::new();
+                let mut fts = run_full_text_query(&table, &args, false).await?;
+                let mut fuzzy = run_full_text_query(&table, &args, true).await?;
+                let mut plain = run_plain_query(&table, &args).await?;
+                merged.append(&mut fts);
+                merged.append(&mut fuzzy);
+                merged.append(&mut plain);
+                merged
+            }
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "invalid search_mode '{}', expected one of: hybrid,text,regex,fulltext,fuzzy",
+                args.search_mode
+            ));
+        }
+    };
+
+    let query_norm = if args.case_sensitive {
+        args.query.clone()
+    } else {
+        args.query.to_lowercase()
+    };
+
+    let regex_enabled = args.search_mode == "regex" && (query_enabled || args.regex.is_some());
+    let regex = if regex_enabled {
+        let pattern = args
+            .regex
+            .as_deref()
+            .unwrap_or(args.query.as_str())
+            .to_string();
+        Some(
+            RegexBuilder::new(&pattern)
+                .case_insensitive(!args.case_sensitive)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid regex pattern: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    for row in &mut candidates {
+        if row.matched_by.is_empty() {
+            row.matched_by.push(args.search_mode.clone());
+        }
+
+        let haystack = searchable_text(row, &args.fields);
+        let haystack_norm = if args.case_sensitive {
+            haystack.clone()
+        } else {
+            haystack.to_lowercase()
+        };
+
+        if query_enabled && args.search_mode != "fulltext" && args.search_mode != "fuzzy" {
+            if haystack_norm.contains(&query_norm) {
+                row.score += 10.0;
+                if !row.matched_by.iter().any(|m| m == "text") {
+                    row.matched_by.push("text".to_string());
+                }
+            }
+        }
+
+        if let Some(re) = &regex
+            && re.is_match(&haystack)
+        {
+            row.score += 15.0;
+            if !row.matched_by.iter().any(|m| m == "regex") {
+                row.matched_by.push("regex".to_string());
+            }
+        }
+    }
+
+    candidates = candidates
+        .into_iter()
+        .filter(|row| {
+            if query_enabled && args.search_mode == "text" {
+                let haystack = searchable_text(row, &args.fields);
+                let haystack = if args.case_sensitive {
+                    haystack
+                } else {
+                    haystack.to_lowercase()
+                };
+                return haystack.contains(&query_norm);
+            }
+
+            if regex_enabled {
+                let Some(re) = &regex else {
+                    return false;
+                };
+                return re.is_match(&searchable_text(row, &args.fields));
+            }
+
+            true
+        })
+        .collect();
+
+    let mut deduped: HashMap<String, SessionMatchRow> = HashMap::new();
+    for row in candidates {
+        let key = format!("{}:{}", row.session_id, row.message_id);
+        match deduped.get_mut(&key) {
+            Some(existing) => {
+                if row.score > existing.score {
+                    *existing = row;
+                } else {
+                    for source in row.matched_by {
+                        if !existing.matched_by.iter().any(|s| s == &source) {
+                            existing.matched_by.push(source);
+                        }
+                    }
+                }
+            }
+            None => {
+                deduped.insert(key, row);
+            }
+        }
+    }
+
+    let mut rows: Vec<SessionMatchRow> = deduped.into_values().collect();
+    rows.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.timestamp.cmp(&a.timestamp))
+    });
+
+    let total_matches = rows.len();
+    finalize_rows_with_total(rows, total_matches, &args)
+}
+
+fn apply_command_form(
+    args: &mut SessionArgs,
+    command: &str,
+    command_name: &str,
+) -> aither_core::Result<()> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{command_name} command must not be empty"
+        ));
+    }
+
+    let prefix = [command_name, " "].concat();
+    let body = trimmed.strip_prefix(prefix.as_str()).unwrap_or(trimmed).trim();
     if body.is_empty() {
         return Err(anyhow::anyhow!(
-            "session command must include a search prompt"
+            "{command_name} command must include a search prompt"
         ));
     }
 
@@ -417,8 +524,10 @@ struct SessionIndexMeta {
 #[derive(Debug, Clone)]
 struct SessionIndexRow {
     session_id: String,
+    profile_id: String,
     title: String,
     model: String,
+    archived: String,
     role: String,
     content: String,
     preview: String,
@@ -604,8 +713,10 @@ async fn build_index_rows(db: &ChatDb) -> anyhow::Result<Vec<SessionIndexRow>> {
             }
             rows.push(SessionIndexRow {
                 session_id: session_id.clone(),
+                profile_id: session.profile_id.clone().unwrap_or_default(),
                 title: title.clone(),
                 model: model.clone(),
+                archived: if session.archived { "1" } else { "0" }.to_string(),
                 role: msg.role,
                 content: msg.content,
                 preview: preview.clone(),
@@ -626,8 +737,10 @@ fn rows_to_record_reader(
 ) -> anyhow::Result<Box<dyn RecordBatchReader + Send>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("session_id", DataType::Utf8, false),
+        Field::new("profile_id", DataType::Utf8, false),
         Field::new("title", DataType::Utf8, false),
         Field::new("model", DataType::Utf8, false),
+        Field::new("archived", DataType::Utf8, false),
         Field::new("role", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, false),
         Field::new("preview", DataType::Utf8, false),
@@ -645,10 +758,16 @@ fn rows_to_record_reader(
                 rows.iter().map(|r| r.session_id.as_str()),
             )),
             Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|r| r.profile_id.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|r| r.title.as_str()),
             )),
             Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|r| r.model.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|r| r.archived.as_str()),
             )),
             Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|r| r.role.as_str()),
@@ -704,6 +823,14 @@ fn build_sql_filter(args: &SessionArgs) -> Option<String> {
         filters.push(binary_sql_expr("model", BinaryOperator::Eq, model));
     }
 
+    if let Some(profile_id) = &args.profile_id {
+        filters.push(binary_sql_expr(
+            "profile_id",
+            BinaryOperator::Eq,
+            profile_id,
+        ));
+    }
+
     if let Some(role) = &args.role {
         filters.push(binary_sql_expr("role", BinaryOperator::Eq, role));
     }
@@ -724,6 +851,10 @@ fn build_sql_filter(args: &SessionArgs) -> Option<String> {
             pattern: Box::new(string_sql_expr(["%", title_contains, "%"].concat())),
             escape_char: None,
         });
+    }
+
+    if !args.include_archived {
+        filters.push(binary_sql_expr("archived", BinaryOperator::Eq, "0"));
     }
 
     filters
@@ -760,8 +891,10 @@ async fn run_plain_query(
         .query()
         .select(Select::columns(&[
             "session_id",
+            "profile_id",
             "title",
             "model",
+            "archived",
             "role",
             "content",
             "preview",
@@ -810,8 +943,10 @@ async fn run_full_text_query(
         .full_text_search(fts)
         .select(Select::columns(&[
             "session_id",
+            "profile_id",
             "title",
             "model",
+            "archived",
             "role",
             "content",
             "preview",
@@ -1023,6 +1158,7 @@ mod tests {
             session_id: None,
             exclude_session_id: None,
             model: None,
+            profile_id: None,
             role: None,
             since: None,
             until: None,
@@ -1033,13 +1169,14 @@ mod tests {
             fields: Vec::new(),
             include_content: false,
             include_current: false,
+            include_archived: false,
         }
     }
 
     #[test]
     fn parses_scoped_session_command_form() {
         let mut args = base_args();
-        apply_command_form(&mut args, "session abc123 search investigate failures")
+        apply_command_form(&mut args, "session abc123 search investigate failures", "session")
             .expect("command form should parse");
         assert_eq!(args.session_id.as_deref(), Some("abc123"));
         assert_eq!(args.query, "investigate failures");
@@ -1048,7 +1185,7 @@ mod tests {
     #[test]
     fn parses_global_session_command_form() {
         let mut args = base_args();
-        apply_command_form(&mut args, "session recall onboarding decision")
+        apply_command_form(&mut args, "session recall onboarding decision", "session")
             .expect("global command form should parse");
         assert_eq!(args.session_id, None);
         assert_eq!(args.query, "recall onboarding decision");
@@ -1057,7 +1194,7 @@ mod tests {
     #[test]
     fn rejects_missing_prompt_in_scoped_command() {
         let mut args = base_args();
-        let err = apply_command_form(&mut args, "session abc123 search")
+        let err = apply_command_form(&mut args, "session abc123 search", "session")
             .expect_err("missing prompt must fail");
         assert!(
             err.to_string().contains("missing prompt"),
@@ -1070,13 +1207,16 @@ mod tests {
         let mut args = base_args();
         args.session_id = Some("session-1".to_string());
         args.model = Some("gpt-5".to_string());
+        args.profile_id = Some("work".to_string());
         args.since = Some("2026-03-12T00:00:00Z".to_string());
 
         let filter = build_sql_filter(&args).expect("filter should be built");
 
         assert!(filter.contains("session_id = 'session-1'"));
         assert!(filter.contains("model = 'gpt-5'"));
+        assert!(filter.contains("profile_id = 'work'"));
         assert!(filter.contains("timestamp >= '2026-03-12T00:00:00Z'"));
+        assert!(filter.contains("archived = '0'"));
         assert!(filter.contains(" AND "));
     }
 
