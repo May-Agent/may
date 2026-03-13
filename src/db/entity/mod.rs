@@ -3,6 +3,7 @@
 pub mod context_debug_snapshots;
 pub mod folders;
 pub mod messages;
+pub mod network_access_logs;
 pub mod notification_mailbox;
 pub mod profile_memories;
 pub mod profile_memory_jobs;

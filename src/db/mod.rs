@@ -22,7 +22,7 @@ use crate::session::{
 use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 use crate::xml_fragment::XmlFragment;
 use entity::{
-    context_debug_snapshots, folders, messages, notification_mailbox, profile_memories,
+    context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox, profile_memories,
     profile_memory_jobs, profiles, push_subscriptions, scheduled_tasks, session_context_snapshots,
     session_pending_ask_user, session_pending_messages, session_pending_permissions, session_plans,
     session_runtimes, sessions,
@@ -86,6 +86,18 @@ pub struct MessageStatsParams {
     pub cache_write_tokens: Option<u32>,
     pub context_window: Option<u32>,
     pub elapsed_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkAccessLogParams<'a> {
+    pub session_id: Option<&'a str>,
+    pub profile_id: Option<&'a str>,
+    pub source: &'a str,
+    pub mode: &'a str,
+    pub domain: &'a str,
+    pub port: u16,
+    pub allowed: bool,
+    pub reason: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -219,6 +231,13 @@ impl ChatDb {
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
 
+        let network_access_logs_stmt =
+            schema.create_table_from_entity(network_access_logs::Entity);
+        let create_sql = network_access_logs_stmt
+            .to_string(SqliteQueryBuilder)
+            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        conn.execute_unprepared(&create_sql).await?;
+
         let session_context_stmt =
             schema.create_table_from_entity(session_context_snapshots::Entity);
         let create_sql = session_context_stmt
@@ -306,6 +325,14 @@ impl ChatDb {
         .await?;
         conn.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_session_pending_messages_session_created ON session_pending_messages(session_id, created_at)",
+        )
+        .await?;
+        conn.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_network_access_logs_timestamp ON network_access_logs(timestamp)",
+        )
+        .await?;
+        conn.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_network_access_logs_session ON network_access_logs(session_id, timestamp)",
         )
         .await?;
         conn.execute_unprepared(
@@ -1451,6 +1478,40 @@ impl ChatDb {
     ) -> Result<Vec<notification_mailbox::Model>, ChatDbError> {
         notification_mailbox::Entity::find()
             .order_by_desc(notification_mailbox::Column::CreatedAt)
+            .limit(limit)
+            .all(&self.conn)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn append_network_access_log(
+        &self,
+        params: NetworkAccessLogParams<'_>,
+    ) -> Result<network_access_logs::Model, ChatDbError> {
+        let port = i32::from(params.port);
+        network_access_logs::ActiveModel {
+            id: NotSet,
+            session_id: Set(params.session_id.map(ToOwned::to_owned)),
+            profile_id: Set(params.profile_id.map(ToOwned::to_owned)),
+            source: Set(params.source.to_string()),
+            mode: Set(params.mode.to_string()),
+            domain: Set(params.domain.to_string()),
+            port: Set(port),
+            allowed: Set(params.allowed),
+            reason: Set(params.reason.map(ToOwned::to_owned)),
+            timestamp: Set(jiff::Timestamp::now().to_string()),
+        }
+        .insert(&self.conn)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn list_network_access_logs(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<network_access_logs::Model>, ChatDbError> {
+        network_access_logs::Entity::find()
+            .order_by_desc(network_access_logs::Column::Timestamp)
             .limit(limit)
             .all(&self.conn)
             .await

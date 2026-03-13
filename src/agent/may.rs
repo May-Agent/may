@@ -32,6 +32,7 @@ use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
 use crate::copilot::clear_copilot_credentials;
+use crate::db::NetworkAccessLogParams;
 use crate::live_response::LiveResponseRegistry;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{MessageRole, SessionId, SessionPaths, SessionPlanState};
@@ -412,17 +413,47 @@ impl PermissionHandler for PermissionApprover {
 struct MayPermissionHandler {
     approver: Option<PermissionApprover>,
     network_policy: Option<CompiledNetworkPolicy>,
+    profile_id: Option<String>,
 }
 
 impl MayPermissionHandler {
     const fn new(
         approver: Option<PermissionApprover>,
         network_policy: Option<CompiledNetworkPolicy>,
+        profile_id: Option<String>,
     ) -> Self {
         Self {
             approver,
             network_policy,
+            profile_id,
         }
+    }
+
+    async fn append_network_audit_log(
+        &self,
+        domain: &str,
+        port: u16,
+        allowed: bool,
+        reason: Option<&str>,
+    ) {
+        let Some(approver) = &self.approver else {
+            return;
+        };
+        let Some(db) = approver.runtime_db.clone() else {
+            return;
+        };
+        let _ = db
+            .append_network_access_log(NetworkAccessLogParams {
+                session_id: approver.session_id.as_deref(),
+                profile_id: self.profile_id.as_deref(),
+                source: "chat",
+                mode: "network",
+                domain,
+                port,
+                allowed,
+                reason,
+            })
+            .await;
     }
 }
 
@@ -439,12 +470,16 @@ impl PermissionHandler for MayPermissionHandler {
             && !policy.allows_domain(domain)
         {
             tracing::warn!(domain, port, mode = %policy.mode().as_str(), "blocked outbound domain by configured network policy");
+            self.append_network_audit_log(domain, port, false, Some(policy.mode().as_str()))
+                .await;
             return false;
         }
-        match &self.approver {
+        let allowed = match &self.approver {
             Some(approver) => approver.check_domain(domain, port).await,
             None => NoopPermissionHandler.check_domain(domain, port).await,
-        }
+        };
+        self.append_network_audit_log(domain, port, allowed, None).await;
+        allowed
     }
 }
 
@@ -836,7 +871,11 @@ impl MayAgent {
         // Create bash tool in sandbox dir (BashTool creates its own working directory inside)
         let bash_tool: BashTool<MayPermissionHandler, DefaultExecutor> = BashTool::new_exact(
             &config.sandbox_dir,
-            MayPermissionHandler::new(config.permission_approver.clone(), config.network_policy.clone()),
+            MayPermissionHandler::new(
+                config.permission_approver.clone(),
+                config.network_policy.clone(),
+                config.profile_id.clone(),
+            ),
             executor,
         )
         .await

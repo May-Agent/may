@@ -117,3 +117,18 @@ pub(super) async fn list_notification_mailbox(
         .collect();
     Ok(Json(super::types::NotificationMailboxResponse { items }))
 }
+
+pub(super) async fn list_network_access_logs(
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<super::types::NetworkAccessLogsResponse>> {
+    let items = state
+        .db()
+        .await
+        .list_network_access_logs(200)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(super::types::NetworkAccessLogEntryResponse::from)
+        .collect();
+    Ok(Json(super::types::NetworkAccessLogsResponse { items }))
+}

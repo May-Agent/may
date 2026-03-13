@@ -27,6 +27,7 @@ use crate::config::SshServerConfig;
 use crate::container::lifecycle::ContainerManager;
 use crate::db::ChatDb;
 use crate::db::entity::{profiles, scheduled_tasks};
+use crate::db::NetworkAccessLogParams;
 use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
@@ -125,6 +126,9 @@ impl TaskExecutionEnvelope {
 
 #[derive(Debug, Clone)]
 struct SchedulerPermissionHandler {
+    db: ChatDb,
+    profile_id: String,
+    source: String,
     allow_network: bool,
     network_policy: Option<CompiledNetworkPolicy>,
 }
@@ -134,12 +138,37 @@ impl PermissionHandler for SchedulerPermissionHandler {
         Ok(true)
     }
 
-    async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
-        self.allow_network
+    async fn check_domain(&self, domain: &str, port: u16) -> bool {
+        let allowed = self.allow_network
             && self
                 .network_policy
                 .as_ref()
-                .is_none_or(|policy| policy.allows_domain(_domain))
+                .is_none_or(|policy| policy.allows_domain(domain));
+        let reason = if !self.allow_network {
+            Some("needs_network_disabled")
+        } else if let Some(policy) = &self.network_policy {
+            if !policy.allows_domain(domain) {
+                Some(policy.mode().as_str())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let _ = self
+            .db
+            .append_network_access_log(NetworkAccessLogParams {
+                session_id: None,
+                profile_id: Some(self.profile_id.as_str()),
+                source: self.source.as_str(),
+                mode: "network",
+                domain,
+                port,
+                allowed,
+                reason,
+            })
+            .await;
+        allowed
     }
 }
 
@@ -503,7 +532,7 @@ impl TaskRuntime {
             .await?;
 
         match profile_info.environment {
-            ProfileEnvironment::Local => self.validate_local(&script).await,
+            ProfileEnvironment::Local => self.validate_local(&profile.id, &script).await,
             ProfileEnvironment::Container { .. } => self.validate_container(profile, &script).await,
             ProfileEnvironment::Remote { .. } => self.validate_remote(profile, &script).await,
         }
@@ -746,13 +775,15 @@ impl TaskRuntime {
         command: String,
     ) -> Result<String, String> {
         let bash_tool = self
-            .local_bash_tool(script, task.needs_network)
+            .local_bash_tool(&task.profile_id, "task_local", script, task.needs_network)
             .await?;
         run_bash_script(&bash_tool, BashExecutionMode::Default, None, command).await
     }
 
-    async fn validate_local(&self, script: &TaskScript) -> Result<(), String> {
-        let bash_tool = self.local_bash_tool(script, false).await?;
+    async fn validate_local(&self, profile_id: &str, script: &TaskScript) -> Result<(), String> {
+        let bash_tool = self
+            .local_bash_tool(profile_id, "task_validation_local", script, false)
+            .await?;
 
         run_bash_script(
             &bash_tool,
@@ -766,6 +797,8 @@ impl TaskRuntime {
 
     async fn local_bash_tool(
         &self,
+        profile_id: &str,
+        source: &str,
         script: &TaskScript,
         allow_network: bool,
     ) -> Result<BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
@@ -780,6 +813,9 @@ impl TaskRuntime {
         BashTool::new_exact(
             &script.host_working_dir,
             SchedulerPermissionHandler {
+                db: self.db.clone(),
+                profile_id: profile_id.to_string(),
+                source: source.to_string(),
                 allow_network,
                 network_policy,
             },
@@ -822,6 +858,9 @@ impl TaskRuntime {
         BashTool::new_exact(
             working_dir,
             SchedulerPermissionHandler {
+                db: self.db.clone(),
+                profile_id: profile.id.clone(),
+                source: "task_remote".to_string(),
                 allow_network: true,
                 network_policy,
             },
@@ -942,6 +981,9 @@ impl TaskRuntime {
             BashTool::new_exact(
                 &workspace_dir,
                 SchedulerPermissionHandler {
+                    db: self.db.clone(),
+                    profile_id: profile.id.clone(),
+                    source: "task_container".to_string(),
                     allow_network: true,
                     network_policy,
                 },
@@ -1040,6 +1082,9 @@ impl TaskRuntime {
             BashTool::new_exact(
                 &workspace_dir,
                 SchedulerPermissionHandler {
+                    db: self.db.clone(),
+                    profile_id: profile.id.clone(),
+                    source: "task_validation_container".to_string(),
                     allow_network: true,
                     network_policy,
                 },

@@ -375,7 +375,10 @@ fn api_routes() -> Route {
                 "/unsubscribe".post(unsubscribe),
                 "/test".post(test_notification),
             ))),
-            "/notifications".route(Route::new(("/mailbox".at(list_notification_mailbox),))),
+            "/notifications".route(Route::new((
+                "/mailbox".at(list_notification_mailbox),
+                "/network-access".at(list_network_access_logs),
+            ))),
         )),
     ))
 }
