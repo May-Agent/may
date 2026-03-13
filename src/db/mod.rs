@@ -1898,7 +1898,7 @@ impl ChatDb {
         let mut first_id = None;
         for def in &defaults {
             let ensured = if let Some(existing) = self.get_profile_by_slug(def.slug).await? {
-                self.apply_default_profile_correction(existing, def).await?
+                existing
             } else {
                 let id = uuid::Uuid::new_v4().to_string();
                 self.create_profile(CreateProfileParams {
@@ -1922,27 +1922,6 @@ impl ChatDb {
 
         // first_id is always set because we iterate at least one default profile
         Ok(first_id.expect("at least one default profile must be created"))
-    }
-
-    async fn apply_default_profile_correction(
-        &self,
-        existing: profiles::Model,
-        def: &DefaultProfile<'_>,
-    ) -> Result<profiles::Model, ChatDbError> {
-        let now = jiff::Timestamp::now().to_string();
-        let mut active: profiles::ActiveModel = existing.into();
-        active.slug = Set(Some(def.slug.to_string()));
-        active.name = Set(def.name.to_string());
-        active.icon = Set(Some(def.icon.to_string()));
-        active.environment = Set(def.environment.to_string());
-        active.location_aware = Set(def.location_aware);
-        if def.environment == "local" {
-            active.container_image = Set(None);
-            active.container_id = Set(None);
-        }
-        active.updated_at = Set(now);
-        let model = active.update(&self.conn).await?;
-        Ok(model)
     }
 
     async fn max_profile_sort_order(&self) -> Result<i32, ChatDbError> {
@@ -2939,7 +2918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_default_profiles_corrects_legacy_rows_without_duplicates() {
+    async fn ensure_default_profiles_preserve_existing_profiles_by_slug() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
         let db = ChatDb::open(&db_path)
@@ -2947,94 +2926,86 @@ mod tests {
             .expect("db should initialize successfully");
 
         db.create_profile(CreateProfileParams {
-            id: "legacy-daily",
-            name: "Daily",
+            id: "daily-id",
+            name: "Custom Daily",
             environment: "container",
-            container_image: Some("legacy-image"),
-            slug: None,
-            icon: Some("X"),
+            container_image: Some("custom-image"),
+            slug: Some("daily"),
+            icon: Some("D"),
             persona: None,
             preferences_json: None,
             location_aware: false,
         })
         .await
-        .expect("legacy daily should be created");
+        .expect("daily profile should be created");
         db.create_profile(CreateProfileParams {
-            id: "legacy-work",
-            name: "Work",
+            id: "work-id",
+            name: "Custom Work",
             environment: "container",
-            container_image: Some("legacy-image"),
-            slug: None,
-            icon: Some("Y"),
+            container_image: Some("work-image"),
+            slug: Some("work"),
+            icon: Some("W"),
             persona: None,
             preferences_json: None,
             location_aware: true,
         })
         .await
-        .expect("legacy work should be created");
+        .expect("work profile should be created");
         db.create_profile(CreateProfileParams {
-            id: "legacy-local",
-            name: "Local",
+            id: "local-id",
+            name: "Custom Local",
             environment: "local",
-            container_image: Some("should-clear"),
-            slug: None,
-            icon: Some("Z"),
+            container_image: Some("still-here"),
+            slug: Some("local"),
+            icon: Some("L"),
             persona: None,
             preferences_json: None,
             location_aware: true,
         })
         .await
-        .expect("legacy local should be created");
-
-        drop(db);
-        let db = ChatDb::open(&db_path)
-            .await
-            .expect("db should reopen successfully with migrations");
+        .expect("local profile should be created");
 
         let first_id = db
             .ensure_default_profiles()
             .await
-            .expect("default profiles should be corrected");
-        assert_eq!(first_id, "legacy-daily");
+            .expect("default profiles should exist");
+        assert_eq!(first_id, "daily-id");
 
         let all = db.list_profiles().await.expect("profiles should be listed");
-        assert_eq!(all.len(), 3, "legacy rows should be corrected in-place");
+        assert_eq!(all.len(), 3, "existing slugged profiles should be reused");
 
         let daily = db
             .get_profile_by_slug("daily")
             .await
             .expect("daily query should succeed")
             .expect("daily profile should exist");
-        assert_eq!(daily.id, "legacy-daily");
-        assert_eq!(daily.name, "Daily");
+        assert_eq!(daily.id, "daily-id");
+        assert_eq!(daily.name, "Custom Daily");
         assert_eq!(daily.environment, "container");
-        assert_eq!(daily.icon.as_deref(), Some("\u{1F305}"));
-        assert!(daily.location_aware);
+        assert_eq!(daily.icon.as_deref(), Some("D"));
+        assert!(!daily.location_aware);
 
         let work = db
             .get_profile_by_slug("work")
             .await
             .expect("work query should succeed")
             .expect("work profile should exist");
-        assert_eq!(work.id, "legacy-work");
-        assert_eq!(work.name, "Work");
+        assert_eq!(work.id, "work-id");
+        assert_eq!(work.name, "Custom Work");
         assert_eq!(work.environment, "container");
-        assert_eq!(work.icon.as_deref(), Some("\u{1F4BC}"));
-        assert!(!work.location_aware);
+        assert_eq!(work.icon.as_deref(), Some("W"));
+        assert!(work.location_aware);
 
         let local = db
             .get_profile_by_slug("local")
             .await
             .expect("local query should succeed")
             .expect("local profile should exist");
-        let expected_hostname = hostname::get()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "local".to_string());
-        assert_eq!(local.id, "legacy-local");
-        assert_eq!(local.name, expected_hostname);
+        assert_eq!(local.id, "local-id");
+        assert_eq!(local.name, "Custom Local");
         assert_eq!(local.environment, "local");
-        assert_eq!(local.icon.as_deref(), Some("\u{1F5A5}\u{FE0F}"));
-        assert!(!local.location_aware);
+        assert_eq!(local.icon.as_deref(), Some("L"));
+        assert!(local.location_aware);
         assert!(local.container_image.is_none());
     }
 
