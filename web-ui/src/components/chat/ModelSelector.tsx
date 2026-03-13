@@ -33,22 +33,9 @@ export function ModelSelector({
       ? [...tiers.advanced, ...tiers.balanced, ...tiers.fast]
       : models.map((model) => model.id);
     const uniqueOrderedIds = orderedIds.filter((id, i) => orderedIds.indexOf(id) === i);
-    const finalModelIds =
-      currentModelId && !uniqueOrderedIds.includes(currentModelId)
-        ? [...uniqueOrderedIds, currentModelId]
-        : uniqueOrderedIds;
-
-    return finalModelIds.map((id) => {
-      const existing = models.find((m) => m.id === id);
-      return (
-        existing ?? {
-          id,
-          name: id,
-          provider: inferProvider(id),
-          reasoning: /o1|reason/i.test(id),
-        }
-      );
-    });
+    return uniqueOrderedIds
+      .map((id) => models.find((model) => model.id === id))
+      .filter((model): model is NonNullable<typeof model> => model != null);
   }, [models, uiConfig.fullConfig?.models, currentModelId]);
 
   const selected = getModel(currentModelId, prioritizedModels) ?? getModel(currentModelId, models);
@@ -70,9 +57,7 @@ export function ModelSelector({
     );
   }
 
-  const fallbackModel = prioritizedModels[0];
-  const displayModel = selected ?? fallbackModel;
-  const SelectedIcon = PROVIDER_ICONS[displayModel.provider];
+  const SelectedIcon = PROVIDER_ICONS[selected?.provider ?? inferProvider(currentModelId)];
 
   return (
     <Popover
@@ -90,7 +75,7 @@ export function ModelSelector({
           disabled={disabled}
         >
           {isUpdating ? <Loader2 className="h-4 w-4 animate-spin" /> : <SelectedIcon className="h-4 w-4" />}
-          <span className="truncate">{selected?.name ?? 'Select model'}</span>
+          <span className="truncate">{selected?.name ?? (currentModelId || 'Select model')}</span>
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-[320px] p-0" align="start">
