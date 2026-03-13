@@ -537,11 +537,36 @@ pub(super) async fn chat_stream(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Sse> {
+    let runtime = state
+        .runtime_service
+        .get(&req.session_id)
+        .await
+        .map_err(internal_error)?;
+    if runtime.is_active() {
+        return Err(
+            skyzen::Error::msg(
+                "session is already active; send this message via steer or queue instead",
+            )
+            .set_status(skyzen::StatusCode::CONFLICT),
+        );
+    }
+
     let (sender, sse) = Sse::channel();
 
     tokio::spawn(async move {
         let session_id = req.session_id.clone();
-        state.active_streaming_sessions.insert(session_id.clone()).await;
+        let inserted = state.active_streaming_sessions.insert(session_id.clone()).await;
+        if !inserted {
+            send_event(
+                &sender,
+                "error",
+                &SseErrorEvent {
+                    message: "session is already streaming; send this message via steer or queue instead",
+                },
+            )
+            .await;
+            return;
+        }
 
         if let Err(err) = stream_chat_events(state.clone(), req, sender.clone()).await {
             send_event(
@@ -907,10 +932,6 @@ async fn stream_chat_events(
             true,
             true,
         )
-        .await;
-    state
-        .active_streaming_sessions
-        .remove(req.session_id.as_str())
         .await;
     let response_session_id = req.session_id.clone();
     match result {
