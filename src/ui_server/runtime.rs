@@ -26,6 +26,10 @@ impl SessionRuntimeService {
         Self { db, notify }
     }
 
+    pub(crate) fn db(&self) -> ChatDb {
+        self.db.clone()
+    }
+
     fn notify_ui(&self) {
         self.notify.notify_waiters();
     }

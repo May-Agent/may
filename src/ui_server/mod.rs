@@ -133,7 +133,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let permission_approver = crate::agent::PermissionApprover::new()
         .with_runtime_sync(db_for_archive.clone(), ui_events_notify.clone());
     let ask_user_approver =
-        AskUserApprover::new().with_runtime_sync(db_for_archive.clone(), ui_events_notify.clone());
+        AskUserApprover::new().with_runtime_service(runtime_service.clone());
 
     // Initialize memory processor with fast-tier provider chain
     let memory_processor = match crate::agent::build_fast_provider_chain(&config).await {
