@@ -106,6 +106,7 @@ export interface Session {
   projectId?: string;
   model: string;
   reasoningEffort?: string;
+  runtime: SessionRuntimeSummaryPayload;
   planState?: SessionPlanState;
   runtimeState?: SessionRuntimeState;
   queuedCount?: number;

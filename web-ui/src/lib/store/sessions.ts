@@ -2,6 +2,7 @@ import type { StateCreator } from 'zustand';
 import type { Session, Message, Attachment } from '@/types';
 import * as api from '@/lib/api';
 import { buildModelCatalog, type Model } from '@/lib/constants';
+import { useRuntimeStore } from '@/lib/runtimeStore';
 import type { AppState } from './index';
 import {
   sortSessions,
@@ -58,6 +59,12 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
       ]);
 
       const sorted = sortSessions(sessions);
+      useRuntimeStore.getState().applyRuntimes(
+        sorted.map((session) => ({
+          sessionId: session.id,
+          runtime: session.runtime,
+        })),
+      );
       const defaultProfile = profiles[0] ?? null;
       set({
         sessions: sorted,

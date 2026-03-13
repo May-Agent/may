@@ -517,6 +517,7 @@ pub(crate) struct ApiSession {
     pub(crate) model: String,
     #[serde(default)]
     pub(crate) reasoning_effort: Option<String>,
+    pub(crate) runtime: SessionRuntimeResponse,
     #[serde(default)]
     pub(crate) plan_state: SessionPlanState,
     pub(crate) runtime_state: SessionRuntimeState,
@@ -549,6 +550,7 @@ impl ApiSession {
             profile_id: summary.profile_id,
             model,
             reasoning_effort: None,
+            runtime: summary.runtime.clone().into(),
             plan_state: summary.runtime.plan_state,
             runtime_state: summary.runtime.state,
             queued_count: summary.runtime.queued_count,
@@ -566,6 +568,7 @@ impl ApiSession {
             profile_id,
             model,
             reasoning_effort: None,
+            runtime: crate::session::SessionRuntimeSummary::default().into(),
             plan_state: SessionPlanState::Disabled,
             runtime_state: SessionRuntimeState::Idle,
             queued_count: 0,

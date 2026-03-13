@@ -341,6 +341,7 @@ pub(super) async fn update_session(
         profile_id,
         model,
         reasoning_effort: None,
+        runtime: runtime.clone().into(),
         plan_state: runtime.plan_state,
         runtime_state: runtime.state,
         queued_count: runtime.queued_count,
