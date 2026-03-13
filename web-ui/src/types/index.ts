@@ -164,7 +164,7 @@ export interface SessionSummary {
   planState: SessionPlanState;
   runtimeState: SessionRuntimeState;
   queuedCount: number;
-  runtime?: SessionRuntimeSummaryPayload;
+  runtime: SessionRuntimeSummaryPayload;
 }
 
 export type SessionPlanState = 'disabled' | 'draft' | 'approved';

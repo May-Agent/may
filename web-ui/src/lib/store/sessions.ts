@@ -6,6 +6,7 @@ import type { AppState } from './index';
 import {
   sortSessions,
   backendUnavailableReasonFromError,
+  errorMessage,
   isContainerProfile,
   PREVIEW_MAX_LENGTH,
   TITLE_MAX_LENGTH,
@@ -47,94 +48,49 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
   loadInitialData: async () => {
     if (get().loaded) return;
 
-    const [
-      sessionsResult,
-      modelsResult,
-      uiConfigResult,
-      fullConfigResult,
-      profilesResult,
-    ] = await Promise.allSettled([
-      api.fetchSessions(),
-      api.fetchModels(),
-      api.fetchUiConfig(),
-      api.fetchFullConfig(),
-      api.fetchProfiles(),
-    ]);
+    try {
+      const [sessions, modelPayload, uiConfig, fullConfig, profiles] = await Promise.all([
+        api.fetchSessions(),
+        api.fetchModels(),
+        api.fetchUiConfig(),
+        api.fetchFullConfig(),
+        api.fetchProfiles(),
+      ]);
 
-    const sessions =
-      sessionsResult.status === 'fulfilled' ? sessionsResult.value : [];
-    const fullConfig =
-      fullConfigResult.status === 'fulfilled' ? fullConfigResult.value : null;
-    const fallbackModelIds = fullConfig
-      ? [
-          ...fullConfig.models.advanced,
-          ...fullConfig.models.balanced,
-          ...fullConfig.models.fast,
-        ].filter((id, index, list) => list.indexOf(id) === index)
-      : [];
-    const modelPayload =
-      modelsResult.status === 'fulfilled'
-        ? modelsResult.value
-        : { models: fallbackModelIds, details: [] };
-    const uiConfig =
-      uiConfigResult.status === 'fulfilled'
-        ? uiConfigResult.value
-        : {
-            sshServers: [],
-            maxIterations: 0,
-            uiFont: 'Inter',
-            uiTheme: 'system' as const,
-          };
-    const profiles =
-      profilesResult.status === 'fulfilled' ? profilesResult.value : [];
+      const sorted = sortSessions(sessions);
+      const defaultProfile = profiles[0] ?? null;
+      set({
+        sessions: sorted,
+        models: buildModelCatalog(modelPayload.models, modelPayload.details),
+        modelsLoaded: true,
+        settings: {
+          font: uiConfig.uiFont,
+          theme: uiConfig.uiTheme,
+        },
+        uiConfig: {
+          sshServers: uiConfig.sshServers,
+          maxIterations: uiConfig.maxIterations,
+          fullConfig,
+        },
+        profiles,
+        currentProfileId: defaultProfile?.id ?? null,
+        profileSessionsLoading: defaultProfile != null,
+        backendUnavailableReason: null,
+        loaded: true,
+        currentSessionId: null,
+      });
 
-    if (sessionsResult.status === 'rejected') {
-      console.error('failed to load sessions', sessionsResult.reason);
-    }
-    if (modelsResult.status === 'rejected') {
-      console.error('failed to load models', modelsResult.reason);
-    }
-    if (uiConfigResult.status === 'rejected') {
-      console.error('failed to load ui config', uiConfigResult.reason);
-    }
-    if (fullConfigResult.status === 'rejected') {
-      console.error('failed to load full config', fullConfigResult.reason);
-    }
-    if (profilesResult.status === 'rejected') {
-      console.error('failed to load profiles', profilesResult.reason);
-    }
-
-    const sorted = sortSessions(sessions);
-    const initBackendUnavailableReason =
-      [sessionsResult, modelsResult, uiConfigResult, fullConfigResult, profilesResult]
-        .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
-        .map((result) => backendUnavailableReasonFromError(result.reason))
-        .find((reason): reason is string => typeof reason === 'string') ?? null;
-    const defaultProfile = profiles[0] ?? null;
-    set({
-      sessions: sorted,
-      models: buildModelCatalog(modelPayload.models, modelPayload.details),
-      modelsLoaded: true,
-      settings: {
-        font: uiConfig.uiFont,
-        theme: uiConfig.uiTheme,
-      },
-      uiConfig: {
-        sshServers: uiConfig.sshServers,
-        maxIterations: uiConfig.maxIterations,
-        fullConfig,
-      },
-      profiles,
-      currentProfileId: defaultProfile?.id ?? null,
-      profileSessionsLoading: defaultProfile != null,
-      backendUnavailableReason: initBackendUnavailableReason,
-      loaded: true,
-      currentSessionId: null,
-    });
-
-    if (defaultProfile) {
-      void get().refreshSkills();
-      await get().refreshProfileSessions();
+      if (defaultProfile) {
+        void get().refreshSkills();
+        await get().refreshProfileSessions();
+      }
+    } catch (error) {
+      set({
+        backendUnavailableReason:
+          backendUnavailableReasonFromError(error) ?? errorMessage(error),
+        profileSessionsLoading: false,
+        loaded: true,
+      });
     }
   },
 
