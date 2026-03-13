@@ -14,8 +14,9 @@ use super::helpers::send_event;
 use super::state::UiServerState;
 use super::types::{
     ConfigEventPayload, NotificationMailboxEntryResponse, NotificationMailboxResponse,
-    ProfileSessionsEventPayload, RequestLogsResponse, SessionRuntimeEventPayload,
-    SessionRuntimeSnapshotItem, SessionRuntimesEventPayload, SseHeartbeat,
+    ProfileSessionsEventPayload, RemoteAccessEventPayload, RequestLogsResponse,
+    SessionRuntimeEventPayload, SessionRuntimeSnapshotItem, SessionRuntimesEventPayload,
+    SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -57,6 +58,7 @@ pub(super) async fn stream_events(
         let mut last_runtime_sig = String::new();
         let mut last_profile_runtime_sig = String::new();
         let mut last_profile_sessions_sig = String::new();
+        let mut last_remote_access_sig = String::new();
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Ignore the first immediate tick; we emit initial state immediately below.
@@ -111,6 +113,15 @@ pub(super) async fn stream_events(
             &sender,
             profile_id.as_deref(),
             &mut last_profile_sessions_sig,
+        )
+        .await
+        {
+            return;
+        }
+        if !emit_remote_access_if_changed(
+            &state_cloned,
+            &sender,
+            &mut last_remote_access_sig,
         )
         .await
         {
@@ -179,6 +190,15 @@ pub(super) async fn stream_events(
                         &sender,
                         profile_id.as_deref(),
                         &mut last_profile_sessions_sig,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    if !emit_remote_access_if_changed(
+                        &state_cloned,
+                        &sender,
+                        &mut last_remote_access_sig,
                     )
                     .await
                     {
@@ -362,6 +382,25 @@ async fn emit_session_runtimes_if_changed(
         && sig != *last_sig
     {
         if !send_event(sender, "session_runtimes", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
+    }
+    true
+}
+
+async fn emit_remote_access_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    last_sig: &mut String,
+) -> bool {
+    let payload = RemoteAccessEventPayload {
+        status: state.remote_access_manager.snapshot(),
+    };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "remote_access", &payload).await {
             return false;
         }
         *last_sig = sig;

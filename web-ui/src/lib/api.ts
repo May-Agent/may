@@ -76,12 +76,23 @@ export interface ContainerPrepareEventPayload {
   statuses: ContainerPrepareStatus[];
 }
 
+export type RemoteAccessState = 'disabled' | 'starting' | 'running' | 'error';
+
+export interface RemoteAccessStatus {
+  state: RemoteAccessState;
+  enabled: boolean;
+  publicUrl?: string | null;
+  lastError?: string | null;
+  recentLogs: string[];
+}
+
 export interface UiEventsSubscription {
   sessionId?: string;
   profileId?: string;
   onOpen?: () => void;
   onConfig?: (payload: UiConfigEventPayload) => void;
   onContainerPrepare?: (payload: ContainerPrepareEventPayload) => void;
+  onRemoteAccess?: (payload: { status: RemoteAccessStatus }) => void;
   onNotificationMailbox?: (payload: NotificationMailboxPayload) => void;
   onProfileSessions?: (payload: { profileSessions: ProfileSessions }) => void;
   onRequestLogs?: (payload: RequestLogsPayload) => void;
@@ -395,6 +406,14 @@ export interface UiPlaywrightConfig {
   screencastMaxWidth: number;
 }
 
+export interface UiRemoteAccessConfig {
+  enabled: boolean;
+  cloudflaredBinary: string;
+  tunnelToken?: string | null;
+  publicUrl?: string | null;
+  allowLocalEnvironment: boolean;
+}
+
 export interface UiFullConfig {
   providers: UiProviderConfig[];
   models: UiModelsConfig;
@@ -406,6 +425,7 @@ export interface UiFullConfig {
   lastModel: string | null;
   maxIterations: number;
   playwright: UiPlaywrightConfig;
+  remoteAccess: UiRemoteAccessConfig;
 }
 
 export interface McpServerInfo {
@@ -1094,6 +1114,22 @@ export async function saveFullConfig(config: UiFullConfig): Promise<void> {
   });
 }
 
+export async function fetchRemoteAccessStatus(): Promise<RemoteAccessStatus> {
+  return request<RemoteAccessStatus>('/api/remote-access/status');
+}
+
+export async function startRemoteAccess(): Promise<void> {
+  await request<{ ok: boolean }>('/api/remote-access/start', {
+    method: 'POST',
+  });
+}
+
+export async function stopRemoteAccess(): Promise<void> {
+  await request<{ ok: boolean }>('/api/remote-access/stop', {
+    method: 'POST',
+  });
+}
+
 export async function setLastModel(model: string): Promise<void> {
   await request<{ ok: boolean }>('/api/config/last-model', {
     method: 'POST',
@@ -1311,6 +1347,13 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
         'container_prepare',
         options.onContainerPrepare
           ? (data) => options.onContainerPrepare!({ statuses: data.statuses ?? [] })
+          : undefined,
+        options.onError,
+      ),
+      remote_access: buildSSEListener<{ status: RemoteAccessStatus }>(
+        'remote_access',
+        options.onRemoteAccess
+          ? (data) => options.onRemoteAccess!({ status: data.status })
           : undefined,
         options.onError,
       ),

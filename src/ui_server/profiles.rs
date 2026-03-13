@@ -330,6 +330,9 @@ pub(super) async fn create_profile(
         })
         .await
         .map_err(map_profile_error)?;
+    super::remote_access::sync_remote_access_from_state(&state)
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events();
 
     Ok(Json(
@@ -377,6 +380,9 @@ pub(super) async fn update_profile(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Profile not found"))?;
+    super::remote_access::sync_remote_access_from_state(&state)
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events();
 
     Ok(Json(
@@ -396,6 +402,9 @@ pub(super) async fn delete_profile(
     };
 
     db.delete_profile(&id).await.map_err(internal_error)?;
+    super::remote_access::sync_remote_access_from_state(&state)
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }

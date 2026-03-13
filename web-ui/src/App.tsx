@@ -319,6 +319,9 @@ function AppShell() {
         clearBackendUnavailable();
         useStore.getState().setContainerPrepareStatuses(payload.statuses);
       },
+      onRemoteAccess: ({ status }) => {
+        useStore.getState().setRemoteAccessStatus(status);
+      },
       onProfileSessions: ({ profileSessions }) => {
         clearBackendUnavailable();
         useRuntimeStore.getState().applyRuntimes(

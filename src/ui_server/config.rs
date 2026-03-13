@@ -21,6 +21,7 @@ use super::types::{
     CopilotStatusResponse, LastModelRequest, McpAddRequest, MemoryPayload, MemorySaveRequest,
     SkillInfoDto, SkillInstallRequest, SshServerRequest, UiAppearanceConfig, UiConfigResponse,
     UiFullConfig, UiModelsConfig, UiPlaywrightConfig, UiPreferencesConfig, UiProviderConfig,
+    UiRemoteAccessConfig,
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -96,6 +97,7 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             screencast_quality: config.playwright.screencast_quality,
             screencast_max_width: config.playwright.screencast_max_width,
         },
+        remote_access: UiRemoteAccessConfig::from(&config.remote_access),
     }
 }
 
@@ -135,12 +137,26 @@ pub(super) async fn save_full_config(
         config.playwright.port = req.playwright.port;
         config.playwright.screencast_quality = req.playwright.screencast_quality;
         config.playwright.screencast_max_width = req.playwright.screencast_max_width;
+        config.remote_access.enabled = req.remote_access.enabled;
+        config.remote_access.cloudflared_binary = req.remote_access.cloudflared_binary;
+        config.remote_access.tunnel_token = req
+            .remote_access
+            .tunnel_token
+            .filter(|value| !value.trim().is_empty());
+        config.remote_access.public_url = req
+            .remote_access
+            .public_url
+            .filter(|value| !value.trim().is_empty());
+        config.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
         config.clone()
     };
 
     let ssh_servers = updated.ssh_servers.clone();
     save_config_to_disk(updated).await.map_err(internal_error)?;
     state.task_runtime.set_ssh_servers(ssh_servers);
+    super::remote_access::sync_remote_access_from_state(&state)
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))
 }

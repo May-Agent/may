@@ -9,6 +9,7 @@ export interface ServicesSlice {
   skills: api.SkillInfo[];
   scheduledTasks: ScheduledTask[];
   pushEnabled: boolean;
+  remoteAccessStatus: api.RemoteAccessStatus | null;
 
   refreshMcpServers: () => Promise<void>;
   addMcpServer: (input: { name: string; command?: string; args?: string[]; url?: string }) => Promise<void>;
@@ -22,6 +23,10 @@ export interface ServicesSlice {
   enablePush: () => Promise<void>;
   disablePush: () => Promise<void>;
   sendTestNotification: () => Promise<void>;
+  refreshRemoteAccessStatus: () => Promise<void>;
+  setRemoteAccessStatus: (status: api.RemoteAccessStatus) => void;
+  startRemoteAccess: () => Promise<void>;
+  stopRemoteAccess: () => Promise<void>;
 
   refreshTasks: () => Promise<void>;
   createTask: (input: CreateTaskInput) => Promise<ScheduledTask>;
@@ -43,6 +48,7 @@ export const createServicesSlice: StateCreator<AppState, [], [], ServicesSlice> 
   skills: [],
   scheduledTasks: [],
   pushEnabled: false,
+  remoteAccessStatus: null,
 
   refreshMcpServers: async () => {
     const mcpServers = await api.fetchMcpServers();
@@ -126,6 +132,25 @@ export const createServicesSlice: StateCreator<AppState, [], [], ServicesSlice> 
 
   sendTestNotification: async () => {
     await api.sendTestNotification();
+  },
+
+  refreshRemoteAccessStatus: async () => {
+    const remoteAccessStatus = await api.fetchRemoteAccessStatus();
+    set({ remoteAccessStatus });
+  },
+
+  setRemoteAccessStatus: (remoteAccessStatus) => {
+    set({ remoteAccessStatus });
+  },
+
+  startRemoteAccess: async () => {
+    await api.startRemoteAccess();
+    await get().refreshRemoteAccessStatus();
+  },
+
+  stopRemoteAccess: async () => {
+    await api.stopRemoteAccess();
+    await get().refreshRemoteAccessStatus();
   },
 
   refreshTasks: async () => {
