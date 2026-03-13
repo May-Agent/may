@@ -777,7 +777,13 @@ impl TaskRuntime {
         let bash_tool = self
             .local_bash_tool(&task.profile_id, "task_local", script, task.needs_network)
             .await?;
-        run_bash_script(&bash_tool, BashExecutionMode::Default, None, command).await
+        run_bash_script(
+            &bash_tool,
+            local_task_execution_mode(task.needs_network),
+            None,
+            command,
+        )
+        .await
     }
 
     async fn validate_local(&self, profile_id: &str, script: &TaskScript) -> Result<(), String> {
@@ -787,7 +793,7 @@ impl TaskRuntime {
 
         run_bash_script(
             &bash_tool,
-            BashExecutionMode::Default,
+            local_task_execution_mode(false),
             None,
             build_validation_command(script),
         )
@@ -1110,6 +1116,14 @@ impl TaskRuntime {
     }
 }
 
+const fn local_task_execution_mode(needs_network: bool) -> BashExecutionMode {
+    if needs_network {
+        BashExecutionMode::Default
+    } else {
+        BashExecutionMode::Sandboxed
+    }
+}
+
 impl TaskScheduler {
     pub fn new(runtime: Arc<TaskRuntime>) -> Self {
         Self { runtime }
@@ -1208,4 +1222,16 @@ fn build_validation_command(script: &TaskScript) -> String {
 fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp(ts.as_second(), ts.subsec_nanosecond() as u32)
         .expect("jiff timestamp must fit within chrono DateTime range")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_task_execution_mode;
+    use aither_sandbox::BashExecutionMode;
+
+    #[test]
+    fn local_tasks_respect_needs_network_flag() {
+        assert_eq!(local_task_execution_mode(true), BashExecutionMode::Default);
+        assert_eq!(local_task_execution_mode(false), BashExecutionMode::Sandboxed);
+    }
 }
