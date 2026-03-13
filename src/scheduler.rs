@@ -29,6 +29,7 @@ use crate::db::ChatDb;
 use crate::db::entity::{profiles, scheduled_tasks};
 use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
+use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
 use crate::profile::{ProfileEnvironment, ProfileInfo};
 use crate::task_trigger::{
     TRIGGER_KIND_EVENT, TRIGGER_KIND_TIME, TRIGGER_KIND_WEBHOOK, TRIGGER_TYPE_CRON,
@@ -43,6 +44,7 @@ pub struct TaskRuntime {
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
     ssh_servers: Arc<ArcSwap<Vec<SshServerConfig>>>,
+    network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
 }
 
@@ -121,9 +123,10 @@ impl TaskExecutionEnvelope {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SchedulerPermissionHandler {
     allow_network: bool,
+    network_policy: Option<CompiledNetworkPolicy>,
 }
 
 impl PermissionHandler for SchedulerPermissionHandler {
@@ -133,6 +136,10 @@ impl PermissionHandler for SchedulerPermissionHandler {
 
     async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
         self.allow_network
+            && self
+                .network_policy
+                .as_ref()
+                .is_none_or(|policy| policy.allows_domain(_domain))
     }
 }
 
@@ -144,6 +151,7 @@ impl TaskRuntime {
             may_dir,
             container_manager: None,
             ssh_servers: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
         };
         runtime.reload_active_tasks().await?;
@@ -169,6 +177,17 @@ impl TaskRuntime {
 
     pub fn set_ssh_servers(&self, ssh_servers: Vec<SshServerConfig>) {
         self.ssh_servers.store(Arc::new(ssh_servers));
+    }
+
+    pub fn with_network_policy(self, network_policy: NetworkPolicyConfig) -> Result<Self, String> {
+        self.set_network_policy(network_policy)?;
+        Ok(self)
+    }
+
+    pub fn set_network_policy(&self, network_policy: NetworkPolicyConfig) -> Result<(), String> {
+        let compiled = network_policy.compile()?;
+        self.network_policy.store(Arc::new(compiled));
+        Ok(())
     }
 
     pub async fn reload_active_tasks(&self) -> Result<(), crate::db::ChatDbError> {
@@ -757,9 +776,13 @@ impl TaskRuntime {
         });
         let registry =
             Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
+        let network_policy = self.network_policy.load().as_ref().clone();
         BashTool::new_exact(
             &script.host_working_dir,
-            SchedulerPermissionHandler { allow_network },
+            SchedulerPermissionHandler {
+                allow_network,
+                network_policy,
+            },
             DefaultExecutor,
         )
         .await
@@ -795,10 +818,12 @@ impl TaskRuntime {
             }])
             .map_err(|error| format!("failed to configure remote ssh server: {error}"))?;
         let registry = Arc::new(ToolRegistryBuilder::new().build(working_dir.join("outputs")));
+        let network_policy = self.network_policy.load().as_ref().clone();
         BashTool::new_exact(
             working_dir,
             SchedulerPermissionHandler {
                 allow_network: true,
+                network_policy,
             },
             DefaultExecutor,
         )
@@ -912,11 +937,13 @@ impl TaskRuntime {
         // Use host workspace dir for output storage while executing commands in
         // /workspace inside container.
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
+        let network_policy = self.network_policy.load().as_ref().clone();
         let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
             BashTool::new_exact(
                 &workspace_dir,
                 SchedulerPermissionHandler {
                     allow_network: true,
+                    network_policy,
                 },
                 DefaultExecutor,
             )
@@ -1008,11 +1035,13 @@ impl TaskRuntime {
         shell_sessions.set_container_id(container_id.clone());
 
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
+        let network_policy = self.network_policy.load().as_ref().clone();
         let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
             BashTool::new_exact(
                 &workspace_dir,
                 SchedulerPermissionHandler {
                     allow_network: true,
+                    network_policy,
                 },
                 DefaultExecutor,
             )

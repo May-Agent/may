@@ -1,6 +1,7 @@
 use crate::config::{
     LoadBalanceStrategy, PlaywrightBrowser, ProviderType, RemoteAccessConfig, SshServerConfig,
 };
+use crate::network_policy::NetworkPolicyMode;
 use crate::session::{
     PendingUserMessage, PendingUserMessageMode, SessionPlanState, SessionRuntimeState,
 };
@@ -831,6 +832,8 @@ pub(crate) struct UiPreferencesConfig {
     pub(crate) warn_on_model_change: bool,
     pub(crate) show_token_usage: bool,
     pub(crate) strict_model_matching: bool,
+    pub(crate) network_policy_mode: NetworkPolicyMode,
+    pub(crate) network_policy_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -396,6 +396,8 @@ export interface UiPreferencesConfig {
   warnOnModelChange: boolean;
   showTokenUsage: boolean;
   strictModelMatching: boolean;
+  networkPolicyMode: 'disabled' | 'restricted' | 'allow_list' | 'deny_list';
+  networkPolicyHosts: string[];
 }
 
 export interface UiPlaywrightConfig {

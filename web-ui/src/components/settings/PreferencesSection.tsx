@@ -2,6 +2,7 @@ import { SlidersHorizontal } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Textarea } from '@/components/ui/textarea';
 import type { UiFullConfig } from '@/lib/api';
 import type { ConfigSectionProps } from './constants';
 
@@ -128,6 +129,54 @@ export function PreferencesSection({ configDraft, setDraft }: ConfigSectionProps
               Off (default): treat -preview and date-suffixed variants as the same base model for fallback matching.
             </span>
           </div>
+        </div>
+
+        <div className="space-y-1">
+          <Label>Network policy</Label>
+          <Select
+            value={configDraft.preferences.networkPolicyMode}
+            onValueChange={(value) =>
+              setDraft((prev) => ({
+                ...prev,
+                preferences: {
+                  ...prev.preferences,
+                  networkPolicyMode: value as UiFullConfig['preferences']['networkPolicyMode'],
+                },
+              }))
+            }
+          >
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="disabled">disabled</SelectItem>
+              <SelectItem value="restricted">restricted</SelectItem>
+              <SelectItem value="allow_list">allow_list</SelectItem>
+              <SelectItem value="deny_list">deny_list</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">
+            `restricted` blocks all outbound domains. `allow_list` and `deny_list` use glob patterns such as `*.example.com`.
+          </p>
+        </div>
+
+        <div className="space-y-1 md:col-span-2">
+          <Label>Network policy hosts</Label>
+          <Textarea
+            value={configDraft.preferences.networkPolicyHosts.join('\n')}
+            onChange={(event) =>
+              setDraft((prev) => ({
+                ...prev,
+                preferences: {
+                  ...prev.preferences,
+                  networkPolicyHosts: event.target.value
+                    .split('\n')
+                    .map((value) => value.trim())
+                    .filter((value) => value.length > 0),
+                },
+              }))
+            }
+            className="min-h-[140px] font-mono text-xs"
+            placeholder={"*.example.com\napi.github.com"}
+          />
         </div>
       </div>
     </section>
