@@ -261,6 +261,8 @@ fn api_routes() -> Route {
                         "".at(get_session),
                         "".put(update_session),
                         "".delete(delete_session),
+                        "/tasks".at(get_session_tasks),
+                        "/tasks".put(save_session_tasks),
                         "/stop".post(stop_session_run),
                         "/runtime".route(Route::new((
                             "".at(get_session_runtime),

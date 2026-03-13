@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use async_fs;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
@@ -16,7 +17,7 @@ use super::model_resolution::{
 use super::state::UiServerState;
 use super::types::{
     ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, SessionContextDebugResponse,
-    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse,
+    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse, SessionTasksPayload,
     UpdateSessionRequest,
 };
 
@@ -117,6 +118,36 @@ pub(super) async fn get_session_context_debug(
         assembled_messages,
         window_snapshot,
     }))
+}
+
+pub(super) async fn get_session_tasks(
+    params: Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<SessionTasksPayload>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let path = crate::session::SessionPaths::from_may_dir(&state.may_dir, &id).tasks_path();
+    let content = match async_fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(internal_error(error)),
+    };
+    Ok(Json(SessionTasksPayload { content }))
+}
+
+pub(super) async fn save_session_tasks(
+    params: Params,
+    Json(payload): Json<SessionTasksPayload>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let paths = crate::session::SessionPaths::from_may_dir(&state.may_dir, &id);
+    async_fs::create_dir_all(paths.root())
+        .await
+        .map_err(internal_error)?;
+    async_fs::write(paths.tasks_path(), payload.content)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ApiHealth { ok: true }))
 }
 
 fn build_window_snapshot(

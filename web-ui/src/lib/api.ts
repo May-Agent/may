@@ -192,6 +192,10 @@ export interface NotificationMailboxPayload {
   items: NotificationMailboxEntry[];
 }
 
+export interface SessionTasksPayload {
+  content: string;
+}
+
 export interface ContextDebugMessage {
   role: string;
   content: string;
@@ -1527,6 +1531,26 @@ export async function moveSessionToFolder(
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify({ folderId }),
+    },
+  );
+}
+
+export async function fetchSessionTasks(sessionId: string): Promise<SessionTasksPayload> {
+  return request<SessionTasksPayload>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/tasks`,
+  );
+}
+
+export async function saveSessionTasks(
+  sessionId: string,
+  content: string,
+): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/tasks`,
+    {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ content }),
     },
   );
 }
