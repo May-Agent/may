@@ -2,7 +2,7 @@ import { memo, useState, useMemo, useEffect, useRef } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
-import { buildSessionOutputPreviewUrl } from '@/lib/api';
+import { buildSessionOutputPreviewUrl, fetchSessionTasks, saveSessionTasks } from '@/lib/api';
 import type { ArtifactPreviewTarget, Message } from '@/types';
 import { extractArtifactPreviewTargets, stripArtifactPreviewTags } from './chatUtils';
 import ReactMarkdown from 'react-markdown';
@@ -12,6 +12,12 @@ import { Copy, Check, FileText, File, ChevronRight, RotateCcw, Download, Termina
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
 import { FlowMarkdown } from './StreamingText';
+
+const TASKS_TAG_PATTERN = /<tasks\s*\/>/i;
+
+function stripTasksTag(content: string): string {
+  return content.replace(/<tasks\s*\/>/gi, "").trim();
+}
 
 const MemoMarkdown = memo(function MemoMarkdown({
   content,
@@ -586,9 +592,19 @@ export function MessageItem({
   const [expandedTimelineItemIds, setExpandedTimelineItemIds] = useState<Record<string, boolean>>({});
   const hasSeenRunningTimelineRef = useRef(false);
   const [showTyping, setShowTyping] = useState(false);
+  const [tasksContent, setTasksContent] = useState("");
+  const [tasksDraft, setTasksDraft] = useState("");
+  const [tasksLoading, setTasksLoading] = useState(false);
+  const [tasksSaving, setTasksSaving] = useState(false);
+  const [tasksEditing, setTasksEditing] = useState(false);
+  const [tasksError, setTasksError] = useState<string | null>(null);
   const components = useMemo(
     () => makeComponents(isUser, isStreaming),
     [isUser, isStreaming]
+  );
+  const showsTasksTag = useMemo(
+    () => TASKS_TAG_PATTERN.test(message.content || ""),
+    [message.content],
   );
 
   const previewTargets = useMemo(
@@ -596,7 +612,7 @@ export function MessageItem({
     [message.content],
   );
   const displayContent = useMemo(
-    () => stripArtifactPreviewTags(message.content || ''),
+    () => stripTasksTag(stripArtifactPreviewTags(message.content || '')),
     [message.content],
   );
   const timelineItems = useMemo<TimelineDisplayItem[]>(() => {
@@ -760,6 +776,33 @@ export function MessageItem({
     const timer = window.setTimeout(() => setShowTyping(true), 1000);
     return () => window.clearTimeout(timer);
   }, [isStreaming, message.content, message.id, message.error]);
+
+  useEffect(() => {
+    if (!showsTasksTag || !sessionId) {
+      return;
+    }
+    let cancelled = false;
+    setTasksLoading(true);
+    setTasksError(null);
+    void fetchSessionTasks(sessionId)
+      .then((payload) => {
+        if (cancelled) return;
+        setTasksContent(payload.content);
+        setTasksDraft(payload.content);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setTasksError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setTasksLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, showsTasksTag]);
 
   useEffect(() => {
     if (isUser || !onOpenPreview || previewTargets.length === 0) return;
@@ -1114,6 +1157,76 @@ export function MessageItem({
             ) : (
               <FlowMarkdown content={safeDisplayContent} isStreaming={isStreaming} />
             )
+          )}
+
+          {!isUser && showsTasksTag && sessionId && (
+            <div className="not-prose mt-3 rounded-xl border border-border/70 bg-card/80 px-3 py-3">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium text-foreground">tasks.md</div>
+                  <div className="text-xs text-muted-foreground">Session task plan exposed via `&lt;tasks /&gt;`</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    disabled={tasksLoading || tasksSaving}
+                    onClick={() => {
+                      setTasksEditing((value) => !value);
+                      setTasksDraft(tasksContent);
+                    }}
+                  >
+                    {tasksEditing ? "Preview" : "Edit"}
+                  </Button>
+                  {tasksEditing && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      disabled={tasksSaving}
+                      onClick={async () => {
+                        setTasksSaving(true);
+                        setTasksError(null);
+                        try {
+                          await saveSessionTasks(sessionId, tasksDraft);
+                          setTasksContent(tasksDraft);
+                          setTasksEditing(false);
+                        } catch (error) {
+                          setTasksError(error instanceof Error ? error.message : String(error));
+                        } finally {
+                          setTasksSaving(false);
+                        }
+                      }}
+                    >
+                      {tasksSaving ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : null}
+                      Save
+                    </Button>
+                  )}
+                </div>
+              </div>
+              {tasksError && (
+                <div className="mb-2 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-xs text-destructive">
+                  {tasksError}
+                </div>
+              )}
+              {tasksLoading ? (
+                <div className="text-xs text-muted-foreground">Loading tasks.md…</div>
+              ) : tasksEditing ? (
+                <textarea
+                  value={tasksDraft}
+                  onChange={(event) => setTasksDraft(event.target.value)}
+                  className="min-h-[220px] w-full rounded-lg border border-border bg-background px-3 py-2 font-mono text-xs text-foreground outline-none focus:ring-2 focus:ring-ring"
+                />
+              ) : tasksContent.trim() ? (
+                <div className="rounded-lg border border-border/60 bg-background/70 px-3 py-2">
+                  <MemoMarkdown content={tasksContent} components={components} />
+                </div>
+              ) : (
+                <div className="text-xs text-muted-foreground">tasks.md is empty.</div>
+              )}
+            </div>
           )}
 
           {!isUser && previewTargets.length > 0 && (

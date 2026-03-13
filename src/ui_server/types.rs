@@ -194,6 +194,12 @@ pub(crate) struct NotificationMailboxResponse {
     pub(crate) items: Vec<NotificationMailboxEntryResponse>,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionTasksPayload {
+    pub(crate) content: String,
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ApiHealth {
