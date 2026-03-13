@@ -704,11 +704,28 @@ pub(crate) struct PermissionPollItem {
     pub(crate) request: crate::agent::PermissionRequest,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserInteractionResponse {
+    pub(crate) takeover_active: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionInteractionResponse {
+    pub(crate) browser: BrowserInteractionResponse,
+}
+
 impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
     fn from(summary: crate::session::SessionRuntimeSummary) -> Self {
         Self {
             state: summary.state,
             plan_state: summary.plan_state,
+            interactions: SessionInteractionResponse {
+                browser: BrowserInteractionResponse {
+                    takeover_active: summary.interactions.browser.takeover_active,
+                },
+            },
             queued_count: summary.queued_count,
             pending_immediate: summary.pending_immediate,
             queued_messages: summary.queued_messages,
@@ -753,6 +770,8 @@ pub(crate) struct SessionRuntimeResponse {
     pub(crate) state: SessionRuntimeState,
     #[serde(default)]
     pub(crate) plan_state: SessionPlanState,
+    #[serde(default)]
+    pub(crate) interactions: SessionInteractionResponse,
     #[serde(default)]
     pub(crate) queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]

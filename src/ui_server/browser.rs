@@ -42,7 +42,13 @@ pub(super) struct BrowserTakeoverRequest {
 pub(super) async fn browser_status(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<BrowserStatus>> {
-    let takeover_session_id = state.browser_takeover_session.lock().await.clone();
+    let takeover_session_id = state
+        .runtime_service
+        .find_browser_takeover_session()
+        .await
+        .map_err(|error| {
+            skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
     let Some(ref bm) = state.browser_manager else {
         return Ok(Json(BrowserStatus {
             running: false,
@@ -77,7 +83,14 @@ pub(super) async fn browser_start(
     Ok(Json(BrowserStatus {
         running: true,
         cdp_endpoint: Some(bm.cdp_endpoint()),
-        takeover_session_id: state.browser_takeover_session.lock().await.clone(),
+        takeover_session_id: state
+            .runtime_service
+            .find_browser_takeover_session()
+            .await
+            .map_err(|error| {
+                skyzen::Error::msg(error.to_string())
+                    .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+            })?,
     }))
 }
 
@@ -96,7 +109,14 @@ pub(super) async fn browser_stop(
     Ok(Json(BrowserStatus {
         running: false,
         cdp_endpoint: None,
-        takeover_session_id: state.browser_takeover_session.lock().await.clone(),
+        takeover_session_id: state
+            .runtime_service
+            .find_browser_takeover_session()
+            .await
+            .map_err(|error| {
+                skyzen::Error::msg(error.to_string())
+                    .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+            })?,
     }))
 }
 
@@ -134,7 +154,13 @@ pub(super) async fn browser_takeover_start(
     }
 
     let session_id = session_id.to_string();
-    *state.browser_takeover_session.lock().await = Some(session_id.clone());
+    state
+        .runtime_service
+        .set_browser_takeover_owner(session_id.as_str())
+        .await
+        .map_err(|error| {
+            skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
     Ok(Json(BrowserTakeoverResponse {
         ok: true,
         session_id,
@@ -154,16 +180,13 @@ pub(super) async fn browser_takeover_stop(
     }
 
     let session_id = session_id.to_string();
-    let mut takeover = state.browser_takeover_session.lock().await;
-    if takeover.as_deref() == Some(session_id.as_str()) {
-        *takeover = None;
-        state
-            .browser_takeover_alert_pending
-            .lock()
-            .await
-            .insert(session_id.clone());
-    }
-    drop(takeover);
+    state
+        .runtime_service
+        .clear_browser_takeover_owner(session_id.as_str())
+        .await
+        .map_err(|error| {
+            skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
 
     Ok(Json(BrowserTakeoverResponse {
         ok: true,

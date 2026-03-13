@@ -16,8 +16,9 @@ use sea_orm::{
 };
 
 use crate::session::{
-    MessageRole, PendingUserMessage, PersistedAskUserRequest, PersistedPermissionRequest,
-    SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
+    BrowserInteractionState, MessageRole, PendingUserMessage, PersistedAskUserRequest,
+    PersistedPermissionRequest, SessionInteractionState, SessionPlanState, SessionRuntimeState,
+    SessionRuntimeSummary,
 };
 use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 use crate::xml_fragment::XmlFragment;
@@ -364,6 +365,20 @@ impl ChatDb {
         .await?;
         Self::migrate_add_column(
             &conn,
+            "session_runtimes",
+            "browser_takeover_active",
+            "BOOLEAN NOT NULL DEFAULT 0",
+        )
+        .await?;
+        Self::migrate_add_column(
+            &conn,
+            "session_runtimes",
+            "browser_takeover_alert_pending",
+            "BOOLEAN NOT NULL DEFAULT 0",
+        )
+        .await?;
+        Self::migrate_add_column(
+            &conn,
             "session_context_snapshots",
             "assembled_messages_json",
             "TEXT",
@@ -552,6 +567,16 @@ impl ChatDb {
                 .unwrap_or(SessionPlanState::Disabled.as_str())
                 .parse()
                 .unwrap_or(SessionPlanState::Disabled),
+            interactions: SessionInteractionState {
+                browser: BrowserInteractionState {
+                    takeover_active: runtime_row
+                        .as_ref()
+                        .is_some_and(|row| row.browser_takeover_active),
+                    takeover_alert_pending: runtime_row
+                        .as_ref()
+                        .is_some_and(|row| row.browser_takeover_alert_pending),
+                },
+            },
             pending_immediate,
             queued_messages,
             waiting_permission: permission_row.map(|row| PersistedPermissionRequest {
@@ -586,6 +611,10 @@ impl ChatDb {
         let active_runtime = session_runtimes::ActiveModel {
             session_id: Set(session_id.to_string()),
             state: Set(summary.state.as_str().to_string()),
+            browser_takeover_active: Set(summary.interactions.browser.takeover_active),
+            browser_takeover_alert_pending: Set(
+                summary.interactions.browser.takeover_alert_pending,
+            ),
             updated_at: Set(now.clone()),
         };
         session_runtimes::Entity::insert(active_runtime)
@@ -593,6 +622,8 @@ impl ChatDb {
                 sea_orm::sea_query::OnConflict::column(session_runtimes::Column::SessionId)
                     .update_columns([
                         session_runtimes::Column::State,
+                        session_runtimes::Column::BrowserTakeoverActive,
+                        session_runtimes::Column::BrowserTakeoverAlertPending,
                         session_runtimes::Column::UpdatedAt,
                     ])
                     .to_owned(),
@@ -881,6 +912,86 @@ impl ChatDb {
         Ok(summary)
     }
 
+    pub async fn set_browser_takeover_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let session = self.get_session(session_id).await?.ok_or_else(|| {
+            ChatDbError::Db(DbErr::RecordNotFound(["Session not found: ", session_id].concat()))
+        })?;
+        session_runtimes::Entity::update_many()
+            .col_expr(
+                session_runtimes::Column::BrowserTakeoverActive,
+                Expr::value(false),
+            )
+            .exec(&self.conn)
+            .await?;
+
+        let mut summary = self.load_session_runtime_summary(&session.id).await?;
+        summary.interactions.browser.takeover_active = true;
+        summary.interactions.browser.takeover_alert_pending = false;
+        summary.normalize_state();
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
+        Ok(summary)
+    }
+
+    pub async fn clear_browser_takeover_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let session = self.get_session(session_id).await?.ok_or_else(|| {
+            ChatDbError::Db(DbErr::RecordNotFound(["Session not found: ", session_id].concat()))
+        })?;
+        let mut summary = self.load_session_runtime_summary(&session.id).await?;
+        if !summary.interactions.browser.takeover_active {
+            return Ok(summary);
+        }
+        summary.interactions.browser.takeover_active = false;
+        summary.interactions.browser.takeover_alert_pending = true;
+        summary.normalize_state();
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
+        Ok(summary)
+    }
+
+    pub async fn take_browser_takeover_alert_pending(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, ChatDbError> {
+        let session = self.get_session(session_id).await?.ok_or_else(|| {
+            ChatDbError::Db(DbErr::RecordNotFound(["Session not found: ", session_id].concat()))
+        })?;
+        let mut summary = self.load_session_runtime_summary(&session.id).await?;
+        let pending = summary.interactions.browser.takeover_alert_pending;
+        if !pending {
+            return Ok(false);
+        }
+        summary.interactions.browser.takeover_alert_pending = false;
+        summary.normalize_state();
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn session_has_browser_takeover(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, ChatDbError> {
+        let Some(summary) = self.get_session_runtime(session_id).await? else {
+            return Ok(false);
+        };
+        Ok(summary.interactions.browser.takeover_active)
+    }
+
+    pub async fn find_browser_takeover_session(&self) -> Result<Option<String>, ChatDbError> {
+        let row = session_runtimes::Entity::find()
+            .filter(session_runtimes::Column::BrowserTakeoverActive.eq(true))
+            .one(&self.conn)
+            .await?;
+        Ok(row.map(|model| model.session_id))
+    }
+
     pub(crate) async fn find_pending_permission_request(
         &self,
         request_id: &str,
@@ -1021,11 +1132,16 @@ impl ChatDb {
             let session_id = session.id.clone();
             let mut summary = self.load_session_runtime_summary(&session_id).await?;
             let original_state = summary.state;
+            let original_browser_takeover = summary.interactions.browser.takeover_active;
             let expired_terminal_wait =
                 matches!(original_state, SessionRuntimeState::WaitingTerminalInput);
 
             if expired_terminal_wait {
                 summary.state = SessionRuntimeState::Idle;
+            }
+            if original_browser_takeover {
+                summary.interactions.browser.takeover_active = false;
+                summary.interactions.browser.takeover_alert_pending = true;
             }
             summary.normalize_state();
             if matches!(original_state, SessionRuntimeState::Running)
@@ -1034,7 +1150,10 @@ impl ChatDb {
                 summary.state = SessionRuntimeState::Idle;
             }
 
-            if summary.state != original_state || expired_terminal_wait {
+            if summary.state != original_state
+                || expired_terminal_wait
+                || original_browser_takeover
+            {
                 self.write_session_runtime_summary(&session_id, &summary)
                     .await?;
             }
@@ -3026,6 +3145,83 @@ mod tests {
         assert!(
             error.to_string().contains("cannot archive active session"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_takeover_state_persists_and_is_consumable() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let session_a = "session-a";
+        let session_b = "session-b";
+        db.create_session(session_a, Some("Session A"), Some("test-model"))
+            .await
+            .expect("first session should be created");
+        db.create_session(session_b, Some("Session B"), Some("test-model"))
+            .await
+            .expect("second session should be created");
+
+        db.set_browser_takeover_owner(session_a)
+            .await
+            .expect("browser takeover should persist");
+        assert_eq!(
+            db.find_browser_takeover_session()
+                .await
+                .expect("takeover owner should load"),
+            Some(session_a.to_string())
+        );
+        assert!(
+            db.session_has_browser_takeover(session_a)
+                .await
+                .expect("session takeover state should load")
+        );
+
+        db.clear_browser_takeover_owner(session_a)
+            .await
+            .expect("browser takeover release should persist");
+        assert!(
+            db.take_browser_takeover_alert_pending(session_a)
+                .await
+                .expect("pending takeover alert should be consumable")
+        );
+        assert!(
+            !db.take_browser_takeover_alert_pending(session_a)
+                .await
+                .expect("pending takeover alert should clear after consumption")
+        );
+
+        db.set_browser_takeover_owner(session_b)
+            .await
+            .expect("browser takeover owner should switch");
+        assert_eq!(
+            db.find_browser_takeover_session()
+                .await
+                .expect("switched takeover owner should load"),
+            Some(session_b.to_string())
+        );
+        assert!(
+            !db.session_has_browser_takeover(session_a)
+                .await
+                .expect("previous takeover owner should be cleared")
+        );
+
+        db.recover_session_runtimes_after_restart()
+            .await
+            .expect("runtime recovery should clear stale takeover ownership");
+        assert_eq!(
+            db.find_browser_takeover_session()
+                .await
+                .expect("no active takeover should remain after restart"),
+            None
+        );
+        assert!(
+            db.take_browser_takeover_alert_pending(session_b)
+                .await
+                .expect("restart recovery should preserve takeover alert as pending")
         );
     }
 

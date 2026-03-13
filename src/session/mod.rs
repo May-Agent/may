@@ -18,8 +18,9 @@ pub use manager::{
 };
 pub use plan::SessionPlanState;
 pub use runtime::{
-    PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion, PersistedAskUserRequest,
-    PersistedAttachment, PersistedPermissionRequest, PersistedPermissionRequestPayload,
+    BrowserInteractionState, PendingUserMessage, PendingUserMessageMode,
+    PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment,
+    PersistedPermissionRequest, PersistedPermissionRequestPayload, SessionInteractionState,
     SessionRuntimeState, SessionRuntimeSummary,
 };
 pub use store::SessionStore;

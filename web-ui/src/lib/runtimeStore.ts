@@ -11,6 +11,11 @@ import type { SessionPlanState } from '@/types';
 interface SessionRuntime {
   state: SessionRuntimeState;
   planState: SessionPlanState;
+  interactions?: {
+    browser: {
+      takeoverActive: boolean;
+    };
+  };
   queuedCount: number;
   waitingPermission: PermissionRequest | null;
   waitingAskUser: AskUserRequest | null;
@@ -48,6 +53,7 @@ function runtimeFromStatus(
     firstTokenAt: current?.firstTokenAt,
     state: runtime.state,
     planState: runtime.planState ?? current?.planState ?? 'disabled',
+    interactions: runtime.interactions ?? current?.interactions,
     queuedCount: Math.max(0, runtime.queuedCount ?? 0),
     waitingPermission: runtime.waitingPermission ?? null,
     waitingAskUser: runtime.waitingAskUser ?? null,

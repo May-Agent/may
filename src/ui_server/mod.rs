@@ -195,8 +195,6 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         browser_manager,
         remote_access_manager,
         notification_service: notification_service.clone(),
-        browser_takeover_session: Mutex::new(None),
-        browser_takeover_alert_pending: Mutex::new(HashSet::new()),
         memory_processor,
         local_url_port_mapper: Arc::new(local_url_mapper::LocalUrlPortMapper::new()),
         title_generation_queue,

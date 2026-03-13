@@ -119,8 +119,6 @@ pub(crate) struct UiServerState {
     pub(crate) browser_manager: Option<Arc<crate::container::playwright::BrowserManager>>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
     pub(crate) notification_service: Arc<crate::notification_service::NotificationService>,
-    pub(crate) browser_takeover_session: Mutex<Option<String>>,
-    pub(crate) browser_takeover_alert_pending: Mutex<HashSet<String>>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
     pub(crate) local_url_port_mapper: Arc<LocalUrlPortMapper>,
     pub(crate) title_generation_queue: TitleGenerationQueue,

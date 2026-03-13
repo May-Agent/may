@@ -55,6 +55,31 @@ impl core::str::FromStr for SessionRuntimeState {
     }
 }
 
+/// Persisted browser interaction state owned by the server runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserInteractionState {
+    #[serde(default)]
+    pub takeover_active: bool,
+    #[serde(default)]
+    pub takeover_alert_pending: bool,
+}
+
+/// Persisted interactive-resource state for a session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInteractionState {
+    #[serde(default)]
+    pub browser: BrowserInteractionState,
+}
+
+impl SessionInteractionState {
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        self.browser.takeover_active
+    }
+}
+
 /// Server-owned user message waiting to be processed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,6 +145,8 @@ pub struct SessionRuntimeSummary {
     #[serde(default)]
     pub plan_state: SessionPlanState,
     #[serde(default)]
+    pub interactions: SessionInteractionState,
+    #[serde(default)]
     pub queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_immediate: Option<PendingUserMessage>,
@@ -138,6 +165,7 @@ impl Default for SessionRuntimeSummary {
         Self {
             state: SessionRuntimeState::Idle,
             plan_state: SessionPlanState::Disabled,
+            interactions: SessionInteractionState::default(),
             queued_count: 0,
             pending_immediate: None,
             queued_messages: Vec::new(),
@@ -196,7 +224,10 @@ impl SessionRuntimeSummary {
 
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.state.is_active() || self.has_pending_messages() || self.plan_state.blocks_auto_archive()
+        self.state.is_active()
+            || self.has_pending_messages()
+            || self.plan_state.blocks_auto_archive()
+            || self.interactions.is_active()
     }
 }
 

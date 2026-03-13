@@ -208,6 +208,11 @@ export interface RuntimeAskUserRequest {
 export interface SessionRuntimeSummaryPayload {
   state: SessionRuntimeState;
   planState: SessionPlanState;
+  interactions?: {
+    browser: {
+      takeoverActive: boolean;
+    };
+  };
   queuedCount: number;
   pendingImmediate?: PendingUserMessage | null;
   queuedMessages: PendingUserMessage[];
