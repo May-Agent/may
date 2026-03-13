@@ -505,7 +505,7 @@ pub(crate) struct ApiMessage {
     pub(crate) stats: Option<RequestStats>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ApiSession {
     pub(crate) id: String,
@@ -518,11 +518,6 @@ pub(crate) struct ApiSession {
     #[serde(default)]
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) runtime: SessionRuntimeResponse,
-    #[serde(default)]
-    pub(crate) plan_state: SessionPlanState,
-    pub(crate) runtime_state: SessionRuntimeState,
-    #[serde(default)]
-    pub(crate) queued_count: usize,
 }
 
 impl ApiSession {
@@ -551,9 +546,6 @@ impl ApiSession {
             model,
             reasoning_effort: None,
             runtime: summary.runtime.clone().into(),
-            plan_state: summary.runtime.plan_state,
-            runtime_state: summary.runtime.state,
-            queued_count: summary.runtime.queued_count,
         }
     }
 
@@ -569,9 +561,6 @@ impl ApiSession {
             model,
             reasoning_effort: None,
             runtime: crate::session::SessionRuntimeSummary::default().into(),
-            plan_state: SessionPlanState::Disabled,
-            runtime_state: SessionRuntimeState::Idle,
-            queued_count: 0,
         }
     }
 }
@@ -795,7 +784,7 @@ pub(crate) struct UiConfigResponse {
     pub(crate) ui_theme: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionRuntimeResponse {
     pub(crate) state: SessionRuntimeState,
