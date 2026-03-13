@@ -33,11 +33,6 @@ pub(super) async fn respond_permission_request(
         .await
         .map_err(internal_error)?;
     if !responded {
-        state
-            .runtime_service
-            .clear_running_if_needed(&session_id)
-            .await
-            .map_err(internal_error)?;
         tracing::warn!(request_id = %req.id, session_id = %session_id, "permission response arrived without a live waiter");
     }
 
@@ -48,6 +43,26 @@ pub(super) async fn respond_permission_request(
     let session_id = SessionId::from(session_id);
     let _ =
         append_history_message(&state, &session_id, ChatMessage::permission_response(&data)).await;
+    if !responded {
+        let resumed_state = state.clone();
+        let resumed_session_id = session_id.as_str().to_string();
+        tokio::spawn(async move {
+            if let Err(error) = super::chat::resume_waiting_turn(
+                resumed_state,
+                resumed_session_id.clone(),
+                "permission",
+                if req.approved { "approved" } else { "denied" },
+            )
+            .await
+            {
+                tracing::error!(
+                    session_id = %resumed_session_id,
+                    error = %error,
+                    "failed to resume waiting permission turn after restart"
+                );
+            }
+        });
+    }
 
     Ok(Json(runtime.into()))
 }
@@ -82,11 +97,6 @@ pub(super) async fn respond_ask_user_request(
         .await
         .map_err(internal_error)?;
     if !responded {
-        state
-            .runtime_service
-            .clear_running_if_needed(&session_id)
-            .await
-            .map_err(internal_error)?;
         tracing::warn!(request_id = %req.id, session_id = %session_id, "ask-user response arrived without a live waiter");
     }
 
@@ -98,6 +108,26 @@ pub(super) async fn respond_ask_user_request(
     let session_id = SessionId::from(session_id);
     let _ =
         append_history_message(&state, &session_id, ChatMessage::ask_user_response(&data)).await;
+    if !responded {
+        let resumed_state = state.clone();
+        let resumed_session_id = session_id.as_str().to_string();
+        tokio::spawn(async move {
+            if let Err(error) = super::chat::resume_waiting_turn(
+                resumed_state,
+                resumed_session_id.clone(),
+                "ask_user",
+                "answered",
+            )
+            .await
+            {
+                tracing::error!(
+                    session_id = %resumed_session_id,
+                    error = %error,
+                    "failed to resume waiting ask-user turn after restart"
+                );
+            }
+        });
+    }
 
     Ok(Json(runtime.into()))
 }
