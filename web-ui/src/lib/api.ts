@@ -86,6 +86,23 @@ export interface RemoteAccessStatus {
   recentLogs: string[];
 }
 
+export interface NetworkAccessLogEntry {
+  id: number;
+  sessionId?: string | null;
+  profileId?: string | null;
+  source: string;
+  mode: string;
+  domain: string;
+  port: number;
+  allowed: boolean;
+  reason?: string | null;
+  timestamp: string;
+}
+
+export interface NetworkAccessLogsPayload {
+  items: NetworkAccessLogEntry[];
+}
+
 export interface UiEventsSubscription {
   sessionId?: string;
   profileId?: string;
@@ -93,6 +110,7 @@ export interface UiEventsSubscription {
   onConfig?: (payload: UiConfigEventPayload) => void;
   onContainerPrepare?: (payload: ContainerPrepareEventPayload) => void;
   onRemoteAccess?: (payload: { status: RemoteAccessStatus }) => void;
+  onNetworkAccessLogs?: (payload: NetworkAccessLogsPayload) => void;
   onNotificationMailbox?: (payload: NotificationMailboxPayload) => void;
   onProfileSessions?: (payload: { profileSessions: ProfileSessions }) => void;
   onRequestLogs?: (payload: RequestLogsPayload) => void;
@@ -934,6 +952,10 @@ export async function fetchNotificationMailbox(): Promise<NotificationMailboxPay
   return request<NotificationMailboxPayload>('/api/notifications/mailbox');
 }
 
+export async function fetchNetworkAccessLogs(): Promise<NetworkAccessLogsPayload> {
+  return request<NetworkAccessLogsPayload>('/api/notifications/network-access');
+}
+
 export async function fetchSessionRuntime(sessionId: string): Promise<SessionRuntimeStatus> {
   return request<SessionRuntimeStatus>(`/api/sessions/${encodeURIComponent(sessionId)}/runtime`);
 }
@@ -1343,6 +1365,11 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
       notification_mailbox: buildSSEListener<NotificationMailboxPayload>(
         'notification_mailbox',
         options.onNotificationMailbox,
+        options.onError,
+      ),
+      network_access_logs: buildSSEListener<NetworkAccessLogsPayload>(
+        'network_access_logs',
+        options.onNetworkAccessLogs,
         options.onError,
       ),
       container_prepare: buildSSEListener<ContainerPrepareEventPayload>(

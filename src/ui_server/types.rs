@@ -199,6 +199,44 @@ pub(crate) struct NotificationMailboxResponse {
     pub(crate) items: Vec<NotificationMailboxEntryResponse>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NetworkAccessLogEntryResponse {
+    pub(crate) id: i32,
+    pub(crate) session_id: Option<String>,
+    pub(crate) profile_id: Option<String>,
+    pub(crate) source: String,
+    pub(crate) mode: String,
+    pub(crate) domain: String,
+    pub(crate) port: i32,
+    pub(crate) allowed: bool,
+    pub(crate) reason: Option<String>,
+    pub(crate) timestamp: String,
+}
+
+impl From<crate::db::entity::network_access_logs::Model> for NetworkAccessLogEntryResponse {
+    fn from(value: crate::db::entity::network_access_logs::Model) -> Self {
+        Self {
+            id: value.id,
+            session_id: value.session_id,
+            profile_id: value.profile_id,
+            source: value.source,
+            mode: value.mode,
+            domain: value.domain,
+            port: value.port,
+            allowed: value.allowed,
+            reason: value.reason,
+            timestamp: value.timestamp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NetworkAccessLogsResponse {
+    pub(crate) items: Vec<NetworkAccessLogEntryResponse>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RemoteAccessState {

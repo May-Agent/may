@@ -13,10 +13,10 @@ use crate::profile::query_profile_sessions;
 use super::helpers::send_event;
 use super::state::UiServerState;
 use super::types::{
-    ConfigEventPayload, NotificationMailboxEntryResponse, NotificationMailboxResponse,
-    ProfileSessionsEventPayload, RemoteAccessEventPayload, RequestLogsResponse,
-    SessionRuntimeEventPayload, SessionRuntimeSnapshotItem, SessionRuntimesEventPayload,
-    SseHeartbeat,
+    ConfigEventPayload, NetworkAccessLogEntryResponse, NetworkAccessLogsResponse,
+    NotificationMailboxEntryResponse, NotificationMailboxResponse, ProfileSessionsEventPayload,
+    RemoteAccessEventPayload, RequestLogsResponse, SessionRuntimeEventPayload,
+    SessionRuntimeSnapshotItem, SessionRuntimesEventPayload, SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -54,6 +54,7 @@ pub(super) async fn stream_events(
         let mut last_config_sig = String::new();
         let mut last_request_logs_sig = String::new();
         let mut last_notification_mailbox_sig = String::new();
+        let mut last_network_access_logs_sig = String::new();
         let mut last_container_prepare_sig = String::new();
         let mut last_runtime_sig = String::new();
         let mut last_profile_runtime_sig = String::new();
@@ -74,6 +75,15 @@ pub(super) async fn stream_events(
             &state_cloned,
             &sender,
             &mut last_notification_mailbox_sig,
+        )
+        .await
+        {
+            return;
+        }
+        if !emit_network_access_logs_if_changed(
+            &state_cloned,
+            &sender,
+            &mut last_network_access_logs_sig,
         )
         .await
         {
@@ -151,6 +161,15 @@ pub(super) async fn stream_events(
                         &state_cloned,
                         &sender,
                         &mut last_notification_mailbox_sig,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    if !emit_network_access_logs_if_changed(
+                        &state_cloned,
+                        &sender,
+                        &mut last_network_access_logs_sig,
                     )
                     .await
                     {
@@ -303,6 +322,33 @@ async fn emit_notification_mailbox_if_changed(
         if !send_event(sender, "notification_mailbox", &payload).await {
             return false;
         }
+    }
+    true
+}
+
+async fn emit_network_access_logs_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    last_sig: &mut String,
+) -> bool {
+    let items = match state.db().await.list_network_access_logs(200).await {
+        Ok(items) => items
+            .into_iter()
+            .map(NetworkAccessLogEntryResponse::from)
+            .collect(),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load network access logs");
+            return true;
+        }
+    };
+    let payload = NetworkAccessLogsResponse { items };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "network_access_logs", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
     }
     true
 }

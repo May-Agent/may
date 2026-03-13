@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { BookOpen } from 'lucide-react';
 import * as api from '@/lib/api';
 import type {
+  NetworkAccessLogEntry,
   NotificationMailboxEntry,
   RequestLogCacheSummary,
   RequestLogEntry,
@@ -11,6 +12,7 @@ export function LogsSection() {
   const [requestLogs, setRequestLogs] = useState<RequestLogEntry[]>([]);
   const [cacheSummary, setCacheSummary] = useState<RequestLogCacheSummary | null>(null);
   const [mailbox, setMailbox] = useState<NotificationMailboxEntry[]>([]);
+  const [networkLogs, setNetworkLogs] = useState<NetworkAccessLogEntry[]>([]);
   const [requestLogsError, setRequestLogsError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -31,10 +33,12 @@ export function LogsSection() {
       try {
         const payload = await api.fetchRequestLogs();
         const mailboxPayload = await api.fetchNotificationMailbox();
+        const networkPayload = await api.fetchNetworkAccessLogs();
         if (!cancelled) {
           setRequestLogs(payload.logs);
           setCacheSummary(payload.cacheSummary);
           setMailbox(mailboxPayload.items);
+          setNetworkLogs(networkPayload.items);
           setRequestLogsError(null);
           clearDisconnectError();
         }
@@ -59,6 +63,11 @@ export function LogsSection() {
       onNotificationMailbox: (payload) => {
         if (cancelled) return;
         setMailbox(payload.items);
+        clearDisconnectError();
+      },
+      onNetworkAccessLogs: (payload) => {
+        if (cancelled) return;
+        setNetworkLogs(payload.items);
         clearDisconnectError();
       },
       onError: () => {
@@ -137,6 +146,35 @@ export function LogsSection() {
               )}
               {item.lastError && (
                 <div className="text-destructive break-all">{item.lastError}</div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="space-y-2">
+        <div className="text-sm font-medium uppercase text-muted-foreground tracking-wide">
+          Network Audit
+        </div>
+        <div className="rounded border divide-y max-h-[320px] overflow-auto">
+          {networkLogs.length === 0 && (
+            <div className="px-3 py-3 text-sm text-muted-foreground">No network audit events yet.</div>
+          )}
+          {networkLogs.map((item) => (
+            <div key={item.id} className="px-3 py-2 text-xs space-y-1">
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-mono">{item.timestamp}</span>
+                <span className={item.allowed ? 'text-green-500' : 'text-red-500'}>
+                  {item.allowed ? 'allowed' : 'blocked'}
+                </span>
+              </div>
+              <div className="break-all">
+                {item.domain}:{item.port} · source={item.source} · mode={item.mode}
+              </div>
+              <div className="text-muted-foreground">
+                session={item.sessionId ?? '-'} profile={item.profileId ?? '-'}
+              </div>
+              {item.reason && (
+                <div className="text-muted-foreground break-all">{item.reason}</div>
               )}
             </div>
           ))}
