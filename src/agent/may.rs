@@ -33,6 +33,7 @@ use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
 use crate::copilot::clear_copilot_credentials;
 use crate::live_response::LiveResponseRegistry;
+use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{MessageRole, SessionId, SessionPaths, SessionPlanState};
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
@@ -410,11 +411,18 @@ impl PermissionHandler for PermissionApprover {
 #[derive(Debug, Clone, Default)]
 struct MayPermissionHandler {
     approver: Option<PermissionApprover>,
+    network_policy: Option<CompiledNetworkPolicy>,
 }
 
 impl MayPermissionHandler {
-    const fn new(approver: Option<PermissionApprover>) -> Self {
-        Self { approver }
+    const fn new(
+        approver: Option<PermissionApprover>,
+        network_policy: Option<CompiledNetworkPolicy>,
+    ) -> Self {
+        Self {
+            approver,
+            network_policy,
+        }
     }
 }
 
@@ -427,6 +435,12 @@ impl PermissionHandler for MayPermissionHandler {
     }
 
     async fn check_domain(&self, domain: &str, port: u16) -> bool {
+        if let Some(policy) = &self.network_policy
+            && !policy.allows_domain(domain)
+        {
+            tracing::warn!(domain, port, mode = %policy.mode().as_str(), "blocked outbound domain by configured network policy");
+            return false;
+        }
         match &self.approver {
             Some(approver) => approver.check_domain(domain, port).await,
             None => NoopPermissionHandler.check_domain(domain, port).await,
@@ -522,6 +536,8 @@ pub struct MayAgentConfig {
     pub profile_memories: Option<crate::memory::ProfileMemories>,
     /// Session-scoped planning workflow state.
     pub plan_state: SessionPlanState,
+    /// Global network restriction policy.
+    pub network_policy: Option<CompiledNetworkPolicy>,
     /// Optional location info for location-aware profiles.
     pub location: Option<crate::location::LocationInfo>,
     /// Optional broker for `task` command requests.
@@ -568,6 +584,7 @@ struct RuntimeSystemContext {
     profile_persona: Option<ProfilePersona>,
     profile_memories: Option<ProfileMemories>,
     plan_mode: Option<PlanMode>,
+    network_restrictions: Option<NetworkRestrictions>,
     location: Option<LocationContext>,
     native_voice_input: Option<NativeVoiceInput>,
     platform: Option<Platform>,
@@ -583,6 +600,7 @@ impl RuntimeSystemContext {
             profile_persona: None,
             profile_memories: None,
             plan_mode: None,
+            network_restrictions: None,
             location: None,
             native_voice_input: None,
             platform: None,
@@ -614,6 +632,11 @@ impl RuntimeSystemContext {
         self
     }
 
+    fn with_network_restrictions(mut self, network_restrictions: NetworkRestrictions) -> Self {
+        self.network_restrictions = Some(network_restrictions);
+        self
+    }
+
     fn with_location(mut self, location: LocationContext) -> Self {
         self.location = Some(location);
         self
@@ -638,6 +661,7 @@ impl RuntimeSystemContext {
         reconcile_system_block(context, self.profile_persona.as_ref());
         reconcile_system_block(context, self.profile_memories.as_ref());
         reconcile_system_block(context, self.plan_mode.as_ref());
+        reconcile_system_block(context, self.network_restrictions.as_ref());
         reconcile_system_block(context, self.location.as_ref());
         reconcile_system_block(context, self.native_voice_input.as_ref());
         reconcile_system_block(context, self.platform.as_ref());
@@ -812,7 +836,7 @@ impl MayAgent {
         // Create bash tool in sandbox dir (BashTool creates its own working directory inside)
         let bash_tool: BashTool<MayPermissionHandler, DefaultExecutor> = BashTool::new_exact(
             &config.sandbox_dir,
-            MayPermissionHandler::new(config.permission_approver.clone()),
+            MayPermissionHandler::new(config.permission_approver.clone(), config.network_policy.clone()),
             executor,
         )
         .await
@@ -996,6 +1020,14 @@ impl MayAgent {
         if let Some(plan_mode) = build_plan_mode_context(config.plan_state) {
             runtime_system_context = runtime_system_context.with_plan_mode(plan_mode.clone());
             builder = builder.system(plan_mode);
+        }
+
+        if let Some(network_restrictions) =
+            build_network_restrictions_context(config.network_policy.as_ref())
+        {
+            runtime_system_context =
+                runtime_system_context.with_network_restrictions(network_restrictions.clone());
+            builder = builder.system(network_restrictions);
         }
 
         if let Some(ref location) = config.location {
@@ -1241,6 +1273,7 @@ impl MayAgent {
             profile_persona,
             profile_memories,
             plan_state,
+            network_policy: may_config.preferences.network_policy.compile().map_err(MayAgentError::Sandbox)?,
             location,
             task_broker,
             notify_broker,
@@ -1632,6 +1665,12 @@ struct PlanMode {
 }
 
 #[derive(Clone, serde::Serialize)]
+struct NetworkRestrictions {
+    mode: String,
+    hosts: Vec<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
 struct LocationContext {
     city: String,
     region: String,
@@ -1731,6 +1770,19 @@ fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<PlanMode> {
             content: PLAN_MODE_APPROVED_HINT.to_string(),
         }),
     }
+}
+
+fn build_network_restrictions_context(
+    policy: Option<&CompiledNetworkPolicy>,
+) -> Option<NetworkRestrictions> {
+    let policy = policy?;
+    if matches!(policy.mode(), NetworkPolicyMode::Disabled) {
+        return None;
+    }
+    Some(NetworkRestrictions {
+        mode: policy.mode().as_str().to_string(),
+        hosts: policy.hosts().to_vec(),
+    })
 }
 
 fn build_macos_host_automation_context() -> Option<Platform> {

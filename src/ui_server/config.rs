@@ -83,6 +83,8 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             warn_on_model_change: config.preferences.warn_on_model_change,
             show_token_usage: config.preferences.show_token_usage,
             strict_model_matching: config.preferences.strict_model_matching,
+            network_policy_mode: config.preferences.network_policy.mode,
+            network_policy_hosts: config.preferences.network_policy.hosts.clone(),
         },
         appearance: UiAppearanceConfig {
             font: config.appearance.font.clone(),
@@ -128,6 +130,14 @@ pub(super) async fn save_full_config(
         config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
         config.preferences.show_token_usage = req.preferences.show_token_usage;
         config.preferences.strict_model_matching = req.preferences.strict_model_matching;
+        config.preferences.network_policy.mode = req.preferences.network_policy_mode;
+        config.preferences.network_policy.hosts = req
+            .preferences
+            .network_policy_hosts
+            .into_iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect();
         config.appearance.font = req.appearance.font;
         config.appearance.theme = req.appearance.theme;
         config.last_model = req.last_model;
@@ -151,9 +161,19 @@ pub(super) async fn save_full_config(
         config.clone()
     };
 
+    updated
+        .preferences
+        .network_policy
+        .compile()
+        .map_err(bad_request_error)?;
+
     let ssh_servers = updated.ssh_servers.clone();
     save_config_to_disk(updated).await.map_err(internal_error)?;
     state.task_runtime.set_ssh_servers(ssh_servers);
+    state
+        .task_runtime
+        .set_network_policy(state.config.read().await.preferences.network_policy.clone())
+        .map_err(internal_error)?;
     super::remote_access::sync_remote_access_from_state(&state)
         .await
         .map_err(internal_error)?;

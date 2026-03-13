@@ -51,6 +51,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::network_policy::NetworkPolicyConfig;
+
 /// Infer model tier from aither-models metadata.
 ///
 /// Uses model mode, pricing percentiles, and context window as signals.
@@ -732,6 +734,9 @@ pub struct Preferences {
     /// Strict model matching (no relaxed fallback aliases).
     #[serde(default)]
     pub strict_model_matching: bool,
+    /// Global network restriction settings.
+    #[serde(default)]
+    pub network_policy: NetworkPolicyConfig,
 }
 
 impl Default for Preferences {
@@ -741,6 +746,7 @@ impl Default for Preferences {
             warn_on_model_change: true,
             show_token_usage: true,
             strict_model_matching: false,
+            network_policy: NetworkPolicyConfig::default(),
         }
     }
 }

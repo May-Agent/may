@@ -15,6 +15,7 @@ pub mod location;
 pub mod mcp;
 pub mod memory;
 pub mod models;
+pub mod network_policy;
 pub mod notification;
 pub mod notification_service;
 pub mod profile;
