@@ -107,9 +107,6 @@ export interface Session {
   model: string;
   reasoningEffort?: string;
   runtime: SessionRuntimeSummaryPayload;
-  planState?: SessionPlanState;
-  runtimeState?: SessionRuntimeState;
-  queuedCount?: number;
 }
 
 export interface Artifact {
