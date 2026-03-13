@@ -235,8 +235,7 @@ pub struct PermissionRequest {
 pub struct PermissionApprover {
     live_responses: Arc<LiveResponseRegistry<bool>>,
     session_id: Option<String>,
-    runtime_db: Option<crate::db::ChatDb>,
-    ui_events_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+    runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
 }
 
 impl PermissionApprover {
@@ -244,8 +243,7 @@ impl PermissionApprover {
         Self {
             live_responses: Arc::new(LiveResponseRegistry::new()),
             session_id: None,
-            runtime_db: None,
-            ui_events_notify: None,
+            runtime_service: None,
         }
     }
 
@@ -253,26 +251,17 @@ impl PermissionApprover {
         Self {
             live_responses: self.live_responses.clone(),
             session_id: Some(session_id.into()),
-            runtime_db: self.runtime_db.clone(),
-            ui_events_notify: self.ui_events_notify.clone(),
+            runtime_service: self.runtime_service.clone(),
         }
     }
 
     #[must_use]
-    pub fn with_runtime_sync(
+    pub fn with_runtime_service(
         mut self,
-        db: crate::db::ChatDb,
-        notify: std::sync::Arc<tokio::sync::Notify>,
+        runtime_service: Arc<crate::session::SessionRuntimeService>,
     ) -> Self {
-        self.runtime_db = Some(db);
-        self.ui_events_notify = Some(notify);
+        self.runtime_service = Some(runtime_service);
         self
-    }
-
-    fn notify_ui_events(&self) {
-        if let Some(notify) = &self.ui_events_notify {
-            notify.notify_waiters();
-        }
     }
 
     fn persisted_request(
@@ -338,8 +327,9 @@ impl PermissionApprover {
         };
 
         if mode == BashMode::Network
-            && let Some(db) = &self.runtime_db
-            && db
+            && let Some(runtime_service) = &self.runtime_service
+            && runtime_service
+                .db()
                 .session_has_approved_permission_mode(&session_id, Self::history_mode(mode))
                 .await
                 .map_err(anyhow::Error::from)
@@ -356,29 +346,25 @@ impl PermissionApprover {
         let request_id = uuid::Uuid::new_v4().to_string();
         let rx = self.live_responses.open(request_id.clone());
 
-        if let Some(db) = self.runtime_db.clone() {
-            db.set_waiting_permission(
+        if let Some(runtime_service) = self.runtime_service.clone() {
+            runtime_service
+                .set_waiting_permission(
                 &session_id,
                 Some(Self::persisted_request(request_id.clone(), payload.clone())),
             )
             .await
             .map_err(anyhow::Error::from)
             .map_err(PermissionError::Internal)?;
+            let db = runtime_service.db();
             Self::append_request_history(&db, &session_id, &request_id, mode, &payload.script)
                 .await?;
         }
-
-        self.notify_ui_events();
 
         rx.recv().await.map_err(|_| PermissionError::Interrupted)
     }
 
     pub fn respond(&self, request_id: &str, approved: bool) -> bool {
-        let responded = self.live_responses.resolve(request_id, approved);
-        if responded {
-            self.notify_ui_events();
-        }
-        responded
+        self.live_responses.resolve(request_id, approved)
     }
 }
 
@@ -440,10 +426,11 @@ impl MayPermissionHandler {
         let Some(approver) = &self.approver else {
             return;
         };
-        let Some(db) = approver.runtime_db.clone() else {
+        let Some(runtime_service) = approver.runtime_service.clone() else {
             return;
         };
-        let _ = db
+        let _ = runtime_service
+            .db()
             .append_network_access_log(NetworkAccessLogParams {
                 session_id: approver.session_id.as_deref(),
                 profile_id: self.profile_id.as_deref(),
@@ -963,7 +950,9 @@ impl MayAgent {
             config
                 .permission_approver
                 .as_ref()
-                .and_then(|approver| approver.runtime_db.clone()),
+                .map(|approver| approver.runtime_service.as_ref())
+                .flatten()
+                .map(|runtime_service| runtime_service.db()),
             &config.session_id,
         );
 

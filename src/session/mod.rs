@@ -7,6 +7,7 @@ pub mod layout;
 mod manager;
 mod plan;
 pub mod runtime;
+mod runtime_service;
 mod store;
 
 pub use history::{
@@ -23,4 +24,5 @@ pub use runtime::{
     PersistedPermissionRequest, PersistedPermissionRequestPayload, SessionInteractionState,
     SessionRuntimeState, SessionRuntimeSummary,
 };
+pub use runtime_service::SessionRuntimeService;
 pub use store::SessionStore;

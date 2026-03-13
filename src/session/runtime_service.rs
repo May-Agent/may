@@ -3,13 +3,14 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 use crate::db::ChatDb;
-use crate::session::{
+
+use super::{
     PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
     PersistedPermissionRequest, SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
 };
 
 #[derive(Clone)]
-pub(crate) struct SessionRuntimeService {
+pub struct SessionRuntimeService {
     db: ChatDb,
     notify: Arc<Notify>,
 }
@@ -22,11 +23,11 @@ impl std::fmt::Debug for SessionRuntimeService {
 }
 
 impl SessionRuntimeService {
-    pub(crate) fn new(db: ChatDb, notify: Arc<Notify>) -> Self {
+    pub fn new(db: ChatDb, notify: Arc<Notify>) -> Self {
         Self { db, notify }
     }
 
-    pub(crate) fn db(&self) -> ChatDb {
+    pub fn db(&self) -> ChatDb {
         self.db.clone()
     }
 
@@ -34,7 +35,7 @@ impl SessionRuntimeService {
         self.notify.notify_waiters();
     }
 
-    pub(crate) async fn get(
+    pub async fn get(
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
@@ -45,7 +46,7 @@ impl SessionRuntimeService {
             .unwrap_or_default())
     }
 
-    pub(crate) async fn set_state(
+    pub async fn set_state(
         &self,
         session_id: &str,
         state: SessionRuntimeState,
@@ -55,7 +56,7 @@ impl SessionRuntimeService {
         Ok(())
     }
 
-    pub(crate) async fn set_plan_state(
+    pub async fn set_plan_state(
         &self,
         session_id: &str,
         plan_state: SessionPlanState,
@@ -65,7 +66,7 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
-    pub(crate) async fn enqueue(
+    pub async fn enqueue(
         &self,
         session_id: &str,
         message: PendingUserMessage,
@@ -82,7 +83,7 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
-    pub(crate) async fn list_for_profile(
+    pub async fn list_for_profile(
         &self,
         profile_id: &str,
     ) -> Result<Vec<(String, SessionRuntimeSummary)>, crate::db::ChatDbError> {
@@ -100,7 +101,7 @@ impl SessionRuntimeService {
         Ok(runtimes)
     }
 
-    pub(crate) async fn take_next_pending(
+    pub async fn take_next_pending(
         &self,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, crate::db::ChatDbError> {
@@ -109,7 +110,7 @@ impl SessionRuntimeService {
         Ok(next)
     }
 
-    pub(crate) async fn remove_pending_immediate(
+    pub async fn remove_pending_immediate(
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
@@ -118,7 +119,7 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
-    pub(crate) async fn remove_queued_at(
+    pub async fn remove_queued_at(
         &self,
         session_id: &str,
         index: usize,
@@ -128,7 +129,7 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
-    pub(crate) async fn set_waiting_permission(
+    pub async fn set_waiting_permission(
         &self,
         session_id: &str,
         request: Option<PersistedPermissionRequest>,
@@ -138,7 +139,7 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
-    pub(crate) async fn set_waiting_ask_user(
+    pub async fn set_waiting_ask_user(
         &self,
         session_id: &str,
         request: Option<PersistedAskUserRequest>,
@@ -148,7 +149,7 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
-    pub(crate) async fn clear_running_if_needed(
+    pub async fn clear_running_if_needed(
         &self,
         session_id: &str,
     ) -> Result<(), crate::db::ChatDbError> {
@@ -160,7 +161,7 @@ impl SessionRuntimeService {
         Ok(())
     }
 
-    pub(crate) async fn set_browser_takeover_owner(
+    pub async fn set_browser_takeover_owner(
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
@@ -169,7 +170,7 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
-    pub(crate) async fn clear_browser_takeover_owner(
+    pub async fn clear_browser_takeover_owner(
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
@@ -178,20 +179,20 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
-    pub(crate) async fn has_browser_takeover(
+    pub async fn has_browser_takeover(
         &self,
         session_id: &str,
     ) -> Result<bool, crate::db::ChatDbError> {
         self.db.session_has_browser_takeover(session_id).await
     }
 
-    pub(crate) async fn find_browser_takeover_session(
+    pub async fn find_browser_takeover_session(
         &self,
     ) -> Result<Option<String>, crate::db::ChatDbError> {
         self.db.find_browser_takeover_session().await
     }
 
-    pub(crate) async fn take_browser_takeover_alert_pending(
+    pub async fn take_browser_takeover_alert_pending(
         &self,
         session_id: &str,
     ) -> Result<bool, crate::db::ChatDbError> {

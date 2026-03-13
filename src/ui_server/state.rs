@@ -123,7 +123,7 @@ pub(crate) struct UiServerState {
     pub(crate) title_generation_queue: TitleGenerationQueue,
     pub(crate) register_subagents_broker: RegisterBroker,
     pub(crate) location_provider: crate::location::LocationProvider,
-    pub(crate) runtime_service: Arc<super::runtime::SessionRuntimeService>,
+    pub(crate) runtime_service: Arc<crate::session::SessionRuntimeService>,
     pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,
     pub(crate) cwd: PathBuf,
     pub(crate) may_dir: PathBuf,
@@ -152,7 +152,7 @@ pub(crate) struct AskUserRespondRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct AskUserApprover {
     live_responses: Arc<LiveResponseRegistry<Vec<QuestionAnswer>>>,
-    runtime_service: Option<Arc<super::runtime::SessionRuntimeService>>,
+    runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -218,7 +218,7 @@ impl AskUserApprover {
     #[must_use]
     pub(crate) fn with_runtime_service(
         mut self,
-        runtime_service: Arc<super::runtime::SessionRuntimeService>,
+        runtime_service: Arc<crate::session::SessionRuntimeService>,
     ) -> Self {
         self.runtime_service = Some(runtime_service);
         self

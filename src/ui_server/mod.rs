@@ -14,7 +14,6 @@ mod model_resolution;
 mod notifications;
 mod profiles;
 mod remote_access;
-mod runtime;
 mod sessions;
 mod state;
 mod tasks;
@@ -123,7 +122,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let (title_generation_queue, title_generation_rx) =
         crate::ui_server::state::TitleGenerationQueue::new();
     let ui_events_notify = Arc::new(tokio::sync::Notify::new());
-    let runtime_service = Arc::new(runtime::SessionRuntimeService::new(
+    let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
         db_for_archive.clone(),
         ui_events_notify.clone(),
     ));
@@ -131,7 +130,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         ui_events_notify.clone(),
     ));
     let permission_approver = crate::agent::PermissionApprover::new()
-        .with_runtime_sync(db_for_archive.clone(), ui_events_notify.clone());
+        .with_runtime_service(runtime_service.clone());
     let ask_user_approver =
         AskUserApprover::new().with_runtime_service(runtime_service.clone());
 
