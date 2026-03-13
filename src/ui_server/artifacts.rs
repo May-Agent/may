@@ -16,10 +16,8 @@ use skyzen::utils::{Json, State};
 use skyzen::{Result as SkyResult, StatusCode};
 use tokio::process::Command;
 
-use crate::session::SessionPaths;
-
 use super::error::{bad_request_error, internal_error};
-use super::helpers::send_event;
+use super::helpers::{load_session_paths, send_event};
 use super::local_url_mapper::{
     LocalUrlProxyKey, LocalUrlProxyUpstream, mapped_url_from_target, parse_local_proxy_target,
     target_host_header,
@@ -54,7 +52,7 @@ async fn collect_session_artifacts(
     state: &UiServerState,
     session_id: &str,
 ) -> SkyResult<Vec<ArtifactEntry>> {
-    let artifacts_dir = SessionPaths::from_may_dir(&state.may_dir, session_id).artifacts_dir();
+    let artifacts_dir = load_session_paths(state, session_id).await?.artifacts_dir();
 
     let mut entries = Vec::new();
 
@@ -597,7 +595,7 @@ pub(super) async fn prepare_slidev_preview(
         ));
     }
 
-    let session_paths = SessionPaths::from_may_dir(&state.may_dir, &session_id);
+    let session_paths = load_session_paths(&state, &session_id).await?;
     let session_dir = session_paths.root().to_path_buf();
     let artifacts_dir = session_paths.artifacts_dir();
     let full_path = artifacts_dir.join(&raw_rel);
@@ -699,12 +697,8 @@ pub(super) async fn get_slidev_static_asset(
     let asset_path = params.get("path").unwrap_or("index.html");
     let relative_asset_path = parse_safe_relative_path(asset_path, "slidev static asset path")?;
 
-    let cache_root = state
-        .may_dir
-        .join("sessions")
-        .join(&session_id)
-        .join(".slidev-cache")
-        .join(&cache_key);
+    let session_paths = load_session_paths(&state, &session_id).await?;
+    let cache_root = session_paths.root().join(".slidev-cache").join(&cache_key);
     let full_asset_path = cache_root.join(relative_asset_path);
 
     let canonical_cache_root = async_fs::canonicalize(&cache_root)
@@ -762,10 +756,10 @@ pub(super) async fn stream_session_artifacts(
 
     let (sender, sse) = Sse::channel();
     let state_cloned = state.clone();
-    let sessions_root = state.may_dir.join("sessions");
-    let artifacts_root = SessionPaths::from_may_dir(&state.may_dir, &session_id).artifacts_dir();
+    let session_paths = load_session_paths(&state, &session_id).await?;
+    let artifacts_root = session_paths.artifacts_dir();
 
-    async_fs::create_dir_all(&sessions_root)
+    async_fs::create_dir_all(&artifacts_root)
         .await
         .map_err(internal_error)?;
 
@@ -779,7 +773,7 @@ pub(super) async fn stream_session_artifacts(
     )
     .map_err(internal_error)?;
     watcher
-        .watch(&sessions_root, RecursiveMode::Recursive)
+        .watch(&artifacts_root, RecursiveMode::Recursive)
         .map_err(internal_error)?;
 
     tokio::spawn(async move {
@@ -1048,7 +1042,7 @@ pub(super) async fn get_artifact_preview(
         }
     }
 
-    let session_paths = SessionPaths::from_may_dir(&state.may_dir, &session_id);
+    let session_paths = load_session_paths(&state, &session_id).await?;
     let artifacts_dir = session_paths.artifacts_dir();
 
     let full = artifacts_dir.join(&raw_rel);
@@ -1214,7 +1208,7 @@ pub(super) async fn get_output_preview(
         return Err(bad_request_error("output path must be under outputs/"));
     }
 
-    let session_paths = SessionPaths::from_may_dir(&state.may_dir, &session_id);
+    let session_paths = load_session_paths(&state, &session_id).await?;
     let outputs_dir = session_paths.outputs_dir();
     let full = session_paths.root().join(&raw_rel);
 

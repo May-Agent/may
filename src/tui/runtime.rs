@@ -217,6 +217,13 @@ impl RuntimeDeps {
             })
             .transpose()
             .map_err(anyhow::Error::from)?;
+        let runtime = app
+            .session_manager
+            .db()
+            .get_session_runtime(session_id.as_str())
+            .await
+            .map_err(anyhow::Error::from)?
+            .unwrap_or_default();
         let environment = resolve_agent_environment_for_tui(
             profile_environment,
             profile_model.as_ref(),
@@ -237,6 +244,7 @@ impl RuntimeDeps {
             None,
             profile_persona,
             profile_memories,
+            runtime.plan_state,
             location,
             None,
             None,

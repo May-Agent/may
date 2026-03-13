@@ -10,8 +10,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::MayHomePaths;
-
 /// Permission level for a directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Permission {
@@ -57,8 +55,7 @@ impl WorkspaceConfig {
     ///
     /// Returns `Ok(default)` if the file does not exist,
     /// but propagates parse errors so corrupt configs are not silently dropped.
-    pub fn load(may_dir: &Path) -> Result<Self, WorkspaceConfigError> {
-        let config_path = MayHomePaths::new(may_dir.to_path_buf()).workspace_config();
+    pub fn load(config_path: &Path) -> Result<Self, WorkspaceConfigError> {
         match fs::read_to_string(&config_path) {
             Ok(content) => Ok(toml::from_str(&content)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -67,8 +64,7 @@ impl WorkspaceConfig {
     }
 
     /// Save workspace config to file.
-    pub fn save(&self, may_dir: &Path) -> Result<(), WorkspaceConfigError> {
-        let config_path = MayHomePaths::new(may_dir.to_path_buf()).workspace_config();
+    pub fn save(&self, config_path: &Path) -> Result<(), WorkspaceConfigError> {
         let content = toml::to_string_pretty(self)?;
         fs::write(config_path, content)?;
         Ok(())
@@ -114,8 +110,8 @@ pub struct Workspace {
     pub cwd: PathBuf,
     /// User-configured workspace directories.
     pub config: WorkspaceConfig,
-    /// May config directory.
-    may_dir: PathBuf,
+    /// Profile-scoped workspace configuration path.
+    config_path: PathBuf,
 }
 
 impl Workspace {
@@ -123,14 +119,14 @@ impl Workspace {
     pub fn new(
         sandbox: PathBuf,
         cwd: PathBuf,
-        may_dir: PathBuf,
+        config_path: PathBuf,
     ) -> Result<Self, WorkspaceConfigError> {
-        let config = WorkspaceConfig::load(&may_dir)?;
+        let config = WorkspaceConfig::load(&config_path)?;
         Ok(Self {
             sandbox,
             cwd,
             config,
-            may_dir,
+            config_path,
         })
     }
 
@@ -141,7 +137,7 @@ impl Workspace {
         description: Option<String>,
     ) -> Result<(), WorkspaceConfigError> {
         self.config.add_workdir(path, description);
-        self.config.save(&self.may_dir)
+        self.config.save(&self.config_path)
     }
 
     /// Get all readable directories.

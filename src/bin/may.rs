@@ -601,9 +601,16 @@ where
                     Some(SendAction::SkillInstall { repo }) => {
                         let tx = events.sender();
                         let may_dir = app.session_manager.may_dir().to_path_buf();
+                        let profile_id = app
+                            .session_manager
+                            .current_profile_id()
+                            .map(ToOwned::to_owned)
+                            .expect("session manager must always have a current profile");
                         app.status = Some(format!("Installing from {}...", repo));
                         spawn(async move {
-                            let manager = SkillManager::new(&may_dir);
+                            let home_paths = may_agent::MayHomePaths::new(may_dir);
+                            let manager =
+                                SkillManager::from_profile_home(&home_paths.profile_home(profile_id.as_str()));
                             let result = match SkillManager::parse_github_repo(&repo) {
                                 Ok((owner, repo_name)) => {
                                     manager.install_from_github(owner, repo_name).await
@@ -626,9 +633,16 @@ where
                     Some(SendAction::SkillDelete { dir_name }) => {
                         let tx = events.sender();
                         let may_dir = app.session_manager.may_dir().to_path_buf();
+                        let profile_id = app
+                            .session_manager
+                            .current_profile_id()
+                            .map(ToOwned::to_owned)
+                            .expect("session manager must always have a current profile");
                         app.status = Some(format!("Deleting {}...", dir_name));
                         spawn(async move {
-                            let manager = SkillManager::new(&may_dir);
+                            let home_paths = may_agent::MayHomePaths::new(may_dir);
+                            let manager =
+                                SkillManager::from_profile_home(&home_paths.profile_home(profile_id.as_str()));
                             let result = manager.delete_skill(&dir_name).await;
                             // Refresh skill list after delete
                             let final_result = match result {

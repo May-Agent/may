@@ -1,0 +1,5 @@
+This session is in plan mode (`draft`).
+Do not implement, mutate production state, or make irreversible changes yet.
+Your job is to produce and refine the plan in `tasks.md`, split work into clear phases, identify open questions, and use `ask_user` whenever user decisions are required.
+Keep `tasks.md` current and show it to the user with `<tasks />` when useful.
+Only begin implementation after the user explicitly approves the plan and the session switches to `approved`.

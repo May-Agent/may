@@ -216,10 +216,7 @@ impl SessionManager {
     pub async fn new() -> Result<Self, SessionError> {
         let may_dir = MayConfig::may_dir().map_err(|_| SessionError::NoHomeDir)?;
         let home_paths = MayHomePaths::new(may_dir.clone());
-        let sessions_dir = home_paths.sessions_dir();
-
-        // Create directory structure
-        fs::create_dir_all(&sessions_dir)?;
+        fs::create_dir_all(home_paths.sessions_dir())?;
 
         // Ensure bundle is extracted and symlinks created
         Bundle::ensure_extracted(&may_dir)?;
@@ -256,11 +253,6 @@ impl SessionManager {
         &self.may_dir
     }
 
-    /// Get the sessions directory path.
-    pub fn sessions_dir(&self) -> &Path {
-        self.store.sessions_dir()
-    }
-
     /// Get the database handle.
     pub fn db(&self) -> &ChatDb {
         &self.db
@@ -289,7 +281,7 @@ impl SessionManager {
         let now = Timestamp::now();
 
         // Don't create directories yet - defer until first message
-        let sandbox_dir = self.store.sandbox_dir(id.as_str());
+        let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
         let session = Session {
             id,
             title: None,
@@ -324,7 +316,9 @@ impl SessionManager {
         if !already_persisted {
             let layout = self.session_layout(profile_id.as_deref()).await?;
             // Create filesystem directories (for sandbox, images, etc.)
-            self.store.create_session_dirs(&session_id, layout).await?;
+            self.store
+                .create_session_dirs(&session_id, profile_id.as_deref(), layout)
+                .await?;
 
             // Create session in database with profile_id
             self.db
@@ -360,7 +354,7 @@ impl SessionManager {
             == SandboxResourceLayout::ContainerMountPoints
         {
             self.store
-                .reconcile_container_mount_points(id.as_str())
+                .reconcile_container_mount_points(id.as_str(), profile_id.as_deref())
                 .await?;
         }
         let created_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &db_session.created_at)
@@ -370,7 +364,7 @@ impl SessionManager {
 
         let history = self.load_history_from_db(id.as_str()).await?;
 
-        let sandbox_dir = self.store.sandbox_dir(id.as_str());
+        let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
         let session = Session {
             id: id.clone(),
             title,
@@ -392,8 +386,23 @@ impl SessionManager {
         &self,
         id: &SessionId,
     ) -> Result<(), SessionError> {
+        let profile_id = if let Some(session) = &self.current {
+            if session.id == *id {
+                session.profile_id.clone()
+            } else {
+                self.db
+                    .get_session(id.as_str())
+                    .await?
+                    .and_then(|session| session.profile_id)
+            }
+        } else {
+            self.db
+                .get_session(id.as_str())
+                .await?
+                .and_then(|session| session.profile_id)
+        };
         self.store
-            .reconcile_container_mount_points(id.as_str())
+            .reconcile_container_mount_points(id.as_str(), profile_id.as_deref())
             .await?;
         Ok(())
     }
@@ -440,7 +449,7 @@ impl SessionManager {
             );
             for session in sessions {
                 self.store
-                    .reconcile_container_mount_points(&session.id)
+                    .reconcile_container_mount_points(&session.id, Some(profile.id.as_str()))
                     .await?;
             }
         }
@@ -551,7 +560,7 @@ impl SessionManager {
         // Write chat.txt as human-readable backup (non-fatal)
         if let Err(e) = self
             .store
-            .write_history(session.id.as_str(), &session.history)
+            .write_history(session.id.as_str(), session.profile_id.as_deref(), &session.history)
             .await
         {
             tracing::warn!("Failed to write chat.txt backup: {}", e);
@@ -575,7 +584,7 @@ impl SessionManager {
         // Write chat.txt backup (non-fatal)
         if let Err(e) = self
             .store
-            .write_history(session.id.as_str(), &session.history)
+            .write_history(session.id.as_str(), session.profile_id.as_deref(), &session.history)
             .await
         {
             tracing::warn!("Failed to write chat.txt backup: {}", e);
@@ -599,7 +608,7 @@ impl SessionManager {
         // Write chat.txt backup (non-fatal)
         if let Err(e) = self
             .store
-            .write_history(session.id.as_str(), &session.history)
+            .write_history(session.id.as_str(), session.profile_id.as_deref(), &session.history)
             .await
         {
             tracing::warn!("Failed to write chat.txt backup: {}", e);
@@ -635,8 +644,13 @@ impl SessionManager {
 
     /// Delete a session from both DB and filesystem.
     pub async fn delete_session(&mut self, id: &str) -> Result<(), SessionError> {
+        let profile_id = self
+            .db
+            .get_session(id)
+            .await?
+            .and_then(|session| session.profile_id);
         self.db.delete_session(id).await?;
-        self.store.delete_session(id).await?;
+        self.store.delete_session(id, profile_id.as_deref()).await?;
         Ok(())
     }
 }

@@ -13,5 +13,6 @@ pub mod session_context_snapshots;
 pub mod session_pending_ask_user;
 pub mod session_pending_messages;
 pub mod session_pending_permissions;
+pub mod session_plans;
 pub mod session_runtimes;
 pub mod sessions;

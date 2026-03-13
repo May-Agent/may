@@ -32,7 +32,7 @@ use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
 use crate::copilot::clear_copilot_credentials;
 use crate::live_response::LiveResponseRegistry;
-use crate::session::{MessageRole, SessionId, SessionPaths};
+use crate::session::{MessageRole, SessionId, SessionPaths, SessionPlanState};
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
@@ -517,6 +517,8 @@ pub struct MayAgentConfig {
     pub profile_persona: Option<String>,
     /// Optional profile memories (preference + recency) injected as read-only context.
     pub profile_memories: Option<crate::memory::ProfileMemories>,
+    /// Session-scoped planning workflow state.
+    pub plan_state: SessionPlanState,
     /// Optional location info for location-aware profiles.
     pub location: Option<crate::location::LocationInfo>,
     /// Optional broker for `task` command requests.
@@ -562,6 +564,7 @@ struct RuntimeSystemContext {
     browser: Option<Browser>,
     profile_persona: Option<ProfilePersona>,
     profile_memories: Option<ProfileMemories>,
+    plan_mode: Option<PlanMode>,
     location: Option<LocationContext>,
     native_voice_input: Option<NativeVoiceInput>,
     platform: Option<Platform>,
@@ -576,6 +579,7 @@ impl RuntimeSystemContext {
             browser: None,
             profile_persona: None,
             profile_memories: None,
+            plan_mode: None,
             location: None,
             native_voice_input: None,
             platform: None,
@@ -602,6 +606,11 @@ impl RuntimeSystemContext {
         self
     }
 
+    fn with_plan_mode(mut self, plan_mode: PlanMode) -> Self {
+        self.plan_mode = Some(plan_mode);
+        self
+    }
+
     fn with_location(mut self, location: LocationContext) -> Self {
         self.location = Some(location);
         self
@@ -625,6 +634,7 @@ impl RuntimeSystemContext {
         reconcile_system_block(context, self.browser.as_ref());
         reconcile_system_block(context, self.profile_persona.as_ref());
         reconcile_system_block(context, self.profile_memories.as_ref());
+        reconcile_system_block(context, self.plan_mode.as_ref());
         reconcile_system_block(context, self.location.as_ref());
         reconcile_system_block(context, self.native_voice_input.as_ref());
         reconcile_system_block(context, self.platform.as_ref());
@@ -805,11 +815,13 @@ impl MayAgent {
         .await
         .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
 
+        let session_paths = SessionPaths::new(config.sandbox_dir.clone());
+
         // Create workspace with permissions (only used for local environment context)
         let workspace = MayWorkspace::new(
             config.sandbox_dir.clone(),
             config.cwd.clone(),
-            config.may_dir.clone(),
+            session_paths.workspace_config(),
         )?;
 
         let ssh_servers: Vec<SshServer> = match &config.environment {
@@ -858,7 +870,6 @@ impl MayAgent {
             },
             config.task_broker,
         );
-        let session_paths = SessionPaths::new(config.sandbox_dir.clone());
         let imagine = ImagineTool {
             generator: config.image_generator,
             artifacts_dir: session_paths.artifacts_dir(),
@@ -969,6 +980,11 @@ impl MayAgent {
             runtime_system_context =
                 runtime_system_context.with_profile_memories(profile_memories.clone());
             builder = builder.system(profile_memories);
+        }
+
+        if let Some(plan_mode) = build_plan_mode_context(config.plan_state) {
+            runtime_system_context = runtime_system_context.with_plan_mode(plan_mode.clone());
+            builder = builder.system(plan_mode);
         }
 
         if let Some(ref location) = config.location {
@@ -1101,6 +1117,7 @@ impl MayAgent {
             None,
             None,
             None,
+            SessionPlanState::Disabled,
             None,
             None,
             None,
@@ -1124,6 +1141,7 @@ impl MayAgent {
         permission_approver: Option<PermissionApprover>,
         profile_persona: Option<String>,
         profile_memories: Option<crate::memory::ProfileMemories>,
+        plan_state: SessionPlanState,
         location: Option<crate::location::LocationInfo>,
         task_broker: Option<crate::agent::task_tool::TaskBroker>,
         notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
@@ -1208,6 +1226,7 @@ impl MayAgent {
             environment,
             profile_persona,
             profile_memories,
+            plan_state,
             location,
             task_broker,
             notify_broker,
@@ -1538,6 +1557,8 @@ fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
 const MEMORY_CONTEXT_HINT: &str = include_str!("../texts/memory_context_hint.txt");
 const MACOS_HOST_AUTOMATION_HINT: &str = include_str!("../texts/macos_host_hint.txt");
 const NATIVE_VOICE_AVAILABLE_HINT: &str = "Native voice input is available in this session. You may treat spoken input as first-class user messages.";
+const PLAN_MODE_DRAFT_HINT: &str = include_str!("../texts/plan_mode_draft.txt");
+const PLAN_MODE_APPROVED_HINT: &str = include_str!("../texts/plan_mode_approved.txt");
 
 #[derive(Clone, serde::Serialize)]
 struct Browser {
@@ -1584,6 +1605,14 @@ struct ProfilePersona {
 
 #[derive(Clone, serde::Serialize)]
 struct ProfileMemories {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PlanMode {
+    #[serde(rename = "@state")]
+    state: String,
     #[serde(rename = "$text")]
     content: String,
 }
@@ -1673,6 +1702,20 @@ fn build_native_voice_context(native_voice_input: bool) -> Option<NativeVoiceInp
         })
     } else {
         None
+    }
+}
+
+fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<PlanMode> {
+    match plan_state {
+        SessionPlanState::Disabled => None,
+        SessionPlanState::Draft => Some(PlanMode {
+            state: SessionPlanState::Draft.as_str().to_string(),
+            content: PLAN_MODE_DRAFT_HINT.to_string(),
+        }),
+        SessionPlanState::Approved => Some(PlanMode {
+            state: SessionPlanState::Approved.as_str().to_string(),
+            content: PLAN_MODE_APPROVED_HINT.to_string(),
+        }),
     }
 }
 

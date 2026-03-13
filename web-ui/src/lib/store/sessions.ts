@@ -30,6 +30,7 @@ export interface SessionsSlice {
   deleteSession: (sessionId: string) => Promise<void>;
   updateSessionTitle: (sessionId: string, title: string) => Promise<void>;
   updateSessionModel: (sessionId: string, model: string) => Promise<void>;
+  setSessionPlanState: (sessionId: string, planState: import('@/types').SessionPlanState) => void;
   updateSessionReasoningEffort: (sessionId: string, effort?: string) => void;
   replaceSessionMessages: (sessionId: string, messages: Message[]) => void;
   searchSessions: (query: string) => Session[];
@@ -132,6 +133,7 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
     });
 
     if (defaultProfile) {
+      void get().refreshSkills();
       await get().refreshProfileSessions();
     }
   },
@@ -266,6 +268,14 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
       }
       throw error;
     }
+  },
+
+  setSessionPlanState: (sessionId, planState) => {
+    set((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === sessionId ? { ...session, planState } : session,
+      ),
+    }));
   },
 
   updateSessionReasoningEffort: (sessionId, effort) => {

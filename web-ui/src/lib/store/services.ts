@@ -65,17 +65,30 @@ export const createServicesSlice: StateCreator<AppState, [], [], ServicesSlice> 
   },
 
   refreshSkills: async () => {
-    const skills = await api.fetchSkills();
+    const profileId = get().currentProfileId;
+    if (!profileId) {
+      set({ skills: [] });
+      return;
+    }
+    const skills = await api.fetchSkills(profileId);
     set({ skills });
   },
 
   installSkill: async (repo) => {
-    await api.installSkill(repo);
+    const profileId = get().currentProfileId;
+    if (!profileId) {
+      throw new Error('No active profile selected');
+    }
+    await api.installSkill(repo, profileId);
     await get().refreshSkills();
   },
 
   deleteSkill: async (dirName) => {
-    await api.deleteSkill(dirName);
+    const profileId = get().currentProfileId;
+    if (!profileId) {
+      throw new Error('No active profile selected');
+    }
+    await api.deleteSkill(dirName, profileId);
     await get().refreshSkills();
   },
 

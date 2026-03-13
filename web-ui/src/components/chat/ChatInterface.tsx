@@ -8,10 +8,12 @@ import {
   prepareSlidevPreview,
   fetchSessionArtifacts,
   fetchSessionRuntime,
+  fetchSessionTasks,
   enqueueChat,
   removePendingSessionMessage,
   respondAskUserRequest,
   respondPermissionRequest,
+  saveSessionTasks,
   stopSessionRun,
   streamChat,
   subscribeUiEvents,
@@ -75,6 +77,7 @@ import type {
   BashExecution,
   ToolExecution,
   TimelineSegment,
+  SessionPlanState,
 } from "@/types";
 import { useRuntimeStore } from "@/lib/runtimeStore";
 import {
@@ -139,6 +142,7 @@ export function ChatInterface({
     updateSessionTitle,
     updateSessionModel,
     updateSessionReasoningEffort,
+    setSessionPlanState,
     setLastModel,
     uiConfig,
   } = useStore();
@@ -186,6 +190,7 @@ export function ChatInterface({
   const streamingSessionIdRef = useRef<string | null>(null);
   const previewSessionRef = useRef<string | null>(null);
   const currentSession = sessions.find((s) => s.id === currentSessionId);
+  const currentPlanState: SessionPlanState = currentSession?.planState ?? "disabled";
   const currentProfile = profiles.find((profile) => profile.id === currentProfileId) ?? null;
   const containerPrepareStatus = currentProfileId
     ? containerPrepareStatuses[currentProfileId]
@@ -208,6 +213,27 @@ export function ChatInterface({
     .reverse()
     .some((message) => message.role === "assistant" && (message.isStreaming || message.isThinking));
   const isNewChat = !currentSessionId || !currentSession;
+
+  const handlePlanStateChange = useCallback(async (nextPlanState: SessionPlanState) => {
+    if (!currentSessionId) {
+      return;
+    }
+    try {
+      const payload = await fetchSessionTasks(currentSessionId);
+      const saved = await saveSessionTasks(currentSessionId, {
+        content: payload.content,
+        planState: nextPlanState,
+      });
+      setSessionPlanState(currentSessionId, saved.planState);
+      void refreshProfileSessions();
+    } catch (error) {
+      setUiError(
+        error instanceof Error
+          ? error.message
+          : String(error),
+      );
+    }
+  }, [currentSessionId, refreshProfileSessions, setSessionPlanState]);
   const shouldShowWelcome = isNewChat || messages.length === 0;
   const chatSurfaceState =
     workspaceSurface.state === 'ready'
@@ -2058,6 +2084,36 @@ export function ChatInterface({
             ))}
           </div>
           <div className="flex-1 flex justify-end gap-1">
+            {!shouldShowWelcome && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => {
+                  const nextPlanState =
+                    currentPlanState === "disabled"
+                      ? "draft"
+                      : currentPlanState === "draft"
+                        ? "approved"
+                        : "draft";
+                  void handlePlanStateChange(nextPlanState);
+                }}
+                title={
+                  currentPlanState === "disabled"
+                    ? "Enter plan mode"
+                    : currentPlanState === "draft"
+                      ? "Approve plan"
+                      : "Reopen planning"
+                }
+              >
+                <FileText className="mr-1.5 h-4 w-4" />
+                {currentPlanState === "disabled"
+                  ? "Plan"
+                  : currentPlanState === "draft"
+                    ? "Approve"
+                    : "Reopen"}
+              </Button>
+            )}
             {!shouldShowWelcome && (
               <Button
                 variant="ghost"

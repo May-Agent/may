@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use skyzen::extract::Query;
 use skyzen::Result as SkyResult;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
@@ -21,6 +22,17 @@ use super::types::{
     SkillInfoDto, SkillInstallRequest, SshServerRequest, UiAppearanceConfig, UiConfigResponse,
     UiFullConfig, UiModelsConfig, UiPlaywrightConfig, UiPreferencesConfig, UiProviderConfig,
 };
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SkillScopeQuery {
+    profile_id: String,
+}
+
+fn scoped_skill_manager(state: &UiServerState, profile_id: &str) -> SkillManager {
+    let home_paths = MayHomePaths::new(state.may_dir.clone());
+    SkillManager::from_profile_home(&home_paths.profile_home(profile_id))
+}
 
 pub(super) async fn get_ui_config(
     State(state): State<Arc<UiServerState>>,
@@ -262,10 +274,10 @@ pub(super) async fn reconnect_mcp_server(
 // ── Skills ────────────────────────────────────────
 
 pub(super) async fn list_skills(
+    Query(query): Query<SkillScopeQuery>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<SkillInfoDto>>> {
-    let skills = state
-        .skill_manager
+    let skills = scoped_skill_manager(&state, query.profile_id.as_str())
         .list_skills()
         .await
         .map_err(internal_error)?;
@@ -273,12 +285,12 @@ pub(super) async fn list_skills(
 }
 
 pub(super) async fn install_skill(
+    Query(query): Query<SkillScopeQuery>,
     Json(req): Json<SkillInstallRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<SkillInfoDto>>> {
     let (owner, repo) = SkillManager::parse_github_repo(&req.repo).map_err(bad_request_error)?;
-    let installed = state
-        .skill_manager
+    let installed = scoped_skill_manager(&state, query.profile_id.as_str())
         .install_from_github(owner, repo)
         .await
         .map_err(internal_error)?;
@@ -287,11 +299,11 @@ pub(super) async fn install_skill(
 
 pub(super) async fn delete_skill(
     params: Params,
+    Query(query): Query<SkillScopeQuery>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let dir = params.get("dir").map_err(bad_request_error)?;
-    state
-        .skill_manager
+    scoped_skill_manager(&state, query.profile_id.as_str())
         .delete_skill(dir)
         .await
         .map_err(internal_error)?;

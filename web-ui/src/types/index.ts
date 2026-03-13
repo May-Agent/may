@@ -106,6 +106,7 @@ export interface Session {
   projectId?: string;
   model: string;
   reasoningEffort?: string;
+  planState?: SessionPlanState;
   runtimeState?: SessionRuntimeState;
   queuedCount?: number;
 }
@@ -160,10 +161,13 @@ export interface SessionSummary {
   createdAt: string | null;
   updatedAt: string | null;
   contentPreview: string;
+  planState: SessionPlanState;
   runtimeState: SessionRuntimeState;
   queuedCount: number;
   runtime?: SessionRuntimeSummaryPayload;
 }
+
+export type SessionPlanState = 'disabled' | 'draft' | 'approved';
 
 export type SessionRuntimeState =
   | 'idle'
@@ -203,6 +207,7 @@ export interface RuntimeAskUserRequest {
 
 export interface SessionRuntimeSummaryPayload {
   state: SessionRuntimeState;
+  planState: SessionPlanState;
   queuedCount: number;
   pendingImmediate?: PendingUserMessage | null;
   queuedMessages: PendingUserMessage[];

@@ -29,7 +29,8 @@ use super::attachments::build_prompt_and_attachments;
 use super::bash_parsing::update_bash_snapshot_from_tool_event;
 use super::error::internal_error;
 use super::helpers::{
-    RETRY_BACKOFF_MS, append_history_message, elapsed_ms_saturating, send_event, truncate_preview,
+    RETRY_BACKOFF_MS, append_history_message, elapsed_ms_saturating, load_session_paths,
+    send_event, truncate_preview,
 };
 use super::model_resolution::resolve_default_model;
 use super::state::UiServerState;
@@ -1202,6 +1203,7 @@ struct SessionContext {
     profile_model: Option<crate::db::entity::profiles::Model>,
     profile_environment: Option<crate::profile::ProfileEnvironment>,
     profile_id: Option<String>,
+    plan_state: crate::session::SessionPlanState,
 }
 
 struct PreparedAgent {
@@ -1291,6 +1293,12 @@ async fn resolve_session_context(
     } else {
         None
     };
+    let runtime = manager
+        .db()
+        .get_session_runtime(session_id.as_str())
+        .await
+        .map_err(anyhow::Error::from)?
+        .unwrap_or_default();
 
     let mut incremental_messages = Vec::new();
     if persist_user_message {
@@ -1384,6 +1392,7 @@ async fn resolve_session_context(
         profile_model,
         profile_environment,
         profile_id,
+        plan_state: runtime.plan_state,
     })
 }
 
@@ -1608,6 +1617,7 @@ async fn prepare_agent_for_request(
         ),
         ctx.profile_persona,
         ctx.profile_memories,
+        ctx.plan_state,
         location,
         Some(brokers.task),
         Some(brokers.notify),
@@ -1791,32 +1801,37 @@ async fn resolve_session_root(
     state: &UiServerState,
     session_id: &str,
 ) -> Result<std::path::PathBuf, String> {
-    let sessions_root = state.may_dir.join("sessions");
-    let sessions_root_canonical =
-        tokio::fs::canonicalize(&sessions_root)
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to resolve sessions root {}: {error}",
-                    sessions_root.display()
-                )
-            })?;
-    let session_root = sessions_root.join(session_id);
+    let session_root = load_session_paths(state, session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .root()
+        .to_path_buf();
+    tokio::fs::create_dir_all(&session_root)
+        .await
+        .map_err(|error| {
+            let session_root_display = session_root.display().to_string();
+            let error_message = error.to_string();
+            [
+                "failed to create session root ",
+                session_root_display.as_str(),
+                ": ",
+                error_message.as_str(),
+            ]
+            .concat()
+        })?;
     let session_root_canonical = tokio::fs::canonicalize(&session_root)
         .await
         .map_err(|error| {
-            format!(
-                "failed to resolve session {}: {error}",
-                session_root.display()
-            )
+            let session_root_display = session_root.display().to_string();
+            let error_message = error.to_string();
+            [
+                "failed to resolve session ",
+                session_root_display.as_str(),
+                ": ",
+                error_message.as_str(),
+            ]
+            .concat()
         })?;
-    if !session_root_canonical.starts_with(&sessions_root_canonical) {
-        return Err(format!(
-            "session path {} is outside sessions root {}",
-            session_root_canonical.display(),
-            sessions_root_canonical.display()
-        ));
-    }
     Ok(session_root_canonical)
 }
 

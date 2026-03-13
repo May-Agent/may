@@ -9,7 +9,7 @@ use crate::session::SessionId;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::truncate_preview;
+use super::helpers::{load_session_paths, truncate_preview};
 use super::message_mapping::map_db_messages;
 use super::model_resolution::{
     persist_last_model, preferred_advanced_model, resolve_default_model,
@@ -65,7 +65,12 @@ pub(super) async fn get_session(
             SkyError::msg(format!("Session {id} not found")).set_status(StatusCode::NOT_FOUND)
         })?;
 
-    let summary = crate::session::SessionSummary::from_db_model(db_session);
+    let mut summary = crate::session::SessionSummary::from_db_model(db_session);
+    summary.runtime = db
+        .get_session_runtime(&id)
+        .await
+        .map_err(internal_error)?
+        .unwrap_or_default();
 
     let config = state.config.read().await;
     let model = resolve_default_model(&config, summary.model.clone())
@@ -125,29 +130,47 @@ pub(super) async fn get_session_tasks(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let path = crate::session::SessionPaths::from_may_dir(&state.may_dir, &id).tasks_path();
+    let path = load_session_paths(&state, &id).await?.tasks_path();
+    let runtime = state
+        .runtime_service
+        .get(&id)
+        .await
+        .map_err(internal_error)?;
     let content = match async_fs::read_to_string(&path).await {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(internal_error(error)),
     };
-    Ok(Json(SessionTasksPayload { content }))
+    Ok(Json(SessionTasksPayload {
+        content,
+        plan_state: runtime.plan_state,
+    }))
 }
 
 pub(super) async fn save_session_tasks(
     params: Params,
     Json(payload): Json<SessionTasksPayload>,
     State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Json<ApiHealth>> {
+) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let paths = crate::session::SessionPaths::from_may_dir(&state.may_dir, &id);
+    let paths = load_session_paths(&state, &id).await?;
     async_fs::create_dir_all(paths.root())
         .await
         .map_err(internal_error)?;
     async_fs::write(paths.tasks_path(), payload.content)
         .await
         .map_err(internal_error)?;
-    Ok(Json(ApiHealth { ok: true }))
+    let runtime = state
+        .runtime_service
+        .set_plan_state(&id, payload.plan_state)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(SessionTasksPayload {
+        content: async_fs::read_to_string(paths.tasks_path())
+            .await
+            .map_err(internal_error)?,
+        plan_state: runtime.plan_state,
+    }))
 }
 
 fn build_window_snapshot(
@@ -318,6 +341,7 @@ pub(super) async fn update_session(
         profile_id,
         model,
         reasoning_effort: None,
+        plan_state: runtime.plan_state,
         runtime_state: runtime.state,
         queued_count: runtime.queued_count,
     }))
@@ -345,10 +369,10 @@ pub(super) async fn delete_all_sessions(
 
     // Clean up filesystem session directories
     let store = manager.store().clone();
-    let ids = store.list_sessions().await.map_err(internal_error)?;
-    for id in ids {
-        store.delete_session(&id).await.map_err(internal_error)?;
-    }
+    store
+        .delete_all_session_dirs()
+        .await
+        .map_err(internal_error)?;
 
     let _ = manager.create_session();
     state.notify_ui_events();

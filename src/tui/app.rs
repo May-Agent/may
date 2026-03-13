@@ -535,8 +535,14 @@ impl App {
 
         let session_dir = self
             .session_manager
-            .store()
-            .session_dir(session_id.as_str());
+            .current()
+            .map(|session| session.sandbox_dir.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "current session missing while initializing session {}",
+                    session_id.as_str()
+                )
+            });
         self.image_manager = Some(ImageManager::new(&session_dir));
         self.text_manager = Some(TextManager::new(&session_dir));
 
@@ -1309,8 +1315,16 @@ impl App {
             "/skill" => {
                 let tx = self.event_tx.clone();
                 let may_dir = self.session_manager.may_dir().to_path_buf();
+                let profile_id = self
+                    .session_manager
+                    .current_profile_id()
+                    .map(ToOwned::to_owned)
+                    .expect("session manager must always have a current profile");
                 spawn(async move {
-                    let manager = crate::skill::SkillManager::new(&may_dir);
+                    let home_paths = crate::session::MayHomePaths::new(may_dir);
+                    let manager = crate::skill::SkillManager::from_profile_home(
+                        &home_paths.profile_home(profile_id.as_str()),
+                    );
                     let result = manager.list_skills().await;
                     let _ = tx
                         .send(AppEvent::SkillsLoaded(result.map_err(anyhow::Error::from)))

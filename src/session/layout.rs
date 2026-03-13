@@ -14,6 +14,12 @@ pub struct MayHomePaths {
     root: PathBuf,
 }
 
+/// Canonical paths for one profile home environment rooted under the May home.
+#[derive(Debug, Clone)]
+pub struct ProfileHomePaths {
+    root: PathBuf,
+}
+
 impl MayHomePaths {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -25,6 +31,10 @@ impl MayHomePaths {
 
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")
+    }
+
+    pub fn profiles_dir(&self) -> PathBuf {
+        self.root.join("profiles")
     }
 
     pub fn skills_dir(&self) -> PathBuf {
@@ -50,6 +60,38 @@ impl MayHomePaths {
     pub fn session_paths(&self, session_id: &str) -> SessionPaths {
         SessionPaths::new(self.sessions_dir().join(session_id))
     }
+
+    pub fn profile_home(&self, profile_id: &str) -> ProfileHomePaths {
+        ProfileHomePaths {
+            root: self.profiles_dir().join(profile_id),
+        }
+    }
+}
+
+impl ProfileHomePaths {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join("skills")
+    }
+
+    pub fn subagents_dir(&self) -> PathBuf {
+        self.root.join("subagents")
+    }
+
+    pub fn workspace_config(&self) -> PathBuf {
+        self.root.join("workspace.toml")
+    }
+
+    pub fn session_paths(&self, session_id: &str) -> SessionPaths {
+        SessionPaths::new(self.sessions_dir().join(session_id))
+    }
 }
 
 impl SessionPaths {
@@ -58,19 +100,23 @@ impl SessionPaths {
         Self { root }
     }
 
-    /// Construct layout from the May directory and session id.
-    pub fn from_may_dir(may_dir: &Path, session_id: &str) -> Self {
-        Self::new(may_dir.join("sessions").join(session_id))
-    }
-
-    /// Construct layout from typed May home paths and session id.
-    pub fn from_home_paths(home_paths: &MayHomePaths, session_id: &str) -> Self {
-        home_paths.session_paths(session_id)
-    }
-
     /// Session root directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Home root containing this session and its profile-scoped resources.
+    pub fn home_root(&self) -> PathBuf {
+        self.root
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid session layout {}, expected .../sessions/<session_id>",
+                    self.root.display()
+                )
+            })
+            .to_path_buf()
     }
 
     /// Session-scoped temporary directory.
@@ -126,5 +172,10 @@ impl SessionPaths {
     /// Optional task document path for long-running plans.
     pub fn tasks_path(&self) -> PathBuf {
         self.root.join("tasks.md")
+    }
+
+    /// Workspace configuration scoped to the session home/profile home.
+    pub fn workspace_config(&self) -> PathBuf {
+        self.home_root().join("workspace.toml")
     }
 }

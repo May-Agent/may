@@ -1,5 +1,7 @@
 use crate::config::{LoadBalanceStrategy, PlaywrightBrowser, ProviderType, SshServerConfig};
-use crate::session::{PendingUserMessage, PendingUserMessageMode, SessionRuntimeState};
+use crate::session::{
+    PendingUserMessage, PendingUserMessageMode, SessionPlanState, SessionRuntimeState,
+};
 use crate::xml_fragment::XmlFragment;
 
 // ── Typed API Errors ────────────────────────────────────────
@@ -198,6 +200,8 @@ pub(crate) struct NotificationMailboxResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionTasksPayload {
     pub(crate) content: String,
+    #[serde(default)]
+    pub(crate) plan_state: SessionPlanState,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -416,6 +420,8 @@ pub(crate) struct ApiSession {
     pub(crate) model: String,
     #[serde(default)]
     pub(crate) reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub(crate) plan_state: SessionPlanState,
     pub(crate) runtime_state: SessionRuntimeState,
     #[serde(default)]
     pub(crate) queued_count: usize,
@@ -446,6 +452,7 @@ impl ApiSession {
             profile_id: summary.profile_id,
             model,
             reasoning_effort: None,
+            plan_state: summary.runtime.plan_state,
             runtime_state: summary.runtime.state,
             queued_count: summary.runtime.queued_count,
         }
@@ -462,6 +469,7 @@ impl ApiSession {
             profile_id,
             model,
             reasoning_effort: None,
+            plan_state: SessionPlanState::Disabled,
             runtime_state: SessionRuntimeState::Idle,
             queued_count: 0,
         }
@@ -631,6 +639,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
     fn from(summary: crate::session::SessionRuntimeSummary) -> Self {
         Self {
             state: summary.state,
+            plan_state: summary.plan_state,
             queued_count: summary.queued_count,
             pending_immediate: summary.pending_immediate,
             queued_messages: summary.queued_messages,
@@ -673,6 +682,8 @@ pub(crate) struct UiConfigResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionRuntimeResponse {
     pub(crate) state: SessionRuntimeState,
+    #[serde(default)]
+    pub(crate) plan_state: SessionPlanState,
     #[serde(default)]
     pub(crate) queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
