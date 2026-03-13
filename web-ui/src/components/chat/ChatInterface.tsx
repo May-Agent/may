@@ -1088,6 +1088,11 @@ export function ChatInterface({
 
     if (pendingBatch.length === 0) { setIsSending(false); return; }
 
+    const baseMessages =
+      useStore.getState().sessions.find((session) => session.id === sessionId)?.messages ?? [];
+    const fallbackPrompt = pendingBatch.map((message) => message.content).join("\n\n");
+    const fallbackAttachments = pendingBatch.flatMap((message) => message.attachments);
+
     if (!options?.skipAppendUserMessages) {
       for (const queued of pendingBatch) {
         addMessage(sessionId, queued.content, "user", queued.attachments);
@@ -1112,6 +1117,27 @@ export function ChatInterface({
     const toolSegmentByToolId = new Map<string, string>();
     let lastStreamEventKind: "reasoning" | "text" | "tool" | null = null;
     let lastTextFlushAt = 0;
+    let shouldFallbackToSteer = false;
+
+    const isActiveSessionStreamError = (message: string): boolean =>
+      message.includes("session is already active")
+      || message.includes("session is already streaming");
+
+    const fallbackToSteerQueue = async (): Promise<boolean> => {
+      if (options?.retryAssistantId) {
+        return false;
+      }
+      const runtime = await enqueueChat({
+        sessionId,
+        content: fallbackPrompt,
+        attachments: fallbackAttachments,
+        deliveryMode: "steer",
+      });
+      replaceSessionMessages(sessionId, baseMessages);
+      applyRuntime(sessionId, runtime);
+      completedNormally = true;
+      return true;
+    };
 
     const cloneTimelineSegments = (segments: TimelineSegment[]): TimelineSegment[] =>
       segments.map((segment) =>
@@ -1514,6 +1540,10 @@ export function ChatInterface({
           );
         },
         onError: (message) => {
+          if (isActiveSessionStreamError(message)) {
+            shouldFallbackToSteer = true;
+            return;
+          }
           closeActiveThinkingSegment();
           const latest = useStore
             .getState()
@@ -1540,10 +1570,23 @@ export function ChatInterface({
           setUiError(`LLM endpoint error: ${message}`);
         },
       });
+      if (shouldFallbackToSteer) {
+        const recovered = await fallbackToSteerQueue();
+        if (!recovered) {
+          setUiError("session is already active; send this message via steer or queue instead");
+        }
+      }
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isActiveSessionStreamError(message)) {
+          const recovered = await fallbackToSteerQueue();
+          if (recovered) {
+            return;
+          }
+        }
         closeActiveThinkingSegment();
-        const errText = `LLM endpoint error: ${(error as Error).message}`;
+        const errText = `LLM endpoint error: ${message}`;
         const latest = useStore
           .getState()
           .sessions.find((s) => s.id === sessionId);
