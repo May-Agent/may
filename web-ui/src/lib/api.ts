@@ -814,14 +814,14 @@ export async function streamChat(input: {
     })),
   };
 
-  const res = await fetch('/api/chat/stream', {
+  const res = await requestResponse('/api/chat/stream', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify(payload),
     signal: input.signal,
   });
-  if (!res.ok || !res.body) {
-    throw new Error(await res.text());
+  if (!res.body) {
+    throw new ApiError('chat stream returned an empty body', res.status, null);
   }
 
   const reader = res.body.getReader();
