@@ -6872,6 +6872,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "futures-util",
  "git2",
+ "globset",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",

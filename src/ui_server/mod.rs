@@ -169,7 +169,9 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
             .await
             .context("failed to load task runtime state")?
             .with_notifier(notification_service.clone())
-            .with_ssh_servers(config.ssh_servers.clone());
+            .with_ssh_servers(config.ssh_servers.clone())
+            .with_network_policy(config.preferences.network_policy.clone())
+            .map_err(|error| anyhow!(error))?;
     if let Some(ref manager) = container_manager {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
