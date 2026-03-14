@@ -4,15 +4,19 @@ use std::sync::Arc;
 
 use aither_sandbox::SshSessionAuthorizer;
 
-use crate::ask_user::{AnswerValue, AskUserArgs, AskUserBroker};
+use crate::ask_user::{AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload};
 
 pub struct MaySshAuthorizer {
     broker: AskUserBroker,
+    session_id: String,
 }
 
 impl MaySshAuthorizer {
-    pub fn new(broker: AskUserBroker) -> Arc<Self> {
-        Arc::new(Self { broker })
+    pub fn new(session_id: impl Into<String>, broker: AskUserBroker) -> Arc<Self> {
+        Arc::new(Self {
+            broker,
+            session_id: session_id.into(),
+        })
     }
 
     /// Ask a yes/no permission question via the AskUser UI.
@@ -23,7 +27,14 @@ impl MaySshAuthorizer {
             multi_select: false,
             questions: Vec::new(),
         };
-        let response = self.broker.request(args).await.map_err(|e| e.to_string())?;
+        let response = self
+            .broker
+            .request(AskUserRequestPayload {
+                session_id: self.session_id.clone(),
+                request: args,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(response.iter().any(|a| {
             matches!(&a.answer, AnswerValue::Selected(opts) if opts.iter().any(|o| o == allow_label))
         }))

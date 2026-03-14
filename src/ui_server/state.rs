@@ -278,11 +278,12 @@ impl AskUserApprover {
     }
 
     pub(crate) async fn enqueue(&self, request: AskUserRequest, session_id: Option<String>) {
-        let questions = request.args.clone().into_questions();
+        let questions = request.args.request.clone().into_questions();
+        let request_session_id = Some(request.args.session_id.clone()).or(session_id);
         let request_id = uuid::Uuid::new_v4().to_string();
         let rx = self.live_responses.open(request_id.clone());
 
-        if let Some(session_id) = session_id.as_deref()
+        if let Some(session_id) = request_session_id.as_deref()
             && let Some(runtime_service) = self.runtime_service.clone()
         {
             let persisted_request = PersistedAskUserRequest {

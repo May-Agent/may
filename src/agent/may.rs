@@ -991,7 +991,10 @@ impl MayAgent {
             config.workspace_request_broker,
         );
         let ssh_authorizer_broker = config.ask_user_broker.clone();
-        let ask_user = AskUserTool::new(config.ask_user_broker);
+        let ask_user = AskUserTool::new(
+            config.session_id.as_str().to_string(),
+            config.ask_user_broker,
+        );
         let session_tool = SessionTool::new(
             config.may_dir.clone(),
             config.session_id.as_str().to_string(),
@@ -1091,6 +1094,7 @@ impl MayAgent {
             .shell_runtime_availability(availability)
             .ssh_servers(ssh_servers)
             .ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
+                config.session_id.as_str().to_string(),
                 ssh_authorizer_broker,
             ))
             .agent_kind(AgentKind::Coding)

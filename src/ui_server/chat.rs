@@ -1992,16 +1992,19 @@ async fn request_registration_approval(
 ) -> Result<(), String> {
     let (tx, rx) = async_channel::bounded(1);
     let request = ask_user::AskUserRequest::new(
-        ask_user::AskUserArgs {
-            question: None,
-            option: Vec::new(),
-            multi_select: false,
-            questions: vec![ask_user::Question {
-                section: "registration".to_string(),
-                question: question.to_string(),
-                option: vec!["approve".to_string(), "deny".to_string()],
+        ask_user::AskUserRequestPayload {
+            session_id: session_id.to_string(),
+            request: ask_user::AskUserArgs {
+                question: None,
+                option: Vec::new(),
                 multi_select: false,
-            }],
+                questions: vec![ask_user::Question {
+                    section: "registration".to_string(),
+                    question: question.to_string(),
+                    option: vec!["approve".to_string(), "deny".to_string()],
+                    multi_select: false,
+                }],
+            },
         },
         tx,
     );
