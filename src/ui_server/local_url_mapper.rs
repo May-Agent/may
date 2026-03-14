@@ -12,7 +12,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{OnceCell, watch};
 use zenwave::Client;
 use zenwave::ResponseExt;
 
@@ -76,13 +76,63 @@ impl Hash for LocalUrlProxyKey {
 #[derive(Debug)]
 struct LocalUrlProxyEntry {
     mapped_port: u16,
-    upstream: LocalUrlProxyUpstream,
     shutdown_tx: watch::Sender<bool>,
+}
+
+#[derive(Debug)]
+struct LocalUrlProxySlot {
+    upstream: LocalUrlProxyUpstream,
+    entry: OnceCell<LocalUrlProxyEntry>,
+}
+
+impl LocalUrlProxySlot {
+    fn new(upstream: LocalUrlProxyUpstream) -> Self {
+        Self {
+            upstream,
+            entry: OnceCell::new(),
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Some(entry) = self.entry.get() {
+            let _ = entry.shutdown_tx.send(true);
+        }
+    }
+
+    async fn ensure_port(
+        self: &Arc<Self>,
+        manager: &Arc<LocalUrlPortMapper>,
+        key: &LocalUrlProxyKey,
+    ) -> anyhow::Result<u16> {
+        let entry = self
+            .entry
+            .get_or_try_init(|| async {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+                let mapped_port = listener.local_addr()?.port();
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let task_upstream = self.upstream.clone();
+                let task_key = key.clone();
+                let task_slot = Arc::clone(self);
+                let task_manager = Arc::clone(manager);
+
+                tokio::spawn(async move {
+                    run_proxy_listener(listener, task_upstream, shutdown_rx).await;
+                    task_manager.remove_entry(&task_key, &task_slot);
+                });
+
+                Ok::<LocalUrlProxyEntry, anyhow::Error>(LocalUrlProxyEntry {
+                    mapped_port,
+                    shutdown_tx,
+                })
+            })
+            .await?;
+        Ok(entry.mapped_port)
+    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct LocalUrlPortMapper {
-    entries: DashMap<LocalUrlProxyKey, LocalUrlProxyEntry>,
+    entries: DashMap<LocalUrlProxyKey, Arc<LocalUrlProxySlot>>,
 }
 
 impl LocalUrlPortMapper {
@@ -95,45 +145,34 @@ impl LocalUrlPortMapper {
         key: LocalUrlProxyKey,
         upstream: LocalUrlProxyUpstream,
     ) -> anyhow::Result<u16> {
-        if let Some(existing) = self.entries.get(&key) {
-            if existing.upstream == upstream {
-                return Ok(existing.mapped_port);
+        loop {
+            if let Some(existing) = self.entries.get(&key) {
+                let slot = Arc::clone(existing.value());
+                drop(existing);
+                if slot.upstream == upstream {
+                    return slot.ensure_port(self, &key).await;
+                }
+                slot.shutdown();
+                self.entries.remove(&key);
+                continue;
             }
-            let shutdown_tx = existing.shutdown_tx.clone();
-            drop(existing);
-            let _ = shutdown_tx.send(true);
-            self.entries.remove(&key);
+
+            let slot = Arc::new(LocalUrlProxySlot::new(upstream.clone()));
+            match self.entries.entry(key.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => continue,
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(Arc::clone(&slot));
+                    return slot.ensure_port(self, &key).await;
+                }
+            }
         }
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-        let mapped_port = listener.local_addr()?.port();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let task_upstream = upstream.clone();
-        let task_key = key.clone();
-        let manager = Arc::clone(self);
-
-        tokio::spawn(async move {
-            run_proxy_listener(listener, task_upstream, shutdown_rx).await;
-            manager.remove_entry(&task_key, mapped_port);
-        });
-
-        self.entries.insert(
-            key,
-            LocalUrlProxyEntry {
-                mapped_port,
-                upstream,
-                shutdown_tx,
-            },
-        );
-
-        Ok(mapped_port)
     }
 
-    fn remove_entry(self: &Arc<Self>, key: &LocalUrlProxyKey, mapped_port: u16) {
-        if let Some(entry) = self.entries.get(key)
-            && entry.mapped_port == mapped_port
+    fn remove_entry(self: &Arc<Self>, key: &LocalUrlProxyKey, slot: &Arc<LocalUrlProxySlot>) {
+        if let Some(current) = self.entries.get(key)
+            && Arc::ptr_eq(current.value(), slot)
         {
-            drop(entry);
+            drop(current);
             self.entries.remove(key);
         }
     }
