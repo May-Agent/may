@@ -6,7 +6,8 @@ use crate::db::ChatDb;
 
 use super::{
     PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
-    PersistedPermissionRequest, SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
+    PersistedPermissionRequest, PersistedWorkspaceRequest, SessionPlanState, SessionRuntimeState,
+    SessionRuntimeSummary,
 };
 
 #[derive(Clone)]
@@ -138,6 +139,16 @@ impl SessionRuntimeService {
         request: Option<PersistedPermissionRequest>,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.set_waiting_permission(session_id, request).await?;
+        self.notify_ui();
+        Ok(summary)
+    }
+
+    pub async fn set_waiting_workspace(
+        &self,
+        session_id: &str,
+        request: Option<PersistedWorkspaceRequest>,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self.db.set_waiting_workspace(session_id, request).await?;
         self.notify_ui();
         Ok(summary)
     }

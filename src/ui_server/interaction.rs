@@ -4,13 +4,13 @@ use skyzen::Result as SkyResult;
 use skyzen::utils::{Json, State};
 
 use crate::ask_user::QuestionAnswer;
-use crate::session::history::{AskUserResponseData, PermissionResponseData};
+use crate::session::history::{AskUserResponseData, PermissionResponseData, WorkspaceResponseData};
 use crate::session::{ChatMessage, SessionId};
 
 use super::error::{bad_request_error, internal_error};
 use super::helpers::{append_history_message, parse_ui_answer_value};
 use super::state::{AskUserRespondRequest, UiServerState};
-use super::types::{PermissionRespondRequest, SessionRuntimeResponse};
+use super::types::{PermissionRespondRequest, SessionRuntimeResponse, WorkspaceRespondRequest};
 
 pub(super) async fn respond_permission_request(
     Json(req): Json<PermissionRespondRequest>,
@@ -114,6 +114,56 @@ pub(super) async fn respond_ask_user_request(
             session_id.as_str(),
             "ask_user",
             "answered",
+        )
+        .await
+        .map_err(internal_error)?;
+    }
+
+    Ok(Json(runtime.into()))
+}
+
+pub(super) async fn respond_workspace_request(
+    Json(req): Json<WorkspaceRespondRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<SessionRuntimeResponse>> {
+    let pending = state
+        .db()
+        .await
+        .find_pending_workspace_request(&req.id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request_error("workspace request not found or already resolved"))?;
+    let session_id = pending.session_id;
+
+    let responded = state.workspace_approver.respond(&req.id, req.approved);
+
+    let mut runtime = state
+        .runtime_service
+        .set_waiting_workspace(&session_id, None)
+        .await
+        .map_err(internal_error)?;
+    if !responded {
+        tracing::warn!(request_id = %req.id, session_id = %session_id, "workspace response arrived without a live waiter");
+    }
+
+    let data = WorkspaceResponseData {
+        id: req.id.clone(),
+        approved: req.approved,
+    };
+    let session_id = SessionId::from(session_id);
+    let _ =
+        append_history_message(&state, &session_id, ChatMessage::workspace_response(&data)).await;
+    if !responded {
+        state
+            .runtime_service
+            .set_state(session_id.as_str(), crate::session::SessionRuntimeState::Idle)
+            .await
+            .map_err(internal_error)?;
+        runtime = super::chat::schedule_waiting_turn_resume(
+            &state,
+            session_id.as_str(),
+            "workspace",
+            if req.approved { "approved" } else { "denied" },
         )
         .await
         .map_err(internal_error)?;

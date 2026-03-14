@@ -648,9 +648,22 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: U
         register_subagents,
     } = queues;
 
+    let workspace_state = state.clone();
     tokio::spawn(async move {
         while let Some(request) = workspace.next().await {
-            let _ = request.respond(false);
+            let session_id = request.args.session_id.clone();
+            let approved = match workspace_state
+                .workspace_approver
+                .request_and_wait(session_id.as_str(), request.args.request.clone())
+                .await
+            {
+                Ok(approved) => approved,
+                Err(error) => {
+                    tracing::error!(session_id = %session_id, error = %error, "workspace request failed");
+                    false
+                }
+            };
+            let _ = request.respond(approved);
         }
     });
 

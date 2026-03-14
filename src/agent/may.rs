@@ -986,7 +986,10 @@ impl MayAgent {
         let websearch = WebSearchTool::default();
         let webfetch = WebFetchTool::new();
         let ask = AskCommand::new(fast_llm);
-        let request_workspace = RequestWorkspaceTool::new(config.workspace_request_broker);
+        let request_workspace = RequestWorkspaceTool::new(
+            config.session_id.as_str().to_string(),
+            config.workspace_request_broker,
+        );
         let ssh_authorizer_broker = config.ask_user_broker.clone();
         let ask_user = AskUserTool::new(config.ask_user_broker);
         let session_tool = SessionTool::new(

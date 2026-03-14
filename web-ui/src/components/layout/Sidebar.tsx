@@ -137,6 +137,8 @@ function sessionStatusLabel(state: SessionRuntimeState | undefined, queuedCount:
       return 'Running';
     case 'waiting_permission':
       return 'Waiting permission';
+    case 'waiting_workspace':
+      return 'Waiting workspace';
     case 'waiting_ask_user':
       return 'Waiting user';
     case 'waiting_terminal_input':

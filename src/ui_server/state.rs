@@ -18,7 +18,7 @@ use crate::live_response::LiveResponseRegistry;
 use crate::mcp::McpManager;
 use crate::session::SessionManager;
 use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
-use crate::workspace_request::{WorkspaceRequestBroker, WorkspaceRequestQueue};
+use crate::workspace_request::{RequestWorkspaceArgs, WorkspaceRequestBroker, WorkspaceRequestQueue};
 use super::local_url_mapper::LocalUrlPortMapper;
 use super::types::{ModelsResponse, ProviderModelsResponse};
 
@@ -157,6 +157,7 @@ pub(crate) struct UiServerState {
     pub(crate) session_manager: Mutex<SessionManager>,
     pub(crate) mcp_manager: Mutex<McpManager>,
     pub(crate) permission_approver: PermissionApprover,
+    pub(crate) workspace_approver: WorkspaceApprover,
     pub(crate) ask_user_approver: AskUserApprover,
     pub(crate) tool_dispatchers: UiToolDispatchers,
     pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,
@@ -203,6 +204,12 @@ pub(crate) struct AskUserRespondRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct AskUserApprover {
     live_responses: Arc<LiveResponseRegistry<Vec<QuestionAnswer>>>,
+    runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceApprover {
+    live_responses: Arc<LiveResponseRegistry<bool>>,
     runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
 }
 
@@ -325,6 +332,89 @@ impl AskUserApprover {
 
     pub(crate) fn respond(&self, request_id: &str, answers: Vec<QuestionAnswer>) -> bool {
         self.live_responses.resolve(request_id, answers)
+    }
+}
+
+impl WorkspaceApprover {
+    pub(crate) fn new() -> Self {
+        Self {
+            live_responses: Arc::new(LiveResponseRegistry::new()),
+            runtime_service: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_service(
+        mut self,
+        runtime_service: Arc<crate::session::SessionRuntimeService>,
+    ) -> Self {
+        self.runtime_service = Some(runtime_service);
+        self
+    }
+
+    fn persisted_request(
+        request_id: String,
+        session_id: &str,
+        request: &RequestWorkspaceArgs,
+    ) -> crate::session::PersistedWorkspaceRequest {
+        crate::session::PersistedWorkspaceRequest {
+            id: request_id,
+            request: crate::session::PersistedWorkspaceRequestPayload {
+                path: request.path.clone(),
+                reason: request.reason.clone(),
+                session_id: Some(session_id.to_string()),
+            },
+        }
+    }
+
+    pub(crate) async fn request_and_wait(
+        &self,
+        session_id: &str,
+        request: RequestWorkspaceArgs,
+    ) -> anyhow::Result<bool> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let rx = self.live_responses.open(request_id.clone());
+
+        if let Some(runtime_service) = self.runtime_service.clone() {
+            runtime_service
+                .set_waiting_workspace(
+                    session_id,
+                    Some(Self::persisted_request(
+                        request_id.clone(),
+                        session_id,
+                        &request,
+                    )),
+                )
+                .await
+                .map_err(anyhow::Error::from)?;
+
+            let content = serde_json::to_string(&crate::session::history::WorkspaceRequestData {
+                id: request_id.clone(),
+                path: request.path.clone(),
+                reason: request.reason.clone(),
+            })
+            .expect("workspace request content must serialize");
+            runtime_service
+                .db()
+                .append_message(
+                    session_id,
+                    MessageRole::WorkspaceRequest,
+                    &content,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
+
+        rx.recv()
+            .await
+            .map_err(|_| anyhow::anyhow!("workspace request interrupted"))
+    }
+
+    pub(crate) fn respond(&self, request_id: &str, approved: bool) -> bool {
+        self.live_responses.resolve(request_id, approved)
     }
 }
 

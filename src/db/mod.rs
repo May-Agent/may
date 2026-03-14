@@ -18,8 +18,8 @@ use sea_orm::{
 
 use crate::session::{
     BrowserInteractionState, MessageRole, PendingUserMessage, PersistedAskUserRequest,
-    PersistedPermissionRequest, SessionInteractionState, SessionPlanState, SessionRuntimeState,
-    SessionRuntimeSummary,
+    PersistedPermissionRequest, PersistedWorkspaceRequest, SessionInteractionState,
+    SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
 };
 use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 use crate::xml_fragment::XmlFragment;
@@ -27,7 +27,8 @@ use entity::{
     context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox, profile_memories,
     profile_memory_jobs, profiles, push_subscriptions, request_logs, scheduled_task_runs,
     scheduled_tasks, session_context_snapshots, session_pending_ask_user, session_pending_messages,
-    session_pending_permissions, session_plans, session_run_leases, session_runtimes, sessions,
+    session_pending_permissions, session_pending_workspace, session_plans, session_run_leases,
+    session_runtimes, sessions,
 };
 
 /// Error type for database operations.
@@ -135,6 +136,11 @@ pub(crate) struct PendingPermissionLookup {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingAskUserLookup {
+    pub(crate) session_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingWorkspaceLookup {
     pub(crate) session_id: String,
 }
 
@@ -325,6 +331,13 @@ impl ChatDb {
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
 
+        let pending_workspace_stmt =
+            schema.create_table_from_entity(session_pending_workspace::Entity);
+        let create_sql = pending_workspace_stmt
+            .to_string(SqliteQueryBuilder)
+            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        conn.execute_unprepared(&create_sql).await?;
+
         // Create indexes
         conn.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id)",
@@ -396,6 +409,10 @@ impl ChatDb {
         .await?;
         conn.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_session_pending_ask_user_session ON session_pending_ask_user(session_id)",
+        )
+        .await?;
+        conn.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_session_pending_workspace_session ON session_pending_workspace(session_id)",
         )
         .await?;
 
@@ -483,6 +500,10 @@ impl ChatDb {
             .filter(session_pending_permissions::Column::SessionId.eq(session_id))
             .one(&self.conn)
             .await?;
+        let workspace_row = session_pending_workspace::Entity::find()
+            .filter(session_pending_workspace::Column::SessionId.eq(session_id))
+            .one(&self.conn)
+            .await?;
         let ask_user_row = session_pending_ask_user::Entity::find()
             .filter(session_pending_ask_user::Column::SessionId.eq(session_id))
             .one(&self.conn)
@@ -545,6 +566,14 @@ impl ChatDb {
                 request: crate::session::PersistedPermissionRequestPayload {
                     mode: row.mode,
                     script: row.script,
+                    session_id: Some(row.session_id),
+                },
+            }),
+            waiting_workspace: workspace_row.map(|row| PersistedWorkspaceRequest {
+                id: row.request_id,
+                request: crate::session::PersistedWorkspaceRequestPayload {
+                    path: row.path,
+                    reason: row.reason,
                     session_id: Some(row.session_id),
                 },
             }),
@@ -657,6 +686,25 @@ impl ChatDb {
                 session_id: Set(session_id.to_string()),
                 mode: Set(request.request.mode.clone()),
                 script: Set(request.request.script.clone()),
+                created_at: Set(summary
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| jiff::Timestamp::now().to_string())),
+            }
+            .insert(&self.conn)
+            .await?;
+        }
+
+        session_pending_workspace::Entity::delete_many()
+            .filter(session_pending_workspace::Column::SessionId.eq(session_id))
+            .exec(&self.conn)
+            .await?;
+        if let Some(request) = &summary.waiting_workspace {
+            session_pending_workspace::ActiveModel {
+                request_id: Set(request.id.clone()),
+                session_id: Set(session_id.to_string()),
+                path: Set(request.request.path.clone()),
+                reason: Set(request.request.reason.clone()),
                 created_at: Set(summary
                     .updated_at
                     .clone()
@@ -868,6 +916,28 @@ impl ChatDb {
         Ok(summary)
     }
 
+    /// Persist a waiting workspace request for refresh-safe recovery.
+    pub async fn set_waiting_workspace(
+        &self,
+        session_id: &str,
+        request: Option<PersistedWorkspaceRequest>,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let session = self.get_session(session_id).await?.ok_or_else(|| {
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
+        })?;
+        let mut summary = self.load_session_runtime_summary(&session.id).await?;
+        summary.waiting_workspace = request;
+        if summary.waiting_workspace.is_none() {
+            summary.state = SessionRuntimeState::Running;
+        }
+        summary.normalize_state();
+        self.write_session_runtime_summary(session_id, &summary)
+            .await?;
+        Ok(summary)
+    }
+
     /// Persist a waiting ask-user request for refresh-safe recovery.
     pub async fn set_waiting_ask_user(
         &self,
@@ -982,6 +1052,22 @@ impl ChatDb {
         };
 
         Ok(Some(PendingPermissionLookup {
+            session_id: row.session_id,
+        }))
+    }
+
+    pub(crate) async fn find_pending_workspace_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PendingWorkspaceLookup>, ChatDbError> {
+        let Some(row) = session_pending_workspace::Entity::find_by_id(request_id)
+            .one(&self.conn)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(PendingWorkspaceLookup {
             session_id: row.session_id,
         }))
     }
@@ -2456,6 +2542,13 @@ impl ChatDb {
                 .into_iter()
                 .map(|row| row.session_id),
         );
+        active_session_ids.extend(
+            session_pending_workspace::Entity::find()
+                .all(&self.conn)
+                .await?
+                .into_iter()
+                .map(|row| row.session_id),
+        );
 
         let mut query = sessions::Entity::find()
             .filter(sessions::Column::Pinned.eq(false))
@@ -2988,7 +3081,7 @@ mod tests {
     use crate::session::{
         PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
         PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
-        SessionRuntimeState,
+        PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload, SessionRuntimeState,
     };
 
     use super::{ChatDb, CreateProfileParams, CreateScheduledTaskParams};
@@ -3612,6 +3705,19 @@ mod tests {
         )
         .await
         .expect("waiting ask-user should persist");
+        db.set_waiting_workspace(
+            session_id,
+            Some(PersistedWorkspaceRequest {
+                id: "workspace-1".to_string(),
+                request: PersistedWorkspaceRequestPayload {
+                    path: "/tmp/project".to_string(),
+                    reason: "Need write access".to_string(),
+                    session_id: Some(session_id.to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("waiting workspace should persist");
 
         db.recover_session_runtimes_after_restart()
             .await
@@ -3624,6 +3730,7 @@ mod tests {
             .expect("runtime should exist");
         assert_eq!(runtime.state, SessionRuntimeState::WaitingPermission);
         assert!(runtime.waiting_permission.is_some());
+        assert!(runtime.waiting_workspace.is_some());
         assert!(runtime.waiting_ask_user.is_some());
         assert!(runtime.has_pending_immediate());
         assert_eq!(runtime.queued_count, 1);

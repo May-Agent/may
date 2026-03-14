@@ -10,6 +10,7 @@ pub enum SessionRuntimeState {
     Idle,
     Running,
     WaitingPermission,
+    WaitingWorkspace,
     WaitingAskUser,
     WaitingTerminalInput,
 }
@@ -22,6 +23,7 @@ impl SessionRuntimeState {
             Self::Idle => "idle",
             Self::Running => "running",
             Self::WaitingPermission => "waiting_permission",
+            Self::WaitingWorkspace => "waiting_workspace",
             Self::WaitingAskUser => "waiting_ask_user",
             Self::WaitingTerminalInput => "waiting_terminal_input",
         }
@@ -48,6 +50,7 @@ impl core::str::FromStr for SessionRuntimeState {
             "idle" => Ok(Self::Idle),
             "running" => Ok(Self::Running),
             "waiting_permission" => Ok(Self::WaitingPermission),
+            "waiting_workspace" => Ok(Self::WaitingWorkspace),
             "waiting_ask_user" => Ok(Self::WaitingAskUser),
             "waiting_terminal_input" => Ok(Self::WaitingTerminalInput),
             other => {
@@ -147,6 +150,14 @@ pub struct PersistedAskUserRequest {
     pub questions: Vec<PersistedAskUserQuestion>,
 }
 
+/// Persisted workspace request visible after refresh.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedWorkspaceRequest {
+    pub id: String,
+    pub request: PersistedWorkspaceRequestPayload,
+}
+
 /// Persisted runtime summary used by session lists and runtime endpoints.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -165,6 +176,8 @@ pub struct SessionRuntimeSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_permission: Option<PersistedPermissionRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_workspace: Option<PersistedWorkspaceRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_ask_user: Option<PersistedAskUserRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -180,6 +193,7 @@ impl Default for SessionRuntimeSummary {
             pending_immediate: None,
             queued_messages: Vec::new(),
             waiting_permission: None,
+            waiting_workspace: None,
             waiting_ask_user: None,
             updated_at: None,
         }
@@ -194,6 +208,16 @@ pub struct PersistedPermissionRequest {
     pub request: PersistedPermissionRequestPayload,
 }
 
+/// Persisted workspace request payload visible after refresh.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedWorkspaceRequestPayload {
+    pub path: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
 impl SessionRuntimeSummary {
     /// Keep overflow steer messages ahead of regular queued work.
     pub fn push_overflow_steer(&mut self, message: PendingUserMessage) {
@@ -206,11 +230,15 @@ impl SessionRuntimeSummary {
             self.queued_messages.len() + usize::from(self.pending_immediate.is_some());
         self.state = if self.waiting_permission.is_some() {
             SessionRuntimeState::WaitingPermission
+        } else if self.waiting_workspace.is_some() {
+            SessionRuntimeState::WaitingWorkspace
         } else if self.waiting_ask_user.is_some() {
             SessionRuntimeState::WaitingAskUser
         } else if matches!(
             self.state,
-            SessionRuntimeState::WaitingPermission | SessionRuntimeState::WaitingAskUser
+            SessionRuntimeState::WaitingPermission
+                | SessionRuntimeState::WaitingWorkspace
+                | SessionRuntimeState::WaitingAskUser
         ) {
             SessionRuntimeState::Idle
         } else if self.state == SessionRuntimeState::WaitingTerminalInput {

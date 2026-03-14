@@ -24,6 +24,13 @@ export interface PermissionRequest {
   sessionId?: string;
 }
 
+export interface WorkspaceRequest {
+  id: string;
+  path: string;
+  reason: string;
+  sessionId?: string;
+}
+
 export interface SessionRuntimeStatus {
   state: SessionRuntimeState;
   planState: SessionPlanState;
@@ -36,6 +43,7 @@ export interface SessionRuntimeStatus {
   pendingImmediate?: PendingUserMessage | null;
   queuedMessages: PendingUserMessage[];
   waitingPermission?: PermissionRequest | null;
+  waitingWorkspace?: WorkspaceRequest | null;
   waitingAskUser?: AskUserRequest | null;
 }
 
@@ -1117,6 +1125,17 @@ export async function respondPermissionRequest(
   approved: boolean,
 ): Promise<SessionRuntimeStatus> {
   return request<SessionRuntimeStatus>('/api/permissions/respond', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ id, approved }),
+  });
+}
+
+export async function respondWorkspaceRequest(
+  id: string,
+  approved: boolean,
+): Promise<SessionRuntimeStatus> {
+  return request<SessionRuntimeStatus>('/api/workspace/respond', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ id, approved }),

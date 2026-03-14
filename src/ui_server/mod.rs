@@ -41,7 +41,8 @@ use aither_models::lookup as lookup_model_info;
 
 use error::internal_error;
 use state::{
-    AskUserApprover, SessionRunCancellationRegistry, UiServerState, tool_dispatch_channels,
+    AskUserApprover, SessionRunCancellationRegistry, UiServerState, WorkspaceApprover,
+    tool_dispatch_channels,
 };
 use types::{
     ApiHealth, ModelInfoItem, ModelsResponse, ProviderModelsItem, ProviderModelsResponse,
@@ -135,6 +136,8 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     ));
     let permission_approver = crate::agent::PermissionApprover::new()
         .with_runtime_service(runtime_service.clone());
+    let workspace_approver =
+        WorkspaceApprover::new().with_runtime_service(runtime_service.clone());
     let ask_user_approver =
         AskUserApprover::new().with_runtime_service(runtime_service.clone());
 
@@ -184,6 +187,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         session_manager: Mutex::new(session_manager),
         mcp_manager: Mutex::new(mcp_manager),
         permission_approver,
+        workspace_approver,
         ask_user_approver,
         tool_dispatchers,
         run_cancellation_registry: SessionRunCancellationRegistry::new(),
@@ -314,6 +318,7 @@ fn api_routes() -> Route {
                 "/enqueue".post(enqueue_chat),
             ))),
             "/permissions".route(Route::new(("/respond".post(respond_permission_request),))),
+            "/workspace".route(Route::new(("/respond".post(respond_workspace_request),))),
             "/ask-user".route(Route::new(("/respond".post(respond_ask_user_request),))),
             "/config".route(Route::new((
                 "".at(get_ui_config),

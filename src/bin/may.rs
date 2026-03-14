@@ -361,8 +361,8 @@ where
 
             Event::Workspace(request) => {
                 tracing::info!(
-                    path = %request.args.path,
-                    reason = %request.args.reason,
+                    path = %request.args.request.path,
+                    reason = %request.args.request.reason,
                     "Workspace access requested"
                 );
                 app.mode = may_agent::tui::AppMode::WorkspaceConfirm(request);
