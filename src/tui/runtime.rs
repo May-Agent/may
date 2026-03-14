@@ -166,6 +166,13 @@ impl RuntimeDeps {
         session_id: SessionId,
         model: &str,
     ) -> anyhow::Result<AgentWorker> {
+        let db = app.session_manager.db().clone();
+        let session_id_string = session_id.as_str().to_string();
+        let history_messages = app
+            .session_manager
+            .current()
+            .map(|session| session.history.to_aither_messages())
+            .unwrap_or_default();
         let may_dir = app.session_manager.may_dir().to_path_buf();
         let profile_model = if let Some(profile_id) = app
             .session_manager
@@ -232,7 +239,7 @@ impl RuntimeDeps {
             &session_id,
         )
         .await?;
-        let agent = MayAgent::from_config_with_model_and_permissions(
+        let mut agent = MayAgent::from_config_with_model_and_permissions(
             &app.config,
             sandbox_dir,
             may_dir,
@@ -256,7 +263,25 @@ impl RuntimeDeps {
         )
         .await?;
 
-        Ok(spawn_worker(DefaultExecutor, agent))
+        if let Some(snapshot) =
+            crate::session::load_persisted_context_snapshot(&db, &session_id_string).await?
+        {
+            agent
+                .restore_context_json(&snapshot.context_json)
+                .map_err(anyhow::Error::from)?;
+            for message in crate::session::history_delta_since_snapshot(
+                &history_messages,
+                snapshot.history_message_count,
+            )? {
+                agent.push_message(message);
+            }
+        } else {
+            for message in history_messages {
+                agent.push_message(message);
+            }
+        }
+
+        Ok(spawn_worker(DefaultExecutor, agent, db))
     }
 
     fn spawn_title_generation(

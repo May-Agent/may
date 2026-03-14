@@ -21,14 +21,6 @@ use super::types::{
     UpdateSessionRequest,
 };
 
-#[derive(serde::Deserialize)]
-struct StoredContextWindowMetadata {
-    phase: aither_agent::ContextWindowPhase,
-    metrics: aither_agent::ContextWindowMetrics,
-    #[serde(default, rename = "history_message_count")]
-    _history_message_count: usize,
-}
-
 pub(super) async fn list_sessions(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<ApiSession>>> {
@@ -181,7 +173,7 @@ fn build_window_snapshot(
     let metadata_json = snapshot
         .metadata_json
         .ok_or_else(|| internal_error("session context snapshot is missing metadata_json"))?;
-    let stored: StoredContextWindowMetadata = serde_json::from_str(&metadata_json)
+    let stored: crate::session::StoredContextWindowMetadata = serde_json::from_str(&metadata_json)
         .map_err(|e| internal_error(format!("invalid session context metadata_json: {e}")))?;
     let assembled_messages_json = snapshot.assembled_messages_json.ok_or_else(|| {
         internal_error("session context snapshot is missing assembled_messages_json")

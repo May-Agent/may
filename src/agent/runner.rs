@@ -23,6 +23,7 @@ use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
 use futures_lite::StreamExt;
 
+use crate::db::ChatDb;
 use crate::MayAgent;
 
 /// Events sent from the agent background task to the TUI.
@@ -145,16 +146,20 @@ impl AgentHandle {
 ///
 /// The agent is moved into a background task. Use the returned `AgentWorker`
 /// to send prompts and receive events.
-pub fn spawn_worker<E: Executor + 'static>(executor: E, agent: MayAgent) -> AgentWorker {
+pub fn spawn_worker<E: Executor + 'static>(
+    executor: E,
+    agent: MayAgent,
+    snapshot_db: ChatDb,
+) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
 
-    executor.spawn(run_worker(agent, command_rx)).detach();
+    executor.spawn(run_worker(agent, command_rx, snapshot_db)).detach();
 
     AgentWorker { command_tx }
 }
 
 /// The worker loop that owns and runs the agent.
-async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>) {
+async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>, snapshot_db: ChatDb) {
     loop {
         // Wait for a command
         let Ok(command) = command_rx.recv().await else {
@@ -168,10 +173,35 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>) {
                 attachments,
                 event_tx,
             } => {
-                run_agent_prompt(&mut agent, &prompt, attachments, &command_rx, &event_tx).await;
+                let completed = run_agent_prompt(
+                    &mut agent,
+                    &prompt,
+                    attachments,
+                    &command_rx,
+                    &event_tx,
+                )
+                .await;
+                if completed {
+                    let session_id = agent.session_id().as_str().to_string();
+                    let _ = crate::session::persist_agent_context_snapshot(
+                        &snapshot_db,
+                        &session_id,
+                        &mut agent,
+                    )
+                    .await;
+                }
             }
             WorkerCommand::Compact { focus, event_tx } => {
                 let result = agent.compact(focus.as_deref()).await;
+                if result.is_ok() {
+                    let session_id = agent.session_id().as_str().to_string();
+                    let _ = crate::session::persist_agent_context_snapshot(
+                        &snapshot_db,
+                        &session_id,
+                        &mut agent,
+                    )
+                    .await;
+                }
                 let _ = event_tx.send(TuiEvent::Compacted(result)).await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }
@@ -192,9 +222,8 @@ async fn run_agent_prompt(
     attachments: Vec<url::Url>,
     command_rx: &Receiver<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
-) {
+) -> bool {
     let mut stream = std::pin::pin!(agent.run(prompt, attachments));
-    let mut cancelled = false;
 
     loop {
         // Race between stream event and cancel command
@@ -234,26 +263,24 @@ async fn run_agent_prompt(
         match event {
             Some(TuiEvent::Complete) => {
                 let _ = event_tx.send(TuiEvent::Complete).await;
-                break;
+                return true;
             }
             Some(tui_event) => {
                 if event_tx.send(tui_event).await.is_err() {
                     // Receiver dropped, stop processing
-                    break;
+                    return false;
                 }
             }
             None => {
                 // Cancelled
-                cancelled = true;
                 break;
             }
         }
     }
 
-    if cancelled {
-        // Send completion after cancel so TUI knows processing stopped
-        let _ = event_tx.send(TuiEvent::Complete).await;
-    }
+    // Send completion after cancel so TUI knows processing stopped
+    let _ = event_tx.send(TuiEvent::Complete).await;
+    false
 }
 
 #[cfg(test)]
