@@ -24,9 +24,9 @@ use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 use crate::xml_fragment::XmlFragment;
 use entity::{
     context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox, profile_memories,
-    profile_memory_jobs, profiles, push_subscriptions, request_logs, scheduled_tasks, session_context_snapshots,
-    session_pending_ask_user, session_pending_messages, session_pending_permissions, session_plans,
-    session_runtimes, sessions,
+    profile_memory_jobs, profiles, push_subscriptions, request_logs, scheduled_task_runs,
+    scheduled_tasks, session_context_snapshots, session_pending_ask_user, session_pending_messages,
+    session_pending_permissions, session_plans, session_runtimes, sessions,
 };
 
 /// Error type for database operations.
@@ -221,6 +221,12 @@ impl ChatDb {
         // Scheduled tasks table
         let tasks_stmt = schema.create_table_from_entity(scheduled_tasks::Entity);
         let create_sql = tasks_stmt
+            .to_string(SqliteQueryBuilder)
+            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        conn.execute_unprepared(&create_sql).await?;
+
+        let task_runs_stmt = schema.create_table_from_entity(scheduled_task_runs::Entity);
+        let create_sql = task_runs_stmt
             .to_string(SqliteQueryBuilder)
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
@@ -1122,6 +1128,23 @@ impl ChatDb {
                 self.write_session_runtime_summary(&session_id, &summary)
                     .await?;
             }
+        }
+        Ok(())
+    }
+
+    pub async fn recover_task_runs_after_restart(&self) -> Result<(), ChatDbError> {
+        let running = scheduled_task_runs::Entity::find()
+            .filter(scheduled_task_runs::Column::Status.eq("running"))
+            .all(&self.conn)
+            .await?;
+        let finished_at = jiff::Timestamp::now().to_string();
+        for run in running {
+            let mut active: scheduled_task_runs::ActiveModel = run.into();
+            active.status = Set("interrupted".to_string());
+            active.output = Set(Some("May server restarted before the task run completed".to_string()));
+            active.finished_at = Set(Some(finished_at.clone()));
+            active.updated_at = Set(finished_at.clone());
+            active.update(&self.conn).await?;
         }
         Ok(())
     }
@@ -2529,6 +2552,51 @@ impl ChatDb {
         Ok(())
     }
 
+    pub async fn start_task_run(
+        &self,
+        id: &str,
+        task: &scheduled_tasks::Model,
+        invocation_kind: &str,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        scheduled_task_runs::ActiveModel {
+            id: Set(id.to_string()),
+            task_id: Set(task.id.clone()),
+            profile_id: Set(task.profile_id.clone()),
+            session_id: Set(task.session_id.clone()),
+            invocation_kind: Set(invocation_kind.to_string()),
+            status: Set("running".to_string()),
+            output: Set(None),
+            started_at: Set(now.clone()),
+            finished_at: Set(None),
+            updated_at: Set(now),
+        }
+        .insert(&self.conn)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn finish_task_run(
+        &self,
+        id: &str,
+        status: &str,
+        output: Option<&str>,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        let mut active: scheduled_task_runs::ActiveModel =
+            scheduled_task_runs::Entity::find_by_id(id)
+                .one(&self.conn)
+                .await?
+                .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?
+                .into();
+        active.status = Set(status.to_string());
+        active.output = Set(output.map(ToOwned::to_owned));
+        active.finished_at = Set(Some(now.clone()));
+        active.updated_at = Set(now);
+        active.update(&self.conn).await?;
+        Ok(())
+    }
+
     /// List enabled and approved tasks.
     ///
     /// Due-ness is resolved by the scheduler runtime because it depends on
@@ -3590,5 +3658,54 @@ mod tests {
         assert!(second.has_callback);
         assert!(!second.callback_consumed);
         assert_eq!(second.callback_message.as_deref(), Some("Follow up"));
+    }
+
+    #[tokio::test]
+    async fn task_run_recovery_marks_running_runs_interrupted() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "task-1",
+            profile_id: "profile-1",
+            session_id: Some("session-1"),
+            name: "Demo task",
+            trigger_kind: "event",
+            trigger_type: "chat.turn.completed",
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo hi"),
+            needs_network: false,
+        })
+        .await
+        .expect("task should persist");
+        let task = db
+            .get_scheduled_task("task-1")
+            .await
+            .expect("task lookup should succeed")
+            .expect("task should exist");
+        db.start_task_run("run-1", &task, "event")
+            .await
+            .expect("task run should persist");
+
+        db.recover_task_runs_after_restart()
+            .await
+            .expect("task run recovery should succeed");
+
+        let recovered = scheduled_task_runs::Entity::find_by_id("run-1")
+            .one(&db.conn)
+            .await
+            .expect("task run lookup should succeed")
+            .expect("task run should exist");
+        assert_eq!(recovered.status, "interrupted");
+        assert!(recovered.finished_at.is_some());
+        assert_eq!(
+            recovered.output.as_deref(),
+            Some("May server restarted before the task run completed")
+        );
     }
 }

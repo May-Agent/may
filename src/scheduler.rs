@@ -545,8 +545,11 @@ impl TaskRuntime {
         })
     }
 
-    pub fn run_manual_task(&self, task: scheduled_tasks::Model) {
-        self.spawn_task(task, TaskInvocation::Manual);
+    pub async fn run_manual_task(
+        &self,
+        task: scheduled_tasks::Model,
+    ) -> Result<(), crate::db::ChatDbError> {
+        self.spawn_task(task, TaskInvocation::Manual).await
     }
 
     /// Check for due tasks and execute them.
@@ -558,13 +561,13 @@ impl TaskRuntime {
             let is_due = self.is_due(task, now)?;
 
             if is_due {
-                self.execute_task(
-                    task,
+                self.spawn_task(
+                    task.clone(),
                     TaskInvocation::Time {
                         trigger_type: task.trigger_type.clone(),
                     },
                 )
-                .await;
+                .await?;
             }
         }
 
@@ -607,7 +610,8 @@ impl TaskRuntime {
                     profile_id: profile_id.map(ToOwned::to_owned),
                     session_id: session_id.map(ToOwned::to_owned),
                 },
-            );
+            )
+            .await?;
         }
 
         Ok(dispatched)
@@ -627,7 +631,8 @@ impl TaskRuntime {
                     token: token.clone(),
                     request: request.clone(),
                 },
-            );
+            )
+            .await?;
         }
         Ok(triggered)
     }
@@ -720,11 +725,20 @@ impl TaskRuntime {
         Ok(now >= target)
     }
 
-    fn spawn_task(&self, task: scheduled_tasks::Model, invocation: TaskInvocation) {
+    async fn spawn_task(
+        &self,
+        task: scheduled_tasks::Model,
+        invocation: TaskInvocation,
+    ) -> Result<(), crate::db::ChatDbError> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        self.db
+            .start_task_run(&run_id, &task, Self::invocation_kind(&invocation))
+            .await?;
         let runtime = self.clone();
         tokio::spawn(async move {
-            runtime.execute_task(&task, invocation).await;
+            runtime.execute_task(run_id.as_str(), &task, invocation).await;
         });
+        Ok(())
     }
 
     async fn validate_task_script_for_profile_model(
@@ -747,7 +761,12 @@ impl TaskRuntime {
     }
 
     /// Execute a task (run its script).
-    async fn execute_task(&self, task: &scheduled_tasks::Model, invocation: TaskInvocation) {
+    async fn execute_task(
+        &self,
+        run_id: &str,
+        task: &scheduled_tasks::Model,
+        invocation: TaskInvocation,
+    ) {
         tracing::info!(
             task_id = %task.id,
             name = %task.name,
@@ -767,6 +786,13 @@ impl TaskRuntime {
                     .await
                 {
                     tracing::error!(task_id = %task.id, error = %e, "Failed to record task run");
+                }
+                if let Err(error) = self
+                    .db
+                    .finish_task_run(run_id, "success", Some(&truncated))
+                    .await
+                {
+                    tracing::error!(task_id = %task.id, run_id, error = %error, "Failed to record task run history");
                 }
 
                 if let Some(ref notifier) = self.notifier {
@@ -802,6 +828,13 @@ impl TaskRuntime {
                     .await
                 {
                     tracing::error!(task_id = %task.id, error = %e, "Failed to record task run");
+                }
+                if let Err(error) = self
+                    .db
+                    .finish_task_run(run_id, "failed", Some(&truncated))
+                    .await
+                {
+                    tracing::error!(task_id = %task.id, run_id, error = %error, "Failed to record task run history");
                 }
 
                 if let Some(ref notifier) = self.notifier {

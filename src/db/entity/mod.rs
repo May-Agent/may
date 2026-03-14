@@ -11,6 +11,7 @@ pub mod profiles;
 pub mod push_subscriptions;
 pub mod request_logs;
 pub mod scheduled_tasks;
+pub mod scheduled_task_runs;
 pub mod session_context_snapshots;
 pub mod session_pending_ask_user;
 pub mod session_pending_messages;
