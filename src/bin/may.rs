@@ -383,6 +383,16 @@ fn render_oneshot_event(
         Ok(AgentEvent::TerminalInputNeeded { task_id, notice }) => {
             writeln!(stderr, "[terminal_input_needed] task_id={task_id:?} notice={notice}")?;
         }
+        Ok(AgentEvent::SkillActivated {
+            name,
+            matched_trigger,
+            allowed_tools,
+        }) => {
+            writeln!(
+                stderr,
+                "[skill_activated] name={name} matched_trigger={matched_trigger:?} allowed_tools={allowed_tools:?}"
+            )?;
+        }
         Ok(AgentEvent::Usage(usage)) => {
             writeln!(
                 stderr,
