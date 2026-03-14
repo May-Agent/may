@@ -108,6 +108,13 @@ export interface NetworkAccessLogsPayload {
   items: NetworkAccessLogEntry[];
 }
 
+export interface NotificationCallbackPayload {
+  notificationId: string;
+  sessionId?: string | null;
+  callbackContextXml?: string | null;
+  callbackMessage?: string | null;
+}
+
 export interface UiEventsSubscription {
   sessionId?: string;
   profileId?: string;
@@ -1734,4 +1741,15 @@ export async function sendTestNotification(
     headers: JSON_HEADERS,
     body: JSON.stringify({ title, body }),
   });
+}
+
+export async function consumeNotificationCallback(
+  notificationId: string,
+): Promise<NotificationCallbackPayload> {
+  return request<NotificationCallbackPayload>(
+    `/api/notifications/${encodeURIComponent(notificationId)}/callback`,
+    {
+      method: 'POST',
+    },
+  );
 }

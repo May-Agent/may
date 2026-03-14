@@ -1799,6 +1799,7 @@ async fn handle_notify_request(
     args: crate::agent::notify_tool::NotifyArgs,
 ) -> Result<crate::agent::notify_tool::NotifyResult, String> {
     let payload = NotificationPayload {
+        notification_id: None,
         title: args.title,
         body: args.body,
         session_id: args.session_id,

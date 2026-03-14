@@ -44,6 +44,7 @@ impl NotificationService {
 
     pub async fn send(&self, title: &str, body: &str) -> Result<usize, NotificationServiceError> {
         self.send_payload(NotificationPayload {
+            notification_id: None,
             title: title.to_string(),
             body: body.to_string(),
             session_id: None,
@@ -55,9 +56,10 @@ impl NotificationService {
 
     pub async fn send_payload(
         &self,
-        payload: NotificationPayload,
+        mut payload: NotificationPayload,
     ) -> Result<usize, NotificationServiceError> {
         let notification_id = uuid::Uuid::new_v4().to_string();
+        payload.notification_id = Some(notification_id.clone());
         self.db
             .create_notification_mailbox_entry(&notification_id, &payload, MAILBOX_STATUS_PENDING)
             .await?;
@@ -111,6 +113,7 @@ impl NotificationService {
         let pending = self.db.list_pending_notification_mailbox_entries().await?;
         for item in pending {
             let payload = NotificationPayload {
+                notification_id: Some(item.id.clone()),
                 title: item.title,
                 body: item.body,
                 session_id: item.session_id,

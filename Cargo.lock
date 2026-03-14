@@ -348,6 +348,7 @@ dependencies = [
  "leash",
  "libc",
  "magika",
+ "quick-xml 0.37.5",
  "rs-tree-sitter-languages",
  "schemars 1.2.0",
  "serde",

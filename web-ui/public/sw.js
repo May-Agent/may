@@ -41,6 +41,10 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close()
   const payload = event.notification.data || {}
+  const notificationId =
+    typeof payload.notificationId === 'string' && payload.notificationId.trim().length > 0
+      ? payload.notificationId.trim()
+      : ''
 
   event.waitUntil((async () => {
     const clientsList = await clients.matchAll({
@@ -58,7 +62,10 @@ self.addEventListener('notificationclick', (event) => {
       return
     }
 
-    const opened = await clients.openWindow('/chat/new')
+    const targetPath = notificationId
+      ? `/chat/new?notification=${encodeURIComponent(notificationId)}`
+      : '/chat/new'
+    const opened = await clients.openWindow(targetPath)
     if (opened) {
       opened.postMessage({
         type: 'may-notification-click',

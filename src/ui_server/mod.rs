@@ -373,6 +373,7 @@ fn api_routes() -> Route {
             ))),
             "/notifications".route(Route::new((
                 "/mailbox".at(list_notification_mailbox),
+                "/{id}/callback".post(consume_notification_callback),
                 "/network-access".at(list_network_access_logs),
             ))),
         )),

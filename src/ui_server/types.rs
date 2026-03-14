@@ -201,6 +201,15 @@ pub(crate) struct NotificationMailboxResponse {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct NotificationCallbackResponse {
+    pub(crate) notification_id: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) callback_context_xml: Option<String>,
+    pub(crate) callback_message: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct NetworkAccessLogEntryResponse {
     pub(crate) id: i32,
     pub(crate) session_id: Option<String>,
