@@ -1520,6 +1520,7 @@ async fn setup_agent_environment(
 
             let container_name =
                 crate::container::profile::container_name_for_profile_session(profile, &ctx.session_id);
+            let host_gateway = container_manager.runtime().host_gateway();
 
             let mut extra_env = Vec::new();
             let browser_backend: Option<Arc<dyn BrowserBackend>> = if let Some(ref bm) =
@@ -1529,7 +1530,6 @@ async fn setup_agent_environment(
                     tracing::warn!(error = %e, "Failed to auto-start browser for container session");
                     None
                 } else {
-                    let host_gateway = container_manager.runtime().host_gateway();
                     let config = state.config.read().await;
                     let port = config.playwright.port.to_string();
                     let endpoint =
@@ -1560,14 +1560,16 @@ async fn setup_agent_environment(
                 .await
                 .map_err(|e| anyhow::anyhow!("Container start failed: {e}"))?;
 
-            let container_exec = std::sync::Arc::new(ContainerExecHandle::new(std::sync::Arc::new(
+            let container_ipc_host = host_gateway.to_string();
+            let container_exec = ContainerExecHandle::new(std::sync::Arc::new(
                 BollardContainerExec::new(std::sync::Arc::new(
                     container_manager.runtime().client.clone(),
                 )),
-            )));
+            ));
 
             crate::agent::AgentEnvironment::Container {
                 container_id,
+                container_ipc_host,
                 container_exec,
                 browser_backend,
             }

@@ -448,12 +448,13 @@ async fn resolve_agent_environment_for_tui(
         .await
         .map_err(|e| anyhow::anyhow!("Container start failed: {e}"))?;
 
-    let container_exec = Arc::new(ContainerExecHandle::new(Arc::new(
+    let container_exec = ContainerExecHandle::new(Arc::new(
         BollardContainerExec::new(Arc::new(container_manager.runtime().client.clone())),
-    )));
+    ));
 
     Ok(crate::agent::AgentEnvironment::Container {
         container_id,
+        container_ipc_host: container_manager.runtime().host_gateway().to_string(),
         container_exec,
         browser_backend: None,
     })

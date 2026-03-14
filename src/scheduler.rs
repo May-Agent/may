@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use aither_core::llm::Tool;
 use aither_sandbox::{
-    BashArgs, BashExecutionMode, BashMode, BashResult, BashTool, BollardContainerExec, Configured,
-    ContainerLaunchSpec, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, SshServer, ToolRegistryBuilder, permission::PermissionError,
+    BashArgs, BashExecutionMode, BashMode, BashResult, BashTool, BollardContainerExec,
+    Configured, ContainerExecHandle, ContainerLaunchSpec, ContainerShellRuntime, OutputFormat,
+    PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
+    ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -852,13 +853,12 @@ impl TaskRuntime {
             local: false,
             container: false,
             ssh: true,
-        });
-        shell_sessions
-            .set_ssh_servers(vec![SshServer {
+        })
+        .with_ssh_servers(vec![SshServer {
                 name: ssh_server.name,
                 target: ssh_server.target,
             }])
-            .map_err(|error| format!("failed to configure remote ssh server: {error}"))?;
+        .map_err(|error| format!("failed to configure remote ssh server: {error}"))?;
         let registry = Arc::new(ToolRegistryBuilder::new().build(working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
         BashTool::new_exact(
@@ -969,15 +969,19 @@ impl TaskRuntime {
             .map_err(|e| format!("failed to start container: {e}"))?;
         container_manager.touch_activity(&container_id).await;
 
+        let container_runtime = ContainerShellRuntime::new(
+            container_id.clone(),
+            container_manager.runtime().host_gateway().to_string(),
+            ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
+                container_manager.runtime().client.clone(),
+            )))),
+        );
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
             ssh: false,
-        });
-        shell_sessions.set_container_exec(Arc::new(BollardContainerExec::new(Arc::new(
-            container_manager.runtime().client.clone(),
-        ))));
-        shell_sessions.set_container_id(container_id.clone());
+        })
+        .with_container_runtime(container_runtime);
 
         // Use host workspace dir for output storage while executing commands in
         // /workspace inside container.
@@ -1072,15 +1076,19 @@ impl TaskRuntime {
             .map_err(|e| format!("failed to start container: {e}"))?;
         container_manager.touch_activity(&container_id).await;
 
+        let container_runtime = ContainerShellRuntime::new(
+            container_id.clone(),
+            container_manager.runtime().host_gateway().to_string(),
+            ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
+                container_manager.runtime().client.clone(),
+            )))),
+        );
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
             ssh: false,
-        });
-        shell_sessions.set_container_exec(Arc::new(BollardContainerExec::new(Arc::new(
-            container_manager.runtime().client.clone(),
-        ))));
-        shell_sessions.set_container_id(container_id.clone());
+        })
+        .with_container_runtime(container_runtime);
 
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();

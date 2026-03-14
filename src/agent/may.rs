@@ -16,7 +16,8 @@ use aither_cloud::{
 use aither_core::image::{ImageGenerator, Prompt, Size};
 use aither_core::llm::{Message as LlmMessage, Tool, ToolOutput};
 use aither_sandbox::{
-    BashMode, BashTool, ContainerExecHandle, ShellRuntimeAvailability, SshServer,
+    BashMode, BashTool, ContainerExecHandle, ContainerShellRuntime, ShellRuntimeAvailability,
+    SshServer,
     permission::{NoopPermissionHandler, PermissionError, PermissionHandler},
 };
 use executor_core::DefaultExecutor;
@@ -516,8 +517,10 @@ pub enum AgentEnvironment {
     Container {
         /// Container ID from Docker.
         container_id: String,
+        /// Hostname reachable from the container for IPC back to the host.
+        container_ipc_host: String,
         /// Executor for running commands inside the container.
-        container_exec: Arc<ContainerExecHandle>,
+        container_exec: ContainerExecHandle,
         /// Optional browser backend that can provide a CDP endpoint.
         browser_backend: Option<Arc<dyn BrowserBackend>>,
     },
@@ -1071,12 +1074,16 @@ impl MayAgent {
         match config.environment {
             AgentEnvironment::Container {
                 container_id,
+                container_ipc_host,
                 container_exec,
                 browser_backend,
             } => {
                 builder = builder
-                    .container_id(container_id)
-                    .container_exec(container_exec);
+                    .container_runtime(ContainerShellRuntime::new(
+                        container_id,
+                        container_ipc_host,
+                        container_exec,
+                    ));
                 if let Some(browser_backend) = browser_backend {
                     let endpoint = browser_backend.cdp_endpoint().await.map_err(|error| {
                         MayAgentError::Sandbox(format!(
