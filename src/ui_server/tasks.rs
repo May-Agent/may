@@ -500,7 +500,11 @@ pub(super) async fn run_task(
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Task not found"))?;
 
-    state.task_runtime.run_manual_task(task);
+    state
+        .task_runtime
+        .run_manual_task(task)
+        .await
+        .map_err(internal_error)?;
 
     Ok(Json(super::types::TaskTriggerResponse {
         ok: true,
