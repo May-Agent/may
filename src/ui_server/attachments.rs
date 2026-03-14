@@ -95,11 +95,7 @@ struct FileMentionsXml {
 }
 
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> SkyResult<String> {
-    let mut output = String::new();
-    let serializer =
-        quick_xml::se::Serializer::with_root(&mut output, Some(tag)).map_err(internal_error)?;
-    value.serialize(serializer).map_err(internal_error)?;
-    Ok(output)
+    crate::xml_fragment::serialize_tagged_xml(tag, value).map_err(internal_error)
 }
 
 pub(super) async fn build_prompt_and_attachments(

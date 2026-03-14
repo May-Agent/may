@@ -137,6 +137,16 @@ fn task_notification_title(task_name: &str) -> String {
     join_text(&["Task: ", task_name])
 }
 
+fn task_notification_callback_message(task_name: &str, status: &str) -> String {
+    join_text(&[
+        "Continue from scheduled task \"",
+        task_name,
+        "\" (",
+        status,
+        "). Review the hidden task result and choose the next action.",
+    ])
+}
+
 const fn task_runtime_kind_name(kind: TaskRuntimeKind) -> &'static str {
     match kind {
         TaskRuntimeKind::Local => "local",
@@ -175,6 +185,44 @@ fn profile_workspace_key(profile: &profiles::Model) -> &str {
 
 fn container_profile_name(profile: &profiles::Model) -> String {
     join_text(&["may-", profile_workspace_key(profile)])
+}
+
+fn task_notification_callback_context(
+    task: &scheduled_tasks::Model,
+    status: &'static str,
+    summary: &str,
+) -> Option<crate::XmlFragment> {
+    task.session_id.as_ref()?;
+    let xml = crate::xml_fragment::serialize_tagged_xml(
+        "system_alert",
+        &TaskNotificationCallbackXml {
+            alert_type: "task_callback",
+            task_id: task.id.as_str(),
+            task_name: task.name.as_str(),
+            profile_id: task.profile_id.as_str(),
+            trigger_kind: task.trigger_kind.as_str(),
+            trigger_type: task.trigger_type.as_str(),
+            status,
+            summary,
+        },
+    )
+    .ok()?;
+    crate::XmlFragment::parse(xml).ok()
+}
+
+fn task_notification_callback_payload(
+    task: &scheduled_tasks::Model,
+    status: &'static str,
+    summary: &str,
+) -> (Option<crate::XmlFragment>, Option<String>) {
+    if task.session_id.is_none() {
+        return (None, None);
+    }
+
+    (
+        task_notification_callback_context(task, status, summary),
+        Some(task_notification_callback_message(task.name.as_str(), status)),
+    )
 }
 
 fn task_db_error(message: String) -> crate::db::ChatDbError {
@@ -255,6 +303,19 @@ struct TaskExecutionTask {
     session_id: Option<String>,
     trigger_kind: String,
     trigger_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TaskNotificationCallbackXml<'a> {
+    #[serde(rename = "@type")]
+    alert_type: &'static str,
+    task_id: &'a str,
+    task_name: &'a str,
+    profile_id: &'a str,
+    trigger_kind: &'a str,
+    trigger_type: &'a str,
+    status: &'a str,
+    summary: &'a str,
 }
 
 impl TaskExecutionEnvelope {
@@ -673,7 +734,7 @@ impl TaskRuntime {
         script_inline: Option<&str>,
     ) -> Result<(), String> {
         let profile_info = ProfileInfo::from_db_model(profile.clone())
-            .map_err(|e| format!("invalid profile {}: {e}", profile.id))?;
+            .map_err(|error| invalid_profile_error(profile.id.as_str(), &error))?;
         let script = self
             .resolve_script_source(script_path, script_inline)
             .await?;
@@ -709,13 +770,19 @@ impl TaskRuntime {
                 }
 
                 if let Some(ref notifier) = self.notifier {
+                    let (callback_context_xml, callback_message) =
+                        task_notification_callback_payload(
+                            task,
+                            "completed",
+                            truncated.as_str(),
+                        );
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
                         body: "Completed successfully".to_string(),
                         session_id: task.session_id.clone(),
-                        callback_context_xml: None,
-                        callback_message: None,
+                        callback_context_xml,
+                        callback_message,
                     };
                     if let Err(e) = notifier.send_payload(payload).await {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
@@ -738,13 +805,19 @@ impl TaskRuntime {
                 }
 
                 if let Some(ref notifier) = self.notifier {
+                    let (callback_context_xml, callback_message) =
+                        task_notification_callback_payload(
+                            task,
+                            "failed",
+                            truncated.as_str(),
+                        );
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
                         body: "Execution failed".to_string(),
                         session_id: task.session_id.clone(),
-                        callback_context_xml: None,
-                        callback_message: None,
+                        callback_context_xml,
+                        callback_message,
                     };
                     if let Err(e) = notifier.send_payload(payload).await {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
@@ -817,30 +890,12 @@ impl TaskRuntime {
 
         tokio::fs::write(&script_path, script.content.as_bytes())
             .await
-            .map_err(|error| {
-                let display = script_path.display().to_string();
-                let error = error.to_string();
-                [
-                    "failed to write task script ",
-                    display.as_str(),
-                    ": ",
-                    error.as_str(),
-                ]
-                .concat()
-            })?;
+            .map_err(|error| path_error_text("failed to write task script ", &script_path, &error))?;
         tokio::fs::write(&trigger_path, trigger_payload)
             .await
             .map_err(|error| {
                 let _ = std::fs::remove_file(&script_path);
-                let display = trigger_path.display().to_string();
-                let error = error.to_string();
-                [
-                    "failed to write task trigger payload ",
-                    display.as_str(),
-                    ": ",
-                    error.as_str(),
-                ]
-                .concat()
+                path_error_text("failed to write task trigger payload ", &trigger_path, &error)
             })?;
 
         let trigger_file =

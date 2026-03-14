@@ -137,6 +137,16 @@ pub(crate) struct PendingAskUserLookup {
     pub(crate) session_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct NotificationCallbackConsumeResult {
+    pub id: String,
+    pub session_id: Option<String>,
+    pub callback_context_xml: Option<String>,
+    pub callback_message: Option<String>,
+    pub has_callback: bool,
+    pub callback_consumed: bool,
+}
+
 struct DefaultProfile<'a> {
     slug: &'static str,
     name: &'a str,
@@ -1596,6 +1606,30 @@ impl ChatDb {
         active.updated_at = Set(jiff::Timestamp::now().to_string());
         active.update(&self.conn).await?;
         Ok(())
+    }
+
+    pub async fn consume_notification_callback(
+        &self,
+        id: &str,
+    ) -> Result<NotificationCallbackConsumeResult, ChatDbError> {
+        let entry = self
+            .get_notification_mailbox_entry(id)
+            .await?
+            .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?;
+        let has_callback =
+            entry.callback_context_xml.is_some() || entry.callback_message.is_some();
+        let callback_consumed = has_callback && entry.status != "opened";
+        if entry.status != "opened" {
+            self.mark_notification_mailbox_opened(id).await?;
+        }
+        Ok(NotificationCallbackConsumeResult {
+            id: entry.id,
+            session_id: entry.session_id,
+            callback_context_xml: entry.callback_context_xml,
+            callback_message: entry.callback_message,
+            has_callback,
+            callback_consumed,
+        })
     }
 
     pub async fn append_request_log(
@@ -3516,5 +3550,45 @@ mod tests {
             .expect("dispatchable lookup should succeed")
             .expect("pending steer should dispatch once idle");
         assert_eq!(resumed.content, "resume later");
+    }
+
+    #[tokio::test]
+    async fn notification_callback_consumes_only_once() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let payload = crate::notification::NotificationPayload {
+            notification_id: Some("notification-1".to_string()),
+            title: "Task".to_string(),
+            body: "Completed".to_string(),
+            session_id: Some("session-1".to_string()),
+            callback_context_xml: Some(
+                crate::XmlFragment::parse("<system_alert><status>ok</status></system_alert>")
+                    .expect("callback XML should parse"),
+            ),
+            callback_message: Some("Follow up".to_string()),
+        };
+        db.create_notification_mailbox_entry("notification-1", &payload, "delivered")
+            .await
+            .expect("mailbox entry should persist");
+
+        let first = db
+            .consume_notification_callback("notification-1")
+            .await
+            .expect("first callback consume should succeed");
+        assert!(first.has_callback);
+        assert!(first.callback_consumed);
+        assert_eq!(first.callback_message.as_deref(), Some("Follow up"));
+
+        let second = db
+            .consume_notification_callback("notification-1")
+            .await
+            .expect("second callback consume should succeed");
+        assert!(second.has_callback);
+        assert!(!second.callback_consumed);
+        assert_eq!(second.callback_message.as_deref(), Some("Follow up"));
     }
 }

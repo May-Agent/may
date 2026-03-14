@@ -17,6 +17,16 @@ pub enum XmlFragmentError {
     Invalid(String),
 }
 
+pub fn serialize_tagged_xml<T: Serialize>(
+    tag: &str,
+    value: &T,
+) -> Result<String, quick_xml::SeError> {
+    let mut output = String::new();
+    let serializer = quick_xml::se::Serializer::with_root(&mut output, Some(tag))?;
+    value.serialize(serializer)?;
+    Ok(output)
+}
+
 impl XmlFragment {
     pub fn parse(value: impl Into<String>) -> Result<Self, XmlFragmentError> {
         let value = value.into();
