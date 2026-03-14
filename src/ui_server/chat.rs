@@ -206,6 +206,37 @@ fn active_session_conflict_error() -> skyzen::Error {
         .set_status(skyzen::StatusCode::CONFLICT)
 }
 
+fn join_text(parts: &[&str]) -> String {
+    let capacity = parts.iter().map(|part| part.len()).sum();
+    let mut text = String::with_capacity(capacity);
+    for part in parts {
+        text.push_str(part);
+    }
+    text
+}
+
+fn prefixed_text(prefix: &str, suffix: &str) -> String {
+    let mut text = String::with_capacity(prefix.len() + suffix.len());
+    text.push_str(prefix);
+    text.push_str(suffix);
+    text
+}
+
+fn path_error_text(
+    prefix: &str,
+    path: &std::path::Path,
+    error: &impl std::fmt::Display,
+) -> String {
+    let path_text = path.display().to_string();
+    let error_text = error.to_string();
+    join_text(&[prefix, path_text.as_str(), ": ", error_text.as_str()])
+}
+
+fn path_message(prefix: &str, path: &std::path::Path) -> String {
+    let path_text = path.display().to_string();
+    join_text(&[prefix, path_text.as_str()])
+}
+
 fn persisted_attachments(
     attachments: Vec<super::types::ApiAttachment>,
 ) -> Vec<PersistedAttachment> {
@@ -518,7 +549,7 @@ pub(super) async fn stop_session_run(
     };
     if !db.session_exists(&session_id).await.map_err(internal_error)? {
         return Err(
-            skyzen::Error::msg(["Session ", session_id.as_str(), " not found"].concat())
+            skyzen::Error::msg(join_text(&["Session ", session_id.as_str(), " not found"]))
                 .set_status(skyzen::StatusCode::NOT_FOUND),
         );
     }
@@ -643,7 +674,8 @@ async fn run_agent_loop(
             .model_context_window()
             .or_else(|| lookup_model_info(&current_model).and_then(|m| m.max_input_tokens()));
 
-        let assistant_id = format!("assistant-{}", uuid::Uuid::new_v4());
+        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let assistant_id = prefixed_text("assistant-", assistant_uuid.as_str());
         let started_at = Instant::now();
         let mut usage = Usage::default();
         let mut segment_text = String::new(); // current text segment, flushed on tool calls
@@ -1452,8 +1484,10 @@ async fn setup_agent_environment(
                 } else {
                     let host_gateway = container_manager.runtime().host_gateway();
                     let config = state.config.read().await;
-                    let endpoint = format!("http://{}:{}", host_gateway, config.playwright.port);
-                    extra_env.push(format!("BROWSER_CDP_ENDPOINT={endpoint}"));
+                    let port = config.playwright.port.to_string();
+                    let endpoint =
+                        join_text(&["http://", host_gateway, ":", port.as_str()]);
+                    extra_env.push(prefixed_text("BROWSER_CDP_ENDPOINT=", endpoint.as_str()));
                     Some(Arc::new(StaticCdpBrowser::new(endpoint)))
                 }
             } else {
@@ -1758,7 +1792,13 @@ async fn handle_notify_request(
     let sent = notification_service
         .send_payload(payload)
         .await
-        .map_err(|e| format!("failed to send notification payload: {e}"))?;
+        .map_err(|error| {
+            let error_text = error.to_string();
+            join_text(&[
+                "failed to send notification payload: ",
+                error_text.as_str(),
+            ])
+        })?;
 
     Ok(crate::agent::notify_tool::NotifyResult { sent })
 }
@@ -1777,17 +1817,7 @@ async fn handle_register_skills_request(
             let info = manager
                 .register_from_local_path(&source)
                 .await
-                .map_err(|error| {
-                    let source_display = source.display().to_string();
-                    let error_text = error.to_string();
-                    [
-                        "failed to register skill from ",
-                        source_display.as_str(),
-                        ": ",
-                        error_text.as_str(),
-                    ]
-                    .concat()
-                })?;
+                .map_err(|error| path_error_text("failed to register skill from ", &source, &error))?;
             Ok(vec![info.dir_name])
         },
     )
@@ -1809,15 +1839,7 @@ async fn handle_register_subagents_request(
                 .register_from_local_path(&source)
                 .await
                 .map_err(|error| {
-                    let source_display = source.display().to_string();
-                    let error_text = error.to_string();
-                    [
-                        "failed to register subagents from ",
-                        source_display.as_str(),
-                        ": ",
-                        error_text.as_str(),
-                    ]
-                    .concat()
+                    path_error_text("failed to register subagents from ", &source, &error)
                 })?;
             Ok(infos.into_iter().map(|item| item.file_name).collect())
         },
@@ -1858,7 +1880,7 @@ fn build_registration_approval_message(
     target_dir_name: &str,
 ) -> String {
     let source_display = source.display().to_string();
-    [
+    join_text(&[
         "Session ",
         session_id,
         " requests registering ",
@@ -1868,8 +1890,7 @@ fn build_registration_approval_message(
         " into this session's ",
         target_dir_name,
         ". Approve?",
-    ]
-    .concat()
+    ])
 }
 
 async fn resolve_session_root(
@@ -1883,30 +1904,10 @@ async fn resolve_session_root(
         .to_path_buf();
     tokio::fs::create_dir_all(&session_root)
         .await
-        .map_err(|error| {
-            let session_root_display = session_root.display().to_string();
-            let error_message = error.to_string();
-            [
-                "failed to create session root ",
-                session_root_display.as_str(),
-                ": ",
-                error_message.as_str(),
-            ]
-            .concat()
-        })?;
+        .map_err(|error| path_error_text("failed to create session root ", &session_root, &error))?;
     let session_root_canonical = tokio::fs::canonicalize(&session_root)
         .await
-        .map_err(|error| {
-            let session_root_display = session_root.display().to_string();
-            let error_message = error.to_string();
-            [
-                "failed to resolve session ",
-                session_root_display.as_str(),
-                ": ",
-                error_message.as_str(),
-            ]
-            .concat()
-        })?;
+        .map_err(|error| path_error_text("failed to resolve session ", &session_root, &error))?;
     Ok(session_root_canonical)
 }
 
@@ -1925,23 +1926,17 @@ async fn resolve_registration_source_path(
         state.cwd.join(path)
     };
 
-    let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|e| {
-        format!(
-            "failed to resolve registration path {}: {e}",
-            candidate.display()
-        )
-    })?;
-    let project_root = tokio::fs::canonicalize(&state.cwd).await.map_err(|e| {
-        format!(
-            "failed to resolve project root {}: {e}",
-            state.cwd.display()
-        )
-    })?;
+    let canonical = tokio::fs::canonicalize(&candidate)
+        .await
+        .map_err(|error| path_error_text("failed to resolve registration path ", &candidate, &error))?;
+    let project_root = tokio::fs::canonicalize(&state.cwd)
+        .await
+        .map_err(|error| path_error_text("failed to resolve project root ", &state.cwd, &error))?;
 
     if !canonical.starts_with(&project_root) {
-        return Err(format!(
-            "registration path must be inside project root {}",
-            project_root.display()
+        return Err(path_message(
+            "registration path must be inside project root ",
+            &project_root,
         ));
     }
 
@@ -1975,7 +1970,10 @@ async fn request_registration_approval(
     let answers = rx
         .recv()
         .await
-        .map_err(|e| format!("failed to receive user approval: {e}"))?;
+        .map_err(|error| {
+            let error_text = error.to_string();
+            join_text(&["failed to receive user approval: ", error_text.as_str()])
+        })?;
 
     let approved = answers.into_iter().any(|answer| match answer.answer {
         ask_user::AnswerValue::Selected(values) => values
