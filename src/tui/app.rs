@@ -2293,12 +2293,12 @@ impl App {
                         } else {
                             self.usage = Some(u);
                         }
-                        // Usage typically comes at the end - finalize and signal completion
-                        self.chat.end_loading();
-                        self.chat.end_text();
-                        self.scroll = usize::MAX;
-                        self.input_visible = true;
-                        return true;
+                    }
+                    AgentEvent::RunStart { .. }
+                    | AgentEvent::TurnComplete { .. }
+                    | AgentEvent::Checkpoint { .. } => {
+                        // Lifecycle events are currently used for runtime coordination,
+                        // not directly rendered in the TUI timeline.
                     }
                     _ => {}
                 }
