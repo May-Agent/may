@@ -40,7 +40,9 @@ use crate::session::SessionManager;
 use aither_models::lookup as lookup_model_info;
 
 use error::internal_error;
-use state::{AskUserApprover, SessionRunCancellationRegistry, UiServerState};
+use state::{
+    AskUserApprover, SessionRunCancellationRegistry, UiServerState, tool_dispatch_channels,
+};
 use types::{
     ApiHealth, ModelInfoItem, ModelsResponse, ProviderModelsItem, ProviderModelsResponse,
     RequestLogCacheSummary, RequestLogEntry, RequestLogsResponse,
@@ -74,8 +76,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         let _ = mcp_manager.connect_all().await;
     }
 
-    let (register_subagents_broker, register_subagents_queue) =
-        crate::agent::register_tool::subagents_channel();
+    let (tool_dispatchers, tool_queues) = tool_dispatch_channels();
 
     let config = helpers::load_config_from_disk()
         .await
@@ -180,6 +181,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         mcp_manager: Mutex::new(mcp_manager),
         permission_approver,
         ask_user_approver,
+        tool_dispatchers,
         run_cancellation_registry: SessionRunCancellationRegistry::new(),
         session_execution_gate: state::SessionExecutionGate::default(),
         models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
@@ -195,7 +197,6 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         memory_processor,
         local_url_port_mapper: Arc::new(local_url_mapper::LocalUrlPortMapper::new()),
         title_generation_queue,
-        register_subagents_broker,
         location_provider: crate::location::LocationProvider::new(),
         runtime_service,
         task_runtime: task_runtime.clone(),
@@ -212,7 +213,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     if let Some(ref cm) = state.container_manager {
         let _auto_stop = cm.spawn_auto_stop_task();
     }
-    chat::spawn_register_subagents_worker(state.clone(), register_subagents_queue);
+    chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
     title_generation::spawn_worker(state.clone(), title_generation_rx);
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();

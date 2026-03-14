@@ -161,12 +161,28 @@ function isActiveRuntimeState(state: SessionRuntimeState | undefined): boolean {
   return state !== undefined && state !== 'idle';
 }
 
+function hasPendingFollowUp(
+  queuedCount: number | undefined,
+  pendingImmediate: unknown,
+  queuedMessages: unknown[] | undefined,
+): boolean {
+  if (pendingImmediate != null) return true;
+  if ((queuedMessages?.length ?? 0) > 0) return true;
+  return (queuedCount ?? 0) > 0;
+}
+
 function sessionBlocksArchive(
   runtimeState: SessionRuntimeState | undefined,
   planState: SessionPlanState | undefined,
   browserTakeoverActive: boolean | undefined,
+  followUpPending: boolean,
 ): boolean {
-  return isActiveRuntimeState(runtimeState) || planState === 'draft' || !!browserTakeoverActive;
+  return (
+    isActiveRuntimeState(runtimeState)
+    || followUpPending
+    || planState === 'draft'
+    || !!browserTakeoverActive
+  );
 }
 
 // ── DnD types and helpers ────────────────────────────────
@@ -218,6 +234,9 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
   const fallbackRuntime = sourceData.session.runtime;
   const runtimeState = runtime?.state ?? fallbackRuntime.state;
   const planState = runtime?.planState ?? fallbackRuntime.planState;
+  const queuedCount = runtime?.queuedCount ?? fallbackRuntime.queuedCount;
+  const pendingImmediate = runtime?.pendingImmediate ?? fallbackRuntime.pendingImmediate;
+  const queuedMessages = runtime?.queuedMessages ?? fallbackRuntime.queuedMessages;
   const browserTakeoverActive =
     runtime?.interactions?.browser.takeoverActive
     ?? fallbackRuntime.interactions?.browser.takeoverActive;
@@ -254,7 +273,16 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
 
   // Dropped on archive zone
   if (targetId === 'archive-zone' && sourceZone !== 'archive') {
-    if (sessionBlocksArchive(runtimeState, planState, browserTakeoverActive)) return;
+    if (
+      sessionBlocksArchive(
+        runtimeState,
+        planState,
+        browserTakeoverActive,
+        hasPendingFollowUp(queuedCount, pendingImmediate, queuedMessages),
+      )
+    ) {
+      return;
+    }
     if (sourceData.folderId) await store.moveSessionToFolder(sessionId, null);
     if (sourceZone === 'pinned') await store.unpinSession(sessionId);
     await store.archiveSession(sessionId);

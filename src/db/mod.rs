@@ -764,6 +764,23 @@ impl ChatDb {
         Ok(next)
     }
 
+    /// Remove and return the next pending message only when follow-up execution is allowed.
+    pub async fn take_next_dispatchable_pending_message(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<PendingUserMessage>, ChatDbError> {
+        let session = self.get_session(session_id).await?.ok_or_else(|| {
+            ChatDbError::Db(DbErr::RecordNotFound(format!(
+                "Session not found: {session_id}"
+            )))
+        })?;
+        let summary = self.load_session_runtime_summary(&session.id).await?;
+        if !summary.can_dispatch_follow_up() {
+            return Ok(None);
+        }
+        self.take_next_pending_message(session_id).await
+    }
+
     /// Remove a persisted pending-immediate message, if present.
     pub async fn clear_pending_immediate_message(
         &self,
@@ -1105,7 +1122,7 @@ impl ChatDb {
         let mut session_ids = Vec::new();
         for session in sessions {
             let summary = self.load_session_runtime_summary(&session.id).await?;
-            if summary.has_pending_messages() {
+            if summary.can_dispatch_follow_up() {
                 session_ids.push(session.id);
             }
         }
@@ -3393,7 +3410,7 @@ mod tests {
             .sessions_requiring_pending_dispatch()
             .await
             .expect("pending dispatch lookup should succeed");
-        assert_eq!(resumable, vec![session_id.to_string()]);
+        assert!(resumable.is_empty());
     }
 
     #[tokio::test]
@@ -3423,5 +3440,58 @@ mod tests {
             .expect("runtime should exist");
         assert_eq!(runtime.state, SessionRuntimeState::Idle);
         assert!(!runtime.has_pending_messages());
+    }
+
+    #[tokio::test]
+    async fn dispatchable_pending_message_requires_idle_runtime() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let session_id = "session-test";
+        db.create_session(session_id, Some("Test session"), Some("test-model"))
+            .await
+            .expect("session should be created");
+        db.set_pending_immediate_message(
+            session_id,
+            test_pending_message("resume later", PendingUserMessageMode::Steer),
+        )
+        .await
+        .expect("pending steer should persist");
+        db.set_waiting_permission(
+            session_id,
+            Some(PersistedPermissionRequest {
+                id: "perm-1".to_string(),
+                request: PersistedPermissionRequestPayload {
+                    mode: "default".to_string(),
+                    script: "echo hi".to_string(),
+                    session_id: Some(session_id.to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("waiting permission should persist");
+
+        let blocked = db
+            .take_next_dispatchable_pending_message(session_id)
+            .await
+            .expect("dispatchable lookup should succeed");
+        assert!(blocked.is_none());
+
+        db.set_waiting_permission(session_id, None)
+            .await
+            .expect("waiting permission should clear");
+        db.set_session_runtime_state(session_id, SessionRuntimeState::Idle)
+            .await
+            .expect("runtime should become idle before resumed dispatch");
+
+        let resumed = db
+            .take_next_dispatchable_pending_message(session_id)
+            .await
+            .expect("dispatchable lookup should succeed")
+            .expect("pending steer should dispatch once idle");
+        assert_eq!(resumed.content, "resume later");
     }
 }

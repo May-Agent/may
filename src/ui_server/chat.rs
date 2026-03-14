@@ -23,7 +23,7 @@ use crate::session::{
     SessionRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
-use crate::{ask_user, workspace_request};
+use crate::ask_user;
 
 use super::attachments::build_prompt_and_attachments;
 use super::bash_parsing::update_bash_snapshot_from_tool_event;
@@ -33,7 +33,7 @@ use super::helpers::{
     send_event, truncate_preview,
 };
 use super::model_resolution::resolve_default_model;
-use super::state::UiServerState;
+use super::state::{UiServerState, UiToolQueues};
 use super::title_generation;
 use super::types::{
     ApiMessage, BashStateSnapshot, ChatRequest, ChatResponse, ContextDebugMessage,
@@ -334,7 +334,11 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
         }
 
         loop {
-            let next = match state.runtime_service.take_next_pending(&session_id).await {
+            let next = match state
+                .runtime_service
+                .take_next_dispatchable(&session_id)
+                .await
+            {
                 Ok(next) => next,
                 Err(error) => {
                     tracing::warn!(session_id = %session_id, error = %error, "failed to load next pending message");
@@ -439,24 +443,30 @@ fn resume_waiting_turn_xml(
     crate::XmlFragment::parse(xml).map_err(anyhow::Error::from)
 }
 
-pub(super) async fn resume_waiting_turn(
-    state: Arc<UiServerState>,
-    session_id: String,
+pub(super) async fn schedule_waiting_turn_resume(
+    state: &Arc<UiServerState>,
+    session_id: &str,
     request_kind: &'static str,
     resolution: &'static str,
-) -> anyhow::Result<()> {
-    let hidden_context_xml = Some(resume_waiting_turn_xml(request_kind, resolution)?);
-    let request = ChatRequest {
-        session_id: session_id.clone(),
+) -> anyhow::Result<crate::session::SessionRuntimeSummary> {
+    let pending = PendingUserMessage {
         content: String::new(),
         attachments: Vec::new(),
-        hidden_context_xml,
+        hidden_context_xml: Some(resume_waiting_turn_xml(request_kind, resolution)?),
+        created_at: jiff::Timestamp::now().to_string(),
         delivery_mode: crate::session::PendingUserMessageMode::Steer,
     };
-    run_chat_collect_with_persistence(state.clone(), request, false, false)
+    let runtime = state
+        .runtime_service
+        .enqueue(
+            session_id,
+            pending,
+            crate::session::PendingUserMessageMode::Steer,
+        )
         .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    Ok(())
+        .map_err(anyhow::Error::from)?;
+    spawn_follow_up_runs(state.clone(), session_id.to_string());
+    Ok(runtime)
 }
 
 async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) {
@@ -615,12 +625,49 @@ pub(super) async fn chat_stream(
     Ok(sse)
 }
 
-pub(super) fn spawn_register_subagents_worker(
-    state: Arc<UiServerState>,
-    queue: crate::agent::register_tool::RegisterQueue,
-) {
+pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: UiToolQueues) {
+    let UiToolQueues {
+        workspace,
+        task,
+        notify,
+        register_skills,
+        register_subagents,
+    } = queues;
+
     tokio::spawn(async move {
-        while let Some(request) = queue.next().await {
+        while let Some(request) = workspace.next().await {
+            let _ = request.respond(false);
+        }
+    });
+
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(request) = task.next().await {
+            let result = handle_task_request(&task_state, request.args.clone()).await;
+            let _ = request.respond(result);
+        }
+    });
+
+    let notification_service = state.notification_service.clone();
+    tokio::spawn(async move {
+        while let Some(request) = notify.next().await {
+            let result =
+                handle_notify_request(notification_service.clone(), request.args.clone()).await;
+            let _ = request.respond(result);
+        }
+    });
+
+    let register_skills_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(request) = register_skills.next().await {
+            let result =
+                handle_register_skills_request(&register_skills_state, request.args.clone()).await;
+            let _ = request.respond(result);
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(request) = register_subagents.next().await {
             let result = handle_register_subagents_request(&state, request.args.clone()).await;
             let _ = request.respond(result);
         }
@@ -1259,7 +1306,7 @@ struct PreparedAgent {
 }
 
 struct ToolBrokers {
-    workspace: workspace_request::WorkspaceRequestBroker,
+    workspace: crate::workspace_request::WorkspaceRequestBroker,
     ask_user: ask_user::AskUserBroker,
     task: crate::agent::task_tool::TaskBroker,
     notify: crate::agent::notify_tool::NotifyBroker,
@@ -1554,21 +1601,11 @@ async fn setup_agent_environment(
     Ok((environment, location))
 }
 
-fn wire_tool_channels(state: &Arc<UiServerState>, session_id: &SessionId) -> ToolBrokers {
-    let (workspace_broker, workspace_queue) = workspace_request::channel();
+fn spawn_ask_user_forwarder(
+    state: &Arc<UiServerState>,
+    session_id: &SessionId,
+) -> ask_user::AskUserBroker {
     let (ask_user_broker, ask_user_queue) = ask_user::channel();
-    let (task_broker, task_queue) = crate::agent::task_tool::channel();
-    let (notify_broker, notify_queue) = crate::agent::notify_tool::channel();
-    let (register_skills_broker, register_skills_queue) =
-        crate::agent::register_tool::skills_channel();
-    let register_subagents_broker = state.register_subagents_broker.clone();
-
-    tokio::spawn(async move {
-        while let Some(request) = workspace_queue.next().await {
-            let _ = request.respond(false);
-        }
-    });
-
     let ask_user_approver = state.ask_user_approver.clone();
     let ask_user_session_id = session_id.as_str().to_string();
     tokio::spawn(async move {
@@ -1578,40 +1615,17 @@ fn wire_tool_channels(state: &Arc<UiServerState>, session_id: &SessionId) -> Too
                 .await;
         }
     });
+    ask_user_broker
+}
 
-    let task_state = state.clone();
-    tokio::spawn(async move {
-        while let Some(request) = task_queue.next().await {
-            let result = handle_task_request(&task_state, request.args.clone()).await;
-            let _ = request.respond(result);
-        }
-    });
-
-    let notification_service = state.notification_service.clone();
-    tokio::spawn(async move {
-        while let Some(request) = notify_queue.next().await {
-            let result =
-                handle_notify_request(notification_service.clone(), request.args.clone()).await;
-            let _ = request.respond(result);
-        }
-    });
-
-    let register_skills_state = state.clone();
-    tokio::spawn(async move {
-        while let Some(request) = register_skills_queue.next().await {
-            let result =
-                handle_register_skills_request(&register_skills_state, request.args.clone()).await;
-            let _ = request.respond(result);
-        }
-    });
-
+fn build_tool_brokers(state: &Arc<UiServerState>, session_id: &SessionId) -> ToolBrokers {
     ToolBrokers {
-        workspace: workspace_broker,
-        ask_user: ask_user_broker,
-        task: task_broker,
-        notify: notify_broker,
-        register_skills: register_skills_broker,
-        register_subagents: register_subagents_broker,
+        workspace: state.tool_dispatchers.workspace.clone(),
+        ask_user: spawn_ask_user_forwarder(state, session_id),
+        task: state.tool_dispatchers.task.clone(),
+        notify: state.tool_dispatchers.notify.clone(),
+        register_skills: state.tool_dispatchers.register_skills.clone(),
+        register_subagents: state.tool_dispatchers.register_subagents.clone(),
     }
 }
 
@@ -1630,7 +1644,7 @@ async fn prepare_agent_for_request(
     )
     .await?;
     let (environment, location) = setup_agent_environment(state, &ctx).await?;
-    let brokers = wire_tool_channels(state, &ctx.session_id);
+    let brokers = build_tool_brokers(state, &ctx.session_id);
 
     let config = state.config.read().await;
     let mut agent = MayAgent::from_config_with_model_and_permissions(

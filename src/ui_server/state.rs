@@ -10,12 +10,15 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::agent::PermissionApprover;
 use crate::agent::register_tool::RegisterBroker;
+use crate::agent::register_tool::RegisterQueue;
+use crate::agent::task_tool::{TaskBroker, TaskQueue};
 use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
 use crate::live_response::LiveResponseRegistry;
 use crate::mcp::McpManager;
 use crate::session::SessionManager;
 use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
+use crate::workspace_request::{WorkspaceRequestBroker, WorkspaceRequestQueue};
 use super::local_url_mapper::LocalUrlPortMapper;
 use super::types::{ModelsResponse, ProviderModelsResponse};
 
@@ -67,6 +70,49 @@ impl TitleGenerationQueue {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct UiToolDispatchers {
+    pub(crate) workspace: WorkspaceRequestBroker,
+    pub(crate) task: TaskBroker,
+    pub(crate) notify: crate::agent::notify_tool::NotifyBroker,
+    pub(crate) register_skills: RegisterBroker,
+    pub(crate) register_subagents: RegisterBroker,
+}
+
+pub(crate) struct UiToolQueues {
+    pub(crate) workspace: WorkspaceRequestQueue,
+    pub(crate) task: TaskQueue,
+    pub(crate) notify: crate::agent::notify_tool::NotifyQueue,
+    pub(crate) register_skills: RegisterQueue,
+    pub(crate) register_subagents: RegisterQueue,
+}
+
+pub(crate) fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
+    let (workspace, workspace_queue) = crate::workspace_request::channel();
+    let (task, task_queue) = crate::agent::task_tool::channel();
+    let (notify, notify_queue) = crate::agent::notify_tool::channel();
+    let (register_skills, register_skills_queue) = crate::agent::register_tool::skills_channel();
+    let (register_subagents, register_subagents_queue) =
+        crate::agent::register_tool::subagents_channel();
+
+    (
+        UiToolDispatchers {
+            workspace,
+            task,
+            notify,
+            register_skills,
+            register_subagents,
+        },
+        UiToolQueues {
+            workspace: workspace_queue,
+            task: task_queue,
+            notify: notify_queue,
+            register_skills: register_skills_queue,
+            register_subagents: register_subagents_queue,
+        },
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct RefreshableCache<T> {
     ttl: Duration,
@@ -112,6 +158,7 @@ pub(crate) struct UiServerState {
     pub(crate) mcp_manager: Mutex<McpManager>,
     pub(crate) permission_approver: PermissionApprover,
     pub(crate) ask_user_approver: AskUserApprover,
+    pub(crate) tool_dispatchers: UiToolDispatchers,
     pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,
     pub(crate) session_execution_gate: SessionExecutionGate,
     pub(crate) models_cache: RefreshableCache<ModelsResponse>,
@@ -127,7 +174,6 @@ pub(crate) struct UiServerState {
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
     pub(crate) local_url_port_mapper: Arc<LocalUrlPortMapper>,
     pub(crate) title_generation_queue: TitleGenerationQueue,
-    pub(crate) register_subagents_broker: RegisterBroker,
     pub(crate) location_provider: crate::location::LocationProvider,
     pub(crate) runtime_service: Arc<crate::session::SessionRuntimeService>,
     pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,

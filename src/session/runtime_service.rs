@@ -101,11 +101,14 @@ impl SessionRuntimeService {
         Ok(runtimes)
     }
 
-    pub async fn take_next_pending(
+    pub async fn take_next_dispatchable(
         &self,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, crate::db::ChatDbError> {
-        let next = self.db.take_next_pending_message(session_id).await?;
+        let next = self
+            .db
+            .take_next_dispatchable_pending_message(session_id)
+            .await?;
         self.notify_ui();
         Ok(next)
     }
