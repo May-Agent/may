@@ -6,12 +6,14 @@
 //! - Communication: All through async_channel (runtime-agnostic)
 
 use std::io;
+use std::io::Write;
 use std::panic;
 
 use aither_agent::AgentEvent;
 use anyhow::Context;
 
 use async_channel::TryRecvError;
+use jiff::Timestamp;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -31,7 +33,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
 use may_agent::tui::runtime::{RuntimeDeps, TitleGenContext};
-use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
+use may_agent::tui::{App, AppEvent, EventHandler, PendingMessage, SendAction, ui};
 use may_agent::workspace_request::{self, WorkspaceRequestQueue};
 use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
 
@@ -41,13 +43,29 @@ fn ensure_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CliMode {
+    Tui,
+    Ui(Vec<String>),
+    OneShot(String),
+}
+
+fn parse_cli_mode(args: &[String]) -> CliMode {
+    match args.get(1).map(String::as_str) {
+        Some("ui") => CliMode::Ui(args[2..].to_vec()),
+        Some(_) => CliMode::OneShot(args[1..].join(" ")),
+        None => CliMode::Tui,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
     ensure_rustls_provider();
 
     let args: Vec<String> = std::env::args().collect();
-    let is_ui_mode = args.get(1).is_some_and(|arg| arg == "ui");
+    let cli_mode = parse_cli_mode(&args);
+    let is_ui_mode = matches!(cli_mode, CliMode::Ui(_));
 
     // Initialize logging to file (shared by both UI server and TUI modes)
     let log_dir = dirs::home_dir()
@@ -80,8 +98,10 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    if args.get(1).is_some_and(|arg| arg == "ui") {
-        return may_agent::ui_server::run_ui_server(&args[2..]).await;
+    match cli_mode {
+        CliMode::Ui(ui_args) => return may_agent::ui_server::run_ui_server(&ui_args).await,
+        CliMode::OneShot(prompt) => return run_oneshot(prompt).await,
+        CliMode::Tui => {}
     }
 
     // Set up panic hook to restore terminal state before panicking
@@ -133,6 +153,237 @@ async fn main() -> anyhow::Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CliMode, parse_cli_mode};
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_cli_mode_defaults_to_tui() {
+        assert_eq!(parse_cli_mode(&args(&["may"])), CliMode::Tui);
+    }
+
+    #[test]
+    fn parse_cli_mode_detects_ui_subcommand() {
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "ui", "--host", "127.0.0.1"])),
+            CliMode::Ui(vec!["--host".to_string(), "127.0.0.1".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_joins_prompt_into_oneshot() {
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "fix", "the", "bug"])),
+            CliMode::OneShot("fix the bug".to_string())
+        );
+    }
+}
+
+async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
+    let (event_tx, _event_rx) = async_channel::unbounded();
+    let mut app = App::new(event_tx, None).await?;
+    if !app.is_configured() {
+        anyhow::bail!("May is not configured");
+    }
+
+    let (workspace_broker, workspace_queue) = workspace_request::channel();
+    let (ask_user_broker, ask_user_queue) = ask_user::channel();
+    let runtime_deps = RuntimeDeps::new(
+        workspace_broker,
+        ask_user_broker,
+        std::sync::Arc::new(may_agent::location::LocationProvider::new()),
+    );
+
+    spawn(async move {
+        while let Some(request) = workspace_queue.next().await {
+            let _ = writeln!(
+                io::stderr(),
+                "[workspace_request] path={} reason={}",
+                request.args.request.path,
+                request.args.request.reason
+            );
+            drop(request);
+        }
+    })
+    .detach();
+
+    spawn(async move {
+        while let Some(request) = ask_user_queue.next().await {
+            let questions = request.args.clone().into_questions();
+            let _ = writeln!(
+                io::stderr(),
+                "[ask_user_request] questions={}",
+                questions.len()
+            );
+            drop(request);
+        }
+    })
+    .detach();
+
+    let mut worker: Option<AgentWorker> = None;
+    runtime_deps.start_new_session(&mut app, &mut worker).await?;
+    let worker = worker
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("oneshot worker was not initialized"))?;
+
+    let mut pending_title_gen: Option<TitleGenContext> = None;
+    let mut assistant_response = String::new();
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    let handle = runtime_deps.start_agent_task(
+        &mut app,
+        worker,
+        PendingMessage {
+            content: prompt,
+            attachments: Vec::new(),
+            queued_at: Timestamp::now(),
+        },
+        &mut pending_title_gen,
+    )?;
+    let mut agent_handle = Some(handle);
+
+    loop {
+        let Some(handle) = agent_handle.as_ref() else {
+            break;
+        };
+        let Some(event) = handle.recv().await else {
+            break;
+        };
+        match event {
+            TuiEvent::Agent(result) => {
+                if let Ok(AgentEvent::Text(ref text)) = result {
+                    assistant_response.push_str(text);
+                    stdout.write_all(text.as_bytes())?;
+                    stdout.flush()?;
+                }
+                render_oneshot_event(&mut stderr, &result)?;
+                let run_failed = result.is_err();
+                let ended = app.handle_agent_event(result);
+                if ended {
+                    runtime_deps
+                        .finish_agent_task(
+                            &mut app,
+                            &mut agent_handle,
+                            &mut pending_title_gen,
+                            &assistant_response,
+                        )
+                        .await;
+                    if run_failed {
+                        anyhow::bail!("oneshot agent run failed");
+                    }
+                    if !assistant_response.ends_with('\n') {
+                        stdout.write_all(b"\n")?;
+                        stdout.flush()?;
+                    }
+                    return Ok(());
+                }
+            }
+            TuiEvent::Complete => {
+                runtime_deps
+                    .finish_agent_task(
+                        &mut app,
+                        &mut None,
+                        &mut pending_title_gen,
+                        &assistant_response,
+                    )
+                    .await;
+                if !assistant_response.ends_with('\n') {
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                }
+                return Ok(());
+            }
+            TuiEvent::Compacted(_) => {}
+            TuiEvent::Error(error) => {
+                let _ = writeln!(stderr, "[error] {error}");
+                runtime_deps
+                    .finish_agent_task(
+                        &mut app,
+                        &mut None,
+                        &mut pending_title_gen,
+                        &assistant_response,
+                    )
+                    .await;
+                anyhow::bail!(error);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn render_oneshot_event(
+    stderr: &mut impl Write,
+    result: &Result<AgentEvent, aither_agent::AgentError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(AgentEvent::RunStart {
+            run_id,
+            max_iterations,
+        }) => {
+            writeln!(
+                stderr,
+                "[run_start] run_id={run_id} max_iterations={max_iterations}"
+            )?;
+        }
+        Ok(AgentEvent::Reasoning(text)) => {
+            if !text.trim().is_empty() {
+                writeln!(stderr, "[reasoning] {text}")?;
+            }
+        }
+        Ok(AgentEvent::ToolCallStart {
+            name, arguments, ..
+        }) => {
+            writeln!(stderr, "[tool_start] {name} {arguments}")?;
+        }
+        Ok(AgentEvent::ToolCallEnd { name, result, .. }) => match result {
+            Ok(_) => writeln!(stderr, "[tool_end] {name} ok")?,
+            Err(error) => writeln!(stderr, "[tool_end] {name} error: {error}")?,
+        },
+        Ok(AgentEvent::TurnComplete {
+            turn,
+            has_tool_calls,
+        }) => {
+            writeln!(
+                stderr,
+                "[turn_complete] turn={turn} has_tool_calls={has_tool_calls}"
+            )?;
+        }
+        Ok(AgentEvent::Checkpoint {
+            reason,
+            turn,
+            phase,
+            message_count,
+            ..
+        }) => {
+            writeln!(
+                stderr,
+                "[checkpoint] reason={reason:?} turn={turn} phase={phase:?} messages={message_count}"
+            )?;
+        }
+        Ok(AgentEvent::Usage(usage)) => {
+            writeln!(
+                stderr,
+                "[usage] prompt={:?} completion={:?} total={:?}",
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            )?;
+        }
+        Ok(AgentEvent::Complete { .. }) => {}
+        Ok(AgentEvent::Text(_)) => {}
+        Err(error) => {
+            writeln!(stderr, "[error] {error}")?;
+        }
+    }
+    stderr.flush()?;
+    Ok(())
 }
 
 async fn run_app<B: Backend>(
