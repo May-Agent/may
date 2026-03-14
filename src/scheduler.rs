@@ -159,6 +159,24 @@ fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String
     join_text(&[prefix, execution_id, suffix])
 }
 
+fn path_error_text(
+    prefix: &str,
+    path: &std::path::Path,
+    error: &impl std::fmt::Display,
+) -> String {
+    let path_text = path.display().to_string();
+    let error_text = error.to_string();
+    join_text(&[prefix, path_text.as_str(), ": ", error_text.as_str()])
+}
+
+fn profile_workspace_key(profile: &profiles::Model) -> &str {
+    profile.slug.as_deref().unwrap_or(&profile.id)
+}
+
+fn container_profile_name(profile: &profiles::Model) -> String {
+    join_text(&["may-", profile_workspace_key(profile)])
+}
+
 #[derive(Debug, Clone)]
 struct TaskScript {
     content: String,
