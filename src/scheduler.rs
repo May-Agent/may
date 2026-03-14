@@ -177,6 +177,58 @@ fn container_profile_name(profile: &profiles::Model) -> String {
     join_text(&["may-", profile_workspace_key(profile)])
 }
 
+fn task_db_error(message: String) -> crate::db::ChatDbError {
+    crate::db::ChatDbError::Db(DbErr::Custom(message))
+}
+
+fn task_field_error(task_id: &str, prefix: &str, field: &str) -> crate::db::ChatDbError {
+    task_db_error(join_text(&[prefix, task_id, " is missing ", field]))
+}
+
+fn task_value_error(
+    task_id: &str,
+    prefix: &str,
+    error: &impl std::fmt::Display,
+) -> crate::db::ChatDbError {
+    let error_text = error.to_string();
+    task_db_error(join_text(&[
+        prefix,
+        task_id,
+        ": ",
+        error_text.as_str(),
+    ]))
+}
+
+fn task_kind_error(kind: &str, task_id: &str) -> crate::db::ChatDbError {
+    task_db_error(join_text(&[
+        "unsupported trigger_kind '",
+        kind,
+        "' for task ",
+        task_id,
+    ]))
+}
+
+fn task_trigger_type_error(trigger_type: &str, task_id: &str) -> crate::db::ChatDbError {
+    task_db_error(join_text(&[
+        "unsupported time trigger_type '",
+        trigger_type,
+        "' for task ",
+        task_id,
+    ]))
+}
+
+fn workspace_prepare_error(path: &std::path::Path, error: &impl std::fmt::Display) -> String {
+    path_error_text("failed to prepare workspace ", path, error)
+}
+
+fn init_bash_tool_error(prefix: &str, error: &impl std::fmt::Display) -> String {
+    prefixed_error(prefix, error)
+}
+
+fn invalid_profile_component_error(prefix: &str, error: &impl std::fmt::Display) -> String {
+    prefixed_error(prefix, error)
+}
+
 #[derive(Debug, Clone)]
 struct TaskScript {
     content: String,
@@ -527,16 +579,10 @@ impl TaskRuntime {
         match (task.trigger_kind.as_str(), task.trigger_type.as_str()) {
             (TRIGGER_KIND_TIME, TRIGGER_TYPE_CRON) => self.is_cron_due(task, now),
             (TRIGGER_KIND_TIME, TRIGGER_TYPE_ONCE) => self.is_once_due(task, now),
-            (TRIGGER_KIND_TIME, other) => Err(crate::db::ChatDbError::Db(DbErr::Custom(format!(
-                "unsupported time trigger_type '{other}' for task {}",
-                task.id
-            )))),
+            (TRIGGER_KIND_TIME, other) => Err(task_trigger_type_error(other, task.id.as_str())),
             (TRIGGER_KIND_EVENT, _) => Ok(false),
             (TRIGGER_KIND_WEBHOOK, _) => Ok(false),
-            (other_kind, _) => Err(crate::db::ChatDbError::Db(DbErr::Custom(format!(
-                "unsupported trigger_kind '{other_kind}' for task {}",
-                task.id
-            )))),
+            (other_kind, _) => Err(task_kind_error(other_kind, task.id.as_str())),
         }
     }
 
@@ -547,17 +593,19 @@ impl TaskRuntime {
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
         let Some(ref expr) = task.cron_expression else {
-            return Err(crate::db::ChatDbError::Db(DbErr::Custom(format!(
-                "cron task {} is missing cron_expression",
-                task.id
-            ))));
+            return Err(task_field_error(
+                task.id.as_str(),
+                "cron task ",
+                "cron_expression",
+            ));
         };
 
-        let schedule = cron::Schedule::from_str(expr).map_err(|e| {
-            crate::db::ChatDbError::Db(DbErr::Custom(format!(
-                "invalid cron expression stored in task {}: {e}",
-                task.id
-            )))
+        let schedule = cron::Schedule::from_str(expr).map_err(|error| {
+            task_value_error(
+                task.id.as_str(),
+                "invalid cron expression stored in task ",
+                &error,
+            )
         })?;
 
         // Check if any scheduled time falls within the last 30 seconds.
@@ -566,11 +614,12 @@ impl TaskRuntime {
 
         // Skip if we already ran within this window.
         if let Some(ref last_run) = task.last_run_at {
-            let last = jiff::Timestamp::from_str(last_run).map_err(|e| {
-                crate::db::ChatDbError::Db(DbErr::Custom(format!(
-                    "invalid last_run_at stored in task {}: {e}",
-                    task.id
-                )))
+            let last = jiff::Timestamp::from_str(last_run).map_err(|error| {
+                task_value_error(
+                    task.id.as_str(),
+                    "invalid last_run_at stored in task ",
+                    &error,
+                )
             })?;
             let last_chrono = timestamp_to_chrono(last);
             if last_chrono > window_start {
@@ -591,10 +640,7 @@ impl TaskRuntime {
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
         let Some(ref run_at) = task.run_at else {
-            return Err(crate::db::ChatDbError::Db(DbErr::Custom(format!(
-                "one-time task {} is missing run_at",
-                task.id
-            ))));
+            return Err(task_field_error(task.id.as_str(), "one-time task ", "run_at"));
         };
 
         // Skip if already executed.
@@ -602,11 +648,12 @@ impl TaskRuntime {
             return Ok(false);
         }
 
-        let target = jiff::Timestamp::from_str(run_at).map_err(|e| {
-            crate::db::ChatDbError::Db(DbErr::Custom(format!(
-                "invalid run_at stored in task {}: {e}",
-                task.id
-            )))
+        let target = jiff::Timestamp::from_str(run_at).map_err(|error| {
+            task_value_error(
+                task.id.as_str(),
+                "invalid run_at stored in task ",
+                &error,
+            )
         })?;
 
         Ok(now >= target)
@@ -839,18 +886,18 @@ impl TaskRuntime {
             (None, Some(path)) => {
                 let canonical = tokio::fs::canonicalize(path)
                     .await
-                    .map_err(|e| format!("failed to resolve script_path {path}: {e}"))?;
-                let content = tokio::fs::read_to_string(&canonical).await.map_err(|e| {
-                    format!("failed to read script_path {}: {e}", canonical.display())
-                })?;
+                    .map_err(|error| prefixed_error("failed to resolve script_path: ", &error))?;
+                let content = tokio::fs::read_to_string(&canonical)
+                    .await
+                    .map_err(|error| path_error_text("failed to read script_path ", &canonical, &error))?;
+                let canonical_display = canonical.display().to_string();
                 let working_dir = canonical
                     .parent()
-                    .ok_or_else(|| {
-                        format!(
-                            "script_path {} has no parent directory",
-                            canonical.display()
-                        )
-                    })?
+                    .ok_or_else(|| join_text(&[
+                        "script_path ",
+                        canonical_display.as_str(),
+                        " has no parent directory",
+                    ]))?
                     .to_path_buf();
                 Ok(TaskScript {
                     content,
@@ -927,7 +974,7 @@ impl TaskRuntime {
             DefaultExecutor,
         )
         .await
-        .map_err(|e| format!("failed to initialize local bash tool: {e}"))
+        .map_err(|error| init_bash_tool_error("failed to initialize local bash tool: ", &error))
         .map(|tool| {
             tool.with_shell_sessions(shell_sessions)
                 .with_writable_paths([script.host_working_dir.clone()])
@@ -956,7 +1003,7 @@ impl TaskRuntime {
                 name: ssh_server.name,
                 target: ssh_server.target,
             }])
-        .map_err(|error| format!("failed to configure remote ssh server: {error}"))?;
+        .map_err(|error| prefixed_error("failed to configure remote ssh server: ", &error))?;
         let registry = Arc::new(ToolRegistryBuilder::new().build(working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
         BashTool::new_exact(
@@ -971,7 +1018,7 @@ impl TaskRuntime {
             DefaultExecutor,
         )
         .await
-        .map_err(|e| format!("failed to initialize remote bash tool: {e}"))
+        .map_err(|error| init_bash_tool_error("failed to initialize remote bash tool: ", &error))
         .map(|tool| {
             tool.with_shell_sessions(shell_sessions)
                 .with_writable_paths([working_dir.to_path_buf()])
@@ -987,7 +1034,7 @@ impl TaskRuntime {
     ) -> Result<String, String> {
         let working_dir = self.may_dir.join("tasks").join("remote").join(&profile.id);
         std::fs::create_dir_all(working_dir.join("outputs"))
-            .map_err(|error| format!("failed to prepare remote task workspace: {error}"))?;
+            .map_err(|error| workspace_prepare_error(&working_dir, &error))?;
         let bash_tool = self.remote_bash_tool(profile, &working_dir).await?;
         run_bash_script(&bash_tool, BashExecutionMode::Ssh, None, command).await
     }
@@ -1022,34 +1069,29 @@ impl TaskRuntime {
 
         let default_image_tag =
             crate::container::profile::default_image_tag(&self.may_dir, profile)
-                .map_err(|e| format!("invalid container profile image tag: {e}"))?;
+                .map_err(|error| invalid_profile_component_error("invalid container profile image tag: ", &error))?;
         let image_spec = crate::container::profile::image_spec_for_profile(
             &self.may_dir,
             profile,
             &default_image_tag,
         )
-        .map_err(|e| format!("invalid container profile image configuration: {e}"))?;
+        .map_err(|error| invalid_profile_component_error("invalid container profile image configuration: ", &error))?;
         let extra_mounts = crate::container::profile::mounts_for_profile(profile)
-            .map_err(|e| format!("invalid container profile mount configuration: {e}"))?;
+            .map_err(|error| invalid_profile_component_error("invalid container profile mount configuration: ", &error))?;
 
         crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
             .await
-            .map_err(|e| format!("container image check/build failed: {e}"))?;
+            .map_err(|error| prefixed_error("container image check/build failed: ", &error))?;
 
-        let container_name = format!("may-{}", profile.slug.as_deref().unwrap_or(&profile.id));
+        let container_name = container_profile_name(profile);
 
         let workspace_dir = self
             .may_dir
             .join("task-workspaces")
-            .join(profile.slug.as_deref().unwrap_or(&profile.id));
+            .join(profile_workspace_key(profile));
         tokio::fs::create_dir_all(&workspace_dir)
             .await
-            .map_err(|e| {
-                format!(
-                    "failed to prepare container workspace {}: {e}",
-                    workspace_dir.display()
-                )
-            })?;
+            .map_err(|error| workspace_prepare_error(&workspace_dir, &error))?;
 
         let ipc_socket = workspace_dir.join("leash-ipc.sock");
         let mut launch_spec = ContainerLaunchSpec::new(
@@ -1064,7 +1106,7 @@ impl TaskRuntime {
         let container_id = container_manager
             .ensure_running(&launch_spec)
             .await
-            .map_err(|e| format!("failed to start container: {e}"))?;
+            .map_err(|error| prefixed_error("failed to start container: ", &error))?;
         container_manager.touch_activity(&container_id).await;
 
         let container_runtime = ContainerShellRuntime::new(
@@ -1098,7 +1140,7 @@ impl TaskRuntime {
                 DefaultExecutor,
             )
             .await
-            .map_err(|e| format!("failed to initialize container bash tool: {e}"))?
+            .map_err(|error| init_bash_tool_error("failed to initialize container bash tool: ", &error))?
             .with_shell_sessions(shell_sessions)
             .with_writable_paths([workspace_dir.clone()])
             .with_readable_paths([workspace_dir])
@@ -1130,33 +1172,28 @@ impl TaskRuntime {
 
         let default_image_tag =
             crate::container::profile::default_image_tag(&self.may_dir, profile)
-                .map_err(|e| format!("invalid container profile image tag: {e}"))?;
+                .map_err(|error| invalid_profile_component_error("invalid container profile image tag: ", &error))?;
         let image_spec = crate::container::profile::image_spec_for_profile(
             &self.may_dir,
             profile,
             &default_image_tag,
         )
-        .map_err(|e| format!("invalid container profile image configuration: {e}"))?;
+        .map_err(|error| invalid_profile_component_error("invalid container profile image configuration: ", &error))?;
         let extra_mounts = crate::container::profile::mounts_for_profile(profile)
-            .map_err(|e| format!("invalid container profile mount configuration: {e}"))?;
+            .map_err(|error| invalid_profile_component_error("invalid container profile mount configuration: ", &error))?;
 
         crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
             .await
-            .map_err(|e| format!("container image check/build failed: {e}"))?;
+            .map_err(|error| prefixed_error("container image check/build failed: ", &error))?;
 
-        let container_name = format!("may-{}", profile.slug.as_deref().unwrap_or(&profile.id));
+        let container_name = container_profile_name(profile);
         let workspace_dir = self
             .may_dir
             .join("task-workspaces")
-            .join(profile.slug.as_deref().unwrap_or(&profile.id));
+            .join(profile_workspace_key(profile));
         tokio::fs::create_dir_all(&workspace_dir)
             .await
-            .map_err(|e| {
-                format!(
-                    "failed to prepare container workspace {}: {e}",
-                    workspace_dir.display()
-                )
-            })?;
+            .map_err(|error| workspace_prepare_error(&workspace_dir, &error))?;
 
         let ipc_socket = workspace_dir.join("leash-ipc.sock");
         let mut launch_spec = ContainerLaunchSpec::new(
@@ -1171,7 +1208,7 @@ impl TaskRuntime {
         let container_id = container_manager
             .ensure_running(&launch_spec)
             .await
-            .map_err(|e| format!("failed to start container: {e}"))?;
+            .map_err(|error| prefixed_error("failed to start container: ", &error))?;
         container_manager.touch_activity(&container_id).await;
 
         let container_runtime = ContainerShellRuntime::new(
@@ -1203,7 +1240,7 @@ impl TaskRuntime {
                 DefaultExecutor,
             )
             .await
-            .map_err(|e| format!("failed to initialize container bash tool: {e}"))?
+            .map_err(|error| init_bash_tool_error("failed to initialize container bash tool: ", &error))?
             .with_shell_sessions(shell_sessions)
             .with_writable_paths([workspace_dir.clone()])
             .with_readable_paths([workspace_dir])
