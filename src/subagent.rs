@@ -98,14 +98,7 @@ impl SubagentManager {
 
         let mut planned = Vec::with_capacity(files.len());
         for file in &files {
-            let def = SubagentDefinition::from_file_async(file)
-                .await?
-                .ok_or_else(|| {
-                    SubagentError::InvalidDefinition(format!(
-                        "{} does not contain valid subagent frontmatter",
-                        file.display()
-                    ))
-                })?;
+            let def = SubagentDefinition::from_file_async(file).await?;
             let file_name = format!("{}.md", def.id);
             let dest = self.subagents_dir.join(&file_name);
             if tokio::fs::try_exists(&dest).await? {
@@ -145,14 +138,7 @@ impl SubagentManager {
             )));
         }
 
-        let def = SubagentDefinition::from_file_async(source)
-            .await?
-            .ok_or_else(|| {
-                SubagentError::InvalidDefinition(format!(
-                    "{} does not contain valid subagent frontmatter",
-                    source.display()
-                ))
-            })?;
+        let def = SubagentDefinition::from_file_async(source).await?;
         let file_name = format!("{}.md", def.id);
         let dest = self.subagents_dir.join(&file_name);
 
