@@ -111,6 +111,8 @@ export interface NetworkAccessLogsPayload {
 export interface NotificationCallbackPayload {
   notificationId: string;
   sessionId?: string | null;
+  hasCallback: boolean;
+  callbackConsumed: boolean;
   callbackContextXml?: string | null;
   callbackMessage?: string | null;
 }

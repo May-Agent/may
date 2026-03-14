@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use sea_orm::DbErr;
 use skyzen::routing::Params;
 use skyzen::Result as SkyResult;
 use skyzen::utils::{Json, State};
@@ -124,30 +125,27 @@ pub(super) async fn consume_notification_callback(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<super::types::NotificationCallbackResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let entry = state
+    let callback = state
         .db()
         .await
-        .get_notification_mailbox_entry(&id)
+        .consume_notification_callback(&id)
         .await
-        .map_err(internal_error)?
-        .ok_or_else(|| {
-            skyzen::Error::msg("notification mailbox entry not found")
-                .set_status(skyzen::StatusCode::NOT_FOUND)
+        .map_err(|error| match error {
+            crate::db::ChatDbError::Db(DbErr::RecordNotFound(_)) => {
+                skyzen::Error::msg("notification mailbox entry not found")
+                    .set_status(skyzen::StatusCode::NOT_FOUND)
+            }
+            other => internal_error(other),
         })?;
-
-    state
-        .db()
-        .await
-        .mark_notification_mailbox_opened(&id)
-        .await
-        .map_err(internal_error)?;
     state.notify_ui_events();
 
     Ok(Json(super::types::NotificationCallbackResponse {
-        notification_id: entry.id,
-        session_id: entry.session_id,
-        callback_context_xml: entry.callback_context_xml,
-        callback_message: entry.callback_message,
+        notification_id: callback.id,
+        session_id: callback.session_id,
+        has_callback: callback.has_callback,
+        callback_consumed: callback.callback_consumed,
+        callback_context_xml: callback.callback_context_xml,
+        callback_message: callback.callback_message,
     }))
 }
 

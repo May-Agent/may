@@ -204,6 +204,8 @@ pub(crate) struct NotificationMailboxResponse {
 pub(crate) struct NotificationCallbackResponse {
     pub(crate) notification_id: String,
     pub(crate) session_id: Option<String>,
+    pub(crate) has_callback: bool,
+    pub(crate) callback_consumed: bool,
     pub(crate) callback_context_xml: Option<String>,
     pub(crate) callback_message: Option<String>,
 }

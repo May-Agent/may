@@ -226,6 +226,8 @@ function AppShell() {
           typeof callback.callbackContextXml === 'string'
             ? callback.callbackContextXml.trim()
             : '';
+        const hasCallback = callback.hasCallback;
+        const callbackConsumed = callback.callbackConsumed;
 
         let callbackProfileId: string | null = null;
         if (requestedSessionId) {
@@ -238,6 +240,10 @@ function AppShell() {
 
         if (callbackProfileId && callbackProfileId !== store.currentProfileId) {
           await store.switchProfile(callbackProfileId);
+        }
+
+        if (hasCallback && callbackConsumed) {
+          return;
         }
 
         const existingSession = requestedSessionId

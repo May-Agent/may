@@ -407,10 +407,7 @@ struct ResumeWaitingTurnXml<'a> {
 }
 
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> anyhow::Result<String> {
-    let mut output = String::new();
-    let serializer = quick_xml::se::Serializer::with_root(&mut output, Some(tag))?;
-    value.serialize(serializer)?;
-    Ok(output)
+    crate::xml_fragment::serialize_tagged_xml(tag, value).map_err(anyhow::Error::from)
 }
 
 fn browser_takeover_alert_xml() -> anyhow::Result<String> {
