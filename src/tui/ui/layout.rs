@@ -1632,7 +1632,7 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRe
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("  {}", request.args.path.as_str()),
+            format!("  {}", request.args.request.path.as_str()),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(ratatui::style::Modifier::BOLD),
@@ -1640,7 +1640,7 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRe
         Line::from(""),
         Line::from(Span::styled("Reason:", Style::default().fg(Color::White))),
         Line::from(Span::styled(
-            format!("  {}", request.args.reason.as_str()),
+            format!("  {}", request.args.request.reason.as_str()),
             Style::default().fg(Color::Yellow),
         )),
         Line::from(""),

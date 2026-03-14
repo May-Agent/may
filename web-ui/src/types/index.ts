@@ -168,6 +168,7 @@ export type SessionRuntimeState =
   | 'idle'
   | 'running'
   | 'waiting_permission'
+  | 'waiting_workspace'
   | 'waiting_ask_user'
   | 'waiting_terminal_input';
 
@@ -185,6 +186,13 @@ export interface RuntimePermissionRequest {
   id: string;
   mode: 'default' | 'unsafe' | 'ssh';
   script: string;
+  sessionId?: string;
+}
+
+export interface RuntimeWorkspaceRequest {
+  id: string;
+  path: string;
+  reason: string;
   sessionId?: string;
 }
 
@@ -212,6 +220,7 @@ export interface SessionRuntimeSummaryPayload {
   pendingImmediate?: PendingUserMessage | null;
   queuedMessages: PendingUserMessage[];
   waitingPermission?: RuntimePermissionRequest | null;
+  waitingWorkspace?: RuntimeWorkspaceRequest | null;
   waitingAskUser?: RuntimeAskUserRequest | null;
 }
 

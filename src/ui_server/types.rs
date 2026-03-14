@@ -735,6 +735,16 @@ pub(crate) struct PermissionPollItem {
     pub(crate) request: crate::agent::PermissionRequest,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspacePollItem {
+    pub(crate) id: String,
+    pub(crate) path: String,
+    pub(crate) reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserInteractionResponse {
@@ -774,6 +784,14 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
                         session_id: request.request.session_id,
                     },
                 }),
+            waiting_workspace: summary
+                .waiting_workspace
+                .map(|request| WorkspacePollItem {
+                    id: request.id,
+                    path: request.request.path,
+                    reason: request.request.reason,
+                    session_id: request.request.session_id,
+                }),
             waiting_ask_user: summary.waiting_ask_user,
         }
     }
@@ -782,6 +800,13 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PermissionRespondRequest {
+    pub(crate) id: String,
+    pub(crate) approved: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceRespondRequest {
     pub(crate) id: String,
     pub(crate) approved: bool,
 }
@@ -811,6 +836,8 @@ pub(crate) struct SessionRuntimeResponse {
     pub(crate) queued_messages: Vec<PendingUserMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) waiting_permission: Option<PermissionPollItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting_workspace: Option<WorkspacePollItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) waiting_ask_user: Option<crate::session::PersistedAskUserRequest>,
 }

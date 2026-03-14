@@ -83,6 +83,10 @@ pub enum MessageRole {
     PermissionRequest,
     /// User's response to a permission request.
     PermissionResponse,
+    /// Agent requests workspace access.
+    WorkspaceRequest,
+    /// User's response to a workspace request.
+    WorkspaceResponse,
     /// Agent asks the user a question.
     AskUserRequest,
     /// User's answer to an ask-user question.
@@ -106,6 +110,8 @@ impl MessageRole {
             Self::Tool => "tool",
             Self::PermissionRequest => "permission_request",
             Self::PermissionResponse => "permission_response",
+            Self::WorkspaceRequest => "workspace_request",
+            Self::WorkspaceResponse => "workspace_response",
             Self::AskUserRequest => "ask_user_request",
             Self::AskUserResponse => "ask_user_response",
         }
@@ -123,6 +129,8 @@ impl MessageRole {
             | Self::Tool
             | Self::PermissionRequest
             | Self::PermissionResponse
+            | Self::WorkspaceRequest
+            | Self::WorkspaceResponse
             | Self::AskUserRequest
             | Self::AskUserResponse => SessionSummaryUpdate {
                 touch_updated_at: true,
@@ -141,6 +149,8 @@ impl MessageRole {
             "tool" => Ok(Self::Tool),
             "permission_request" => Ok(Self::PermissionRequest),
             "permission_response" => Ok(Self::PermissionResponse),
+            "workspace_request" => Ok(Self::WorkspaceRequest),
+            "workspace_response" => Ok(Self::WorkspaceResponse),
             "ask_user_request" => Ok(Self::AskUserRequest),
             "ask_user_response" => Ok(Self::AskUserResponse),
             _ => Err(ChatHistoryError::InvalidRole(s.to_string())),
@@ -273,6 +283,34 @@ impl ChatMessage {
         }
     }
 
+    /// Create a workspace request message.
+    ///
+    /// Content is JSON-serialized `WorkspaceRequestData`.
+    pub fn workspace_request(data: &WorkspaceRequestData) -> Self {
+        Self {
+            role: MessageRole::WorkspaceRequest,
+            content: serde_json::to_string(data)
+                .expect("WorkspaceRequestData is always serializable"),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: None,
+            stats: None,
+        }
+    }
+
+    /// Create a workspace response message.
+    ///
+    /// Content is JSON-serialized `WorkspaceResponseData`.
+    pub fn workspace_response(data: &WorkspaceResponseData) -> Self {
+        Self {
+            role: MessageRole::WorkspaceResponse,
+            content: serde_json::to_string(data)
+                .expect("WorkspaceResponseData is always serializable"),
+            timestamp: Some(Timestamp::now()),
+            tool_call_id: None,
+            stats: None,
+        }
+    }
+
     /// Create an ask-user response message.
     ///
     /// Content is JSON-serialized `AskUserResponseData`.
@@ -310,6 +348,26 @@ pub struct PermissionResponseData {
     /// Request ID this responds to.
     pub id: String,
     /// Whether permission was granted.
+    pub approved: bool,
+}
+
+/// Workspace request data stored in chat history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRequestData {
+    /// Unique request ID.
+    pub id: String,
+    /// Requested path.
+    pub path: String,
+    /// User-visible reason for the request.
+    pub reason: String,
+}
+
+/// Workspace response data stored in chat history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceResponseData {
+    /// Request ID this responds to.
+    pub id: String,
+    /// Whether access was granted.
     pub approved: bool,
 }
 
@@ -559,6 +617,8 @@ impl ChatHistory {
                     // Interaction messages are metadata, not LLM context
                     MessageRole::PermissionRequest
                     | MessageRole::PermissionResponse
+                    | MessageRole::WorkspaceRequest
+                    | MessageRole::WorkspaceResponse
                     | MessageRole::AskUserRequest
                     | MessageRole::AskUserResponse => None,
                 }

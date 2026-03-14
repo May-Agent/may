@@ -4,6 +4,7 @@ import type {
   PermissionRequest,
   SessionRuntimeSnapshot,
   SessionRuntimeStatus,
+  WorkspaceRequest,
 } from '@/lib/api';
 import type { PendingUserMessage, SessionRuntimeState } from '@/types';
 import type { SessionPlanState } from '@/types';
@@ -18,6 +19,7 @@ interface SessionRuntime {
   };
   queuedCount: number;
   waitingPermission: PermissionRequest | null;
+  waitingWorkspace: WorkspaceRequest | null;
   waitingAskUser: AskUserRequest | null;
   pendingImmediate: PendingUserMessage | null;
   queuedMessages: PendingUserMessage[];
@@ -39,6 +41,7 @@ const defaultRuntime = (): SessionRuntime => ({
   planState: 'disabled',
   queuedCount: 0,
   waitingPermission: null,
+  waitingWorkspace: null,
   waitingAskUser: null,
   pendingImmediate: null,
   queuedMessages: [],
@@ -56,6 +59,7 @@ function runtimeFromStatus(
     interactions: runtime.interactions ?? current?.interactions,
     queuedCount: Math.max(0, runtime.queuedCount ?? 0),
     waitingPermission: runtime.waitingPermission ?? null,
+    waitingWorkspace: runtime.waitingWorkspace ?? null,
     waitingAskUser: runtime.waitingAskUser ?? null,
     pendingImmediate: runtime.pendingImmediate ?? null,
     queuedMessages: runtime.queuedMessages ?? [],
@@ -84,6 +88,7 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => ({
           ...(state.sessions[sessionId] ?? defaultRuntime()),
           state: 'running',
           waitingPermission: null,
+          waitingWorkspace: null,
           waitingAskUser: null,
         },
       },

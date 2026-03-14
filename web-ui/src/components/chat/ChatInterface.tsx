@@ -14,6 +14,7 @@ import {
   removePendingSessionMessage,
   respondAskUserRequest,
   respondPermissionRequest,
+  respondWorkspaceRequest,
   saveSessionTasks,
   stopSessionRun,
   streamChat,
@@ -22,6 +23,7 @@ import {
   type AskUserAnswer,
   type AskUserRequest,
   type PermissionRequest,
+  type WorkspaceRequest,
 } from "@/lib/api";
 import { MessageItem } from "./MessageItem";
 import { ModelSelector } from "./ModelSelector";
@@ -158,6 +160,7 @@ export function ChatInterface({
   const [isModelUpdating, setIsModelUpdating] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
   const [isPermissionSubmitting, setIsPermissionSubmitting] = useState(false);
+  const [isWorkspaceSubmitting, setIsWorkspaceSubmitting] = useState(false);
   const [pendingAskUser, setPendingAskUser] = useState<AskUserState | null>(null);
   const [isAskUserSubmitting, setIsAskUserSubmitting] = useState(false);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -295,6 +298,8 @@ export function ChatInterface({
     : [];
   const pendingPermission: PermissionRequest | null =
     runtimeSession?.waitingPermission ?? null;
+  const pendingWorkspace: WorkspaceRequest | null =
+    runtimeSession?.waitingWorkspace ?? null;
   const pendingAskUserRequest: AskUserRequest | null =
     runtimeSession?.waitingAskUser ?? null;
   const isGenerating = runtimeSession?.state === 'running';
@@ -1746,6 +1751,23 @@ export function ChatInterface({
     }
   };
 
+  const handleWorkspaceDecision = async (approved: boolean) => {
+    if (!pendingWorkspace || !currentSessionId) return;
+    setIsWorkspaceSubmitting(true);
+    try {
+      const runtime = await respondWorkspaceRequest(pendingWorkspace.id, approved);
+      applyRuntime(currentSessionId, runtime);
+    } catch (error) {
+      setUiError(
+        `workspace submit failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } finally {
+      setIsWorkspaceSubmitting(false);
+    }
+  };
+
   const handleAskUserAnswerChange = (
     questionIndex: number,
     value: AskUserAnswer["answer"],
@@ -1783,6 +1805,9 @@ export function ChatInterface({
     ? pendingPermission.mode === "unsafe"
       ? "border-red-300 bg-red-100 text-red-900 dark:border-red-800 dark:bg-red-950/95 dark:text-red-100"
       : "border-border bg-card text-foreground"
+    : "";
+  const workspaceToneClass = pendingWorkspace
+    ? "border-border bg-card text-foreground"
     : "";
 
   const handleTitleSubmit = () => {
@@ -2391,6 +2416,31 @@ export function ChatInterface({
                   variant="outline"
                   disabled={isPermissionSubmitting}
                   onClick={() => void handlePermissionDecision(false)}
+                >
+                  Deny
+                </Button>
+              </div>
+            </div>
+          )}
+            {pendingWorkspace && (
+            <div className={`mb-3 rounded-lg border px-3 py-2 text-sm ${workspaceToneClass}`}>
+              <div className="font-medium">Workspace access required</div>
+              <div className="mt-1 break-all font-mono text-xs">{pendingWorkspace.path}</div>
+              <div className="mt-2 text-muted-foreground">{pendingWorkspace.reason}</div>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={isWorkspaceSubmitting}
+                  onClick={() => void handleWorkspaceDecision(true)}
+                >
+                  Approve
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={isWorkspaceSubmitting}
+                  onClick={() => void handleWorkspaceDecision(false)}
                 >
                   Deny
                 </Button>

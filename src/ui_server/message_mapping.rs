@@ -25,6 +25,8 @@ pub(super) fn map_db_messages(
             }
             MessageRole::PermissionRequest
             | MessageRole::PermissionResponse
+            | MessageRole::WorkspaceRequest
+            | MessageRole::WorkspaceResponse
             | MessageRole::AskUserRequest
             | MessageRole::AskUserResponse
             | MessageRole::HiddenContext => continue,
