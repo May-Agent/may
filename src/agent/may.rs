@@ -44,12 +44,34 @@ use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 // Error message templates
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
 
+fn join_text(parts: &[&str]) -> String {
+    let capacity = parts.iter().map(|part| part.len()).sum();
+    let mut output = String::with_capacity(capacity);
+    for part in parts {
+        output.push_str(part);
+    }
+    output
+}
+
+fn quoted_name_error(prefix: &str, name: &str, suffix: &str) -> String {
+    join_text(&[prefix, "'", name, "'", suffix])
+}
+
+fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
+    let error_text = error.to_string();
+    join_text(&[prefix, error_text.as_str()])
+}
+
 fn err_no_provider(model: &str) -> String {
-    format!("No provider available for model '{model}'. Use /config to add providers.")
+    quoted_name_error(
+        "No provider available for model ",
+        model,
+        ". Use /config to add providers.",
+    )
 }
 
 fn err_api_key_required(provider: &str) -> String {
-    format!("API key required for provider '{provider}'")
+    quoted_name_error("API key required for provider ", provider, "")
 }
 
 fn ordered_provider_ids_for_model(config: &MayConfig, model: &str) -> Vec<String> {
@@ -142,9 +164,15 @@ async fn validate_generic_provider_model_support(
     let fetched = crate::models::fetch_models_for_provider_instance(provider_id, instance)
         .await
         .map_err(|error| {
-            MayAgentError::Llm(format!(
-                "Failed to validate model '{model}' for provider '{provider_id}' via /models: {error}"
-            ))
+            let error_text = error.to_string();
+            MayAgentError::Llm(join_text(&[
+                "Failed to validate model '",
+                model,
+                "' for provider '",
+                provider_id,
+                "' via /models: ",
+                error_text.as_str(),
+            ]))
         })?;
 
     let mode = MatchMode::from_strict_flag(config.preferences.strict_model_matching);
@@ -153,9 +181,13 @@ async fn validate_generic_provider_model_support(
         .any(|candidate| model_ids_match(candidate.id.as_str(), model, mode));
 
     if !has_match {
-        return Err(MayAgentError::Llm(format!(
-            "Provider '{provider_id}' does not advertise model '{model}' in /models"
-        )));
+        return Err(MayAgentError::Llm(join_text(&[
+            "Provider '",
+            provider_id,
+            "' does not advertise model '",
+            model,
+            "' in /models",
+        ])));
     }
 
     Ok(())
@@ -209,7 +241,7 @@ impl core::str::FromStr for PermissionRequestMode {
             "default" => Ok(Self::Default),
             "unsafe" => Ok(Self::Unsafe),
             "ssh" => Ok(Self::Ssh),
-            other => Err(format!("unknown permission request mode: {other}")),
+            other => Err(join_text(&["unknown permission request mode: ", other])),
         }
     }
 }
@@ -384,9 +416,10 @@ impl PermissionHandler for PermissionApprover {
                 if approved {
                     Ok(true)
                 } else {
-                    Err(PermissionError::Denied(
-                        [mode.description(), " mode denied for script"].concat(),
-                    ))
+                    Err(PermissionError::Denied(join_text(&[
+                        mode.description(),
+                        " mode denied for script",
+                    ])))
                 }
             }
         }
@@ -757,12 +790,16 @@ impl Tool for ImagineTool {
         }
 
         let image = latest.ok_or_else(|| anyhow::anyhow!("image generation returned no data"))?;
-        let filename = format!("{}.png", uuid::Uuid::new_v4());
+        let mut filename = uuid::Uuid::new_v4().to_string();
+        filename.push_str(".png");
         let path = self.artifacts_dir.join(&filename);
         async_fs::create_dir_all(&self.artifacts_dir).await?;
         async_fs::write(&path, image).await?;
 
-        Ok(ToolOutput::text(format!("artifacts/{filename}")))
+        let mut artifact_path = String::with_capacity(filename.len() + 10);
+        artifact_path.push_str("artifacts/");
+        artifact_path.push_str(filename.as_str());
+        Ok(ToolOutput::text(artifact_path))
     }
 }
 
@@ -1086,8 +1123,9 @@ impl MayAgent {
                     ));
                 if let Some(browser_backend) = browser_backend {
                     let endpoint = browser_backend.cdp_endpoint().await.map_err(|error| {
-                        MayAgentError::Sandbox(format!(
-                            "failed to resolve browser CDP endpoint from backend: {error}"
+                        MayAgentError::Sandbox(prefixed_error(
+                            "failed to resolve browser CDP endpoint from backend: ",
+                            &error,
                         ))
                     })?;
                     let browser_context = build_browser_context(Some(endpoint.as_str()));
@@ -1571,9 +1609,10 @@ async fn build_cloud_provider_from_instance(
         }
         ProviderType::Custom => {
             let url = base_url.ok_or_else(|| {
-                MayAgentError::MissingApiKey(format!(
-                    "Base URL required for custom provider '{}'",
-                    id
+                MayAgentError::MissingApiKey(quoted_name_error(
+                    "Base URL required for custom provider ",
+                    id,
+                    "",
                 ))
             })?;
             OpenAI::new(api_key)
@@ -1624,10 +1663,12 @@ pub async fn generate_session_title(
     let user_truncated = truncate_at_char_boundary(user_message, 200);
     let assistant_truncated = truncate_at_char_boundary(assistant_response, 300);
 
-    let prompt = format!(
-        "Generate a short, descriptive title (3-6 words) for this conversation. Output ONLY the title, nothing else.\n\nUser: {}\n\nAssistant: {}",
-        user_truncated, assistant_truncated
-    );
+    let prompt = join_text(&[
+        "Generate a short, descriptive title (3-6 words) for this conversation. Output ONLY the title, nothing else.\n\nUser: ",
+        user_truncated,
+        "\n\nAssistant: ",
+        assistant_truncated,
+    ]);
 
     let request = LLMRequest::new(vec![Message::user(&prompt)]);
     let mut stream = std::pin::pin!(llm.respond(request));
@@ -1796,7 +1837,7 @@ fn build_location_context(location: &crate::location::LocationInfo) -> LocationC
 }
 
 fn build_memory_context_content(memory: &str) -> String {
-    format!("{}\n\n{}", MEMORY_CONTEXT_HINT.trim(), memory)
+    join_text(&[MEMORY_CONTEXT_HINT.trim(), "\n\n", memory])
 }
 
 fn build_memory_context(memory: &str) -> Memory {

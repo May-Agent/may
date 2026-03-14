@@ -81,6 +81,84 @@ impl TaskCatalog {
     }
 }
 
+fn join_text(parts: &[&str]) -> String {
+    let capacity = parts.iter().map(|part| part.len()).sum();
+    let mut output = String::with_capacity(capacity);
+    for part in parts {
+        output.push_str(part);
+    }
+    output
+}
+
+fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
+    let error_text = error.to_string();
+    join_text(&[prefix, error_text.as_str()])
+}
+
+fn profile_load_error(profile_id: &str, error: &impl std::fmt::Display) -> String {
+    let error_text = error.to_string();
+    join_text(&[
+        "failed to load profile ",
+        profile_id,
+        ": ",
+        error_text.as_str(),
+    ])
+}
+
+fn profile_not_found_error(profile_id: &str) -> String {
+    join_text(&["profile ", profile_id, " not found"])
+}
+
+fn invalid_profile_error(profile_id: &str, error: &impl std::fmt::Display) -> String {
+    let error_text = error.to_string();
+    join_text(&[
+        "invalid profile ",
+        profile_id,
+        ": ",
+        error_text.as_str(),
+    ])
+}
+
+fn session_load_error(session_id: &str, error: &impl std::fmt::Display) -> String {
+    let error_text = error.to_string();
+    join_text(&[
+        "failed to load session ",
+        session_id,
+        ": ",
+        error_text.as_str(),
+    ])
+}
+
+fn session_not_found_error(session_id: &str) -> String {
+    join_text(&["session not found: ", session_id])
+}
+
+fn task_notification_title(task_name: &str) -> String {
+    join_text(&["Task: ", task_name])
+}
+
+const fn task_runtime_kind_name(kind: TaskRuntimeKind) -> &'static str {
+    match kind {
+        TaskRuntimeKind::Local => "local",
+        TaskRuntimeKind::Container => "container",
+        TaskRuntimeKind::Remote => "remote",
+    }
+}
+
+fn task_script_failure(exit_code: i32, output: &str) -> String {
+    let exit_code_text = exit_code.to_string();
+    join_text(&[
+        "task script failed with exit code ",
+        exit_code_text.as_str(),
+        "\n",
+        output,
+    ])
+}
+
+fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String {
+    join_text(&[prefix, execution_id, suffix])
+}
+
 #[derive(Debug, Clone)]
 struct TaskScript {
     content: String,
@@ -238,8 +316,8 @@ impl TaskRuntime {
             .db
             .get_profile(profile_id)
             .await
-            .map_err(|e| format!("failed to load profile {profile_id}: {e}"))?
-            .ok_or_else(|| format!("profile {profile_id} not found"))?;
+            .map_err(|error| profile_load_error(profile_id, &error))?
+            .ok_or_else(|| profile_not_found_error(profile_id))?;
         self.validate_task_script_for_profile_model(&profile, script_path, script_inline)
             .await
     }
@@ -256,33 +334,36 @@ impl TaskRuntime {
             .db
             .get_session(&normalized.session_id)
             .await
-            .map_err(|e| format!("failed to load session {}: {e}", normalized.session_id))?
-            .ok_or_else(|| format!("session not found: {}", normalized.session_id))?;
+            .map_err(|error| session_load_error(normalized.session_id.as_str(), &error))?
+            .ok_or_else(|| session_not_found_error(normalized.session_id.as_str()))?;
 
         let profile_id = session.profile_id.ok_or_else(|| {
-            format!(
-                "session {} is not attached to a profile",
-                normalized.session_id
-            )
+            join_text(&[
+                "session ",
+                normalized.session_id.as_str(),
+                " is not attached to a profile",
+            ])
         })?;
         let profile = self
             .db
             .get_profile(&profile_id)
             .await
-            .map_err(|e| format!("failed to load profile {profile_id}: {e}"))?
-            .ok_or_else(|| format!("profile {profile_id} not found"))?;
+            .map_err(|error| profile_load_error(profile_id.as_str(), &error))?
+            .ok_or_else(|| profile_not_found_error(profile_id.as_str()))?;
         let profile_info = ProfileInfo::from_db_model(profile.clone())
-            .map_err(|e| format!("invalid profile {profile_id}: {e}"))?;
+            .map_err(|error| invalid_profile_error(profile_id.as_str(), &error))?;
         let actual_runtime = match profile_info.environment {
             ProfileEnvironment::Local => TaskRuntimeKind::Local,
             ProfileEnvironment::Container { .. } => TaskRuntimeKind::Container,
             ProfileEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
         };
         if runtime_kind != actual_runtime {
-            return Err(format!(
-                "task runtime mismatch: session profile uses {:?}, request declared {:?}",
-                actual_runtime, runtime_kind
-            ));
+            return Err(join_text(&[
+                "task runtime mismatch: session profile uses ",
+                task_runtime_kind_name(actual_runtime),
+                ", request declared ",
+                task_runtime_kind_name(runtime_kind),
+            ]));
         }
 
         self.validate_task_script_for_profile_model(
@@ -310,7 +391,7 @@ impl TaskRuntime {
                 needs_network: normalized.needs_network,
             })
             .await
-            .map_err(|e| format!("failed to create scheduled task: {e}"))?;
+            .map_err(|error| prefixed_error("failed to create scheduled task: ", &error))?;
         self.reload_active_tasks()
             .await
             .map_err(|e| e.to_string())?;
@@ -564,7 +645,7 @@ impl TaskRuntime {
 
                 if let Some(ref notifier) = self.notifier {
                     let payload = NotificationPayload {
-                        title: ["Task: ", task.name.as_str()].concat(),
+                        title: task_notification_title(task.name.as_str()),
                         body: "Completed successfully".to_string(),
                         session_id: task.session_id.clone(),
                         callback_context_xml: None,
@@ -592,7 +673,7 @@ impl TaskRuntime {
 
                 if let Some(ref notifier) = self.notifier {
                     let payload = NotificationPayload {
-                        title: ["Task: ", task.name.as_str()].concat(),
+                        title: task_notification_title(task.name.as_str()),
                         body: "Execution failed".to_string(),
                         session_id: task.session_id.clone(),
                         callback_context_xml: None,
@@ -620,10 +701,10 @@ impl TaskRuntime {
             .db
             .get_profile(&task.profile_id)
             .await
-            .map_err(|e| format!("failed to load profile {}: {e}", task.profile_id))?
-            .ok_or_else(|| format!("profile {} not found", task.profile_id))?;
+            .map_err(|error| profile_load_error(task.profile_id.as_str(), &error))?
+            .ok_or_else(|| profile_not_found_error(task.profile_id.as_str()))?;
         let profile_info = ProfileInfo::from_db_model(profile.clone())
-            .map_err(|e| format!("invalid profile {}: {e}", task.profile_id))?;
+            .map_err(|error| invalid_profile_error(task.profile_id.as_str(), &error))?;
 
         let script = self.resolve_script(task).await?;
         let materialized = self
@@ -658,17 +739,14 @@ impl TaskRuntime {
         let execution_id = uuid::Uuid::new_v4().to_string();
         let script_path = script
             .host_working_dir
-            .join([".may-task-script-", execution_id.as_str(), ".sh"].concat());
+            .join(temp_task_file_name(".may-task-script-", execution_id.as_str(), ".sh"));
         let trigger_path = script
             .host_working_dir
-            .join([".may-task-trigger-", execution_id.as_str(), ".json"].concat());
+            .join(temp_task_file_name(".may-task-trigger-", execution_id.as_str(), ".json"));
         let trigger_kind =
             shell_escape(Cow::Borrowed(Self::invocation_kind(&invocation))).into_owned();
         let trigger_payload = serde_json::to_vec(&TaskExecutionEnvelope::new(task, invocation))
-            .map_err(|error| {
-                let error = error.to_string();
-                ["failed to encode task trigger payload: ", error.as_str()].concat()
-            })?;
+            .map_err(|error| prefixed_error("failed to encode task trigger payload: ", &error))?;
 
         tokio::fs::write(&script_path, script.content.as_bytes())
             .await
@@ -1157,7 +1235,7 @@ async fn run_bash_script(
     ssh_server_id: Option<String>,
     script: String,
 ) -> Result<String, String> {
-    let output = bash_tool
+        let output = bash_tool
         .call(BashArgs {
             script,
             mode,
@@ -1168,7 +1246,7 @@ async fn run_bash_script(
             raw: false,
         })
         .await
-        .map_err(|e| format!("task bash execution failed: {e}"))?;
+        .map_err(|error| prefixed_error("task bash execution failed: ", &error))?;
 
     let payload = output
         .as_str()
@@ -1179,16 +1257,16 @@ async fn run_bash_script(
 
 fn parse_bash_result(payload: &str) -> Result<String, String> {
     let result: BashResult =
-        serde_json::from_str(payload).map_err(|e| format!("failed to parse bash result: {e}"))?;
+        serde_json::from_str(payload).map_err(|error| prefixed_error("failed to parse bash result: ", &error))?;
 
     if result.exit_code != 0 {
-        return Err(format!(
-            "task script failed with exit code {}\n{}",
+        return Err(task_script_failure(
             result.exit_code,
             combine_output(
                 &result.stdout.to_string(),
-                result.stderr.as_ref().map(ToString::to_string)
+                result.stderr.as_ref().map(ToString::to_string),
             )
+            .as_str(),
         ));
     }
 
@@ -1201,7 +1279,7 @@ fn parse_bash_result(payload: &str) -> Result<String, String> {
 fn combine_output(stdout: &str, stderr: Option<String>) -> String {
     match stderr {
         Some(stderr_text) if !stderr_text.trim().is_empty() => {
-            format!("{stdout}\n--- stderr ---\n{stderr_text}")
+            join_text(&[stdout, "\n--- stderr ---\n", stderr_text.as_str()])
         }
         _ => stdout.to_string(),
     }
@@ -1209,7 +1287,7 @@ fn combine_output(stdout: &str, stderr: Option<String>) -> String {
 
 fn truncate_output(output: &str) -> String {
     if output.len() > 10240 {
-        format!("{}...(truncated)", &output[..10240])
+        join_text(&[&output[..10240], "...(truncated)"])
     } else {
         output.to_string()
     }

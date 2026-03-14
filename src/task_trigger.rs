@@ -13,6 +13,20 @@ pub const TRIGGER_TYPE_CRON: &str = "cron";
 pub const EVENT_CHAT_TURN_COMPLETED: &str = "chat.turn.completed";
 const WEBHOOK_ROUTE_PREFIX: &str = "/api/tasks/webhook/";
 
+fn join_text(parts: &[&str]) -> String {
+    let capacity = parts.iter().map(|part| part.len()).sum();
+    let mut output = String::with_capacity(capacity);
+    for part in parts {
+        output.push_str(part);
+    }
+    output
+}
+
+fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
+    let error_text = error.to_string();
+    join_text(&[prefix, error_text.as_str()])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskTriggerKind {
     Time,
@@ -55,7 +69,7 @@ impl FromStr for TimeTriggerType {
         match trigger_type.as_str() {
             TRIGGER_TYPE_ONCE => Ok(Self::Once),
             TRIGGER_TYPE_CRON => Ok(Self::Cron),
-            other => Err([
+            other => Err(join_text(&[
                 "unsupported time trigger_type '",
                 other,
                 "', expected '",
@@ -63,8 +77,7 @@ impl FromStr for TimeTriggerType {
                 "' or '",
                 TRIGGER_TYPE_CRON,
                 "'",
-            ]
-            .concat()),
+            ])),
         }
     }
 }
@@ -78,7 +91,7 @@ impl FromStr for TaskTriggerKind {
             TRIGGER_KIND_TIME => Ok(Self::Time),
             TRIGGER_KIND_EVENT => Ok(Self::Event),
             TRIGGER_KIND_WEBHOOK => Ok(Self::Webhook),
-            other => Err([
+            other => Err(join_text(&[
                 "unsupported task trigger_kind '",
                 other,
                 "', expected '",
@@ -88,8 +101,7 @@ impl FromStr for TaskTriggerKind {
                 "', or '",
                 TRIGGER_KIND_WEBHOOK,
                 "'",
-            ]
-            .concat()),
+            ])),
         }
     }
 }
@@ -190,7 +202,7 @@ pub fn new_webhook_token() -> String {
 
 #[must_use]
 pub fn webhook_path(token: &str) -> String {
-    [WEBHOOK_ROUTE_PREFIX, token].concat()
+    join_text(&[WEBHOOK_ROUTE_PREFIX, token])
 }
 
 pub fn normalize_trigger(input: TaskTriggerInput<'_>) -> Result<NormalizedTaskTrigger, String> {
@@ -234,7 +246,7 @@ pub fn normalize_utc_timestamp(value: &str) -> Result<String, String> {
     }
     jiff::Timestamp::from_str(timestamp)
         .map(|parsed| parsed.to_string())
-        .map_err(|error| ["invalid UTC timestamp: ", error.to_string().as_str()].concat())
+        .map_err(|error| prefixed_error("invalid UTC timestamp: ", &error))
 }
 
 pub fn normalize_event_name(value: &str) -> Result<String, String> {
@@ -246,12 +258,11 @@ pub fn normalize_event_name(value: &str) -> Result<String, String> {
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'));
     if !valid {
-        return Err([
+        return Err(join_text(&[
             "invalid event name '",
             raw.as_str(),
             "': only [a-z0-9._-] are allowed",
-        ]
-        .concat());
+        ]));
     }
     Ok(raw)
 }
@@ -298,9 +309,8 @@ fn normalize_time_trigger(
             }
             let cron_expression =
                 cron_expression.ok_or_else(|| "cron trigger requires cron_utc".to_string())?;
-            cron::Schedule::from_str(cron_expression).map_err(|error| {
-                ["invalid cron_utc expression: ", error.to_string().as_str()].concat()
-            })?;
+            cron::Schedule::from_str(cron_expression)
+                .map_err(|error| prefixed_error("invalid cron_utc expression: ", &error))?;
             Ok(NormalizedTaskTrigger {
                 kind: TaskTriggerKind::Time,
                 time_trigger_type: Some(TimeTriggerType::Cron),
@@ -434,7 +444,7 @@ mod tests {
         assert!(!token.is_empty());
         assert_eq!(
             webhook_path(&token),
-            ["/api/tasks/webhook/", token.as_str()].concat()
+            super::join_text(&["/api/tasks/webhook/", token.as_str()])
         );
     }
 
