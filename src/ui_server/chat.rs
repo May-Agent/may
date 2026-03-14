@@ -297,7 +297,7 @@ fn result_waits_for_terminal_input(result: &Result<String, String>) -> bool {
 
 fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     tokio::spawn(async move {
-        let inserted = state.active_streaming_sessions.insert(session_id.clone());
+        let inserted = state.session_execution_gate.claim(session_id.clone());
         if !inserted {
             return;
         }
@@ -334,7 +334,7 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
             }
         }
 
-        state.active_streaming_sessions.remove(session_id.as_str());
+        state.session_execution_gate.release(session_id.as_str());
         let _ = clear_running_state_if_needed(&state, &session_id).await;
     });
 }
@@ -554,7 +554,7 @@ pub(super) async fn chat_stream(
 
     tokio::spawn(async move {
         let session_id = req.session_id.clone();
-        let inserted = state.active_streaming_sessions.insert(session_id.clone());
+        let inserted = state.session_execution_gate.claim(session_id.clone());
         if !inserted {
             send_event(
                 &sender,
@@ -578,7 +578,7 @@ pub(super) async fn chat_stream(
             .await;
         }
 
-        state.active_streaming_sessions.remove(&session_id);
+        state.session_execution_gate.release(&session_id);
     });
 
     Ok(sse)

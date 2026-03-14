@@ -181,7 +181,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         permission_approver,
         ask_user_approver,
         run_cancellation_registry: SessionRunCancellationRegistry::new(),
-        active_streaming_sessions: state::ActiveStreamingSessions::default(),
+        session_execution_gate: state::SessionExecutionGate::default(),
         models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         provider_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         config: tokio::sync::RwLock::new(config),
