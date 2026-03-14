@@ -16,6 +16,26 @@ pub struct PersistedContextSnapshot {
     pub history_message_count: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct ContextSnapshotRecord {
+    pub context_json: String,
+    pub assembled_messages_json: String,
+    pub phase: aither_agent::ContextWindowPhase,
+    pub metrics: aither_agent::ContextWindowMetrics,
+}
+
+impl ContextSnapshotRecord {
+    pub fn from_checkpoint(checkpoint: &aither_agent::CheckpointContext<'_>) -> anyhow::Result<Self> {
+        let assembled_messages_json = serde_json::to_string(&checkpoint.window.messages)?;
+        Ok(Self {
+            context_json: checkpoint.context_json.to_string(),
+            assembled_messages_json,
+            phase: checkpoint.window.phase,
+            metrics: checkpoint.window.metrics.clone(),
+        })
+    }
+}
+
 pub fn parse_persisted_context_snapshot(
     snapshot: crate::db::entity::session_context_snapshots::Model,
 ) -> anyhow::Result<PersistedContextSnapshot> {
@@ -54,17 +74,25 @@ pub async fn load_persisted_context_snapshot(
         .transpose()
 }
 
-pub async fn persist_agent_context_snapshot(
-    db: &ChatDb,
-    session_id: &str,
-    agent: &mut MayAgent,
-) -> anyhow::Result<()> {
+pub async fn snapshot_record_from_agent(agent: &mut MayAgent) -> anyhow::Result<ContextSnapshotRecord> {
     let context_json = agent.export_context_json().map_err(anyhow::Error::from)?;
     let window_snapshot = agent.snapshot_context_window().await;
-    let assembled_messages_json = serde_json::to_string(&window_snapshot.messages)?;
-    let metadata_json = serde_json::to_string(&StoredContextWindowMetadata {
+    Ok(ContextSnapshotRecord {
+        context_json,
+        assembled_messages_json: serde_json::to_string(&window_snapshot.messages)?,
         phase: window_snapshot.phase,
         metrics: window_snapshot.metrics,
+    })
+}
+
+pub async fn persist_context_snapshot_record(
+    db: &ChatDb,
+    session_id: &str,
+    record: ContextSnapshotRecord,
+) -> anyhow::Result<()> {
+    let metadata_json = serde_json::to_string(&StoredContextWindowMetadata {
+        phase: record.phase,
+        metrics: record.metrics,
         history_message_count: db
             .llm_message_count(session_id)
             .await
@@ -74,11 +102,20 @@ pub async fn persist_agent_context_snapshot(
     db.upsert_session_context_snapshot(
         session_id,
         crate::db::SessionContextSnapshotUpsert {
-            context_json: &context_json,
-            assembled_messages_json: Some(&assembled_messages_json),
+            context_json: &record.context_json,
+            assembled_messages_json: Some(&record.assembled_messages_json),
             metadata_json: Some(&metadata_json),
         },
     )
     .await
     .map_err(anyhow::Error::from)
+}
+
+pub async fn persist_agent_context_snapshot(
+    db: &ChatDb,
+    session_id: &str,
+    agent: &mut MayAgent,
+) -> anyhow::Result<()> {
+    let record = snapshot_record_from_agent(agent).await?;
+    persist_context_snapshot_record(db, session_id, record).await
 }

@@ -13,6 +13,7 @@ use sea_orm::{
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, DbErr, EntityTrait, Order,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Set,
     sea_query::{Expr, Query, SqliteQueryBuilder},
+    TransactionTrait,
 };
 
 use crate::session::{
@@ -26,7 +27,7 @@ use entity::{
     context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox, profile_memories,
     profile_memory_jobs, profiles, push_subscriptions, request_logs, scheduled_task_runs,
     scheduled_tasks, session_context_snapshots, session_pending_ask_user, session_pending_messages,
-    session_pending_permissions, session_plans, session_runtimes, sessions,
+    session_pending_permissions, session_plans, session_run_leases, session_runtimes, sessions,
 };
 
 /// Error type for database operations.
@@ -293,6 +294,12 @@ impl ChatDb {
 
         let session_plan_stmt = schema.create_table_from_entity(session_plans::Entity);
         let create_sql = session_plan_stmt
+            .to_string(SqliteQueryBuilder)
+            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
+        conn.execute_unprepared(&create_sql).await?;
+
+        let session_run_lease_stmt = schema.create_table_from_entity(session_run_leases::Entity);
+        let create_sql = session_run_lease_stmt
             .to_string(SqliteQueryBuilder)
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
@@ -1147,6 +1154,94 @@ impl ChatDb {
             active.update(&self.conn).await?;
         }
         Ok(())
+    }
+
+    pub async fn recover_session_run_leases_after_restart(&self) -> Result<(), ChatDbError> {
+        session_run_leases::Entity::update_many()
+            .col_expr(session_run_leases::Column::Active, Expr::value(false))
+            .col_expr(
+                session_run_leases::Column::CancellationRequested,
+                Expr::value(false),
+            )
+            .col_expr(
+                session_run_leases::Column::UpdatedAt,
+                Expr::value(jiff::Timestamp::now().to_string()),
+            )
+            .filter(session_run_leases::Column::Active.eq(true))
+            .exec(&self.conn)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn claim_session_run_lease(&self, session_id: &str) -> Result<bool, ChatDbError> {
+        let session_id_owned = session_id.to_string();
+        self.conn
+            .transaction::<_, bool, DbErr>(|txn| {
+                Box::pin(async move {
+                    let existing = session_run_leases::Entity::find_by_id(session_id_owned.as_str())
+                        .one(txn)
+                        .await?;
+                    if let Some(existing) = existing {
+                        if existing.active {
+                            return Ok(false);
+                        }
+                        let mut active: session_run_leases::ActiveModel = existing.into();
+                        active.active = Set(true);
+                        active.cancellation_requested = Set(false);
+                        active.updated_at = Set(jiff::Timestamp::now().to_string());
+                        active.update(txn).await?;
+                    } else {
+                        session_run_leases::ActiveModel {
+                            session_id: Set(session_id_owned.clone()),
+                            active: Set(true),
+                            cancellation_requested: Set(false),
+                            updated_at: Set(jiff::Timestamp::now().to_string()),
+                        }
+                        .insert(txn)
+                        .await?;
+                    }
+                    Ok(true)
+                })
+            })
+            .await
+            .map_err(|error| match error {
+                sea_orm::TransactionError::Connection(db_error)
+                | sea_orm::TransactionError::Transaction(db_error) => ChatDbError::Db(db_error),
+            })
+    }
+
+    pub async fn release_session_run_lease(&self, session_id: &str) -> Result<(), ChatDbError> {
+        session_run_leases::Entity::update_many()
+            .col_expr(session_run_leases::Column::Active, Expr::value(false))
+            .col_expr(
+                session_run_leases::Column::CancellationRequested,
+                Expr::value(false),
+            )
+            .col_expr(
+                session_run_leases::Column::UpdatedAt,
+                Expr::value(jiff::Timestamp::now().to_string()),
+            )
+            .filter(session_run_leases::Column::SessionId.eq(session_id))
+            .exec(&self.conn)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn request_session_run_cancel(&self, session_id: &str) -> Result<bool, ChatDbError> {
+        let result = session_run_leases::Entity::update_many()
+            .col_expr(
+                session_run_leases::Column::CancellationRequested,
+                Expr::value(true),
+            )
+            .col_expr(
+                session_run_leases::Column::UpdatedAt,
+                Expr::value(jiff::Timestamp::now().to_string()),
+            )
+            .filter(session_run_leases::Column::SessionId.eq(session_id))
+            .filter(session_run_leases::Column::Active.eq(true))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     /// Return session ids that have persisted follow-up work ready to resume.
@@ -2885,8 +2980,10 @@ pub struct AskUserResponsePayload {
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::EntityTrait;
     use tempfile::tempdir;
 
+    use crate::db::entity::{scheduled_task_runs, session_run_leases};
     use crate::profile::ProfileEnvironment;
     use crate::session::{
         PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
@@ -2894,7 +2991,7 @@ mod tests {
         SessionRuntimeState,
     };
 
-    use super::{ChatDb, CreateProfileParams};
+    use super::{ChatDb, CreateProfileParams, CreateScheduledTaskParams};
 
     fn test_pending_message(content: &str, mode: PendingUserMessageMode) -> PendingUserMessage {
         PendingUserMessage {
@@ -3706,6 +3803,85 @@ mod tests {
         assert_eq!(
             recovered.output.as_deref(),
             Some("May server restarted before the task run completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_run_lease_rejects_second_claim_until_released() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        db.create_session("session-1", Some("Session"), Some("test-model"))
+            .await
+            .expect("session should persist");
+
+        assert!(
+            db.claim_session_run_lease("session-1")
+                .await
+                .expect("first lease claim should succeed")
+        );
+        assert!(
+            !db.claim_session_run_lease("session-1")
+                .await
+                .expect("second lease claim should be rejected")
+        );
+        assert!(
+            db.request_session_run_cancel("session-1")
+                .await
+                .expect("cancellation request should persist against active lease")
+        );
+
+        db.release_session_run_lease("session-1")
+            .await
+            .expect("lease release should persist");
+
+        assert!(
+            db.claim_session_run_lease("session-1")
+                .await
+                .expect("released lease should become claimable again")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_run_lease_recovery_clears_stale_active_run() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        db.create_session("session-1", Some("Session"), Some("test-model"))
+            .await
+            .expect("session should persist");
+        assert!(
+            db.claim_session_run_lease("session-1")
+                .await
+                .expect("lease claim should succeed")
+        );
+        assert!(
+            db.request_session_run_cancel("session-1")
+                .await
+                .expect("cancellation request should persist")
+        );
+
+        db.recover_session_run_leases_after_restart()
+            .await
+            .expect("lease recovery should clear stale active state");
+
+        let recovered = session_run_leases::Entity::find_by_id("session-1")
+            .one(&db.conn)
+            .await
+            .expect("lease lookup should succeed")
+            .expect("lease row should exist");
+        assert!(!recovered.active);
+        assert!(!recovered.cancellation_requested);
+        assert!(
+            db.claim_session_run_lease("session-1")
+                .await
+                .expect("recovered lease should become claimable")
         );
     }
 }

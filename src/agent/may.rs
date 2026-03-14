@@ -7,8 +7,8 @@ use aither_agent::specialized::{SubagentFileMount, SubagentTool};
 use aither_agent::webfetch::WebFetchTool;
 use aither_agent::websearch::WebSearchTool;
 use aither_agent::{
-    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, BrowserBackend, CompactResult,
-    HCons, Hook, TurnBoundaryAction, TurnBoundaryContext,
+    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, BrowserBackend, CheckpointContext,
+    CompactResult, HCons, Hook, TurnBoundaryAction, TurnBoundaryContext,
 };
 use aither_cloud::{
     CloudProvider, claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI,
@@ -537,6 +537,37 @@ impl Hook for PendingSteerHook {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ContextSnapshotHook {
+    db: Option<crate::db::ChatDb>,
+    session_id: String,
+}
+
+impl ContextSnapshotHook {
+    fn new(db: Option<crate::db::ChatDb>, session_id: &SessionId) -> Self {
+        Self {
+            db,
+            session_id: session_id.as_str().to_string(),
+        }
+    }
+}
+
+impl Hook for ContextSnapshotHook {
+    async fn on_checkpoint(&self, ctx: &CheckpointContext<'_>) -> Option<String> {
+        let Some(db) = &self.db else {
+            return None;
+        };
+        let record = match crate::session::ContextSnapshotRecord::from_checkpoint(ctx) {
+            Ok(record) => record,
+            Err(error) => return Some(error.to_string()),
+        };
+        match crate::session::persist_context_snapshot_record(db, &self.session_id, record).await {
+            Ok(()) => None,
+            Err(error) => Some(error.to_string()),
+        }
+    }
+}
+
 /// Execution environment for a MayAgent.
 pub enum AgentEnvironment {
     /// Native macOS sandbox via leash.
@@ -883,7 +914,12 @@ fn resolve_image_generator_config(may_config: &MayConfig) -> Option<ImageGenerat
 
 /// The May agent.
 pub struct MayAgent {
-    inner: Agent<CloudProvider, CloudProvider, CloudProvider, HCons<PendingSteerHook, ()>>,
+    inner: Agent<
+        CloudProvider,
+        CloudProvider,
+        CloudProvider,
+        HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>,
+    >,
     session_id: SessionId,
     sandbox_dir: PathBuf,
     provider_id: String,
@@ -986,15 +1022,13 @@ impl MayAgent {
             config.register_subagents_broker,
         );
         let subagent_tool = SubagentTool::new(subagent_llm).with_builtins();
-        let pending_steer_hook = PendingSteerHook::new(
-            config
-                .permission_approver
-                .as_ref()
-                .map(|approver| approver.runtime_service.as_ref())
-                .flatten()
-                .map(|runtime_service| runtime_service.db()),
-            &config.session_id,
-        );
+        let runtime_db = config
+            .permission_approver
+            .as_ref()
+            .and_then(|approver| approver.runtime_service.as_ref())
+            .map(|runtime_service| runtime_service.db());
+        let pending_steer_hook = PendingSteerHook::new(runtime_db.clone(), &config.session_id);
+        let context_snapshot_hook = ContextSnapshotHook::new(runtime_db, &config.session_id);
 
         let transcript_file = session_paths.transcript_path();
         let transcript_path = transcript_file.display().to_string();
@@ -1037,6 +1071,7 @@ impl MayAgent {
             .tool(notify_tool)
             .tool(register_skills_tool)
             .tool(register_subagents_tool)
+            .hook(context_snapshot_hook)
             .hook(pending_steer_hook);
         if !is_container {
             builder = builder.tool(request_workspace);

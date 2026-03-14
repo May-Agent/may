@@ -180,9 +180,25 @@ struct SessionRunRegistration {
 }
 
 impl SessionRunRegistration {
-    fn try_new(state: Arc<UiServerState>, session_id: impl Into<String>) -> Option<Self> {
+    async fn try_new(state: Arc<UiServerState>, session_id: impl Into<String>) -> Option<Self> {
         let session_id = session_id.into();
-        let receiver = state.run_cancellation_registry.try_open(session_id.clone())?;
+        let claimed = state
+            .db()
+            .await
+            .claim_session_run_lease(session_id.as_str())
+            .await
+            .ok()?;
+        if !claimed {
+            return None;
+        }
+        let Some(receiver) = state.run_cancellation_registry.try_open(session_id.clone()) else {
+            let _ = state
+                .db()
+                .await
+                .release_session_run_lease(session_id.as_str())
+                .await;
+            return None;
+        };
         Some(Self {
             state,
             session_id,
@@ -192,6 +208,16 @@ impl SessionRunRegistration {
 
     fn receiver(&self) -> &async_channel::Receiver<()> {
         &self.receiver
+    }
+
+    async fn close(&self) {
+        let _ = self
+            .state
+            .db()
+            .await
+            .release_session_run_lease(self.session_id.as_str())
+            .await;
+        self.state.run_cancellation_registry.close(&self.session_id);
     }
 }
 
@@ -328,10 +354,11 @@ fn result_waits_for_terminal_input(result: &Result<String, String>) -> bool {
 
 fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     tokio::spawn(async move {
-        let inserted = state.session_execution_gate.claim(session_id.clone());
-        if !inserted {
+        let Some(run_registration) =
+            SessionRunRegistration::try_new(state.clone(), session_id.clone()).await
+        else {
             return;
-        }
+        };
 
         loop {
             let next = match state
@@ -369,7 +396,7 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
             }
         }
 
-        state.session_execution_gate.release(session_id.as_str());
+        run_registration.close().await;
         let _ = clear_running_state_if_needed(&state, &session_id).await;
     });
 }
@@ -561,7 +588,13 @@ pub(super) async fn stop_session_run(
         );
     }
 
-    let cancelled = state.run_cancellation_registry.cancel(&session_id);
+    let persisted_cancel = state
+        .db()
+        .await
+        .request_session_run_cancel(&session_id)
+        .await
+        .map_err(internal_error)?;
+    let cancelled = state.run_cancellation_registry.cancel(&session_id) || persisted_cancel;
     tracing::info!(session_id = %session_id, cancelled, "received session stop request");
 
     let runtime = state
@@ -585,26 +618,12 @@ pub(super) async fn chat_stream(
         return Err(active_session_conflict_error());
     }
 
-    let Some(run_registration) = SessionRunRegistration::try_new(state.clone(), req.session_id.clone()) else {
+    let Some(run_registration) = SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await else {
         return Err(active_session_conflict_error());
     };
     let (sender, sse) = Sse::channel();
 
     tokio::spawn(async move {
-        let session_id = req.session_id.clone();
-        let inserted = state.session_execution_gate.claim(session_id.clone());
-        if !inserted {
-            send_event(
-                &sender,
-                "error",
-                &SseErrorEvent {
-                    message: "session is already streaming; send this message via steer or queue instead",
-                },
-            )
-            .await;
-            return;
-        }
-
         if let Err(err) = stream_chat_events(state.clone(), req, sender.clone(), run_registration).await {
             send_event(
                 &sender,
@@ -615,8 +634,6 @@ pub(super) async fn chat_stream(
             )
             .await;
         }
-
-        state.session_execution_gate.release(&session_id);
     });
 
     Ok(sse)
@@ -976,7 +993,6 @@ async fn run_agent_loop(
         schedule_profile_memory_processing(state, profile_id.as_deref()).await;
         title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
         enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
-        persist_context_snapshot(state, &session_id, &mut agent).await?;
 
         return Ok(AgentRunResult {
             assistant_id,
@@ -1042,11 +1058,13 @@ async fn stream_chat_events(
             };
             send_event(&sender, "done", &done_event).await;
             spawn_follow_up_runs(state.clone(), response_session_id.clone());
+            run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
             Ok(())
         }
         // Errors are already sent to the sink via on_error in run_agent_loop.
         Err(_) => {
+            run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
             Ok(())
         }
@@ -1059,7 +1077,9 @@ async fn run_chat_collect_with_persistence(
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
 ) -> SkyResult<ChatResponse> {
-    let Some(run_registration) = SessionRunRegistration::try_new(state.clone(), req.session_id.clone()) else {
+    let Some(run_registration) =
+        SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await
+    else {
         return Err(active_session_conflict_error());
     };
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running)
@@ -1078,6 +1098,7 @@ async fn run_chat_collect_with_persistence(
     match result {
         Ok(result) => {
             spawn_follow_up_runs(state.clone(), req.session_id.clone());
+            run_registration.close().await;
             clear_running_state_if_needed(&state, &req.session_id)
                 .await
                 .map_err(internal_error)?;
@@ -1113,6 +1134,7 @@ async fn run_chat_collect_with_persistence(
             })
         }
         Err(error) => {
+            run_registration.close().await;
             clear_running_state_if_needed(&state, &req.session_id)
                 .await
                 .map_err(internal_error)?;
@@ -1123,18 +1145,6 @@ async fn run_chat_collect_with_persistence(
 
 async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyResult<ChatResponse> {
     run_chat_collect_with_persistence(state, req, true, true).await
-}
-
-async fn persist_context_snapshot(
-    state: &Arc<UiServerState>,
-    session_id: &SessionId,
-    agent: &mut MayAgent,
-) -> anyhow::Result<()> {
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
-    crate::session::persist_agent_context_snapshot(&db, session_id.as_str(), agent).await
 }
 
 async fn schedule_profile_memory_processing(state: &Arc<UiServerState>, profile_id: Option<&str>) {

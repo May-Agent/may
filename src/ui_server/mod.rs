@@ -119,6 +119,10 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         .recover_session_runtimes_after_restart()
         .await
         .context("failed to reconcile persisted session runtime state after restart")?;
+    db_for_archive
+        .recover_session_run_leases_after_restart()
+        .await
+        .context("failed to reconcile persisted session run leases after restart")?;
     let (title_generation_queue, title_generation_rx) =
         crate::ui_server::state::TitleGenerationQueue::new();
     let ui_events_notify = Arc::new(tokio::sync::Notify::new());
@@ -183,7 +187,6 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         ask_user_approver,
         tool_dispatchers,
         run_cancellation_registry: SessionRunCancellationRegistry::new(),
-        session_execution_gate: state::SessionExecutionGate::default(),
         models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         provider_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         config: tokio::sync::RwLock::new(config),

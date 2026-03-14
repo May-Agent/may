@@ -160,7 +160,6 @@ pub(crate) struct UiServerState {
     pub(crate) ask_user_approver: AskUserApprover,
     pub(crate) tool_dispatchers: UiToolDispatchers,
     pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,
-    pub(crate) session_execution_gate: SessionExecutionGate,
     pub(crate) models_cache: RefreshableCache<ModelsResponse>,
     pub(crate) provider_models_cache: RefreshableCache<ProviderModelsResponse>,
     pub(crate) config: tokio::sync::RwLock<MayConfig>,
@@ -233,21 +232,6 @@ impl SessionRunCancellationRegistry {
 
     pub(crate) fn close(&self, session_id: &str) -> bool {
         self.live_responses.discard(session_id)
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SessionExecutionGate {
-    sessions: Arc<DashSet<String>>,
-}
-
-impl SessionExecutionGate {
-    pub(crate) fn claim(&self, session_id: impl Into<String>) -> bool {
-        self.sessions.insert(session_id.into())
-    }
-
-    pub(crate) fn release(&self, session_id: &str) -> bool {
-        self.sessions.remove(session_id).is_some()
     }
 }
 
