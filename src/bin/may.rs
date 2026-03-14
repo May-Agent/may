@@ -215,7 +215,7 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
 
     spawn(async move {
         while let Some(request) = ask_user_queue.next().await {
-            let questions = request.args.clone().into_questions();
+            let questions = request.args.request.clone().into_questions();
             let _ = writeln!(
                 io::stderr(),
                 "[ask_user_request] questions={}",
@@ -633,7 +633,7 @@ where
 
         match event {
             Event::AskUser(request) => {
-                let questions = request.args.clone().into_questions();
+                let questions = request.args.request.clone().into_questions();
                 tracing::info!(question_count = questions.len(), "User question requested");
                 let state = may_agent::tui::AskUserState::new(request, questions);
                 app.mode = may_agent::tui::AppMode::AskUser(state);
