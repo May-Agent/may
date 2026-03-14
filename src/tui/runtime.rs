@@ -273,7 +273,7 @@ impl RuntimeDeps {
             crate::session::load_persisted_context_snapshot(&db, &session_id_string).await?
         {
             agent
-                .restore_context_json(&snapshot.context_json)
+                .restore_checkpoint(snapshot.checkpoint.clone())
                 .map_err(anyhow::Error::from)?;
             for message in crate::session::history_delta_since_snapshot(
                 &history_messages,

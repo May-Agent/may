@@ -16,7 +16,7 @@ pub struct StoredContextWindowMetadata {
 
 #[derive(Debug, Clone)]
 pub struct PersistedContextSnapshot {
-    pub context_json: String,
+    pub checkpoint: aither_agent::AgentCheckpoint,
     pub history_message_count: usize,
 }
 
@@ -47,13 +47,13 @@ impl ContextSnapshotRecord {
 pub fn parse_persisted_context_snapshot(
     snapshot: crate::db::entity::session_context_snapshots::Model,
 ) -> anyhow::Result<PersistedContextSnapshot> {
-    let metadata_json = snapshot
-        .metadata_json
-        .ok_or_else(|| anyhow::anyhow!("session context snapshot is missing metadata_json"))?;
-    let metadata: StoredContextWindowMetadata = serde_json::from_str(&metadata_json)?;
+    let checkpoint: aither_agent::AgentCheckpoint = serde_json::from_str(&snapshot.context_json)?;
+    let history_message_count = checkpoint
+        .history_anchor
+        .ok_or_else(|| anyhow::anyhow!("agent checkpoint is missing history_anchor"))?;
     Ok(PersistedContextSnapshot {
-        context_json: snapshot.context_json,
-        history_message_count: metadata.history_message_count,
+        checkpoint,
+        history_message_count,
     })
 }
 
@@ -84,7 +84,7 @@ pub async fn load_persisted_context_snapshot(
 
 pub async fn snapshot_record_from_agent(agent: &mut MayAgent) -> anyhow::Result<ContextSnapshotRecord> {
     let checkpoint = agent
-        .export_checkpoint(None)
+        .export_checkpoint(Some(0))
         .await
         .map_err(anyhow::Error::from)?;
     Ok(ContextSnapshotRecord {
@@ -100,15 +100,19 @@ pub async fn snapshot_record_from_agent(agent: &mut MayAgent) -> anyhow::Result<
 pub async fn persist_context_snapshot_record(
     db: &ChatDb,
     session_id: &str,
-    record: ContextSnapshotRecord,
+    mut record: ContextSnapshotRecord,
 ) -> anyhow::Result<()> {
+    let history_message_count = db
+        .llm_message_count(session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let mut checkpoint: aither_agent::AgentCheckpoint = serde_json::from_str(&record.context_json)?;
+    checkpoint.history_anchor = Some(history_message_count);
+    record.context_json = serde_json::to_string(&checkpoint)?;
     let metadata_json = serde_json::to_string(&StoredContextWindowMetadata {
         phase: record.phase,
         metrics: record.metrics,
-        history_message_count: db
-            .llm_message_count(session_id)
-            .await
-            .map_err(anyhow::Error::from)?,
+        history_message_count,
         tool_surface_hash: record.tool_surface_hash,
         has_background_tasks: record.has_background_tasks,
     })?;
