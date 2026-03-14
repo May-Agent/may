@@ -1472,6 +1472,13 @@ impl MayAgent {
         self.inner.export_context_json()
     }
 
+    pub(crate) async fn export_checkpoint(
+        &mut self,
+        history_anchor: Option<usize>,
+    ) -> Result<aither_agent::AgentCheckpoint, AgentError> {
+        self.inner.export_checkpoint(history_anchor).await
+    }
+
     pub(crate) fn push_message(&mut self, message: aither_core::llm::Message) {
         self.inner.push_message(message);
     }

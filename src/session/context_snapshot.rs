@@ -8,6 +8,10 @@ pub struct StoredContextWindowMetadata {
     pub metrics: aither_agent::ContextWindowMetrics,
     #[serde(default)]
     pub history_message_count: usize,
+    #[serde(default)]
+    pub tool_surface_hash: Option<String>,
+    #[serde(default)]
+    pub has_background_tasks: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +26,8 @@ pub struct ContextSnapshotRecord {
     pub assembled_messages_json: String,
     pub phase: aither_agent::ContextWindowPhase,
     pub metrics: aither_agent::ContextWindowMetrics,
+    pub tool_surface_hash: Option<String>,
+    pub has_background_tasks: bool,
 }
 
 impl ContextSnapshotRecord {
@@ -32,6 +38,8 @@ impl ContextSnapshotRecord {
             assembled_messages_json,
             phase: checkpoint.window.phase,
             metrics: checkpoint.window.metrics.clone(),
+            tool_surface_hash: Some(checkpoint.tool_surface_hash.to_string()),
+            has_background_tasks: checkpoint.has_background_tasks,
         })
     }
 }
@@ -75,13 +83,17 @@ pub async fn load_persisted_context_snapshot(
 }
 
 pub async fn snapshot_record_from_agent(agent: &mut MayAgent) -> anyhow::Result<ContextSnapshotRecord> {
-    let context_json = agent.export_context_json().map_err(anyhow::Error::from)?;
-    let window_snapshot = agent.snapshot_context_window().await;
+    let checkpoint = agent
+        .export_checkpoint(None)
+        .await
+        .map_err(anyhow::Error::from)?;
     Ok(ContextSnapshotRecord {
-        context_json,
-        assembled_messages_json: serde_json::to_string(&window_snapshot.messages)?,
-        phase: window_snapshot.phase,
-        metrics: window_snapshot.metrics,
+        context_json: checkpoint.context_json,
+        assembled_messages_json: serde_json::to_string(&checkpoint.context_window.messages)?,
+        phase: checkpoint.context_window.phase,
+        metrics: checkpoint.context_window.metrics,
+        tool_surface_hash: Some(checkpoint.tool_surface_hash),
+        has_background_tasks: checkpoint.has_background_tasks,
     })
 }
 
@@ -97,6 +109,8 @@ pub async fn persist_context_snapshot_record(
             .llm_message_count(session_id)
             .await
             .map_err(anyhow::Error::from)?,
+        tool_surface_hash: record.tool_surface_hash,
+        has_background_tasks: record.has_background_tasks,
     })?;
 
     db.upsert_session_context_snapshot(
