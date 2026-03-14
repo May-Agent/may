@@ -3597,6 +3597,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_archiving_sessions_waiting_on_workspace_access() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+
+        let session_id = "session-test";
+        db.create_session(session_id, Some("Test session"), Some("test-model"))
+            .await
+            .expect("session should be created");
+        db.set_waiting_workspace(
+            session_id,
+            Some(PersistedWorkspaceRequest {
+                id: "workspace-1".to_string(),
+                request: PersistedWorkspaceRequestPayload {
+                    path: "/tmp/project".to_string(),
+                    reason: "Need write access".to_string(),
+                    session_id: Some(session_id.to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("waiting workspace should persist");
+
+        let error = db
+            .archive_session(session_id)
+            .await
+            .expect_err("session with pending workspace request must not archive");
+        assert!(
+            error.to_string().contains("cannot archive active session"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn creates_remote_profile_with_typed_environment() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
