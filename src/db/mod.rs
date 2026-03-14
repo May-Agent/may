@@ -1308,6 +1308,23 @@ impl ChatDb {
         Ok(msgs)
     }
 
+    /// Count messages that contribute to the LLM-visible conversation history.
+    pub async fn llm_message_count(&self, session_id: &str) -> Result<usize, ChatDbError> {
+        let count = messages::Entity::find()
+            .filter(messages::Column::SessionId.eq(session_id))
+            .filter(messages::Column::Role.is_in([
+                MessageRole::User.as_str(),
+                MessageRole::Assistant.as_str(),
+                MessageRole::System.as_str(),
+                MessageRole::HiddenContext.as_str(),
+                MessageRole::Tool.as_str(),
+            ]))
+            .count(&self.conn)
+            .await?;
+        usize::try_from(count)
+            .map_err(|error| ChatDbError::Db(DbErr::Custom(error.to_string())))
+    }
+
     /// Get messages for a session filtered by role.
     pub async fn get_messages_by_role(
         &self,

@@ -371,6 +371,18 @@ struct ResumeWaitingTurnXml<'a> {
     instruction: &'a str,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct StoredContextSnapshotMetadata {
+    #[serde(default)]
+    history_message_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedContextSnapshot {
+    context_json: String,
+    history_message_count: usize,
+}
+
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> anyhow::Result<String> {
     let mut output = String::new();
     let serializer = quick_xml::se::Serializer::with_root(&mut output, Some(tag))?;
@@ -451,6 +463,33 @@ async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) 
         tracing::warn!(error = %error, "failed to persist request log");
     }
     state.notify_ui_events();
+}
+
+fn parse_persisted_context_snapshot(
+    snapshot: crate::db::entity::session_context_snapshots::Model,
+) -> anyhow::Result<PersistedContextSnapshot> {
+    let metadata_json = snapshot
+        .metadata_json
+        .ok_or_else(|| anyhow::anyhow!("session context snapshot is missing metadata_json"))?;
+    let metadata: StoredContextSnapshotMetadata = serde_json::from_str(&metadata_json)?;
+    Ok(PersistedContextSnapshot {
+        context_json: snapshot.context_json,
+        history_message_count: metadata.history_message_count,
+    })
+}
+
+fn history_delta_since_snapshot(
+    history_messages: &[LlmMessage],
+    history_message_count: usize,
+) -> anyhow::Result<Vec<LlmMessage>> {
+    if history_message_count > history_messages.len() {
+        return Err(anyhow::anyhow!(
+            "persisted context snapshot anchor exceeds available history: anchor={}, history={}",
+            history_message_count,
+            history_messages.len()
+        ));
+    }
+    Ok(history_messages[history_message_count..].to_vec())
 }
 
 pub(super) async fn chat(
@@ -1054,17 +1093,21 @@ async fn persist_context_snapshot(
     session_id: &SessionId,
     agent: &mut MayAgent,
 ) -> anyhow::Result<()> {
+    let db = {
+        let manager = state.session_manager.lock().await;
+        manager.db().clone()
+    };
     let context_json = agent.export_context_json().map_err(anyhow::Error::from)?;
     let window_snapshot = agent.snapshot_context_window().await;
     let assembled_messages_json = serde_json::to_string(&window_snapshot.messages)?;
     let metadata_json = serde_json::to_string(&serde_json::json!({
         "phase": window_snapshot.phase,
         "metrics": window_snapshot.metrics,
+        "history_message_count": db
+            .llm_message_count(session_id.as_str())
+            .await
+            .map_err(anyhow::Error::from)?,
     }))?;
-    let db = {
-        let manager = state.session_manager.lock().await;
-        manager.db().clone()
-    };
     db.upsert_session_context_snapshot(
         session_id.as_str(),
         crate::db::SessionContextSnapshotUpsert {
@@ -1221,7 +1264,7 @@ struct SessionContext {
     provider_candidate_count: usize,
     sandbox_dir: std::path::PathBuf,
     history_messages: Vec<LlmMessage>,
-    context_snapshot_json: Option<String>,
+    context_snapshot: Option<PersistedContextSnapshot>,
     incremental_messages: Vec<LlmMessage>,
     profile_persona: Option<String>,
     profile_memories: Option<crate::memory::ProfileMemories>,
@@ -1325,6 +1368,22 @@ async fn resolve_session_context(
         .map_err(anyhow::Error::from)?
         .unwrap_or_default();
 
+    let history_messages = manager
+        .current()
+        .map(|s| s.history.to_aither_messages())
+        .unwrap_or_default();
+    let context_snapshot = if use_persisted_context_snapshot {
+        manager
+            .db()
+            .get_session_context_snapshot(session_id.as_str())
+            .await
+            .map_err(anyhow::Error::from)?
+            .map(parse_persisted_context_snapshot)
+            .transpose()?
+    } else {
+        None
+    };
+
     let mut incremental_messages = Vec::new();
     if persist_user_message {
         if take_over_alert_pending(state, &session_id).await {
@@ -1372,33 +1431,6 @@ async fn resolve_session_context(
             .map_err(anyhow::Error::from)?;
     }
 
-    let history_messages = manager
-        .current()
-        .map(|s| s.history.to_aither_messages())
-        .unwrap_or_default();
-    let history_messages = if persist_user_message {
-        let mut history_messages = history_messages;
-        let should_pop = history_messages.last().is_some_and(|message| {
-            message.role() == LlmRole::User && message.content() == req.content
-        });
-        if should_pop {
-            let _ = history_messages.pop();
-        }
-        history_messages
-    } else {
-        history_messages
-    };
-    let context_snapshot_json = if use_persisted_context_snapshot {
-        manager
-            .db()
-            .get_session_context_snapshot(session_id.as_str())
-            .await
-            .map_err(anyhow::Error::from)?
-            .map(|snapshot| snapshot.context_json)
-    } else {
-        None
-    };
-
     let sandbox_dir = manager
         .current()
         .map(|s| s.sandbox_dir.clone())
@@ -1410,7 +1442,7 @@ async fn resolve_session_context(
         provider_candidate_count,
         sandbox_dir,
         history_messages,
-        context_snapshot_json,
+        context_snapshot,
         incremental_messages,
         profile_persona,
         profile_memories,
@@ -1655,10 +1687,16 @@ async fn prepare_agent_for_request(
     .await
     .map_err(anyhow::Error::from)?;
 
-    if let Some(context_snapshot_json) = ctx.context_snapshot_json.as_deref() {
+    if let Some(snapshot) = ctx.context_snapshot.as_ref() {
         agent
-            .restore_context_json(context_snapshot_json)
+            .restore_context_json(&snapshot.context_json)
             .map_err(anyhow::Error::from)?;
+        for message in history_delta_since_snapshot(
+            &ctx.history_messages,
+            snapshot.history_message_count,
+        )? {
+            agent.push_message(message);
+        }
         for message in ctx.incremental_messages {
             agent.push_message(message);
         }
@@ -1957,4 +1995,58 @@ async fn request_registration_approval(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        StoredContextSnapshotMetadata, history_delta_since_snapshot,
+        parse_persisted_context_snapshot,
+    };
+    use aither_core::llm::Message as LlmMessage;
+
+    #[test]
+    fn history_delta_since_snapshot_returns_suffix_after_anchor() {
+        let history = vec![
+            LlmMessage::system("memory"),
+            LlmMessage::user("first"),
+            LlmMessage::assistant("second"),
+        ];
+
+        let delta = history_delta_since_snapshot(&history, 2).expect("anchor must be valid");
+        assert_eq!(delta, vec![LlmMessage::assistant("second")]);
+    }
+
+    #[test]
+    fn history_delta_since_snapshot_rejects_out_of_bounds_anchor() {
+        let history = vec![LlmMessage::user("only")];
+        let error = history_delta_since_snapshot(&history, 2)
+            .expect_err("invalid anchor must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("persisted context snapshot anchor exceeds available history")
+        );
+    }
+
+    #[test]
+    fn parse_persisted_context_snapshot_reads_history_anchor() {
+        let metadata = serde_json::to_string(&StoredContextSnapshotMetadata {
+            history_message_count: 7,
+        })
+        .expect("metadata should serialize");
+        let snapshot = parse_persisted_context_snapshot(
+            crate::db::entity::session_context_snapshots::Model {
+                session_id: "session-1".to_string(),
+                context_json: "{\"recent\":[]}".to_string(),
+                assembled_messages_json: None,
+                metadata_json: Some(metadata),
+                updated_at: "2026-03-14T00:00:00Z".to_string(),
+            },
+        )
+        .expect("snapshot metadata should parse");
+
+        assert_eq!(snapshot.history_message_count, 7);
+        assert_eq!(snapshot.context_json, "{\"recent\":[]}");
+    }
 }
