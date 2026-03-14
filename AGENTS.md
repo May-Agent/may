@@ -1,0 +1,2 @@
+- Please read entire Claude.md file for guidance on working with this codebase
+- Use modern techniques and best practices, for instance, use bun instead of npm
