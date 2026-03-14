@@ -12,9 +12,10 @@ mod runtime_service;
 mod store;
 
 pub use context_snapshot::{
-    PersistedContextSnapshot, StoredContextWindowMetadata, history_delta_since_snapshot,
-    load_persisted_context_snapshot, persist_agent_context_snapshot,
-    parse_persisted_context_snapshot,
+    ContextSnapshotRecord, PersistedContextSnapshot, StoredContextWindowMetadata,
+    history_delta_since_snapshot, load_persisted_context_snapshot,
+    parse_persisted_context_snapshot, persist_agent_context_snapshot,
+    persist_context_snapshot_record, snapshot_record_from_agent,
 };
 pub use history::{
     ChatHistory, ChatHistoryError, ChatMessage, ChatMessageStats, MessageRole, SessionMetadata,
