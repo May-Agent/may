@@ -19,13 +19,19 @@ use crate::{MayAgent, MayConfig, SessionId, generate_session_title};
 pub struct RuntimeDeps {
     workspace_broker: WorkspaceRequestBroker,
     ask_user_broker: AskUserBroker,
+    location_provider: Arc<crate::location::LocationProvider>,
 }
 
 impl RuntimeDeps {
-    pub fn new(workspace_broker: WorkspaceRequestBroker, ask_user_broker: AskUserBroker) -> Self {
+    pub fn new(
+        workspace_broker: WorkspaceRequestBroker,
+        ask_user_broker: AskUserBroker,
+        location_provider: Arc<crate::location::LocationProvider>,
+    ) -> Self {
         Self {
             workspace_broker,
             ask_user_broker,
+            location_provider,
         }
     }
 
@@ -208,7 +214,7 @@ impl RuntimeDeps {
             .is_some_and(|profile| profile.location_aware)
         {
             Some(
-                crate::location::LocationProvider::new()
+                self.location_provider
                     .get()
                     .await
                     .map_err(|e| anyhow::anyhow!("Location fetch failed: {e}"))?,

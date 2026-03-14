@@ -28,6 +28,7 @@ struct CachedLocation {
 }
 
 /// Cached location provider with automatic refresh.
+#[derive(Debug)]
 pub struct LocationProvider {
     cache: ArcSwapOption<CachedLocation>,
 }
