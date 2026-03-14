@@ -20,7 +20,6 @@ mod tasks;
 mod title_generation;
 mod types;
 
-use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -187,8 +186,8 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         provider_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         config: tokio::sync::RwLock::new(config),
         ui_events_notify,
-        container_prepare_statuses: Mutex::new(HashMap::new()),
-        container_prepare_inflight: Mutex::new(HashSet::new()),
+        container_prepare_statuses: Default::default(),
+        container_prepare_inflight: Default::default(),
         container_manager,
         browser_manager,
         remote_access_manager,

@@ -81,12 +81,12 @@ async fn ensure_profile_environment_ready(
         let config = state.config.read().await;
         crate::remote_profile::resolve_remote_profile_server(&profile, &config.ssh_servers)
             .map_err(bad_request_error)?;
-        state.clear_container_prepare_status(profile_id).await;
+        state.clear_container_prepare_status(profile_id);
         return Ok(());
     }
 
     if profile.environment != "container" {
-        state.clear_container_prepare_status(profile_id).await;
+        state.clear_container_prepare_status(profile_id);
         return Ok(());
     }
 
@@ -97,14 +97,12 @@ async fn ensure_profile_environment_ready(
         Ok(manager) => manager,
         Err(crate::container::ContainerError::ManagedPodmanDownloadApprovalRequired) => {
             let message = "Managed Podman is not installed. Approve download before preparing this container profile.".to_string();
-            state
-                .set_container_prepare_status(ContainerPrepareStatus {
-                    profile_id: profile_id.to_string(),
-                    stage: ContainerPrepareStage::Failed,
-                    summary: message.clone(),
-                    recent_logs: Vec::new(),
-                })
-                .await;
+            state.set_container_prepare_status(ContainerPrepareStatus {
+                profile_id: profile_id.to_string(),
+                stage: ContainerPrepareStage::Failed,
+                summary: message.clone(),
+                recent_logs: Vec::new(),
+            });
             return Err(ContainerPrepareError::Domain {
                 code: ApiErrorCode::ManagedPodmanApprovalRequired,
                 message,
@@ -114,14 +112,12 @@ async fn ensure_profile_environment_ready(
             let message = format!(
                 "Container runtime is unavailable: start Docker/Podman/OrbStack and retry ({error})"
             );
-            state
-                .set_container_prepare_status(ContainerPrepareStatus {
-                    profile_id: profile_id.to_string(),
-                    stage: ContainerPrepareStage::Failed,
-                    summary: message.clone(),
-                    recent_logs: Vec::new(),
-                })
-                .await;
+            state.set_container_prepare_status(ContainerPrepareStatus {
+                profile_id: profile_id.to_string(),
+                stage: ContainerPrepareStage::Failed,
+                summary: message.clone(),
+                recent_logs: Vec::new(),
+            });
             return Err(ContainerPrepareError::Domain {
                 code: ApiErrorCode::ContainerRuntimeUnavailable,
                 message,
@@ -141,7 +137,6 @@ async fn ensure_profile_environment_ready(
     if !state.try_begin_container_prepare(profile_id).await {
         let summary = state
             .get_container_prepare_status(profile_id)
-            .await
             .map(|status| status.summary)
             .unwrap_or_else(|| "Container image is still preparing".to_string());
         return Err(ContainerPrepareError::Domain {
@@ -157,7 +152,7 @@ async fn ensure_profile_environment_ready(
             summary: format!("checking image {}", image_spec.tag),
             recent_logs: Vec::new(),
         };
-        state.set_container_prepare_status(checking_status).await;
+        state.set_container_prepare_status(checking_status);
 
         let (progress_tx, mut progress_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::container::image::ImageBuildProgress>();
@@ -193,7 +188,7 @@ async fn ensure_profile_environment_ready(
                     summary: progress.message,
                     recent_logs: recent_logs.iter().cloned().collect(),
                 };
-                progress_state.set_container_prepare_status(status).await;
+                progress_state.set_container_prepare_status(status);
             }
         });
 
@@ -210,24 +205,21 @@ async fn ensure_profile_environment_ready(
 
         match ensure_result {
             Ok(()) => {
-                state.clear_container_prepare_status(profile_id).await;
+                state.clear_container_prepare_status(profile_id);
                 Ok(())
             }
             Err(error) => {
                 let recent_logs = state
                     .get_container_prepare_status(profile_id)
-                    .await
                     .map(|status| status.recent_logs)
                     .unwrap_or_default();
 
-                state
-                    .set_container_prepare_status(ContainerPrepareStatus {
-                        profile_id: profile_id.to_string(),
-                        stage: ContainerPrepareStage::Failed,
-                        summary: format!("container build failed: {error}"),
-                        recent_logs,
-                    })
-                    .await;
+                state.set_container_prepare_status(ContainerPrepareStatus {
+                    profile_id: profile_id.to_string(),
+                    stage: ContainerPrepareStage::Failed,
+                    summary: format!("container build failed: {error}"),
+                    recent_logs,
+                });
 
                 Err(ContainerPrepareError::Domain {
                     code: ApiErrorCode::ContainerBuildFailed,
@@ -238,7 +230,7 @@ async fn ensure_profile_environment_ready(
     }
     .await;
 
-    state.finish_container_prepare(profile_id).await;
+    state.finish_container_prepare(profile_id);
     prepare_result
 }
 
