@@ -11,7 +11,7 @@ use bollard::query_parameters::{
     CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
     StopContainerOptionsBuilder,
 };
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 use tokio::time::Instant;
 
 use super::{ContainerError, ContainerRuntime};
@@ -34,7 +34,7 @@ pub struct ContainerManager {
     runtime: Arc<ContainerRuntime>,
     may_dir: PathBuf,
     /// Last activity timestamp per container ID.
-    activity: Arc<RwLock<HashMap<String, Instant>>>,
+    activity: Arc<DashMap<String, Instant>>,
 }
 
 impl ContainerManager {
@@ -42,7 +42,7 @@ impl ContainerManager {
         Self {
             runtime,
             may_dir,
-            activity: Arc::new(RwLock::new(HashMap::new())),
+            activity: Arc::new(DashMap::new()),
         }
     }
 
@@ -363,7 +363,7 @@ impl ContainerManager {
             .client
             .stop_container(container_id, Some(opts))
             .await?;
-        self.activity.write().await.remove(container_id);
+        self.activity.remove(container_id);
         tracing::info!(container_id = %container_id, "Stopped container");
         Ok(())
     }
@@ -375,17 +375,14 @@ impl ContainerManager {
             .client
             .remove_container(container_id, Some(opts))
             .await?;
-        self.activity.write().await.remove(container_id);
+        self.activity.remove(container_id);
         tracing::info!(container_id = %container_id, "Removed container");
         Ok(())
     }
 
     /// Record activity for a container (resets auto-stop timer).
     pub async fn touch_activity(&self, container_id: &str) {
-        self.activity
-            .write()
-            .await
-            .insert(container_id.to_string(), Instant::now());
+        self.activity.insert(container_id.to_string(), Instant::now());
     }
 
     /// Spawn a background task that auto-stops idle containers.
@@ -409,10 +406,10 @@ impl ContainerManager {
 
                 let now = Instant::now();
                 let idle_containers: Vec<String> = {
-                    let map = activity.read().await;
-                    map.iter()
-                        .filter(|(_, last)| now.duration_since(**last) > timeout)
-                        .map(|(id, _)| id.clone())
+                    activity
+                        .iter()
+                        .filter(|entry| now.duration_since(*entry.value()) > timeout)
+                        .map(|entry| entry.key().clone())
                         .collect()
                 };
 
@@ -424,7 +421,7 @@ impl ContainerManager {
                         .await
                     {
                         Ok(_) => {
-                            activity.write().await.remove(&container_id);
+                            activity.remove(&container_id);
                             tracing::info!(
                                 container_id = %container_id,
                                 "Auto-stopped idle container"
@@ -437,7 +434,7 @@ impl ContainerManager {
                                 error = %e,
                                 "Failed to auto-stop container"
                             );
-                            activity.write().await.remove(&container_id);
+                            activity.remove(&container_id);
                         }
                     }
                 }
