@@ -1468,10 +1468,6 @@ impl MayAgent {
         self.model_context_window
     }
 
-    pub(crate) fn export_context_json(&self) -> Result<String, serde_json::Error> {
-        self.inner.export_context_json()
-    }
-
     pub(crate) async fn export_checkpoint(
         &mut self,
         history_anchor: Option<usize>,
@@ -1490,15 +1486,11 @@ impl MayAgent {
         self.inner.compact(focus).await
     }
 
-    pub(crate) async fn snapshot_context_window(&mut self) -> aither_agent::ContextWindowSnapshot {
-        self.inner.snapshot_context_window().await
-    }
-
-    pub(crate) fn restore_context_json(
+    pub(crate) fn restore_checkpoint(
         &mut self,
-        context_json: &str,
-    ) -> Result<(), serde_json::Error> {
-        self.inner.restore_context_json(context_json)?;
+        checkpoint: aither_agent::AgentCheckpoint,
+    ) -> Result<(), AgentError> {
+        self.inner.restore_checkpoint(checkpoint)?;
         self.refresh_runtime_context();
         Ok(())
     }

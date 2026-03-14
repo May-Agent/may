@@ -1705,7 +1705,7 @@ async fn prepare_agent_for_request(
 
     if let Some(snapshot) = ctx.context_snapshot.as_ref() {
         agent
-            .restore_context_json(&snapshot.context_json)
+            .restore_checkpoint(snapshot.checkpoint.clone())
             .map_err(anyhow::Error::from)?;
         for message in crate::session::history_delta_since_snapshot(
             &ctx.history_messages,
@@ -2063,34 +2063,41 @@ mod tests {
 
     #[test]
     fn parse_persisted_context_snapshot_reads_history_anchor() {
-        let metadata = serde_json::to_string(&crate::session::StoredContextWindowMetadata {
-            phase: aither_agent::ContextWindowPhase::Stable,
-            metrics: aither_agent::ContextWindowMetrics {
-                usage_fraction: 0.0,
-                selected_model_context_window: None,
-                fast_model_context_window: None,
-                effective_context_window: 0,
-                system_block_count: 0,
-                reminder_count: 0,
-                recent_message_count: 0,
-                recent_system_message_count: 0,
-                has_handoff: false,
+        let checkpoint = serde_json::to_string(&aither_agent::AgentCheckpoint {
+            context_json: "{\"recent\":[]}".to_string(),
+            todo_items: Vec::new(),
+            history_anchor: Some(7),
+            tool_surface_hash: "abc123".to_string(),
+            context_window: aither_agent::ContextWindowSnapshot {
+                phase: aither_agent::ContextWindowPhase::Stable,
+                metrics: aither_agent::ContextWindowMetrics {
+                    usage_fraction: 0.0,
+                    selected_model_context_window: None,
+                    fast_model_context_window: None,
+                    effective_context_window: 0,
+                    system_block_count: 0,
+                    reminder_count: 0,
+                    recent_message_count: 0,
+                    recent_system_message_count: 0,
+                    has_handoff: false,
+                },
+                messages: Vec::new(),
             },
-            history_message_count: 7,
+            has_background_tasks: false,
         })
-        .expect("metadata should serialize");
+        .expect("checkpoint should serialize");
         let snapshot = crate::session::parse_persisted_context_snapshot(
             crate::db::entity::session_context_snapshots::Model {
                 session_id: "session-1".to_string(),
-                context_json: "{\"recent\":[]}".to_string(),
+                context_json: checkpoint,
                 assembled_messages_json: None,
-                metadata_json: Some(metadata),
+                metadata_json: None,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
             },
         )
         .expect("snapshot metadata should parse");
 
         assert_eq!(snapshot.history_message_count, 7);
-        assert_eq!(snapshot.context_json, "{\"recent\":[]}");
+        assert_eq!(snapshot.checkpoint.context_json, "{\"recent\":[]}");
     }
 }
