@@ -180,14 +180,14 @@ struct SessionRunRegistration {
 }
 
 impl SessionRunRegistration {
-    fn new(state: Arc<UiServerState>, session_id: impl Into<String>) -> Self {
+    fn try_new(state: Arc<UiServerState>, session_id: impl Into<String>) -> Option<Self> {
         let session_id = session_id.into();
-        let receiver = state.run_cancellation_registry.open(session_id.clone());
-        Self {
+        let receiver = state.run_cancellation_registry.try_open(session_id.clone())?;
+        Some(Self {
             state,
             session_id,
             receiver,
-        }
+        })
     }
 
     fn receiver(&self) -> &async_channel::Receiver<()> {
@@ -199,6 +199,11 @@ impl Drop for SessionRunRegistration {
     fn drop(&mut self) {
         self.state.run_cancellation_registry.close(&self.session_id);
     }
+}
+
+fn active_session_conflict_error() -> skyzen::Error {
+    skyzen::Error::msg("session is already active; send this message via steer or queue instead")
+        .set_status(skyzen::StatusCode::CONFLICT)
 }
 
 fn persisted_attachments(
@@ -409,7 +414,6 @@ pub(super) async fn resume_waiting_turn(
     request_kind: &'static str,
     resolution: &'static str,
 ) -> anyhow::Result<()> {
-    set_session_runtime_state(&state, &session_id, SessionRuntimeState::Running).await?;
     let hidden_context_xml = Some(resume_waiting_turn_xml(request_kind, resolution)?);
     let request = ChatRequest {
         session_id: session_id.clone(),
@@ -453,9 +457,6 @@ pub(super) async fn chat(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ChatResponse>> {
-    set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running)
-        .await
-        .map_err(internal_error)?;
     let response = run_chat_collect(state, req).await?;
     Ok(Json(response))
 }
@@ -543,14 +544,12 @@ pub(super) async fn chat_stream(
         .await
         .map_err(internal_error)?;
     if runtime.is_active() {
-        return Err(
-            skyzen::Error::msg(
-                "session is already active; send this message via steer or queue instead",
-            )
-            .set_status(skyzen::StatusCode::CONFLICT),
-        );
+        return Err(active_session_conflict_error());
     }
 
+    let Some(run_registration) = SessionRunRegistration::try_new(state.clone(), req.session_id.clone()) else {
+        return Err(active_session_conflict_error());
+    };
     let (sender, sse) = Sse::channel();
 
     tokio::spawn(async move {
@@ -568,7 +567,7 @@ pub(super) async fn chat_stream(
             return;
         }
 
-        if let Err(err) = stream_chat_events(state.clone(), req, sender.clone()).await {
+        if let Err(err) = stream_chat_events(state.clone(), req, sender.clone(), run_registration).await {
             send_event(
                 &sender,
                 "error",
@@ -920,9 +919,9 @@ async fn stream_chat_events(
     state: Arc<UiServerState>,
     req: ChatRequest,
     sender: skyzen::responder::sse::Sender,
+    run_registration: SessionRunRegistration,
 ) -> anyhow::Result<()> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
-    let run_registration = SessionRunRegistration::new(state.clone(), req.session_id.clone());
     let mut sink = SseSink(sender.clone());
         let result = run_agent_loop(
             &state,
@@ -984,7 +983,12 @@ async fn run_chat_collect_with_persistence(
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
 ) -> SkyResult<ChatResponse> {
-    let run_registration = SessionRunRegistration::new(state.clone(), req.session_id.clone());
+    let Some(run_registration) = SessionRunRegistration::try_new(state.clone(), req.session_id.clone()) else {
+        return Err(active_session_conflict_error());
+    };
+    set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running)
+        .await
+        .map_err(internal_error)?;
     let mut sink = CollectSink;
     let result = run_agent_loop(
         &state,

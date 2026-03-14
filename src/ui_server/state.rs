@@ -168,8 +168,11 @@ impl SessionRunCancellationRegistry {
         }
     }
 
-    pub(crate) fn open(&self, session_id: impl Into<String>) -> async_channel::Receiver<()> {
-        self.live_responses.open(session_id.into())
+    pub(crate) fn try_open(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Option<async_channel::Receiver<()>> {
+        self.live_responses.try_open(session_id.into())
     }
 
     pub(crate) fn cancel(&self, session_id: &str) -> bool {

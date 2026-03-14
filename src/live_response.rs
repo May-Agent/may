@@ -1,4 +1,5 @@
 use async_channel::{Receiver, Sender};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 #[derive(Debug, Default)]
@@ -18,6 +19,17 @@ impl<Response> LiveResponseRegistry<Response> {
         let (tx, rx) = async_channel::bounded(1);
         self.senders.insert(request_id, tx);
         rx
+    }
+
+    pub(crate) fn try_open(&self, request_id: String) -> Option<Receiver<Response>> {
+        let (tx, rx) = async_channel::bounded(1);
+        match self.senders.entry(request_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(tx);
+                Some(rx)
+            }
+            Entry::Occupied(_) => None,
+        }
     }
 
     pub(crate) fn resolve(&self, request_id: &str, response: Response) -> bool {
