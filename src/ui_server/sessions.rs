@@ -25,6 +25,8 @@ use super::types::{
 struct StoredContextWindowMetadata {
     phase: aither_agent::ContextWindowPhase,
     metrics: aither_agent::ContextWindowMetrics,
+    #[serde(default, rename = "history_message_count")]
+    _history_message_count: usize,
 }
 
 pub(super) async fn list_sessions(
