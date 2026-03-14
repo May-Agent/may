@@ -50,7 +50,12 @@ impl core::str::FromStr for SessionRuntimeState {
             "waiting_permission" => Ok(Self::WaitingPermission),
             "waiting_ask_user" => Ok(Self::WaitingAskUser),
             "waiting_terminal_input" => Ok(Self::WaitingTerminalInput),
-            other => Err(format!("unknown session runtime state: {other}")),
+            other => {
+                let mut message = String::with_capacity(31 + other.len());
+                message.push_str("unknown session runtime state: ");
+                message.push_str(other);
+                Err(message)
+            }
         }
     }
 }
@@ -124,7 +129,12 @@ impl core::str::FromStr for PendingUserMessageMode {
         match value {
             "steer" => Ok(Self::Steer),
             "queue" => Ok(Self::Queue),
-            other => Err(format!("unknown pending user message mode: {other}")),
+            other => {
+                let mut message = String::with_capacity(35 + other.len());
+                message.push_str("unknown pending user message mode: ");
+                message.push_str(other);
+                Err(message)
+            }
         }
     }
 }
@@ -220,6 +230,13 @@ impl SessionRuntimeSummary {
     #[must_use]
     pub fn has_pending_messages(&self) -> bool {
         self.pending_immediate.is_some() || !self.queued_messages.is_empty()
+    }
+
+    #[must_use]
+    pub fn can_dispatch_follow_up(&self) -> bool {
+        self.state == SessionRuntimeState::Idle
+            && !self.interactions.is_active()
+            && self.has_pending_messages()
     }
 
     #[must_use]
