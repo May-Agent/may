@@ -3,9 +3,10 @@
 //! Fetches approximate location from ipinfo.io and caches it for one hour.
 //! Used by location-aware profiles (e.g., daily) to inject geographic context.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use arc_swap::ArcSwapOption;
 use zenwave::ResponseExt;
 
 const IPINFO_URL: &str = "https://ipinfo.io/json";
@@ -20,33 +21,37 @@ pub struct LocationInfo {
     pub timezone: String,
 }
 
+#[derive(Debug)]
+struct CachedLocation {
+    fetched_at: Instant,
+    info: LocationInfo,
+}
+
 /// Cached location provider with automatic refresh.
 pub struct LocationProvider {
-    cache: RwLock<Option<(Instant, LocationInfo)>>,
+    cache: ArcSwapOption<CachedLocation>,
 }
 
 impl LocationProvider {
     pub fn new() -> Self {
         Self {
-            cache: RwLock::new(None),
+            cache: ArcSwapOption::empty(),
         }
     }
 
     /// Get the current location, fetching from ipinfo.io if cache is stale.
     pub async fn get(&self) -> anyhow::Result<LocationInfo> {
-        // Fast path: return cached if fresh
+        if let Some(cached) = self.cache.load_full()
+            && cached.fetched_at.elapsed() < CACHE_TTL
         {
-            let cached = self.cache.read().await;
-            if let Some((fetched_at, ref info)) = *cached {
-                if fetched_at.elapsed() < CACHE_TTL {
-                    return Ok(info.clone());
-                }
-            }
+            return Ok(cached.info.clone());
         }
 
         let info = Self::fetch().await?;
-        let mut cache = self.cache.write().await;
-        *cache = Some((Instant::now(), info.clone()));
+        self.cache.store(Some(Arc::new(CachedLocation {
+            fetched_at: Instant::now(),
+            info: info.clone(),
+        })));
         Ok(info)
     }
 
