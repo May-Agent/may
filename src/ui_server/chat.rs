@@ -641,31 +641,11 @@ pub(super) async fn chat_stream(
 
 pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: UiToolQueues) {
     let UiToolQueues {
-        workspace,
         task,
         notify,
         register_skills,
         register_subagents,
     } = queues;
-
-    let workspace_state = state.clone();
-    tokio::spawn(async move {
-        while let Some(request) = workspace.next().await {
-            let session_id = request.args.session_id.clone();
-            let approved = match workspace_state
-                .workspace_approver
-                .request_and_wait(session_id.as_str(), request.args.request.clone())
-                .await
-            {
-                Ok(approved) => approved,
-                Err(error) => {
-                    tracing::error!(session_id = %session_id, error = %error, "workspace request failed");
-                    false
-                }
-            };
-            let _ = request.respond(approved);
-        }
-    });
 
     let task_state = state.clone();
     tokio::spawn(async move {
@@ -1640,9 +1620,34 @@ fn spawn_ask_user_forwarder(
     ask_user_broker
 }
 
+fn spawn_workspace_forwarder(
+    state: &Arc<UiServerState>,
+    session_id: &SessionId,
+) -> crate::workspace_request::WorkspaceRequestBroker {
+    let (workspace_broker, workspace_queue) = crate::workspace_request::channel();
+    let workspace_approver = state.workspace_approver.clone();
+    let workspace_session_id = session_id.as_str().to_string();
+    tokio::spawn(async move {
+        while let Some(request) = workspace_queue.next().await {
+            let approved = match workspace_approver
+                .request_and_wait(workspace_session_id.as_str(), request.args.request.clone())
+                .await
+            {
+                Ok(approved) => approved,
+                Err(error) => {
+                    tracing::error!(session_id = %workspace_session_id, error = %error, "workspace request failed");
+                    false
+                }
+            };
+            let _ = request.respond(approved);
+        }
+    });
+    workspace_broker
+}
+
 fn build_tool_brokers(state: &Arc<UiServerState>, session_id: &SessionId) -> ToolBrokers {
     ToolBrokers {
-        workspace: state.tool_dispatchers.workspace.clone(),
+        workspace: spawn_workspace_forwarder(state, session_id),
         ask_user: spawn_ask_user_forwarder(state, session_id),
         task: state.tool_dispatchers.task.clone(),
         notify: state.tool_dispatchers.notify.clone(),

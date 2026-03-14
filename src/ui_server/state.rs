@@ -18,7 +18,7 @@ use crate::live_response::LiveResponseRegistry;
 use crate::mcp::McpManager;
 use crate::session::SessionManager;
 use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
-use crate::workspace_request::{RequestWorkspaceArgs, WorkspaceRequestBroker, WorkspaceRequestQueue};
+use crate::workspace_request::RequestWorkspaceArgs;
 use super::local_url_mapper::LocalUrlPortMapper;
 use super::types::{ModelsResponse, ProviderModelsResponse};
 
@@ -72,7 +72,6 @@ impl TitleGenerationQueue {
 
 #[derive(Debug, Clone)]
 pub(crate) struct UiToolDispatchers {
-    pub(crate) workspace: WorkspaceRequestBroker,
     pub(crate) task: TaskBroker,
     pub(crate) notify: crate::agent::notify_tool::NotifyBroker,
     pub(crate) register_skills: RegisterBroker,
@@ -80,7 +79,6 @@ pub(crate) struct UiToolDispatchers {
 }
 
 pub(crate) struct UiToolQueues {
-    pub(crate) workspace: WorkspaceRequestQueue,
     pub(crate) task: TaskQueue,
     pub(crate) notify: crate::agent::notify_tool::NotifyQueue,
     pub(crate) register_skills: RegisterQueue,
@@ -88,7 +86,6 @@ pub(crate) struct UiToolQueues {
 }
 
 pub(crate) fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
-    let (workspace, workspace_queue) = crate::workspace_request::channel();
     let (task, task_queue) = crate::agent::task_tool::channel();
     let (notify, notify_queue) = crate::agent::notify_tool::channel();
     let (register_skills, register_skills_queue) = crate::agent::register_tool::skills_channel();
@@ -97,14 +94,12 @@ pub(crate) fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
 
     (
         UiToolDispatchers {
-            workspace,
             task,
             notify,
             register_skills,
             register_subagents,
         },
         UiToolQueues {
-            workspace: workspace_queue,
             task: task_queue,
             notify: notify_queue,
             register_skills: register_skills_queue,
