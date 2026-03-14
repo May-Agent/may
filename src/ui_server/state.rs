@@ -1,10 +1,9 @@
-use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
 
@@ -113,8 +112,8 @@ pub(crate) struct UiServerState {
     pub(crate) provider_models_cache: RefreshableCache<ProviderModelsResponse>,
     pub(crate) config: tokio::sync::RwLock<MayConfig>,
     pub(crate) ui_events_notify: Arc<tokio::sync::Notify>,
-    pub(crate) container_prepare_statuses: Mutex<HashMap<String, ContainerPrepareStatus>>,
-    pub(crate) container_prepare_inflight: Mutex<HashSet<String>>,
+    pub(crate) container_prepare_statuses: DashMap<String, ContainerPrepareStatus>,
+    pub(crate) container_prepare_inflight: DashSet<String>,
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
     pub(crate) browser_manager: Option<Arc<crate::container::playwright::BrowserManager>>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
@@ -320,53 +319,38 @@ impl UiServerState {
     }
 
     pub(crate) async fn try_begin_container_prepare(&self, profile_id: &str) -> bool {
-        let mut inflight = self.container_prepare_inflight.lock().await;
-        inflight.insert(profile_id.to_string())
+        self.container_prepare_inflight.insert(profile_id.to_string())
     }
 
-    pub(crate) async fn finish_container_prepare(&self, profile_id: &str) {
-        self.container_prepare_inflight
-            .lock()
-            .await
-            .remove(profile_id);
+    pub(crate) fn finish_container_prepare(&self, profile_id: &str) {
+        self.container_prepare_inflight.remove(profile_id);
     }
 
-    pub(crate) async fn set_container_prepare_status(&self, status: ContainerPrepareStatus) {
+    pub(crate) fn set_container_prepare_status(&self, status: ContainerPrepareStatus) {
         self.container_prepare_statuses
-            .lock()
-            .await
             .insert(status.profile_id.clone(), status);
         self.notify_ui_events();
     }
 
-    pub(crate) async fn get_container_prepare_status(
+    pub(crate) fn get_container_prepare_status(
         &self,
         profile_id: &str,
     ) -> Option<ContainerPrepareStatus> {
         self.container_prepare_statuses
-            .lock()
-            .await
             .get(profile_id)
-            .cloned()
+            .map(|entry| entry.clone())
     }
 
-    pub(crate) async fn clear_container_prepare_status(&self, profile_id: &str) {
-        self.container_prepare_statuses
-            .lock()
-            .await
-            .remove(profile_id);
+    pub(crate) fn clear_container_prepare_status(&self, profile_id: &str) {
+        self.container_prepare_statuses.remove(profile_id);
         self.notify_ui_events();
     }
 
-    pub(crate) async fn snapshot_container_prepare_statuses(
-        &self,
-    ) -> ContainerPrepareStatusesPayload {
+    pub(crate) fn snapshot_container_prepare_statuses(&self) -> ContainerPrepareStatusesPayload {
         let mut statuses = self
             .container_prepare_statuses
-            .lock()
-            .await
-            .values()
-            .cloned()
+            .iter()
+            .map(|entry| entry.value().clone())
             .collect::<Vec<_>>();
         statuses.sort_by(|a, b| a.profile_id.cmp(&b.profile_id));
         ContainerPrepareStatusesPayload { statuses }

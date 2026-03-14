@@ -364,7 +364,7 @@ async fn emit_container_prepare_if_changed(
     sender: &skyzen::responder::sse::Sender,
     last_sig: &mut String,
 ) -> bool {
-    let payload = state.snapshot_container_prepare_statuses().await;
+    let payload = state.snapshot_container_prepare_statuses();
     if let Ok(sig) = serde_json::to_string(&payload)
         && sig != *last_sig
     {
