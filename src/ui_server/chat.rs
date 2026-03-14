@@ -1767,55 +1767,109 @@ async fn handle_register_skills_request(
     state: &Arc<UiServerState>,
     request: crate::agent::register_tool::RegisterRequest,
 ) -> Result<crate::agent::register_tool::RegisterResult, String> {
-    let source = resolve_registration_source_path(state, &request.path).await?;
-    let session_root = resolve_session_root(state, request.session_id.as_str()).await?;
-    let skills_dir = session_root.join("skills");
-    let approval_message = format!(
-        "Session {} requests registering skill from {} into this session's skills. Approve?",
-        request.session_id,
-        source.display()
-    );
-    request_registration_approval(state, request.session_id.as_str(), &approval_message).await?;
-
-    let manager = crate::skill::SkillManager::from_skills_dir(skills_dir);
-    let info = manager
-        .register_from_local_path(&source)
-        .await
-        .map_err(|e| format!("failed to register skill from {}: {e}", source.display()))?;
-
-    Ok(crate::agent::register_tool::RegisterResult {
-        registered: vec![info.dir_name],
-    })
+    handle_register_request(
+        state,
+        request,
+        "skill",
+        "skills",
+        |skills_dir, source| async move {
+            let manager = crate::skill::SkillManager::from_skills_dir(skills_dir);
+            let info = manager
+                .register_from_local_path(&source)
+                .await
+                .map_err(|error| {
+                    let source_display = source.display().to_string();
+                    let error_text = error.to_string();
+                    [
+                        "failed to register skill from ",
+                        source_display.as_str(),
+                        ": ",
+                        error_text.as_str(),
+                    ]
+                    .concat()
+                })?;
+            Ok(vec![info.dir_name])
+        },
+    )
+    .await
 }
 
 async fn handle_register_subagents_request(
     state: &Arc<UiServerState>,
     request: crate::agent::register_tool::RegisterRequest,
 ) -> Result<crate::agent::register_tool::RegisterResult, String> {
+    handle_register_request(
+        state,
+        request,
+        "subagent definitions",
+        "subagents",
+        |subagents_dir, source| async move {
+            let manager = crate::subagent::SubagentManager::from_subagents_dir(subagents_dir);
+            let infos = manager
+                .register_from_local_path(&source)
+                .await
+                .map_err(|error| {
+                    let source_display = source.display().to_string();
+                    let error_text = error.to_string();
+                    [
+                        "failed to register subagents from ",
+                        source_display.as_str(),
+                        ": ",
+                        error_text.as_str(),
+                    ]
+                    .concat()
+                })?;
+            Ok(infos.into_iter().map(|item| item.file_name).collect())
+        },
+    )
+    .await
+}
+
+async fn handle_register_request<F, Fut>(
+    state: &Arc<UiServerState>,
+    request: crate::agent::register_tool::RegisterRequest,
+    source_label: &str,
+    target_dir_name: &str,
+    register: F,
+) -> Result<crate::agent::register_tool::RegisterResult, String>
+where
+    F: FnOnce(std::path::PathBuf, std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>, String>>,
+{
     let source = resolve_registration_source_path(state, &request.path).await?;
     let session_root = resolve_session_root(state, request.session_id.as_str()).await?;
-    let subagents_dir = session_root.join("subagents");
-    let approval_message = format!(
-        "Session {} requests registering subagent definitions from {} into this session's subagents. Approve?",
-        request.session_id,
-        source.display()
+    let target_dir = session_root.join(target_dir_name);
+    let approval_message = build_registration_approval_message(
+        request.session_id.as_str(),
+        &source,
+        source_label,
+        target_dir_name,
     );
     request_registration_approval(state, request.session_id.as_str(), &approval_message).await?;
-
-    let manager = crate::subagent::SubagentManager::from_subagents_dir(subagents_dir);
-    let infos = manager
-        .register_from_local_path(&source)
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to register subagents from {}: {e}",
-                source.display()
-            )
-        })?;
-
     Ok(crate::agent::register_tool::RegisterResult {
-        registered: infos.into_iter().map(|item| item.file_name).collect(),
+        registered: register(target_dir, source).await?,
     })
+}
+
+fn build_registration_approval_message(
+    session_id: &str,
+    source: &std::path::Path,
+    source_label: &str,
+    target_dir_name: &str,
+) -> String {
+    let source_display = source.display().to_string();
+    [
+        "Session ",
+        session_id,
+        " requests registering ",
+        source_label,
+        " from ",
+        source_display.as_str(),
+        " into this session's ",
+        target_dir_name,
+        ". Approve?",
+    ]
+    .concat()
 }
 
 async fn resolve_session_root(
