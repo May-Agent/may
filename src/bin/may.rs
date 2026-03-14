@@ -173,7 +173,11 @@ where
     // Update app's MCP server list
     app.mcp_servers = mcp_manager.server_info();
 
-    let runtime_deps = RuntimeDeps::new(workspace_broker.clone(), ask_user_broker.clone());
+    let runtime_deps = RuntimeDeps::new(
+        workspace_broker.clone(),
+        ask_user_broker.clone(),
+        std::sync::Arc::new(may_agent::location::LocationProvider::new()),
+    );
 
     // Only start a session if configuration is complete
     if app.is_configured()
