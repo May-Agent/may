@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::{DashMap, DashSet};
+use arc_swap::ArcSwapOption;
 use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
 
@@ -69,14 +70,20 @@ impl TitleGenerationQueue {
 #[derive(Debug)]
 pub(crate) struct RefreshableCache<T> {
     ttl: Duration,
-    inner: Mutex<Option<(TokioInstant, T)>>,
+    inner: ArcSwapOption<CachedValue<T>>,
+}
+
+#[derive(Debug)]
+struct CachedValue<T> {
+    updated_at: TokioInstant,
+    value: T,
 }
 
 impl<T: Clone> RefreshableCache<T> {
     pub(crate) fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            inner: Mutex::new(None),
+            inner: ArcSwapOption::empty(),
         }
     }
 
@@ -85,18 +92,17 @@ impl<T: Clone> RefreshableCache<T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
+        if let Some(cached) = self.inner.load_full()
+            && cached.updated_at.elapsed() < self.ttl
         {
-            let guard = self.inner.lock().await;
-            if let Some((updated_at, value)) = guard.as_ref()
-                && updated_at.elapsed() < self.ttl
-            {
-                return value.clone();
-            }
+            return cached.value.clone();
         }
 
         let value = refresh().await;
-        let mut guard = self.inner.lock().await;
-        *guard = Some((TokioInstant::now(), value.clone()));
+        self.inner.store(Some(Arc::new(CachedValue {
+            updated_at: TokioInstant::now(),
+            value: value.clone(),
+        })));
         value
     }
 }
