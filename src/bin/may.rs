@@ -367,6 +367,22 @@ fn render_oneshot_event(
                 "[checkpoint] reason={reason:?} turn={turn} phase={phase:?} messages={message_count}"
             )?;
         }
+        Ok(AgentEvent::BackgroundTaskStarted {
+            task_id,
+            output_preview,
+            output_file,
+        }) => {
+            writeln!(
+                stderr,
+                "[background_started] task_id={task_id} output_file={output_file} preview={output_preview}"
+            )?;
+        }
+        Ok(AgentEvent::BackgroundTaskCompleted { task_id, result }) => {
+            writeln!(stderr, "[background_completed] task_id={task_id} result={result}")?;
+        }
+        Ok(AgentEvent::TerminalInputNeeded { task_id, notice }) => {
+            writeln!(stderr, "[terminal_input_needed] task_id={task_id:?} notice={notice}")?;
+        }
         Ok(AgentEvent::Usage(usage)) => {
             writeln!(
                 stderr,
@@ -378,6 +394,9 @@ fn render_oneshot_event(
         }
         Ok(AgentEvent::Complete { .. }) => {}
         Ok(AgentEvent::Text(_)) => {}
+        Ok(AgentEvent::Error(error)) => {
+            writeln!(stderr, "[error] {error}")?;
+        }
         Err(error) => {
             writeln!(stderr, "[error] {error}")?;
         }
