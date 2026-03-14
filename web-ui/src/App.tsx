@@ -1,9 +1,14 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { SettingsPage } from '@/components/layout/SettingsPage';
 import { ChatInterface } from '@/components/chat/ChatInterface';
-import { fetchSession, sendChat, subscribeUiEvents } from '@/lib/api';
+import {
+  consumeNotificationCallback,
+  fetchSession,
+  sendChat,
+  subscribeUiEvents,
+} from '@/lib/api';
 import { Menu } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
@@ -169,6 +174,7 @@ function AppShell() {
   const navigate = useNavigate();
   const [isSidebarOpen, setSidebarOpen] = useState(false);
   const [isDesktopSidebarOpen, setDesktopSidebarOpen] = useState(true);
+  const handledNotificationIdsRef = useRef<Set<string>>(new Set());
 
   const {
     settings,
@@ -200,14 +206,76 @@ function AppShell() {
       return;
     }
 
+    const processNotificationCallback = async (notificationId: string) => {
+      const normalizedId = notificationId.trim();
+      if (!normalizedId || handledNotificationIdsRef.current.has(normalizedId)) {
+        return;
+      }
+      handledNotificationIdsRef.current.add(normalizedId);
+
+      const store = useStore.getState();
+      try {
+        const callback = await consumeNotificationCallback(normalizedId);
+        const requestedSessionId =
+          typeof callback.sessionId === 'string' && callback.sessionId.trim().length > 0
+            ? callback.sessionId
+            : undefined;
+        const callbackMessage =
+          typeof callback.callbackMessage === 'string' ? callback.callbackMessage.trim() : '';
+        const callbackContextXml =
+          typeof callback.callbackContextXml === 'string'
+            ? callback.callbackContextXml.trim()
+            : '';
+
+        let callbackProfileId: string | null = null;
+        if (requestedSessionId) {
+          const knownSession = store.sessions.find((session) => session.id === requestedSessionId);
+          callbackProfileId =
+            knownSession?.profileId ??
+            (await fetchSession(requestedSessionId)).profileId ??
+            null;
+        }
+
+        if (callbackProfileId && callbackProfileId !== store.currentProfileId) {
+          await store.switchProfile(callbackProfileId);
+        }
+
+        const existingSession = requestedSessionId
+          ? store.sessions.find((session) => session.id === requestedSessionId)
+          : undefined;
+        const targetSessionId = callbackMessage
+          ? await store.createSession(undefined, callbackProfileId)
+          : existingSession?.id ?? (await store.createSession(undefined, callbackProfileId));
+
+        store.setCurrentSession(targetSessionId);
+        navigate(`/chat/${encodeURIComponent(targetSessionId)}`, { replace: true });
+
+        if (!callbackMessage) {
+          return;
+        }
+
+        store.addMessage(targetSessionId, callbackMessage, 'user');
+        const assistant = await sendChat({
+          sessionId: targetSessionId,
+          content: callbackMessage,
+          hiddenContextXml: callbackContextXml || undefined,
+          attachments: [],
+        });
+        store.addMessage(targetSessionId, assistant.content, 'assistant');
+      } catch (error) {
+        handledNotificationIdsRef.current.delete(normalizedId);
+        const reason = error instanceof Error ? error.message : String(error);
+        store.markBackendUnavailable(reason);
+        console.error('failed to process notification click callback', error);
+      }
+    };
+
     const handleServiceWorkerMessage = (event: MessageEvent) => {
       const data = event.data as
         | {
             type?: string;
             payload?: {
-              sessionId?: unknown;
-              callbackContextXml?: unknown;
-              callbackMessage?: unknown;
+              notificationId?: unknown;
             };
           }
         | undefined;
@@ -216,72 +284,38 @@ function AppShell() {
         return;
       }
 
-      void (async () => {
-        const store = useStore.getState();
-        try {
-          const payload = data.payload ?? {};
-          const requestedSessionId =
-            typeof payload.sessionId === 'string' && payload.sessionId.trim().length > 0
-              ? payload.sessionId
-              : undefined;
-          const callbackMessage =
-            typeof payload.callbackMessage === 'string' ? payload.callbackMessage.trim() : '';
-          const callbackContextXml =
-            typeof payload.callbackContextXml === 'string'
-              ? payload.callbackContextXml.trim()
-              : '';
+      const notificationId =
+        typeof data.payload?.notificationId === 'string'
+          ? data.payload.notificationId
+          : '';
+      if (!notificationId.trim()) {
+        return;
+      }
 
-          let callbackProfileId: string | null = null;
-          if (requestedSessionId) {
-            const knownSession = store.sessions.find((session) => session.id === requestedSessionId);
-            callbackProfileId =
-              knownSession?.profileId ??
-              (await fetchSession(requestedSessionId)).profileId ??
-              null;
-          }
-
-          if (
-            callbackProfileId &&
-            callbackProfileId !== store.currentProfileId
-          ) {
-            await store.switchProfile(callbackProfileId);
-          }
-
-          const existingSession = requestedSessionId
-            ? store.sessions.find((s) => s.id === requestedSessionId)
-            : undefined;
-          const targetSessionId = callbackMessage
-            ? await store.createSession(undefined, callbackProfileId)
-            : existingSession?.id ?? (await store.createSession(undefined, callbackProfileId));
-
-          store.setCurrentSession(targetSessionId);
-          navigate(`/chat/${encodeURIComponent(targetSessionId)}`);
-
-          if (!callbackMessage) {
-            return;
-          }
-
-          store.addMessage(targetSessionId, callbackMessage, 'user');
-          const assistant = await sendChat({
-            sessionId: targetSessionId,
-            content: callbackMessage,
-            hiddenContextXml: callbackContextXml || undefined,
-            attachments: [],
-          });
-          store.addMessage(targetSessionId, assistant.content, 'assistant');
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error);
-          store.markBackendUnavailable(reason);
-          console.error('failed to process notification click callback', error);
-        }
-      })();
+      void processNotificationCallback(notificationId);
     };
 
     navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+    const notificationId = new URLSearchParams(location.search).get('notification');
+    if (notificationId && notificationId.trim()) {
+      void processNotificationCallback(notificationId).finally(() => {
+        const params = new URLSearchParams(location.search);
+        params.delete('notification');
+        const nextSearch = params.toString();
+        navigate(
+          {
+            pathname: location.pathname,
+            search: nextSearch ? `?${nextSearch}` : '',
+          },
+          { replace: true },
+        );
+      });
+    }
+
     return () => {
       navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
     };
-  }, [navigate]);
+  }, [location.pathname, location.search, navigate]);
 
   useEffect(() => {
     const unsubscribeEvents = subscribeUiEvents({

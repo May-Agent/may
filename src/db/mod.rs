@@ -1575,6 +1575,29 @@ impl ChatDb {
             .map_err(Into::into)
     }
 
+    pub async fn get_notification_mailbox_entry(
+        &self,
+        id: &str,
+    ) -> Result<Option<notification_mailbox::Model>, ChatDbError> {
+        notification_mailbox::Entity::find_by_id(id)
+            .one(&self.conn)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn mark_notification_mailbox_opened(&self, id: &str) -> Result<(), ChatDbError> {
+        let mut active: notification_mailbox::ActiveModel =
+            notification_mailbox::Entity::find_by_id(id)
+                .one(&self.conn)
+                .await?
+                .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?
+                .into();
+        active.status = Set("opened".to_string());
+        active.updated_at = Set(jiff::Timestamp::now().to_string());
+        active.update(&self.conn).await?;
+        Ok(())
+    }
+
     pub async fn append_request_log(
         &self,
         params: RequestLogParams<'_>,

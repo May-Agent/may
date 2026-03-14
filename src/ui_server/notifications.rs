@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
+use skyzen::routing::Params;
 use skyzen::Result as SkyResult;
 use skyzen::utils::{Json, State};
 
-use super::error::internal_error;
+use super::error::{bad_request_error, internal_error};
 use super::state::UiServerState;
 
 // ── Request/response types ──────────────────────────────
@@ -116,6 +117,38 @@ pub(super) async fn list_notification_mailbox(
         .map(super::types::NotificationMailboxEntryResponse::from)
         .collect();
     Ok(Json(super::types::NotificationMailboxResponse { items }))
+}
+
+pub(super) async fn consume_notification_callback(
+    params: Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<super::types::NotificationCallbackResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let entry = state
+        .db()
+        .await
+        .get_notification_mailbox_entry(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            skyzen::Error::msg("notification mailbox entry not found")
+                .set_status(skyzen::StatusCode::NOT_FOUND)
+        })?;
+
+    state
+        .db()
+        .await
+        .mark_notification_mailbox_opened(&id)
+        .await
+        .map_err(internal_error)?;
+    state.notify_ui_events();
+
+    Ok(Json(super::types::NotificationCallbackResponse {
+        notification_id: entry.id,
+        session_id: entry.session_id,
+        callback_context_xml: entry.callback_context_xml,
+        callback_message: entry.callback_message,
+    }))
 }
 
 pub(super) async fn list_network_access_logs(

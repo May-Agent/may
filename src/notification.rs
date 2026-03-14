@@ -17,7 +17,10 @@ use crate::xml_fragment::XmlFragment;
 
 /// Push notification payload delivered to browser service workers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_id: Option<String>,
     pub title: String,
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +117,7 @@ impl NotificationManager {
     /// Send a push notification to all subscribed browsers.
     pub async fn send(&self, title: &str, body: &str) -> Result<usize, NotificationError> {
         self.send_payload(NotificationPayload {
+            notification_id: None,
             title: title.to_string(),
             body: body.to_string(),
             session_id: None,

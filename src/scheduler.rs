@@ -663,6 +663,7 @@ impl TaskRuntime {
 
                 if let Some(ref notifier) = self.notifier {
                     let payload = NotificationPayload {
+                        notification_id: None,
                         title: task_notification_title(task.name.as_str()),
                         body: "Completed successfully".to_string(),
                         session_id: task.session_id.clone(),
@@ -691,6 +692,7 @@ impl TaskRuntime {
 
                 if let Some(ref notifier) = self.notifier {
                     let payload = NotificationPayload {
+                        notification_id: None,
                         title: task_notification_title(task.name.as_str()),
                         body: "Execution failed".to_string(),
                         session_id: task.session_id.clone(),
