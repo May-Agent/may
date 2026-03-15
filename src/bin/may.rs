@@ -13,7 +13,6 @@ use aither_agent::AgentEvent;
 use anyhow::Context;
 
 use async_channel::TryRecvError;
-use jiff::Timestamp;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -25,6 +24,7 @@ use crossterm::{
 };
 use executor_core::tokio::TokioGlobal;
 use executor_core::{spawn, try_init_global_executor};
+use jiff::Timestamp;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
@@ -32,7 +32,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
-use may_agent::tui::runtime::{RuntimeDeps, TitleGenContext};
+use may_agent::tui::runtime::{LocalSessionRuntime, RuntimeDeps, TitleGenContext};
 use may_agent::tui::{App, AppEvent, EventHandler, PendingMessage, SendAction, ui};
 use may_agent::workspace_request::{self, WorkspaceRequestQueue};
 use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliMode, parse_cli_mode};
+    use super::{CliMode, parse_cli_mode, parse_oneshot_selection};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
@@ -183,6 +183,28 @@ mod tests {
             CliMode::OneShot("fix the bug".to_string())
         );
     }
+
+    #[test]
+    fn parse_oneshot_selection_accepts_single_choice() {
+        let options = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let selected =
+            parse_oneshot_selection("2", &options, false).expect("single selection must parse");
+        assert_eq!(selected, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn parse_oneshot_selection_rejects_multiple_when_not_allowed() {
+        let options = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(parse_oneshot_selection("1,2", &options, false).is_none());
+    }
+
+    #[test]
+    fn parse_oneshot_selection_accepts_multi_select() {
+        let options = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let selected =
+            parse_oneshot_selection("1,3", &options, true).expect("multi selection must parse");
+        assert_eq!(selected, vec!["a".to_string(), "c".to_string()]);
+    }
 }
 
 async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
@@ -194,40 +216,18 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
 
     let (workspace_broker, workspace_queue) = workspace_request::channel();
     let (ask_user_broker, ask_user_queue) = ask_user::channel();
+    let local_runtime = LocalSessionRuntime::new(app.session_manager.db().clone());
     let runtime_deps = RuntimeDeps::new(
+        local_runtime,
         workspace_broker,
         ask_user_broker,
         std::sync::Arc::new(may_agent::location::LocationProvider::new()),
     );
 
-    spawn(async move {
-        while let Some(request) = workspace_queue.next().await {
-            let _ = writeln!(
-                io::stderr(),
-                "[workspace_request] path={} reason={}",
-                request.args.request.path,
-                request.args.request.reason
-            );
-            drop(request);
-        }
-    })
-    .detach();
-
-    spawn(async move {
-        while let Some(request) = ask_user_queue.next().await {
-            let questions = request.args.request.clone().into_questions();
-            let _ = writeln!(
-                io::stderr(),
-                "[ask_user_request] questions={}",
-                questions.len()
-            );
-            drop(request);
-        }
-    })
-    .detach();
-
     let mut worker: Option<AgentWorker> = None;
-    runtime_deps.start_new_session(&mut app, &mut worker).await?;
+    runtime_deps
+        .start_new_session(&mut app, &mut worker)
+        .await?;
     let worker = worker
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("oneshot worker was not initialized"))?;
@@ -236,6 +236,7 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
     let mut assistant_response = String::new();
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
+    runtime_deps.mark_running(&app).await?;
     let handle = runtime_deps.start_agent_task(
         &mut app,
         worker,
@@ -243,20 +244,73 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
             content: prompt,
             attachments: Vec::new(),
             queued_at: Timestamp::now(),
+            delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
         },
         &mut pending_title_gen,
     )?;
     let mut agent_handle = Some(handle);
 
     loop {
+        if let Some(request) = runtime_deps.pending_permission(&app).await? {
+            let approved = prompt_oneshot_permission(&request.request, &mut stderr)?;
+            runtime_deps
+                .resolve_permission_response(&mut app, &request.id, approved)
+                .await?;
+            continue;
+        }
+        enum Event {
+            AskUser(may_agent::ask_user::AskUserRequest),
+            Workspace(may_agent::workspace_request::WorkspaceRequest),
+            Agent(TuiEvent),
+        }
+
         let Some(handle) = agent_handle.as_ref() else {
             break;
         };
-        let Some(event) = handle.recv().await else {
+        let next = futures_lite::future::or(
+            async { ask_user_queue.next().await.map(Event::AskUser) },
+            futures_lite::future::or(
+                async { workspace_queue.next().await.map(Event::Workspace) },
+                async { handle.recv().await.map(Event::Agent) },
+            ),
+        )
+        .await;
+        let Some(event) = next else {
             break;
         };
         match event {
-            TuiEvent::Agent(result) => {
+            Event::AskUser(request) => {
+                let session_id = app
+                    .session_manager
+                    .current()
+                    .map(|session| session.id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
+                let questions = request.args.request.clone().into_questions();
+                let request_id = runtime_deps
+                    .register_ask_user_request(&mut app, &session_id, &questions)
+                    .await?;
+                let answers = prompt_oneshot_questions(&questions, &mut stderr)?;
+                runtime_deps
+                    .resolve_ask_user_response(&mut app, &session_id, &request_id, &answers)
+                    .await?;
+                request.respond(answers).map_err(anyhow::Error::from)?;
+            }
+            Event::Workspace(request) => {
+                let session_id = app
+                    .session_manager
+                    .current()
+                    .map(|session| session.id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
+                let request_id = runtime_deps
+                    .register_workspace_request(&mut app, &session_id, &request.args.request)
+                    .await?;
+                let approved = prompt_oneshot_workspace(&request.args.request, &mut stderr)?;
+                runtime_deps
+                    .resolve_workspace_response(&mut app, &session_id, &request_id, approved)
+                    .await?;
+                request.respond(approved).map_err(anyhow::Error::from)?;
+            }
+            Event::Agent(TuiEvent::Agent(result)) => {
                 if let Ok(AgentEvent::Text(ref text)) = result {
                     assistant_response.push_str(text);
                     stdout.write_all(text.as_bytes())?;
@@ -284,7 +338,7 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
                     return Ok(());
                 }
             }
-            TuiEvent::Complete => {
+            Event::Agent(TuiEvent::Complete) => {
                 runtime_deps
                     .finish_agent_task(
                         &mut app,
@@ -299,8 +353,8 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            TuiEvent::Compacted(_) => {}
-            TuiEvent::Error(error) => {
+            Event::Agent(TuiEvent::Compacted(_)) => {}
+            Event::Agent(TuiEvent::Error(error)) => {
                 let _ = writeln!(stderr, "[error] {error}");
                 runtime_deps
                     .finish_agent_task(
@@ -316,6 +370,147 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn prompt_oneshot_questions(
+    questions: &[may_agent::ask_user::Question],
+    stderr: &mut impl Write,
+) -> anyhow::Result<Vec<may_agent::ask_user::QuestionAnswer>> {
+    let mut answers = Vec::with_capacity(questions.len());
+    for question in questions {
+        writeln!(stderr, "[ask_user] {}", question.question)?;
+        if !question.section.is_empty() {
+            writeln!(stderr, "section: {}", question.section)?;
+        }
+        for (index, option) in question.option.iter().enumerate() {
+            writeln!(stderr, "{}. {}", index + 1, option)?;
+        }
+        if question.multi_select {
+            writeln!(
+                stderr,
+                "Enter comma-separated numbers, `s` to skip, or any other text for a custom answer:"
+            )?;
+        } else {
+            writeln!(
+                stderr,
+                "Enter a number, `s` to skip, or any other text for a custom answer:"
+            )?;
+        }
+        stderr.flush()?;
+        let answer = loop {
+            let input = read_oneshot_line()?;
+            let trimmed = input.trim();
+            if trimmed.eq_ignore_ascii_case("s") || trimmed.eq_ignore_ascii_case("skip") {
+                break may_agent::ask_user::AnswerValue::Skipped;
+            }
+            if question.option.is_empty() {
+                if trimmed.is_empty() {
+                    writeln!(stderr, "answer must not be empty")?;
+                    stderr.flush()?;
+                    continue;
+                }
+                break may_agent::ask_user::AnswerValue::Custom(trimmed.to_string());
+            }
+            if let Some(selected) =
+                parse_oneshot_selection(trimmed, &question.option, question.multi_select)
+            {
+                break may_agent::ask_user::AnswerValue::Selected(selected);
+            }
+            if trimmed.is_empty() {
+                writeln!(stderr, "answer must not be empty")?;
+                stderr.flush()?;
+                continue;
+            }
+            break may_agent::ask_user::AnswerValue::Custom(trimmed.to_string());
+        };
+        answers.push(may_agent::ask_user::QuestionAnswer {
+            section: question.section.clone(),
+            answer,
+        });
+    }
+    Ok(answers)
+}
+
+fn prompt_oneshot_workspace(
+    request: &may_agent::workspace_request::RequestWorkspaceArgs,
+    stderr: &mut impl Write,
+) -> anyhow::Result<bool> {
+    writeln!(stderr, "[workspace_request] path={}", request.path)?;
+    writeln!(stderr, "reason={}", request.reason)?;
+    writeln!(stderr, "Approve? [y/N]")?;
+    stderr.flush()?;
+    loop {
+        let input = read_oneshot_line()?;
+        let trimmed = input.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("n")
+            || trimmed.eq_ignore_ascii_case("no")
+        {
+            return Ok(false);
+        }
+        if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
+            return Ok(true);
+        }
+        writeln!(stderr, "Please answer `y` or `n`.")?;
+        stderr.flush()?;
+    }
+}
+
+fn prompt_oneshot_permission(
+    request: &may_agent::session::PersistedPermissionRequestPayload,
+    stderr: &mut impl Write,
+) -> anyhow::Result<bool> {
+    writeln!(stderr, "[permission_request] mode={}", request.mode)?;
+    writeln!(stderr, "script={}", request.script)?;
+    writeln!(stderr, "Approve? [y/N]")?;
+    stderr.flush()?;
+    loop {
+        let input = read_oneshot_line()?;
+        let trimmed = input.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("n")
+            || trimmed.eq_ignore_ascii_case("no")
+        {
+            return Ok(false);
+        }
+        if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
+            return Ok(true);
+        }
+        writeln!(stderr, "Please answer `y` or `n`.")?;
+        stderr.flush()?;
+    }
+}
+
+fn read_oneshot_line() -> anyhow::Result<String> {
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line)
+}
+
+fn parse_oneshot_selection(
+    input: &str,
+    options: &[String],
+    multi_select: bool,
+) -> Option<Vec<String>> {
+    let mut selected = Vec::new();
+    for raw_part in input.split(',') {
+        let trimmed = raw_part.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let index = trimmed.parse::<usize>().ok()?;
+        let option = options.get(index.checked_sub(1)?).cloned()?;
+        if !selected.iter().any(|existing| existing == &option) {
+            selected.push(option);
+        }
+    }
+    if selected.is_empty() {
+        return None;
+    }
+    if !multi_select && selected.len() > 1 {
+        return None;
+    }
+    Some(selected)
 }
 
 fn render_oneshot_event(
@@ -378,22 +573,34 @@ fn render_oneshot_event(
             )?;
         }
         Ok(AgentEvent::BackgroundTaskCompleted { task_id, result }) => {
-            writeln!(stderr, "[background_completed] task_id={task_id} result={result}")?;
+            writeln!(
+                stderr,
+                "[background_completed] task_id={task_id} result={result}"
+            )?;
         }
         Ok(AgentEvent::TerminalInputNeeded { task_id, notice }) => {
-            writeln!(stderr, "[terminal_input_needed] task_id={task_id:?} notice={notice}")?;
+            writeln!(
+                stderr,
+                "[terminal_input_needed] task_id={task_id:?} notice={notice}"
+            )?;
         }
         Ok(AgentEvent::RunPaused {
             reason,
             tool_call_id,
         }) => {
-            writeln!(stderr, "[run_paused] reason={reason:?} tool_call_id={tool_call_id}")?;
+            writeln!(
+                stderr,
+                "[run_paused] reason={reason:?} tool_call_id={tool_call_id}"
+            )?;
         }
         Ok(AgentEvent::RunResumed {
             reason,
             tool_call_id,
         }) => {
-            writeln!(stderr, "[run_resumed] reason={reason:?} tool_call_id={tool_call_id}")?;
+            writeln!(
+                stderr,
+                "[run_resumed] reason={reason:?} tool_call_id={tool_call_id}"
+            )?;
         }
         Ok(AgentEvent::SkillActivated {
             name,
@@ -409,9 +616,7 @@ fn render_oneshot_event(
             writeln!(
                 stderr,
                 "[usage] prompt={:?} completion={:?} total={:?}",
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.total_tokens
+                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
             )?;
         }
         Ok(AgentEvent::Complete { .. }) => {}
@@ -465,7 +670,9 @@ where
     // Update app's MCP server list
     app.mcp_servers = mcp_manager.server_info();
 
+    let local_runtime = LocalSessionRuntime::new(app.session_manager.db().clone());
     let runtime_deps = RuntimeDeps::new(
+        local_runtime,
         workspace_broker.clone(),
         ask_user_broker.clone(),
         std::sync::Arc::new(may_agent::location::LocationProvider::new()),
@@ -560,11 +767,23 @@ where
             app.handle_paste_result(result).await?;
         }
 
+        if matches!(app.mode, may_agent::tui::AppMode::Chat)
+            && let Some(request) = runtime_deps.pending_permission(app).await?
+        {
+            app.mode = may_agent::tui::AppMode::PermissionConfirm(
+                may_agent::tui::state::PermissionConfirmState {
+                    request_id: request.id,
+                    request: request.request,
+                },
+            );
+        }
+
         // Check for queued messages - start processing if agent is idle
         if agent_handle.is_none()
-            && let Some(msg) = app.next_queued()
+            && let Some(msg) = runtime_deps.take_next_dispatchable(app).await?
             && let Some(w) = worker.as_ref()
         {
+            runtime_deps.mark_running(app).await?;
             agent_handle =
                 Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
             assistant_response.clear();
@@ -647,7 +866,15 @@ where
             Event::AskUser(request) => {
                 let questions = request.args.request.clone().into_questions();
                 tracing::info!(question_count = questions.len(), "User question requested");
-                let state = may_agent::tui::AskUserState::new(request, questions);
+                let session_id = app
+                    .session_manager
+                    .current()
+                    .map(|session| session.id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+                let request_id = runtime_deps
+                    .register_ask_user_request(app, &session_id, &questions)
+                    .await?;
+                let state = may_agent::tui::AskUserState::new(request_id, request, questions);
                 app.mode = may_agent::tui::AppMode::AskUser(state);
             }
 
@@ -657,7 +884,20 @@ where
                     reason = %request.args.request.reason,
                     "Workspace access requested"
                 );
-                app.mode = may_agent::tui::AppMode::WorkspaceConfirm(request);
+                let session_id = app
+                    .session_manager
+                    .current()
+                    .map(|session| session.id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+                let request_id = runtime_deps
+                    .register_workspace_request(app, &session_id, &request.args.request)
+                    .await?;
+                app.mode = may_agent::tui::AppMode::WorkspaceConfirm(
+                    may_agent::tui::state::WorkspaceConfirmState {
+                        request_id,
+                        request,
+                    },
+                );
             }
 
             Event::Agent(tui_event) => {
@@ -733,7 +973,14 @@ where
                         app.chat.end_text();
                         app.chat.push_text("\n\n[Interrupted]");
                         app.chat.end_text();
-                        app.finish_processing();
+                        runtime_deps
+                            .finish_agent_task(
+                                app,
+                                &mut agent_handle,
+                                &mut pending_title_gen,
+                                &assistant_response,
+                            )
+                            .await;
                         continue;
                     }
                 }
@@ -750,6 +997,7 @@ where
                     Some(SendAction::Send(msg)) => {
                         if agent_handle.is_none() {
                             if let Some(w) = worker.as_ref() {
+                                runtime_deps.mark_running(app).await?;
                                 agent_handle = Some(runtime_deps.start_agent_task(
                                     app,
                                     w,
@@ -758,10 +1006,27 @@ where
                                 )?);
                                 assistant_response.clear();
                             }
-                        } else {
-                            // Agent is busy, queue the message
-                            app.queue.enqueue(msg);
                         }
+                    }
+                    Some(SendAction::EnqueuePending(msg)) => {
+                        runtime_deps.enqueue_pending_message(app, msg).await?;
+                    }
+                    Some(SendAction::RespondAskUser {
+                        request_id,
+                        request,
+                        answers,
+                    }) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone())
+                            .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+                        runtime_deps
+                            .resolve_ask_user_response(app, &session_id, &request_id, &answers)
+                            .await?;
+                        request.respond(answers).unwrap_or_else(|_| {
+                            panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
+                        });
                     }
                     Some(SendAction::StartCopilotAuth) => {
                         run_copilot_auth(app, events, terminal).await?;
@@ -894,6 +1159,31 @@ where
                             }
                         }
                     }
+                    Some(SendAction::RespondWorkspace {
+                        request_id,
+                        request,
+                        approved,
+                    }) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone())
+                            .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+                        runtime_deps
+                            .resolve_workspace_response(app, &session_id, &request_id, approved)
+                            .await?;
+                        request.respond(approved).unwrap_or_else(|_| {
+                            panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
+                        });
+                    }
+                    Some(SendAction::RespondPermission {
+                        request_id,
+                        approved,
+                    }) => {
+                        runtime_deps
+                            .resolve_permission_response(app, &request_id, approved)
+                            .await?;
+                    }
                     Some(SendAction::SkillInstall { repo }) => {
                         let tx = events.sender();
                         let may_dir = app.session_manager.may_dir().to_path_buf();
@@ -905,8 +1195,9 @@ where
                         app.status = Some(format!("Installing from {}...", repo));
                         spawn(async move {
                             let home_paths = may_agent::MayHomePaths::new(may_dir);
-                            let manager =
-                                SkillManager::from_profile_home(&home_paths.profile_home(profile_id.as_str()));
+                            let manager = SkillManager::from_profile_home(
+                                &home_paths.profile_home(profile_id.as_str()),
+                            );
                             let result = match SkillManager::parse_github_repo(&repo) {
                                 Ok((owner, repo_name)) => {
                                     manager.install_from_github(owner, repo_name).await
@@ -937,8 +1228,9 @@ where
                         app.status = Some(format!("Deleting {}...", dir_name));
                         spawn(async move {
                             let home_paths = may_agent::MayHomePaths::new(may_dir);
-                            let manager =
-                                SkillManager::from_profile_home(&home_paths.profile_home(profile_id.as_str()));
+                            let manager = SkillManager::from_profile_home(
+                                &home_paths.profile_home(profile_id.as_str()),
+                            );
                             let result = manager.delete_skill(&dir_name).await;
                             // Refresh skill list after delete
                             let final_result = match result {
@@ -953,7 +1245,7 @@ where
                         })
                         .detach();
                     }
-                    Some(SendAction::Queued) | None => {}
+                    None => {}
                 }
             }
         }

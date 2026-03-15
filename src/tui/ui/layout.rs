@@ -45,8 +45,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_copilot_auth_screen(frame, area, app);
             return;
         }
-        AppMode::WorkspaceConfirm(request) => {
-            render_workspace_confirm(frame, area, request);
+        AppMode::PermissionConfirm(state) => {
+            render_permission_confirm(frame, area, state);
+            return;
+        }
+        AppMode::WorkspaceConfirm(state) => {
+            render_workspace_confirm(frame, area, &state.request);
             return;
         }
         AppMode::AskUser(state) => {
@@ -60,7 +64,19 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.scan_and_fetch_images();
 
     // Build queue message previews
-    let queue_messages: Vec<String> = app.queue.iter().map(|m| m.content.clone()).collect();
+    let queue_messages: Vec<String> = app
+        .queue
+        .iter()
+        .map(|message| {
+            let label = match message.delivery_mode {
+                crate::session::PendingUserMessageMode::Steer => "[steer] ",
+                crate::session::PendingUserMessageMode::Queue => "[queue] ",
+            };
+            let mut preview = String::from(label);
+            preview.push_str(message.content.as_str());
+            preview
+        })
+        .collect();
 
     // Build usage info for status
     let usage_info = app.usage.as_ref().and_then(|u| {
@@ -1664,6 +1680,75 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRe
         )
         .alignment(ratatui::layout::Alignment::Left);
 
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+fn render_permission_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    state: &crate::tui::state::PermissionConfirmState,
+) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Min(12),
+            Constraint::Percentage(25),
+        ])
+        .split(area);
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(12),
+            Constraint::Min(60),
+            Constraint::Percentage(12),
+        ])
+        .split(chunks[1]);
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "The agent is requesting elevated bash access:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  mode: {}", state.request.mode.as_str()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Script:", Style::default().fg(Color::White))),
+        Line::from(Span::styled(
+            format!("  {}", state.request.script.as_str()),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
+            Span::styled("Approve", Style::default().fg(Color::White)),
+            Span::raw("    "),
+            Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
+            Span::styled("Deny", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightRed))
+                .title(" Permission Request ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
     frame.render_widget(widget, center_chunks[1]);
 }
 

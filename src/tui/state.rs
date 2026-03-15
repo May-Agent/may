@@ -26,8 +26,10 @@ pub enum AppMode {
     TierModelPicker,
     /// GitHub Copilot OAuth authentication
     CopilotAuth,
+    /// Permission approval dialog for elevated bash modes.
+    PermissionConfirm(PermissionConfirmState),
     /// Workspace access confirmation dialog
-    WorkspaceConfirm(WorkspaceRequest),
+    WorkspaceConfirm(WorkspaceConfirmState),
     /// MCP server management overlay
     McpManage,
     /// SSH server management overlay
@@ -83,6 +85,8 @@ impl std::fmt::Debug for AskUserState {
 }
 
 pub struct AskUserState {
+    /// Stable persisted request identifier.
+    pub request_id: String,
     /// The original request (holds the response channel).
     pub request: AskUserRequest,
     /// Normalized list of questions.
@@ -94,12 +98,13 @@ pub struct AskUserState {
 }
 
 impl AskUserState {
-    pub fn new(request: AskUserRequest, questions: Vec<Question>) -> Self {
+    pub fn new(request_id: String, request: AskUserRequest, questions: Vec<Question>) -> Self {
         let states = questions
             .iter()
             .map(|_| AskUserQuestionState::new())
             .collect();
         Self {
+            request_id,
             request,
             questions,
             current_question: 0,
@@ -132,6 +137,18 @@ impl AskUserState {
     pub fn is_multi(&self) -> bool {
         self.questions.len() > 1
     }
+}
+
+#[derive(Debug)]
+pub struct WorkspaceConfirmState {
+    pub request_id: String,
+    pub request: WorkspaceRequest,
+}
+
+#[derive(Debug)]
+pub struct PermissionConfirmState {
+    pub request_id: String,
+    pub request: crate::session::PersistedPermissionRequestPayload,
 }
 
 /// Status of Copilot OAuth authentication flow.
