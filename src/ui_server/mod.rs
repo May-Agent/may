@@ -31,7 +31,6 @@ use skyzen::Result as SkyResult;
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::runtime::native;
 use skyzen::utils::{Json, State};
-use tokio::sync::Mutex;
 
 use crate::config::MayConfig;
 use crate::mcp::McpManager;
@@ -134,12 +133,10 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let remote_access_manager = Arc::new(remote_access::RemoteAccessManager::new(
         ui_events_notify.clone(),
     ));
-    let permission_approver = crate::agent::PermissionApprover::new()
-        .with_runtime_service(runtime_service.clone());
-    let workspace_approver =
-        WorkspaceApprover::new().with_runtime_service(runtime_service.clone());
-    let ask_user_approver =
-        AskUserApprover::new().with_runtime_service(runtime_service.clone());
+    let permission_approver =
+        crate::agent::PermissionApprover::new().with_runtime_service(runtime_service.clone());
+    let workspace_approver = WorkspaceApprover::new().with_runtime_service(runtime_service.clone());
+    let ask_user_approver = AskUserApprover::new().with_runtime_service(runtime_service.clone());
 
     // Initialize memory processor with fast-tier provider chain
     let memory_processor = match crate::agent::build_fast_provider_chain(&config).await {
@@ -184,8 +181,8 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let task_runtime = Arc::new(task_runtime);
 
     let state = Arc::new(UiServerState {
-        session_manager: Mutex::new(session_manager),
-        mcp_manager: Mutex::new(mcp_manager),
+        session_manager: state::SharedSessionManager::new(session_manager),
+        mcp_manager: state::SharedMcpManager::new(mcp_manager),
         permission_approver,
         workspace_approver,
         ask_user_approver,

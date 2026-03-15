@@ -282,7 +282,7 @@ pub(super) async fn list_profiles(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<ProfileInfo>>> {
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -297,7 +297,7 @@ pub(super) async fn create_profile(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ProfileInfo>> {
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -340,7 +340,7 @@ pub(super) async fn update_profile(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -389,7 +389,7 @@ pub(super) async fn delete_profile(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -409,7 +409,7 @@ pub(super) async fn get_profile_sessions(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -459,7 +459,7 @@ pub(super) async fn create_folder(
     let profile_id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -486,7 +486,7 @@ pub(super) async fn update_folder(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -510,7 +510,7 @@ pub(super) async fn delete_folder(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -528,7 +528,7 @@ pub(super) async fn pin_session(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -544,7 +544,7 @@ pub(super) async fn unpin_session(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -560,7 +560,7 @@ pub(super) async fn archive_session(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -576,7 +576,7 @@ pub(super) async fn unarchive_session(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -593,7 +593,7 @@ pub(super) async fn move_to_folder(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 

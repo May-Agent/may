@@ -400,7 +400,7 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
 
 pub(super) async fn resume_pending_follow_up_runs(state: Arc<UiServerState>) -> anyhow::Result<()> {
     let session_ids = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager
             .db()
             .sessions_requiring_pending_dispatch()
@@ -574,7 +574,7 @@ pub(super) async fn stop_session_run(
         .map_err(super::error::bad_request_error)?
         .to_string();
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
     if !db
@@ -1165,7 +1165,7 @@ async fn persist_latest_assistant_stats(
     model_context_window: Option<u32>,
     elapsed_ms: u64,
 ) -> anyhow::Result<()> {
-    let mut manager = state.session_manager.lock().await;
+    let mut manager = state.sessions().await;
     if manager.current().map(|s| &s.id) != Some(session_id) {
         manager
             .load_session(session_id)
@@ -1243,7 +1243,7 @@ async fn persist_context_debug_snapshot(
     let timestamp = jiff::Timestamp::now().to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
     db.upsert_context_debug_snapshot(
@@ -1337,7 +1337,7 @@ async fn resolve_session_context(
         ));
     }
 
-    let mut manager = state.session_manager.lock().await;
+    let mut manager = state.sessions().await;
     manager
         .load_session(&session_id)
         .await
@@ -1494,7 +1494,7 @@ async fn setup_agent_environment(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("container profile model is missing"))?;
             {
-                let manager = state.session_manager.lock().await;
+                let manager = state.sessions().await;
                 manager
                     .reconcile_container_layout_for_session(&ctx.session_id)
                     .await

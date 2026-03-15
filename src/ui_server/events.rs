@@ -128,12 +128,7 @@ pub(super) async fn stream_events(
         {
             return;
         }
-        if !emit_remote_access_if_changed(
-            &state_cloned,
-            &sender,
-            &mut last_remote_access_sig,
-        )
-        .await
+        if !emit_remote_access_if_changed(&state_cloned, &sender, &mut last_remote_access_sig).await
         {
             return;
         }
@@ -470,7 +465,7 @@ async fn emit_profile_sessions_if_changed(
         return true;
     };
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
     let profile_sessions = match query_profile_sessions(&db, profile_id).await {

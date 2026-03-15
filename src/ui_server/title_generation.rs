@@ -49,7 +49,7 @@ async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
     let placeholder = truncate_preview(&task.user_message);
 
     {
-        let mut manager = state.session_manager.lock().await;
+        let mut manager = state.sessions().await;
         if let Err(e) = manager.load_session(&session_id).await {
             tracing::warn!(
                 session_id = %session_id,
@@ -78,7 +78,7 @@ async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
         return;
     }
 
-    let mut manager = state.session_manager.lock().await;
+    let mut manager = state.sessions().await;
     if let Err(e) = manager.load_session(&session_id).await {
         tracing::warn!(
             session_id = %session_id,

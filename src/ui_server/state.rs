@@ -1,13 +1,16 @@
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::{DashMap, DashSet};
 use arc_swap::ArcSwapOption;
-use tokio::sync::Mutex;
+use dashmap::{DashMap, DashSet};
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant as TokioInstant;
 
+use super::local_url_mapper::LocalUrlPortMapper;
+use super::types::{ModelsResponse, ProviderModelsResponse};
 use crate::agent::PermissionApprover;
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::register_tool::RegisterQueue;
@@ -19,8 +22,6 @@ use crate::mcp::McpManager;
 use crate::session::SessionManager;
 use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::workspace_request::RequestWorkspaceArgs;
-use super::local_url_mapper::LocalUrlPortMapper;
-use super::types::{ModelsResponse, ProviderModelsResponse};
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -148,9 +149,107 @@ impl<T: Clone> RefreshableCache<T> {
     }
 }
 
+pub(crate) struct SessionManagerHandle<'a> {
+    guard: MutexGuard<'a, SessionManager>,
+}
+
+impl std::fmt::Debug for SessionManagerHandle<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionManagerHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deref for SessionManagerHandle<'_> {
+    type Target = SessionManager;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for SessionManagerHandle<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+pub(crate) struct SharedSessionManager {
+    inner: Mutex<SessionManager>,
+}
+
+impl std::fmt::Debug for SharedSessionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedSessionManager")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedSessionManager {
+    pub(crate) fn new(manager: SessionManager) -> Self {
+        Self {
+            inner: Mutex::new(manager),
+        }
+    }
+
+    pub(crate) async fn access(&self) -> SessionManagerHandle<'_> {
+        SessionManagerHandle {
+            guard: self.inner.lock().await,
+        }
+    }
+}
+
+pub(crate) struct McpManagerHandle<'a> {
+    guard: MutexGuard<'a, McpManager>,
+}
+
+impl std::fmt::Debug for McpManagerHandle<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpManagerHandle").finish_non_exhaustive()
+    }
+}
+
+impl Deref for McpManagerHandle<'_> {
+    type Target = McpManager;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for McpManagerHandle<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+pub(crate) struct SharedMcpManager {
+    inner: Mutex<McpManager>,
+}
+
+impl std::fmt::Debug for SharedMcpManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedMcpManager").finish_non_exhaustive()
+    }
+}
+
+impl SharedMcpManager {
+    pub(crate) fn new(manager: McpManager) -> Self {
+        Self {
+            inner: Mutex::new(manager),
+        }
+    }
+
+    pub(crate) async fn access(&self) -> McpManagerHandle<'_> {
+        McpManagerHandle {
+            guard: self.inner.lock().await,
+        }
+    }
+}
+
 pub(crate) struct UiServerState {
-    pub(crate) session_manager: Mutex<SessionManager>,
-    pub(crate) mcp_manager: Mutex<McpManager>,
+    pub(crate) session_manager: SharedSessionManager,
+    pub(crate) mcp_manager: SharedMcpManager,
     pub(crate) permission_approver: PermissionApprover,
     pub(crate) workspace_approver: WorkspaceApprover,
     pub(crate) ask_user_approver: AskUserApprover,
@@ -177,8 +276,16 @@ pub(crate) struct UiServerState {
 }
 
 impl UiServerState {
+    pub(crate) async fn sessions(&self) -> SessionManagerHandle<'_> {
+        self.session_manager.access().await
+    }
+
+    pub(crate) async fn mcp(&self) -> McpManagerHandle<'_> {
+        self.mcp_manager.access().await
+    }
+
     pub(crate) async fn db(&self) -> crate::db::ChatDb {
-        self.session_manager.lock().await.db().clone()
+        self.sessions().await.db().clone()
     }
 }
 
@@ -444,7 +551,8 @@ impl UiServerState {
     }
 
     pub(crate) async fn try_begin_container_prepare(&self, profile_id: &str) -> bool {
-        self.container_prepare_inflight.insert(profile_id.to_string())
+        self.container_prepare_inflight
+            .insert(profile_id.to_string())
     }
 
     pub(crate) fn finish_container_prepare(&self, profile_id: &str) {
