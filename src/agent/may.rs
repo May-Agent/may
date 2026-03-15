@@ -426,6 +426,26 @@ impl PermissionHandler for PermissionApprover {
     async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
         true
     }
+
+    async fn will_wait_for_approval(&self, mode: BashMode, _script: &str) -> bool {
+        let Some(session_id) = self.session_id.as_deref() else {
+            return false;
+        };
+        match mode {
+            BashMode::Sandboxed => false,
+            BashMode::Unsafe => true,
+            BashMode::Network => {
+                let Some(runtime_service) = &self.runtime_service else {
+                    return false;
+                };
+                !runtime_service
+                    .db()
+                    .session_has_approved_permission_mode(session_id, Self::history_mode(mode))
+                    .await
+                    .unwrap_or(false)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -501,6 +521,13 @@ impl PermissionHandler for MayPermissionHandler {
         self.append_network_audit_log(domain, port, allowed, None)
             .await;
         allowed
+    }
+
+    async fn will_wait_for_approval(&self, mode: BashMode, script: &str) -> bool {
+        match &self.approver {
+            Some(approver) => approver.will_wait_for_approval(mode, script).await,
+            None => NoopPermissionHandler.will_wait_for_approval(mode, script).await,
+        }
     }
 }
 
