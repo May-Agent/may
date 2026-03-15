@@ -24,9 +24,7 @@ use executor_core::DefaultExecutor;
 use futures_lite::{Stream, StreamExt};
 
 use crate::agent::notify_tool::NotifyTool;
-use crate::agent::register_tool::{
-    RegisterBroker, RegisterTool, Skills, Subagents,
-};
+use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
 use crate::agent::search_tool::SearchTool;
 use crate::agent::session_tool::{EnvironmentTool, SessionTool};
 use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
@@ -382,12 +380,12 @@ impl PermissionApprover {
         if let Some(runtime_service) = self.runtime_service.clone() {
             runtime_service
                 .set_waiting_permission(
-                &session_id,
-                Some(Self::persisted_request(request_id.clone(), payload.clone())),
-            )
-            .await
-            .map_err(anyhow::Error::from)
-            .map_err(PermissionError::Internal)?;
+                    &session_id,
+                    Some(Self::persisted_request(request_id.clone(), payload.clone())),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .map_err(PermissionError::Internal)?;
             let db = runtime_service.db();
             Self::append_request_history(&db, &session_id, &request_id, mode, &payload.script)
                 .await?;
@@ -500,7 +498,8 @@ impl PermissionHandler for MayPermissionHandler {
             Some(approver) => approver.check_domain(domain, port).await,
             None => NoopPermissionHandler.check_domain(domain, port).await,
         };
-        self.append_network_audit_log(domain, port, allowed, None).await;
+        self.append_network_audit_log(domain, port, allowed, None)
+            .await;
         allowed
     }
 }
@@ -760,13 +759,12 @@ impl RuntimeSystemContext {
     }
 
     fn refresh_memory_file(&mut self) {
-        let memory_content =
-            std::fs::read_to_string(&self.memory_path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to read memory file at {}: {error}",
-                    self.memory_path.display()
-                )
-            });
+        let memory_content = std::fs::read_to_string(&self.memory_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read memory file at {}: {error}",
+                self.memory_path.display()
+            )
+        });
         self.last_memory_content = memory_content;
     }
 }
@@ -1004,7 +1002,8 @@ impl MayAgent {
             config.session_id.as_str().to_string(),
             config.profile_id.clone(),
         );
-        let search_tool = SearchTool::new(config.sandbox_dir.clone(), config.search_embedder.clone());
+        let search_tool =
+            SearchTool::new(config.sandbox_dir.clone(), config.search_embedder.clone());
         let task_tool = TaskTool::new(
             config.session_id.as_str().to_string(),
             match &config.environment {
@@ -1157,12 +1156,11 @@ impl MayAgent {
                 container_exec,
                 browser_backend,
             } => {
-                builder = builder
-                    .container_runtime(ContainerShellRuntime::new(
-                        container_id,
-                        container_ipc_host,
-                        container_exec,
-                    ));
+                builder = builder.container_runtime(ContainerShellRuntime::new(
+                    container_id,
+                    container_ipc_host,
+                    container_exec,
+                ));
                 if let Some(browser_backend) = browser_backend {
                     let endpoint = browser_backend.cdp_endpoint().await.map_err(|error| {
                         MayAgentError::Sandbox(prefixed_error(
@@ -1182,7 +1180,8 @@ impl MayAgent {
                     runtime_system_context.with_workspace(workspace_context.clone());
                 builder = builder.system(workspace_context);
                 if let Some(macos_hint) = build_macos_host_automation_context() {
-                    runtime_system_context = runtime_system_context.with_platform(macos_hint.clone());
+                    runtime_system_context =
+                        runtime_system_context.with_platform(macos_hint.clone());
                     builder = builder.system(macos_hint);
                 }
             }
@@ -1373,23 +1372,23 @@ impl MayAgent {
         };
         let model_info = aither_models::lookup(model);
 
-        let search_embedder = match resolve_embedding_provider(may_config, Some(provider_id.as_str()))
-        {
-            Ok(resolved) => {
-                tracing::debug!(
-                    provider_id = %resolved.provider_id,
-                    "resolved embedding provider for semantic search"
-                );
-                Some(resolved.embedder)
-            }
-            Err(error) => {
-                tracing::debug!(
-                    error = %error,
-                    "semantic search will remain lexical because no embedding provider resolved"
-                );
-                None
-            }
-        };
+        let search_embedder =
+            match resolve_embedding_provider(may_config, Some(provider_id.as_str())) {
+                Ok(resolved) => {
+                    tracing::debug!(
+                        provider_id = %resolved.provider_id,
+                        "resolved embedding provider for semantic search"
+                    );
+                    Some(resolved.embedder)
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "semantic search will remain lexical because no embedding provider resolved"
+                    );
+                    None
+                }
+            };
 
         let config = MayAgentConfig {
             llm,
@@ -1410,7 +1409,11 @@ impl MayAgent {
             profile_persona,
             profile_memories,
             plan_state,
-            network_policy: may_config.preferences.network_policy.compile().map_err(MayAgentError::Sandbox)?,
+            network_policy: may_config
+                .preferences
+                .network_policy
+                .compile()
+                .map_err(MayAgentError::Sandbox)?,
             location,
             task_broker,
             notify_broker,
@@ -1979,8 +1982,7 @@ mod tests {
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
         let dir = tempdir().expect("temp dir should be created");
         let memory_path = dir.path().join("MEMORY.md");
-        std::fs::write(&memory_path, "remember this")
-            .expect("memory file should be written");
+        std::fs::write(&memory_path, "remember this").expect("memory file should be written");
 
         let mut runtime_context =
             RuntimeSystemContext::new(memory_path, "remember this".to_string());
@@ -2018,7 +2020,8 @@ mod tests {
         let memory_path = dir.path().join("MEMORY.md");
         std::fs::write(&memory_path, "before").expect("memory file should be written");
 
-        let mut runtime_context = RuntimeSystemContext::new(memory_path.clone(), "before".to_string());
+        let mut runtime_context =
+            RuntimeSystemContext::new(memory_path.clone(), "before".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
 

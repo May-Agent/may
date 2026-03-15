@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use aither_core::llm::Tool;
 use aither_sandbox::{
-    BashArgs, BashExecutionMode, BashMode, BashResult, BashTool, BollardContainerExec,
-    Configured, ContainerExecHandle, ContainerLaunchSpec, ContainerShellRuntime, OutputFormat,
+    BashArgs, BashExecutionMode, BashMode, BashResult, BashTool, BollardContainerExec, Configured,
+    ContainerExecHandle, ContainerLaunchSpec, ContainerShellRuntime, OutputFormat,
     PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
     ToolRegistryBuilder, permission::PermissionError,
 };
@@ -27,11 +27,11 @@ use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKi
 use crate::config::SshServerConfig;
 use crate::container::lifecycle::ContainerManager;
 use crate::db::ChatDb;
-use crate::db::entity::{profiles, scheduled_tasks};
 use crate::db::NetworkAccessLogParams;
+use crate::db::entity::{profiles, scheduled_tasks};
+use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
 use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
-use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
 use crate::profile::{ProfileEnvironment, ProfileInfo};
 use crate::task_trigger::{
     TRIGGER_KIND_EVENT, TRIGGER_KIND_TIME, TRIGGER_KIND_WEBHOOK, TRIGGER_TYPE_CRON,
@@ -111,12 +111,7 @@ fn profile_not_found_error(profile_id: &str) -> String {
 
 fn invalid_profile_error(profile_id: &str, error: &impl std::fmt::Display) -> String {
     let error_text = error.to_string();
-    join_text(&[
-        "invalid profile ",
-        profile_id,
-        ": ",
-        error_text.as_str(),
-    ])
+    join_text(&["invalid profile ", profile_id, ": ", error_text.as_str()])
 }
 
 fn session_load_error(session_id: &str, error: &impl std::fmt::Display) -> String {
@@ -169,11 +164,7 @@ fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String
     join_text(&[prefix, execution_id, suffix])
 }
 
-fn path_error_text(
-    prefix: &str,
-    path: &std::path::Path,
-    error: &impl std::fmt::Display,
-) -> String {
+fn path_error_text(prefix: &str, path: &std::path::Path, error: &impl std::fmt::Display) -> String {
     let path_text = path.display().to_string();
     let error_text = error.to_string();
     join_text(&[prefix, path_text.as_str(), ": ", error_text.as_str()])
@@ -221,7 +212,10 @@ fn task_notification_callback_payload(
 
     (
         task_notification_callback_context(task, status, summary),
-        Some(task_notification_callback_message(task.name.as_str(), status)),
+        Some(task_notification_callback_message(
+            task.name.as_str(),
+            status,
+        )),
     )
 }
 
@@ -239,12 +233,7 @@ fn task_value_error(
     error: &impl std::fmt::Display,
 ) -> crate::db::ChatDbError {
     let error_text = error.to_string();
-    task_db_error(join_text(&[
-        prefix,
-        task_id,
-        ": ",
-        error_text.as_str(),
-    ]))
+    task_db_error(join_text(&[prefix, task_id, ": ", error_text.as_str()]))
 }
 
 fn task_kind_error(kind: &str, task_id: &str) -> crate::db::ChatDbError {
@@ -706,7 +695,11 @@ impl TaskRuntime {
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
         let Some(ref run_at) = task.run_at else {
-            return Err(task_field_error(task.id.as_str(), "one-time task ", "run_at"));
+            return Err(task_field_error(
+                task.id.as_str(),
+                "one-time task ",
+                "run_at",
+            ));
         };
 
         // Skip if already executed.
@@ -715,11 +708,7 @@ impl TaskRuntime {
         }
 
         let target = jiff::Timestamp::from_str(run_at).map_err(|error| {
-            task_value_error(
-                task.id.as_str(),
-                "invalid run_at stored in task ",
-                &error,
-            )
+            task_value_error(task.id.as_str(), "invalid run_at stored in task ", &error)
         })?;
 
         Ok(now >= target)
@@ -736,7 +725,9 @@ impl TaskRuntime {
             .await?;
         let runtime = self.clone();
         tokio::spawn(async move {
-            runtime.execute_task(run_id.as_str(), &task, invocation).await;
+            runtime
+                .execute_task(run_id.as_str(), &task, invocation)
+                .await;
         });
         Ok(())
     }
@@ -797,11 +788,7 @@ impl TaskRuntime {
 
                 if let Some(ref notifier) = self.notifier {
                     let (callback_context_xml, callback_message) =
-                        task_notification_callback_payload(
-                            task,
-                            "completed",
-                            truncated.as_str(),
-                        );
+                        task_notification_callback_payload(task, "completed", truncated.as_str());
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
@@ -839,11 +826,7 @@ impl TaskRuntime {
 
                 if let Some(ref notifier) = self.notifier {
                     let (callback_context_xml, callback_message) =
-                        task_notification_callback_payload(
-                            task,
-                            "failed",
-                            truncated.as_str(),
-                        );
+                        task_notification_callback_payload(task, "failed", truncated.as_str());
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
@@ -894,7 +877,8 @@ impl TaskRuntime {
                     .await
             }
             ProfileEnvironment::Remote { .. } => {
-                self.execute_remote(&profile, materialized.command.clone()).await
+                self.execute_remote(&profile, materialized.command.clone())
+                    .await
             }
         };
 
@@ -910,12 +894,16 @@ impl TaskRuntime {
         invocation: TaskInvocation,
     ) -> Result<MaterializedTaskExecution, String> {
         let execution_id = uuid::Uuid::new_v4().to_string();
-        let script_path = script
-            .host_working_dir
-            .join(temp_task_file_name(".may-task-script-", execution_id.as_str(), ".sh"));
-        let trigger_path = script
-            .host_working_dir
-            .join(temp_task_file_name(".may-task-trigger-", execution_id.as_str(), ".json"));
+        let script_path = script.host_working_dir.join(temp_task_file_name(
+            ".may-task-script-",
+            execution_id.as_str(),
+            ".sh",
+        ));
+        let trigger_path = script.host_working_dir.join(temp_task_file_name(
+            ".may-task-trigger-",
+            execution_id.as_str(),
+            ".json",
+        ));
         let trigger_kind =
             shell_escape(Cow::Borrowed(Self::invocation_kind(&invocation))).into_owned();
         let trigger_payload = serde_json::to_vec(&TaskExecutionEnvelope::new(task, invocation))
@@ -923,12 +911,18 @@ impl TaskRuntime {
 
         tokio::fs::write(&script_path, script.content.as_bytes())
             .await
-            .map_err(|error| path_error_text("failed to write task script ", &script_path, &error))?;
+            .map_err(|error| {
+                path_error_text("failed to write task script ", &script_path, &error)
+            })?;
         tokio::fs::write(&trigger_path, trigger_payload)
             .await
             .map_err(|error| {
                 let _ = std::fs::remove_file(&script_path);
-                path_error_text("failed to write task trigger payload ", &trigger_path, &error)
+                path_error_text(
+                    "failed to write task trigger payload ",
+                    &trigger_path,
+                    &error,
+                )
             })?;
 
         let trigger_file =
@@ -977,15 +971,19 @@ impl TaskRuntime {
                     .map_err(|error| prefixed_error("failed to resolve script_path: ", &error))?;
                 let content = tokio::fs::read_to_string(&canonical)
                     .await
-                    .map_err(|error| path_error_text("failed to read script_path ", &canonical, &error))?;
+                    .map_err(|error| {
+                        path_error_text("failed to read script_path ", &canonical, &error)
+                    })?;
                 let canonical_display = canonical.display().to_string();
                 let working_dir = canonical
                     .parent()
-                    .ok_or_else(|| join_text(&[
-                        "script_path ",
-                        canonical_display.as_str(),
-                        " has no parent directory",
-                    ]))?
+                    .ok_or_else(|| {
+                        join_text(&[
+                            "script_path ",
+                            canonical_display.as_str(),
+                            " has no parent directory",
+                        ])
+                    })?
                     .to_path_buf();
                 Ok(TaskScript {
                     content,
@@ -1088,9 +1086,9 @@ impl TaskRuntime {
             ssh: true,
         })
         .with_ssh_servers(vec![SshServer {
-                name: ssh_server.name,
-                target: ssh_server.target,
-            }])
+            name: ssh_server.name,
+            target: ssh_server.target,
+        }])
         .map_err(|error| prefixed_error("failed to configure remote ssh server: ", &error))?;
         let registry = Arc::new(ToolRegistryBuilder::new().build(working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
@@ -1156,16 +1154,29 @@ impl TaskRuntime {
         })?;
 
         let default_image_tag =
-            crate::container::profile::default_image_tag(&self.may_dir, profile)
-                .map_err(|error| invalid_profile_component_error("invalid container profile image tag: ", &error))?;
+            crate::container::profile::default_image_tag(&self.may_dir, profile).map_err(
+                |error| {
+                    invalid_profile_component_error("invalid container profile image tag: ", &error)
+                },
+            )?;
         let image_spec = crate::container::profile::image_spec_for_profile(
             &self.may_dir,
             profile,
             &default_image_tag,
         )
-        .map_err(|error| invalid_profile_component_error("invalid container profile image configuration: ", &error))?;
-        let extra_mounts = crate::container::profile::mounts_for_profile(profile)
-            .map_err(|error| invalid_profile_component_error("invalid container profile mount configuration: ", &error))?;
+        .map_err(|error| {
+            invalid_profile_component_error(
+                "invalid container profile image configuration: ",
+                &error,
+            )
+        })?;
+        let extra_mounts =
+            crate::container::profile::mounts_for_profile(profile).map_err(|error| {
+                invalid_profile_component_error(
+                    "invalid container profile mount configuration: ",
+                    &error,
+                )
+            })?;
 
         crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
             .await
@@ -1228,7 +1239,9 @@ impl TaskRuntime {
                 DefaultExecutor,
             )
             .await
-            .map_err(|error| init_bash_tool_error("failed to initialize container bash tool: ", &error))?
+            .map_err(|error| {
+                init_bash_tool_error("failed to initialize container bash tool: ", &error)
+            })?
             .with_shell_sessions(shell_sessions)
             .with_writable_paths([workspace_dir.clone()])
             .with_readable_paths([workspace_dir])
@@ -1259,16 +1272,29 @@ impl TaskRuntime {
         })?;
 
         let default_image_tag =
-            crate::container::profile::default_image_tag(&self.may_dir, profile)
-                .map_err(|error| invalid_profile_component_error("invalid container profile image tag: ", &error))?;
+            crate::container::profile::default_image_tag(&self.may_dir, profile).map_err(
+                |error| {
+                    invalid_profile_component_error("invalid container profile image tag: ", &error)
+                },
+            )?;
         let image_spec = crate::container::profile::image_spec_for_profile(
             &self.may_dir,
             profile,
             &default_image_tag,
         )
-        .map_err(|error| invalid_profile_component_error("invalid container profile image configuration: ", &error))?;
-        let extra_mounts = crate::container::profile::mounts_for_profile(profile)
-            .map_err(|error| invalid_profile_component_error("invalid container profile mount configuration: ", &error))?;
+        .map_err(|error| {
+            invalid_profile_component_error(
+                "invalid container profile image configuration: ",
+                &error,
+            )
+        })?;
+        let extra_mounts =
+            crate::container::profile::mounts_for_profile(profile).map_err(|error| {
+                invalid_profile_component_error(
+                    "invalid container profile mount configuration: ",
+                    &error,
+                )
+            })?;
 
         crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
             .await
@@ -1328,7 +1354,9 @@ impl TaskRuntime {
                 DefaultExecutor,
             )
             .await
-            .map_err(|error| init_bash_tool_error("failed to initialize container bash tool: ", &error))?
+            .map_err(|error| {
+                init_bash_tool_error("failed to initialize container bash tool: ", &error)
+            })?
             .with_shell_sessions(shell_sessions)
             .with_writable_paths([workspace_dir.clone()])
             .with_readable_paths([workspace_dir])
@@ -1380,7 +1408,7 @@ async fn run_bash_script(
     ssh_server_id: Option<String>,
     script: String,
 ) -> Result<String, String> {
-        let output = bash_tool
+    let output = bash_tool
         .call(BashArgs {
             script,
             mode,
@@ -1401,8 +1429,8 @@ async fn run_bash_script(
 }
 
 fn parse_bash_result(payload: &str) -> Result<String, String> {
-    let result: BashResult =
-        serde_json::from_str(payload).map_err(|error| prefixed_error("failed to parse bash result: ", &error))?;
+    let result: BashResult = serde_json::from_str(payload)
+        .map_err(|error| prefixed_error("failed to parse bash result: ", &error))?;
 
     if result.exit_code != 0 {
         return Err(task_script_failure(
@@ -1463,6 +1491,9 @@ mod tests {
     #[test]
     fn local_tasks_respect_needs_network_flag() {
         assert_eq!(local_task_execution_mode(true), BashExecutionMode::Default);
-        assert_eq!(local_task_execution_mode(false), BashExecutionMode::Sandboxed);
+        assert_eq!(
+            local_task_execution_mode(false),
+            BashExecutionMode::Sandboxed
+        );
     }
 }

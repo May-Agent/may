@@ -88,8 +88,7 @@ pub(super) async fn browser_start(
             .find_browser_takeover_session()
             .await
             .map_err(|error| {
-                skyzen::Error::msg(error.to_string())
-                    .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+                skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
             })?,
     }))
 }
@@ -114,8 +113,7 @@ pub(super) async fn browser_stop(
             .find_browser_takeover_session()
             .await
             .map_err(|error| {
-                skyzen::Error::msg(error.to_string())
-                    .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+                skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
             })?,
     }))
 }

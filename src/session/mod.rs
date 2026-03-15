@@ -2,8 +2,8 @@
 //!
 //! Each session has its own sandbox directory and chat history.
 
-pub(crate) mod history;
 mod context_snapshot;
+pub(crate) mod history;
 pub mod layout;
 mod manager;
 mod plan;
@@ -26,11 +26,10 @@ pub use manager::{
 };
 pub use plan::SessionPlanState;
 pub use runtime::{
-    BrowserInteractionState, PendingUserMessage, PendingUserMessageMode,
-    PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment,
-    PersistedPermissionRequest, PersistedPermissionRequestPayload, PersistedWorkspaceRequest,
-    PersistedWorkspaceRequestPayload, SessionInteractionState, SessionRuntimeState,
-    SessionRuntimeSummary,
+    BrowserInteractionState, PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
+    PersistedAskUserRequest, PersistedAttachment, PersistedPermissionRequest,
+    PersistedPermissionRequestPayload, PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload,
+    SessionInteractionState, SessionRuntimeState, SessionRuntimeSummary,
 };
 pub use runtime_service::SessionRuntimeService;
 pub use store::SessionStore;

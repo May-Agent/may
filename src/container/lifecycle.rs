@@ -217,12 +217,14 @@ impl ContainerManager {
             tokio::fs::write(&memory_file, "").await?;
         }
 
-        tokio::fs::canonicalize(home_paths.root()).await.map_err(|error| {
-            ContainerError::Bootstrap(format!(
-                "failed to canonicalize may dir {}: {error}",
-                self.may_dir.display()
-            ))
-        })?;
+        tokio::fs::canonicalize(home_paths.root())
+            .await
+            .map_err(|error| {
+                ContainerError::Bootstrap(format!(
+                    "failed to canonicalize may dir {}: {error}",
+                    self.may_dir.display()
+                ))
+            })?;
         let memory_file = tokio::fs::canonicalize(home_paths.memory_file())
             .await
             .map_err(|error| {
@@ -382,7 +384,8 @@ impl ContainerManager {
 
     /// Record activity for a container (resets auto-stop timer).
     pub async fn touch_activity(&self, container_id: &str) {
-        self.activity.insert(container_id.to_string(), Instant::now());
+        self.activity
+            .insert(container_id.to_string(), Instant::now());
     }
 
     /// Spawn a background task that auto-stops idle containers.

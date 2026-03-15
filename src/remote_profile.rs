@@ -29,12 +29,11 @@ pub fn parse_remote_profile_config(
     let Some(raw) = profile.preferences_json.as_deref() else {
         return Ok(None);
     };
-    let preferences: ProfilePreferences =
-        serde_json::from_str(raw).map_err(|error| {
-            format!(
-                "invalid profile.preferences_json for remote profile {}: {error}",
-                profile.id
-            )
+    let preferences: ProfilePreferences = serde_json::from_str(raw).map_err(|error| {
+        format!(
+            "invalid profile.preferences_json for remote profile {}: {error}",
+            profile.id
+        )
     })?;
     Ok(preferences.remote)
 }

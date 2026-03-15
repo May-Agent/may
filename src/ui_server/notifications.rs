@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use sea_orm::DbErr;
-use skyzen::routing::Params;
 use skyzen::Result as SkyResult;
+use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
 use super::error::{bad_request_error, internal_error};

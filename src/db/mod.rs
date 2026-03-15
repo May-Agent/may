@@ -11,9 +11,8 @@ use sea_orm::{
     ActiveModelTrait,
     ActiveValue::NotSet,
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, DbErr, EntityTrait, Order,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Set, TransactionTrait,
     sea_query::{Expr, Query, SqliteQueryBuilder},
-    TransactionTrait,
 };
 
 use crate::session::{
@@ -24,11 +23,11 @@ use crate::session::{
 use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 use crate::xml_fragment::XmlFragment;
 use entity::{
-    context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox, profile_memories,
-    profile_memory_jobs, profiles, push_subscriptions, request_logs, scheduled_task_runs,
-    scheduled_tasks, session_context_snapshots, session_pending_ask_user, session_pending_messages,
-    session_pending_permissions, session_pending_workspace, session_plans, session_run_leases,
-    session_runtimes, sessions,
+    context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox,
+    profile_memories, profile_memory_jobs, profiles, push_subscriptions, request_logs,
+    scheduled_task_runs, scheduled_tasks, session_context_snapshots, session_pending_ask_user,
+    session_pending_messages, session_pending_permissions, session_pending_workspace,
+    session_plans, session_run_leases, session_runtimes, sessions,
 };
 
 /// Error type for database operations.
@@ -178,6 +177,25 @@ fn parse_profile_environment(value: &str) -> Result<ProfileEnvironmentKind, Chat
     }
 }
 
+fn prefixed_text(prefix: &str, suffix: &str) -> String {
+    let mut text = String::with_capacity(prefix.len() + suffix.len());
+    text.push_str(prefix);
+    text.push_str(suffix);
+    text
+}
+
+fn db_custom_error(prefix: &str, error: &impl std::fmt::Display) -> DbErr {
+    let error_text = error.to_string();
+    DbErr::Custom(prefixed_text(prefix, error_text.as_str()))
+}
+
+fn session_not_found_db_error(session_id: &str) -> ChatDbError {
+    ChatDbError::Db(DbErr::RecordNotFound(prefixed_text(
+        "Session not found: ",
+        session_id,
+    )))
+}
+
 /// Chat history database.
 ///
 /// Wraps a SeaORM `DatabaseConnection` to a SQLite file.
@@ -187,9 +205,9 @@ pub struct ChatDb {
 }
 
 impl ChatDb {
-/// Open (or create) the chat history database at the given path.
-///
-/// Creates the current schema if the tables don't exist.
+    /// Open (or create) the chat history database at the given path.
+    ///
+    /// Creates the current schema if the tables don't exist.
     pub async fn open(db_path: &Path) -> Result<Self, ChatDbError> {
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let mut opts = ConnectOptions::new(url);
@@ -278,8 +296,7 @@ impl ChatDb {
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
         conn.execute_unprepared(&create_sql).await?;
 
-        let network_access_logs_stmt =
-            schema.create_table_from_entity(network_access_logs::Entity);
+        let network_access_logs_stmt = schema.create_table_from_entity(network_access_logs::Entity);
         let create_sql = network_access_logs_stmt
             .to_string(SqliteQueryBuilder)
             .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
@@ -602,9 +619,10 @@ impl ChatDb {
             session_id: Set(session_id.to_string()),
             state: Set(summary.state.as_str().to_string()),
             browser_takeover_active: Set(summary.interactions.browser.takeover_active),
-            browser_takeover_alert_pending: Set(
-                summary.interactions.browser.takeover_alert_pending,
-            ),
+            browser_takeover_alert_pending: Set(summary
+                .interactions
+                .browser
+                .takeover_alert_pending),
             updated_at: Set(now.clone()),
         };
         session_runtimes::Entity::insert(active_runtime)
@@ -964,9 +982,10 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(["Session not found: ", session_id].concat()))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         session_runtimes::Entity::update_many()
             .col_expr(
                 session_runtimes::Column::BrowserTakeoverActive,
@@ -988,9 +1007,10 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(["Session not found: ", session_id].concat()))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         if !summary.interactions.browser.takeover_active {
             return Ok(summary);
@@ -1007,9 +1027,10 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<bool, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(["Session not found: ", session_id].concat()))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         let pending = summary.interactions.browser.takeover_alert_pending;
         if !pending {
@@ -1214,9 +1235,7 @@ impl ChatDb {
                 summary.state = SessionRuntimeState::Idle;
             }
 
-            if summary.state != original_state
-                || expired_terminal_wait
-                || original_browser_takeover
+            if summary.state != original_state || expired_terminal_wait || original_browser_takeover
             {
                 self.write_session_runtime_summary(&session_id, &summary)
                     .await?;
@@ -1234,7 +1253,9 @@ impl ChatDb {
         for run in running {
             let mut active: scheduled_task_runs::ActiveModel = run.into();
             active.status = Set("interrupted".to_string());
-            active.output = Set(Some("May server restarted before the task run completed".to_string()));
+            active.output = Set(Some(
+                "May server restarted before the task run completed".to_string(),
+            ));
             active.finished_at = Set(Some(finished_at.clone()));
             active.updated_at = Set(finished_at.clone());
             active.update(&self.conn).await?;
@@ -1264,9 +1285,10 @@ impl ChatDb {
         self.conn
             .transaction::<_, bool, DbErr>(|txn| {
                 Box::pin(async move {
-                    let existing = session_run_leases::Entity::find_by_id(session_id_owned.as_str())
-                        .one(txn)
-                        .await?;
+                    let existing =
+                        session_run_leases::Entity::find_by_id(session_id_owned.as_str())
+                            .one(txn)
+                            .await?;
                     if let Some(existing) = existing {
                         if existing.active {
                             return Ok(false);
@@ -1552,8 +1574,7 @@ impl ChatDb {
             ]))
             .count(&self.conn)
             .await?;
-        usize::try_from(count)
-            .map_err(|error| ChatDbError::Db(DbErr::Custom(error.to_string())))
+        usize::try_from(count).map_err(|error| ChatDbError::Db(DbErr::Custom(error.to_string())))
     }
 
     /// Get messages for a session filtered by role.
@@ -1756,7 +1777,7 @@ impl ChatDb {
                 .into();
         active.status = Set(status.to_string());
         active.sent_count = Set(i32::try_from(sent_count).map_err(|error| {
-            DbErr::Custom(["notification sent_count overflow: ", &error.to_string()].concat())
+            db_custom_error("notification sent_count overflow: ", &error)
         })?);
         active.last_error = Set(last_error.map(ToOwned::to_owned));
         active.delivered_at = Set(delivered_at.map(ToOwned::to_owned));
@@ -1820,8 +1841,7 @@ impl ChatDb {
             .get_notification_mailbox_entry(id)
             .await?
             .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?;
-        let has_callback =
-            entry.callback_context_xml.is_some() || entry.callback_message.is_some();
+        let has_callback = entry.callback_context_xml.is_some() || entry.callback_message.is_some();
         let callback_consumed = has_callback && entry.status != "opened";
         if entry.status != "opened" {
             self.mark_notification_mailbox_opened(id).await?;
@@ -1850,35 +1870,32 @@ impl ChatDb {
                 .prompt_tokens
                 .map(i32::try_from)
                 .transpose()
-                .map_err(|error| DbErr::Custom(["prompt_tokens overflow: ", &error.to_string()].concat()))?),
+                .map_err(|error| db_custom_error("prompt_tokens overflow: ", &error))?),
             completion_tokens: Set(params
                 .completion_tokens
                 .map(i32::try_from)
                 .transpose()
-                .map_err(|error| DbErr::Custom(["completion_tokens overflow: ", &error.to_string()].concat()))?),
-            total_tokens: Set(params
-                .total_tokens
-                .map(i32::try_from)
-                .transpose()
-                .map_err(|error| DbErr::Custom(["total_tokens overflow: ", &error.to_string()].concat()))?),
+                .map_err(|error| db_custom_error("completion_tokens overflow: ", &error))?),
+            total_tokens: Set(params.total_tokens.map(i32::try_from).transpose().map_err(
+                |error| db_custom_error("total_tokens overflow: ", &error),
+            )?),
             cache_read_tokens: Set(params
                 .cache_read_tokens
                 .map(i32::try_from)
                 .transpose()
-                .map_err(|error| DbErr::Custom(["cache_read_tokens overflow: ", &error.to_string()].concat()))?),
+                .map_err(|error| db_custom_error("cache_read_tokens overflow: ", &error))?),
             cache_write_tokens: Set(params
                 .cache_write_tokens
                 .map(i32::try_from)
                 .transpose()
-                .map_err(|error| DbErr::Custom(["cache_write_tokens overflow: ", &error.to_string()].concat()))?),
+                .map_err(|error| db_custom_error("cache_write_tokens overflow: ", &error))?),
             context_window: Set(params
                 .context_window
                 .map(i32::try_from)
                 .transpose()
-                .map_err(|error| DbErr::Custom(["context_window overflow: ", &error.to_string()].concat()))?),
-            elapsed_ms: Set(i64::try_from(params.elapsed_ms).map_err(|error| {
-                DbErr::Custom(["elapsed_ms overflow: ", &error.to_string()].concat())
-            })?),
+                .map_err(|error| db_custom_error("context_window overflow: ", &error))?),
+            elapsed_ms: Set(i64::try_from(params.elapsed_ms)
+                .map_err(|error| db_custom_error("elapsed_ms overflow: ", &error))?),
             ok: Set(params.ok),
             error: Set(params.error.map(ToOwned::to_owned)),
         }
@@ -2367,19 +2384,17 @@ impl ChatDb {
         let runtime = self.load_session_runtime_summary(id).await?;
         if runtime.is_active() {
             let reason = if runtime.state.is_active() {
-                ["runtime state is ", runtime.state.as_str()].concat()
+                prefixed_text("runtime state is ", runtime.state.as_str())
             } else {
                 "pending follow-up work exists".to_string()
             };
-            return Err(ChatDbError::Db(DbErr::Custom(
-                [
-                    "cannot archive active session ",
-                    id,
-                    " while ",
-                    reason.as_str(),
-                ]
-                .concat(),
-            )));
+            let mut message =
+                String::with_capacity(35 + id.len() + reason.len());
+            message.push_str("cannot archive active session ");
+            message.push_str(id);
+            message.push_str(" while ");
+            message.push_str(reason.as_str());
+            return Err(ChatDbError::Db(DbErr::Custom(message)));
         }
         let mut update = Query::update();
         update.table(sessions::Entity);
@@ -2984,15 +2999,8 @@ fn query_u64(row: &sea_orm::QueryResult, index: usize) -> Result<u64, ChatDbErro
     let value = row
         .try_get_by_index::<i64>(index)
         .map_err(ChatDbError::Db)?;
-    u64::try_from(value).map_err(|error| {
-        ChatDbError::Db(DbErr::Custom(
-            [
-                "u64 aggregate conversion failed: ",
-                error.to_string().as_str(),
-            ]
-            .concat(),
-        ))
-    })
+    u64::try_from(value)
+        .map_err(|error| ChatDbError::Db(db_custom_error("u64 aggregate conversion failed: ", &error)))
 }
 
 /// Parameters for upserting a persisted session context snapshot.

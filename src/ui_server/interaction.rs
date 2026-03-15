@@ -46,7 +46,10 @@ pub(super) async fn respond_permission_request(
     if !responded {
         state
             .runtime_service
-            .set_state(session_id.as_str(), crate::session::SessionRuntimeState::Idle)
+            .set_state(
+                session_id.as_str(),
+                crate::session::SessionRuntimeState::Idle,
+            )
             .await
             .map_err(internal_error)?;
         runtime = super::chat::schedule_waiting_turn_resume(
@@ -106,7 +109,10 @@ pub(super) async fn respond_ask_user_request(
     if !responded {
         state
             .runtime_service
-            .set_state(session_id.as_str(), crate::session::SessionRuntimeState::Idle)
+            .set_state(
+                session_id.as_str(),
+                crate::session::SessionRuntimeState::Idle,
+            )
             .await
             .map_err(internal_error)?;
         runtime = super::chat::schedule_waiting_turn_resume(
@@ -156,7 +162,10 @@ pub(super) async fn respond_workspace_request(
     if !responded {
         state
             .runtime_service
-            .set_state(session_id.as_str(), crate::session::SessionRuntimeState::Idle)
+            .set_state(
+                session_id.as_str(),
+                crate::session::SessionRuntimeState::Idle,
+            )
             .await
             .map_err(internal_error)?;
         runtime = super::chat::schedule_waiting_turn_resume(

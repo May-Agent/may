@@ -5,9 +5,9 @@ use petname::{Generator, Petnames};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{MayHomePaths, SessionRuntimeSummary};
 use super::store::SandboxResourceLayout;
 use super::{ChatHistory, ChatMessage, ChatMessageStats, MessageRole, SessionStore};
+use super::{MayHomePaths, SessionRuntimeSummary};
 use crate::bundle::Bundle;
 use crate::config::MayConfig;
 use crate::db::{ChatDb, ChatDbError};
@@ -560,7 +560,11 @@ impl SessionManager {
         // Write chat.txt as human-readable backup (non-fatal)
         if let Err(e) = self
             .store
-            .write_history(session.id.as_str(), session.profile_id.as_deref(), &session.history)
+            .write_history(
+                session.id.as_str(),
+                session.profile_id.as_deref(),
+                &session.history,
+            )
             .await
         {
             tracing::warn!("Failed to write chat.txt backup: {}", e);
@@ -584,7 +588,11 @@ impl SessionManager {
         // Write chat.txt backup (non-fatal)
         if let Err(e) = self
             .store
-            .write_history(session.id.as_str(), session.profile_id.as_deref(), &session.history)
+            .write_history(
+                session.id.as_str(),
+                session.profile_id.as_deref(),
+                &session.history,
+            )
             .await
         {
             tracing::warn!("Failed to write chat.txt backup: {}", e);
@@ -608,7 +616,11 @@ impl SessionManager {
         // Write chat.txt backup (non-fatal)
         if let Err(e) = self
             .store
-            .write_history(session.id.as_str(), session.profile_id.as_deref(), &session.history)
+            .write_history(
+                session.id.as_str(),
+                session.profile_id.as_deref(),
+                &session.history,
+            )
             .await
         {
             tracing::warn!("Failed to write chat.txt backup: {}", e);

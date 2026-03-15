@@ -23,8 +23,8 @@ use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
 use futures_lite::StreamExt;
 
-use crate::db::ChatDb;
 use crate::MayAgent;
+use crate::db::ChatDb;
 
 /// Events sent from the agent background task to the TUI.
 #[derive(Debug)]
@@ -153,7 +153,9 @@ pub fn spawn_worker<E: Executor + 'static>(
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
 
-    executor.spawn(run_worker(agent, command_rx, snapshot_db)).detach();
+    executor
+        .spawn(run_worker(agent, command_rx, snapshot_db))
+        .detach();
 
     AgentWorker { command_tx }
 }
@@ -173,14 +175,9 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>, sn
                 attachments,
                 event_tx,
             } => {
-                let completed = run_agent_prompt(
-                    &mut agent,
-                    &prompt,
-                    attachments,
-                    &command_rx,
-                    &event_tx,
-                )
-                .await;
+                let completed =
+                    run_agent_prompt(&mut agent, &prompt, attachments, &command_rx, &event_tx)
+                        .await;
                 if completed {
                     let session_id = agent.session_id().as_str().to_string();
                     let _ = crate::session::persist_agent_context_snapshot(

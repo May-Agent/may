@@ -35,9 +35,8 @@ pub struct ProfileInfo {
 
 impl ProfileInfo {
     pub fn from_db_model(m: profiles::Model) -> Result<Self, crate::db::ChatDbError> {
-        let remote_config = crate::remote_profile::parse_remote_profile_config(&m).map_err(
-            crate::db::ChatDbError::InvalidProfileEnvironment,
-        )?;
+        let remote_config = crate::remote_profile::parse_remote_profile_config(&m)
+            .map_err(crate::db::ChatDbError::InvalidProfileEnvironment)?;
         let environment = match m.environment.as_str() {
             "container" => ProfileEnvironment::Container {
                 image: m.container_image,
@@ -51,9 +50,10 @@ impl ProfileInfo {
                     )
                 })?;
                 ProfileEnvironment::Remote {
-                    ssh_server_id: config.normalized_ssh_server_id().map(str::to_string).map_err(
-                        crate::db::ChatDbError::InvalidProfileEnvironment,
-                    )?,
+                    ssh_server_id: config
+                        .normalized_ssh_server_id()
+                        .map(str::to_string)
+                        .map_err(crate::db::ChatDbError::InvalidProfileEnvironment)?,
                 }
             }
             other => {
