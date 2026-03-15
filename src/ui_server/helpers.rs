@@ -39,7 +39,7 @@ pub(super) async fn append_history_message(
     session_id: &SessionId,
     message: ChatMessage,
 ) -> anyhow::Result<()> {
-    let mut manager = state.session_manager.lock().await;
+    let mut manager = state.sessions().await;
     // Ensure the correct session is loaded as current
     if manager.current().map(|s| &s.id) != Some(session_id) {
         manager
@@ -70,7 +70,9 @@ pub(super) async fn load_session_paths(
         })?;
     let home_paths = MayHomePaths::new(state.may_dir.clone());
     let paths = match session.profile_id.as_deref() {
-        Some(profile_id) => home_paths.profile_home(profile_id).session_paths(session_id),
+        Some(profile_id) => home_paths
+            .profile_home(profile_id)
+            .session_paths(session_id),
         None => home_paths.session_paths(session_id),
     };
     Ok(paths)
@@ -170,7 +172,9 @@ pub(super) fn parse_safe_relative_path(raw: &str, label: &str) -> SkyResult<Path
     }
     for comp in rel.components() {
         if matches!(comp, std::path::Component::ParentDir) {
-            return Err(bad_request_error([label, " path traversal is not allowed"].concat()));
+            return Err(bad_request_error(
+                [label, " path traversal is not allowed"].concat(),
+            ));
         }
     }
     Ok(rel)

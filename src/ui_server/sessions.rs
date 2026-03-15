@@ -25,7 +25,7 @@ pub(super) async fn list_sessions(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<ApiSession>>> {
     let summaries = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.list_sessions().await.map_err(internal_error)?
     };
 
@@ -47,7 +47,7 @@ pub(super) async fn get_session(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -83,7 +83,7 @@ pub(super) async fn get_session_context_debug(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
     let row = db
@@ -235,7 +235,7 @@ pub(super) async fn create_session(
             .ok_or_else(|| bad_request_error("No model configured"))?
     };
 
-    let mut manager = state.session_manager.lock().await;
+    let mut manager = state.sessions().await;
     let resolved_profile_id = requested_profile_id
         .clone()
         .or_else(|| manager.current_profile_id().map(ToOwned::to_owned));
@@ -268,7 +268,7 @@ pub(super) async fn update_session(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let session_id = SessionId::from_string(id.clone());
 
-    let mut manager = state.session_manager.lock().await;
+    let mut manager = state.sessions().await;
     manager
         .load_session(&session_id)
         .await
@@ -344,7 +344,7 @@ pub(super) async fn delete_session(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let mut manager = state.session_manager.lock().await;
+    let mut manager = state.sessions().await;
     manager.delete_session(&id).await.map_err(internal_error)?;
     state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))
@@ -353,7 +353,7 @@ pub(super) async fn delete_session(
 pub(super) async fn delete_all_sessions(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let mut manager = state.session_manager.lock().await;
+    let mut manager = state.sessions().await;
 
     // Delete all from DB
     let db = manager.db().clone();

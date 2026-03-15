@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use skyzen::extract::Query;
 use skyzen::Result as SkyResult;
+use skyzen::extract::Query;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
@@ -265,7 +265,7 @@ pub(super) async fn remove_ssh_server(
 pub(super) async fn list_mcp_servers(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<crate::mcp::McpServerInfo>>> {
-    let manager = state.mcp_manager.lock().await;
+    let manager = state.mcp().await;
     Ok(Json(manager.server_info()))
 }
 
@@ -273,7 +273,7 @@ pub(super) async fn add_mcp_server(
     Json(req): Json<McpAddRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let mut manager = state.mcp_manager.lock().await;
+    let mut manager = state.mcp().await;
     let config = MayMcpServerConfig {
         command: req.command,
         args: req.args,
@@ -292,7 +292,7 @@ pub(super) async fn remove_mcp_server(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
-    let mut manager = state.mcp_manager.lock().await;
+    let mut manager = state.mcp().await;
     manager.remove_server(name).await.map_err(internal_error)?;
     Ok(Json(ApiHealth { ok: true }))
 }
@@ -302,7 +302,7 @@ pub(super) async fn reconnect_mcp_server(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
-    let mut manager = state.mcp_manager.lock().await;
+    let mut manager = state.mcp().await;
     manager.reconnect(name).await.map_err(internal_error)?;
     Ok(Json(ApiHealth { ok: true }))
 }

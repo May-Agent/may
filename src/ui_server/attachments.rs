@@ -362,7 +362,7 @@ async fn build_session_mentions_xml(
     }
 
     let db = {
-        let manager = state.session_manager.lock().await;
+        let manager = state.sessions().await;
         manager.db().clone()
     };
 
@@ -431,7 +431,9 @@ async fn build_file_mentions_xml(
         return Ok(None);
     }
 
-    let files_dir = load_session_paths(state, req.session_id.as_str()).await?.files_dir();
+    let files_dir = load_session_paths(state, req.session_id.as_str())
+        .await?
+        .files_dir();
     let mut files = Vec::new();
     for relative_path in relative_paths {
         let validated = parse_relative_file_mention(relative_path.as_str())?;
@@ -657,10 +659,7 @@ mod tests {
         );
         assert_eq!(
             mentions,
-            vec![
-                "notes/today.md".to_string(),
-                "notes/log.txt".to_string(),
-            ]
+            vec!["notes/today.md".to_string(), "notes/log.txt".to_string(),]
         );
     }
 
