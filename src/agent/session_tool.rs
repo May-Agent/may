@@ -19,6 +19,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
 
+use crate::agent::search_match::{extend_unique, push_unique};
 use crate::db::ChatDb;
 
 const TABLE_NAME: &str = "session_messages";
@@ -38,18 +39,6 @@ pub enum SessionSearchMode {
     Regex,
     Fulltext,
     Fuzzy,
-}
-
-impl SessionSearchMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Hybrid => "hybrid",
-            Self::Text => "text",
-            Self::Regex => "regex",
-            Self::Fulltext => "fulltext",
-            Self::Fuzzy => "fuzzy",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -265,7 +254,13 @@ impl Tool for SessionTool {
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         let args = self.normalize_args(arguments)?;
-        execute_search(self.db_path(), self.index_path(), self.index_meta_path(), args).await
+        execute_search(
+            self.db_path(),
+            self.index_path(),
+            self.index_meta_path(),
+            args,
+        )
+        .await
     }
 }
 
@@ -278,7 +273,13 @@ impl Tool for EnvironmentTool {
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         let args = self.normalize_args(arguments)?;
-        execute_search(self.db_path(), self.index_path(), self.index_meta_path(), args).await
+        execute_search(
+            self.db_path(),
+            self.index_path(),
+            self.index_meta_path(),
+            args,
+        )
+        .await
     }
 }
 
@@ -398,7 +399,7 @@ async fn execute_search(
 
     for row in &mut candidates {
         if row.matched_by.is_empty() {
-            row.matched_by.push(args.search_mode.as_str().to_string());
+            push_unique(&mut row.matched_by, args.search_mode);
         }
 
         let haystack = searchable_text(row, &args.fields);
@@ -414,9 +415,7 @@ async fn execute_search(
         {
             if haystack_norm.contains(&query_norm) {
                 row.score += 10.0;
-                if !row.matched_by.iter().any(|m| m == "text") {
-                    row.matched_by.push("text".to_string());
-                }
+                push_unique(&mut row.matched_by, SessionSearchMode::Text);
             }
         }
 
@@ -424,9 +423,7 @@ async fn execute_search(
             && re.is_match(&haystack)
         {
             row.score += 15.0;
-            if !row.matched_by.iter().any(|m| m == "regex") {
-                row.matched_by.push("regex".to_string());
-            }
+            push_unique(&mut row.matched_by, SessionSearchMode::Regex);
         }
     }
 
@@ -462,11 +459,7 @@ async fn execute_search(
                 if row.score > existing.score {
                     *existing = row;
                 } else {
-                    for source in row.matched_by {
-                        if !existing.matched_by.iter().any(|s| s == &source) {
-                            existing.matched_by.push(source);
-                        }
-                    }
+                    extend_unique(&mut existing.matched_by, row.matched_by);
                 }
             }
             None => {
@@ -494,13 +487,16 @@ fn apply_command_form(
 ) -> aither_core::Result<()> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
-        return Err(anyhow::anyhow!(
-            "{command_name} command must not be empty"
-        ));
+        return Err(anyhow::anyhow!("{command_name} command must not be empty"));
     }
 
-    let prefix = [command_name, " "].concat();
-    let body = trimmed.strip_prefix(prefix.as_str()).unwrap_or(trimmed).trim();
+    let mut prefix = String::with_capacity(command_name.len() + 1);
+    prefix.push_str(command_name);
+    prefix.push(' ');
+    let body = trimmed
+        .strip_prefix(prefix.as_str())
+        .unwrap_or(trimmed)
+        .trim();
     if body.is_empty() {
         return Err(anyhow::anyhow!(
             "{command_name} command must include a search prompt"
@@ -563,7 +559,7 @@ struct SessionMatchRow {
     message_id: i64,
     message_count: i32,
     score: f64,
-    matched_by: Vec<String>,
+    matched_by: Vec<SessionSearchMode>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -575,7 +571,7 @@ struct MessageResult {
     timestamp: String,
     message_id: i64,
     score: f64,
-    matched_by: Vec<String>,
+    matched_by: Vec<SessionSearchMode>,
     snippet: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
@@ -860,7 +856,7 @@ fn build_sql_filter(args: &SessionArgs) -> Option<String> {
             negated: false,
             any: false,
             expr: Box::new(identifier_sql_expr("title")),
-            pattern: Box::new(string_sql_expr(["%", title_contains, "%"].concat())),
+            pattern: Box::new(string_sql_expr(contains_match_pattern(title_contains))),
             escape_char: None,
         });
     }
@@ -885,6 +881,14 @@ fn identifier_sql_expr(column: &str) -> SqlExpr {
 
 fn string_sql_expr(value: String) -> SqlExpr {
     SqlExpr::value(SqlValue::SingleQuotedString(value))
+}
+
+fn contains_match_pattern(value: &str) -> String {
+    let mut pattern = String::with_capacity(value.len() + 2);
+    pattern.push('%');
+    pattern.push_str(value);
+    pattern.push('%');
+    pattern
 }
 
 fn binary_sql_expr(column: &str, op: BinaryOperator, value: &str) -> SqlExpr {
@@ -977,8 +981,14 @@ async fn run_full_text_query(
     let mut stream = query.execute().await?;
     let mut rows = read_rows_from_stream(&mut stream).await?;
     for row in &mut rows {
-        row.matched_by
-            .push(if fuzzy { "fuzzy" } else { "fulltext" }.to_string());
+        push_unique(
+            &mut row.matched_by,
+            if fuzzy {
+                SessionSearchMode::Fuzzy
+            } else {
+                SessionSearchMode::Fulltext
+            },
+        );
     }
     Ok(rows)
 }
@@ -1188,8 +1198,12 @@ mod tests {
     #[test]
     fn parses_scoped_session_command_form() {
         let mut args = base_args();
-        apply_command_form(&mut args, "session abc123 search investigate failures", "session")
-            .expect("command form should parse");
+        apply_command_form(
+            &mut args,
+            "session abc123 search investigate failures",
+            "session",
+        )
+        .expect("command form should parse");
         assert_eq!(args.session_id.as_deref(), Some("abc123"));
         assert_eq!(args.query, "investigate failures");
     }
@@ -1212,6 +1226,14 @@ mod tests {
             err.to_string().contains("missing prompt"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn session_search_mode_serializes_as_lowercase_string() {
+        let value =
+            serde_json::to_value(vec![SessionSearchMode::Fulltext, SessionSearchMode::Regex])
+                .expect("session search modes should serialize");
+        assert_eq!(value, serde_json::json!(["fulltext", "regex"]));
     }
 
     #[test]

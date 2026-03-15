@@ -16,6 +16,7 @@ use aither_sandbox::{
 };
 
 use crate::agent::MayAgent;
+use crate::ask_user;
 use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
 use crate::session::{
@@ -23,7 +24,6 @@ use crate::session::{
     SessionRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
-use crate::ask_user;
 
 use super::attachments::build_prompt_and_attachments;
 use super::bash_parsing::update_bash_snapshot_from_tool_event;
@@ -248,11 +248,7 @@ fn prefixed_text(prefix: &str, suffix: &str) -> String {
     text
 }
 
-fn path_error_text(
-    prefix: &str,
-    path: &std::path::Path,
-    error: &impl std::fmt::Display,
-) -> String {
+fn path_error_text(prefix: &str, path: &std::path::Path, error: &impl std::fmt::Display) -> String {
     let path_text = path.display().to_string();
     let error_text = error.to_string();
     join_text(&[prefix, path_text.as_str(), ": ", error_text.as_str()])
@@ -349,7 +345,8 @@ fn result_waits_for_terminal_input(result: &Result<String, String>) -> bool {
     let Ok(parsed) = serde_json::from_str::<BashResult>(serialized) else {
         return false;
     };
-    parsed.status.as_deref() == Some("running") && output_contains_terminal_wait_notice(&parsed.stdout)
+    parsed.status.as_deref() == Some("running")
+        && output_contains_terminal_wait_notice(&parsed.stdout)
 }
 
 fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
@@ -460,8 +457,7 @@ fn resume_waiting_turn_xml(
             alert_type: "resume_waiting_turn",
             request_kind,
             resolution,
-            instruction:
-                "The previous run was interrupted while waiting for this response. Reassess the latest state, use the recorded response, and continue from the most sensible next action.",
+            instruction: "The previous run was interrupted while waiting for this response. Reassess the latest state, use the recorded response, and continue from the most sensible next action.",
         },
     )?;
     crate::XmlFragment::parse(xml).map_err(anyhow::Error::from)
@@ -581,11 +577,17 @@ pub(super) async fn stop_session_run(
         let manager = state.session_manager.lock().await;
         manager.db().clone()
     };
-    if !db.session_exists(&session_id).await.map_err(internal_error)? {
-        return Err(
-            skyzen::Error::msg(join_text(&["Session ", session_id.as_str(), " not found"]))
-                .set_status(skyzen::StatusCode::NOT_FOUND),
-        );
+    if !db
+        .session_exists(&session_id)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err(skyzen::Error::msg(join_text(&[
+            "Session ",
+            session_id.as_str(),
+            " not found",
+        ]))
+        .set_status(skyzen::StatusCode::NOT_FOUND));
     }
 
     let persisted_cancel = state
@@ -618,13 +620,17 @@ pub(super) async fn chat_stream(
         return Err(active_session_conflict_error());
     }
 
-    let Some(run_registration) = SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await else {
+    let Some(run_registration) =
+        SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await
+    else {
         return Err(active_session_conflict_error());
     };
     let (sender, sse) = Sse::channel();
 
     tokio::spawn(async move {
-        if let Err(err) = stream_chat_events(state.clone(), req, sender.clone(), run_registration).await {
+        if let Err(err) =
+            stream_chat_events(state.clone(), req, sender.clone(), run_registration).await
+        {
             send_event(
                 &sender,
                 "error",
@@ -774,7 +780,8 @@ async fn run_agent_loop(
                     Ok(aither_agent::AgentEvent::Reasoning(text)) => {
                         reasoning_text.push_str(&text);
                         if !sink.on_reasoning(&text).await {
-                            cancellation_reason = Some("client disconnected during reasoning stream");
+                            cancellation_reason =
+                                Some("client disconnected during reasoning stream");
                             break;
                         }
                     }
@@ -1008,15 +1015,15 @@ async fn stream_chat_events(
 ) -> anyhow::Result<()> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
     let mut sink = SseSink(sender.clone());
-        let result = run_agent_loop(
-            &state,
-            &req,
-            &mut sink,
-            run_registration.receiver(),
-            true,
-            true,
-        )
-        .await;
+    let result = run_agent_loop(
+        &state,
+        &req,
+        &mut sink,
+        run_registration.receiver(),
+        true,
+        true,
+    )
+    .await;
     let response_session_id = req.session_id.clone();
     match result {
         Ok(result) => {
@@ -1495,12 +1502,15 @@ async fn setup_agent_environment(
                         anyhow::anyhow!("Failed to reconcile container session layout: {error}")
                     })?;
             }
-            let container_manager = state
-                .resolve_container_manager(false)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("No container runtime available for container profile: {error}")
-                })?;
+            let container_manager =
+                state
+                    .resolve_container_manager(false)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "No container runtime available for container profile: {error}"
+                        )
+                    })?;
             let default_image_tag =
                 crate::container::profile::default_image_tag(&state.may_dir, profile)
                     .map_err(|e| anyhow::anyhow!("Invalid container profile image tag: {e}"))?;
@@ -1518,8 +1528,10 @@ async fn setup_agent_environment(
                 .await
                 .map_err(|e| anyhow::anyhow!("Container image build failed: {e}"))?;
 
-            let container_name =
-                crate::container::profile::container_name_for_profile_session(profile, &ctx.session_id);
+            let container_name = crate::container::profile::container_name_for_profile_session(
+                profile,
+                &ctx.session_id,
+            );
             let host_gateway = container_manager.runtime().host_gateway();
 
             let mut extra_env = Vec::new();
@@ -1532,8 +1544,7 @@ async fn setup_agent_environment(
                 } else {
                     let config = state.config.read().await;
                     let port = config.playwright.port.to_string();
-                    let endpoint =
-                        join_text(&["http://", host_gateway, ":", port.as_str()]);
+                    let endpoint = join_text(&["http://", host_gateway, ":", port.as_str()]);
                     extra_env.push(prefixed_text("BROWSER_CDP_ENDPOINT=", endpoint.as_str()));
                     Some(Arc::new(StaticCdpBrowser::new(endpoint)))
                 }
@@ -1561,11 +1572,10 @@ async fn setup_agent_environment(
                 .map_err(|e| anyhow::anyhow!("Container start failed: {e}"))?;
 
             let container_ipc_host = host_gateway.to_string();
-            let container_exec = ContainerExecHandle::new(std::sync::Arc::new(
-                BollardContainerExec::new(std::sync::Arc::new(
-                    container_manager.runtime().client.clone(),
-                )),
-            ));
+            let container_exec =
+                ContainerExecHandle::new(std::sync::Arc::new(BollardContainerExec::new(
+                    std::sync::Arc::new(container_manager.runtime().client.clone()),
+                )));
 
             crate::agent::AgentEnvironment::Container {
                 container_id,
@@ -1836,10 +1846,7 @@ async fn handle_notify_request(
         .await
         .map_err(|error| {
             let error_text = error.to_string();
-            join_text(&[
-                "failed to send notification payload: ",
-                error_text.as_str(),
-            ])
+            join_text(&["failed to send notification payload: ", error_text.as_str()])
         })?;
 
     Ok(crate::agent::notify_tool::NotifyResult { sent })
@@ -1859,7 +1866,9 @@ async fn handle_register_skills_request(
             let info = manager
                 .register_from_local_path(&source)
                 .await
-                .map_err(|error| path_error_text("failed to register skill from ", &source, &error))?;
+                .map_err(|error| {
+                    path_error_text("failed to register skill from ", &source, &error)
+                })?;
             Ok(vec![info.dir_name])
         },
     )
@@ -1946,7 +1955,9 @@ async fn resolve_session_root(
         .to_path_buf();
     tokio::fs::create_dir_all(&session_root)
         .await
-        .map_err(|error| path_error_text("failed to create session root ", &session_root, &error))?;
+        .map_err(|error| {
+            path_error_text("failed to create session root ", &session_root, &error)
+        })?;
     let session_root_canonical = tokio::fs::canonicalize(&session_root)
         .await
         .map_err(|error| path_error_text("failed to resolve session ", &session_root, &error))?;
@@ -1968,9 +1979,9 @@ async fn resolve_registration_source_path(
         state.cwd.join(path)
     };
 
-    let canonical = tokio::fs::canonicalize(&candidate)
-        .await
-        .map_err(|error| path_error_text("failed to resolve registration path ", &candidate, &error))?;
+    let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
+        path_error_text("failed to resolve registration path ", &candidate, &error)
+    })?;
     let project_root = tokio::fs::canonicalize(&state.cwd)
         .await
         .map_err(|error| path_error_text("failed to resolve project root ", &state.cwd, &error))?;
@@ -2012,13 +2023,10 @@ async fn request_registration_approval(
         .ask_user_approver
         .enqueue(request, Some(session_id.to_string()))
         .await;
-    let answers = rx
-        .recv()
-        .await
-        .map_err(|error| {
-            let error_text = error.to_string();
-            join_text(&["failed to receive user approval: ", error_text.as_str()])
-        })?;
+    let answers = rx.recv().await.map_err(|error| {
+        let error_text = error.to_string();
+        join_text(&["failed to receive user approval: ", error_text.as_str()])
+    })?;
 
     let approved = answers.into_iter().any(|answer| match answer.answer {
         ask_user::AnswerValue::Selected(values) => values
@@ -2069,6 +2077,7 @@ mod tests {
         let checkpoint = serde_json::to_string(&aither_agent::AgentCheckpoint {
             context_json: "{\"recent\":[]}".to_string(),
             todo_items: Vec::new(),
+            active_skill_names: Vec::new(),
             history_anchor: Some(7),
             tool_surface_hash: "abc123".to_string(),
             context_window: aither_agent::ContextWindowSnapshot {

@@ -31,7 +31,8 @@ mod tests {
     #[test]
     fn parses_query_command_form() {
         let mut args = base_args();
-        apply_command_form(&mut args, "search query concurrency bug").expect("query command should parse");
+        apply_command_form(&mut args, "search query concurrency bug")
+            .expect("query command should parse");
         assert_eq!(args.action, SearchAction::Query);
         assert_eq!(args.query.as_deref(), Some("concurrency bug"));
     }
@@ -42,5 +43,12 @@ mod tests {
         let chunks = chunk_text(content.as_str());
         assert!(chunks.len() >= 2);
         assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+    }
+
+    #[test]
+    fn search_mode_serializes_as_lowercase_string() {
+        let value = serde_json::to_value(vec![SearchMode::Fulltext, SearchMode::Regex])
+            .expect("search modes should serialize");
+        assert_eq!(value, serde_json::json!(["fulltext", "regex"]));
     }
 }
