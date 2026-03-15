@@ -383,6 +383,18 @@ fn render_oneshot_event(
         Ok(AgentEvent::TerminalInputNeeded { task_id, notice }) => {
             writeln!(stderr, "[terminal_input_needed] task_id={task_id:?} notice={notice}")?;
         }
+        Ok(AgentEvent::RunPaused {
+            reason,
+            tool_call_id,
+        }) => {
+            writeln!(stderr, "[run_paused] reason={reason:?} tool_call_id={tool_call_id}")?;
+        }
+        Ok(AgentEvent::RunResumed {
+            reason,
+            tool_call_id,
+        }) => {
+            writeln!(stderr, "[run_resumed] reason={reason:?} tool_call_id={tool_call_id}")?;
+        }
         Ok(AgentEvent::SkillActivated {
             name,
             matched_trigger,
