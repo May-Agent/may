@@ -31,7 +31,9 @@ pub struct ContextSnapshotRecord {
 }
 
 impl ContextSnapshotRecord {
-    pub fn from_checkpoint(checkpoint: &aither_agent::CheckpointContext<'_>) -> anyhow::Result<Self> {
+    pub fn from_checkpoint(
+        checkpoint: &aither_agent::CheckpointContext<'_>,
+    ) -> anyhow::Result<Self> {
         let assembled_messages_json = serde_json::to_string(&checkpoint.window.messages)?;
         Ok(Self {
             context_json: checkpoint.context_json.to_string(),
@@ -82,7 +84,9 @@ pub async fn load_persisted_context_snapshot(
         .transpose()
 }
 
-pub async fn snapshot_record_from_agent(agent: &mut MayAgent) -> anyhow::Result<ContextSnapshotRecord> {
+pub async fn snapshot_record_from_agent(
+    agent: &mut MayAgent,
+) -> anyhow::Result<ContextSnapshotRecord> {
     let checkpoint = agent
         .export_checkpoint(Some(0))
         .await

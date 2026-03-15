@@ -106,7 +106,8 @@ impl SessionStore {
             SandboxResourceLayout::ContainerMountPoints => {
                 Self::ensure_mount_point_dir(paths.root(), "skills").await?;
                 Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
-                self.seed_session_scoped_resources(&paths, profile_id).await?;
+                self.seed_session_scoped_resources(&paths, profile_id)
+                    .await?;
             }
         }
 
@@ -132,12 +133,17 @@ impl SessionStore {
         async_fs::create_dir_all(paths.artifacts_dir()).await?;
         Self::ensure_mount_point_dir(paths.root(), "skills").await?;
         Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
-        self.seed_session_scoped_resources(&paths, profile_id).await?;
+        self.seed_session_scoped_resources(&paths, profile_id)
+            .await?;
         Ok(())
     }
 
     /// Read chat history from disk.
-    pub async fn read_history(&self, id: &str, profile_id: Option<&str>) -> Result<ChatHistory, StoreError> {
+    pub async fn read_history(
+        &self,
+        id: &str,
+        profile_id: Option<&str>,
+    ) -> Result<ChatHistory, StoreError> {
         let path = self.chat_path(id, profile_id);
         if async_fs::metadata(&path).await.is_err() {
             return Ok(ChatHistory::new());
@@ -160,7 +166,11 @@ impl SessionStore {
     }
 
     /// Delete a session.
-    pub async fn delete_session(&self, id: &str, profile_id: Option<&str>) -> Result<(), StoreError> {
+    pub async fn delete_session(
+        &self,
+        id: &str,
+        profile_id: Option<&str>,
+    ) -> Result<(), StoreError> {
         let path = self.session_dir(id, profile_id);
         if path.exists() {
             async_fs::remove_dir_all(&path).await?;
@@ -243,7 +253,10 @@ impl SessionStore {
                 let profile_home = self.home_paths.profile_home(profile_id);
                 (profile_home.skills_dir(), profile_home.subagents_dir())
             }
-            None => (self.home_paths.skills_dir(), self.home_paths.subagents_dir()),
+            None => (
+                self.home_paths.skills_dir(),
+                self.home_paths.subagents_dir(),
+            ),
         };
         Self::copy_dir_contents_if_target_empty(&skills_dir, &paths.skills_dir()).await?;
         Self::copy_dir_contents_if_target_empty(&subagents_dir, &paths.subagents_dir()).await?;

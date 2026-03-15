@@ -338,11 +338,15 @@ impl From<crate::db::entity::request_logs::Model> for RequestLogEntry {
             timestamp: value.timestamp,
             model: value.model,
             provider_id: value.provider_id,
-            prompt_tokens: value.prompt_tokens.and_then(|entry| u32::try_from(entry).ok()),
+            prompt_tokens: value
+                .prompt_tokens
+                .and_then(|entry| u32::try_from(entry).ok()),
             completion_tokens: value
                 .completion_tokens
                 .and_then(|entry| u32::try_from(entry).ok()),
-            total_tokens: value.total_tokens.and_then(|entry| u32::try_from(entry).ok()),
+            total_tokens: value
+                .total_tokens
+                .and_then(|entry| u32::try_from(entry).ok()),
             cache_read_tokens: value
                 .cache_read_tokens
                 .and_then(|entry| u32::try_from(entry).ok()),
@@ -784,14 +788,12 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
                         session_id: request.request.session_id,
                     },
                 }),
-            waiting_workspace: summary
-                .waiting_workspace
-                .map(|request| WorkspacePollItem {
-                    id: request.id,
-                    path: request.request.path,
-                    reason: request.request.reason,
-                    session_id: request.request.session_id,
-                }),
+            waiting_workspace: summary.waiting_workspace.map(|request| WorkspacePollItem {
+                id: request.id,
+                path: request.request.path,
+                reason: request.request.reason,
+                session_id: request.request.session_id,
+            }),
             waiting_ask_user: summary.waiting_ask_user,
         }
     }

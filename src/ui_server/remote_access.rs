@@ -67,7 +67,8 @@ pub(crate) struct RemoteAccessManager {
 
 impl std::fmt::Debug for RemoteAccessManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteAccessManager").finish_non_exhaustive()
+        f.debug_struct("RemoteAccessManager")
+            .finish_non_exhaustive()
     }
 }
 
@@ -128,7 +129,11 @@ pub(crate) async fn sync_remote_access_from_state(
 ) -> Result<(), crate::db::ChatDbError> {
     let config = state.config.read().await.remote_access.clone();
     let has_local_profile = has_local_profile(&state.db().await).await?;
-    if let Err(error) = state.remote_access_manager.sync(config, has_local_profile).await {
+    if let Err(error) = state
+        .remote_access_manager
+        .sync(config, has_local_profile)
+        .await
+    {
         tracing::warn!(error = %error, "failed to sync remote access state");
     }
     Ok(())
@@ -147,7 +152,10 @@ pub(super) async fn start_remote_access(
         .await
         .map_err(internal_error)?;
     let status = state.remote_access_manager.snapshot();
-    if matches!(status.state, RemoteAccessState::Error | RemoteAccessState::Disabled) {
+    if matches!(
+        status.state,
+        RemoteAccessState::Error | RemoteAccessState::Disabled
+    ) {
         let message = status
             .last_error
             .unwrap_or_else(|| "remote access failed to start".to_string());
@@ -238,7 +246,10 @@ async fn run_remote_access_actor(
                             runtime.status.last_error = Some(if success {
                                 "cloudflared exited unexpectedly".to_string()
                             } else {
-                                ["cloudflared exited with code ", code.to_string().as_str()].concat()
+                                prefixed_text(
+                                    "cloudflared exited with code ",
+                                    code.to_string().as_str(),
+                                )
                             });
                             publish_remote_access_status(&runtime.status, &status_tx, &ui_events_notify);
                         }
@@ -308,7 +319,9 @@ async fn sync_remote_access_runtime(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| ["failed to launch cloudflared: ", error.to_string().as_str()].concat())?;
+        .map_err(|error| {
+            prefixed_text("failed to launch cloudflared: ", error.to_string().as_str())
+        })?;
 
     if let Some(stdout) = process.stdout.take() {
         spawn_remote_access_log_reader(stdout, event_tx.clone(), false);
@@ -319,7 +332,7 @@ async fn sync_remote_access_runtime(
 
     push_log(
         &mut runtime.status.recent_logs,
-        ["starting tunnel at ", launch_spec.public_url.as_str()].concat(),
+        prefixed_text("starting tunnel at ", launch_spec.public_url.as_str()),
     );
     runtime.status.state = RemoteAccessState::Running;
     runtime.status.last_error = None;
@@ -337,7 +350,10 @@ async fn stop_remote_access_runtime(
 ) -> Result<(), String> {
     if let Some(mut process) = child.take() {
         if let Err(error) = process.start_kill() {
-            return Err(["failed to stop cloudflared: ", error.to_string().as_str()].concat());
+            return Err(prefixed_text(
+                "failed to stop cloudflared: ",
+                error.to_string().as_str(),
+            ));
         }
         let _ = process.wait().await;
     }
@@ -425,6 +441,13 @@ fn push_log(logs: &mut Vec<String>, line: String) {
         let _ = deque.pop_front();
     }
     *logs = deque.into_iter().collect();
+}
+
+fn prefixed_text(prefix: &str, suffix: &str) -> String {
+    let mut text = String::with_capacity(prefix.len() + suffix.len());
+    text.push_str(prefix);
+    text.push_str(suffix);
+    text
 }
 
 fn publish_remote_access_status(

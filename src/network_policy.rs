@@ -108,8 +108,13 @@ fn build_matcher(hosts: &[String]) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for host in hosts {
         let glob = Glob::new(host).map_err(|error| {
-            ["invalid network host pattern '", host.as_str(), "': ", error.to_string().as_str()]
-                .concat()
+            let error_text = error.to_string();
+            let mut message = String::with_capacity(host.len() + error_text.len() + 27);
+            message.push_str("invalid network host pattern '");
+            message.push_str(host.as_str());
+            message.push_str("': ");
+            message.push_str(error_text.as_str());
+            message
         })?;
         builder.add(glob);
     }

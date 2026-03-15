@@ -62,7 +62,10 @@ impl SessionRuntimeService {
         session_id: &str,
         plan_state: SessionPlanState,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
-        let summary = self.db.set_session_plan_state(session_id, plan_state).await?;
+        let summary = self
+            .db
+            .set_session_plan_state(session_id, plan_state)
+            .await?;
         self.notify_ui();
         Ok(summary)
     }
@@ -210,7 +213,10 @@ impl SessionRuntimeService {
         &self,
         session_id: &str,
     ) -> Result<bool, crate::db::ChatDbError> {
-        let pending = self.db.take_browser_takeover_alert_pending(session_id).await?;
+        let pending = self
+            .db
+            .take_browser_takeover_alert_pending(session_id)
+            .await?;
         if pending {
             self.notify_ui();
         }

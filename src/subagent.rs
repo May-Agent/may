@@ -5,8 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
-use aither_agent::SubagentDefinition;
 use crate::session::{MayHomePaths, ProfileHomePaths};
+use aither_agent::SubagentDefinition;
 
 /// Subagent management error.
 #[derive(Debug, thiserror::Error)]

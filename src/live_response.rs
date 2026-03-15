@@ -1,6 +1,6 @@
 use async_channel::{Receiver, Sender};
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 #[derive(Debug, Default)]
 pub(crate) struct LiveResponseRegistry<Response> {
