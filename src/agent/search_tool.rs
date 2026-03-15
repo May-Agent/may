@@ -6,7 +6,10 @@ use std::sync::Arc;
 use aither_cloud::CloudEmbedder;
 use aither_core::llm::{Tool, ToolOutput};
 use aither_rag::{Document, Rag};
-use arrow_array::{Array, ArrayRef, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
+use arrow_array::{
+    Array, ArrayRef, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use futures_lite::StreamExt;
 use ignore::WalkBuilder;
@@ -18,6 +21,8 @@ use regex::RegexBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
+
+use crate::agent::search_match::push_unique;
 
 const TABLE_NAME: &str = "file_chunks";
 const INDEX_META_FILE: &str = "search_index.meta.json";
@@ -41,19 +46,6 @@ pub enum SearchMode {
     Fulltext,
     Fuzzy,
     Semantic,
-}
-
-impl SearchMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Hybrid => "hybrid",
-            Self::Text => "text",
-            Self::Regex => "regex",
-            Self::Fulltext => "fulltext",
-            Self::Fuzzy => "fuzzy",
-            Self::Semantic => "semantic",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -125,7 +117,10 @@ pub struct SearchTool {
 
 impl SearchTool {
     pub fn new(sandbox_dir: PathBuf, embedder: Option<CloudEmbedder>) -> Self {
-        Self { sandbox_dir, embedder }
+        Self {
+            sandbox_dir,
+            embedder,
+        }
     }
 
     fn index_dir(&self) -> PathBuf {
@@ -154,12 +149,22 @@ impl SearchTool {
         args.fuzzy_distance = args.fuzzy_distance.min(3);
 
         if args.action == SearchAction::Index {
-            let Some(path) = args.path.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+            let Some(path) = args
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
                 return Err(anyhow::anyhow!("search index requires a non-empty path"));
             };
             args.path = Some(path.to_string());
         } else {
-            let Some(query) = args.query.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+            let Some(query) = args
+                .query
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
                 return Err(anyhow::anyhow!("search query requires a non-empty query"));
             };
             args.query = Some(query.to_string());
@@ -206,7 +211,9 @@ pub(crate) fn apply_command_form(args: &mut SearchArgs, command: &str) -> anyhow
     }
     let body = trimmed.strip_prefix("search ").unwrap_or(trimmed).trim();
     if body.is_empty() {
-        return Err(anyhow::anyhow!("search command must include an action or query"));
+        return Err(anyhow::anyhow!(
+            "search command must include an action or query"
+        ));
     }
     if let Some(rest) = body.strip_prefix("index ").map(str::trim) {
         if rest.is_empty() {
@@ -266,7 +273,7 @@ struct FileMatchRow {
     chunk_id: i64,
     content: String,
     score: f64,
-    matched_by: Vec<String>,
+    matched_by: Vec<SearchMode>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -276,7 +283,7 @@ struct ChunkResult {
     modified_at: String,
     chunk_id: i64,
     score: f64,
-    matched_by: Vec<String>,
+    matched_by: Vec<SearchMode>,
     snippet: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
@@ -325,7 +332,9 @@ async fn index_path(
     )
     .await?;
 
-    let conn = connect(db_path.to_string_lossy().as_ref()).execute().await?;
+    let conn = connect(db_path.to_string_lossy().as_ref())
+        .execute()
+        .await?;
     let table_names = conn.table_names().execute().await?;
     if table_names.iter().any(|name| name == TABLE_NAME) {
         conn.drop_table(TABLE_NAME, &[]).await?;
@@ -373,7 +382,9 @@ async fn index_path(
 async fn load_meta(meta_path: &Path) -> anyhow::Result<SearchIndexMeta> {
     match async_fs::read_to_string(meta_path).await {
         Ok(content) => Ok(serde_json::from_str(&content)?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SearchIndexMeta::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SearchIndexMeta::default())
+        }
         Err(error) => Err(anyhow::anyhow!(
             "failed to read search index metadata {}: {error}",
             meta_path.display()
@@ -442,12 +453,13 @@ async fn query_index(
         ));
     }
 
-    let conn = connect(db_path.to_string_lossy().as_ref()).execute().await?;
-    let table = conn
-        .open_table(TABLE_NAME)
+    let conn = connect(db_path.to_string_lossy().as_ref())
         .execute()
-        .await
-        .map_err(|_| anyhow::anyhow!("search index is missing; run `search index <path>` again"))?;
+        .await?;
+    let table =
+        conn.open_table(TABLE_NAME).execute().await.map_err(|_| {
+            anyhow::anyhow!("search index is missing; run `search index <path>` again")
+        })?;
 
     let query = args.query.clone().expect("validated");
     let query_enabled = query.trim() != "*" && !query.trim().is_empty();
@@ -491,11 +503,7 @@ async fn query_index(
     let regex_enabled =
         args.search_mode == SearchMode::Regex && (query_enabled || args.regex.is_some());
     let regex = if regex_enabled {
-        let pattern = args
-            .regex
-            .as_deref()
-            .unwrap_or(query.as_str())
-            .to_string();
+        let pattern = args.regex.as_deref().unwrap_or(query.as_str()).to_string();
         Some(
             RegexBuilder::new(&pattern)
                 .case_insensitive(!args.case_sensitive)
@@ -508,7 +516,7 @@ async fn query_index(
 
     for row in &mut candidates {
         if row.matched_by.is_empty() {
-            row.matched_by.push(args.search_mode.as_str().to_string());
+            push_unique(&mut row.matched_by, args.search_mode);
         }
 
         let haystack = [row.relative_path.as_str(), row.content.as_str()].join("\n");
@@ -523,18 +531,14 @@ async fn query_index(
         {
             if haystack_norm.contains(&query_norm) {
                 row.score += 10.0;
-                if !row.matched_by.iter().any(|mode| mode == "text") {
-                    row.matched_by.push("text".to_string());
-                }
+                push_unique(&mut row.matched_by, SearchMode::Text);
             }
         }
         if let Some(re) = &regex
             && re.is_match(&haystack)
         {
             row.score += 15.0;
-            if !row.matched_by.iter().any(|mode| mode == "regex") {
-                row.matched_by.push("regex".to_string());
-            }
+            push_unique(&mut row.matched_by, SearchMode::Regex);
         }
     }
 
@@ -637,7 +641,11 @@ async fn run_semantic_query(
         .build()?;
     rag.load()?;
 
-    let path_filter = args.path.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let path_filter = args
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let rows = rag
         .search_with_k(query, args.scan_limit)
         .await?
@@ -648,10 +656,8 @@ async fn run_semantic_query(
                 return Ok(None);
             }
 
-            let relative_path =
-                require_semantic_metadata(&result.chunk.metadata, "relative_path")?;
-            let modified_at =
-                require_semantic_metadata(&result.chunk.metadata, "modified_at")?;
+            let relative_path = require_semantic_metadata(&result.chunk.metadata, "relative_path")?;
+            let modified_at = require_semantic_metadata(&result.chunk.metadata, "modified_at")?;
 
             Ok(Some(FileMatchRow {
                 file_path: file_path.to_string(),
@@ -660,7 +666,7 @@ async fn run_semantic_query(
                 chunk_id: result.chunk.index as i64,
                 content: result.chunk.text,
                 score: result.score as f64,
-                matched_by: vec![SearchMode::Semantic.as_str().to_string()],
+                matched_by: vec![SearchMode::Semantic],
             }))
         })
         .collect::<anyhow::Result<Vec<_>>>()?
@@ -673,12 +679,17 @@ async fn run_semantic_query(
 
 fn build_sql_filter(args: &SearchArgs) -> Option<String> {
     let mut filters = Vec::new();
-    if let Some(path) = args.path.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(path) = args
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         filters.push(SqlExpr::Like {
             negated: false,
             any: false,
             expr: Box::new(identifier_sql_expr("file_path")),
-            pattern: Box::new(string_sql_expr([path, "%"].concat())),
+            pattern: Box::new(string_sql_expr(prefix_match_pattern(path))),
             escape_char: None,
         });
     }
@@ -698,6 +709,13 @@ fn identifier_sql_expr(column: &str) -> SqlExpr {
 
 fn string_sql_expr(value: String) -> SqlExpr {
     SqlExpr::value(SqlValue::SingleQuotedString(value))
+}
+
+fn prefix_match_pattern(value: &str) -> String {
+    let mut pattern = String::with_capacity(value.len() + 1);
+    pattern.push_str(value);
+    pattern.push('%');
+    pattern
 }
 
 async fn run_plain_query(table: &Table, args: &SearchArgs) -> anyhow::Result<Vec<FileMatchRow>> {
@@ -761,8 +779,14 @@ async fn run_full_text_query(
     let mut stream = query.execute().await?;
     let mut rows = read_rows_from_stream(&mut stream).await?;
     for row in &mut rows {
-        row.matched_by
-            .push(if fuzzy { "fuzzy" } else { "fulltext" }.to_string());
+        push_unique(
+            &mut row.matched_by,
+            if fuzzy {
+                SearchMode::Fuzzy
+            } else {
+                SearchMode::Fulltext
+            },
+        );
     }
     Ok(rows)
 }
@@ -784,7 +808,13 @@ async fn read_rows_from_stream(
             .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
             .map(|array| {
                 (0..array.len())
-                    .map(|idx| if array.is_null(idx) { 0.0 } else { array.value(idx) as f64 })
+                    .map(|idx| {
+                        if array.is_null(idx) {
+                            0.0
+                        } else {
+                            array.value(idx) as f64
+                        }
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec![0.0; batch.num_rows()]);
@@ -821,7 +851,9 @@ async fn collect_searchable_files(roots: &[String]) -> anyhow::Result<Vec<Search
     for root in roots {
         let root_path = PathBuf::from(root);
         if async_fs::metadata(&root_path).await?.is_file() {
-            if let Some(file) = read_searchable_file(root_path.as_path(), root_path.as_path()).await? {
+            if let Some(file) =
+                read_searchable_file(root_path.as_path(), root_path.as_path()).await?
+            {
                 files_out.push(file);
             }
             continue;
@@ -844,7 +876,9 @@ async fn collect_searchable_files(roots: &[String]) -> anyhow::Result<Vec<Search
         .await??;
 
         for file in files {
-            if let Some(searchable) = read_searchable_file(root_path.as_path(), file.as_path()).await? {
+            if let Some(searchable) =
+                read_searchable_file(root_path.as_path(), file.as_path()).await?
+            {
                 files_out.push(searchable);
             }
         }
@@ -956,13 +990,27 @@ fn rows_to_record_reader(
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.root_path.as_str()))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.file_path.as_str()))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.relative_path.as_str()))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.file_name.as_str()))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.modified_at.as_str()))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.chunk_id))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.content.as_str()))),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.root_path.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.file_path.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.relative_path.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.file_name.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.modified_at.as_str()),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.chunk_id),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.content.as_str()),
+            )),
         ],
     )?;
 
@@ -1007,14 +1055,16 @@ fn finalize_rows(
     } else {
         let mut grouped = HashMap::<String, FileResult>::new();
         for row in rows {
-            let entry = grouped.entry(row.file_path.clone()).or_insert_with(|| FileResult {
-                file_path: row.file_path.clone(),
-                relative_path: row.relative_path.clone(),
-                modified_at: row.modified_at.clone(),
-                match_count: 0,
-                top_score: row.score,
-                highlights: Vec::new(),
-            });
+            let entry = grouped
+                .entry(row.file_path.clone())
+                .or_insert_with(|| FileResult {
+                    file_path: row.file_path.clone(),
+                    relative_path: row.relative_path.clone(),
+                    modified_at: row.modified_at.clone(),
+                    match_count: 0,
+                    top_score: row.score,
+                    highlights: Vec::new(),
+                });
             entry.match_count += 1;
             if row.score > entry.top_score {
                 entry.top_score = row.score;
