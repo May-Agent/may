@@ -1485,8 +1485,12 @@ fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
 
 #[cfg(test)]
 mod tests {
+    use super::TaskRuntime;
     use super::local_task_execution_mode;
     use aither_sandbox::BashExecutionMode;
+    use tempfile::tempdir;
+
+    use crate::db::{ChatDb, CreateScheduledTaskParams};
 
     #[test]
     fn local_tasks_respect_needs_network_flag() {
@@ -1495,5 +1499,65 @@ mod tests {
             local_task_execution_mode(false),
             BashExecutionMode::Sandboxed
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_filters_by_profile_and_session() {
+        let dir = tempdir().expect("temp dir should be created");
+        let may_dir = dir.path().join(".may");
+        std::fs::create_dir_all(&may_dir).expect("may dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize");
+        db.ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+        let local_profile = db
+            .get_profile_by_slug("local")
+            .await
+            .expect("profile lookup should succeed")
+            .expect("local profile should exist");
+
+        for (task_id, session_id, approved) in [
+            ("task-match", Some("session-a"), true),
+            ("task-other-session", Some("session-b"), true),
+            ("task-unapproved", Some("session-a"), false),
+        ] {
+            db.create_scheduled_task(CreateScheduledTaskParams {
+                id: task_id,
+                profile_id: local_profile.id.as_str(),
+                session_id,
+                name: task_id,
+                trigger_kind: "event",
+                trigger_type: "chat.turn.completed",
+                cron_expression: None,
+                run_at: None,
+                script_path: None,
+                script_inline: Some("echo hi"),
+                needs_network: false,
+            })
+            .await
+            .expect("task should persist");
+            if approved {
+                db.approve_scheduled_task(task_id)
+                    .await
+                    .expect("task should be approved");
+            }
+        }
+
+        let runtime = TaskRuntime::load(db.clone(), may_dir)
+            .await
+            .expect("task runtime should load");
+
+        let triggered = runtime
+            .dispatch_event(
+                "chat.turn.completed",
+                Some(local_profile.id.as_str()),
+                Some("session-a"),
+            )
+            .await
+            .expect("event dispatch should succeed");
+
+        assert_eq!(triggered, 1);
     }
 }

@@ -526,7 +526,11 @@ impl PermissionHandler for MayPermissionHandler {
     async fn will_wait_for_approval(&self, mode: BashMode, script: &str) -> bool {
         match &self.approver {
             Some(approver) => approver.will_wait_for_approval(mode, script).await,
-            None => NoopPermissionHandler.will_wait_for_approval(mode, script).await,
+            None => {
+                NoopPermissionHandler
+                    .will_wait_for_approval(mode, script)
+                    .await
+            }
         }
     }
 }

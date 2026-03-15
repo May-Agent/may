@@ -1776,9 +1776,8 @@ impl ChatDb {
                 .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?
                 .into();
         active.status = Set(status.to_string());
-        active.sent_count = Set(i32::try_from(sent_count).map_err(|error| {
-            db_custom_error("notification sent_count overflow: ", &error)
-        })?);
+        active.sent_count = Set(i32::try_from(sent_count)
+            .map_err(|error| db_custom_error("notification sent_count overflow: ", &error))?);
         active.last_error = Set(last_error.map(ToOwned::to_owned));
         active.delivered_at = Set(delivered_at.map(ToOwned::to_owned));
         active.updated_at = Set(jiff::Timestamp::now().to_string());
@@ -1876,9 +1875,11 @@ impl ChatDb {
                 .map(i32::try_from)
                 .transpose()
                 .map_err(|error| db_custom_error("completion_tokens overflow: ", &error))?),
-            total_tokens: Set(params.total_tokens.map(i32::try_from).transpose().map_err(
-                |error| db_custom_error("total_tokens overflow: ", &error),
-            )?),
+            total_tokens: Set(params
+                .total_tokens
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|error| db_custom_error("total_tokens overflow: ", &error))?),
             cache_read_tokens: Set(params
                 .cache_read_tokens
                 .map(i32::try_from)
@@ -2388,8 +2389,7 @@ impl ChatDb {
             } else {
                 "pending follow-up work exists".to_string()
             };
-            let mut message =
-                String::with_capacity(35 + id.len() + reason.len());
+            let mut message = String::with_capacity(35 + id.len() + reason.len());
             message.push_str("cannot archive active session ");
             message.push_str(id);
             message.push_str(" while ");
@@ -2999,8 +2999,9 @@ fn query_u64(row: &sea_orm::QueryResult, index: usize) -> Result<u64, ChatDbErro
     let value = row
         .try_get_by_index::<i64>(index)
         .map_err(ChatDbError::Db)?;
-    u64::try_from(value)
-        .map_err(|error| ChatDbError::Db(db_custom_error("u64 aggregate conversion failed: ", &error)))
+    u64::try_from(value).map_err(|error| {
+        ChatDbError::Db(db_custom_error("u64 aggregate conversion failed: ", &error))
+    })
 }
 
 /// Parameters for upserting a persisted session context snapshot.
