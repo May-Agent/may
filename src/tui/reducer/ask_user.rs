@@ -19,7 +19,7 @@ pub(crate) fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option
             KeyCode::Esc => qs.custom_mode = false,
             KeyCode::Enter => {
                 qs.custom_mode = false;
-                ask_user_advance_or_submit(app);
+                return Ok(ask_user_advance_or_submit(app));
             }
             KeyCode::Backspace => {
                 qs.custom_text.pop();
@@ -90,14 +90,14 @@ pub(crate) fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option
                         qs.selections.push(cursor);
                         qs.skipped = false;
                     }
-                    ask_user_advance_or_submit(app);
+                    return Ok(ask_user_advance_or_submit(app));
                 } else if cursor == opt_count {
                     if let Some(qs) = state.current_state_mut() {
                         qs.skipped = true;
                         qs.selections.clear();
                         qs.custom_text.clear();
                     }
-                    ask_user_advance_or_submit(app);
+                    return Ok(ask_user_advance_or_submit(app));
                 } else if cursor == opt_count + 1 {
                     if let Some(qs) = state.current_state_mut() {
                         qs.custom_mode = true;
@@ -105,31 +105,32 @@ pub(crate) fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option
                         qs.selections.clear();
                     }
                 } else if q.multi_select {
-                    ask_user_advance_or_submit(app);
+                    return Ok(ask_user_advance_or_submit(app));
                 }
             }
         }
-        KeyCode::Esc => ask_user_submit_all_skipped(app),
+        KeyCode::Esc => return Ok(ask_user_submit_all_skipped(app)),
         _ => {}
     }
 
     Ok(None)
 }
 
-fn ask_user_advance_or_submit(app: &mut App) {
+fn ask_user_advance_or_submit(app: &mut App) -> Option<SendAction> {
     let state = match &mut app.mode {
         AppMode::AskUser(s) => s,
-        _ => return,
+        _ => return None,
     };
 
     if state.current_question + 1 < state.questions.len() {
         state.current_question += 1;
+        None
     } else {
-        ask_user_submit(app);
+        ask_user_submit(app)
     }
 }
 
-fn ask_user_submit(app: &mut App) {
+fn ask_user_submit(app: &mut App) -> Option<SendAction> {
     let mode = std::mem::replace(&mut app.mode, AppMode::Chat);
     if let AppMode::AskUser(state) = mode {
         let answers: Vec<QuestionAnswer> = state
@@ -156,14 +157,16 @@ fn ask_user_submit(app: &mut App) {
                 }
             })
             .collect();
-        state
-            .request
-            .respond(answers)
-            .unwrap_or_else(|_| panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim()));
+        return Some(SendAction::RespondAskUser {
+            request_id: state.request_id,
+            request: state.request,
+            answers,
+        });
     }
+    None
 }
 
-fn ask_user_submit_all_skipped(app: &mut App) {
+fn ask_user_submit_all_skipped(app: &mut App) -> Option<SendAction> {
     let mode = std::mem::replace(&mut app.mode, AppMode::Chat);
     if let AppMode::AskUser(state) = mode {
         let answers: Vec<QuestionAnswer> = state
@@ -174,9 +177,11 @@ fn ask_user_submit_all_skipped(app: &mut App) {
                 answer: AnswerValue::Skipped,
             })
             .collect();
-        state
-            .request
-            .respond(answers)
-            .unwrap_or_else(|_| panic!("{}", super::super::app::ERR_TOOL_RESPONSE_SEND.trim()));
+        return Some(SendAction::RespondAskUser {
+            request_id: state.request_id,
+            request: state.request,
+            answers,
+        });
     }
+    None
 }

@@ -12,6 +12,7 @@ use executor_core::spawn;
 use crate::config::{ModelTier, ProviderType, get_model_tier};
 use crate::models::FetchedModel;
 use crate::profile::{PinnedItem, ProfileInfo, ProfileSessions};
+use crate::session::PendingUserMessageMode;
 use crate::{ChatMessage, MayConfig, MessageRole, SessionId, SessionManager, SessionSummary};
 
 use super::agent_event_adapter::{ToolEndKind, ToolStartKind, parse_tool_end, parse_tool_start};
@@ -26,8 +27,7 @@ use super::queue::{Attachment, LARGE_PASTE_THRESHOLD, MessageQueue, PendingMessa
 use super::ui::chat::{ChatElement, ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
 
-pub(crate) const ERR_TOOL_RESPONSE_SEND: &str =
-    include_str!("../texts/tool_response_send_failed.txt");
+pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../texts/tool_response_send_failed.txt");
 
 /// Convert a character index to a byte index in a string.
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
@@ -799,6 +799,9 @@ impl App {
             AppMode::ModelSelect => self.handle_model_select_key(code),
             AppMode::TierModelPicker => self.handle_tier_model_picker_key(code),
             AppMode::CopilotAuth => super::reducer::manage::handle_copilot_auth_key(self, code),
+            AppMode::PermissionConfirm(_) => {
+                super::reducer::manage::handle_permission_confirm_key(self, code)
+            }
             AppMode::WorkspaceConfirm(_) => {
                 super::reducer::manage::handle_workspace_confirm_key(self, code)
             }
@@ -1008,7 +1011,7 @@ impl App {
                 }
                 // Send as message (slash commands only work from menu selection)
                 if !self.input.is_empty() || !self.attachments.is_empty() {
-                    return Ok(Some(self.prepare_message()));
+                    return Ok(Some(self.prepare_message(PendingUserMessageMode::Steer)));
                 }
             }
             KeyCode::Backspace => {
@@ -1075,11 +1078,18 @@ impl App {
                 }
             }
             KeyCode::Tab => {
-                // Accept completion if active
                 if self.completion.is_active()
                     && let Some(item) = self.completion.complete()
                 {
                     self.accept_completion(&item.insert.clone());
+                    return Ok(None);
+                }
+                if self.processing && (!self.input.is_empty() || !self.attachments.is_empty()) {
+                    if self.has_pending_attachments() {
+                        self.status = Some("Waiting for attachments to finish...".to_string());
+                        return Ok(None);
+                    }
+                    return Ok(Some(self.prepare_message(PendingUserMessageMode::Queue)));
                 }
             }
             KeyCode::Char(c) => {
@@ -2149,7 +2159,7 @@ impl App {
     }
 
     /// Prepare a message for sending, returning the action.
-    fn prepare_message(&mut self) -> SendAction {
+    fn prepare_message(&mut self, delivery_mode: PendingUserMessageMode) -> SendAction {
         // Add to history before clearing (only if non-empty and not just whitespace)
         if !self.input.trim().is_empty() {
             self.history.push(self.input.clone());
@@ -2176,11 +2186,11 @@ impl App {
             content,
             attachments,
             queued_at: jiff::Timestamp::now(),
+            delivery_mode,
         };
 
         if self.processing {
-            self.queue.enqueue(msg);
-            SendAction::Queued
+            SendAction::EnqueuePending(msg)
         } else {
             SendAction::Send(msg)
         }
@@ -2491,10 +2501,16 @@ pub enum SendAction {
     NewSession,
     /// User wants to load an existing session.
     LoadSession(SessionId),
-    /// Message was queued (agent is busy).
-    Queued,
     /// Send this message to the agent.
     Send(PendingMessage),
+    /// Persist a pending message for later dispatch.
+    EnqueuePending(PendingMessage),
+    /// Submit an ask-user response.
+    RespondAskUser {
+        request_id: String,
+        request: crate::ask_user::AskUserRequest,
+        answers: Vec<crate::ask_user::QuestionAnswer>,
+    },
     /// Start GitHub Copilot OAuth authentication.
     StartCopilotAuth,
     /// Open Copilot auth URL in browser and copy code to clipboard.
@@ -2525,6 +2541,17 @@ pub enum SendAction {
     },
     SshRemove {
         name: String,
+    },
+    /// Submit a workspace approval response.
+    RespondWorkspace {
+        request_id: String,
+        request: crate::workspace_request::WorkspaceRequest,
+        approved: bool,
+    },
+    /// Submit a permission approval response.
+    RespondPermission {
+        request_id: String,
+        approved: bool,
     },
     /// Skill management actions.
     SkillInstall {
