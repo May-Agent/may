@@ -184,7 +184,6 @@ impl SessionRunRegistration {
         let session_id = session_id.into();
         let claimed = state
             .db()
-            .await
             .claim_session_run_lease(session_id.as_str())
             .await
             .ok()?;
@@ -194,7 +193,6 @@ impl SessionRunRegistration {
         let Some(receiver) = state.run_cancellation_registry.try_open(session_id.clone()) else {
             let _ = state
                 .db()
-                .await
                 .release_session_run_lease(session_id.as_str())
                 .await;
             return None;
@@ -214,7 +212,6 @@ impl SessionRunRegistration {
         let _ = self
             .state
             .db()
-            .await
             .release_session_run_lease(self.session_id.as_str())
             .await;
         self.state.run_cancellation_registry.close(&self.session_id);
@@ -490,7 +487,7 @@ pub(super) async fn schedule_waiting_turn_resume(
 }
 
 async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) {
-    let db = state.db().await;
+    let db = state.db();
     if let Err(error) = db
         .append_request_log(crate::db::RequestLogParams {
             session_id: entry.session_id.as_str(),
@@ -573,10 +570,7 @@ pub(super) async fn stop_session_run(
         .get("id")
         .map_err(super::error::bad_request_error)?
         .to_string();
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
     if !db
         .session_exists(&session_id)
         .await
@@ -592,7 +586,6 @@ pub(super) async fn stop_session_run(
 
     let persisted_cancel = state
         .db()
-        .await
         .request_session_run_cancel(&session_id)
         .await
         .map_err(internal_error)?;
@@ -1174,7 +1167,6 @@ async fn persist_latest_assistant_stats(
     });
     state
         .db()
-        .await
         .set_latest_assistant_chat_stats(
             session_id.as_str(),
             &ChatMessageStats {
@@ -1240,10 +1232,7 @@ async fn persist_context_debug_snapshot(
     let assembled_messages_json = serde_json::to_string(&assembled_messages)?;
     let timestamp = jiff::Timestamp::now().to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
     db.upsert_context_debug_snapshot(
         session_id.as_str(),
         &timestamp,

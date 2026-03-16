@@ -46,10 +46,7 @@ pub(super) async fn get_session(
 ) -> SkyResult<Json<ApiSession>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     let db_session = db
         .get_session(&id)
@@ -82,10 +79,7 @@ pub(super) async fn get_session_context_debug(
 ) -> SkyResult<Json<SessionContextDebugResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
     let row = db
         .get_context_debug_snapshot(&id)
         .await
@@ -356,7 +350,7 @@ pub(super) async fn delete_all_sessions(
     let mut manager = state.sessions().await;
 
     // Delete all from DB
-    let db = manager.db().clone();
+    let db = state.db();
     db.delete_all_sessions().await.map_err(internal_error)?;
 
     // Clean up filesystem session directories

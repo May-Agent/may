@@ -281,10 +281,7 @@ pub(super) struct MoveToFolderRequest {
 pub(super) async fn list_profiles(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<ProfileInfo>>> {
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     let profiles = crate::profile::list_profiles(&db)
         .await
@@ -296,10 +293,7 @@ pub(super) async fn create_profile(
     Json(req): Json<CreateProfileRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ProfileInfo>> {
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     let id = uuid::Uuid::new_v4().to_string();
     let preferences_json = req
@@ -339,10 +333,7 @@ pub(super) async fn update_profile(
 ) -> SkyResult<Json<ProfileInfo>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     let preferences_json = req
         .preferences
@@ -388,10 +379,7 @@ pub(super) async fn delete_profile(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     db.delete_profile(&id).await.map_err(internal_error)?;
     super::remote_access::sync_remote_access_from_state(&state)
@@ -408,10 +396,7 @@ pub(super) async fn get_profile_sessions(
 ) -> SkyResult<skyzen::Response> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     if let Err(err) =
         ensure_profile_environment_ready(&state, &db, &id, query.allow_managed_podman_download)
@@ -458,10 +443,7 @@ pub(super) async fn create_folder(
 ) -> SkyResult<Json<FolderResponse>> {
     let profile_id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     let folder_id = uuid::Uuid::new_v4().to_string();
     let model = db
@@ -485,10 +467,7 @@ pub(super) async fn update_folder(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     if let Some(name) = req.name {
         db.update_folder(&id, &name).await.map_err(internal_error)?;
@@ -509,10 +488,7 @@ pub(super) async fn delete_folder(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     db.delete_folder(&id).await.map_err(internal_error)?;
     state.notify_ui_events();
@@ -527,10 +503,7 @@ pub(super) async fn pin_session(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     db.pin_session(&id).await.map_err(map_profile_error)?;
     state.notify_ui_events();
@@ -543,10 +516,7 @@ pub(super) async fn unpin_session(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     db.unpin_session(&id).await.map_err(internal_error)?;
     state.notify_ui_events();
@@ -559,10 +529,7 @@ pub(super) async fn archive_session(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     db.archive_session(&id).await.map_err(internal_error)?;
     state.notify_ui_events();
@@ -575,10 +542,7 @@ pub(super) async fn unarchive_session(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     db.unarchive_session(&id).await.map_err(internal_error)?;
     state.notify_ui_events();
@@ -592,10 +556,7 @@ pub(super) async fn move_to_folder(
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     db.move_session_to_folder(&id, req.folder_id.as_deref())
         .await

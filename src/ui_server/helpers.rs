@@ -41,7 +41,6 @@ pub(super) async fn append_history_message(
 ) -> anyhow::Result<()> {
     state
         .db()
-        .await
         .append_chat_message(session_id.as_str(), &message)
         .await
         .map_err(anyhow::Error::from)?;
@@ -54,7 +53,6 @@ pub(super) async fn load_session_paths(
 ) -> SkyResult<SessionPaths> {
     let session = state
         .db()
-        .await
         .get_session(session_id)
         .await
         .map_err(internal_error)?

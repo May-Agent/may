@@ -18,7 +18,6 @@ pub(super) async fn respond_permission_request(
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let pending = state
         .db()
-        .await
         .find_pending_permission_request(&req.id)
         .await
         .map_err(internal_error)?
@@ -71,7 +70,6 @@ pub(super) async fn respond_ask_user_request(
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let pending = state
         .db()
-        .await
         .find_pending_ask_user_request(&req.id)
         .await
         .map_err(internal_error)?
@@ -134,7 +132,6 @@ pub(super) async fn respond_workspace_request(
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let pending = state
         .db()
-        .await
         .find_pending_workspace_request(&req.id)
         .await
         .map_err(internal_error)?
