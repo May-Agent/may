@@ -219,7 +219,7 @@ impl SessionManager {
         fs::create_dir_all(home_paths.sessions_dir())?;
 
         // Ensure bundle is extracted and symlinks created
-        Bundle::ensure_extracted(&may_dir)?;
+        Bundle::ensure_extracted(&may_dir).await?;
 
         // Create MEMORY.md if it doesn't exist
         let memory_path = home_paths.memory_file();
