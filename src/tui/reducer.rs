@@ -150,6 +150,14 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
             }
             Ok(None)
         }
+        AppEvent::ConfigSaved(result) => {
+            if let Err(error) = result {
+                app.chat
+                    .push_error(&format!("Failed to save config: {}", error));
+                app.status = Some("Config save failed".to_string());
+            }
+            Ok(None)
+        }
         AppEvent::ImageFetchResult { url, data } => {
             app.handle_image_fetch_result(url, data);
             Ok(None)

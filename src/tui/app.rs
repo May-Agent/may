@@ -365,6 +365,18 @@ impl App {
         })
     }
 
+    fn persist_config_background(&self) {
+        let tx = self.event_tx.clone();
+        let config = self.config.clone();
+        spawn(async move {
+            let result = unblock(move || config.save())
+                .await
+                .map_err(anyhow::Error::from);
+            let _ = tx.send(AppEvent::ConfigSaved(result)).await;
+        })
+        .detach();
+    }
+
     /// Check if configuration is complete.
     pub fn is_configured(&self) -> bool {
         self.config.is_configured()
@@ -1368,9 +1380,7 @@ impl App {
                     self.config
                         .models
                         .add_model(tier, &model.id, &model.provider_id);
-                    if let Err(e) = self.config.save() {
-                        tracing::error!("Failed to save config: {}", e);
-                    }
+                    self.persist_config_background();
                 }
                 self.mode = AppMode::Config;
                 self.tier_picker_query.clear();
@@ -1602,9 +1612,7 @@ impl App {
                     if state.selected >= state.provider_ids.len() && state.selected > 0 {
                         state.selected -= 1;
                     }
-                    if let Err(e) = self.config.save() {
-                        tracing::error!("Failed to save config: {}", e);
-                    }
+                    self.persist_config_background();
                 }
             }
             KeyCode::Esc => {
@@ -1701,17 +1709,13 @@ impl App {
                                 LoadBalanceStrategy::FailoverOnly => LoadBalanceStrategy::Random,
                                 LoadBalanceStrategy::Random => LoadBalanceStrategy::RoundRobin,
                             };
-                        if let Err(e) = self.config.save() {
-                            tracing::error!("Failed to save config: {}", e);
-                        }
+                        self.persist_config_background();
                     }
                     2 => {
                         // Toggle warn_on_model_change
                         self.config.preferences.warn_on_model_change =
                             !self.config.preferences.warn_on_model_change;
-                        if let Err(e) = self.config.save() {
-                            tracing::error!("Failed to save config: {}", e);
-                        }
+                        self.persist_config_background();
                     }
                     _ => {}
                 }
@@ -1770,9 +1774,7 @@ impl App {
                             state.key_from_env = true;
                             state.key_env_var_name = Some(var_name.to_string());
                             self.auto_populate_models_if_empty();
-                            if let Err(e) = self.config.save() {
-                                tracing::error!("Failed to save config: {}", e);
-                            }
+                            self.persist_config_background();
                         } else {
                             // Need manual API key entry
                             let instance = crate::config::ProviderInstance::new(*provider_type);
@@ -1907,9 +1909,7 @@ impl App {
                     self.config.upsert_provider(&name_val, instance);
                     self.config_state.load_providers(&self.config);
                     self.auto_populate_models_if_empty();
-                    if let Err(e) = self.config.save() {
-                        tracing::error!("Failed to save config: {}", e);
-                    }
+                    self.persist_config_background();
                     return Ok(None);
                 }
                 KeyCode::Esc => {
@@ -2018,9 +2018,7 @@ impl App {
         }
 
         self.config_state.cancel_edit();
-        if let Err(e) = self.config.save() {
-            tracing::error!("Failed to save config: {}", e);
-        }
+        self.persist_config_background();
 
         Ok(None)
     }
