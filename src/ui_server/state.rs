@@ -314,6 +314,7 @@ impl McpService {
 }
 
 pub(crate) struct UiServerState {
+    pub(crate) db: crate::db::ChatDb,
     pub(crate) session_manager: SharedSessionManager,
     pub(crate) mcp_service: McpService,
     pub(crate) permission_approver: PermissionApprover,
@@ -350,8 +351,8 @@ impl UiServerState {
         self.mcp_service.clone()
     }
 
-    pub(crate) async fn db(&self) -> crate::db::ChatDb {
-        self.sessions().await.db().clone()
+    pub(crate) fn db(&self) -> crate::db::ChatDb {
+        self.db.clone()
     }
 }
 

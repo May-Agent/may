@@ -181,6 +181,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let task_runtime = Arc::new(task_runtime);
 
     let state = Arc::new(UiServerState {
+        db: db_for_archive.clone(),
         session_manager: state::SharedSessionManager::new(session_manager),
         mcp_service: state::McpService::spawn(mcp_manager),
         permission_approver,
@@ -412,7 +413,6 @@ async fn get_request_logs(
 ) -> SkyResult<Json<RequestLogsResponse>> {
     let logs = state
         .db()
-        .await
         .list_request_logs(300)
         .await
         .map_err(internal_error)?
@@ -421,7 +421,6 @@ async fn get_request_logs(
         .collect::<Vec<_>>();
     let cache_summary = state
         .db()
-        .await
         .assistant_cache_usage_summary()
         .await
         .map(RequestLogCacheSummary::from)

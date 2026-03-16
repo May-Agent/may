@@ -110,7 +110,6 @@ pub(super) async fn list_notification_mailbox(
 ) -> SkyResult<Json<super::types::NotificationMailboxResponse>> {
     let items = state
         .db()
-        .await
         .list_notification_mailbox_entries(100)
         .await
         .map_err(internal_error)?
@@ -127,7 +126,6 @@ pub(super) async fn consume_notification_callback(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let callback = state
         .db()
-        .await
         .consume_notification_callback(&id)
         .await
         .map_err(|error| match error {
@@ -154,7 +152,6 @@ pub(super) async fn list_network_access_logs(
 ) -> SkyResult<Json<super::types::NetworkAccessLogsResponse>> {
     let items = state
         .db()
-        .await
         .list_network_access_logs(200)
         .await
         .map_err(internal_error)?

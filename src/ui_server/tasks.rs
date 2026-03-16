@@ -248,7 +248,6 @@ pub(super) async fn list_tasks(
 ) -> SkyResult<Json<Vec<ScheduledTaskResponse>>> {
     let tasks = state
         .db()
-        .await
         .list_scheduled_tasks(None)
         .await
         .map_err(internal_error)?;
@@ -290,7 +289,6 @@ pub(super) async fn create_task(
     let trigger_type = trigger.storage_trigger_type();
     let model = state
         .db()
-        .await
         .create_scheduled_task(CreateScheduledTaskParams {
             id: &id,
             profile_id: &req.profile_id,
@@ -324,7 +322,6 @@ pub(super) async fn get_task(
 
     let model = state
         .db()
-        .await
         .get_scheduled_task(&id)
         .await
         .map_err(internal_error)?
@@ -340,7 +337,7 @@ pub(super) async fn update_task(
 ) -> SkyResult<Json<ScheduledTaskResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = state.db().await;
+    let db = state.db();
     let current = db
         .get_scheduled_task(&id)
         .await
@@ -452,7 +449,6 @@ pub(super) async fn delete_task(
 
     state
         .db()
-        .await
         .delete_scheduled_task(&id)
         .await
         .map_err(internal_error)?;
@@ -473,7 +469,6 @@ pub(super) async fn approve_task(
 
     state
         .db()
-        .await
         .approve_scheduled_task(&id)
         .await
         .map_err(internal_error)?;
@@ -494,7 +489,6 @@ pub(super) async fn run_task(
 
     let task = state
         .db()
-        .await
         .get_scheduled_task(&id)
         .await
         .map_err(internal_error)?

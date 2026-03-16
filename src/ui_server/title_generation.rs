@@ -47,7 +47,7 @@ fn is_replaceable_session_title(current: Option<&str>, placeholder: &str) -> boo
 async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
     let session_id = SessionId::from_string(task.session_id);
     let placeholder = truncate_preview(&task.user_message);
-    let db = state.db().await;
+    let db = state.db();
 
     {
         let current = match db.get_session(session_id.as_str()).await {

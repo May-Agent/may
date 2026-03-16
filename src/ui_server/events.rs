@@ -261,7 +261,7 @@ async fn emit_request_logs_if_changed(
     sender: &skyzen::responder::sse::Sender,
     last_logs_sig: &mut String,
 ) -> bool {
-    let logs = match state.db().await.list_request_logs(300).await {
+    let logs = match state.db().list_request_logs(300).await {
         Ok(entries) => entries
             .into_iter()
             .map(super::types::RequestLogEntry::from)
@@ -271,7 +271,7 @@ async fn emit_request_logs_if_changed(
             return true;
         }
     };
-    let cache_summary = match state.db().await.assistant_cache_usage_summary().await {
+    let cache_summary = match state.db().assistant_cache_usage_summary().await {
         Ok(summary) => super::types::RequestLogCacheSummary::from(summary),
         Err(error) => {
             tracing::warn!(error = %error, "failed to build request log cache summary");
@@ -301,7 +301,6 @@ async fn emit_notification_mailbox_if_changed(
 ) -> bool {
     let items = match state
         .db()
-        .await
         .list_notification_mailbox_entries(100)
         .await
     {
@@ -332,7 +331,7 @@ async fn emit_network_access_logs_if_changed(
     sender: &skyzen::responder::sse::Sender,
     last_sig: &mut String,
 ) -> bool {
-    let items = match state.db().await.list_network_access_logs(200).await {
+    let items = match state.db().list_network_access_logs(200).await {
         Ok(items) => items
             .into_iter()
             .map(NetworkAccessLogEntryResponse::from)
@@ -464,10 +463,7 @@ async fn emit_profile_sessions_if_changed(
     let Some(profile_id) = profile_filter else {
         return true;
     };
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
     let profile_sessions = match query_profile_sessions(&db, profile_id).await {
         Ok(profile_sessions) => profile_sessions,
         Err(error) => {
