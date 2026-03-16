@@ -1154,7 +1154,7 @@ impl TaskRuntime {
         })?;
 
         let default_image_tag =
-            crate::container::profile::default_image_tag(&self.may_dir, profile).map_err(
+            crate::container::profile::default_image_tag(&self.may_dir, profile).await.map_err(
                 |error| {
                     invalid_profile_component_error("invalid container profile image tag: ", &error)
                 },
@@ -1272,7 +1272,7 @@ impl TaskRuntime {
         })?;
 
         let default_image_tag =
-            crate::container::profile::default_image_tag(&self.may_dir, profile).map_err(
+            crate::container::profile::default_image_tag(&self.may_dir, profile).await.map_err(
                 |error| {
                     invalid_profile_component_error("invalid container profile image tag: ", &error)
                 },

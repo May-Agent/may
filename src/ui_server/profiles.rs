@@ -126,6 +126,7 @@ async fn ensure_profile_environment_ready(
     };
 
     let default_image_tag = crate::container::profile::default_image_tag(&state.may_dir, &profile)
+        .await
         .map_err(internal_error)?;
     let image_spec = crate::container::profile::image_spec_for_profile(
         &state.may_dir,
