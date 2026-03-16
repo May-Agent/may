@@ -35,7 +35,6 @@ use skyzen::utils::{Json, State};
 use crate::config::MayConfig;
 use crate::mcp::McpManager;
 use crate::models::fetch_all_models;
-use crate::session::SessionManager;
 use aither_models::lookup as lookup_model_info;
 
 use error::internal_error;
@@ -113,12 +112,8 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         None
     };
 
-    let session_manager = SessionManager::new().await?;
-    let default_profile_id = session_manager
-        .current_profile_id()
-        .map(ToOwned::to_owned)
-        .context("session manager did not initialize a default profile")?;
-    let db_for_archive = session_manager.db().clone();
+    let (_session_store, db_for_archive, default_profile_id) =
+        crate::session::initialize_session_persistence(&may_dir).await?;
     db_for_archive
         .recover_session_runtimes_after_restart()
         .await

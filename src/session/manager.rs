@@ -222,6 +222,58 @@ pub async fn list_summaries_from_db(db: &ChatDb) -> Result<Vec<SessionSummary>, 
     Ok(summaries)
 }
 
+pub async fn initialize_session_persistence(
+    may_dir: &Path,
+) -> Result<(SessionStore, ChatDb, String), SessionError> {
+    let home_paths = MayHomePaths::new(may_dir.to_path_buf());
+    async_fs::create_dir_all(home_paths.sessions_dir()).await?;
+
+    Bundle::ensure_extracted(may_dir).await?;
+
+    let memory_path = home_paths.memory_file();
+    if async_fs::metadata(&memory_path).await.is_err() {
+        async_fs::write(&memory_path, "").await?;
+    }
+
+    let store = SessionStore::new(home_paths.clone());
+    let db = ChatDb::open(&home_paths.db_file()).await?;
+    let default_profile_id = db.ensure_default_profiles().await?;
+    reconcile_container_profile_sessions(&store, &db).await?;
+    Ok((store, db, default_profile_id))
+}
+
+pub async fn reconcile_container_profile_sessions(
+    store: &SessionStore,
+    db: &ChatDb,
+) -> Result<(), SessionError> {
+    let profiles = db.list_profiles().await?;
+    let container_profiles = profiles
+        .iter()
+        .filter(|profile| profile.environment.as_str() == "container")
+        .count();
+    tracing::info!(
+        container_profiles,
+        "Reconciling container session mount points"
+    );
+    for profile in profiles
+        .iter()
+        .filter(|profile| profile.environment.as_str() == "container")
+    {
+        let sessions = db.list_sessions_for_profile(&profile.id).await?;
+        tracing::info!(
+            profile_id = %profile.id,
+            session_count = sessions.len(),
+            "Reconciling sessions for container profile"
+        );
+        for session in sessions {
+            store
+                .reconcile_container_mount_points(&session.id, Some(profile.id.as_str()))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Manages sessions and their lifecycle.
 pub struct SessionManager {
     may_dir: PathBuf,
@@ -236,26 +288,7 @@ impl SessionManager {
     /// Create a new SessionManager, initializing ~/.may/ structure if needed.
     pub async fn new() -> Result<Self, SessionError> {
         let may_dir = MayConfig::may_dir().map_err(|_| SessionError::NoHomeDir)?;
-        let home_paths = MayHomePaths::new(may_dir.clone());
-        async_fs::create_dir_all(home_paths.sessions_dir()).await?;
-
-        // Ensure bundle is extracted and symlinks created
-        Bundle::ensure_extracted(&may_dir).await?;
-
-        // Create MEMORY.md if it doesn't exist
-        let memory_path = home_paths.memory_file();
-        if !memory_path.exists() {
-            async_fs::write(&memory_path, "").await?;
-        }
-
-        let store = SessionStore::new(home_paths.clone());
-
-        // Open the database
-        let db_path = home_paths.db_file();
-        let db = ChatDb::open(&db_path).await?;
-
-        // Ensure default profiles (daily, work, local) exist and set first as current
-        let default_profile_id = db.ensure_default_profiles().await?;
+        let (store, db, default_profile_id) = initialize_session_persistence(&may_dir).await?;
 
         let manager = Self {
             may_dir,
@@ -264,8 +297,6 @@ impl SessionManager {
             current: None,
             current_profile_id: Some(default_profile_id),
         };
-        manager.reconcile_container_profile_sessions().await?;
-
         Ok(manager)
     }
 
@@ -446,35 +477,6 @@ impl SessionManager {
             SandboxResourceLayout::Symlinked
         };
         Ok(layout)
-    }
-
-    async fn reconcile_container_profile_sessions(&self) -> Result<(), SessionError> {
-        let profiles = self.db.list_profiles().await?;
-        let container_profiles = profiles
-            .iter()
-            .filter(|profile| profile.environment.as_str() == "container")
-            .count();
-        tracing::info!(
-            container_profiles,
-            "Reconciling container session mount points"
-        );
-        for profile in profiles
-            .iter()
-            .filter(|profile| profile.environment.as_str() == "container")
-        {
-            let sessions = self.db.list_sessions_for_profile(&profile.id).await?;
-            tracing::info!(
-                profile_id = %profile.id,
-                session_count = sessions.len(),
-                "Reconciling sessions for container profile"
-            );
-            for session in sessions {
-                self.store
-                    .reconcile_container_mount_points(&session.id, Some(profile.id.as_str()))
-                    .await?;
-            }
-        }
-        Ok(())
     }
 
     /// Append a message to the current session (DB + in-memory).
