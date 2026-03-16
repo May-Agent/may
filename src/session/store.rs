@@ -205,11 +205,11 @@ impl SessionStore {
 
     async fn ensure_mount_point_dir(parent: &Path, name: &str) -> Result<(), StoreError> {
         let target = parent.join(name);
-        match std::fs::symlink_metadata(&target) {
+        match async_fs::symlink_metadata(&target).await {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
                     tracing::debug!(path = %target.display(), "Removing stale symlink mount point");
-                    std::fs::remove_file(&target)?;
+                    async_fs::remove_file(&target).await?;
                 } else if meta.is_dir() {
                     return Ok(());
                 } else {
