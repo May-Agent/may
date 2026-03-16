@@ -5,7 +5,6 @@
 //! Local/leash session sandboxes get symlinks pointing to their home-scoped resources.
 //! Container sessions use mount points managed by container lifecycle code.
 
-use std::fs;
 use std::path::Path;
 
 use async_fs;
@@ -35,28 +34,30 @@ pub struct Bundle;
 impl Bundle {
     /// Extract bundled resources to ~/.may/ if not already present.
     /// Creates ~/.may/skills/, ~/.may/subagents/, and ~/.may/container/ directories.
-    pub fn ensure_extracted(may_dir: &Path) -> Result<(), BundleError> {
+    pub async fn ensure_extracted(may_dir: &Path) -> Result<(), BundleError> {
         let skills_dir = may_dir.join("skills");
         let subagents_dir = may_dir.join("subagents");
         let container_dir = may_dir.join("container");
         let leash_ipc_dir = container_dir.join("leash-ipc");
 
-        Self::ensure_materialized_dir(&skills_dir)?;
-        Self::ensure_materialized_dir(&subagents_dir)?;
-        fs::create_dir_all(&container_dir)?;
-        fs::create_dir_all(&leash_ipc_dir)?;
+        Self::ensure_materialized_dir(&skills_dir).await?;
+        Self::ensure_materialized_dir(&subagents_dir).await?;
+        async_fs::create_dir_all(&container_dir).await?;
+        async_fs::create_dir_all(&leash_ipc_dir).await?;
 
         // Built-in resources must stay in lockstep with the running binary.
         // Always overwrite bundled content to avoid stale skills/subagents after upgrades.
-        Self::extract_dir_overwrite(&SKILLS_DIR, &skills_dir)?;
+        Self::extract_dir_overwrite(&SKILLS_DIR, &skills_dir).await?;
 
-        Self::extract_dir_overwrite(&SUBAGENTS_DIR, &subagents_dir)?;
+        Self::extract_dir_overwrite(&SUBAGENTS_DIR, &subagents_dir).await?;
 
         // Extract container build context (Dockerfile + leash-ipc source).
         // Container files are always overwritten since they are managed by the binary,
         // not user-modifiable.
-        Self::extract_dir_overwrite(&CONTAINER_DIR, &container_dir)?;
-        Self::extract_dir_overwrite(&LEASH_IPC_DIR, &leash_ipc_dir)?;
+        Self::extract_dir_overwrite(&CONTAINER_DIR, &container_dir)
+            .await?;
+        Self::extract_dir_overwrite(&LEASH_IPC_DIR, &leash_ipc_dir)
+            .await?;
 
         Ok(())
     }
@@ -89,30 +90,26 @@ impl Bundle {
     }
 
     /// Recursively extract an embedded directory, always overwriting existing files.
-    fn extract_dir_overwrite(src: &Dir<'_>, dest: &Path) -> Result<(), BundleError> {
-        Self::extract_dir_inner(src, dest, true)
-    }
-
-    fn extract_dir_inner(src: &Dir<'_>, dest: &Path, overwrite: bool) -> Result<(), BundleError> {
-        for file in src.files() {
-            let file_path = dest.join(file.path());
-            if let Some(parent) = file_path.parent() {
-                fs::create_dir_all(parent)?;
+    async fn extract_dir_overwrite(
+        src: &'static Dir<'static>,
+        dest: &Path,
+    ) -> Result<(), BundleError> {
+        let mut pending = vec![src];
+        while let Some(dir) = pending.pop() {
+            for file in dir.files() {
+                let file_path = dest.join(file.path());
+                if let Some(parent) = file_path.parent() {
+                    async_fs::create_dir_all(parent).await?;
+                }
+                async_fs::write(&file_path, file.contents()).await?;
             }
-            if overwrite || !file_path.exists() {
-                fs::write(&file_path, file.contents())?;
-            }
+            pending.extend(dir.dirs());
         }
-
-        for dir in src.dirs() {
-            Self::extract_dir_inner(dir, dest, overwrite)?;
-        }
-
         Ok(())
     }
 
-    fn ensure_materialized_dir(path: &Path) -> Result<(), BundleError> {
-        match fs::symlink_metadata(path) {
+    async fn ensure_materialized_dir(path: &Path) -> Result<(), BundleError> {
+        match async_fs::symlink_metadata(path).await {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
                     return Err(BundleError::Io(std::io::Error::other(format!(
@@ -129,7 +126,7 @@ impl Bundle {
                 ))));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(path)?;
+                async_fs::create_dir_all(path).await?;
                 return Ok(());
             }
             Err(error) => return Err(BundleError::Io(error)),
