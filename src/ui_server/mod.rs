@@ -70,7 +70,9 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
 
-    let mut mcp_manager = McpManager::load().context("failed to load MCP config")?;
+    let mut mcp_manager = McpManager::load()
+        .await
+        .context("failed to load MCP config")?;
     if mcp_manager.has_servers() {
         let _ = mcp_manager.connect_all().await;
     }
