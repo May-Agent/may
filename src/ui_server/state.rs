@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use dashmap::{DashMap, DashSet};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, oneshot};
 use tokio::time::Instant as TokioInstant;
 
 use super::local_url_mapper::LocalUrlPortMapper;
@@ -18,7 +18,7 @@ use crate::agent::task_tool::{TaskBroker, TaskQueue};
 use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
 use crate::live_response::LiveResponseRegistry;
-use crate::mcp::McpManager;
+use crate::mcp::{MayMcpServerConfig, McpManager, McpServerInfo};
 use crate::session::SessionManager;
 use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::workspace_request::RequestWorkspaceArgs;
@@ -199,57 +199,123 @@ impl SharedSessionManager {
     }
 }
 
-pub(crate) struct McpManagerHandle<'a> {
-    guard: MutexGuard<'a, McpManager>,
+enum McpCommand {
+    ServerInfo {
+        reply: oneshot::Sender<Vec<McpServerInfo>>,
+    },
+    AddServer {
+        name: String,
+        config: MayMcpServerConfig,
+        reply: oneshot::Sender<Result<(), aither_mcp::McpError>>,
+    },
+    RemoveServer {
+        name: String,
+        reply: oneshot::Sender<Result<(), aither_mcp::McpError>>,
+    },
+    Reconnect {
+        name: String,
+        reply: oneshot::Sender<Result<(), aither_mcp::McpError>>,
+    },
 }
 
-impl std::fmt::Debug for McpManagerHandle<'_> {
+#[derive(Clone)]
+pub(crate) struct McpService {
+    tx: tokio::sync::mpsc::UnboundedSender<McpCommand>,
+}
+
+impl std::fmt::Debug for McpService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpManagerHandle").finish_non_exhaustive()
+        f.debug_struct("McpService").finish_non_exhaustive()
     }
 }
 
-impl Deref for McpManagerHandle<'_> {
-    type Target = McpManager;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl DerefMut for McpManagerHandle<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
-    }
-}
-
-pub(crate) struct SharedMcpManager {
-    inner: Mutex<McpManager>,
-}
-
-impl std::fmt::Debug for SharedMcpManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedMcpManager").finish_non_exhaustive()
-    }
-}
-
-impl SharedMcpManager {
-    pub(crate) fn new(manager: McpManager) -> Self {
-        Self {
-            inner: Mutex::new(manager),
-        }
+impl McpService {
+    pub(crate) fn spawn(mut manager: McpManager) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    McpCommand::ServerInfo { reply } => {
+                        let _ = reply.send(manager.server_info());
+                    }
+                    McpCommand::AddServer {
+                        name,
+                        config,
+                        reply,
+                    } => {
+                        let _ = reply.send(manager.add_server(name, config).await);
+                    }
+                    McpCommand::RemoveServer { name, reply } => {
+                        let _ = reply.send(manager.remove_server(&name).await);
+                    }
+                    McpCommand::Reconnect { name, reply } => {
+                        let _ = reply.send(manager.reconnect(&name).await);
+                    }
+                }
+            }
+        });
+        Self { tx }
     }
 
-    pub(crate) async fn access(&self) -> McpManagerHandle<'_> {
-        McpManagerHandle {
-            guard: self.inner.lock().await,
-        }
+    pub(crate) async fn server_info(&self) -> Vec<McpServerInfo> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(McpCommand::ServerInfo { reply: reply_tx })
+            .expect("MCP actor channel unexpectedly closed");
+        reply_rx
+            .await
+            .expect("MCP actor dropped server_info response")
+    }
+
+    pub(crate) async fn add_server(
+        &self,
+        name: String,
+        config: MayMcpServerConfig,
+    ) -> Result<(), aither_mcp::McpError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(McpCommand::AddServer {
+                name,
+                config,
+                reply: reply_tx,
+            })
+            .expect("MCP actor channel unexpectedly closed");
+        reply_rx.await.expect("MCP actor dropped add_server response")
+    }
+
+    pub(crate) async fn remove_server(
+        &self,
+        name: String,
+    ) -> Result<(), aither_mcp::McpError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(McpCommand::RemoveServer {
+                name,
+                reply: reply_tx,
+            })
+            .expect("MCP actor channel unexpectedly closed");
+        reply_rx
+            .await
+            .expect("MCP actor dropped remove_server response")
+    }
+
+    pub(crate) async fn reconnect(&self, name: String) -> Result<(), aither_mcp::McpError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(McpCommand::Reconnect {
+                name,
+                reply: reply_tx,
+            })
+            .expect("MCP actor channel unexpectedly closed");
+        reply_rx
+            .await
+            .expect("MCP actor dropped reconnect response")
     }
 }
 
 pub(crate) struct UiServerState {
     pub(crate) session_manager: SharedSessionManager,
-    pub(crate) mcp_manager: SharedMcpManager,
+    pub(crate) mcp_service: McpService,
     pub(crate) permission_approver: PermissionApprover,
     pub(crate) workspace_approver: WorkspaceApprover,
     pub(crate) ask_user_approver: AskUserApprover,
@@ -280,8 +346,8 @@ impl UiServerState {
         self.session_manager.access().await
     }
 
-    pub(crate) async fn mcp(&self) -> McpManagerHandle<'_> {
-        self.mcp_manager.access().await
+    pub(crate) fn mcp(&self) -> McpService {
+        self.mcp_service.clone()
     }
 
     pub(crate) async fn db(&self) -> crate::db::ChatDb {
