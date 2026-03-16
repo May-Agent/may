@@ -39,19 +39,13 @@ pub(super) async fn append_history_message(
     session_id: &SessionId,
     message: ChatMessage,
 ) -> anyhow::Result<()> {
-    let mut manager = state.sessions().await;
-    // Ensure the correct session is loaded as current
-    if manager.current().map(|s| &s.id) != Some(session_id) {
-        manager
-            .load_session(session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-    }
-    // Single INSERT into DB + in-memory push
-    manager
-        .append_message(message)
+    state
+        .db()
         .await
-        .map_err(anyhow::Error::from)
+        .append_chat_message(session_id.as_str(), &message)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(())
 }
 
 pub(super) async fn load_session_paths(
