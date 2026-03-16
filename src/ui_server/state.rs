@@ -1,12 +1,11 @@
 use std::future::Future;
-use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use dashmap::{DashMap, DashSet};
-use tokio::sync::{Mutex, MutexGuard, oneshot};
+use tokio::sync::{oneshot};
 use tokio::time::Instant as TokioInstant;
 
 use super::local_url_mapper::LocalUrlPortMapper;
@@ -19,7 +18,6 @@ use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
 use crate::live_response::LiveResponseRegistry;
 use crate::mcp::{MayMcpServerConfig, McpManager, McpServerInfo};
-use crate::session::SessionManager;
 use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::workspace_request::RequestWorkspaceArgs;
 
@@ -149,56 +147,6 @@ impl<T: Clone> RefreshableCache<T> {
     }
 }
 
-pub(crate) struct SessionManagerHandle<'a> {
-    guard: MutexGuard<'a, SessionManager>,
-}
-
-impl std::fmt::Debug for SessionManagerHandle<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionManagerHandle")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Deref for SessionManagerHandle<'_> {
-    type Target = SessionManager;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl DerefMut for SessionManagerHandle<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
-    }
-}
-
-pub(crate) struct SharedSessionManager {
-    inner: Mutex<SessionManager>,
-}
-
-impl std::fmt::Debug for SharedSessionManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedSessionManager")
-            .finish_non_exhaustive()
-    }
-}
-
-impl SharedSessionManager {
-    pub(crate) fn new(manager: SessionManager) -> Self {
-        Self {
-            inner: Mutex::new(manager),
-        }
-    }
-
-    pub(crate) async fn access(&self) -> SessionManagerHandle<'_> {
-        SessionManagerHandle {
-            guard: self.inner.lock().await,
-        }
-    }
-}
-
 enum McpCommand {
     ServerInfo {
         reply: oneshot::Sender<Vec<McpServerInfo>>,
@@ -316,7 +264,6 @@ impl McpService {
 pub(crate) struct UiServerState {
     pub(crate) db: crate::db::ChatDb,
     pub(crate) default_profile_id: String,
-    pub(crate) session_manager: SharedSessionManager,
     pub(crate) mcp_service: McpService,
     pub(crate) permission_approver: PermissionApprover,
     pub(crate) workspace_approver: WorkspaceApprover,
@@ -344,10 +291,6 @@ pub(crate) struct UiServerState {
 }
 
 impl UiServerState {
-    pub(crate) async fn sessions(&self) -> SessionManagerHandle<'_> {
-        self.session_manager.access().await
-    }
-
     pub(crate) fn mcp(&self) -> McpService {
         self.mcp_service.clone()
     }

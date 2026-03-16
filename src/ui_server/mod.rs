@@ -187,7 +187,6 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let state = Arc::new(UiServerState {
         db: db_for_archive.clone(),
         default_profile_id,
-        session_manager: state::SharedSessionManager::new(session_manager),
         mcp_service: state::McpService::spawn(mcp_manager),
         permission_approver,
         workspace_approver,

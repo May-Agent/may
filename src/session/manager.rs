@@ -170,6 +170,40 @@ fn map_db_message_stats(row: &crate::db::entity::messages::Model) -> Option<Chat
     }
 }
 
+pub async fn load_history_from_db(
+    db: &ChatDb,
+    session_id: &str,
+) -> Result<ChatHistory, SessionError> {
+    let db_session = db.get_session(session_id).await?;
+    let db_messages = db.get_messages(session_id).await?;
+
+    let mut history = ChatHistory::new();
+
+    if let Some(session) = db_session {
+        history.metadata.title = session.title;
+        history.metadata.model = session.model;
+    }
+
+    for msg in db_messages {
+        let role = MessageRole::from_str(&msg.role).unwrap_or(MessageRole::User);
+        let timestamp = msg
+            .timestamp
+            .as_deref()
+            .and_then(|value| Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", value).ok());
+        let stats = map_db_message_stats(&msg);
+
+        history.push(ChatMessage {
+            role,
+            content: msg.content,
+            timestamp,
+            tool_call_id: msg.tool_call_id,
+            stats,
+        });
+    }
+
+    Ok(history)
+}
+
 /// List all session summaries from a [`ChatDb`] handle.
 ///
 /// This is a standalone function that doesn't require a [`SessionManager`] lock,
@@ -349,7 +383,7 @@ impl SessionManager {
         let updated_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &db_session.updated_at)
             .unwrap_or_else(|_| Timestamp::now());
 
-        let history = self.load_history_from_db(id.as_str()).await?;
+        let history = load_history_from_db(&self.db, id.as_str()).await?;
 
         let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
         let session = Session {
@@ -441,40 +475,6 @@ impl SessionManager {
             }
         }
         Ok(())
-    }
-
-    /// Build a `ChatHistory` from database messages.
-    async fn load_history_from_db(&self, session_id: &str) -> Result<ChatHistory, SessionError> {
-        let db_session = self.db.get_session(session_id).await?;
-        let db_messages = self.db.get_messages(session_id).await?;
-
-        let mut history = ChatHistory::new();
-
-        // Set metadata from session record
-        if let Some(s) = db_session {
-            history.metadata.title = s.title;
-            history.metadata.model = s.model;
-        }
-
-        // Convert DB message rows to ChatMessage
-        for msg in db_messages {
-            let role = MessageRole::from_str(&msg.role).unwrap_or(MessageRole::User);
-            let timestamp = msg
-                .timestamp
-                .as_deref()
-                .and_then(|t| Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", t).ok());
-            let stats = map_db_message_stats(&msg);
-
-            history.push(ChatMessage {
-                role,
-                content: msg.content,
-                timestamp,
-                tool_call_id: msg.tool_call_id,
-                stats,
-            });
-        }
-
-        Ok(history)
     }
 
     /// Append a message to the current session (DB + in-memory).

@@ -1321,13 +1321,15 @@ async fn resolve_session_context(
         ));
     }
 
-    let mut manager = state.sessions().await;
-    manager
-        .load_session(&session_id)
+    let db = state.db();
+    let session = db
+        .get_session(session_id.as_str())
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| anyhow::anyhow!("Session {} not found", session_id))?;
+    let history = crate::session::load_history_from_db(&db, session_id.as_str()).await?;
 
-    let session_model = manager.current().and_then(|s| s.model.clone());
+    let session_model = session.model.clone();
     let cfg = state.config.read().await;
     let current_model = resolve_default_model(&cfg, session_model)
         .ok_or_else(|| anyhow::anyhow!("No model configured"))?;
@@ -1340,18 +1342,14 @@ async fn resolve_session_context(
     }
     drop(cfg);
 
-    let profile_model =
-        if let Some(profile_id) = manager.current().and_then(|s| s.profile_id.clone()) {
-            manager
-                .db()
-                .get_profile(&profile_id)
-                .await
-                .map_err(anyhow::Error::from)?
-        } else {
-            None
-        };
+    let profile_model = if let Some(profile_id) = session.profile_id.clone() {
+        db.get_profile(&profile_id)
+            .await
+            .map_err(anyhow::Error::from)?
+    } else {
+        None
+    };
     let profile_persona = profile_model.as_ref().and_then(|p| p.persona.clone());
-    let profile_id = profile_model.as_ref().map(|p| p.id.clone());
     let profile_environment = profile_model
         .as_ref()
         .map(|profile| {
@@ -1361,7 +1359,7 @@ async fn resolve_session_context(
         .map_err(anyhow::Error::from)?;
 
     let profile_memories = if let Some(ref profile) = profile_model {
-        let memories = crate::memory::ProfileMemories::load(manager.db(), &profile.id)
+        let memories = crate::memory::ProfileMemories::load(&db, &profile.id)
             .await
             .map_err(anyhow::Error::from)?;
         if memories.is_empty() {
@@ -1372,20 +1370,15 @@ async fn resolve_session_context(
     } else {
         None
     };
-    let runtime = manager
-        .db()
+    let runtime = db
         .get_session_runtime(session_id.as_str())
         .await
         .map_err(anyhow::Error::from)?
         .unwrap_or_default();
 
-    let history_messages = manager
-        .current()
-        .map(|s| s.history.to_aither_messages())
-        .unwrap_or_default();
+    let history_messages = history.to_aither_messages();
     let context_snapshot = if use_persisted_context_snapshot {
-        manager
-            .db()
+        db
             .get_session_context_snapshot(session_id.as_str())
             .await
             .map_err(anyhow::Error::from)?
@@ -1399,8 +1392,11 @@ async fn resolve_session_context(
     if persist_user_message {
         if take_over_alert_pending(state, &session_id).await {
             let takeover_alert = browser_takeover_alert_xml()?;
-            manager
-                .append_message(ChatMessage::hidden_context(takeover_alert.clone()))
+            db
+                .append_chat_message(
+                    session_id.as_str(),
+                    &ChatMessage::hidden_context(takeover_alert.clone()),
+                )
                 .await
                 .map_err(anyhow::Error::from)?;
             incremental_messages.push(LlmMessage::system(takeover_alert));
@@ -1412,40 +1408,35 @@ async fn resolve_session_context(
             .map(str::trim)
             .filter(|xml| !xml.is_empty())
         {
-            let hidden_context_already_present = manager.current().is_some_and(|session| {
-                session.history.messages().iter().any(|msg| {
-                    matches!(msg.role, MessageRole::HiddenContext)
-                        && msg.content == hidden_context_xml
-                })
+            let hidden_context_already_present = history.messages().iter().any(|msg| {
+                matches!(msg.role, MessageRole::HiddenContext) && msg.content == hidden_context_xml
             });
             if !hidden_context_already_present {
-                manager
-                    .append_message(ChatMessage::hidden_context(hidden_context_xml.to_string()))
+                db.append_chat_message(
+                    session_id.as_str(),
+                    &ChatMessage::hidden_context(hidden_context_xml.to_string()),
+                )
                     .await
                     .map_err(anyhow::Error::from)?;
                 incremental_messages.push(LlmMessage::system(hidden_context_xml.to_string()));
             }
         }
 
-        let needs_title = manager.current().is_some_and(|s| s.title.is_none());
+        let needs_title = session.title.is_none();
         if needs_title {
             let title = truncate_preview(&req.content);
-            manager
-                .set_current_title(title)
+            db.update_session(session_id.as_str(), Some(title.as_str()), None)
                 .await
                 .map_err(anyhow::Error::from)?;
             state.notify_ui_events();
         }
-        manager
-            .append_message(ChatMessage::user(req.content.clone()))
+        db.append_chat_message(session_id.as_str(), &ChatMessage::user(req.content.clone()))
             .await
             .map_err(anyhow::Error::from)?;
     }
 
-    let sandbox_dir = manager
-        .current()
-        .map(|s| s.sandbox_dir.clone())
-        .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+    let sandbox_dir = SessionStore::new(MayHomePaths::new(state.may_dir.clone()))
+        .sandbox_dir(session_id.as_str(), session.profile_id.as_deref());
 
     Ok(SessionContext {
         session_id,
@@ -1459,7 +1450,7 @@ async fn resolve_session_context(
         profile_memories,
         profile_model,
         profile_environment,
-        profile_id,
+        profile_id: session.profile_id,
         plan_state: runtime.plan_state,
     })
 }

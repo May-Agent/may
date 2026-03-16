@@ -23,6 +23,7 @@ pub use history::{
 pub use layout::{MayHomePaths, ProfileHomePaths, SessionPaths};
 pub use manager::{
     Session, SessionError, SessionId, SessionManager, SessionSummary, list_summaries_from_db,
+    load_history_from_db,
 };
 pub use plan::SessionPlanState;
 pub use runtime::{
