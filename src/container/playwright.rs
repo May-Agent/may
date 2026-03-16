@@ -205,7 +205,7 @@ impl BrowserManager {
         }
 
         // Clean up stale Chrome processes and lock files from previous server runs.
-        cleanup_stale_chrome(self.config.port);
+        cleanup_stale_chrome(self.config.port).await;
 
         // Find browser binary (blocking I/O → spawn_blocking)
         let browser_kind = self.config.browser;
@@ -713,44 +713,46 @@ async fn dispatch_keyboard(page: &Page, input: KeyboardInput) -> Result<(), Brow
 /// When the server exits without cleanly shutting down BrowserManager,
 /// Chrome processes survive and hold the CDP port. This function detects
 /// and kills any chromiumoxide-launched Chrome on the target port.
-fn cleanup_stale_chrome(port: u16) {
-    // Clean up singleton lock files
-    let dir = std::env::temp_dir().join("chromiumoxide-runner");
-    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-        let path = dir.join(name);
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
+async fn cleanup_stale_chrome(port: u16) {
+    let _ = tokio::task::spawn_blocking(move || {
+        // Clean up singleton lock files
+        let dir = std::env::temp_dir().join("chromiumoxide-runner");
+        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+            let path = dir.join(name);
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
         }
-    }
 
-    // Kill any Chrome processes using our port that have chromiumoxide-runner user-data-dir.
-    // This avoids killing the user's regular Chrome.
-    let Ok(output) = std::process::Command::new("lsof")
-        .args(["-ti", &format!(":{port}")])
-        .output()
-    else {
-        return;
-    };
-    let pids_str = String::from_utf8_lossy(&output.stdout);
-    for pid_str in pids_str.split_whitespace() {
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        // Verify it's a chromiumoxide-launched Chrome before killing
-        let Ok(cmdline) = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "args="])
+        // Kill any Chrome processes using our port that have chromiumoxide-runner user-data-dir.
+        // This avoids killing the user's regular Chrome.
+        let Ok(output) = std::process::Command::new("lsof")
+            .args(["-ti", &format!(":{port}")])
             .output()
         else {
-            continue;
+            return;
         };
-        let args = String::from_utf8_lossy(&cmdline.stdout);
-        if args.contains("chromiumoxide-runner") {
-            tracing::info!(pid, "Killing stale Chrome process on port {port}");
-            let _ = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status();
+        let pids_str = String::from_utf8_lossy(&output.stdout);
+        for pid_str in pids_str.split_whitespace() {
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
+            let Ok(cmdline) = std::process::Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "args="])
+                .output()
+            else {
+                continue;
+            };
+            let args = String::from_utf8_lossy(&cmdline.stdout);
+            if args.contains("chromiumoxide-runner") {
+                tracing::info!(pid, "Killing stale Chrome process on port {port}");
+                let _ = std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .status();
+            }
         }
-    }
+    })
+    .await;
 }
 
 /// Find the browser binary path. Runs in spawn_blocking since it does filesystem I/O.
