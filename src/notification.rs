@@ -3,8 +3,10 @@
 //! Handles VAPID keypair generation/loading, push subscription management,
 //! and sending notifications to all subscribed browsers.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
+use async_fs;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::EncodePrivateKey;
 use web_push::{
@@ -48,8 +50,8 @@ pub enum NotificationError {
 
 /// Web Push notification manager.
 pub struct NotificationManager {
-    /// Path to the VAPID private key PEM file.
-    pem_path: PathBuf,
+    /// Cached VAPID private key PEM bytes.
+    vapid_pem: Arc<[u8]>,
     /// VAPID public key as uncompressed point bytes (65 bytes), base64url-encoded.
     public_key_base64url: String,
     /// Database for subscription storage.
@@ -62,25 +64,26 @@ impl NotificationManager {
     /// Create a new notification manager.
     ///
     /// Loads or generates a VAPID keypair at `may_dir/vapid_private.pem`.
-    pub fn new(may_dir: &Path, db: ChatDb) -> Result<Self, NotificationError> {
+    pub async fn new(may_dir: &Path, db: ChatDb) -> Result<Self, NotificationError> {
         let pem_path = may_dir.join("vapid_private.pem");
 
         // Generate keypair if it doesn't exist
-        if !pem_path.exists() {
-            Self::generate_vapid_keypair(&pem_path)?;
+        if async_fs::metadata(&pem_path).await.is_err() {
+            Self::generate_vapid_keypair(&pem_path).await?;
             tracing::info!("Generated new VAPID keypair at {}", pem_path.display());
         }
 
         // Read PEM and derive public key
-        let pem_contents = std::fs::read_to_string(&pem_path)?;
+        let pem_contents = async_fs::read_to_string(&pem_path).await?;
         let public_key_base64url = Self::derive_public_key_from_pem(&pem_contents)?;
+        let vapid_pem: Arc<[u8]> = pem_contents.into_bytes().into();
 
         let client = IsahcWebPushClient::new().map_err(|e| {
             NotificationError::P256Key(format!("Failed to create push client: {e}"))
         })?;
 
         Ok(Self {
-            pem_path,
+            vapid_pem,
             public_key_base64url,
             db,
             client,
@@ -88,12 +91,12 @@ impl NotificationManager {
     }
 
     /// Generate a new VAPID EC P-256 keypair and write the private key as PEM.
-    fn generate_vapid_keypair(pem_path: &Path) -> Result<(), NotificationError> {
+    async fn generate_vapid_keypair(pem_path: &Path) -> Result<(), NotificationError> {
         let signing_key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
         let pem = signing_key
             .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
             .map_err(|_| NotificationError::Pkcs8)?;
-        std::fs::write(pem_path, pem.as_bytes())?;
+        async_fs::write(pem_path, pem.as_bytes()).await?;
         Ok(())
     }
 
@@ -138,7 +141,6 @@ impl NotificationManager {
             return Ok(0);
         }
 
-        let pem_bytes = std::fs::read(&self.pem_path)?;
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| NotificationError::P256Key(format!("Invalid payload JSON: {e}")))?;
 
@@ -148,7 +150,7 @@ impl NotificationManager {
         for sub in &subscriptions {
             let sub_info = SubscriptionInfo::new(&sub.endpoint, &sub.p256dh, &sub.auth);
 
-            let sig_builder = match VapidSignatureBuilder::from_pem(pem_bytes.as_slice(), &sub_info)
+            let sig_builder = match VapidSignatureBuilder::from_pem(self.vapid_pem.as_ref(), &sub_info)
             {
                 Ok(b) => b,
                 Err(e) => {
