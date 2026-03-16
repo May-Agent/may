@@ -361,10 +361,7 @@ async fn build_session_mentions_xml(
         return Ok(None);
     }
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     let mut entries = Vec::new();
     for session_id in mention_ids {
