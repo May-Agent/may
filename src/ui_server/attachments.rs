@@ -554,7 +554,7 @@ async fn save_large_pasted_text(
 }
 
 async fn generate_pasted_text_filename(state: &UiServerState, text: &str) -> String {
-    let config = state.config.read().await;
+    let config = state.config_snapshot();
     let snippet: String = text.chars().take(600).collect();
 
     let generated = generate_session_title(&config, &snippet, "").await;

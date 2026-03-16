@@ -27,7 +27,7 @@ pub(super) async fn list_sessions(
     let db = state.db();
     let summaries = list_summaries_from_db(&db).await.map_err(internal_error)?;
 
-    let config = state.config.read().await;
+    let config = state.config_snapshot();
     let mut sessions = Vec::with_capacity(summaries.len());
     for s in summaries {
         let model = resolve_default_model(&config, s.model.clone())
@@ -61,7 +61,7 @@ pub(super) async fn get_session(
         .map_err(internal_error)?
         .unwrap_or_default();
 
-    let config = state.config.read().await;
+    let config = state.config_snapshot();
     let model = resolve_default_model(&config, summary.model.clone())
         .ok_or_else(|| internal_error(format!("no model resolved for session {id}")))?;
 
@@ -220,7 +220,7 @@ pub(super) async fn create_session(
 ) -> SkyResult<Json<ApiSession>> {
     let requested_profile_id = req.profile_id.clone();
     let model = {
-        let config = state.config.read().await;
+        let config = state.config_snapshot();
         req.model
             .or_else(|| config.last_model.clone())
             .or_else(|| preferred_advanced_model(&config))
@@ -319,7 +319,7 @@ pub(super) async fn update_session(
     }
 
     let model = {
-        let cfg = state.config.read().await;
+        let cfg = state.config_snapshot();
         resolve_default_model(&cfg, next_model.clone()).ok_or_else(|| {
             internal_error(format!("no model resolved for session {}", session.id))
         })?

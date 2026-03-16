@@ -38,7 +38,7 @@ fn scoped_skill_manager(state: &UiServerState, profile_id: &str) -> SkillManager
 pub(super) async fn get_ui_config(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<UiConfigResponse>> {
-    let config = state.config.read().await;
+    let config = state.config_snapshot();
     Ok(Json(UiConfigResponse {
         ssh_servers: config.ssh_servers.clone(),
         max_iterations: config.max_iterations,
@@ -50,7 +50,7 @@ pub(super) async fn get_ui_config(
 pub(super) async fn get_full_config(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<UiFullConfig>> {
-    let config = state.config.read().await;
+    let config = state.config_snapshot();
     Ok(Json(build_ui_full_config(&config)))
 }
 
@@ -107,9 +107,7 @@ pub(super) async fn save_full_config(
     Json(req): Json<UiFullConfig>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let updated = {
-        let mut config = state.config.write().await;
-
+    let updated = state.update_config(|config| {
         let mut provider_map = std::collections::HashMap::new();
         for p in req.providers {
             let mut instance = ProviderInstance::new(p.provider_type);
@@ -158,8 +156,7 @@ pub(super) async fn save_full_config(
             .public_url
             .filter(|value| !value.trim().is_empty());
         config.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
-        config.clone()
-    };
+    });
 
     updated
         .preferences
@@ -172,7 +169,7 @@ pub(super) async fn save_full_config(
     state.task_runtime.set_ssh_servers(ssh_servers);
     state
         .task_runtime
-        .set_network_policy(state.config.read().await.preferences.network_policy.clone())
+        .set_network_policy(state.config_snapshot().preferences.network_policy.clone())
         .map_err(internal_error)?;
     super::remote_access::sync_remote_access_from_state(&state)
         .await
@@ -228,14 +225,12 @@ pub(super) async fn add_ssh_server(
     Json(req): Json<SshServerRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let updated = {
-        let mut config = state.config.write().await;
+    let updated = state.update_config(|config| {
         config.upsert_ssh_server(SshServerConfig {
             name: req.name,
             target: req.target,
         });
-        config.clone()
-    };
+    });
     let ssh_servers = updated.ssh_servers.clone();
     save_config_to_disk(updated).await.map_err(internal_error)?;
     state.task_runtime.set_ssh_servers(ssh_servers);
@@ -248,11 +243,9 @@ pub(super) async fn remove_ssh_server(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
-    let updated = {
-        let mut config = state.config.write().await;
+    let updated = state.update_config(|config| {
         let _ = config.remove_ssh_server(name);
-        config.clone()
-    };
+    });
     let ssh_servers = updated.ssh_servers.clone();
     save_config_to_disk(updated).await.map_err(internal_error)?;
     state.task_runtime.set_ssh_servers(ssh_servers);
