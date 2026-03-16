@@ -1007,6 +1007,7 @@ async fn resolve_agent_environment_for_tui(
     let container_manager = ContainerManager::new(Arc::new(runtime), may_dir.to_path_buf());
 
     let default_image_tag = crate::container::profile::default_image_tag(may_dir, profile)
+        .await
         .map_err(|e| anyhow::anyhow!("Invalid container profile image tag: {e}"))?;
     let image_spec =
         crate::container::profile::image_spec_for_profile(may_dir, profile, &default_image_tag)

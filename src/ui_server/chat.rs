@@ -1489,6 +1489,7 @@ async fn setup_agent_environment(
                     })?;
             let default_image_tag =
                 crate::container::profile::default_image_tag(&state.may_dir, profile)
+                    .await
                     .map_err(|e| anyhow::anyhow!("Invalid container profile image tag: {e}"))?;
 
             let image_spec = crate::container::profile::image_spec_for_profile(

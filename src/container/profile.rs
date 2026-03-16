@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use aither_sandbox::{ContainerImageSpec, MountSpec};
+use async_fs;
+use futures_lite::{StreamExt, io::AsyncReadExt};
 
 use super::{ContainerError, image::MAY_IMAGE_TAG};
 use crate::db::entity::profiles;
@@ -111,7 +112,7 @@ fn normalize_path(context_dir: &Path, configured: &str) -> PathBuf {
 ///
 /// Profiles without a custom Dockerfile share the global May workspace image to
 /// avoid duplicate builds across `daily` / `work` style profiles.
-pub fn default_image_tag(
+pub async fn default_image_tag(
     may_dir: &Path,
     profile: &profiles::Model,
 ) -> Result<String, ContainerError> {
@@ -127,7 +128,7 @@ pub fn default_image_tag(
     let uses_custom_dockerfile = parse_preferences(profile)?
         .and_then(|preferences| preferences.dockerfile)
         .is_some_and(|dockerfile| !dockerfile.trim().is_empty());
-    let context_hash = container_context_hash_hex(may_dir)?;
+    let context_hash = container_context_hash_hex(may_dir).await?;
     let repo = MAY_IMAGE_TAG
         .split(':')
         .next()
@@ -144,54 +145,69 @@ pub fn default_image_tag(
     Ok(format!("{repo}:{context_hash}"))
 }
 
-fn container_context_hash_hex(may_dir: &Path) -> Result<String, ContainerError> {
+async fn container_context_hash_hex(may_dir: &Path) -> Result<String, ContainerError> {
     let context_dir = may_dir.join("container");
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_path_recursive(&context_dir, &context_dir, &mut hasher)?;
+    hash_path_recursive(&context_dir, &context_dir, &mut hasher).await?;
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-fn hash_path_recursive(
+async fn hash_path_recursive(
     root: &Path,
     path: &Path,
     hasher: &mut std::collections::hash_map::DefaultHasher,
 ) -> Result<(), ContainerError> {
-    let metadata = std::fs::metadata(path)?;
-    if metadata.is_dir() {
-        let mut entries = BTreeMap::<String, PathBuf>::new();
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            entries.insert(name, entry.path());
-        }
-        for (name, child_path) in entries {
-            "dir-entry".hash(hasher);
-            name.hash(hasher);
-            hash_path_recursive(root, &child_path, hasher)?;
-        }
-        return Ok(());
+    enum Pending {
+        DirEntry(String),
+        Path(PathBuf),
     }
 
-    if !metadata.is_file() {
-        return Ok(());
-    }
+    let mut stack = vec![Pending::Path(path.to_path_buf())];
+    while let Some(item) = stack.pop() {
+        match item {
+            Pending::DirEntry(name) => {
+                "dir-entry".hash(hasher);
+                name.hash(hasher);
+            }
+            Pending::Path(path) => {
+                let metadata = async_fs::metadata(&path).await?;
+                if metadata.is_dir() {
+                    let mut entries = BTreeMap::<String, PathBuf>::new();
+                    let mut read_dir = async_fs::read_dir(&path).await?;
+                    while let Some(entry) = read_dir.next().await {
+                        let entry = entry?;
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        entries.insert(name, entry.path());
+                    }
+                    for (name, child_path) in entries.into_iter().rev() {
+                        stack.push(Pending::Path(child_path));
+                        stack.push(Pending::DirEntry(name));
+                    }
+                    continue;
+                }
 
-    "file".hash(hasher);
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .hash(hasher);
+                if !metadata.is_file() {
+                    continue;
+                }
 
-    let mut file = std::fs::File::open(path)?;
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+                "file".hash(hasher);
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .hash(hasher);
+
+                let mut file = async_fs::File::open(&path).await?;
+                let mut buffer = [0_u8; 16 * 1024];
+                loop {
+                    let read = file.read(&mut buffer).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    buffer[..read].hash(hasher);
+                }
+            }
         }
-        buffer[..read].hash(hasher);
     }
-
     Ok(())
 }
 
@@ -306,22 +322,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn default_image_tag_uses_shared_tag_without_custom_dockerfile() {
+    #[tokio::test]
+    async fn default_image_tag_uses_shared_tag_without_custom_dockerfile() {
         let profile = profile_with_preferences("{}");
         let may_dir = make_may_dir_with_container_context();
-        let tag = default_image_tag(may_dir.path(), &profile).expect("default tag");
+        let tag = default_image_tag(may_dir.path(), &profile)
+            .await
+            .expect("default tag");
         assert!(tag.starts_with("may-workspace:"));
         assert_eq!(tag.split(':').count(), 2);
     }
 
-    #[test]
-    fn default_image_tag_uses_profile_tag_with_custom_dockerfile() {
+    #[tokio::test]
+    async fn default_image_tag_uses_profile_tag_with_custom_dockerfile() {
         let profile = profile_with_preferences(
             r#"{"container":{"dockerfile":"custom/Dockerfile.profile","mounts":[]}}"#,
         );
         let may_dir = make_may_dir_with_container_context();
-        let tag = default_image_tag(may_dir.path(), &profile).expect("default tag");
+        let tag = default_image_tag(may_dir.path(), &profile)
+            .await
+            .expect("default tag");
         assert!(tag.starts_with("may-workspace-daily:"));
         assert_eq!(tag.split(':').count(), 2);
     }
