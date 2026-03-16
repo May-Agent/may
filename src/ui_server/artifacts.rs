@@ -878,10 +878,7 @@ async fn resolve_container_proxy_target(
         })?
         .clone();
 
-    let db = {
-        let manager = state.sessions().await;
-        manager.db().clone()
-    };
+    let db = state.db();
 
     let session = db
         .get_session(session_id)
