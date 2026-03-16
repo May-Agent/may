@@ -51,17 +51,15 @@ impl LocalSessionRuntime {
             .get(session_id.as_str())
             .await
             .map_err(anyhow::Error::from)?;
-        app.queue.replace(
-            runtime
-                .pending_immediate
-                .map(pending_message_from_runtime)
-                .transpose()?,
-            runtime
-                .queued_messages
-                .into_iter()
-                .map(pending_message_from_runtime)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-        );
+        let pending_immediate = match runtime.pending_immediate {
+            Some(message) => Some(pending_message_from_runtime(message).await?),
+            None => None,
+        };
+        let mut queued_messages = Vec::with_capacity(runtime.queued_messages.len());
+        for message in runtime.queued_messages {
+            queued_messages.push(pending_message_from_runtime(message).await?);
+        }
+        app.queue.replace(pending_immediate, queued_messages);
         Ok(())
     }
 
@@ -80,17 +78,15 @@ impl LocalSessionRuntime {
             )
             .await
             .map_err(anyhow::Error::from)?;
-        app.queue.replace(
-            runtime
-                .pending_immediate
-                .map(pending_message_from_runtime)
-                .transpose()?,
-            runtime
-                .queued_messages
-                .into_iter()
-                .map(pending_message_from_runtime)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-        );
+        let pending_immediate = match runtime.pending_immediate {
+            Some(message) => Some(pending_message_from_runtime(message).await?),
+            None => None,
+        };
+        let mut queued_messages = Vec::with_capacity(runtime.queued_messages.len());
+        for message in runtime.queued_messages {
+            queued_messages.push(pending_message_from_runtime(message).await?);
+        }
+        app.queue.replace(pending_immediate, queued_messages);
         Ok(())
     }
 
@@ -103,9 +99,11 @@ impl LocalSessionRuntime {
             .runtime_service
             .take_next_dispatchable(session_id.as_str())
             .await
-            .map_err(anyhow::Error::from)?
-            .map(pending_message_from_runtime)
-            .transpose()?;
+            .map_err(anyhow::Error::from)?;
+        let next = match next {
+            Some(message) => Some(pending_message_from_runtime(message).await?),
+            None => None,
+        };
         self.sync_app_queue(app, session_id).await?;
         Ok(next)
     }
@@ -329,16 +327,16 @@ fn pending_message_to_runtime(
     })
 }
 
-fn pending_message_from_runtime(
+async fn pending_message_from_runtime(
     message: crate::session::PendingUserMessage,
 ) -> anyhow::Result<PendingMessage> {
+    let mut attachments = Vec::with_capacity(message.attachments.len());
+    for attachment in message.attachments {
+        attachments.push(tui_attachment_from_persisted(attachment).await?);
+    }
     Ok(PendingMessage {
         content: message.content,
-        attachments: message
-            .attachments
-            .into_iter()
-            .map(tui_attachment_from_persisted)
-            .collect::<anyhow::Result<Vec<_>>>()?,
+        attachments,
         queued_at: message
             .created_at
             .parse()
@@ -389,14 +387,14 @@ fn persisted_attachment_from_tui(
     }
 }
 
-fn tui_attachment_from_persisted(
+async fn tui_attachment_from_persisted(
     attachment: crate::session::PersistedAttachment,
 ) -> anyhow::Result<Attachment> {
     match attachment.attachment_type.as_str() {
         "image" => {
             let path = path_from_attachment_url(&attachment.url)?;
-            let data = if path.exists() {
-                std::fs::read(&path).map_err(anyhow::Error::from)?
+            let data = if async_fs::metadata(&path).await.is_ok() {
+                async_fs::read(&path).await.map_err(anyhow::Error::from)?
             } else if let Some(data_url) = attachment.upload_data_url.as_deref() {
                 decode_data_url(data_url)?
             } else {
@@ -414,7 +412,9 @@ fn tui_attachment_from_persisted(
                 content
             } else {
                 let path = path_from_attachment_url(&attachment.url)?;
-                std::fs::read_to_string(path).map_err(anyhow::Error::from)?
+                async_fs::read_to_string(path)
+                    .await
+                    .map_err(anyhow::Error::from)?
             },
             saved_path: if attachment.url.starts_with("file://") {
                 Some(path_from_attachment_url(&attachment.url)?)
