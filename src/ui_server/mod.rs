@@ -182,7 +182,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
 
     let state = Arc::new(UiServerState {
         session_manager: state::SharedSessionManager::new(session_manager),
-        mcp_manager: state::SharedMcpManager::new(mcp_manager),
+        mcp_service: state::McpService::spawn(mcp_manager),
         permission_approver,
         workspace_approver,
         ask_user_approver,

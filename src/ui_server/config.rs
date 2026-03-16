@@ -265,22 +265,21 @@ pub(super) async fn remove_ssh_server(
 pub(super) async fn list_mcp_servers(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<crate::mcp::McpServerInfo>>> {
-    let manager = state.mcp().await;
-    Ok(Json(manager.server_info()))
+    Ok(Json(state.mcp().server_info().await))
 }
 
 pub(super) async fn add_mcp_server(
     Json(req): Json<McpAddRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let mut manager = state.mcp().await;
     let config = MayMcpServerConfig {
         command: req.command,
         args: req.args,
         url: req.url,
         env: std::collections::HashMap::new(),
     };
-    manager
+    state
+        .mcp()
         .add_server(req.name, config)
         .await
         .map_err(internal_error)?;
@@ -292,8 +291,11 @@ pub(super) async fn remove_mcp_server(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
-    let mut manager = state.mcp().await;
-    manager.remove_server(name).await.map_err(internal_error)?;
+    state
+        .mcp()
+        .remove_server(name.to_string())
+        .await
+        .map_err(internal_error)?;
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -302,8 +304,11 @@ pub(super) async fn reconnect_mcp_server(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
-    let mut manager = state.mcp().await;
-    manager.reconnect(name).await.map_err(internal_error)?;
+    state
+        .mcp()
+        .reconnect(name.to_string())
+        .await
+        .map_err(internal_error)?;
     Ok(Json(ApiHealth { ok: true }))
 }
 
