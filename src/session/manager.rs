@@ -1,8 +1,8 @@
 //! Session management for May agent.
 
+use async_fs;
 use jiff::Timestamp;
 use petname::{Generator, Petnames};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::store::SandboxResourceLayout;
@@ -216,7 +216,7 @@ impl SessionManager {
     pub async fn new() -> Result<Self, SessionError> {
         let may_dir = MayConfig::may_dir().map_err(|_| SessionError::NoHomeDir)?;
         let home_paths = MayHomePaths::new(may_dir.clone());
-        fs::create_dir_all(home_paths.sessions_dir())?;
+        async_fs::create_dir_all(home_paths.sessions_dir()).await?;
 
         // Ensure bundle is extracted and symlinks created
         Bundle::ensure_extracted(&may_dir).await?;
@@ -224,7 +224,7 @@ impl SessionManager {
         // Create MEMORY.md if it doesn't exist
         let memory_path = home_paths.memory_file();
         if !memory_path.exists() {
-            fs::write(&memory_path, "")?;
+            async_fs::write(&memory_path, "").await?;
         }
 
         let store = SessionStore::new(home_paths.clone());
