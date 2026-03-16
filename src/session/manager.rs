@@ -170,19 +170,6 @@ fn map_db_message_stats(row: &crate::db::entity::messages::Model) -> Option<Chat
     }
 }
 
-fn map_chat_stats_to_db_params(stats: &ChatMessageStats) -> crate::db::MessageStatsParams {
-    crate::db::MessageStatsParams {
-        provider_id: stats.provider_id.clone(),
-        prompt_tokens: stats.prompt_tokens,
-        completion_tokens: stats.completion_tokens,
-        total_tokens: stats.total_tokens,
-        cache_read_tokens: stats.cache_read_tokens,
-        cache_write_tokens: stats.cache_write_tokens,
-        context_window: stats.context_window,
-        elapsed_ms: stats.elapsed_ms,
-    }
-}
-
 /// List all session summaries from a [`ChatDb`] handle.
 ///
 /// This is a standalone function that doesn't require a [`SessionManager`] lock,
@@ -497,20 +484,7 @@ impl SessionManager {
         let session = self.current.as_mut().ok_or(SessionError::NoActiveSession)?;
         let session_id = session.id.as_str().to_string();
 
-        let ts_string = message.timestamp.map(|t| t.to_string());
-        let stats = message.stats.as_ref().map(map_chat_stats_to_db_params);
-
-        // Write to database
-        self.db
-            .append_message(
-                &session_id,
-                message.role.clone(),
-                &message.content,
-                ts_string.as_deref(),
-                message.tool_call_id.as_deref(),
-                stats.as_ref(),
-            )
-            .await?;
+        self.db.append_chat_message(&session_id, &message).await?;
 
         // Update in-memory history
         session.history.push(message);
@@ -540,7 +514,7 @@ impl SessionManager {
         last_assistant.stats = Some(stats.clone());
 
         self.db
-            .set_latest_assistant_stats(&session_id, &map_chat_stats_to_db_params(&stats))
+            .set_latest_assistant_chat_stats(&session_id, &stats)
             .await?;
         Ok(())
     }

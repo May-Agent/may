@@ -16,9 +16,9 @@ use sea_orm::{
 };
 
 use crate::session::{
-    BrowserInteractionState, MessageRole, PendingUserMessage, PersistedAskUserRequest,
-    PersistedPermissionRequest, PersistedWorkspaceRequest, SessionInteractionState,
-    SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
+    BrowserInteractionState, ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage,
+    PersistedAskUserRequest, PersistedPermissionRequest, PersistedWorkspaceRequest,
+    SessionInteractionState, SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
 };
 use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 use crate::xml_fragment::XmlFragment;
@@ -194,6 +194,19 @@ fn session_not_found_db_error(session_id: &str) -> ChatDbError {
         "Session not found: ",
         session_id,
     )))
+}
+
+fn message_stats_params_from_chat_stats(stats: &ChatMessageStats) -> MessageStatsParams {
+    MessageStatsParams {
+        provider_id: stats.provider_id.clone(),
+        prompt_tokens: stats.prompt_tokens,
+        completion_tokens: stats.completion_tokens,
+        total_tokens: stats.total_tokens,
+        cache_read_tokens: stats.cache_read_tokens,
+        cache_write_tokens: stats.cache_write_tokens,
+        context_window: stats.context_window,
+        elapsed_ms: stats.elapsed_ms,
+    }
 }
 
 /// Chat history database.
@@ -1481,6 +1494,24 @@ impl ChatDb {
         Ok(model)
     }
 
+    pub async fn append_chat_message(
+        &self,
+        session_id: &str,
+        message: &ChatMessage,
+    ) -> Result<messages::Model, ChatDbError> {
+        let timestamp = message.timestamp.map(|value| value.to_string());
+        let stats = message.stats.as_ref().map(message_stats_params_from_chat_stats);
+        self.append_message(
+            session_id,
+            message.role.clone(),
+            &message.content,
+            timestamp.as_deref(),
+            message.tool_call_id.as_deref(),
+            stats.as_ref(),
+        )
+        .await
+    }
+
     /// Update usage/context stats on the latest assistant message in a session.
     pub async fn set_latest_assistant_stats(
         &self,
@@ -1546,6 +1577,15 @@ impl ChatDb {
         active.elapsed_ms = Set(elapsed_ms);
         active.update(&self.conn).await?;
         Ok(())
+    }
+
+    pub async fn set_latest_assistant_chat_stats(
+        &self,
+        session_id: &str,
+        stats: &ChatMessageStats,
+    ) -> Result<(), ChatDbError> {
+        self.set_latest_assistant_stats(session_id, &message_stats_params_from_chat_stats(stats))
+            .await
     }
 
     /// Get all messages for a session, ordered by id.

@@ -1166,31 +1166,28 @@ async fn persist_latest_assistant_stats(
     model_context_window: Option<u32>,
     elapsed_ms: u64,
 ) -> anyhow::Result<()> {
-    let mut manager = state.sessions().await;
-    if manager.current().map(|s| &s.id) != Some(session_id) {
-        manager
-            .load_session(session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-    }
-
     let total_tokens = usage.total_tokens.or_else(|| {
         usage
             .prompt_tokens
             .zip(usage.completion_tokens)
             .map(|(p, c)| p + c)
     });
-    manager
-        .set_latest_assistant_stats(ChatMessageStats {
-            provider_id: Some(provider_id.to_string()),
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-            total_tokens,
-            cache_read_tokens: usage.cache_read_tokens,
-            cache_write_tokens: usage.cache_write_tokens,
-            context_window: model_context_window,
-            elapsed_ms: Some(elapsed_ms),
-        })
+    state
+        .db()
+        .await
+        .set_latest_assistant_chat_stats(
+            session_id.as_str(),
+            &ChatMessageStats {
+                provider_id: Some(provider_id.to_string()),
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                context_window: model_context_window,
+                elapsed_ms: Some(elapsed_ms),
+            },
+        )
         .await
         .map_err(anyhow::Error::from)
 }
