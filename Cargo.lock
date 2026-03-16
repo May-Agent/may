@@ -119,6 +119,7 @@ dependencies = [
  "aither-webfetch",
  "aither-websearch",
  "anyhow",
+ "arc-swap",
  "askama 0.14.0",
  "async-channel 2.5.0",
  "async-fs",
