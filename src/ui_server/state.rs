@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::{DashMap, DashSet};
 use tokio::sync::{oneshot};
 use tokio::time::Instant as TokioInstant;
@@ -272,7 +272,7 @@ pub(crate) struct UiServerState {
     pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,
     pub(crate) models_cache: RefreshableCache<ModelsResponse>,
     pub(crate) provider_models_cache: RefreshableCache<ProviderModelsResponse>,
-    pub(crate) config: tokio::sync::RwLock<MayConfig>,
+    pub(crate) config: ArcSwap<MayConfig>,
     pub(crate) ui_events_notify: Arc<tokio::sync::Notify>,
     pub(crate) container_prepare_statuses: DashMap<String, ContainerPrepareStatus>,
     pub(crate) container_prepare_inflight: DashSet<String>,
@@ -297,6 +297,17 @@ impl UiServerState {
 
     pub(crate) fn db(&self) -> crate::db::ChatDb {
         self.db.clone()
+    }
+
+    pub(crate) fn config_snapshot(&self) -> Arc<MayConfig> {
+        self.config.load_full()
+    }
+
+    pub(crate) fn update_config<R>(&self, update: impl FnOnce(&mut MayConfig) -> R) -> MayConfig {
+        let mut config = (*self.config.load_full()).clone();
+        let _ = update(&mut config);
+        self.config.store(Arc::new(config.clone()));
+        config
     }
 }
 

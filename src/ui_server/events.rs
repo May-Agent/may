@@ -237,7 +237,7 @@ async fn emit_config_if_changed(
     last_config_sig: &mut String,
 ) -> bool {
     let config_payload = {
-        let config = state.config.read().await;
+        let config = state.config_snapshot();
         ConfigEventPayload {
             ui_font: config.appearance.font.clone(),
             ui_theme: config.appearance.theme.clone(),

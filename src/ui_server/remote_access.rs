@@ -127,7 +127,7 @@ impl RemoteAccessManager {
 pub(crate) async fn sync_remote_access_from_state(
     state: &UiServerState,
 ) -> Result<(), crate::db::ChatDbError> {
-    let config = state.config.read().await.remote_access.clone();
+    let config = state.config_snapshot().remote_access.clone();
     let db = state.db();
     let has_local_profile = has_local_profile(&db).await?;
     if let Err(error) = state

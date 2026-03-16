@@ -68,7 +68,7 @@ async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
         }
     }
 
-    let config = state.config.read().await.clone();
+    let config = (*state.config_snapshot()).clone();
     let Some(generated_title) =
         generate_session_title(&config, &task.user_message, &task.assistant_response).await
     else {

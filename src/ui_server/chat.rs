@@ -1330,7 +1330,7 @@ async fn resolve_session_context(
     let history = crate::session::load_history_from_db(&db, session_id.as_str()).await?;
 
     let session_model = session.model.clone();
-    let cfg = state.config.read().await;
+    let cfg = state.config_snapshot();
     let current_model = resolve_default_model(&cfg, session_model)
         .ok_or_else(|| anyhow::anyhow!("No model configured"))?;
     let provider_candidate_count = crate::agent::provider_candidate_count(&cfg, &current_model);
@@ -1518,7 +1518,7 @@ async fn setup_agent_environment(
                     tracing::warn!(error = %e, "Failed to auto-start browser for container session");
                     None
                 } else {
-                    let config = state.config.read().await;
+                    let config = state.config_snapshot();
                     let port = config.playwright.port.to_string();
                     let endpoint = join_text(&["http://", host_gateway, ":", port.as_str()]);
                     extra_env.push(prefixed_text("BROWSER_CDP_ENDPOINT=", endpoint.as_str()));
@@ -1565,7 +1565,7 @@ async fn setup_agent_environment(
                 .profile_model
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("remote profile model is missing"))?;
-            let config = state.config.read().await;
+            let config = state.config_snapshot();
             let ssh_server =
                 crate::remote_profile::resolve_remote_profile_server(profile, &config.ssh_servers)
                     .map_err(|error| anyhow::anyhow!(error))?;
@@ -1659,7 +1659,7 @@ async fn prepare_agent_for_request(
     let (environment, location) = setup_agent_environment(state, &ctx).await?;
     let brokers = build_tool_brokers(state, &ctx.session_id);
 
-    let config = state.config.read().await;
+    let config = state.config_snapshot();
     let mut agent = MayAgent::from_config_with_model_and_permissions(
         &config,
         ctx.sandbox_dir,

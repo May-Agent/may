@@ -195,7 +195,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         run_cancellation_registry: SessionRunCancellationRegistry::new(),
         models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         provider_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
-        config: tokio::sync::RwLock::new(config),
+        config: arc_swap::ArcSwap::from_pointee(config),
         ui_events_notify,
         container_prepare_statuses: Default::default(),
         container_prepare_inflight: Default::default(),
@@ -436,7 +436,7 @@ async fn get_request_logs(
 }
 
 async fn models(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<ModelsResponse>> {
-    let config = state.config.read().await.clone();
+    let config = (*state.config_snapshot()).clone();
     let result = state
         .models_cache
         .get_or_refresh(move || async move {
@@ -525,7 +525,7 @@ fn build_models_response(
 async fn models_by_provider(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ProviderModelsResponse>> {
-    let config = state.config.read().await.clone();
+    let config = (*state.config_snapshot()).clone();
     let result = state
         .provider_models_cache
         .get_or_refresh(move || async move {
