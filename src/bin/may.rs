@@ -606,10 +606,11 @@ fn render_oneshot_event(
             name,
             matched_trigger,
             allowed_tools,
+            resource_paths,
         }) => {
             writeln!(
                 stderr,
-                "[skill_activated] name={name} matched_trigger={matched_trigger:?} allowed_tools={allowed_tools:?}"
+                "[skill_activated] name={name} matched_trigger={matched_trigger:?} allowed_tools={allowed_tools:?} resource_paths={resource_paths:?}"
             )?;
         }
         Ok(AgentEvent::Usage(usage)) => {
