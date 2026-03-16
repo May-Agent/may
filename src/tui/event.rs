@@ -49,6 +49,9 @@ pub enum AppEvent {
     /// Profile sessions loaded (pinned/regular/archived groups)
     ProfileSessionsLoaded(Result<ProfileSessions, anyhow::Error>),
 
+    /// Background config save completed.
+    ConfigSaved(Result<(), anyhow::Error>),
+
     // ─── Image loading ────────────────────────────────────────────────
     /// Image fetch finished from URL (data=None means fetch failed)
     ImageFetchResult { url: String, data: Option<Vec<u8>> },
