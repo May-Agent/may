@@ -212,7 +212,9 @@ impl App {
         event_tx: EventSender,
         image_support: Option<super::ui::image::TerminalImageSupport>,
     ) -> anyhow::Result<Self> {
-        let mut config = MayConfig::load().context("Failed to load config")?;
+        let mut config = unblock(MayConfig::load)
+            .await
+            .context("Failed to load config")?;
         let mut session_manager = SessionManager::new().await?;
 
         // Auto-detect API keys from environment variables
@@ -241,7 +243,12 @@ impl App {
                     }
                 }
             }
-            if let Err(e) = config.save() {
+            if let Err(e) = unblock({
+                let config = config.clone();
+                move || config.save()
+            })
+            .await
+            {
                 tracing::error!("Failed to save config after env detection: {}", e);
             }
         }
