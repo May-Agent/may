@@ -220,6 +220,7 @@ async fn run_agent_prompt(
     command_rx: &Receiver<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
 ) -> bool {
+    agent.sync_runtime_context().await;
     let mut stream = std::pin::pin!(agent.run(prompt, attachments));
 
     loop {

@@ -775,7 +775,6 @@ impl RuntimeSystemContext {
     }
 
     fn reconcile(&mut self, context: &mut aither_agent::Context) {
-        self.refresh_memory_file();
         let memory = build_memory_context(&self.last_memory_content);
         reconcile_system_block(context, Some(&memory));
         reconcile_system_block(context, self.workspace.as_ref());
@@ -789,13 +788,16 @@ impl RuntimeSystemContext {
         reconcile_system_block(context, self.platform.as_ref());
     }
 
-    fn refresh_memory_file(&mut self) {
-        let memory_content = std::fs::read_to_string(&self.memory_path).unwrap_or_else(|error| {
-            panic!(
-                "failed to read memory file at {}: {error}",
-                self.memory_path.display()
-            )
-        });
+    async fn sync_memory_file(&mut self) {
+        let memory_content =
+            async_fs::read_to_string(&self.memory_path)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to read memory file at {}: {error}",
+                        self.memory_path.display()
+                    )
+                });
         self.last_memory_content = memory_content;
     }
 }
@@ -1464,13 +1466,12 @@ impl MayAgent {
         prompt: &str,
         attachments: impl IntoIterator<Item = url::Url>,
     ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
-        self.refresh_runtime_context();
         self.inner.run(prompt, attachments)
     }
 
     /// One-shot query.
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
-        self.refresh_runtime_context();
+        self.sync_runtime_context().await;
         self.inner.query(prompt).await
     }
 
@@ -1480,7 +1481,7 @@ impl MayAgent {
         prompt: &str,
         attachments: impl IntoIterator<Item = url::Url>,
     ) -> Vec<LlmMessage> {
-        self.refresh_runtime_context();
+        self.sync_runtime_context().await;
         self.inner
             .preview_request_messages(prompt, attachments)
             .await
@@ -1529,7 +1530,8 @@ impl MayAgent {
         checkpoint: aither_agent::AgentCheckpoint,
     ) -> Result<(), AgentError> {
         self.inner.restore_checkpoint(checkpoint)?;
-        self.refresh_runtime_context();
+        self.runtime_system_context
+            .reconcile(self.inner.context_mut());
         Ok(())
     }
 
@@ -1538,7 +1540,8 @@ impl MayAgent {
         self.inner.clear_history();
     }
 
-    fn refresh_runtime_context(&mut self) {
+    pub(crate) async fn sync_runtime_context(&mut self) {
+        self.runtime_system_context.sync_memory_file().await;
         self.runtime_system_context
             .reconcile(self.inner.context_mut());
     }

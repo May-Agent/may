@@ -755,6 +755,7 @@ async fn run_agent_loop(
         let mut terminal_error: Option<aither_agent::AgentError> = None;
         let mut cancellation_reason: Option<&'static str> = None;
         {
+            agent.sync_runtime_context().await;
             let mut stream = std::pin::pin!(agent.run(&prompt, attachments));
             loop {
                 let next_event = tokio::select! {
