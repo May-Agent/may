@@ -5,11 +5,11 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
-use crate::session::SessionId;
+use crate::session::{MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db};
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::{load_session_paths, truncate_preview};
+use super::helpers::load_session_paths;
 use super::message_mapping::map_db_messages;
 use super::model_resolution::{
     persist_last_model, preferred_advanced_model, resolve_default_model,
@@ -24,10 +24,8 @@ use super::types::{
 pub(super) async fn list_sessions(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<ApiSession>>> {
-    let summaries = {
-        let manager = state.sessions().await;
-        manager.list_sessions().await.map_err(internal_error)?
-    };
+    let db = state.db();
+    let summaries = list_summaries_from_db(&db).await.map_err(internal_error)?;
 
     let config = state.config.read().await;
     let mut sessions = Vec::with_capacity(summaries.len());
@@ -229,22 +227,39 @@ pub(super) async fn create_session(
             .ok_or_else(|| bad_request_error("No model configured"))?
     };
 
-    let mut manager = state.sessions().await;
     let resolved_profile_id = requested_profile_id
         .clone()
-        .or_else(|| manager.current_profile_id().map(ToOwned::to_owned));
-
-    let session = manager
-        .create_session_in_profile(Some(model.clone()), resolved_profile_id.clone())
-        .map_err(internal_error)?;
-    let id = session.id.as_str().to_string();
-
-    manager.ensure_persisted().await.map_err(internal_error)?;
-    manager
-        .set_current_model(model.clone())
+        .or_else(|| Some(state.default_profile_id.clone()));
+    let id = SessionId::new().to_string();
+    let db = state.db();
+    let layout = match resolved_profile_id.as_deref() {
+        Some(profile_id) => {
+            let profile = db
+                .get_profile(profile_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| bad_request_error("profile not found"))?;
+            if profile.environment == "container" {
+                SandboxResourceLayout::ContainerMountPoints
+            } else {
+                SandboxResourceLayout::Symlinked
+            }
+        }
+        None => SandboxResourceLayout::Symlinked,
+    };
+    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
+    store
+        .create_session_dirs(&id, resolved_profile_id.as_deref(), layout)
         .await
         .map_err(internal_error)?;
-    drop(manager);
+    db.create_session_in_profile(
+        &id,
+        None,
+        Some(model.as_str()),
+        resolved_profile_id.as_deref(),
+    )
+    .await
+    .map_err(internal_error)?;
 
     persist_last_model(&state, &model)
         .await
@@ -260,47 +275,42 @@ pub(super) async fn update_session(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiSession>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let session_id = SessionId::from_string(id.clone());
+    let db = state.db();
+    let session = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            SkyError::msg(format!("Session {id} not found")).set_status(StatusCode::NOT_FOUND)
+        })?;
 
-    let mut manager = state.sessions().await;
-    manager
-        .load_session(&session_id)
+    let mut model_to_persist: Option<String> = None;
+    let requested_title = req.title.clone();
+    let requested_model = req.model.clone();
+    let next_title = requested_title.clone().or_else(|| session.title.clone());
+    let next_model = requested_model.clone().or_else(|| session.model.clone());
+
+    if let Some(model) = next_model.clone() {
+        if session.model.as_deref() != Some(model.as_str()) {
+            model_to_persist = Some(model);
+        }
+    }
+
+    db.update_session(&id, requested_title.as_deref(), requested_model.as_deref())
         .await
         .map_err(internal_error)?;
 
-    let mut model_to_persist: Option<String> = None;
-
-    if let Some(title) = req.title {
-        manager
-            .set_current_title(title)
-            .await
-            .map_err(internal_error)?;
-    }
-    if let Some(model) = req.model {
-        manager
-            .set_current_model(model.clone())
-            .await
-            .map_err(internal_error)?;
-        model_to_persist = Some(model);
-    }
-
-    let current = manager.current().ok_or_else(|| {
-        SkyError::msg("No active session").set_status(StatusCode::INTERNAL_SERVER_ERROR)
-    })?;
-    let title = current
-        .title
-        .clone()
-        .unwrap_or_else(|| "New Chat".to_string());
-    let preview = current
-        .history
-        .messages()
-        .last()
-        .map(|m| truncate_preview(&m.content))
-        .unwrap_or_else(|| "New conversation started".to_string());
-    let current_model = current.model.clone();
-    let current_id = current.id.as_str().to_string();
-    let profile_id = current.profile_id.clone();
-    drop(manager);
+    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
+    let mut history = store
+        .read_history(&id, session.profile_id.as_deref())
+        .await
+        .map_err(internal_error)?;
+    history.metadata.title = next_title.clone();
+    history.metadata.model = next_model.clone();
+    store
+        .write_history(&id, session.profile_id.as_deref(), &history)
+        .await
+        .map_err(internal_error)?;
 
     if let Some(model) = model_to_persist {
         persist_last_model(&state, &model)
@@ -310,8 +320,9 @@ pub(super) async fn update_session(
 
     let model = {
         let cfg = state.config.read().await;
-        resolve_default_model(&cfg, current_model)
-            .ok_or_else(|| internal_error(format!("no model resolved for session {current_id}")))?
+        resolve_default_model(&cfg, next_model.clone()).ok_or_else(|| {
+            internal_error(format!("no model resolved for session {}", session.id))
+        })?
     };
     let runtime = state
         .runtime_service
@@ -322,11 +333,14 @@ pub(super) async fn update_session(
 
     Ok(Json(ApiSession {
         id,
-        title,
+        title: next_title.unwrap_or_else(|| "New Chat".to_string()),
         last_modified: jiff::Timestamp::now().to_string(),
-        preview,
+        preview: session
+            .preview
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "New conversation started".to_string()),
         messages: Vec::new(),
-        profile_id,
+        profile_id: session.profile_id,
         model,
         reasoning_effort: None,
         runtime: runtime.clone().into(),
@@ -338,8 +352,18 @@ pub(super) async fn delete_session(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let mut manager = state.sessions().await;
-    manager.delete_session(&id).await.map_err(internal_error)?;
+    let db = state.db();
+    let profile_id = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .and_then(|session| session.profile_id);
+    db.delete_session(&id).await.map_err(internal_error)?;
+    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
+    store
+        .delete_session(&id, profile_id.as_deref())
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))
 }
@@ -347,20 +371,16 @@ pub(super) async fn delete_session(
 pub(super) async fn delete_all_sessions(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let mut manager = state.sessions().await;
-
     // Delete all from DB
     let db = state.db();
     db.delete_all_sessions().await.map_err(internal_error)?;
 
     // Clean up filesystem session directories
-    let store = manager.store().clone();
+    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     store
         .delete_all_session_dirs()
         .await
         .map_err(internal_error)?;
-
-    let _ = manager.create_session();
     state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))
 }

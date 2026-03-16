@@ -114,6 +114,10 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     };
 
     let session_manager = SessionManager::new().await?;
+    let default_profile_id = session_manager
+        .current_profile_id()
+        .map(ToOwned::to_owned)
+        .context("session manager did not initialize a default profile")?;
     let db_for_archive = session_manager.db().clone();
     db_for_archive
         .recover_session_runtimes_after_restart()
@@ -182,6 +186,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
 
     let state = Arc::new(UiServerState {
         db: db_for_archive.clone(),
+        default_profile_id,
         session_manager: state::SharedSessionManager::new(session_manager),
         mcp_service: state::McpService::spawn(mcp_manager),
         permission_approver,
