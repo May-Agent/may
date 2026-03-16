@@ -384,11 +384,6 @@ impl ChatStream {
         }
     }
 
-    /// Update a tool's status by ID (legacy compatibility).
-    pub fn update_tool(&mut self, id: &str, status: ToolStatus, results: Option<usize>) {
-        self.update_tool_with_output(id, status, results, None);
-    }
-
     /// Add a bash call to a subagent task.
     pub fn update_subagent_bash(&mut self, id: &str, bash_info: BashCallInfo) {
         for elem in &mut self.elements {
@@ -690,32 +685,6 @@ fn total_wrapped_lines(lines: &[Line], width: usize) -> usize {
     Paragraph::new(lines.to_vec())
         .wrap(Wrap { trim: false })
         .line_count(w)
-}
-
-/// Render the chat stream with optional tool selection (legacy API).
-pub fn render_with_selection(
-    frame: &mut Frame,
-    area: Rect,
-    chat: &ChatStream,
-    scroll: usize,
-    selected_tool: Option<&str>,
-    content_height_out: Option<&Cell<usize>>,
-    view_height_out: Option<&Cell<usize>>,
-    input_ctx: Option<InputContext<'_>>,
-) {
-    render_impl(
-        frame,
-        area,
-        chat,
-        scroll,
-        RenderContext {
-            selected_tool,
-            content_height_out,
-            view_height_out,
-            input_ctx,
-            ..Default::default()
-        },
-    );
 }
 
 /// Internal render context with all optional parameters.
