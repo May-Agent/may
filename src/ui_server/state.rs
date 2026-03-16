@@ -315,6 +315,7 @@ impl McpService {
 
 pub(crate) struct UiServerState {
     pub(crate) db: crate::db::ChatDb,
+    pub(crate) default_profile_id: String,
     pub(crate) session_manager: SharedSessionManager,
     pub(crate) mcp_service: McpService,
     pub(crate) permission_approver: PermissionApprover,

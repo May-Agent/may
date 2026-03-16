@@ -20,8 +20,8 @@ use crate::ask_user;
 use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
 use crate::session::{
-    ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage, PersistedAttachment, SessionId,
-    SessionRuntimeState,
+    ChatMessage, ChatMessageStats, MayHomePaths, MessageRole, PendingUserMessage,
+    PersistedAttachment, SessionId, SessionRuntimeState, SessionStore,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 
@@ -396,14 +396,11 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
 }
 
 pub(super) async fn resume_pending_follow_up_runs(state: Arc<UiServerState>) -> anyhow::Result<()> {
-    let session_ids = {
-        let manager = state.sessions().await;
-        manager
-            .db()
-            .sessions_requiring_pending_dispatch()
-            .await
-            .map_err(anyhow::Error::from)?
-    };
+    let session_ids = state
+        .db()
+        .sessions_requiring_pending_dispatch()
+        .await
+        .map_err(anyhow::Error::from)?;
     for session_id in session_ids {
         spawn_follow_up_runs(state.clone(), session_id);
     }
@@ -1480,15 +1477,16 @@ async fn setup_agent_environment(
                 .profile_model
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("container profile model is missing"))?;
-            {
-                let manager = state.sessions().await;
-                manager
-                    .reconcile_container_layout_for_session(&ctx.session_id)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("Failed to reconcile container session layout: {error}")
-                    })?;
-            }
+            let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
+            store
+                .reconcile_container_mount_points(
+                    ctx.session_id.as_str(),
+                    ctx.profile_id.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to reconcile container session layout: {error}")
+                })?;
             let container_manager =
                 state
                     .resolve_container_manager(false)

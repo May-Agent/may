@@ -32,4 +32,4 @@ pub use runtime::{
     SessionInteractionState, SessionRuntimeState, SessionRuntimeSummary,
 };
 pub use runtime_service::SessionRuntimeService;
-pub use store::SessionStore;
+pub use store::{SandboxResourceLayout, SessionStore};
