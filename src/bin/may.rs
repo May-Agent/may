@@ -655,7 +655,9 @@ where
     tracing::info!("=== MAY STARTUP - channels created ===");
 
     // Load MCP configuration and connect to servers
-    let mut mcp_manager = McpManager::load().context("failed to load MCP config")?;
+    let mut mcp_manager = McpManager::load()
+        .await
+        .context("failed to load MCP config")?;
 
     // Connect to all configured MCP servers
     if mcp_manager.has_servers() {

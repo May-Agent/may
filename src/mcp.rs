@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use aither_mcp::{McpConnection, McpError, McpServerConfig};
+use async_fs;
 use serde::{Deserialize, Serialize};
 
 /// MCP configuration error.
@@ -89,34 +90,36 @@ impl McpConfig {
     }
 
     /// Load MCP configuration from `~/.may/mcp.json` or use defaults.
-    pub fn load() -> Result<Self, McpConfigError> {
+    pub async fn load() -> Result<Self, McpConfigError> {
         let path = Self::config_path()?;
-        Self::load_from(&path)
+        Self::load_from(&path).await
     }
 
     /// Load MCP configuration from a specific path.
-    pub fn load_from(path: &Path) -> Result<Self, McpConfigError> {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            Ok(serde_json::from_str(&content)?)
-        } else {
-            Ok(Self::default())
+    pub async fn load_from(path: &Path) -> Result<Self, McpConfigError> {
+        match async_fs::metadata(path).await {
+            Ok(_) => {
+                let content = async_fs::read_to_string(path).await?;
+                Ok(serde_json::from_str(&content)?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(McpConfigError::Read(error)),
         }
     }
 
     /// Save MCP configuration to `~/.may/mcp.json`.
-    pub fn save(&self) -> Result<(), McpConfigError> {
+    pub async fn save(&self) -> Result<(), McpConfigError> {
         let path = Self::config_path()?;
-        self.save_to(&path)
+        self.save_to(&path).await
     }
 
     /// Save MCP configuration to a specific path.
-    pub fn save_to(&self, path: &Path) -> Result<(), McpConfigError> {
+    pub async fn save_to(&self, path: &Path) -> Result<(), McpConfigError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            async_fs::create_dir_all(parent).await?;
         }
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        async_fs::write(path, content).await?;
         Ok(())
     }
 
@@ -227,8 +230,8 @@ impl McpManager {
     }
 
     /// Load MCP manager from default configuration path.
-    pub fn load() -> Result<Self, McpConfigError> {
-        let config = McpConfig::load()?;
+    pub async fn load() -> Result<Self, McpConfigError> {
+        let config = McpConfig::load().await?;
         Ok(Self::new(config))
     }
 
@@ -243,8 +246,8 @@ impl McpManager {
     }
 
     /// Save the current configuration.
-    pub fn save_config(&self) -> Result<(), McpConfigError> {
-        self.config.save()
+    pub async fn save_config(&self) -> Result<(), McpConfigError> {
+        self.config.save().await
     }
 
     /// Connect to all configured MCP servers.
@@ -315,6 +318,7 @@ impl McpManager {
         self.connect_server_internal(&name, &config).await?;
         self.config
             .save()
+            .await
             .map_err(|e| McpError::InvalidConfig(format!("Failed to save config: {e}")))?;
         Ok(())
     }
@@ -332,6 +336,7 @@ impl McpManager {
         self.config.mcp_servers.remove(name);
         self.config
             .save()
+            .await
             .map_err(|e| McpError::InvalidConfig(format!("Failed to save config: {e}")))?;
 
         Ok(())
