@@ -1,9 +1,9 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_LENGTH, HOST, HeaderName};
@@ -12,7 +12,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::{OnceCell, mpsc, oneshot, watch};
 use zenwave::Client;
 use zenwave::ResponseExt;
 
@@ -81,6 +81,7 @@ struct LocalUrlProxyEntry {
 
 #[derive(Debug)]
 struct LocalUrlProxySlot {
+    slot_id: String,
     upstream: LocalUrlProxyUpstream,
     entry: OnceCell<LocalUrlProxyEntry>,
 }
@@ -88,6 +89,7 @@ struct LocalUrlProxySlot {
 impl LocalUrlProxySlot {
     fn new(upstream: LocalUrlProxyUpstream) -> Self {
         Self {
+            slot_id: uuid::Uuid::new_v4().to_string(),
             upstream,
             entry: OnceCell::new(),
         }
@@ -101,8 +103,8 @@ impl LocalUrlProxySlot {
 
     async fn ensure_port(
         self: &Arc<Self>,
-        manager: &Arc<LocalUrlPortMapper>,
         key: &LocalUrlProxyKey,
+        command_tx: &mpsc::UnboundedSender<LocalUrlProxyCommand>,
     ) -> anyhow::Result<u16> {
         let entry = self
             .entry
@@ -112,12 +114,15 @@ impl LocalUrlProxySlot {
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let task_upstream = self.upstream.clone();
                 let task_key = key.clone();
-                let task_slot = Arc::clone(self);
-                let task_manager = Arc::clone(manager);
+                let task_slot_id = self.slot_id.clone();
+                let task_command_tx = command_tx.clone();
 
                 tokio::spawn(async move {
                     run_proxy_listener(listener, task_upstream, shutdown_rx).await;
-                    task_manager.remove_entry(&task_key, &task_slot);
+                    let _ = task_command_tx.send(LocalUrlProxyCommand::Drop {
+                        key: task_key,
+                        slot_id: task_slot_id,
+                    });
                 });
 
                 Ok::<LocalUrlProxyEntry, anyhow::Error>(LocalUrlProxyEntry {
@@ -130,14 +135,34 @@ impl LocalUrlProxySlot {
     }
 }
 
-#[derive(Debug, Default)]
+enum LocalUrlProxyCommand {
+    EnsurePort {
+        key: LocalUrlProxyKey,
+        upstream: LocalUrlProxyUpstream,
+        reply: oneshot::Sender<anyhow::Result<u16>>,
+    },
+    Drop {
+        key: LocalUrlProxyKey,
+        slot_id: String,
+    },
+}
+
 pub(crate) struct LocalUrlPortMapper {
-    entries: DashMap<LocalUrlProxyKey, Arc<LocalUrlProxySlot>>,
+    command_tx: mpsc::UnboundedSender<LocalUrlProxyCommand>,
+}
+
+impl std::fmt::Debug for LocalUrlPortMapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalUrlPortMapper").finish_non_exhaustive()
+    }
 }
 
 impl LocalUrlPortMapper {
     pub(crate) fn new() -> Self {
-        Self::default()
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let actor_tx = command_tx.clone();
+        tokio::spawn(run_local_url_proxy_actor(command_rx, actor_tx));
+        Self { command_tx }
     }
 
     pub(crate) async fn ensure_port(
@@ -145,36 +170,69 @@ impl LocalUrlPortMapper {
         key: LocalUrlProxyKey,
         upstream: LocalUrlProxyUpstream,
     ) -> anyhow::Result<u16> {
-        loop {
-            if let Some(existing) = self.entries.get(&key) {
-                let slot = Arc::clone(existing.value());
-                drop(existing);
-                if slot.upstream == upstream {
-                    return slot.ensure_port(self, &key).await;
-                }
-                slot.shutdown();
-                self.entries.remove(&key);
-                continue;
-            }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(LocalUrlProxyCommand::EnsurePort {
+                key,
+                upstream,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("local url proxy mapper actor is unavailable"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("local url proxy mapper actor dropped reply"))?
+    }
+}
 
-            let slot = Arc::new(LocalUrlProxySlot::new(upstream.clone()));
-            match self.entries.entry(key.clone()) {
-                dashmap::mapref::entry::Entry::Occupied(_) => continue,
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    entry.insert(Arc::clone(&slot));
-                    return slot.ensure_port(self, &key).await;
+async fn run_local_url_proxy_actor(
+    mut command_rx: mpsc::UnboundedReceiver<LocalUrlProxyCommand>,
+    command_tx: mpsc::UnboundedSender<LocalUrlProxyCommand>,
+) {
+    let mut entries: HashMap<LocalUrlProxyKey, Arc<LocalUrlProxySlot>> = HashMap::new();
+
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            LocalUrlProxyCommand::EnsurePort {
+                key,
+                upstream,
+                reply,
+            } => {
+                let result =
+                    ensure_local_url_proxy_port(&mut entries, key, upstream, command_tx.clone())
+                        .await;
+                let _ = reply.send(result);
+            }
+            LocalUrlProxyCommand::Drop { key, slot_id } => {
+                if entries
+                    .get(&key)
+                    .is_some_and(|current| current.slot_id == slot_id)
+                {
+                    entries.remove(&key);
                 }
             }
         }
     }
+}
 
-    fn remove_entry(self: &Arc<Self>, key: &LocalUrlProxyKey, slot: &Arc<LocalUrlProxySlot>) {
-        if let Some(current) = self.entries.get(key)
-            && Arc::ptr_eq(current.value(), slot)
-        {
-            drop(current);
-            self.entries.remove(key);
+async fn ensure_local_url_proxy_port(
+    entries: &mut HashMap<LocalUrlProxyKey, Arc<LocalUrlProxySlot>>,
+    key: LocalUrlProxyKey,
+    upstream: LocalUrlProxyUpstream,
+    command_tx: mpsc::UnboundedSender<LocalUrlProxyCommand>,
+) -> anyhow::Result<u16> {
+    loop {
+        if let Some(existing) = entries.get(&key).cloned() {
+            if existing.upstream == upstream {
+                return existing.ensure_port(&key, &command_tx).await;
+            }
+            existing.shutdown();
+            entries.remove(&key);
+            continue;
         }
+
+        let slot = Arc::new(LocalUrlProxySlot::new(upstream.clone()));
+        entries.insert(key.clone(), Arc::clone(&slot));
+        return slot.ensure_port(&key, &command_tx).await;
     }
 }
 
