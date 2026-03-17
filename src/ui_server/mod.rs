@@ -79,7 +79,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
 
     let (tool_dispatchers, tool_queues) = tool_dispatch_channels();
 
-    let config = helpers::load_config_from_disk()
+    let config = MayConfig::load_async()
         .await
         .context("Failed to load config")?;
 

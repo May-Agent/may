@@ -2,7 +2,6 @@
 
 use crate::config::MayConfig;
 
-use super::helpers::save_config_to_disk;
 use super::state::UiServerState;
 
 pub(super) fn preferred_advanced_model(config: &MayConfig) -> Option<String> {
@@ -46,7 +45,9 @@ pub(super) async fn persist_last_model(state: &UiServerState, model: &str) -> an
         config.last_model = Some(model.to_string());
     });
 
-    save_config_to_disk(updated)
+    updated
+        .save_async()
         .await
+        .map_err(anyhow::Error::from)
         .inspect(|_| state.notify_ui_events())
 }

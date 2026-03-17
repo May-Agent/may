@@ -513,10 +513,6 @@ fn parse_oneshot_selection(
     Some(selected)
 }
 
-async fn persist_tui_config(config: may_agent::config::MayConfig) -> anyhow::Result<()> {
-    config.save_async().await.map_err(anyhow::Error::from)
-}
-
 fn render_oneshot_event(
     stderr: &mut impl Write,
     result: &Result<AgentEvent, aither_agent::AgentError>,
@@ -1051,7 +1047,7 @@ where
                                 tracing::warn!("Failed to save model to session: {}", e);
                             }
                             app.config.last_model = Some(model);
-                            if let Err(e) = persist_tui_config(app.config.clone()).await {
+                            if let Err(e) = app.config.clone().save_async().await {
                                 tracing::warn!("Failed to save config: {}", e);
                             }
                         }
@@ -1141,7 +1137,7 @@ where
                                 name: name.clone(),
                                 target,
                             });
-                        if let Err(e) = persist_tui_config(app.config.clone()).await {
+                        if let Err(e) = app.config.clone().save_async().await {
                             let err_msg = format!("Failed to save SSH server: {}", e);
                             app.chat.push_error(&err_msg);
                         } else {
@@ -1153,7 +1149,7 @@ where
                     }
                     Some(SendAction::SshRemove { name }) => {
                         if app.config.remove_ssh_server(&name) {
-                            if let Err(e) = persist_tui_config(app.config.clone()).await {
+                            if let Err(e) = app.config.clone().save_async().await {
                                 let err_msg = format!("Failed to save SSH config: {}", e);
                                 app.chat.push_error(&err_msg);
                             } else {
@@ -1343,7 +1339,7 @@ where
                 );
                 app.config.upsert_provider("copilot", instance);
                 app.config_state.load_providers(&app.config);
-                if let Err(e) = persist_tui_config(app.config.clone()).await {
+                if let Err(e) = app.config.clone().save_async().await {
                     tracing::error!("Failed to save config: {}", e);
                 }
                 app.copilot_auth_success();
