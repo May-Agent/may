@@ -19,7 +19,7 @@ use crate::session::MayHomePaths;
 
 const LABEL_MANAGED: &str = "may.managed";
 const LABEL_SPEC_FINGERPRINT: &str = "may.spec-fingerprint";
-const SPEC_FINGERPRINT_REVISION: &str = "2026-02-18-v7";
+const SPEC_FINGERPRINT_REVISION: &str = "2026-03-17-v8";
 
 /// Default inactivity timeout before auto-stopping a container (in minutes).
 const DEFAULT_AUTO_STOP_MINUTES: u64 = 30;
@@ -328,10 +328,6 @@ impl ContainerManager {
             "host_gateway": host_gateway,
             "env": env,
             "mounts": mounts,
-            "ipc_socket": spec
-                .ipc_socket
-                .as_ref()
-                .map(|path| path.display().to_string()),
         }))
         .map_err(|error| {
             ContainerError::Bootstrap(format!(
