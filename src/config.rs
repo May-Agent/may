@@ -46,6 +46,7 @@
 //! warn_on_model_change = true
 //! ```
 
+use async_fs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -957,9 +958,12 @@ impl MayConfig {
 
     /// Load configuration from ~/.may/config.toml or use defaults without blocking the async runtime.
     pub async fn load_async() -> Result<Self, ConfigError> {
-        tokio::task::spawn_blocking(Self::load)
-            .await
-            .map_err(|error| ConfigError::Read(std::io::Error::other(error.to_string())))?
+        let path = Self::config_path()?;
+        match async_fs::read_to_string(&path).await {
+            Ok(content) => Ok(toml::from_str(&content)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(ConfigError::Read(error)),
+        }
     }
 
     /// Load configuration from a specific path.
@@ -980,10 +984,13 @@ impl MayConfig {
 
     /// Save configuration to ~/.may/config.toml without blocking the async runtime.
     pub async fn save_async(&self) -> Result<(), ConfigError> {
-        let config = self.clone();
-        tokio::task::spawn_blocking(move || config.save())
-            .await
-            .map_err(|error| ConfigError::Read(std::io::Error::other(error.to_string())))?
+        let path = Self::config_path()?;
+        if let Some(parent) = path.parent() {
+            async_fs::create_dir_all(parent).await?;
+        }
+        let content = toml::to_string_pretty(self)?;
+        async_fs::write(path, content).await?;
+        Ok(())
     }
 
     /// Save configuration to a specific path.
