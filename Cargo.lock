@@ -163,6 +163,7 @@ version = "0.1.0"
 dependencies = [
  "aither-core",
  "aither-models",
+ "async-fs",
  "async-stream",
  "base64 0.22.1",
  "futures-core",
@@ -197,6 +198,7 @@ version = "0.1.0"
 dependencies = [
  "aither-core",
  "aither-models",
+ "async-fs",
  "async-io 2.6.0",
  "async-stream",
  "base64 0.22.1",
