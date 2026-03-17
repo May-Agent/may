@@ -253,6 +253,38 @@ export interface FolderInfo {
 export type TaskTriggerKind = 'time' | 'event' | 'webhook';
 export type TimeTriggerType = 'cron' | 'once';
 
+export type TaskTriggerInput =
+  | {
+      kind: 'time';
+      triggerType: TimeTriggerType;
+      cronUtc?: string;
+      runAtUtc?: string;
+    }
+  | {
+      kind: 'event';
+      eventName: string;
+    }
+  | {
+      kind: 'webhook';
+    };
+
+export type TaskTrigger =
+  | {
+      kind: 'time';
+      triggerType: TimeTriggerType;
+      cronUtc?: string | null;
+      runAtUtc?: string | null;
+    }
+  | {
+      kind: 'event';
+      eventName: string;
+    }
+  | {
+      kind: 'webhook';
+      token: string;
+      webhookPath: string;
+    };
+
 interface TaskCreateInputBase {
   profileId: string;
   sessionId?: string;
@@ -262,30 +294,16 @@ interface TaskCreateInputBase {
   needsNetwork?: boolean;
 }
 
-export type CreateTaskInput =
-  | (TaskCreateInputBase & {
-      triggerKind: 'time';
-      triggerType: TimeTriggerType;
-      cronExpression?: string;
-      runAt?: string;
-    })
-  | (TaskCreateInputBase & {
-      triggerKind: 'event';
-      eventName: string;
-    })
-  | (TaskCreateInputBase & {
-      triggerKind: 'webhook';
-    });
+export type CreateTaskInput = TaskCreateInputBase & {
+  trigger: TaskTriggerInput;
+};
 
 export interface ScheduledTask {
   id: string;
   profileId: string;
   sessionId: string | null;
   name: string;
-  triggerKind: TaskTriggerKind;
-  triggerType: string;
-  cronExpression: string | null;
-  runAt: string | null;
+  trigger: TaskTrigger;
   scriptPath: string | null;
   scriptInline: string | null;
   needsNetwork: boolean;
@@ -294,7 +312,6 @@ export interface ScheduledTask {
   lastRunAt: string | null;
   lastRunStatus: string | null;
   lastRunOutput: string | null;
-  webhookPath?: string | null;
   createdAt: string;
   updatedAt: string;
 }

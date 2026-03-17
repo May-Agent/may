@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 pub const TRIGGER_KIND_TIME: &str = "time";
 pub const TRIGGER_KIND_EVENT: &str = "event";
@@ -27,7 +28,8 @@ fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
     join_text(&[prefix, error_text.as_str()])
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum TaskTriggerKind {
     Time,
     Event,
@@ -45,7 +47,8 @@ impl TaskTriggerKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum TimeTriggerType {
     Once,
     Cron,
@@ -115,6 +118,123 @@ pub struct TaskTriggerInput<'a> {
     pub event_name: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskTriggerRequest {
+    Time {
+        #[serde(rename = "triggerType")]
+        trigger_type: TimeTriggerType,
+        #[serde(rename = "runAtUtc")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_at_utc: Option<String>,
+        #[serde(rename = "cronUtc")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cron_utc: Option<String>,
+    },
+    Event {
+        #[serde(rename = "eventName")]
+        event_name: String,
+    },
+    Webhook,
+}
+
+impl TaskTriggerRequest {
+    pub fn normalize(&self) -> Result<NormalizedTaskTrigger, String> {
+        match self {
+            Self::Time {
+                trigger_type,
+                run_at_utc,
+                cron_utc,
+            } => normalize_time_trigger(
+                Some(trigger_type.as_str()),
+                run_at_utc.as_deref(),
+                cron_utc.as_deref(),
+            ),
+            Self::Event { event_name } => {
+                normalize_event_trigger(None, None, None, Some(event_name.as_str()))
+            }
+            Self::Webhook => normalize_trigger(TaskTriggerInput {
+                kind: TaskTriggerKind::Webhook.as_str(),
+                trigger_type: None,
+                run_at_utc: None,
+                cron_utc: None,
+                event_name: None,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistedTaskTrigger {
+    Time { trigger_type: TimeTriggerType },
+    Event { event_name: String },
+    Webhook { token: String },
+}
+
+impl PersistedTaskTrigger {
+    pub fn from_storage(kind: &str, trigger_type: &str) -> Result<Self, String> {
+        match TaskTriggerKind::from_str(kind)? {
+            TaskTriggerKind::Time => Ok(Self::Time {
+                trigger_type: TimeTriggerType::from_str(trigger_type)?,
+            }),
+            TaskTriggerKind::Event => Ok(Self::Event {
+                event_name: normalize_event_name(trigger_type)?,
+            }),
+            TaskTriggerKind::Webhook => Ok(Self::Webhook {
+                token: trigger_type.to_string(),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> TaskTriggerKind {
+        match self {
+            Self::Time { .. } => TaskTriggerKind::Time,
+            Self::Event { .. } => TaskTriggerKind::Event,
+            Self::Webhook { .. } => TaskTriggerKind::Webhook,
+        }
+    }
+
+    #[must_use]
+    pub fn storage_trigger_type(&self) -> &str {
+        match self {
+            Self::Time { trigger_type } => trigger_type.as_str(),
+            Self::Event { event_name } => event_name.as_str(),
+            Self::Webhook { token } => token.as_str(),
+        }
+    }
+
+    #[must_use]
+    pub fn webhook_path(&self) -> Option<String> {
+        match self {
+            Self::Webhook { token } => Some(webhook_path(token.as_str())),
+            Self::Time { .. } | Self::Event { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn response(
+        &self,
+        run_at_utc: Option<String>,
+        cron_utc: Option<String>,
+    ) -> TaskTriggerResponse {
+        match self {
+            Self::Time { trigger_type } => TaskTriggerResponse::Time {
+                trigger_type: *trigger_type,
+                run_at_utc,
+                cron_utc,
+            },
+            Self::Event { event_name } => TaskTriggerResponse::Event {
+                event_name: event_name.clone(),
+            },
+            Self::Webhook { token } => TaskTriggerResponse::Webhook {
+                token: token.clone(),
+                webhook_path: webhook_path(token.as_str()),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NormalizedTaskTrigger {
     kind: TaskTriggerKind,
@@ -158,6 +278,22 @@ impl NormalizedTaskTrigger {
             _ => panic!("invalid normalized task trigger invariant"),
         }
     }
+
+    #[must_use]
+    pub fn into_persisted(self) -> PersistedTaskTrigger {
+        match (self.kind, self.time_trigger_type, self.event_name) {
+            (TaskTriggerKind::Time, Some(trigger_type), None) => {
+                PersistedTaskTrigger::Time { trigger_type }
+            }
+            (TaskTriggerKind::Event, None, Some(event_name)) => {
+                PersistedTaskTrigger::Event { event_name }
+            }
+            (TaskTriggerKind::Webhook, None, None) => PersistedTaskTrigger::Webhook {
+                token: new_webhook_token(),
+            },
+            _ => panic!("invalid normalized task trigger invariant"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,7 +315,7 @@ pub struct TaskWebhookRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskInvocation {
     Time {
-        trigger_type: String,
+        trigger_type: TimeTriggerType,
     },
     Manual,
     Event {
@@ -192,6 +328,30 @@ pub enum TaskInvocation {
     Webhook {
         token: String,
         request: TaskWebhookRequest,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskTriggerResponse {
+    Time {
+        #[serde(rename = "triggerType")]
+        trigger_type: TimeTriggerType,
+        #[serde(rename = "runAtUtc")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_at_utc: Option<String>,
+        #[serde(rename = "cronUtc")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cron_utc: Option<String>,
+    },
+    Event {
+        #[serde(rename = "eventName")]
+        event_name: String,
+    },
+    Webhook {
+        token: String,
+        #[serde(rename = "webhookPath")]
+        webhook_path: String,
     },
 }
 
@@ -267,6 +427,24 @@ pub fn normalize_event_name(value: &str) -> Result<String, String> {
     Ok(raw)
 }
 
+pub fn normalize_cron_expression(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    let field_count = trimmed.split_whitespace().count();
+    let canonical = match field_count {
+        5 => join_text(&["0 ", trimmed]),
+        6 => trimmed.to_string(),
+        _ => {
+            return Err(
+                "cron_utc must contain 5 fields (minute-hour-day-month-weekday) or 6 fields (including seconds)"
+                    .to_string(),
+            )
+        }
+    };
+    cron::Schedule::from_str(canonical.as_str())
+        .map(|_| canonical)
+        .map_err(|error| prefixed_error("invalid cron_utc expression: ", &error))
+}
+
 fn normalize_time_trigger(
     trigger_type: Option<&str>,
     run_at: Option<&str>,
@@ -309,14 +487,12 @@ fn normalize_time_trigger(
             }
             let cron_expression =
                 cron_expression.ok_or_else(|| "cron trigger requires cron_utc".to_string())?;
-            cron::Schedule::from_str(cron_expression)
-                .map_err(|error| prefixed_error("invalid cron_utc expression: ", &error))?;
             Ok(NormalizedTaskTrigger {
                 kind: TaskTriggerKind::Time,
                 time_trigger_type: Some(TimeTriggerType::Cron),
                 event_name: None,
                 run_at: None,
-                cron_expression: Some(cron_expression.to_string()),
+                cron_expression: Some(normalize_cron_expression(cron_expression)?),
             })
         }
     }
@@ -353,8 +529,9 @@ mod tests {
     use std::str::FromStr;
 
     use super::{
-        TaskTriggerInput, TaskTriggerKind, TimeTriggerType, normalize_event_name,
-        normalize_trigger, normalize_utc_timestamp, webhook_path,
+        PersistedTaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerRequest,
+        TimeTriggerType, normalize_event_name, normalize_trigger, normalize_utc_timestamp,
+        webhook_path,
     };
 
     #[test]
@@ -416,6 +593,19 @@ mod tests {
     }
 
     #[test]
+    fn task_trigger_request_normalizes_nested_time_payload() {
+        let normalized = TaskTriggerRequest::Time {
+            trigger_type: TimeTriggerType::Cron,
+            run_at_utc: None,
+            cron_utc: Some("0 6 * * *".to_string()),
+        }
+        .normalize()
+        .expect("time trigger request should normalize");
+        assert_eq!(normalized.kind(), TaskTriggerKind::Time);
+        assert_eq!(normalized.cron_expression(), Some("0 0 6 * * *"));
+    }
+
+    #[test]
     fn normalize_trigger_requires_event_name_field() {
         let normalized = normalize_trigger(TaskTriggerInput {
             kind: "event",
@@ -446,6 +636,24 @@ mod tests {
             webhook_path(&token),
             super::join_text(&["/api/tasks/webhook/", token.as_str()])
         );
+    }
+
+    #[test]
+    fn persisted_webhook_trigger_builds_api_response() {
+        let trigger = PersistedTaskTrigger::Webhook {
+            token: "abc123".to_string(),
+        };
+        let response = trigger.response(None, None);
+        match response {
+            super::TaskTriggerResponse::Webhook {
+                token,
+                webhook_path,
+            } => {
+                assert_eq!(token, "abc123");
+                assert_eq!(webhook_path, "/api/tasks/webhook/abc123");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[test]

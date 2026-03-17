@@ -61,8 +61,10 @@ async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
                 return;
             }
         };
-        let replaceable =
-            is_replaceable_session_title(current.as_ref().and_then(|s| s.title.as_deref()), &placeholder);
+        let replaceable = is_replaceable_session_title(
+            current.as_ref().and_then(|s| s.title.as_deref()),
+            &placeholder,
+        );
         if !replaceable {
             return;
         }
@@ -97,10 +99,7 @@ async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
         );
         return;
     };
-    let replaceable = is_replaceable_session_title(
-        current.title.as_deref(),
-        &placeholder,
-    );
+    let replaceable = is_replaceable_session_title(current.title.as_deref(), &placeholder);
     if !replaceable {
         return;
     }

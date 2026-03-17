@@ -1378,8 +1378,7 @@ async fn resolve_session_context(
 
     let history_messages = history.to_aither_messages();
     let context_snapshot = if use_persisted_context_snapshot {
-        db
-            .get_session_context_snapshot(session_id.as_str())
+        db.get_session_context_snapshot(session_id.as_str())
             .await
             .map_err(anyhow::Error::from)?
             .map(crate::session::parse_persisted_context_snapshot)
@@ -1392,13 +1391,12 @@ async fn resolve_session_context(
     if persist_user_message {
         if take_over_alert_pending(state, &session_id).await {
             let takeover_alert = browser_takeover_alert_xml()?;
-            db
-                .append_chat_message(
-                    session_id.as_str(),
-                    &ChatMessage::hidden_context(takeover_alert.clone()),
-                )
-                .await
-                .map_err(anyhow::Error::from)?;
+            db.append_chat_message(
+                session_id.as_str(),
+                &ChatMessage::hidden_context(takeover_alert.clone()),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
             incremental_messages.push(LlmMessage::system(takeover_alert));
         }
 
@@ -1416,8 +1414,8 @@ async fn resolve_session_context(
                     session_id.as_str(),
                     &ChatMessage::hidden_context(hidden_context_xml.to_string()),
                 )
-                    .await
-                    .map_err(anyhow::Error::from)?;
+                .await
+                .map_err(anyhow::Error::from)?;
                 incremental_messages.push(LlmMessage::system(hidden_context_xml.to_string()));
             }
         }

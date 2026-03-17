@@ -5,7 +5,9 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
-use crate::session::{MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db};
+use crate::session::{
+    MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db,
+};
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error};
