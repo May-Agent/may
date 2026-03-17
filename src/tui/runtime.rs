@@ -1021,13 +1021,11 @@ async fn resolve_agent_environment_for_tui(
 
     let container_name =
         crate::container::profile::container_name_for_profile_session(profile, session_id);
-    let ipc_socket_path = sandbox_dir.join("leash-ipc.sock");
     let mut launch_spec = ContainerLaunchSpec::new(
         container_name,
         image_spec.tag.clone(),
         sandbox_dir.to_path_buf(),
-    )
-    .with_ipc_socket(ipc_socket_path);
+    );
     for mount in extra_mounts {
         launch_spec = launch_spec.with_mount(mount);
     }

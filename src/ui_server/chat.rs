@@ -1527,13 +1527,11 @@ async fn setup_agent_environment(
                 None
             };
 
-            let ipc_socket_path = ctx.sandbox_dir.join("leash-ipc.sock");
             let mut launch_spec = ContainerLaunchSpec::new(
                 container_name,
                 image_spec.tag.clone(),
                 ctx.sandbox_dir.clone(),
-            )
-            .with_ipc_socket(ipc_socket_path);
+            );
             for mount in extra_mounts {
                 launch_spec = launch_spec.with_mount(mount);
             }

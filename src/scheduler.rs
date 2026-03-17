@@ -1192,13 +1192,11 @@ impl TaskRuntime {
             .await
             .map_err(|error| workspace_prepare_error(&workspace_dir, &error))?;
 
-        let ipc_socket = workspace_dir.join("leash-ipc.sock");
         let mut launch_spec = ContainerLaunchSpec::new(
             container_name,
             image_spec.tag.clone(),
             workspace_dir.clone(),
-        )
-        .with_ipc_socket(ipc_socket);
+        );
         for mount in extra_mounts {
             launch_spec = launch_spec.with_mount(mount);
         }
@@ -1309,13 +1307,11 @@ impl TaskRuntime {
             .await
             .map_err(|error| workspace_prepare_error(&workspace_dir, &error))?;
 
-        let ipc_socket = workspace_dir.join("leash-ipc.sock");
         let mut launch_spec = ContainerLaunchSpec::new(
             container_name,
             image_spec.tag.clone(),
             workspace_dir.clone(),
-        )
-        .with_ipc_socket(ipc_socket);
+        );
         for mount in extra_mounts {
             launch_spec = launch_spec.with_mount(mount);
         }
