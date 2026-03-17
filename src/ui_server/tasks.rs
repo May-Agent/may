@@ -12,8 +12,8 @@ use skyzen::{Body, Request, Result as SkyResult, StatusCode};
 
 use crate::db::{CreateScheduledTaskParams, UpdateScheduledTaskParams};
 use crate::task_trigger::{
-    NormalizedTaskTrigger, TRIGGER_KIND_WEBHOOK, TaskTriggerInput, TaskTriggerKind,
-    TaskWebhookRequest, normalize_trigger, webhook_path,
+    NormalizedTaskTrigger, PersistedTaskTrigger, TaskTriggerKind, TaskTriggerRequest,
+    TaskTriggerResponse, TaskWebhookRequest,
 };
 
 use super::error::{bad_request_error, internal_error};
@@ -28,10 +28,7 @@ pub(super) struct ScheduledTaskResponse {
     pub profile_id: String,
     pub session_id: Option<String>,
     pub name: String,
-    pub trigger_kind: String,
-    pub trigger_type: String,
-    pub cron_expression: Option<String>,
-    pub run_at: Option<String>,
+    pub trigger: TaskTriggerResponse,
     pub script_path: Option<String>,
     pub script_inline: Option<String>,
     pub needs_network: bool,
@@ -40,28 +37,22 @@ pub(super) struct ScheduledTaskResponse {
     pub last_run_at: Option<String>,
     pub last_run_status: Option<String>,
     pub last_run_output: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub webhook_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 impl ScheduledTaskResponse {
     fn from_model(m: crate::db::entity::scheduled_tasks::Model) -> Self {
-        let webhook_path = if m.trigger_kind == TRIGGER_KIND_WEBHOOK {
-            Some(webhook_path(m.trigger_type.as_str()))
-        } else {
-            None
-        };
+        let trigger =
+            PersistedTaskTrigger::from_storage(m.trigger_kind.as_str(), m.trigger_type.as_str())
+                .expect("scheduled task trigger must remain valid")
+                .response(m.run_at.clone(), m.cron_expression.clone());
         Self {
             id: m.id,
             profile_id: m.profile_id,
             session_id: m.session_id,
             name: m.name,
-            trigger_kind: m.trigger_kind,
-            trigger_type: m.trigger_type,
-            cron_expression: m.cron_expression,
-            run_at: m.run_at,
+            trigger,
             script_path: m.script_path,
             script_inline: m.script_inline,
             needs_network: m.needs_network,
@@ -70,7 +61,6 @@ impl ScheduledTaskResponse {
             last_run_at: m.last_run_at,
             last_run_status: m.last_run_status,
             last_run_output: m.last_run_output,
-            webhook_path,
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
@@ -86,15 +76,7 @@ pub(super) struct CreateTaskRequest {
     #[serde(default)]
     pub session_id: Option<String>,
     pub name: String,
-    pub trigger_kind: String,
-    #[serde(default)]
-    pub trigger_type: Option<String>,
-    #[serde(default)]
-    pub event_name: Option<String>,
-    #[serde(default)]
-    pub cron_expression: Option<String>,
-    #[serde(default)]
-    pub run_at: Option<String>,
+    pub trigger: TaskTriggerRequest,
     #[serde(default)]
     pub script_path: Option<String>,
     #[serde(default)]
@@ -185,14 +167,7 @@ impl skyzen::extract::Extractor for WebhookInvocationRequest {
 }
 
 fn normalize_create_trigger(request: &CreateTaskRequest) -> SkyResult<NormalizedTaskTrigger> {
-    normalize_trigger(TaskTriggerInput {
-        kind: &request.trigger_kind,
-        trigger_type: request.trigger_type.as_deref(),
-        run_at_utc: request.run_at.as_deref(),
-        cron_utc: request.cron_expression.as_deref(),
-        event_name: request.event_name.as_deref(),
-    })
-    .map_err(bad_request_error)
+    request.trigger.normalize().map_err(bad_request_error)
 }
 
 fn validate_existing_trigger(
@@ -200,27 +175,25 @@ fn validate_existing_trigger(
     next_cron: Option<&str>,
     next_run_at: Option<&str>,
 ) -> SkyResult<TaskTriggerKind> {
-    let current_kind = current
-        .trigger_kind
-        .parse::<TaskTriggerKind>()
-        .map_err(bad_request_error)?;
-    normalize_trigger(TaskTriggerInput {
-        kind: current_kind.as_str(),
-        trigger_type: if current_kind == TaskTriggerKind::Time {
-            Some(current.trigger_type.as_str())
-        } else {
-            None
-        },
-        run_at_utc: next_run_at,
-        cron_utc: next_cron,
-        event_name: if current_kind == TaskTriggerKind::Event {
-            Some(current.trigger_type.as_str())
-        } else {
-            None
-        },
-    })
+    let trigger = PersistedTaskTrigger::from_storage(
+        current.trigger_kind.as_str(),
+        current.trigger_type.as_str(),
+    )
     .map_err(bad_request_error)?;
-    Ok(current_kind)
+    match trigger {
+        PersistedTaskTrigger::Time { trigger_type } => {
+            TaskTriggerRequest::Time {
+                trigger_type,
+                run_at_utc: next_run_at.map(ToOwned::to_owned),
+                cron_utc: next_cron.map(ToOwned::to_owned),
+            }
+            .normalize()
+            .map_err(bad_request_error)?;
+            Ok(TaskTriggerKind::Time)
+        }
+        PersistedTaskTrigger::Event { .. } => Ok(TaskTriggerKind::Event),
+        PersistedTaskTrigger::Webhook { .. } => Ok(TaskTriggerKind::Webhook),
+    }
 }
 
 fn validate_script_fields(script_path: Option<&str>, script_inline: Option<&str>) -> SkyResult<()> {
@@ -286,7 +259,8 @@ pub(super) async fn create_task(
         .await
         .map_err(bad_request_error)?;
 
-    let trigger_type = trigger.storage_trigger_type();
+    let persisted_trigger = trigger.clone().into_persisted();
+    let trigger_type = persisted_trigger.storage_trigger_type().to_string();
     let model = state
         .db()
         .create_scheduled_task(CreateScheduledTaskParams {
@@ -294,8 +268,8 @@ pub(super) async fn create_task(
             profile_id: &req.profile_id,
             session_id: req.session_id.as_deref(),
             name: &req.name,
-            trigger_kind: trigger.kind_str(),
-            trigger_type: &trigger_type,
+            trigger_kind: persisted_trigger.kind().as_str(),
+            trigger_type: trigger_type.as_str(),
             cron_expression: trigger.cron_expression(),
             run_at: trigger.run_at(),
             script_path: normalized_script_path,

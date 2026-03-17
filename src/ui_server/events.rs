@@ -299,11 +299,7 @@ async fn emit_notification_mailbox_if_changed(
     sender: &skyzen::responder::sse::Sender,
     last_sig: &mut String,
 ) -> bool {
-    let items = match state
-        .db()
-        .list_notification_mailbox_entries(100)
-        .await
-    {
+    let items = match state.db().list_notification_mailbox_entries(100).await {
         Ok(items) => items
             .into_iter()
             .map(NotificationMailboxEntryResponse::from)

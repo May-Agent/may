@@ -54,10 +54,8 @@ impl Bundle {
         // Extract container build context (Dockerfile + leash-ipc source).
         // Container files are always overwritten since they are managed by the binary,
         // not user-modifiable.
-        Self::extract_dir_overwrite(&CONTAINER_DIR, &container_dir)
-            .await?;
-        Self::extract_dir_overwrite(&LEASH_IPC_DIR, &leash_ipc_dir)
-            .await?;
+        Self::extract_dir_overwrite(&CONTAINER_DIR, &container_dir).await?;
+        Self::extract_dir_overwrite(&LEASH_IPC_DIR, &leash_ipc_dir).await?;
 
         Ok(())
     }

@@ -34,8 +34,7 @@ use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
 use crate::profile::{ProfileEnvironment, ProfileInfo};
 use crate::task_trigger::{
-    TRIGGER_KIND_EVENT, TRIGGER_KIND_TIME, TRIGGER_KIND_WEBHOOK, TRIGGER_TYPE_CRON,
-    TRIGGER_TYPE_ONCE, TaskInvocation, TaskWebhookRequest, normalize_event_name, webhook_path,
+    PersistedTaskTrigger, TaskInvocation, TaskWebhookRequest, TimeTriggerType, normalize_event_name,
 };
 
 /// Shared task execution facility used by the scheduler, REST API, and agent tools.
@@ -236,22 +235,13 @@ fn task_value_error(
     task_db_error(join_text(&[prefix, task_id, ": ", error_text.as_str()]))
 }
 
-fn task_kind_error(kind: &str, task_id: &str) -> crate::db::ChatDbError {
-    task_db_error(join_text(&[
-        "unsupported trigger_kind '",
-        kind,
-        "' for task ",
-        task_id,
-    ]))
-}
-
-fn task_trigger_type_error(trigger_type: &str, task_id: &str) -> crate::db::ChatDbError {
-    task_db_error(join_text(&[
-        "unsupported time trigger_type '",
-        trigger_type,
-        "' for task ",
-        task_id,
-    ]))
+fn stored_task_trigger(
+    task: &scheduled_tasks::Model,
+) -> Result<PersistedTaskTrigger, crate::db::ChatDbError> {
+    PersistedTaskTrigger::from_storage(task.trigger_kind.as_str(), task.trigger_type.as_str())
+        .map_err(|error| {
+            task_value_error(task.id.as_str(), "invalid stored trigger for task ", &error)
+        })
 }
 
 fn workspace_prepare_error(path: &std::path::Path, error: &impl std::fmt::Display) -> String {
@@ -494,7 +484,8 @@ impl TaskRuntime {
         .await?;
 
         let task_id = uuid::Uuid::new_v4().to_string();
-        let trigger_type = normalized.trigger.storage_trigger_type();
+        let persisted_trigger = normalized.trigger.clone().into_persisted();
+        let trigger_type = persisted_trigger.storage_trigger_type().to_string();
         let model = self
             .db
             .create_scheduled_task(crate::db::CreateScheduledTaskParams {
@@ -502,8 +493,8 @@ impl TaskRuntime {
                 profile_id: &profile_id,
                 session_id: Some(normalized.session_id.as_str()),
                 name: &normalized.name,
-                trigger_kind: &normalized.trigger_kind,
-                trigger_type: &trigger_type,
+                trigger_kind: persisted_trigger.kind().as_str(),
+                trigger_type: trigger_type.as_str(),
                 cron_expression: normalized.trigger.cron_expression(),
                 run_at: normalized.trigger.run_at(),
                 script_path: normalized.script.script_path.as_deref(),
@@ -515,20 +506,17 @@ impl TaskRuntime {
         self.reload_active_tasks()
             .await
             .map_err(|e| e.to_string())?;
-        let webhook_path = if model.trigger_kind == TRIGGER_KIND_WEBHOOK {
-            Some(webhook_path(model.trigger_type.as_str()))
-        } else {
-            None
-        };
+        let trigger = PersistedTaskTrigger::from_storage(
+            model.trigger_kind.as_str(),
+            model.trigger_type.as_str(),
+        )
+        .map_err(|error| prefixed_error("failed to decode persisted task trigger: ", &error))?
+        .response(model.run_at.clone(), model.cron_expression.clone());
 
         Ok(TaskCreateResult {
             task_id: model.id,
             profile_id: model.profile_id,
-            trigger_kind: model.trigger_kind,
-            trigger_type: model.trigger_type,
-            run_at: model.run_at,
-            cron_expression: model.cron_expression,
-            webhook_path,
+            trigger,
             approved: model.approved,
             enabled: model.enabled,
         })
@@ -547,16 +535,15 @@ impl TaskRuntime {
         let now = jiff::Timestamp::now();
 
         for task in &tasks.tasks {
-            let is_due = self.is_due(task, now)?;
+            let trigger = stored_task_trigger(task)?;
+            let is_due = self.is_due(task, &trigger, now)?;
 
             if is_due {
-                self.spawn_task(
-                    task.clone(),
-                    TaskInvocation::Time {
-                        trigger_type: task.trigger_type.clone(),
-                    },
-                )
-                .await?;
+                let PersistedTaskTrigger::Time { trigger_type } = trigger else {
+                    panic!("is_due only returns true for time triggers");
+                };
+                self.spawn_task(task.clone(), TaskInvocation::Time { trigger_type })
+                    .await?;
             }
         }
 
@@ -578,7 +565,14 @@ impl TaskRuntime {
         let mut dispatched = 0usize;
 
         for task in &tasks.tasks {
-            if task.trigger_kind != TRIGGER_KIND_EVENT || task.trigger_type != event_name {
+            let trigger = stored_task_trigger(task)?;
+            let PersistedTaskTrigger::Event {
+                event_name: task_event_name,
+            } = trigger
+            else {
+                continue;
+            };
+            if task_event_name != event_name {
                 continue;
             }
             if let Some(expected_profile) = profile_id
@@ -629,15 +623,17 @@ impl TaskRuntime {
     fn is_due(
         &self,
         task: &scheduled_tasks::Model,
+        trigger: &PersistedTaskTrigger,
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
-        match (task.trigger_kind.as_str(), task.trigger_type.as_str()) {
-            (TRIGGER_KIND_TIME, TRIGGER_TYPE_CRON) => self.is_cron_due(task, now),
-            (TRIGGER_KIND_TIME, TRIGGER_TYPE_ONCE) => self.is_once_due(task, now),
-            (TRIGGER_KIND_TIME, other) => Err(task_trigger_type_error(other, task.id.as_str())),
-            (TRIGGER_KIND_EVENT, _) => Ok(false),
-            (TRIGGER_KIND_WEBHOOK, _) => Ok(false),
-            (other_kind, _) => Err(task_kind_error(other_kind, task.id.as_str())),
+        match trigger {
+            PersistedTaskTrigger::Time {
+                trigger_type: TimeTriggerType::Cron,
+            } => self.is_cron_due(task, now),
+            PersistedTaskTrigger::Time {
+                trigger_type: TimeTriggerType::Once,
+            } => self.is_once_due(task, now),
+            PersistedTaskTrigger::Event { .. } | PersistedTaskTrigger::Webhook { .. } => Ok(false),
         }
     }
 
@@ -1158,11 +1154,11 @@ impl TaskRuntime {
         })?;
 
         let default_image_tag =
-            crate::container::profile::default_image_tag(&self.may_dir, profile).await.map_err(
-                |error| {
+            crate::container::profile::default_image_tag(&self.may_dir, profile)
+                .await
+                .map_err(|error| {
                     invalid_profile_component_error("invalid container profile image tag: ", &error)
-                },
-            )?;
+                })?;
         let image_spec = crate::container::profile::image_spec_for_profile(
             &self.may_dir,
             profile,
@@ -1276,11 +1272,11 @@ impl TaskRuntime {
         })?;
 
         let default_image_tag =
-            crate::container::profile::default_image_tag(&self.may_dir, profile).await.map_err(
-                |error| {
+            crate::container::profile::default_image_tag(&self.may_dir, profile)
+                .await
+                .map_err(|error| {
                     invalid_profile_component_error("invalid container profile image tag: ", &error)
-                },
-            )?;
+                })?;
         let image_spec = crate::container::profile::image_spec_for_profile(
             &self.may_dir,
             profile,

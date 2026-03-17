@@ -150,8 +150,10 @@ impl NotificationManager {
         for sub in &subscriptions {
             let sub_info = SubscriptionInfo::new(&sub.endpoint, &sub.p256dh, &sub.auth);
 
-            let sig_builder = match VapidSignatureBuilder::from_pem(self.vapid_pem.as_ref(), &sub_info)
-            {
+            let sig_builder = match VapidSignatureBuilder::from_pem(
+                self.vapid_pem.as_ref(),
+                &sub_info,
+            ) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!(endpoint = %sub.endpoint, error = %e, "VAPID signature build failed");

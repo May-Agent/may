@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-use crate::task_trigger::{NormalizedTaskTrigger, TaskTriggerInput, normalize_trigger};
+use crate::task_trigger::{NormalizedTaskTrigger, TaskTriggerRequest, TaskTriggerResponse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -20,17 +20,8 @@ pub enum TaskRuntimeKind {
 pub struct TaskArgs {
     /// Human-readable task name.
     pub name: String,
-    /// Trigger category (`time`, `event`, or `webhook`).
-    pub trigger_kind: String,
-    /// Run once at this UTC timestamp (must end with `Z`).
-    #[serde(default)]
-    pub run_at_utc: Option<String>,
-    /// Cron expression evaluated in UTC (e.g. `0 6 * * *`).
-    #[serde(default)]
-    pub cron_utc: Option<String>,
-    /// Event name for `trigger_kind=event` (e.g. `chat.turn.completed`).
-    #[serde(default)]
-    pub event_name: Option<String>,
+    /// Trigger definition.
+    pub trigger: TaskTriggerRequest,
     /// Path to a shell script file to execute.
     #[serde(default)]
     pub script_path: Option<String>,
@@ -59,7 +50,6 @@ pub struct TaskScriptSpec {
 pub struct NormalizedTaskCreateRequest {
     pub session_id: String,
     pub name: String,
-    pub trigger_kind: String,
     pub trigger: NormalizedTaskTrigger,
     pub script: TaskScriptSpec,
     pub needs_network: bool,
@@ -69,13 +59,20 @@ pub struct NormalizedTaskCreateRequest {
 pub struct TaskCreateResult {
     pub task_id: String,
     pub profile_id: String,
-    pub trigger_kind: String,
-    pub trigger_type: String,
-    pub run_at: Option<String>,
-    pub cron_expression: Option<String>,
-    pub webhook_path: Option<String>,
+    pub trigger: TaskTriggerResponse,
     pub approved: bool,
     pub enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskToolResponse {
+    ok: bool,
+    task_id: String,
+    profile_id: String,
+    trigger: TaskTriggerResponse,
+    approved: bool,
+    enabled: bool,
+    approval_required: bool,
 }
 
 pub type TaskBroker = ToolRequestBroker<TaskCreateRequest, Result<TaskCreateResult, String>>;
@@ -93,13 +90,7 @@ impl TaskCreateRequest {
             return Err("task name must not be empty".to_string());
         }
 
-        let trigger = normalize_trigger(TaskTriggerInput {
-            kind: &self.args.trigger_kind,
-            trigger_type: None,
-            run_at_utc: self.args.run_at_utc.as_deref(),
-            cron_utc: self.args.cron_utc.as_deref(),
-            event_name: self.args.event_name.as_deref(),
-        })?;
+        let trigger = self.args.trigger.normalize()?;
         let script = normalize_script(&self.args)?;
 
         let needs_network = match self.runtime {
@@ -112,7 +103,6 @@ impl TaskCreateRequest {
         Ok(NormalizedTaskCreateRequest {
             session_id: self.session_id,
             name: name.to_string(),
-            trigger_kind: trigger.kind_str().to_string(),
             trigger,
             script,
             needs_network,
@@ -184,18 +174,14 @@ impl Tool for TaskTool {
         let response = broker.request(request).await?;
         let model = response.map_err(anyhow::Error::msg)?;
 
-        ToolOutput::json(&serde_json::json!({
-            "ok": true,
-            "task_id": model.task_id,
-            "profile_id": model.profile_id,
-            "trigger_kind": model.trigger_kind,
-            "trigger_type": model.trigger_type,
-            "run_at": model.run_at,
-            "cron_expression": model.cron_expression,
-            "webhook_path": model.webhook_path,
-            "approved": model.approved,
-            "enabled": model.enabled,
-            "approval_required": true
-        }))
+        ToolOutput::json(&TaskToolResponse {
+            ok: true,
+            task_id: model.task_id,
+            profile_id: model.profile_id,
+            trigger: model.trigger,
+            approved: model.approved,
+            enabled: model.enabled,
+            approval_required: true,
+        })
     }
 }

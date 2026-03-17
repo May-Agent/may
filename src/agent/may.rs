@@ -789,15 +789,14 @@ impl RuntimeSystemContext {
     }
 
     async fn sync_memory_file(&mut self) {
-        let memory_content =
-            async_fs::read_to_string(&self.memory_path)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "failed to read memory file at {}: {error}",
-                        self.memory_path.display()
-                    )
-                });
+        let memory_content = async_fs::read_to_string(&self.memory_path)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to read memory file at {}: {error}",
+                    self.memory_path.display()
+                )
+            });
         self.last_memory_content = memory_content;
     }
 }

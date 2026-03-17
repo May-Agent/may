@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::{DashMap, DashSet};
-use tokio::sync::{oneshot};
+use tokio::sync::oneshot;
 use tokio::time::Instant as TokioInstant;
 
 use super::local_url_mapper::LocalUrlPortMapper;
@@ -228,13 +228,12 @@ impl McpService {
                 reply: reply_tx,
             })
             .expect("MCP actor channel unexpectedly closed");
-        reply_rx.await.expect("MCP actor dropped add_server response")
+        reply_rx
+            .await
+            .expect("MCP actor dropped add_server response")
     }
 
-    pub(crate) async fn remove_server(
-        &self,
-        name: String,
-    ) -> Result<(), aither_mcp::McpError> {
+    pub(crate) async fn remove_server(&self, name: String) -> Result<(), aither_mcp::McpError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(McpCommand::RemoveServer {

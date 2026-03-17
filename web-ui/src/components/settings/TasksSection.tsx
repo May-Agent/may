@@ -62,23 +62,23 @@ export function TasksSection() {
   );
 
   const describeTaskTrigger = (task: ScheduledTask): string => {
-    switch (task.triggerKind) {
+    switch (task.trigger.kind) {
       case 'time':
-        switch (task.triggerType) {
+        switch (task.trigger.triggerType) {
           case 'cron':
-            return task.cronExpression ?? 'cron';
+            return task.trigger.cronUtc ?? 'cron';
           case 'once':
-            return task.runAt ?? 'once';
+            return task.trigger.runAtUtc ?? 'once';
           default:
-            return task.triggerType;
+            return task.trigger.triggerType;
         }
       case 'event':
-        return task.triggerType;
+        return task.trigger.eventName;
       case 'webhook':
-        return task.webhookPath ?? task.triggerType;
-      default:
-        return `${task.triggerKind}:${task.triggerType}`;
+        return task.trigger.webhookPath;
     }
+    const exhaustiveTrigger: never = task.trigger;
+    return exhaustiveTrigger;
   };
 
   const clearTaskForm = () => {
@@ -137,20 +137,26 @@ export function TasksSection() {
       const taskInput: CreateTaskInput = taskTriggerKind === 'time'
         ? {
             ...baseInput,
-            triggerKind: 'time',
-            triggerType: taskTriggerType,
-            runAt: taskTriggerType === 'once' ? taskRunAt.trim() : undefined,
-            cronExpression: taskTriggerType === 'cron' ? taskCron.trim() : undefined,
+            trigger: {
+              kind: 'time',
+              triggerType: taskTriggerType,
+              runAtUtc: taskTriggerType === 'once' ? taskRunAt.trim() : undefined,
+              cronUtc: taskTriggerType === 'cron' ? taskCron.trim() : undefined,
+            },
           }
         : taskTriggerKind === 'event'
           ? {
               ...baseInput,
-              triggerKind: 'event',
-              eventName: taskEventName.trim(),
+              trigger: {
+                kind: 'event',
+                eventName: taskEventName.trim(),
+              },
             }
           : {
               ...baseInput,
-              triggerKind: 'webhook',
+              trigger: {
+                kind: 'webhook',
+              },
             };
       await createTask(taskInput);
       clearTaskForm();
@@ -343,9 +349,9 @@ export function TasksSection() {
             <div className="text-xs text-muted-foreground">
               profile={task.profileId} · updated={task.updatedAt}
             </div>
-            {task.webhookPath && (
+            {task.trigger.kind === 'webhook' && (
               <div className="rounded border bg-muted/20 p-2 text-xs font-mono break-all">
-                POST {task.webhookPath}
+                POST {task.trigger.webhookPath}
               </div>
             )}
             {task.lastRunStatus && (

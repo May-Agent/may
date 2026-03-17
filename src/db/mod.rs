@@ -1500,7 +1500,10 @@ impl ChatDb {
         message: &ChatMessage,
     ) -> Result<messages::Model, ChatDbError> {
         let timestamp = message.timestamp.map(|value| value.to_string());
-        let stats = message.stats.as_ref().map(message_stats_params_from_chat_stats);
+        let stats = message
+            .stats
+            .as_ref()
+            .map(message_stats_params_from_chat_stats);
         self.append_message(
             session_id,
             message.role.clone(),
