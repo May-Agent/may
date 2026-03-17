@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aither_sandbox::{ContainerLaunchSpec, MountAccess};
+use arc_swap::ArcSwap;
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
     StopContainerOptionsBuilder,
 };
-use dashmap::DashMap;
 use tokio::time::Instant;
 
 use super::{ContainerError, ContainerRuntime};
@@ -34,7 +34,7 @@ pub struct ContainerManager {
     runtime: Arc<ContainerRuntime>,
     may_dir: PathBuf,
     /// Last activity timestamp per container ID.
-    activity: Arc<DashMap<String, Instant>>,
+    activity: Arc<ArcSwap<HashMap<String, Instant>>>,
 }
 
 impl ContainerManager {
@@ -42,7 +42,7 @@ impl ContainerManager {
         Self {
             runtime,
             may_dir,
-            activity: Arc::new(DashMap::new()),
+            activity: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         }
     }
 
@@ -361,7 +361,9 @@ impl ContainerManager {
             .client
             .stop_container(container_id, Some(opts))
             .await?;
-        self.activity.remove(container_id);
+        self.update_activity(|activity| {
+            activity.remove(container_id);
+        });
         tracing::info!(container_id = %container_id, "Stopped container");
         Ok(())
     }
@@ -373,15 +375,18 @@ impl ContainerManager {
             .client
             .remove_container(container_id, Some(opts))
             .await?;
-        self.activity.remove(container_id);
+        self.update_activity(|activity| {
+            activity.remove(container_id);
+        });
         tracing::info!(container_id = %container_id, "Removed container");
         Ok(())
     }
 
     /// Record activity for a container (resets auto-stop timer).
     pub async fn touch_activity(&self, container_id: &str) {
-        self.activity
-            .insert(container_id.to_string(), Instant::now());
+        self.update_activity(|activity| {
+            activity.insert(container_id.to_string(), Instant::now());
+        });
     }
 
     /// Spawn a background task that auto-stops idle containers.
@@ -404,13 +409,12 @@ impl ContainerManager {
                 interval.tick().await;
 
                 let now = Instant::now();
-                let idle_containers: Vec<String> = {
-                    activity
-                        .iter()
-                        .filter(|entry| now.duration_since(*entry.value()) > timeout)
-                        .map(|entry| entry.key().clone())
-                        .collect()
-                };
+                let snapshot = activity.load();
+                let idle_containers: Vec<String> = snapshot
+                    .iter()
+                    .filter(|(_, last_seen)| now.duration_since(**last_seen) > timeout)
+                    .map(|(container_id, _)| container_id.clone())
+                    .collect();
 
                 for container_id in idle_containers {
                     let opts = StopContainerOptionsBuilder::default().t(10).build();
@@ -420,7 +424,9 @@ impl ContainerManager {
                         .await
                     {
                         Ok(_) => {
-                            activity.remove(&container_id);
+                            let mut next_activity = activity.load().as_ref().clone();
+                            next_activity.remove(&container_id);
+                            activity.store(Arc::new(next_activity));
                             tracing::info!(
                                 container_id = %container_id,
                                 "Auto-stopped idle container"
@@ -433,12 +439,20 @@ impl ContainerManager {
                                 error = %e,
                                 "Failed to auto-stop container"
                             );
-                            activity.remove(&container_id);
+                            let mut next_activity = activity.load().as_ref().clone();
+                            next_activity.remove(&container_id);
+                            activity.store(Arc::new(next_activity));
                         }
                     }
                 }
             }
         })
+    }
+
+    fn update_activity(&self, update: impl FnOnce(&mut HashMap<String, Instant>)) {
+        let mut activity = self.activity.load().as_ref().clone();
+        update(&mut activity);
+        self.activity.store(Arc::new(activity));
     }
 
     /// Check if a container is currently running.
