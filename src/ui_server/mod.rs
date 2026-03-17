@@ -181,6 +181,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
     let task_runtime = Arc::new(task_runtime);
+    let container_prepare = state::ContainerPrepareTracker::new(ui_events_notify.clone());
 
     let state = Arc::new(UiServerState {
         db: db_for_archive.clone(),
@@ -195,8 +196,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         provider_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         config: arc_swap::ArcSwap::from_pointee(config),
         ui_events_notify,
-        container_prepare_statuses: Default::default(),
-        container_prepare_inflight: Default::default(),
+        container_prepare,
         container_manager,
         browser_manager,
         remote_access_manager,
