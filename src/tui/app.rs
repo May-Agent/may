@@ -212,7 +212,7 @@ impl App {
         event_tx: EventSender,
         image_support: Option<super::ui::image::TerminalImageSupport>,
     ) -> anyhow::Result<Self> {
-        let mut config = unblock(MayConfig::load)
+        let mut config = MayConfig::load_async()
             .await
             .context("Failed to load config")?;
         let mut session_manager = SessionManager::new().await?;
@@ -243,12 +243,7 @@ impl App {
                     }
                 }
             }
-            if let Err(e) = unblock({
-                let config = config.clone();
-                move || config.save()
-            })
-            .await
-            {
+            if let Err(e) = config.clone().save_async().await {
                 tracing::error!("Failed to save config after env detection: {}", e);
             }
         }
@@ -376,9 +371,7 @@ impl App {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
         spawn(async move {
-            let result = unblock(move || config.save())
-                .await
-                .map_err(anyhow::Error::from);
+            let result = config.save_async().await.map_err(anyhow::Error::from);
             let _ = tx.send(AppEvent::ConfigSaved(result)).await;
         })
         .detach();

@@ -514,10 +514,7 @@ fn parse_oneshot_selection(
 }
 
 async fn persist_tui_config(config: may_agent::config::MayConfig) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || config.save())
-        .await
-        .map_err(|error| anyhow::anyhow!("config save task failed: {error}"))?
-        .map_err(anyhow::Error::from)
+    config.save_async().await.map_err(anyhow::Error::from)
 }
 
 fn render_oneshot_event(

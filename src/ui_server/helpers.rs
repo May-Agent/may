@@ -71,17 +71,11 @@ pub(super) async fn load_session_paths(
 }
 
 pub(super) async fn load_config_from_disk() -> anyhow::Result<MayConfig> {
-    tokio::task::spawn_blocking(MayConfig::load)
-        .await
-        .map_err(|err| anyhow::anyhow!("config load task failed: {err}"))?
-        .map_err(anyhow::Error::from)
+    MayConfig::load_async().await.map_err(anyhow::Error::from)
 }
 
 pub(super) async fn save_config_to_disk(config: MayConfig) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || config.save())
-        .await
-        .map_err(|err| anyhow::anyhow!("config save task failed: {err}"))?
-        .map_err(anyhow::Error::from)
+    config.save_async().await.map_err(anyhow::Error::from)
 }
 
 pub(super) fn parse_arg_value(args: &[String], key: &str) -> Option<String> {

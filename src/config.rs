@@ -955,6 +955,13 @@ impl MayConfig {
         Self::load_from(&path)
     }
 
+    /// Load configuration from ~/.may/config.toml or use defaults without blocking the async runtime.
+    pub async fn load_async() -> Result<Self, ConfigError> {
+        tokio::task::spawn_blocking(Self::load)
+            .await
+            .map_err(|error| ConfigError::Read(std::io::Error::other(error.to_string())))?
+    }
+
     /// Load configuration from a specific path.
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         if path.exists() {
@@ -969,6 +976,14 @@ impl MayConfig {
     pub fn save(&self) -> Result<(), ConfigError> {
         let path = Self::config_path()?;
         self.save_to(&path)
+    }
+
+    /// Save configuration to ~/.may/config.toml without blocking the async runtime.
+    pub async fn save_async(&self) -> Result<(), ConfigError> {
+        let config = self.clone();
+        tokio::task::spawn_blocking(move || config.save())
+            .await
+            .map_err(|error| ConfigError::Read(std::io::Error::other(error.to_string())))?
     }
 
     /// Save configuration to a specific path.
