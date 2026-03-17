@@ -12,7 +12,6 @@ use crate::session::MayHomePaths;
 use crate::skill::SkillManager;
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::save_config_to_disk;
 use super::message_mapping::map_skill;
 use super::model_resolution::persist_last_model;
 use super::state::UiServerState;
@@ -165,7 +164,7 @@ pub(super) async fn save_full_config(
         .map_err(bad_request_error)?;
 
     let ssh_servers = updated.ssh_servers.clone();
-    save_config_to_disk(updated).await.map_err(internal_error)?;
+    updated.save_async().await.map_err(internal_error)?;
     state.task_runtime.set_ssh_servers(ssh_servers);
     state
         .task_runtime
@@ -232,7 +231,7 @@ pub(super) async fn add_ssh_server(
         });
     });
     let ssh_servers = updated.ssh_servers.clone();
-    save_config_to_disk(updated).await.map_err(internal_error)?;
+    updated.save_async().await.map_err(internal_error)?;
     state.task_runtime.set_ssh_servers(ssh_servers);
     state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))
@@ -247,7 +246,7 @@ pub(super) async fn remove_ssh_server(
         let _ = config.remove_ssh_server(name);
     });
     let ssh_servers = updated.ssh_servers.clone();
-    save_config_to_disk(updated).await.map_err(internal_error)?;
+    updated.save_async().await.map_err(internal_error)?;
     state.task_runtime.set_ssh_servers(ssh_servers);
     state.notify_ui_events();
     Ok(Json(ApiHealth { ok: true }))

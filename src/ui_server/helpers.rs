@@ -14,7 +14,6 @@ use serde::Serialize;
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::ask_user::AnswerValue;
-use crate::config::MayConfig;
 use crate::session::{ChatMessage, MayHomePaths, SessionId, SessionPaths};
 
 use super::error::{bad_request_error, internal_error};
@@ -68,14 +67,6 @@ pub(super) async fn load_session_paths(
         None => home_paths.session_paths(session_id),
     };
     Ok(paths)
-}
-
-pub(super) async fn load_config_from_disk() -> anyhow::Result<MayConfig> {
-    MayConfig::load_async().await.map_err(anyhow::Error::from)
-}
-
-pub(super) async fn save_config_to_disk(config: MayConfig) -> anyhow::Result<()> {
-    config.save_async().await.map_err(anyhow::Error::from)
 }
 
 pub(super) fn parse_arg_value(args: &[String], key: &str) -> Option<String> {
