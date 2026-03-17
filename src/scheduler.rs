@@ -917,7 +917,10 @@ impl TaskRuntime {
         tokio::fs::write(&trigger_path, trigger_payload)
             .await
             .map_err(|error| {
-                let _ = std::fs::remove_file(&script_path);
+                let script_path = script_path.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::fs::remove_file(script_path).await;
+                });
                 path_error_text(
                     "failed to write task trigger payload ",
                     &trigger_path,
@@ -1119,7 +1122,8 @@ impl TaskRuntime {
         command: String,
     ) -> Result<String, String> {
         let working_dir = self.may_dir.join("tasks").join("remote").join(&profile.id);
-        std::fs::create_dir_all(working_dir.join("outputs"))
+        tokio::fs::create_dir_all(working_dir.join("outputs"))
+            .await
             .map_err(|error| workspace_prepare_error(&working_dir, &error))?;
         let bash_tool = self.remote_bash_tool(profile, &working_dir).await?;
         run_bash_script(&bash_tool, BashExecutionMode::Ssh, None, command).await
