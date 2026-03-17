@@ -34,7 +34,8 @@ use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
 use crate::profile::{ProfileEnvironment, ProfileInfo};
 use crate::task_trigger::{
-    PersistedTaskTrigger, TaskInvocation, TaskWebhookRequest, TimeTriggerType, normalize_event_name,
+    PersistedTaskTrigger, TaskInvocation, TaskTriggerResponse, TaskWebhookRequest, TimeTriggerType,
+    normalize_event_name,
 };
 
 /// Shared task execution facility used by the scheduler, REST API, and agent tools.
@@ -65,7 +66,6 @@ struct TaskValidationScriptTemplate<'a> {
 #[template(path = "task_execute_script.sh", escape = "none")]
 struct TaskExecutionScriptTemplate<'a> {
     trigger_file: &'a str,
-    trigger_kind: &'a str,
     script_file: &'a str,
 }
 
@@ -280,8 +280,7 @@ struct TaskExecutionTask {
     name: String,
     profile_id: String,
     session_id: Option<String>,
-    trigger_kind: String,
-    trigger_type: String,
+    trigger: TaskTriggerResponse,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -298,18 +297,23 @@ struct TaskNotificationCallbackXml<'a> {
 }
 
 impl TaskExecutionEnvelope {
-    fn new(task: &scheduled_tasks::Model, invocation: TaskInvocation) -> Self {
-        Self {
+    fn new(task: &scheduled_tasks::Model, invocation: TaskInvocation) -> Result<Self, String> {
+        let trigger = PersistedTaskTrigger::from_storage(
+            task.trigger_kind.as_str(),
+            task.trigger_type.as_str(),
+        )
+        .map_err(|error| prefixed_error("invalid persisted task trigger: ", &error))?
+        .response(task.run_at.clone(), task.cron_expression.clone());
+        Ok(Self {
             task: TaskExecutionTask {
                 id: task.id.clone(),
                 name: task.name.clone(),
                 profile_id: task.profile_id.clone(),
                 session_id: task.session_id.clone(),
-                trigger_kind: task.trigger_kind.clone(),
-                trigger_type: task.trigger_type.clone(),
+                trigger,
             },
             invocation,
-        }
+        })
     }
 }
 
@@ -900,10 +904,12 @@ impl TaskRuntime {
             execution_id.as_str(),
             ".json",
         ));
-        let trigger_kind =
-            shell_escape(Cow::Borrowed(Self::invocation_kind(&invocation))).into_owned();
-        let trigger_payload = serde_json::to_vec(&TaskExecutionEnvelope::new(task, invocation))
-            .map_err(|error| prefixed_error("failed to encode task trigger payload: ", &error))?;
+        let trigger_payload = serde_json::to_vec(
+            &TaskExecutionEnvelope::new(task, invocation).map_err(|error| {
+                prefixed_error("failed to build task trigger payload: ", &error)
+            })?,
+        )
+        .map_err(|error| prefixed_error("failed to encode task trigger payload: ", &error))?;
 
         tokio::fs::write(&script_path, script.content.as_bytes())
             .await
@@ -929,7 +935,6 @@ impl TaskRuntime {
         let script_file = shell_escape(Cow::Owned(script_path.display().to_string())).into_owned();
         let command = TaskExecutionScriptTemplate {
             trigger_file: &trigger_file,
-            trigger_kind: &trigger_kind,
             script_file: &script_file,
         }
         .render()
