@@ -12,6 +12,7 @@
 //! - Optional: GStreamer (hardware accel via VideoToolbox/NVENC/VAAPI, AV1 SCC)
 //!   Enable with `--features gstreamer`. Requires GStreamer installed on system.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,7 +28,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
 use chromiumoxide::page::Page;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{mpsc, oneshot, watch};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
@@ -38,6 +39,7 @@ use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::TrackLocal;
@@ -119,6 +121,61 @@ struct BrowserSession {
     _audio_writer: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct BrowserRuntimeSnapshot {
+    running: bool,
+}
+
+enum BrowserCommand {
+    Start {
+        reply: oneshot::Sender<Result<(), BrowserError>>,
+    },
+    Stop {
+        reply: oneshot::Sender<Result<(), BrowserError>>,
+    },
+    HandleOffer {
+        offer_sdp: String,
+        reply: oneshot::Sender<Result<String, BrowserError>>,
+    },
+    DropPeer {
+        peer_id: String,
+    },
+}
+
+struct BrowserRuntime {
+    session: Option<BrowserSession>,
+    video_track: Arc<TrackLocalStaticSample>,
+    audio_track: Arc<TrackLocalStaticSample>,
+    webrtc_api: webrtc::api::API,
+    peers: HashMap<String, Arc<RTCPeerConnection>>,
+}
+
+impl BrowserRuntime {
+    fn new(
+        video_track: Arc<TrackLocalStaticSample>,
+        audio_track: Arc<TrackLocalStaticSample>,
+        webrtc_api: webrtc::api::API,
+    ) -> Self {
+        Self {
+            session: None,
+            video_track,
+            audio_track,
+            webrtc_api,
+            peers: HashMap::new(),
+        }
+    }
+
+    fn publish_snapshot(&self, snapshot_tx: &watch::Sender<BrowserRuntimeSnapshot>) {
+        let _ = snapshot_tx.send(BrowserRuntimeSnapshot {
+            running: self.session.is_some(),
+        });
+    }
+
+    fn drop_peer(&mut self, peer_id: &str) {
+        self.peers.remove(peer_id);
+    }
+}
+
 // ── BrowserManager ─────────────────────────────────────────────────────────────
 
 /// Manages a browser instance with WebRTC live streaming and input forwarding.
@@ -127,12 +184,8 @@ struct BrowserSession {
 /// Input pipeline: WebRTC DataChannel → JSON → CDP Input.dispatch*
 pub struct BrowserManager {
     config: PlaywrightConfig,
-    session: RwLock<Option<BrowserSession>>,
-    video_track: Arc<TrackLocalStaticSample>,
-    audio_track: Arc<TrackLocalStaticSample>,
-    webrtc_api: webrtc::api::API,
-    peers: RwLock<Vec<Arc<RTCPeerConnection>>>,
-    state_notify: Notify,
+    command_tx: mpsc::UnboundedSender<BrowserCommand>,
+    snapshot_rx: watch::Receiver<BrowserRuntimeSnapshot>,
 }
 
 impl BrowserManager {
@@ -177,20 +230,51 @@ impl BrowserManager {
             "browser-audio".to_owned(),
         ));
 
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let actor_tx = command_tx.clone();
+        let (snapshot_tx, snapshot_rx) = watch::channel(BrowserRuntimeSnapshot::default());
+        let config_for_actor = config.clone();
+
+        tokio::spawn(async move {
+            let mut runtime = BrowserRuntime::new(video_track, audio_track, api);
+            runtime.publish_snapshot(&snapshot_tx);
+
+            while let Some(command) = command_rx.recv().await {
+                match command {
+                    BrowserCommand::Start { reply } => {
+                        let result = runtime.start(&config_for_actor).await;
+                        runtime.publish_snapshot(&snapshot_tx);
+                        let _ = reply.send(result);
+                    }
+                    BrowserCommand::Stop { reply } => {
+                        let result = runtime.stop().await;
+                        runtime.publish_snapshot(&snapshot_tx);
+                        let _ = reply.send(result);
+                    }
+                    BrowserCommand::HandleOffer { offer_sdp, reply } => {
+                        let _ = reply.send(runtime.handle_offer(offer_sdp, actor_tx.clone()).await);
+                    }
+                    BrowserCommand::DropPeer { peer_id } => {
+                        runtime.drop_peer(peer_id.as_str());
+                    }
+                }
+            }
+
+            if let Err(error) = runtime.stop().await {
+                tracing::warn!(error = %error, "failed to stop browser runtime after actor shutdown");
+            }
+        });
+
         Ok(Self {
             config,
-            session: RwLock::new(None),
-            video_track,
-            audio_track,
-            webrtc_api: api,
-            peers: RwLock::new(Vec::new()),
-            state_notify: Notify::new(),
+            command_tx,
+            snapshot_rx,
         })
     }
 
     /// Whether the browser is currently running.
     pub async fn is_running(&self) -> bool {
-        self.session.read().await.is_some()
+        self.snapshot_rx.borrow().running
     }
 
     /// CDP endpoint URL for agent connections (e.g. from container).
@@ -200,103 +284,24 @@ impl BrowserManager {
 
     /// Launch the browser and start the encoding pipeline.
     pub async fn start(&self) -> Result<(), BrowserError> {
-        if self.is_running().await {
-            return Ok(());
-        }
-
-        // Clean up stale Chrome processes and lock files from previous server runs.
-        cleanup_stale_chrome(self.config.port).await;
-
-        // Find browser binary (blocking I/O → spawn_blocking)
-        let browser_kind = self.config.browser;
-        let binary_path = tokio::task::spawn_blocking(move || find_browser_binary(browser_kind))
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(BrowserCommand::Start { reply: reply_tx })
+            .map_err(|_| BrowserError::Browser("browser actor unexpectedly closed".to_string()))?;
+        reply_rx
             .await
-            .map_err(|e| BrowserError::Browser(e.to_string()))?;
-
-        // Build browser config — always headless since we stream via WebRTC
-        let mut builder = BrowserConfig::builder()
-            .port(self.config.port)
-            // Allow CDP connections from containers via host.docker.internal
-            .arg("--remote-allow-origins=*")
-            .arg("--remote-debugging-address=0.0.0.0");
-
-        if let Some(path) = binary_path {
-            builder = builder.chrome_executable(path);
-        }
-
-        let browser_config = builder.build().map_err(BrowserError::Browser)?;
-
-        let (browser, mut handler) = Browser::launch(browser_config)
-            .await
-            .map_err(|e| BrowserError::Browser(e.to_string()))?;
-
-        // Handler must be polled continuously for CDP to work
-        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-
-        // Create initial page
-        let page = Arc::new(
-            browser
-                .new_page("about:blank")
-                .await
-                .map_err(|e| BrowserError::Browser(e.to_string()))?,
-        );
-
-        // Start screencast
-        let max_width = self.config.screencast_max_width as i64;
-        let max_height = max_width * 5 / 8; // 16:10 aspect ratio
-        page.execute(
-            StartScreencastParams::builder()
-                .format(StartScreencastFormat::Jpeg)
-                .quality(self.config.screencast_quality as i64)
-                .max_width(max_width)
-                .max_height(max_height)
-                .every_nth_frame(1)
-                .build(),
-        )
-        .await
-        .map_err(|e| BrowserError::Browser(e.to_string()))?;
-
-        // Start the encoding pipeline (CDP → encoder thread → WebRTC track)
-        let (cdp_reader, sample_writer) = self.start_encoding_pipeline(page.clone()).await?;
-        let audio_writer = self.start_audio_pipeline();
-
-        *self.session.write().await = Some(BrowserSession {
-            browser,
-            page,
-            _handler: handler_task,
-            _cdp_reader: cdp_reader,
-            _sample_writer: sample_writer,
-            _audio_writer: audio_writer,
-        });
-
-        self.state_notify.notify_waiters();
-        tracing::info!(
-            port = self.config.port,
-            "Browser started with WebRTC streaming"
-        );
-        Ok(())
+            .map_err(|_| BrowserError::Browser("browser actor dropped start reply".to_string()))?
     }
 
     /// Stop the browser and clean up all resources.
     pub async fn stop(&self) -> Result<(), BrowserError> {
-        // Close all peer connections first
-        let peers = std::mem::take(&mut *self.peers.write().await);
-        for peer in peers {
-            let _ = peer.close().await;
-        }
-
-        // Abort tasks and close browser
-        if let Some(mut session) = self.session.write().await.take() {
-            session._cdp_reader.abort();
-            session._sample_writer.abort();
-            session._audio_writer.abort();
-            session._handler.abort();
-            let _ = session.browser.close().await;
-            tracing::info!("Browser stopped");
-        }
-
-        self.state_notify.notify_waiters();
-        Ok(())
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(BrowserCommand::Stop { reply: reply_tx })
+            .map_err(|_| BrowserError::Browser("browser actor unexpectedly closed".to_string()))?;
+        reply_rx
+            .await
+            .map_err(|_| BrowserError::Browser("browser actor dropped stop reply".to_string()))?
     }
 
     /// Handle a WebRTC SDP offer from a client. Returns the SDP answer.
@@ -306,14 +311,119 @@ impl BrowserManager {
     /// 2. Server creates answer with video track + ICE candidates
     /// 3. Connection established, video flows, DataChannel ready for input
     pub async fn handle_offer(&self, offer_sdp: String) -> Result<String, BrowserError> {
-        let page = {
-            let session = self.session.read().await;
-            session
-                .as_ref()
-                .ok_or(BrowserError::NotRunning)?
-                .page
-                .clone()
-        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(BrowserCommand::HandleOffer {
+                offer_sdp,
+                reply: reply_tx,
+            })
+            .map_err(|_| BrowserError::Browser("browser actor unexpectedly closed".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            BrowserError::Browser("browser actor dropped offer handling reply".to_string())
+        })?
+    }
+}
+
+impl BrowserRuntime {
+    async fn start(&mut self, config: &PlaywrightConfig) -> Result<(), BrowserError> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+
+        cleanup_stale_chrome(config.port).await;
+
+        let browser_kind = config.browser;
+        let binary_path = tokio::task::spawn_blocking(move || find_browser_binary(browser_kind))
+            .await
+            .map_err(|e| BrowserError::Browser(e.to_string()))?;
+
+        let mut builder = BrowserConfig::builder()
+            .port(config.port)
+            .arg("--remote-allow-origins=*")
+            .arg("--remote-debugging-address=0.0.0.0");
+
+        if let Some(path) = binary_path {
+            builder = builder.chrome_executable(path);
+        }
+
+        let browser_config = builder.build().map_err(BrowserError::Browser)?;
+        let (browser, mut handler) = Browser::launch(browser_config)
+            .await
+            .map_err(|e| BrowserError::Browser(e.to_string()))?;
+
+        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+        let page = Arc::new(
+            browser
+                .new_page("about:blank")
+                .await
+                .map_err(|e| BrowserError::Browser(e.to_string()))?,
+        );
+
+        let max_width = config.screencast_max_width as i64;
+        let max_height = max_width * 5 / 8;
+        page.execute(
+            StartScreencastParams::builder()
+                .format(StartScreencastFormat::Jpeg)
+                .quality(config.screencast_quality as i64)
+                .max_width(max_width)
+                .max_height(max_height)
+                .every_nth_frame(1)
+                .build(),
+        )
+        .await
+        .map_err(|e| BrowserError::Browser(e.to_string()))?;
+
+        let (cdp_reader, sample_writer) = start_encoding_pipeline(
+            page.clone(),
+            self.video_track.clone(),
+            config.screencast_quality,
+        )
+        .await?;
+        let audio_writer = start_audio_pipeline(self.audio_track.clone());
+
+        self.session = Some(BrowserSession {
+            browser,
+            page,
+            _handler: handler_task,
+            _cdp_reader: cdp_reader,
+            _sample_writer: sample_writer,
+            _audio_writer: audio_writer,
+        });
+
+        tracing::info!(port = config.port, "Browser started with WebRTC streaming");
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<(), BrowserError> {
+        let peers = std::mem::take(&mut self.peers);
+        for (_, peer) in peers {
+            let _ = peer.close().await;
+        }
+
+        if let Some(mut session) = self.session.take() {
+            session._cdp_reader.abort();
+            session._sample_writer.abort();
+            session._audio_writer.abort();
+            session._handler.abort();
+            let _ = session.browser.close().await;
+            tracing::info!("Browser stopped");
+        }
+
+        Ok(())
+    }
+
+    async fn handle_offer(
+        &mut self,
+        offer_sdp: String,
+        peer_events: mpsc::UnboundedSender<BrowserCommand>,
+    ) -> Result<String, BrowserError> {
+        let page = self
+            .session
+            .as_ref()
+            .ok_or(BrowserError::NotRunning)?
+            .page
+            .clone();
 
         let config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
@@ -330,7 +440,6 @@ impl BrowserManager {
                 .map_err(|e| BrowserError::WebRtc(e.to_string()))?,
         );
 
-        // Add shared video track
         let video_rtp_sender = peer_connection
             .add_track(Arc::clone(&self.video_track) as Arc<dyn TrackLocal + Send + Sync>)
             .await
@@ -340,7 +449,6 @@ impl BrowserManager {
             .await
             .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
 
-        // Must read RTCP packets for NACK/PLI (keyframe request) processing
         tokio::spawn(async move {
             let mut buf = vec![0u8; 1500];
             while video_rtp_sender.read(&mut buf).await.is_ok() {}
@@ -350,10 +458,11 @@ impl BrowserManager {
             while audio_rtp_sender.read(&mut buf).await.is_ok() {}
         });
 
-        // DataChannel handler for input forwarding
         setup_data_channel_handler(&peer_connection, page);
 
-        // Set remote description (client's offer)
+        let peer_id = uuid::Uuid::new_v4().to_string();
+        setup_peer_connection_lifecycle(&peer_connection, peer_id.clone(), peer_events);
+
         let offer = RTCSessionDescription::offer(offer_sdp)
             .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
         peer_connection
@@ -361,13 +470,11 @@ impl BrowserManager {
             .await
             .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
 
-        // Create answer
         let answer = peer_connection
             .create_answer(None)
             .await
             .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
 
-        // Gather ICE candidates — get the promise BEFORE setting local description
         let mut gather_complete = peer_connection.gathering_complete_promise().await;
 
         peer_connection
@@ -375,126 +482,103 @@ impl BrowserManager {
             .await
             .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
 
-        // Wait for ICE gathering with timeout
         tokio::time::timeout(Duration::from_secs(10), gather_complete.recv())
             .await
             .map_err(|_| BrowserError::WebRtc("ICE gathering timed out".to_string()))?;
 
-        // Complete SDP with all ICE candidates
         let local_desc = peer_connection.local_description().await.ok_or_else(|| {
             BrowserError::WebRtc("No local description after gathering".to_string())
         })?;
 
-        // Keep peer connection alive
-        self.peers.write().await.push(peer_connection);
-
+        self.peers.insert(peer_id, peer_connection);
         Ok(local_desc.sdp)
     }
+}
 
-    /// Start the three-stage encoding pipeline:
-    /// 1. CDP event reader (async) → JPEG bytes channel
-    /// 2. Encoder thread (std::thread) → encoded samples channel
-    /// 3. WebRTC sample writer (async)
-    async fn start_encoding_pipeline(
-        &self,
-        page: Arc<Page>,
-    ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), BrowserError> {
-        let mut event_stream = page
-            .event_listener::<EventScreencastFrame>()
-            .await
-            .map_err(|e| BrowserError::Browser(e.to_string()))?;
+async fn start_encoding_pipeline(
+    page: Arc<Page>,
+    video_track: Arc<TrackLocalStaticSample>,
+    screencast_quality: u32,
+) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), BrowserError> {
+    let mut event_stream = page
+        .event_listener::<EventScreencastFrame>()
+        .await
+        .map_err(|e| BrowserError::Browser(e.to_string()))?;
 
-        // Channel: CDP reader → encoder thread (sync channel, blocks encoder when empty)
-        let (jpeg_tx, jpeg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        // Channel: encoder thread → WebRTC writer (async channel)
-        let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<EncodedSample>(16);
+    let (jpeg_tx, jpeg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<EncodedSample>(16);
 
-        let video_track = self.video_track.clone();
-        let screencast_quality = self.config.screencast_quality;
+    let page_ack = page.clone();
+    let cdp_reader = tokio::spawn(async move {
+        while let Some(event) = event_stream.next().await {
+            if let Err(e) = page_ack
+                .execute(ScreencastFrameAckParams::new(event.session_id))
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to ack screencast frame");
+                continue;
+            }
 
-        // Stage 1: Read CDP screencast events, base64-decode, send JPEG bytes
-        let page_ack = page.clone();
-        let cdp_reader = tokio::spawn(async move {
-            while let Some(event) = event_stream.next().await {
-                // Acknowledge frame to keep screencast flowing
-                if let Err(e) = page_ack
-                    .execute(ScreencastFrameAckParams::new(event.session_id))
-                    .await
-                {
-                    tracing::warn!(error = %e, "Failed to ack screencast frame");
+            let b64_str: &str = event.data.as_ref();
+            let jpeg_bytes = match base64::engine::general_purpose::STANDARD.decode(b64_str) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Invalid base64 in screencast frame");
                     continue;
                 }
+            };
 
-                // Decode base64 → raw JPEG bytes
-                let b64_str: &str = event.data.as_ref();
-                let jpeg_bytes = match base64::engine::general_purpose::STANDARD.decode(b64_str) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Invalid base64 in screencast frame");
-                        continue;
-                    }
-                };
-
-                // Send to encoder thread (drop frame if channel disconnected)
-                if jpeg_tx.send(jpeg_bytes).is_err() {
-                    break;
-                }
+            if jpeg_tx.send(jpeg_bytes).is_err() {
+                break;
             }
-            tracing::info!("CDP screencast reader stopped");
-        });
+        }
+        tracing::info!("CDP screencast reader stopped");
+    });
 
-        // Stage 2: Encoding thread — CPU-bound, runs in dedicated std::thread
-        // Stops when jpeg_rx channel closes (cdp_reader dropped)
-        std::thread::Builder::new()
-            .name("browser-encoder".into())
-            .spawn(move || {
-                encode_loop(jpeg_rx, sample_tx, screencast_quality);
-            })
-            .map_err(|e| BrowserError::Encoder(e.to_string()))?;
-
-        // Stage 3: Write encoded samples to WebRTC video track
-        let sample_writer = tokio::spawn(async move {
-            while let Some(encoded) = sample_rx.recv().await {
-                if let Err(e) = video_track
-                    .write_sample(&Sample {
-                        data: bytes::Bytes::from(encoded.data),
-                        duration: encoded.duration,
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    // Not fatal — might just mean no peers connected yet
-                    tracing::trace!(error = %e, "WebRTC sample write skipped");
-                }
-            }
-            tracing::info!("WebRTC sample writer stopped");
-        });
-
-        Ok((cdp_reader, sample_writer))
-    }
-
-    /// Emit a continuous low-bandwidth Opus silence stream so remote viewers
-    /// get synchronized audio/video tracks under varying network conditions.
-    fn start_audio_pipeline(&self) -> tokio::task::JoinHandle<()> {
-        let audio_track = self.audio_track.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(20));
-            let silence_frame = bytes::Bytes::from_static(&[0xF8, 0xFF, 0xFE]);
-            loop {
-                ticker.tick().await;
-                if let Err(e) = audio_track
-                    .write_sample(&Sample {
-                        data: silence_frame.clone(),
-                        duration: Duration::from_millis(20),
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    tracing::trace!(error = %e, "WebRTC audio sample write skipped");
-                }
-            }
+    std::thread::Builder::new()
+        .name("browser-encoder".into())
+        .spawn(move || {
+            encode_loop(jpeg_rx, sample_tx, screencast_quality);
         })
-    }
+        .map_err(|e| BrowserError::Encoder(e.to_string()))?;
+
+    let sample_writer = tokio::spawn(async move {
+        while let Some(encoded) = sample_rx.recv().await {
+            if let Err(e) = video_track
+                .write_sample(&Sample {
+                    data: bytes::Bytes::from(encoded.data),
+                    duration: encoded.duration,
+                    ..Default::default()
+                })
+                .await
+            {
+                tracing::trace!(error = %e, "WebRTC sample write skipped");
+            }
+        }
+        tracing::info!("WebRTC sample writer stopped");
+    });
+
+    Ok((cdp_reader, sample_writer))
+}
+
+fn start_audio_pipeline(audio_track: Arc<TrackLocalStaticSample>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(20));
+        let silence_frame = bytes::Bytes::from_static(&[0xF8, 0xFF, 0xFE]);
+        loop {
+            ticker.tick().await;
+            if let Err(e) = audio_track
+                .write_sample(&Sample {
+                    data: silence_frame.clone(),
+                    duration: Duration::from_millis(20),
+                    ..Default::default()
+                })
+                .await
+            {
+                tracing::trace!(error = %e, "WebRTC audio sample write skipped");
+            }
+        }
+    })
 }
 
 // ── H.264 encoding loop (dedicated thread) ─────────────────────────────────────
@@ -581,6 +665,27 @@ fn encode_loop(
 }
 
 // ── DataChannel input handler ──────────────────────────────────────────────────
+
+fn setup_peer_connection_lifecycle(
+    pc: &Arc<RTCPeerConnection>,
+    peer_id: String,
+    peer_events: mpsc::UnboundedSender<BrowserCommand>,
+) {
+    pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+        let peer_id = peer_id.clone();
+        let peer_events = peer_events.clone();
+        Box::pin(async move {
+            if matches!(
+                state,
+                RTCPeerConnectionState::Disconnected
+                    | RTCPeerConnectionState::Failed
+                    | RTCPeerConnectionState::Closed
+            ) {
+                let _ = peer_events.send(BrowserCommand::DropPeer { peer_id });
+            }
+        })
+    }));
+}
 
 fn setup_data_channel_handler(pc: &RTCPeerConnection, page: Arc<Page>) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
