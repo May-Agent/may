@@ -30,6 +30,15 @@ use super::types::{
     SlidevPreviewResponse,
 };
 
+const PREVIEW_CACHE_CONTROL: &str = "private, no-cache";
+const SLIDEV_CACHE_CONTROL: &str = "private, max-age=0, must-revalidate";
+
+struct ResolvedSessionFile {
+    canonical_path: PathBuf,
+    relative_path: PathBuf,
+    metadata: std::fs::Metadata,
+}
+
 pub(super) async fn get_session_runtime(
     params: Params,
     State(state): State<Arc<UiServerState>>,
@@ -113,6 +122,130 @@ fn artifacts_signature(entries: &[ArtifactEntry]) -> String {
         .map(|e| format!("{}:{}:{}", e.path, e.fingerprint, e.is_html))
         .collect::<Vec<_>>()
         .join("|")
+}
+
+async fn resolve_scoped_file(
+    scope_root: &Path,
+    relative_path: PathBuf,
+    not_found_message: &str,
+    traversal_message: &str,
+) -> Result<ResolvedSessionFile, skyzen::Error> {
+    let full_path = scope_root.join(&relative_path);
+    let canonical_scope_root = async_fs::canonicalize(scope_root)
+        .await
+        .map_err(|_| bad_request_error(not_found_message))?;
+    let canonical_path = async_fs::canonicalize(&full_path)
+        .await
+        .map_err(|_| bad_request_error(not_found_message))?;
+    if !canonical_path.starts_with(&canonical_scope_root) {
+        return Err(bad_request_error(traversal_message));
+    }
+
+    let metadata = async_fs::metadata(&canonical_path)
+        .await
+        .map_err(internal_error)?;
+    if !metadata.is_file() {
+        return Err(bad_request_error(not_found_message));
+    }
+
+    Ok(ResolvedSessionFile {
+        canonical_path,
+        relative_path,
+        metadata,
+    })
+}
+
+fn output_relative_path(raw: &str) -> Result<PathBuf, skyzen::Error> {
+    let relative_path = parse_safe_relative_path(raw, "output path")?;
+    let outputs_prefix = Path::new("outputs");
+    if !relative_path.starts_with(outputs_prefix) {
+        return Err(bad_request_error("output path must be under outputs/"));
+    }
+
+    let scoped = relative_path
+        .strip_prefix(outputs_prefix)
+        .map_err(internal_error)?;
+    if scoped.as_os_str().is_empty() {
+        return Err(bad_request_error("output path must point to a file"));
+    }
+
+    Ok(scoped.to_path_buf())
+}
+
+fn metadata_modified_nanos(metadata: &std::fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|timestamp| timestamp.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn etag_value(metadata: &std::fs::Metadata) -> String {
+    let mut value = String::new();
+    value.push('"');
+    value.push_str(metadata.len().to_string().as_str());
+    value.push('-');
+    value.push_str(metadata_modified_nanos(metadata).to_string().as_str());
+    value.push('"');
+    value
+}
+
+fn etag_matches(if_none_match: &IfNoneMatchHeader, etag: &str) -> bool {
+    let current = etag.trim_start_matches("W/").trim_matches('"');
+    if_none_match
+        .0
+        .as_deref()
+        .map(str::trim)
+        .map(|value| value.trim_start_matches("W/").trim_matches('"'))
+        .is_some_and(|value| value == "*" || value == current)
+}
+
+fn insert_header(response: &mut skyzen::Response, header: skyzen::header::HeaderName, value: &str) {
+    if let Ok(header_value) = skyzen::header::HeaderValue::from_str(value) {
+        response.headers_mut().insert(header, header_value);
+    }
+}
+
+fn not_modified_response(etag: &str, cache_control: &str) -> skyzen::Response {
+    let mut response = skyzen::Response::new(skyzen::Body::empty());
+    *response.status_mut() = StatusCode::NOT_MODIFIED;
+    insert_header(&mut response, skyzen::header::ETAG, etag);
+    insert_header(&mut response, skyzen::header::CACHE_CONTROL, cache_control);
+    response
+}
+
+fn file_response(
+    bytes: Vec<u8>,
+    content_type: &str,
+    etag: &str,
+    cache_control: &str,
+) -> skyzen::Response {
+    let mut response = skyzen::Response::new(skyzen::Body::from(bytes));
+    insert_header(&mut response, skyzen::header::CONTENT_TYPE, content_type);
+    insert_header(&mut response, skyzen::header::ETAG, etag);
+    insert_header(&mut response, skyzen::header::CACHE_CONTROL, cache_control);
+    response
+}
+
+fn mime_requires_utf8(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || matches!(
+            mime,
+            "application/json" | "application/javascript" | "application/xml" | "image/svg+xml"
+        )
+}
+
+fn content_type_for_path(path: &Path) -> String {
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let essence = mime.essence_str();
+    if mime_requires_utf8(essence) {
+        let mut content_type = essence.to_string();
+        content_type.push_str("; charset=utf-8");
+        content_type
+    } else {
+        essence.to_string()
+    }
 }
 
 fn is_slidev_markdown_path(path: &Path) -> bool {
@@ -578,27 +711,14 @@ pub(super) async fn prepare_slidev_preview(
 
     let session_paths = load_session_paths(&state, &session_id).await?;
     let session_dir = session_paths.root().to_path_buf();
-    let artifacts_dir = session_paths.artifacts_dir();
-    let full_path = artifacts_dir.join(&raw_rel);
-
-    let canonical_artifacts = async_fs::canonicalize(&artifacts_dir)
-        .await
-        .map_err(|_| bad_request_error("artifacts directory not found"))?;
-    let canonical_full = async_fs::canonicalize(&full_path)
-        .await
-        .map_err(|_| bad_request_error("artifact not found"))?;
-    if !canonical_full.starts_with(&canonical_artifacts) {
-        return Err(bad_request_error("artifact path traversal is not allowed"));
-    }
-
-    let meta = async_fs::metadata(&canonical_full)
-        .await
-        .map_err(internal_error)?;
-    if !meta.is_file() {
-        return Err(bad_request_error("artifact is not a file"));
-    }
-
-    let cache_key = slidev_cache_key(&raw_rel, &meta);
+    let resolved = resolve_scoped_file(
+        &session_paths.artifacts_dir(),
+        raw_rel.clone(),
+        "artifact not found",
+        "artifact path traversal is not allowed",
+    )
+    .await?;
+    let cache_key = slidev_cache_key(&raw_rel, &resolved.metadata);
     let cache_root = session_dir.join(".slidev-cache");
     async_fs::create_dir_all(&cache_root)
         .await
@@ -631,7 +751,7 @@ pub(super) async fn prepare_slidev_preview(
             let source_root = ensure_slidev_source_root(
                 toolchain_dir.as_path(),
                 cache_key.as_str(),
-                &canonical_artifacts,
+                &session_paths.artifacts_dir(),
             )
             .await?;
             let build_entry = source_root.join(&raw_rel);
@@ -680,50 +800,23 @@ pub(super) async fn get_slidev_static_asset(
 
     let session_paths = load_session_paths(&state, &session_id).await?;
     let cache_root = session_paths.root().join(".slidev-cache").join(&cache_key);
-    let full_asset_path = cache_root.join(relative_asset_path);
+    let resolved = resolve_scoped_file(
+        &cache_root,
+        relative_asset_path,
+        "slidev asset not found",
+        "slidev asset path traversal is not allowed",
+    )
+    .await?;
 
-    let canonical_cache_root = async_fs::canonicalize(&cache_root)
-        .await
-        .map_err(|_| bad_request_error("slidev preview not found"))?;
-    let canonical_asset_path = async_fs::canonicalize(&full_asset_path)
-        .await
-        .map_err(|_| bad_request_error("slidev asset not found"))?;
-    if !canonical_asset_path.starts_with(&canonical_cache_root) {
-        return Err(bad_request_error(
-            "slidev asset path traversal is not allowed",
-        ));
-    }
-
-    let metadata = async_fs::metadata(&canonical_asset_path)
+    let bytes = async_fs::read(&resolved.canonical_path)
         .await
         .map_err(internal_error)?;
-    if !metadata.is_file() {
-        return Err(bad_request_error("slidev asset not found"));
-    }
-
-    let bytes = async_fs::read(&canonical_asset_path)
-        .await
-        .map_err(internal_error)?;
-    let content_type = mime_guess::from_path(&canonical_asset_path)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string();
-
-    let mut response = skyzen::Response::new(skyzen::Body::from(bytes));
-    if let Ok(content_type_header) = skyzen::header::HeaderValue::from_str(content_type.as_str()) {
-        response
-            .headers_mut()
-            .insert(skyzen::header::CONTENT_TYPE, content_type_header);
-    }
-    if let Ok(cache_control) =
-        skyzen::header::HeaderValue::from_str("private, max-age=0, must-revalidate")
-    {
-        response
-            .headers_mut()
-            .insert(skyzen::header::CACHE_CONTROL, cache_control);
-    }
-
-    Ok(response)
+    Ok(file_response(
+        bytes,
+        content_type_for_path(&resolved.relative_path).as_str(),
+        etag_value(&resolved.metadata).as_str(),
+        SLIDEV_CACHE_CONTROL,
+    ))
 }
 
 pub(super) async fn stream_session_artifacts(
@@ -1010,115 +1103,32 @@ pub(super) async fn get_artifact_preview(
         return Err(bad_request_error("artifact path is required"));
     }
 
-    let raw_rel = PathBuf::from(requested);
-    if raw_rel.is_absolute() {
-        return Err(bad_request_error("artifact path must be relative"));
-    }
-    for comp in raw_rel.components() {
-        if matches!(comp, std::path::Component::ParentDir) {
-            return Err(bad_request_error("artifact path traversal is not allowed"));
-        }
-    }
-
+    let raw_rel = parse_safe_relative_path(requested, "artifact path")?;
     let session_paths = load_session_paths(&state, &session_id).await?;
-    let artifacts_dir = session_paths.artifacts_dir();
+    let resolved = resolve_scoped_file(
+        &session_paths.artifacts_dir(),
+        raw_rel,
+        "artifact not found",
+        "artifact path traversal is not allowed",
+    )
+    .await?;
+    let etag = etag_value(&resolved.metadata);
+    if etag_matches(&if_none_match, &etag) {
+        return Ok(not_modified_response(&etag, PREVIEW_CACHE_CONTROL));
+    }
 
-    let full = artifacts_dir.join(&raw_rel);
-
-    let canonical_artifacts = async_fs::canonicalize(&artifacts_dir)
+    let bytes = async_fs::read(&resolved.canonical_path)
         .await
         .map_err(internal_error)?;
-    let canonical_full = async_fs::canonicalize(&full)
-        .await
-        .map_err(|_| bad_request_error("artifact not found"))?;
-    if !canonical_full.starts_with(&canonical_artifacts) {
-        return Err(bad_request_error("artifact path traversal is not allowed"));
-    }
-
-    let meta = async_fs::metadata(&canonical_full)
-        .await
-        .map_err(internal_error)?;
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let etag_value = format!("\"{}-{}\"", meta.len(), modified);
-
-    let incoming_etag = if_none_match
-        .0
-        .as_deref()
-        .map(str::trim)
-        .map(|v| v.trim_start_matches("W/").trim_matches('"'));
-    let current_etag = etag_value.trim_start_matches("W/").trim_matches('"');
-
-    if incoming_etag.is_some_and(|v| v == "*" || v == current_etag) {
-        let mut not_modified = skyzen::Response::new(skyzen::Body::empty());
-        *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
-        if let Ok(etag_header) = skyzen::header::HeaderValue::from_str(&etag_value) {
-            not_modified
-                .headers_mut()
-                .insert(skyzen::header::ETAG, etag_header);
-        }
-        if let Ok(cache_control) = skyzen::header::HeaderValue::from_str("private, no-cache") {
-            not_modified
-                .headers_mut()
-                .insert(skyzen::header::CACHE_CONTROL, cache_control);
-        }
-        return Ok(not_modified);
-    }
-
-    let bytes = async_fs::read(&canonical_full)
-        .await
-        .map_err(internal_error)?;
-
-    let ext = raw_rel
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    let content_type = match ext.as_str() {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "md" | "markdown" => "text/markdown; charset=utf-8",
-        "txt" | "text" | "log" | "csv" | "json" | "xml" => "text/plain; charset=utf-8",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "pdf" => "application/pdf",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "ogg" => "audio/ogg",
-        "m4a" => "audio/mp4",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        _ => "application/octet-stream",
-    }
-    .to_string();
-
-    let mut response = skyzen::Response::new(skyzen::Body::from(bytes));
-    if let Ok(content_type_header) = skyzen::header::HeaderValue::from_str(&content_type) {
-        response
-            .headers_mut()
-            .insert(skyzen::header::CONTENT_TYPE, content_type_header);
-    }
-    if let Ok(etag_header) = skyzen::header::HeaderValue::from_str(&etag_value) {
-        response
-            .headers_mut()
-            .insert(skyzen::header::ETAG, etag_header);
-    }
-    if let Ok(cache_control) = skyzen::header::HeaderValue::from_str("private, no-cache") {
-        response
-            .headers_mut()
-            .insert(skyzen::header::CACHE_CONTROL, cache_control);
-    }
-
-    Ok(response)
+    Ok(file_response(
+        bytes,
+        content_type_for_path(&resolved.relative_path).as_str(),
+        &etag,
+        PREVIEW_CACHE_CONTROL,
+    ))
 }
 
-fn detect_output_content_type(ext: &str, bytes: &[u8]) -> String {
+fn detect_output_content_type(path: &Path, bytes: &[u8]) -> String {
     if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
         return "image/png".to_string();
     }
@@ -1135,25 +1145,20 @@ fn detect_output_content_type(ext: &str, bytes: &[u8]) -> String {
         return "image/webp".to_string();
     }
 
-    match ext {
-        "svg" => "image/svg+xml".to_string(),
-        "png" => "image/png".to_string(),
-        "jpg" | "jpeg" => "image/jpeg".to_string(),
-        "webp" => "image/webp".to_string(),
-        "gif" => "image/gif".to_string(),
-        "txt" | "text" | "log" | "csv" | "json" | "xml" | "md" | "markdown" => {
+    let guessed = content_type_for_path(path);
+    if guessed != "application/octet-stream" {
+        return guessed;
+    }
+
+    match std::str::from_utf8(bytes) {
+        Ok(text)
+            if text
+                .chars()
+                .all(|c| c == '\n' || c == '\r' || c == '\t' || (c >= ' ' && c != '\x7f')) =>
+        {
             "text/plain; charset=utf-8".to_string()
         }
-        _ => match std::str::from_utf8(bytes) {
-            Ok(text)
-                if text
-                    .chars()
-                    .all(|c| c == '\n' || c == '\r' || c == '\t' || (c >= ' ' && c != '\x7f')) =>
-            {
-                "text/plain; charset=utf-8".to_string()
-            }
-            _ => "application/octet-stream".to_string(),
-        },
+        _ => "application/octet-stream".to_string(),
     }
 }
 
@@ -1173,98 +1178,29 @@ pub(super) async fn get_output_preview(
         return Err(bad_request_error("output path is required"));
     }
 
-    let raw_rel = PathBuf::from(requested);
-    if raw_rel.is_absolute() {
-        return Err(bad_request_error("output path must be relative"));
-    }
-    for comp in raw_rel.components() {
-        if matches!(comp, std::path::Component::ParentDir) {
-            return Err(bad_request_error("output path traversal is not allowed"));
-        }
-    }
-    if !raw_rel.starts_with(Path::new("outputs")) {
-        return Err(bad_request_error("output path must be under outputs/"));
-    }
-
+    let raw_rel = output_relative_path(requested)?;
     let session_paths = load_session_paths(&state, &session_id).await?;
-    let outputs_dir = session_paths.outputs_dir();
-    let full = session_paths.root().join(&raw_rel);
-
-    let canonical_outputs = async_fs::canonicalize(&outputs_dir)
-        .await
-        .map_err(|_| bad_request_error("output not found"))?;
-    let canonical_full = async_fs::canonicalize(&full)
-        .await
-        .map_err(|_| bad_request_error("output not found"))?;
-    if !canonical_full.starts_with(&canonical_outputs) {
-        return Err(bad_request_error("output path traversal is not allowed"));
+    let resolved = resolve_scoped_file(
+        &session_paths.outputs_dir(),
+        raw_rel,
+        "output not found",
+        "output path traversal is not allowed",
+    )
+    .await?;
+    let etag = etag_value(&resolved.metadata);
+    if etag_matches(&if_none_match, &etag) {
+        return Ok(not_modified_response(&etag, PREVIEW_CACHE_CONTROL));
     }
 
-    let meta = async_fs::metadata(&canonical_full)
-        .await
-        .map_err(internal_error)?;
-    if !meta.is_file() {
-        return Err(bad_request_error("output not found"));
-    }
-
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let etag_value = format!("\"{}-{}\"", meta.len(), modified);
-
-    let incoming_etag = if_none_match
-        .0
-        .as_deref()
-        .map(str::trim)
-        .map(|v| v.trim_start_matches("W/").trim_matches('"'));
-    let current_etag = etag_value.trim_start_matches("W/").trim_matches('"');
-
-    if incoming_etag.is_some_and(|v| v == "*" || v == current_etag) {
-        let mut not_modified = skyzen::Response::new(skyzen::Body::empty());
-        *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
-        if let Ok(etag_header) = skyzen::header::HeaderValue::from_str(&etag_value) {
-            not_modified
-                .headers_mut()
-                .insert(skyzen::header::ETAG, etag_header);
-        }
-        if let Ok(cache_control) = skyzen::header::HeaderValue::from_str("private, no-cache") {
-            not_modified
-                .headers_mut()
-                .insert(skyzen::header::CACHE_CONTROL, cache_control);
-        }
-        return Ok(not_modified);
-    }
-
-    let bytes = async_fs::read(&canonical_full)
+    let bytes = async_fs::read(&resolved.canonical_path)
         .await
         .map_err(internal_error)?;
+    let content_type = detect_output_content_type(&resolved.relative_path, &bytes);
 
-    let ext = raw_rel
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let content_type = detect_output_content_type(ext.as_str(), &bytes);
-
-    let mut response = skyzen::Response::new(skyzen::Body::from(bytes));
-    if let Ok(content_type_header) = skyzen::header::HeaderValue::from_str(&content_type) {
-        response
-            .headers_mut()
-            .insert(skyzen::header::CONTENT_TYPE, content_type_header);
-    }
-    if let Ok(etag_header) = skyzen::header::HeaderValue::from_str(&etag_value) {
-        response
-            .headers_mut()
-            .insert(skyzen::header::ETAG, etag_header);
-    }
-    if let Ok(cache_control) = skyzen::header::HeaderValue::from_str("private, no-cache") {
-        response
-            .headers_mut()
-            .insert(skyzen::header::CACHE_CONTROL, cache_control);
-    }
-
-    Ok(response)
+    Ok(file_response(
+        bytes,
+        &content_type,
+        &etag,
+        PREVIEW_CACHE_CONTROL,
+    ))
 }
