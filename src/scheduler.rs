@@ -74,6 +74,37 @@ struct TaskCatalog {
     tasks: Vec<scheduled_tasks::Model>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunStatus {
+    Running,
+    Success,
+    Failed,
+    Interrupted,
+}
+
+impl TaskRunStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "running" => Ok(Self::Running),
+            "success" => Ok(Self::Success),
+            "failed" => Ok(Self::Failed),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(join_text(&["unknown task run status: ", other])),
+        }
+    }
+}
+
 impl TaskCatalog {
     fn from_tasks(tasks: Vec<scheduled_tasks::Model>) -> Self {
         Self { tasks }
@@ -773,14 +804,14 @@ impl TaskRuntime {
                 let truncated = truncate_output(&output);
                 if let Err(e) = self
                     .db
-                    .record_task_run(&task.id, "success", Some(&truncated))
+                    .record_task_run(&task.id, TaskRunStatus::Success, Some(&truncated))
                     .await
                 {
                     tracing::error!(task_id = %task.id, error = %e, "Failed to record task run");
                 }
                 if let Err(error) = self
                     .db
-                    .finish_task_run(run_id, "success", Some(&truncated))
+                    .finish_task_run(run_id, TaskRunStatus::Success, Some(&truncated))
                     .await
                 {
                     tracing::error!(task_id = %task.id, run_id, error = %error, "Failed to record task run history");
@@ -811,14 +842,14 @@ impl TaskRuntime {
                 let truncated = truncate_output(&error_message);
                 if let Err(e) = self
                     .db
-                    .record_task_run(&task.id, "failed", Some(&truncated))
+                    .record_task_run(&task.id, TaskRunStatus::Failed, Some(&truncated))
                     .await
                 {
                     tracing::error!(task_id = %task.id, error = %e, "Failed to record task run");
                 }
                 if let Err(error) = self
                     .db
-                    .finish_task_run(run_id, "failed", Some(&truncated))
+                    .finish_task_run(run_id, TaskRunStatus::Failed, Some(&truncated))
                     .await
                 {
                     tracing::error!(task_id = %task.id, run_id, error = %error, "Failed to record task run history");
