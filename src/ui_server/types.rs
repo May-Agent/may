@@ -1067,8 +1067,18 @@ pub(crate) struct CopilotStartResponse {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CopilotPollResponse {
-    pub(crate) status: String,
+    pub(crate) status: CopilotPollStatus,
     pub(crate) message: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CopilotPollStatus {
+    Pending,
+    Success,
+    Expired,
+    Denied,
+    Error,
 }
 
 #[derive(Debug, serde::Serialize)]

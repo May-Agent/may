@@ -370,24 +370,24 @@ pub(super) async fn copilot_poll(
         Ok(token) => {
             save_copilot_token(&token).await.map_err(internal_error)?;
             Ok(Json(CopilotPollResponse {
-                status: "success".to_string(),
+                status: super::types::CopilotPollStatus::Success,
                 message: None,
             }))
         }
         Err(aither_copilot::CopilotError::AuthorizationPending) => Ok(Json(CopilotPollResponse {
-            status: "pending".to_string(),
+            status: super::types::CopilotPollStatus::Pending,
             message: None,
         })),
         Err(aither_copilot::CopilotError::DeviceCodeExpired) => Ok(Json(CopilotPollResponse {
-            status: "expired".to_string(),
+            status: super::types::CopilotPollStatus::Expired,
             message: Some("Device code expired. Please restart authentication.".to_string()),
         })),
         Err(aither_copilot::CopilotError::AccessDenied) => Ok(Json(CopilotPollResponse {
-            status: "denied".to_string(),
+            status: super::types::CopilotPollStatus::Denied,
             message: Some("Authorization denied by user.".to_string()),
         })),
         Err(err) => Ok(Json(CopilotPollResponse {
-            status: "error".to_string(),
+            status: super::types::CopilotPollStatus::Error,
             message: Some(err.to_string()),
         })),
     }
