@@ -1,4 +1,4 @@
-import { memo, useState, useMemo, useEffect, useRef } from 'react';
+import { Suspense, lazy, memo, useState, useMemo, useEffect, useRef } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
@@ -7,14 +7,13 @@ import type { ArtifactPreviewTarget, Message, SessionPlanState } from '@/types';
 import { useStore } from '@/lib/store';
 import { extractArtifactPreviewTargets, stripArtifactPreviewTags } from './chatUtils';
 import ReactMarkdown from 'react-markdown';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { Copy, Check, FileText, File, ChevronRight, RotateCcw, Download, Terminal, Globe, Search, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
 import { FlowMarkdown } from './StreamingText';
 
 const TASKS_TAG_PATTERN = /<tasks\s*\/>/i;
+const LazySyntaxCodeBlock = lazy(() => import('./SyntaxCodeBlock'));
 
 function stripTasksTag(content: string): string {
   return content.replace(/<tasks\s*\/>/gi, "").trim();
@@ -558,10 +557,15 @@ function makeComponents(isUser: boolean, isStreaming: boolean) {
             <span>{lang}</span>
             {!isStreaming && <CopyButton text={code} className="h-5 w-5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-700/50" />}
           </div>
-          {/* @ts-ignore */}
-          <SyntaxHighlighter {...props} style={vscDarkPlus} language={lang} PreTag="div" customStyle={{ margin: 0, borderRadius: 0, fontSize: '0.8125rem' }}>
-            {code}
-          </SyntaxHighlighter>
+          <Suspense
+            fallback={
+              <pre className="m-0 overflow-x-auto bg-zinc-950 px-4 py-3 text-[0.8125rem] text-zinc-100">
+                <code>{code}</code>
+              </pre>
+            }
+          >
+            <LazySyntaxCodeBlock language={lang} code={code} />
+          </Suspense>
         </div>
       ) : (
         <code {...props} className={cn('rounded px-1 py-0.5 font-mono text-sm', isUser ? 'bg-black/10 dark:bg-white/10' : 'bg-muted', className)}>{children}</code>
