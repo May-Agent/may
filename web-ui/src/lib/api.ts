@@ -232,7 +232,7 @@ export interface NotificationMailboxEntry {
   title: string;
   body: string;
   sessionId?: string | null;
-  status: string;
+  status: 'pending' | 'delivered' | 'failed';
   sentCount: number;
   lastError?: string | null;
   deliveredAt?: string | null;

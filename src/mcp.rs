@@ -196,6 +196,23 @@ pub enum McpServerSource {
     Unknown,
 }
 
+impl std::fmt::Display for McpServerSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Url { url } => f.write_str(url),
+            Self::Process { command, args } => {
+                f.write_str(command)?;
+                if !args.is_empty() {
+                    f.write_str(" ")?;
+                    f.write_str(args.join(" ").as_str())?;
+                }
+                Ok(())
+            }
+            Self::Unknown => f.write_str("Unknown"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum McpServerStatus {
@@ -203,6 +220,29 @@ pub enum McpServerStatus {
     Connecting,
     Connected { tool_count: usize },
     Error { message: String },
+}
+
+impl McpServerStatus {
+    #[must_use]
+    pub const fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
+    }
+}
+
+impl std::fmt::Display for McpServerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => f.write_str("Disconnected"),
+            Self::Connecting => f.write_str("Connecting..."),
+            Self::Connected { tool_count } => {
+                write!(f, "Connected ({tool_count} tools)")
+            }
+            Self::Error { message } => {
+                f.write_str("Error: ")?;
+                f.write_str(message)
+            }
+        }
+    }
 }
 
 /// Server information for display in UI.
