@@ -79,9 +79,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
 
     let (tool_dispatchers, tool_queues) = tool_dispatch_channels();
 
-    let config = MayConfig::load_async()
-        .await
-        .context("Failed to load config")?;
+    let config = MayConfig::load().await.context("Failed to load config")?;
 
     // Try to detect a container runtime (OrbStack/Docker/Podman)
     let container_manager = match crate::container::ContainerRuntime::detect().await {

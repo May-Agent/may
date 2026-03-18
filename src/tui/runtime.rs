@@ -987,9 +987,11 @@ async fn resolve_agent_environment_for_tui(
             let profile =
                 profile_model.ok_or_else(|| anyhow::anyhow!("remote profile model is missing"))?;
             let config_path = may_dir.join("config.toml");
-            let config = crate::config::MayConfig::load_from(&config_path).map_err(|error| {
-                anyhow::anyhow!("failed to load config.toml for remote profile: {error}")
-            })?;
+            let config = crate::config::MayConfig::load_from(&config_path)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to load config.toml for remote profile: {error}")
+                })?;
             let ssh_server =
                 crate::remote_profile::resolve_remote_profile_server(profile, &config.ssh_servers)
                     .map_err(anyhow::Error::msg)?;

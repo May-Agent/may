@@ -951,55 +951,33 @@ impl MayConfig {
     }
 
     /// Load configuration from ~/.may/config.toml or use defaults.
-    pub fn load() -> Result<Self, ConfigError> {
+    pub async fn load() -> Result<Self, ConfigError> {
         let path = Self::config_path()?;
-        Self::load_from(&path)
+        Self::load_from(&path).await
     }
 
-    /// Load configuration from ~/.may/config.toml or use defaults without blocking the async runtime.
-    pub async fn load_async() -> Result<Self, ConfigError> {
-        let path = Self::config_path()?;
-        match async_fs::read_to_string(&path).await {
+    /// Load configuration from a specific path.
+    pub async fn load_from(path: &Path) -> Result<Self, ConfigError> {
+        match async_fs::read_to_string(path).await {
             Ok(content) => Ok(toml::from_str(&content)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(ConfigError::Read(error)),
         }
     }
 
-    /// Load configuration from a specific path.
-    pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            Ok(toml::from_str(&content)?)
-        } else {
-            Ok(Self::default())
-        }
-    }
-
     /// Save configuration to ~/.may/config.toml.
-    pub fn save(&self) -> Result<(), ConfigError> {
+    pub async fn save(&self) -> Result<(), ConfigError> {
         let path = Self::config_path()?;
-        self.save_to(&path)
+        self.save_to(&path).await
     }
 
-    /// Save configuration to ~/.may/config.toml without blocking the async runtime.
-    pub async fn save_async(&self) -> Result<(), ConfigError> {
-        let path = Self::config_path()?;
+    /// Save configuration to a specific path.
+    pub async fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
             async_fs::create_dir_all(parent).await?;
         }
         let content = toml::to_string_pretty(self)?;
         async_fs::write(path, content).await?;
-        Ok(())
-    }
-
-    /// Save configuration to a specific path.
-    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
         Ok(())
     }
 
