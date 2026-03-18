@@ -470,12 +470,21 @@ export interface UiFullConfig {
   remoteAccess: UiRemoteAccessConfig;
 }
 
+export type McpServerSource =
+  | { kind: 'url'; url: string }
+  | { kind: 'process'; command: string; args: string[] }
+  | { kind: 'unknown' };
+
+export type McpServerStatus =
+  | { state: 'disconnected' }
+  | { state: 'connecting' }
+  | { state: 'connected'; toolCount: number }
+  | { state: 'error'; message: string };
+
 export interface McpServerInfo {
   name: string;
-  source: string;
-  status: string;
-  isConnected: boolean;
-  toolCount: number;
+  source: McpServerSource;
+  status: McpServerStatus;
 }
 
 export interface SkillInfo {

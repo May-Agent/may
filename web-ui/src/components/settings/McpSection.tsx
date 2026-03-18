@@ -3,6 +3,31 @@ import { PlugZap, Plus, Trash2, RotateCcw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useStore } from '@/lib/store';
+import type { McpServerInfo } from '@/lib/api';
+
+function mcpSourceLabel(source: McpServerInfo['source']): string {
+  switch (source.kind) {
+    case 'url':
+      return source.url;
+    case 'process':
+      return [source.command, ...source.args].join(' ').trim();
+    case 'unknown':
+      return 'Unknown';
+  }
+}
+
+function mcpStatusLabel(status: McpServerInfo['status']): string {
+  switch (status.state) {
+    case 'disconnected':
+      return 'Disconnected';
+    case 'connecting':
+      return 'Connecting...';
+    case 'connected':
+      return `Connected (${status.toolCount} tools)`;
+    case 'error':
+      return `Error: ${status.message}`;
+  }
+}
 
 export function McpSection() {
   const { mcpServers, addMcpServer, removeMcpServer, reconnectMcpServer } = useStore();
@@ -44,8 +69,8 @@ export function McpSection() {
           <div key={server.name} className="flex items-center justify-between rounded border px-3 py-2">
             <div>
               <div className="font-medium">{server.name}</div>
-              <div className="text-xs text-muted-foreground">{server.source}</div>
-              <div className="text-xs">{server.status}</div>
+              <div className="text-xs text-muted-foreground">{mcpSourceLabel(server.source)}</div>
+              <div className="text-xs">{mcpStatusLabel(server.status)}</div>
             </div>
             <div className="flex gap-2">
               <Button variant="outline" size="icon" onClick={() => reconnectMcpServer(server.name)}>

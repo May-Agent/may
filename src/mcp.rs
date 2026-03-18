@@ -189,17 +189,31 @@ impl McpConnectionState {
 
 /// Server information for display in UI.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpServerSource {
+    Url { url: String },
+    Process { command: String, args: Vec<String> },
+    Unknown,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum McpServerStatus {
+    Disconnected,
+    Connecting,
+    Connected { tool_count: usize },
+    Error { message: String },
+}
+
+/// Server information for display in UI.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct McpServerInfo {
     /// Server name (configuration key).
     pub name: String,
-    /// Command or URL used to connect.
-    pub source: String,
-    /// Connection status description.
-    pub status: String,
-    /// Whether the server is connected.
-    pub is_connected: bool,
-    /// Number of tools provided by this server.
-    pub tool_count: usize,
+    /// Structured source definition.
+    pub source: McpServerSource,
+    /// Structured connection status.
+    pub status: McpServerStatus,
 }
 
 /// MCP connection manager.
@@ -394,31 +408,32 @@ impl McpManager {
             .iter()
             .map(|(name, config)| {
                 let source = if let Some(ref url) = config.url {
-                    url.clone()
+                    McpServerSource::Url { url: url.clone() }
                 } else if let Some(ref cmd) = config.command {
-                    format!("{} {}", cmd, config.args.join(" "))
+                    McpServerSource::Process {
+                        command: cmd.clone(),
+                        args: config.args.clone(),
+                    }
                 } else {
-                    "Unknown".to_string()
+                    McpServerSource::Unknown
                 };
 
-                let (status, is_connected, tool_count) = match self.connections.get(name) {
+                let status = match self.connections.get(name) {
                     Some(McpConnectionState::Connected(conn)) => {
                         let count = conn.definitions().len();
-                        (format!("Connected ({count} tools)"), true, count)
+                        McpServerStatus::Connected { tool_count: count }
                     }
-                    Some(McpConnectionState::Connecting) => ("Connecting...".to_string(), false, 0),
-                    Some(McpConnectionState::Error(e)) => (format!("Error: {e}"), false, 0),
-                    Some(McpConnectionState::Disconnected) | None => {
-                        ("Disconnected".to_string(), false, 0)
+                    Some(McpConnectionState::Connecting) => McpServerStatus::Connecting,
+                    Some(McpConnectionState::Error(e)) => {
+                        McpServerStatus::Error { message: e.clone() }
                     }
+                    Some(McpConnectionState::Disconnected) | None => McpServerStatus::Disconnected,
                 };
 
                 McpServerInfo {
                     name: name.clone(),
                     source,
                     status,
-                    is_connected,
-                    tool_count,
                 }
             })
             .collect()
