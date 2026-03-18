@@ -1026,15 +1026,20 @@ pub(crate) struct SshServerRequest {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct McpAddRequest {
-    pub(crate) name: String,
-    #[serde(default)]
-    pub(crate) command: Option<String>,
-    #[serde(default)]
-    pub(crate) args: Vec<String>,
-    #[serde(default)]
-    pub(crate) url: Option<String>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum McpCreateRequest {
+    Process {
+        name: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+    },
+    Url {
+        name: String,
+        url: String,
+    },
 }
 
 #[derive(Debug, serde::Deserialize)]
