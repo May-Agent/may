@@ -136,7 +136,10 @@ export interface UiEventsSubscription {
   onNotificationMailbox?: (payload: NotificationMailboxPayload) => void;
   onProfileSessions?: (payload: { profileSessions: ProfileSessions }) => void;
   onRequestLogs?: (payload: RequestLogsPayload) => void;
-  onSessionRuntime?: (payload: { sessionId: string; runtime: SessionRuntimeStatus }) => void;
+  onSessionRuntime?: (payload: {
+    sessionId: string;
+    runtime: SessionRuntimeStatus;
+  }) => void;
   onSessionRuntimes?: (payload: { sessions: SessionRuntimeSnapshot[] }) => void;
   onHeartbeat?: () => void;
   onError?: () => void;
@@ -259,11 +262,11 @@ export interface ContextDebugMessage {
 }
 
 export type ContextWindowPhase =
-  | "stable"
-  | "reassembly_due"
-  | "compression_due"
-  | "handoff_due"
-  | "handoff_active";
+  | 'stable'
+  | 'reassembly_due'
+  | 'compression_due'
+  | 'handoff_due'
+  | 'handoff_active';
 
 export interface SessionContextWindowMetrics {
   usageFraction: number;
@@ -301,7 +304,9 @@ export interface SessionContextDebugPayload {
 
 function requireObject(value: unknown, field: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`Invalid context debug payload: ${field} must be an object`);
+    throw new Error(
+      `Invalid context debug payload: ${field} must be an object`,
+    );
   }
   return value as Record<string, unknown>;
 }
@@ -313,12 +318,17 @@ function requireString(value: unknown, field: string): string {
   return value;
 }
 
-function requireOptionalString(value: unknown, field: string): string | undefined {
+function requireOptionalString(
+  value: unknown,
+  field: string,
+): string | undefined {
   if (value === undefined || value === null) {
     return undefined;
   }
   if (typeof value !== 'string') {
-    throw new Error(`Invalid context debug payload: ${field} must be a string when present`);
+    throw new Error(
+      `Invalid context debug payload: ${field} must be a string when present`,
+    );
   }
   return value;
 }
@@ -331,7 +341,9 @@ function requireStringArray(value: unknown, field: string): string[] {
   for (let index = 0; index < value.length; index += 1) {
     const item = value[index];
     if (typeof item !== 'string') {
-      throw new Error(`Invalid context debug payload: ${field}[${index}] must be a string`);
+      throw new Error(
+        `Invalid context debug payload: ${field}[${index}] must be a string`,
+      );
     }
     result.push(item);
   }
@@ -339,59 +351,111 @@ function requireStringArray(value: unknown, field: string): string[] {
 }
 
 function requireNumber(value: unknown, field: string): number {
-  if (typeof value !== "number" || Number.isNaN(value)) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
     throw new Error(`Invalid context debug payload: ${field} must be a number`);
   }
   return value;
 }
 
 function requireBoolean(value: unknown, field: string): boolean {
-  if (typeof value !== "boolean") {
-    throw new Error(`Invalid context debug payload: ${field} must be a boolean`);
+  if (typeof value !== 'boolean') {
+    throw new Error(
+      `Invalid context debug payload: ${field} must be a boolean`,
+    );
   }
   return value;
 }
 
-function requireOptionalNumber(value: unknown, field: string): number | undefined {
+function requireOptionalNumber(
+  value: unknown,
+  field: string,
+): number | undefined {
   if (value === undefined || value === null) {
     return undefined;
   }
   return requireNumber(value, field);
 }
 
-function parseContextDebugMessage(value: unknown, index: number): ContextDebugMessage {
+function parseContextDebugMessage(
+  value: unknown,
+  index: number,
+): ContextDebugMessage {
   const record = requireObject(value, `assembledMessages[${index}]`);
   return {
     role: requireString(record.role, `assembledMessages[${index}].role`),
-    content: requireString(record.content, `assembledMessages[${index}].content`),
-    attachments: requireStringArray(record.attachments, `assembledMessages[${index}].attachments`),
-    toolCallId: requireOptionalString(record.toolCallId, `assembledMessages[${index}].toolCallId`),
-    toolCallNames: requireStringArray(record.toolCallNames, `assembledMessages[${index}].toolCallNames`),
+    content: requireString(
+      record.content,
+      `assembledMessages[${index}].content`,
+    ),
+    attachments: requireStringArray(
+      record.attachments,
+      `assembledMessages[${index}].attachments`,
+    ),
+    toolCallId: requireOptionalString(
+      record.toolCallId,
+      `assembledMessages[${index}].toolCallId`,
+    ),
+    toolCallNames: requireStringArray(
+      record.toolCallNames,
+      `assembledMessages[${index}].toolCallNames`,
+    ),
   };
 }
 
 function parseSessionContextWindowSnapshot(
   value: unknown,
 ): SessionContextWindowSnapshot {
-  const record = requireObject(value, "windowSnapshot");
-  const metrics = requireObject(record.metrics, "windowSnapshot.metrics");
+  const record = requireObject(value, 'windowSnapshot');
+  const metrics = requireObject(record.metrics, 'windowSnapshot.metrics');
   const assembledMessagesValue = record.assembledMessages;
   if (!Array.isArray(assembledMessagesValue)) {
-    throw new Error("Invalid context debug payload: windowSnapshot.assembledMessages must be an array");
+    throw new Error(
+      'Invalid context debug payload: windowSnapshot.assembledMessages must be an array',
+    );
   }
 
   return {
-    phase: requireString(record.phase, "windowSnapshot.phase") as ContextWindowPhase,
+    phase: requireString(
+      record.phase,
+      'windowSnapshot.phase',
+    ) as ContextWindowPhase,
     metrics: {
-      usageFraction: requireNumber(metrics.usageFraction, "windowSnapshot.metrics.usageFraction"),
-      selectedModelContextWindow: requireOptionalNumber(metrics.selectedModelContextWindow, "windowSnapshot.metrics.selectedModelContextWindow"),
-      fastModelContextWindow: requireOptionalNumber(metrics.fastModelContextWindow, "windowSnapshot.metrics.fastModelContextWindow"),
-      effectiveContextWindow: requireNumber(metrics.effectiveContextWindow, "windowSnapshot.metrics.effectiveContextWindow"),
-      systemBlockCount: requireNumber(metrics.systemBlockCount, "windowSnapshot.metrics.systemBlockCount"),
-      reminderCount: requireNumber(metrics.reminderCount, "windowSnapshot.metrics.reminderCount"),
-      recentMessageCount: requireNumber(metrics.recentMessageCount, "windowSnapshot.metrics.recentMessageCount"),
-      recentSystemMessageCount: requireNumber(metrics.recentSystemMessageCount, "windowSnapshot.metrics.recentSystemMessageCount"),
-      hasHandoff: requireBoolean(metrics.hasHandoff, "windowSnapshot.metrics.hasHandoff"),
+      usageFraction: requireNumber(
+        metrics.usageFraction,
+        'windowSnapshot.metrics.usageFraction',
+      ),
+      selectedModelContextWindow: requireOptionalNumber(
+        metrics.selectedModelContextWindow,
+        'windowSnapshot.metrics.selectedModelContextWindow',
+      ),
+      fastModelContextWindow: requireOptionalNumber(
+        metrics.fastModelContextWindow,
+        'windowSnapshot.metrics.fastModelContextWindow',
+      ),
+      effectiveContextWindow: requireNumber(
+        metrics.effectiveContextWindow,
+        'windowSnapshot.metrics.effectiveContextWindow',
+      ),
+      systemBlockCount: requireNumber(
+        metrics.systemBlockCount,
+        'windowSnapshot.metrics.systemBlockCount',
+      ),
+      reminderCount: requireNumber(
+        metrics.reminderCount,
+        'windowSnapshot.metrics.reminderCount',
+      ),
+      recentMessageCount: requireNumber(
+        metrics.recentMessageCount,
+        'windowSnapshot.metrics.recentMessageCount',
+      ),
+      recentSystemMessageCount: requireNumber(
+        metrics.recentSystemMessageCount,
+        'windowSnapshot.metrics.recentSystemMessageCount',
+      ),
+      hasHandoff: requireBoolean(
+        metrics.hasHandoff,
+        'windowSnapshot.metrics.hasHandoff',
+      ),
     },
     assembledMessages: assembledMessagesValue.map((item, index) =>
       parseContextDebugMessage(item, index),
@@ -399,11 +463,15 @@ function parseSessionContextWindowSnapshot(
   };
 }
 
-function parseSessionContextDebugSnapshot(value: unknown): SessionContextDebugSnapshot {
+function parseSessionContextDebugSnapshot(
+  value: unknown,
+): SessionContextDebugSnapshot {
   const record = requireObject(value, 'root');
   const assembledMessagesValue = record.assembledMessages;
   if (!Array.isArray(assembledMessagesValue)) {
-    throw new Error('Invalid context debug payload: assembledMessages must be an array');
+    throw new Error(
+      'Invalid context debug payload: assembledMessages must be an array',
+    );
   }
 
   return {
@@ -412,7 +480,10 @@ function parseSessionContextDebugSnapshot(value: unknown): SessionContextDebugSn
     model: requireString(record.model, 'model'),
     providerId: requireString(record.providerId, 'providerId'),
     prompt: requireString(record.prompt, 'prompt'),
-    promptAttachments: requireStringArray(record.promptAttachments, 'promptAttachments'),
+    promptAttachments: requireStringArray(
+      record.promptAttachments,
+      'promptAttachments',
+    ),
     assembledMessages: assembledMessagesValue.map((item, index) =>
       parseContextDebugMessage(item, index),
     ),
@@ -487,6 +558,20 @@ export interface McpServerInfo {
   status: McpServerStatus;
 }
 
+export type McpServerCreateRequest =
+  | {
+      kind: 'process';
+      name: string;
+      command: string;
+      args: string[];
+      env: Record<string, string>;
+    }
+  | {
+      kind: 'url';
+      name: string;
+      url: string;
+    };
+
 export interface SkillInfo {
   name: string;
   description: string;
@@ -553,7 +638,9 @@ function buildTimelineSegments(m: Message): TimelineSegment[] {
       offset: 0,
       commands: m.bashExecutions,
       startedAt,
-      endedAt: m.bashExecutions.some((x: BashExecution) => x.status === 'running')
+      endedAt: m.bashExecutions.some(
+        (x: BashExecution) => x.status === 'running',
+      )
         ? undefined
         : startedAt,
     });
@@ -676,7 +763,11 @@ function buildRequestError(url: string, res: Response, text: string): ApiError {
 
   if (text) {
     try {
-      const parsed = JSON.parse(text) as { error?: unknown; message?: unknown; code?: unknown };
+      const parsed = JSON.parse(text) as {
+        error?: unknown;
+        message?: unknown;
+        code?: unknown;
+      };
       // Machine-readable error code from the backend (Phase 4 typed errors).
       if (typeof parsed.code === 'string' && parsed.code.trim().length > 0) {
         errorCode = parsed.code.trim();
@@ -716,21 +807,33 @@ function buildRequestError(url: string, res: Response, text: string): ApiError {
       rawMessage.length > 0
         ? rawMessage.replace(/\s+/g, ' ').slice(0, 220)
         : `request ${url} failed with status ${res.status}`;
-    return new ApiError(`Backend unavailable: ${compact}`, res.status, 'backend_unavailable');
+    return new ApiError(
+      `Backend unavailable: ${compact}`,
+      res.status,
+      'backend_unavailable',
+    );
   }
 
   const message = decodedMessage || text || `Request failed: ${res.status}`;
   return new ApiError(message, res.status, errorCode);
 }
 
-async function requestResponse(url: string, init?: RequestInit): Promise<Response> {
+async function requestResponse(
+  url: string,
+  init?: RequestInit,
+): Promise<Response> {
   let res: Response;
   try {
     res = await fetch(url, init);
   } catch (fetchError) {
     // Network-level error: the request never reached the server (connection refused, DNS, etc.).
-    const detail = fetchError instanceof Error ? fetchError.message : String(fetchError);
-    throw new ApiError(`Backend unavailable: ${detail}`, 0, 'backend_unavailable');
+    const detail =
+      fetchError instanceof Error ? fetchError.message : String(fetchError);
+    throw new ApiError(
+      `Backend unavailable: ${detail}`,
+      0,
+      'backend_unavailable',
+    );
   }
   if (!res.ok) {
     const text = await res.text();
@@ -756,7 +859,10 @@ export async function fetchSession(id: string): Promise<Session> {
   return enrichSession(data);
 }
 
-export async function createSession(model?: string, profileId?: string): Promise<Session> {
+export async function createSession(
+  model?: string,
+  profileId?: string,
+): Promise<Session> {
   const data = await request<Session>('/api/sessions', {
     method: 'POST',
     headers: JSON_HEADERS,
@@ -765,7 +871,10 @@ export async function createSession(model?: string, profileId?: string): Promise
   return enrichSession(data);
 }
 
-export async function updateSession(id: string, payload: { title?: string; model?: string }): Promise<Session> {
+export async function updateSession(
+  id: string,
+  payload: { title?: string; model?: string },
+): Promise<Session> {
   const data = await request<Session>(`/api/sessions/${id}`, {
     method: 'PUT',
     headers: JSON_HEADERS,
@@ -801,12 +910,15 @@ export async function sendChat(input: {
     })),
   };
 
-  const data = await request<{ sessionId: string; assistant: Message }>('/api/chat', {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify(payload),
-    signal: input.signal,
-  });
+  const data = await request<{ sessionId: string; assistant: Message }>(
+    '/api/chat',
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(payload),
+      signal: input.signal,
+    },
+  );
 
   return enrichMessage(data.assistant);
 }
@@ -821,7 +933,11 @@ export async function streamChat(input: {
   onText?: (chunk: string) => void;
   onToolStart?: (tool: unknown) => void;
   onToolEnd?: (tool: unknown) => void;
-  onTodoUpdate?: (event: { items: Array<{ text: string; checked: boolean }>; total: number; completed: number }) => void;
+  onTodoUpdate?: (event: {
+    items: Array<{ text: string; checked: boolean }>;
+    total: number;
+    completed: number;
+  }) => void;
   onDone?: (assistant: Message) => void;
   onError?: (message: string) => void;
   signal?: AbortSignal;
@@ -861,7 +977,9 @@ export async function streamChat(input: {
     const parsed = JSON.parse(data);
     const requireString = (value: unknown, field: string): string => {
       if (typeof value !== 'string') {
-        throw new Error(`Invalid SSE payload: expected string field '${field}'`);
+        throw new Error(
+          `Invalid SSE payload: expected string field '${field}'`,
+        );
       }
       return value;
     };
@@ -887,7 +1005,9 @@ export async function streamChat(input: {
         break;
       case 'done':
         if (!parsed.assistant || typeof parsed.assistant !== 'object') {
-          throw new Error("Invalid SSE payload: missing 'assistant' in done event");
+          throw new Error(
+            "Invalid SSE payload: missing 'assistant' in done event",
+          );
         }
         input.onDone?.(enrichMessage(parsed.assistant));
         break;
@@ -962,8 +1082,14 @@ export async function enqueueChat(input: {
 
 // ── Models API ───────────────────────────────────────────
 
-export async function fetchModels(): Promise<{ models: string[]; details: ModelDetailsItem[] }> {
-  const data = await request<{ models: string[]; details?: ModelDetailsItem[] }>('/api/models');
+export async function fetchModels(): Promise<{
+  models: string[];
+  details: ModelDetailsItem[];
+}> {
+  const data = await request<{
+    models: string[];
+    details?: ModelDetailsItem[];
+  }>('/api/models');
   return {
     models: data.models,
     details: data.details ?? [],
@@ -971,7 +1097,9 @@ export async function fetchModels(): Promise<{ models: string[]; details: ModelD
 }
 
 export async function fetchModelsByProvider(): Promise<ProviderModelsItem[]> {
-  const data = await request<{ providers: ProviderModelsItem[] }>('/api/models/by-provider');
+  const data = await request<{ providers: ProviderModelsItem[] }>(
+    '/api/models/by-provider',
+  );
   return data.providers;
 }
 
@@ -987,15 +1115,24 @@ export async function fetchNetworkAccessLogs(): Promise<NetworkAccessLogsPayload
   return request<NetworkAccessLogsPayload>('/api/notifications/network-access');
 }
 
-export async function fetchSessionRuntime(sessionId: string): Promise<SessionRuntimeStatus> {
-  return request<SessionRuntimeStatus>(`/api/sessions/${encodeURIComponent(sessionId)}/runtime`);
+export async function fetchSessionRuntime(
+  sessionId: string,
+): Promise<SessionRuntimeStatus> {
+  return request<SessionRuntimeStatus>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runtime`,
+  );
 }
 
-export async function stopSessionRun(sessionId: string): Promise<SessionRuntimeStatus> {
-  return request<SessionRuntimeStatus>(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, {
-    method: 'POST',
-    headers: JSON_HEADERS,
-  });
+export async function stopSessionRun(
+  sessionId: string,
+): Promise<SessionRuntimeStatus> {
+  return request<SessionRuntimeStatus>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/stop`,
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+    },
+  );
 }
 
 export async function removePendingSessionMessage(input: {
@@ -1034,7 +1171,9 @@ export async function fetchSessionContextDebug(
     payload = JSON.parse(rawJson);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid context debug payload: non-JSON response (${reason})`);
+    throw new Error(
+      `Invalid context debug payload: non-JSON response (${reason})`,
+    );
   }
   return {
     snapshot: parseSessionContextDebugSnapshot(payload),
@@ -1044,7 +1183,9 @@ export async function fetchSessionContextDebug(
 
 // ── Artifacts API ────────────────────────────────────────
 
-export async function fetchSessionArtifacts(sessionId: string): Promise<Artifact[]> {
+export async function fetchSessionArtifacts(
+  sessionId: string,
+): Promise<Artifact[]> {
   const data = await request<{ artifacts: Artifact[] }>(
     `/api/sessions/${encodeURIComponent(sessionId)}/artifacts`,
   );
@@ -1096,7 +1237,10 @@ export async function prepareSlidevPreview(
   return previewUrl;
 }
 
-export function buildSessionOutputPreviewUrl(sessionId: string, path: string): string {
+export function buildSessionOutputPreviewUrl(
+  sessionId: string,
+  path: string,
+): string {
   const safeSessionId = sessionId.trim();
   const safePath = path.trim();
   if (!safeSessionId) {
@@ -1204,7 +1348,10 @@ export async function setLastModel(model: string): Promise<void> {
   });
 }
 
-export async function addSshServer(name: string, target: string): Promise<void> {
+export async function addSshServer(
+  name: string,
+  target: string,
+): Promise<void> {
   await request<{ ok: boolean }>('/api/ssh', {
     method: 'POST',
     headers: JSON_HEADERS,
@@ -1224,12 +1371,9 @@ export async function fetchMcpServers(): Promise<McpServerInfo[]> {
   return request<McpServerInfo[]>('/api/mcp');
 }
 
-export async function addMcpServer(input: {
-  name: string;
-  command?: string;
-  args?: string[];
-  url?: string;
-}): Promise<void> {
+export async function addMcpServer(
+  input: McpServerCreateRequest,
+): Promise<void> {
   await request<{ ok: boolean }>('/api/mcp', {
     method: 'POST',
     headers: JSON_HEADERS,
@@ -1244,9 +1388,12 @@ export async function removeMcpServer(name: string): Promise<void> {
 }
 
 export async function reconnectMcpServer(name: string): Promise<void> {
-  await request<{ ok: boolean }>(`/api/mcp/${encodeURIComponent(name)}/reconnect`, {
-    method: 'POST',
-  });
+  await request<{ ok: boolean }>(
+    `/api/mcp/${encodeURIComponent(name)}/reconnect`,
+    {
+      method: 'POST',
+    },
+  );
 }
 
 // ── Skills API ───────────────────────────────────────────
@@ -1257,18 +1404,24 @@ export async function fetchSkills(profileId: string): Promise<SkillInfo[]> {
   );
 }
 
-export async function installSkill(repo: string, profileId: string): Promise<SkillInfo[]> {
+export async function installSkill(
+  repo: string,
+  profileId: string,
+): Promise<SkillInfo[]> {
   return request<SkillInfo[]>(
     `/api/skills/install?profileId=${encodeURIComponent(profileId)}`,
     {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ repo }),
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ repo }),
     },
   );
 }
 
-export async function deleteSkill(dirName: string, profileId: string): Promise<void> {
+export async function deleteSkill(
+  dirName: string,
+  profileId: string,
+): Promise<void> {
   await request<{ ok: boolean }>(
     `/api/skills/${encodeURIComponent(dirName)}?profileId=${encodeURIComponent(profileId)}`,
     {
@@ -1291,7 +1444,9 @@ export interface CopilotPollResponse {
   message?: string | null;
 }
 
-export async function fetchCopilotStatus(): Promise<{ authenticated: boolean }> {
+export async function fetchCopilotStatus(): Promise<{
+  authenticated: boolean;
+}> {
   return request<{ authenticated: boolean }>('/api/copilot/status');
 }
 
@@ -1303,7 +1458,9 @@ export async function startCopilotAuth(): Promise<CopilotStartResponse> {
   });
 }
 
-export async function pollCopilotAuth(deviceCode: string): Promise<CopilotPollResponse> {
+export async function pollCopilotAuth(
+  deviceCode: string,
+): Promise<CopilotPollResponse> {
   return request<CopilotPollResponse>('/api/copilot/poll', {
     method: 'POST',
     headers: JSON_HEADERS,
@@ -1417,7 +1574,8 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
       container_prepare: buildSSEListener<ContainerPrepareEventPayload>(
         'container_prepare',
         options.onContainerPrepare
-          ? (data) => options.onContainerPrepare!({ statuses: data.statuses ?? [] })
+          ? (data) =>
+              options.onContainerPrepare!({ statuses: data.statuses ?? [] })
           : undefined,
         options.onError,
       ),
@@ -1431,7 +1589,10 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
       profile_sessions: buildSSEListener<{ profileSessions: ProfileSessions }>(
         'profile_sessions',
         options.onProfileSessions
-          ? (data) => options.onProfileSessions!({ profileSessions: data.profileSessions })
+          ? (data) =>
+              options.onProfileSessions!({
+                profileSessions: data.profileSessions,
+              })
           : undefined,
         options.onError,
       ),
@@ -1449,10 +1610,13 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
           : undefined,
         options.onError,
       ),
-      session_runtimes: buildSSEListener<{ sessions?: SessionRuntimeSnapshot[] }>(
+      session_runtimes: buildSSEListener<{
+        sessions?: SessionRuntimeSnapshot[];
+      }>(
         'session_runtimes',
         options.onSessionRuntimes
-          ? (data) => options.onSessionRuntimes!({ sessions: data.sessions ?? [] })
+          ? (data) =>
+              options.onSessionRuntimes!({ sessions: data.sessions ?? [] })
           : undefined,
         options.onError,
       ),
@@ -1499,11 +1663,14 @@ export async function browserTakeoverStart(sessionId: string): Promise<void> {
     throw new Error('browser takeover requires a non-empty session id');
   }
 
-  await request<{ ok: boolean; sessionId: string }>('/api/browser/takeover/start', {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ sessionId: value }),
-  });
+  await request<{ ok: boolean; sessionId: string }>(
+    '/api/browser/takeover/start',
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ sessionId: value }),
+    },
+  );
 }
 
 export async function browserTakeoverStop(sessionId: string): Promise<void> {
@@ -1512,11 +1679,14 @@ export async function browserTakeoverStop(sessionId: string): Promise<void> {
     throw new Error('browser takeover requires a non-empty session id');
   }
 
-  await request<{ ok: boolean; sessionId: string }>('/api/browser/takeover/stop', {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ sessionId: value }),
-  });
+  await request<{ ok: boolean; sessionId: string }>(
+    '/api/browser/takeover/stop',
+    {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ sessionId: value }),
+    },
+  );
 }
 
 // ── Profile API ──────────────────────────────────────────
@@ -1588,7 +1758,10 @@ export async function fetchProfileSessions(
 
 // ── Folder API ───────────────────────────────────────────
 
-export async function createFolder(profileId: string, name: string): Promise<FolderInfo> {
+export async function createFolder(
+  profileId: string,
+  name: string,
+): Promise<FolderInfo> {
   return request<FolderInfo>(
     `/api/profiles/${encodeURIComponent(profileId)}/folders`,
     {
@@ -1660,7 +1833,9 @@ export async function moveSessionToFolder(
   );
 }
 
-export async function fetchSessionTasks(sessionId: string): Promise<SessionTasksPayload> {
+export async function fetchSessionTasks(
+  sessionId: string,
+): Promise<SessionTasksPayload> {
   return request<SessionTasksPayload>(
     `/api/sessions/${encodeURIComponent(sessionId)}/tasks`,
   );
@@ -1686,7 +1861,9 @@ export async function fetchTasks(): Promise<ScheduledTask[]> {
   return request<ScheduledTask[]>('/api/tasks');
 }
 
-export async function createTask(input: CreateTaskInput): Promise<ScheduledTask> {
+export async function createTask(
+  input: CreateTaskInput,
+): Promise<ScheduledTask> {
   return request<ScheduledTask>('/api/tasks', {
     method: 'POST',
     headers: JSON_HEADERS,
@@ -1730,10 +1907,9 @@ export async function approveTask(id: string): Promise<void> {
 }
 
 export async function runTask(id: string): Promise<void> {
-  await request<{ ok: boolean }>(
-    `/api/tasks/${encodeURIComponent(id)}/run`,
-    { method: 'POST' },
-  );
+  await request<{ ok: boolean }>(`/api/tasks/${encodeURIComponent(id)}/run`, {
+    method: 'POST',
+  });
 }
 
 // ── Web Push Notification API ───────────────────────────

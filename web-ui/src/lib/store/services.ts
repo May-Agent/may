@@ -12,7 +12,7 @@ export interface ServicesSlice {
   remoteAccessStatus: api.RemoteAccessStatus | null;
 
   refreshMcpServers: () => Promise<void>;
-  addMcpServer: (input: { name: string; command?: string; args?: string[]; url?: string }) => Promise<void>;
+  addMcpServer: (input: api.McpServerCreateRequest) => Promise<void>;
   removeMcpServer: (name: string) => Promise<void>;
   reconnectMcpServer: (name: string) => Promise<void>;
 
@@ -30,20 +30,28 @@ export interface ServicesSlice {
 
   refreshTasks: () => Promise<void>;
   createTask: (input: CreateTaskInput) => Promise<ScheduledTask>;
-  updateTask: (id: string, input: {
-    name?: string;
-    enabled?: boolean;
-    cronExpression?: string;
-    runAt?: string;
-    scriptPath?: string;
-    scriptInline?: string;
-  }) => Promise<void>;
+  updateTask: (
+    id: string,
+    input: {
+      name?: string;
+      enabled?: boolean;
+      cronExpression?: string;
+      runAt?: string;
+      scriptPath?: string;
+      scriptInline?: string;
+    },
+  ) => Promise<void>;
   deleteTask: (id: string) => Promise<void>;
   approveTask: (id: string) => Promise<void>;
   runTask: (id: string) => Promise<void>;
 }
 
-export const createServicesSlice: StateCreator<AppState, [], [], ServicesSlice> = (set, get) => ({
+export const createServicesSlice: StateCreator<
+  AppState,
+  [],
+  [],
+  ServicesSlice
+> = (set, get) => ({
   mcpServers: [],
   skills: [],
   scheduledTasks: [],

@@ -17,7 +17,7 @@ use super::model_resolution::persist_last_model;
 use super::state::UiServerState;
 use super::types::{
     ApiHealth, CopilotPollRequest, CopilotPollResponse, CopilotStartResponse,
-    CopilotStatusResponse, LastModelRequest, McpAddRequest, MemoryPayload, MemorySaveRequest,
+    CopilotStatusResponse, LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest,
     SkillInfoDto, SkillInstallRequest, SshServerRequest, UiAppearanceConfig, UiConfigResponse,
     UiFullConfig, UiModelsConfig, UiPlaywrightConfig, UiPreferencesConfig, UiProviderConfig,
     UiRemoteAccessConfig,
@@ -261,18 +261,80 @@ pub(super) async fn list_mcp_servers(
 }
 
 pub(super) async fn add_mcp_server(
-    Json(req): Json<McpAddRequest>,
+    Json(req): Json<McpCreateRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
-    let config = MayMcpServerConfig {
-        command: req.command,
-        args: req.args,
-        url: req.url,
-        env: std::collections::HashMap::new(),
+    let (name, config) = match req {
+        McpCreateRequest::Process {
+            name,
+            command,
+            args,
+            env,
+        } => {
+            let trimmed_name = name.trim();
+            if trimmed_name.is_empty() {
+                return Err(bad_request_error("mcp server name is required"));
+            }
+            let trimmed_command = command.trim();
+            if trimmed_command.is_empty() {
+                return Err(bad_request_error("mcp process command is required"));
+            }
+
+            let mut normalized_args = Vec::with_capacity(args.len());
+            for arg in args {
+                let trimmed = arg.trim();
+                if trimmed.is_empty() {
+                    return Err(bad_request_error("mcp process args must not be empty"));
+                }
+                normalized_args.push(trimmed.to_string());
+            }
+
+            let mut normalized_env = std::collections::HashMap::with_capacity(env.len());
+            for (key, value) in env {
+                let trimmed_key = key.trim();
+                if trimmed_key.is_empty() {
+                    return Err(bad_request_error(
+                        "mcp environment variable key is required",
+                    ));
+                }
+                normalized_env.insert(trimmed_key.to_string(), value);
+            }
+
+            (
+                trimmed_name.to_string(),
+                MayMcpServerConfig {
+                    command: Some(trimmed_command.to_string()),
+                    args: normalized_args,
+                    url: None,
+                    env: normalized_env,
+                },
+            )
+        }
+        McpCreateRequest::Url { name, url } => {
+            let trimmed_name = name.trim();
+            if trimmed_name.is_empty() {
+                return Err(bad_request_error("mcp server name is required"));
+            }
+            let trimmed_url = url.trim();
+            if trimmed_url.is_empty() {
+                return Err(bad_request_error("mcp server url is required"));
+            }
+            let parsed_url = url::Url::parse(trimmed_url)
+                .map_err(|error| bad_request_error(error.to_string()))?;
+            (
+                trimmed_name.to_string(),
+                MayMcpServerConfig {
+                    command: None,
+                    args: Vec::new(),
+                    url: Some(parsed_url.to_string()),
+                    env: std::collections::HashMap::new(),
+                },
+            )
+        }
     };
     state
         .mcp()
-        .add_server(req.name, config)
+        .add_server(name, config)
         .await
         .map_err(internal_error)?;
     Ok(Json(ApiHealth { ok: true }))

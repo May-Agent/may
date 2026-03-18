@@ -68,6 +68,57 @@ impl From<&MayMcpServerConfig> for McpServerConfig {
     }
 }
 
+impl MayMcpServerConfig {
+    fn validate(&self) -> Result<(), McpError> {
+        let has_command = self
+            .command
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let has_url = self
+            .url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+
+        match (has_command, has_url) {
+            (true, false) => {}
+            (false, true) => {
+                let url = self
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .expect("url presence must match validation branch");
+                url::Url::parse(url).map_err(|error| McpError::InvalidConfig(error.to_string()))?;
+            }
+            (false, false) => {
+                return Err(McpError::InvalidConfig(
+                    "MCP server config requires either a process command or a URL".to_string(),
+                ));
+            }
+            (true, true) => {
+                return Err(McpError::InvalidConfig(
+                    "MCP server config must choose either process or URL, not both".to_string(),
+                ));
+            }
+        }
+
+        if self.args.iter().any(|arg| arg.trim().is_empty()) {
+            return Err(McpError::InvalidConfig(
+                "MCP server args must not contain empty entries".to_string(),
+            ));
+        }
+
+        if self.env.keys().any(|key| key.trim().is_empty()) {
+            return Err(McpError::InvalidConfig(
+                "MCP server env keys must not be empty".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// MCP server configurations map.
 pub type MayMcpServersConfig = HashMap<String, MayMcpServerConfig>;
 
@@ -326,6 +377,14 @@ impl McpManager {
         name: &str,
         config: &MayMcpServerConfig,
     ) -> Result<(), McpError> {
+        if let Err(error) = config.validate() {
+            self.connections.insert(
+                name.to_string(),
+                McpConnectionState::Error(error.to_string()),
+            );
+            return Err(error);
+        }
+
         // Mark as connecting
         self.connections
             .insert(name.to_string(), McpConnectionState::Connecting);
@@ -368,17 +427,35 @@ impl McpManager {
         config: MayMcpServerConfig,
     ) -> Result<(), McpError> {
         let name = name.into();
-        self.config.mcp_servers.insert(name.clone(), config.clone());
-        self.connect_server_internal(&name, &config).await?;
-        self.config
+        config.validate()?;
+
+        let mut next_config = self.config.clone();
+        next_config.upsert_server(name.clone(), config.clone());
+        next_config
             .save()
             .await
             .map_err(|e| McpError::InvalidConfig(format!("Failed to save config: {e}")))?;
+        self.config = next_config;
+        self.connections
+            .entry(name.clone())
+            .or_insert(McpConnectionState::Disconnected);
+        self.connect_server_internal(&name, &config).await?;
         Ok(())
     }
 
     /// Remove a server and disconnect if connected.
     pub async fn remove_server(&mut self, name: &str) -> Result<(), McpError> {
+        let mut next_config = self.config.clone();
+        if next_config.remove_server(name).is_none() {
+            return Err(McpError::InvalidConfig(format!(
+                "Server '{name}' not found in configuration"
+            )));
+        }
+        next_config
+            .save()
+            .await
+            .map_err(|e| McpError::InvalidConfig(format!("Failed to save config: {e}")))?;
+
         // Close connection if exists
         if let Some(mut state) = self.connections.remove(name)
             && let Some(conn) = state.connection_mut()
@@ -386,13 +463,7 @@ impl McpManager {
             let _ = conn.close().await;
         }
 
-        // Remove from config
-        self.config.mcp_servers.remove(name);
-        self.config
-            .save()
-            .await
-            .map_err(|e| McpError::InvalidConfig(format!("Failed to save config: {e}")))?;
-
+        self.config = next_config;
         Ok(())
     }
 
