@@ -1888,6 +1888,11 @@ fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
+                    "Shell quoting is supported.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
                     "[Enter] Add Server  [Esc] Back",
                     Style::default().fg(Color::DarkGray),
                 )),

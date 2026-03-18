@@ -151,19 +151,28 @@ pub(crate) fn handle_mcp_key(app: &mut App, code: KeyCode) -> Result<Option<Send
                 app.mcp_add_mode = McpAddMode::Name;
             }
             KeyCode::Enter => {
-                if !app.mcp_add_command.is_empty() {
-                    let parts: Vec<&str> = app.mcp_add_command.split_whitespace().collect();
-                    if let Some((command, args)) = parts.split_first() {
-                        let name = std::mem::take(&mut app.mcp_add_name);
-                        let command_str = (*command).to_string();
-                        let args_vec: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-                        app.mcp_add_mode = McpAddMode::None;
-                        app.mcp_add_command.clear();
-                        return Ok(Some(SendAction::McpAdd {
-                            name,
-                            command: command_str,
-                            args: args_vec,
-                        }));
+                let command_line = app.mcp_add_command.trim();
+                if !command_line.is_empty() {
+                    match shell_words::split(command_line) {
+                        Ok(parts) => {
+                            if let Some((command, args)) = parts.split_first() {
+                                let name = std::mem::take(&mut app.mcp_add_name);
+                                let command_str = command.clone();
+                                let args_vec = args.to_vec();
+                                app.mcp_add_mode = McpAddMode::None;
+                                app.mcp_add_command.clear();
+                                return Ok(Some(SendAction::McpAdd {
+                                    name,
+                                    command: command_str,
+                                    args: args_vec,
+                                }));
+                            }
+                        }
+                        Err(error) => {
+                            let mut message = String::from("Invalid MCP command line: ");
+                            message.push_str(error.to_string().as_str());
+                            app.status = Some(message);
+                        }
                     }
                 }
             }
