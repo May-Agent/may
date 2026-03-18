@@ -10,10 +10,12 @@ import ReactMarkdown from 'react-markdown';
 import { Copy, Check, FileText, File, ChevronRight, RotateCcw, Download, Terminal, Globe, Search, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
-import { FlowMarkdown } from './StreamingText';
 
 const TASKS_TAG_PATTERN = /<tasks\s*\/>/i;
 const LazySyntaxCodeBlock = lazy(() => import('./SyntaxCodeBlock'));
+const LazyFlowMarkdown = lazy(() =>
+  import('./StreamingText').then((module) => ({ default: module.FlowMarkdown })),
+);
 
 function stripTasksTag(content: string): string {
   return content.replace(/<tasks\s*\/>/gi, "").trim();
@@ -1192,7 +1194,9 @@ export function MessageItem({
             isUser ? (
               <MemoMarkdown content={safeDisplayContent} components={components} />
             ) : (
-              <FlowMarkdown content={safeDisplayContent} isStreaming={isStreaming} />
+              <Suspense fallback={<MemoMarkdown content={safeDisplayContent} components={components} />}>
+                <LazyFlowMarkdown content={safeDisplayContent} isStreaming={isStreaming} />
+              </Suspense>
             )
           )}
 
