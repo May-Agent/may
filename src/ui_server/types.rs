@@ -160,13 +160,21 @@ pub(crate) struct NotificationSentResponse {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NotificationMailboxStatus {
+    Pending,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NotificationMailboxEntryResponse {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) body: String,
     pub(crate) session_id: Option<String>,
-    pub(crate) status: String,
+    pub(crate) status: NotificationMailboxStatus,
     pub(crate) sent_count: i32,
     pub(crate) last_error: Option<String>,
     pub(crate) delivered_at: Option<String>,
@@ -182,7 +190,12 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
             title: value.title,
             body: value.body,
             session_id: value.session_id,
-            status: value.status,
+            status: match value.status.as_str() {
+                "pending" => NotificationMailboxStatus::Pending,
+                "delivered" => NotificationMailboxStatus::Delivered,
+                "failed" => NotificationMailboxStatus::Failed,
+                other => panic!("unknown notification mailbox status: {other}"),
+            },
             sent_count: value.sent_count,
             last_error: value.last_error,
             delivered_at: value.delivered_at,

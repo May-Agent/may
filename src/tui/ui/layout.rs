@@ -1788,7 +1788,7 @@ fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
                     let selected = idx == app.mcp_selected;
                     let prefix = if selected { "> " } else { "  " };
 
-                    let status_color = if server.is_connected {
+                    let status_color = if server.status.is_connected() {
                         Color::Green
                     } else {
                         Color::Red
@@ -1814,7 +1814,7 @@ fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
                             },
                         ),
                         Span::styled(" - ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(&server.status, Style::default().fg(status_color)),
+                        Span::styled(server.status.to_string(), Style::default().fg(status_color)),
                     ]);
                     lines.push(line);
 
