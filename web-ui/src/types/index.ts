@@ -252,6 +252,7 @@ export interface FolderInfo {
 
 export type TaskTriggerKind = 'time' | 'event' | 'webhook';
 export type TimeTriggerType = 'cron' | 'once';
+export type TaskRunStatus = 'running' | 'success' | 'failed' | 'interrupted';
 
 export type TaskTriggerInput =
   | {
@@ -310,7 +311,7 @@ export interface ScheduledTask {
   approved: boolean;
   enabled: boolean;
   lastRunAt: string | null;
-  lastRunStatus: string | null;
+  lastRunStatus: TaskRunStatus | null;
   lastRunOutput: string | null;
   createdAt: string;
   updatedAt: string;

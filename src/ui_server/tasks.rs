@@ -11,6 +11,7 @@ use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Result as SkyResult, StatusCode};
 
 use crate::db::{CreateScheduledTaskParams, UpdateScheduledTaskParams};
+use crate::scheduler::TaskRunStatus;
 use crate::task_trigger::{
     NormalizedTaskTrigger, PersistedTaskTrigger, TaskTriggerKind, TaskTriggerRequest,
     TaskTriggerResponse, TaskWebhookRequest,
@@ -35,7 +36,7 @@ pub(super) struct ScheduledTaskResponse {
     pub approved: bool,
     pub enabled: bool,
     pub last_run_at: Option<String>,
-    pub last_run_status: Option<String>,
+    pub last_run_status: Option<TaskRunStatus>,
     pub last_run_output: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -59,7 +60,12 @@ impl ScheduledTaskResponse {
             approved: m.approved,
             enabled: m.enabled,
             last_run_at: m.last_run_at,
-            last_run_status: m.last_run_status,
+            last_run_status: m
+                .last_run_status
+                .as_deref()
+                .map(TaskRunStatus::parse)
+                .transpose()
+                .expect("scheduled task last_run_status must be valid"),
             last_run_output: m.last_run_output,
             created_at: m.created_at,
             updated_at: m.updated_at,

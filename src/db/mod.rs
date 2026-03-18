@@ -15,6 +15,7 @@ use sea_orm::{
     sea_query::{Expr, Query, SqliteQueryBuilder},
 };
 
+use crate::scheduler::TaskRunStatus;
 use crate::session::{
     BrowserInteractionState, ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage,
     PersistedAskUserRequest, PersistedPermissionRequest, PersistedWorkspaceRequest,
@@ -1259,13 +1260,13 @@ impl ChatDb {
 
     pub async fn recover_task_runs_after_restart(&self) -> Result<(), ChatDbError> {
         let running = scheduled_task_runs::Entity::find()
-            .filter(scheduled_task_runs::Column::Status.eq("running"))
+            .filter(scheduled_task_runs::Column::Status.eq(TaskRunStatus::Running.as_str()))
             .all(&self.conn)
             .await?;
         let finished_at = jiff::Timestamp::now().to_string();
         for run in running {
             let mut active: scheduled_task_runs::ActiveModel = run.into();
-            active.status = Set("interrupted".to_string());
+            active.status = Set(TaskRunStatus::Interrupted.as_str().to_string());
             active.output = Set(Some(
                 "May server restarted before the task run completed".to_string(),
             ));
@@ -2782,14 +2783,14 @@ impl ChatDb {
     pub async fn record_task_run(
         &self,
         id: &str,
-        status: &str,
+        status: TaskRunStatus,
         output: Option<&str>,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         let active = scheduled_tasks::ActiveModel {
             id: Set(id.to_string()),
             last_run_at: Set(Some(now.clone())),
-            last_run_status: Set(Some(status.to_string())),
+            last_run_status: Set(Some(status.as_str().to_string())),
             last_run_output: Set(output.map(String::from)),
             updated_at: Set(now),
             ..Default::default()
@@ -2811,7 +2812,7 @@ impl ChatDb {
             profile_id: Set(task.profile_id.clone()),
             session_id: Set(task.session_id.clone()),
             invocation_kind: Set(invocation_kind.to_string()),
-            status: Set("running".to_string()),
+            status: Set(TaskRunStatus::Running.as_str().to_string()),
             output: Set(None),
             started_at: Set(now.clone()),
             finished_at: Set(None),
@@ -2825,7 +2826,7 @@ impl ChatDb {
     pub async fn finish_task_run(
         &self,
         id: &str,
-        status: &str,
+        status: TaskRunStatus,
         output: Option<&str>,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
@@ -2835,7 +2836,7 @@ impl ChatDb {
                 .await?
                 .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?
                 .into();
-        active.status = Set(status.to_string());
+        active.status = Set(status.as_str().to_string());
         active.output = Set(output.map(ToOwned::to_owned));
         active.finished_at = Set(Some(now.clone()));
         active.updated_at = Set(now);
