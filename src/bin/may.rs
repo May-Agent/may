@@ -1047,7 +1047,7 @@ where
                                 tracing::warn!("Failed to save model to session: {}", e);
                             }
                             app.config.last_model = Some(model);
-                            if let Err(e) = app.config.clone().save_async().await {
+                            if let Err(e) = app.config.clone().save().await {
                                 tracing::warn!("Failed to save config: {}", e);
                             }
                         }
@@ -1137,7 +1137,7 @@ where
                                 name: name.clone(),
                                 target,
                             });
-                        if let Err(e) = app.config.clone().save_async().await {
+                        if let Err(e) = app.config.clone().save().await {
                             let err_msg = format!("Failed to save SSH server: {}", e);
                             app.chat.push_error(&err_msg);
                         } else {
@@ -1149,7 +1149,7 @@ where
                     }
                     Some(SendAction::SshRemove { name }) => {
                         if app.config.remove_ssh_server(&name) {
-                            if let Err(e) = app.config.clone().save_async().await {
+                            if let Err(e) = app.config.clone().save().await {
                                 let err_msg = format!("Failed to save SSH config: {}", e);
                                 app.chat.push_error(&err_msg);
                             } else {
@@ -1339,7 +1339,7 @@ where
                 );
                 app.config.upsert_provider("copilot", instance);
                 app.config_state.load_providers(&app.config);
-                if let Err(e) = app.config.clone().save_async().await {
+                if let Err(e) = app.config.clone().save().await {
                     tracing::error!("Failed to save config: {}", e);
                 }
                 app.copilot_auth_success();

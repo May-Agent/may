@@ -46,7 +46,7 @@ pub(super) async fn persist_last_model(state: &UiServerState, model: &str) -> an
     });
 
     updated
-        .save_async()
+        .save()
         .await
         .map_err(anyhow::Error::from)
         .inspect(|_| state.notify_ui_events())
