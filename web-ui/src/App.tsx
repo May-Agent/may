@@ -1,7 +1,21 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
+import {
+  Suspense,
+  lazy,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+import {
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useParams,
+} from 'react-router-dom';
 import { Sidebar } from '@/components/layout/Sidebar';
-import { SettingsPage } from '@/components/layout/SettingsPage';
 import { ChatInterface } from '@/components/chat/ChatInterface';
 import {
   consumeNotificationCallback,
@@ -17,15 +31,29 @@ import { FONTS } from '@/lib/constants';
 import { useRuntimeStore } from '@/lib/runtimeStore';
 import type { ProfileSessions } from '@/types';
 
-function profileHasSession(profileSessions: ProfileSessions | null, sessionId: string): boolean {
+const LazySettingsPage = lazy(() =>
+  import('@/components/layout/SettingsPage').then((module) => ({
+    default: module.SettingsPage,
+  })),
+);
+
+function profileHasSession(
+  profileSessions: ProfileSessions | null,
+  sessionId: string,
+): boolean {
   if (!profileSessions) return false;
-  if (profileSessions.regular.some((session) => session.id === sessionId)) return true;
-  if (profileSessions.archived.some((session) => session.id === sessionId)) return true;
+  if (profileSessions.regular.some((session) => session.id === sessionId))
+    return true;
+  if (profileSessions.archived.some((session) => session.id === sessionId))
+    return true;
   for (const item of profileSessions.pinned) {
     if (item.type === 'session' && item.id === sessionId) {
       return true;
     }
-    if (item.type === 'folder' && item.sessions.some((session) => session.id === sessionId)) {
+    if (
+      item.type === 'folder' &&
+      item.sessions.some((session) => session.id === sessionId)
+    ) {
       return true;
     }
   }
@@ -36,7 +64,11 @@ function flattenProfileSessions(profileSessions: ProfileSessions) {
   const pinnedSessions = profileSessions.pinned.flatMap((item) =>
     item.type === 'session' ? [item] : item.sessions,
   );
-  return [...pinnedSessions, ...profileSessions.regular, ...profileSessions.archived];
+  return [
+    ...pinnedSessions,
+    ...profileSessions.regular,
+    ...profileSessions.archived,
+  ];
 }
 
 function AppScaffold({
@@ -66,7 +98,9 @@ function AppScaffold({
           <SheetContent side="left" className="p-0 w-72">
             <Sidebar
               onOpenSettings={onOpenSettings}
-              onSelectSession={(id) => navigate(`/chat/${encodeURIComponent(id)}`)}
+              onSelectSession={(id) =>
+                navigate(`/chat/${encodeURIComponent(id)}`)
+              }
               onNewChat={() => navigate('/chat/new')}
             />
           </SheetContent>
@@ -84,7 +118,9 @@ function AppScaffold({
         />
       </div>
 
-      <main className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">{children}</main>
+      <main className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {children}
+      </main>
     </div>
   );
 }
@@ -164,7 +200,15 @@ function ChatRouteView({
 function SettingsRouteView() {
   return (
     <div className="h-full min-h-0 bg-background text-foreground overflow-auto">
-      <SettingsPage />
+      <Suspense
+        fallback={
+          <div className="px-6 py-6 text-sm text-muted-foreground">
+            Loading settings…
+          </div>
+        }
+      >
+        <LazySettingsPage />
+      </Suspense>
     </div>
   );
 }
@@ -199,7 +243,13 @@ function AppShell() {
       void refreshMcpServers();
       void refreshSkills();
     }
-  }, [location.pathname, refreshRuntimeSettings, refreshFullConfig, refreshMcpServers, refreshSkills]);
+  }, [
+    location.pathname,
+    refreshRuntimeSettings,
+    refreshFullConfig,
+    refreshMcpServers,
+    refreshSkills,
+  ]);
 
   useEffect(() => {
     if (!('serviceWorker' in navigator)) {
@@ -208,7 +258,10 @@ function AppShell() {
 
     const processNotificationCallback = async (notificationId: string) => {
       const normalizedId = notificationId.trim();
-      if (!normalizedId || handledNotificationIdsRef.current.has(normalizedId)) {
+      if (
+        !normalizedId ||
+        handledNotificationIdsRef.current.has(normalizedId)
+      ) {
         return;
       }
       handledNotificationIdsRef.current.add(normalizedId);
@@ -217,11 +270,14 @@ function AppShell() {
       try {
         const callback = await consumeNotificationCallback(normalizedId);
         const requestedSessionId =
-          typeof callback.sessionId === 'string' && callback.sessionId.trim().length > 0
+          typeof callback.sessionId === 'string' &&
+          callback.sessionId.trim().length > 0
             ? callback.sessionId
             : undefined;
         const callbackMessage =
-          typeof callback.callbackMessage === 'string' ? callback.callbackMessage.trim() : '';
+          typeof callback.callbackMessage === 'string'
+            ? callback.callbackMessage.trim()
+            : '';
         const callbackContextXml =
           typeof callback.callbackContextXml === 'string'
             ? callback.callbackContextXml.trim()
@@ -231,7 +287,9 @@ function AppShell() {
 
         let callbackProfileId: string | null = null;
         if (requestedSessionId) {
-          const knownSession = store.sessions.find((session) => session.id === requestedSessionId);
+          const knownSession = store.sessions.find(
+            (session) => session.id === requestedSessionId,
+          );
           callbackProfileId =
             knownSession?.profileId ??
             (await fetchSession(requestedSessionId)).profileId ??
@@ -251,10 +309,13 @@ function AppShell() {
           : undefined;
         const targetSessionId = callbackMessage
           ? await store.createSession(undefined, callbackProfileId)
-          : existingSession?.id ?? (await store.createSession(undefined, callbackProfileId));
+          : (existingSession?.id ??
+            (await store.createSession(undefined, callbackProfileId)));
 
         store.setCurrentSession(targetSessionId);
-        navigate(`/chat/${encodeURIComponent(targetSessionId)}`, { replace: true });
+        navigate(`/chat/${encodeURIComponent(targetSessionId)}`, {
+          replace: true,
+        });
 
         if (!callbackMessage) {
           return;
@@ -301,8 +362,13 @@ function AppShell() {
       void processNotificationCallback(notificationId);
     };
 
-    navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
-    const notificationId = new URLSearchParams(location.search).get('notification');
+    navigator.serviceWorker.addEventListener(
+      'message',
+      handleServiceWorkerMessage,
+    );
+    const notificationId = new URLSearchParams(location.search).get(
+      'notification',
+    );
     if (notificationId && notificationId.trim()) {
       void processNotificationCallback(notificationId).finally(() => {
         const params = new URLSearchParams(location.search);
@@ -319,7 +385,10 @@ function AppShell() {
     }
 
     return () => {
-      navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+      navigator.serviceWorker.removeEventListener(
+        'message',
+        handleServiceWorkerMessage,
+      );
     };
   }, [location.pathname, location.search, navigate]);
 
@@ -348,8 +417,7 @@ function AppShell() {
             uiConfig: {
               ...state.uiConfig,
               sshServers: data.sshServers ?? state.uiConfig.sshServers,
-              maxIterations:
-                data.maxIterations ?? state.uiConfig.maxIterations,
+              maxIterations: data.maxIterations ?? state.uiConfig.maxIterations,
               fullConfig: nextFullConfig,
             },
           };
