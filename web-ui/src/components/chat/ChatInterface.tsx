@@ -121,6 +121,14 @@ function isWebFetchToolName(normalizedName: string): boolean {
   );
 }
 
+function isBashExecutionMode(value: unknown): value is BashExecution["mode"] {
+  return (
+    value === "default" ||
+    value === "sandboxed" ||
+    value === "unsafe" ||
+    value === "ssh"
+  );
+}
 
 export function ChatInterface({
   onToggleSidebar,
@@ -154,24 +162,33 @@ export function ChatInterface({
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleInput, setTitleInput] = useState("");
   const [newChatModelId, setNewChatModelId] = useState("");
-  const [newChatReasoningEffort, setNewChatReasoningEffort] = useState<string | undefined>(undefined);
+  const [newChatReasoningEffort, setNewChatReasoningEffort] = useState<
+    string | undefined
+  >(undefined);
   const [isSending, setIsSending] = useState(false);
-  const [isStreamControllerActive, setIsStreamControllerActive] = useState(false);
+  const [isStreamControllerActive, setIsStreamControllerActive] =
+    useState(false);
   const [isModelUpdating, setIsModelUpdating] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
   const [isPermissionSubmitting, setIsPermissionSubmitting] = useState(false);
   const [isWorkspaceSubmitting, setIsWorkspaceSubmitting] = useState(false);
-  const [pendingAskUser, setPendingAskUser] = useState<AskUserState | null>(null);
+  const [pendingAskUser, setPendingAskUser] = useState<AskUserState | null>(
+    null,
+  );
   const [isAskUserSubmitting, setIsAskUserSubmitting] = useState(false);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [isArtifactsOpen, setIsArtifactsOpen] = useState(false);
   const [isBrowserOpen, setIsBrowserOpen] = useState(false);
   const [showArtifactHistory, setShowArtifactHistory] = useState(false);
-  const [selectedPreviewPath, setSelectedPreviewPath] = useState<string | null>(null);
+  const [selectedPreviewPath, setSelectedPreviewPath] = useState<string | null>(
+    null,
+  );
   const [selectedPreviewViewer, setSelectedPreviewViewer] =
     useState<ArtifactPreviewTarget["viewer"]>(undefined);
   const [previewPane, setPreviewPane] = useState<PreviewPaneState | null>(null);
-  const [artifactPanelWidth, setArtifactPanelWidth] = useState(ARTIFACT_PANEL_DEFAULT_WIDTH);
+  const [artifactPanelWidth, setArtifactPanelWidth] = useState(
+    ARTIFACT_PANEL_DEFAULT_WIDTH,
+  );
   const [isArtifactPanelResizing, setIsArtifactPanelResizing] = useState(false);
   const [todoProgress, setTodoProgress] = useState<{
     items: Array<{ text: string; checked: boolean }>;
@@ -180,10 +197,13 @@ export function ChatInterface({
   } | null>(null);
   const previewBlobUrlRef = useRef<string | null>(null);
   const selectedPreviewPathRef = useRef<string | null>(null);
-  const selectedPreviewViewerRef = useRef<ArtifactPreviewTarget["viewer"]>(undefined);
-  const artifactResizeStartRef = useRef<{ pointerId: number; x: number; width: number } | null>(
-    null,
-  );
+  const selectedPreviewViewerRef =
+    useRef<ArtifactPreviewTarget["viewer"]>(undefined);
+  const artifactResizeStartRef = useRef<{
+    pointerId: number;
+    x: number;
+    width: number;
+  } | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
   const pendingInitialScrollRef = useRef(false);
@@ -194,8 +214,10 @@ export function ChatInterface({
   const streamingSessionIdRef = useRef<string | null>(null);
   const previewSessionRef = useRef<string | null>(null);
   const currentSession = sessions.find((s) => s.id === currentSessionId);
-  const currentPlanState: SessionPlanState = currentSession?.runtime.planState ?? "disabled";
-  const currentProfile = profiles.find((profile) => profile.id === currentProfileId) ?? null;
+  const currentPlanState: SessionPlanState =
+    currentSession?.runtime.planState ?? "disabled";
+  const currentProfile =
+    profiles.find((profile) => profile.id === currentProfileId) ?? null;
   const containerPrepareStatus = currentProfileId
     ? containerPrepareStatuses[currentProfileId]
     : undefined;
@@ -211,41 +233,47 @@ export function ChatInterface({
   const containerPreparation = workspaceSurface.container;
   const isContainerPrepareFailed = containerPreparation.isPrepareFailed;
   const containerPrepareSummary = containerPreparation.summary;
-  const requiresManagedPodmanApproval = isManagedPodmanApprovalCode(profileAccessBlockedCode);
+  const requiresManagedPodmanApproval = isManagedPodmanApprovalCode(
+    profileAccessBlockedCode,
+  );
   const messages = currentSession?.messages || [];
   const hasPendingAssistantMessage = [...messages]
     .reverse()
-    .some((message) => message.role === "assistant" && (message.isStreaming || message.isThinking));
+    .some(
+      (message) =>
+        message.role === "assistant" &&
+        (message.isStreaming || message.isThinking),
+    );
   const isNewChat = !currentSessionId || !currentSession;
 
-  const handlePlanStateChange = useCallback(async (nextPlanState: SessionPlanState) => {
-    if (!currentSessionId) {
-      return;
-    }
-    try {
-      const payload = await fetchSessionTasks(currentSessionId);
-      const saved = await saveSessionTasks(currentSessionId, {
-        content: payload.content,
-        planState: nextPlanState,
-      });
-      setSessionPlanState(currentSessionId, saved.planState);
-      void refreshProfileSessions();
-    } catch (error) {
-      setUiError(
-        error instanceof Error
-          ? error.message
-          : String(error),
-      );
-    }
-  }, [currentSessionId, refreshProfileSessions, setSessionPlanState]);
+  const handlePlanStateChange = useCallback(
+    async (nextPlanState: SessionPlanState) => {
+      if (!currentSessionId) {
+        return;
+      }
+      try {
+        const payload = await fetchSessionTasks(currentSessionId);
+        const saved = await saveSessionTasks(currentSessionId, {
+          content: payload.content,
+          planState: nextPlanState,
+        });
+        setSessionPlanState(currentSessionId, saved.planState);
+        void refreshProfileSessions();
+      } catch (error) {
+        setUiError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [currentSessionId, refreshProfileSessions, setSessionPlanState],
+  );
   const shouldShowWelcome = isNewChat || messages.length === 0;
   const chatSurfaceState =
-    workspaceSurface.state === 'ready'
+    workspaceSurface.state === "ready"
       ? shouldShowWelcome
-        ? 'welcome'
-        : 'chat'
+        ? "welcome"
+        : "chat"
       : workspaceSurface.state;
-  const showComposer = chatSurfaceState === 'welcome' || chatSurfaceState === 'chat';
+  const showComposer =
+    chatSurfaceState === "welcome" || chatSurfaceState === "chat";
   const hasInput = inputValue.trim() || attachments.length > 0;
   const configuredModelIds = (() => {
     const modelConfig = uiConfig.fullConfig?.models;
@@ -264,9 +292,12 @@ export function ChatInterface({
     : currentSessionModelId.trim().length > 0;
   const isCurrentSessionModelConfigured = isNewChat
     ? true
-    : configuredModelIds.size === 0 || configuredModelIds.has(currentSessionModelId);
-  const canSend = hasInput && hasSelectedModel && isCurrentSessionModelConfigured;
-  const showTokenUsage = uiConfig.fullConfig?.preferences.showTokenUsage ?? true;
+    : configuredModelIds.size === 0 ||
+      configuredModelIds.has(currentSessionModelId);
+  const canSend =
+    hasInput && hasSelectedModel && isCurrentSessionModelConfigured;
+  const showTokenUsage =
+    uiConfig.fullConfig?.preferences.showTokenUsage ?? true;
   const latestAssistantWithStats = [...messages]
     .reverse()
     .find((m) => m.role === "assistant" && m.stats);
@@ -282,7 +313,10 @@ export function ChatInterface({
     latestStats?.promptTokens ?? latestStats?.totalTokens ?? totalTokens;
   const contextUsagePercent =
     contextWindow && typeof contextUsedTokens === "number"
-      ? Math.max(0, Math.min(100, Math.round((contextUsedTokens / contextWindow) * 100)))
+      ? Math.max(
+          0,
+          Math.min(100, Math.round((contextUsedTokens / contextWindow) * 100)),
+        )
       : null;
   const contextUsageTitle = latestStats
     ? `Context usage\n${contextUsedTokens ?? "-"}/${contextWindow ?? "-"} tokens (${contextUsagePercent ?? "-"}%)\nPrompt: ${latestStats.promptTokens ?? "-"}\nCompletion: ${latestStats.completionTokens ?? "-"}\nTotal: ${totalTokens ?? "-"}`
@@ -292,7 +326,9 @@ export function ChatInterface({
   );
   const queuedMessages = runtimeSession
     ? [
-        ...(runtimeSession.pendingImmediate ? [runtimeSession.pendingImmediate] : []),
+        ...(runtimeSession.pendingImmediate
+          ? [runtimeSession.pendingImmediate]
+          : []),
         ...(runtimeSession.queuedMessages ?? []),
       ]
     : [];
@@ -302,12 +338,17 @@ export function ChatInterface({
     runtimeSession?.waitingWorkspace ?? null;
   const pendingAskUserRequest: AskUserRequest | null =
     runtimeSession?.waitingAskUser ?? null;
-  const isGenerating = runtimeSession?.state === 'running';
+  const isGenerating = runtimeSession?.state === "running";
   const showStopButton =
-    isGenerating || isSending || isStreamControllerActive || hasPendingAssistantMessage;
+    isGenerating ||
+    isSending ||
+    isStreamControllerActive ||
+    hasPendingAssistantMessage;
   const markRuntimeRunning = useRuntimeStore((state) => state.markRunning);
   const applyRuntime = useRuntimeStore((state) => state.applyRuntime);
-  const markRuntimeFirstToken = useRuntimeStore((state) => state.markFirstToken);
+  const markRuntimeFirstToken = useRuntimeStore(
+    (state) => state.markFirstToken,
+  );
 
   const normalizePreviewUrl = useCallback((value: string): string | null => {
     const trimmed = value.trim();
@@ -338,24 +379,27 @@ export function ChatInterface({
   const normalizeArtifactPath = useCallback((value: string): string => {
     const trimmed = value.trim();
     if (!trimmed) {
-      return '';
+      return "";
     }
 
-    const slashNormalized = trimmed.replace(/\\/g, '/');
-    const withoutDotPrefix = slashNormalized.replace(/^\.\/+/, '');
+    const slashNormalized = trimmed.replace(/\\/g, "/");
+    const withoutDotPrefix = slashNormalized.replace(/^\.\/+/, "");
     const lower = withoutDotPrefix.toLowerCase();
-    if (lower === 'artifacts') {
-      return '';
+    if (lower === "artifacts") {
+      return "";
     }
-    if (lower.startsWith('artifacts/')) {
-      return withoutDotPrefix.slice('artifacts/'.length);
+    if (lower.startsWith("artifacts/")) {
+      return withoutDotPrefix.slice("artifacts/".length);
     }
     return withoutDotPrefix;
   }, []);
 
-  const isPreviewUrl = useCallback((value: string): boolean => {
-    return normalizePreviewUrl(value) !== null;
-  }, [normalizePreviewUrl]);
+  const isPreviewUrl = useCallback(
+    (value: string): boolean => {
+      return normalizePreviewUrl(value) !== null;
+    },
+    [normalizePreviewUrl],
+  );
 
   const artifactViewerHints = useMemo(
     () => buildArtifactViewerHints(messages, normalizeArtifactPath),
@@ -378,7 +422,9 @@ export function ChatInterface({
       if (nextArtifacts.length === 0) {
         return null;
       }
-      const artifactPaths = new Set(nextArtifacts.map((artifact) => artifact.path));
+      const artifactPaths = new Set(
+        nextArtifacts.map((artifact) => artifact.path),
+      );
       const hintedEntries = Array.from(artifactViewerHints.entries());
       for (let index = hintedEntries.length - 1; index >= 0; index -= 1) {
         const [path, viewer] = hintedEntries[index];
@@ -456,126 +502,159 @@ export function ChatInterface({
     pickPreferredArtifactTarget,
   ]);
 
-  const openPreview = useCallback(async (target: ArtifactPreviewTarget | string) => {
-    const request = typeof target === "string" ? { path: target } : target;
-    const rawPath = request.path.trim();
-    if (!rawPath || !currentSessionId) return;
+  const openPreview = useCallback(
+    async (target: ArtifactPreviewTarget | string) => {
+      const request = typeof target === "string" ? { path: target } : target;
+      const rawPath = request.path.trim();
+      if (!rawPath || !currentSessionId) return;
 
-    const normalizedUrl = normalizePreviewUrl(rawPath);
-    const previewPath = normalizedUrl ?? normalizeArtifactPath(rawPath);
-    if (!previewPath) {
-      setUiError('artifact path is required');
-      setPreviewPane({ kind: 'text', text: 'Preview failed: artifact path is required' });
-      return;
-    }
-
-    setSelectedPreviewPath(previewPath);
-    setSelectedPreviewViewer(request.viewer);
-    selectedPreviewPathRef.current = previewPath;
-    selectedPreviewViewerRef.current = request.viewer;
-    setIsArtifactsOpen(true);
-    setShowArtifactHistory(false);
-
-    if (previewBlobUrlRef.current) {
-      URL.revokeObjectURL(previewBlobUrlRef.current);
-      previewBlobUrlRef.current = null;
-    }
-
-    if (normalizedUrl) {
-      // For container profiles, delegate host detection to the backend by
-      // calling the local-url-map endpoint.  The backend is the single source of
-      // truth for what constitutes a mappable local host (eliminating the previous
-      // duplicated `isLocalPreviewHost` check on the frontend).
-      let resolvedUrl = normalizedUrl;
-      const isContainerProfile = currentProfile?.environment.type === 'container';
-      if (isContainerProfile && currentSessionId) {
-        try {
-          resolvedUrl = await mapContainerLocalArtifactUrl(currentSessionId, normalizedUrl);
-        } catch {
-          // Backend rejected the URL (not a local host, or missing port, etc.) —
-          // fall through to show the original URL directly.
-        }
+      const normalizedUrl = normalizePreviewUrl(rawPath);
+      const previewPath = normalizedUrl ?? normalizeArtifactPath(rawPath);
+      if (!previewPath) {
+        setUiError("artifact path is required");
+        setPreviewPane({
+          kind: "text",
+          text: "Preview failed: artifact path is required",
+        });
+        return;
       }
 
-      if (request.viewer === "slidev") {
+      setSelectedPreviewPath(previewPath);
+      setSelectedPreviewViewer(request.viewer);
+      selectedPreviewPathRef.current = previewPath;
+      selectedPreviewViewerRef.current = request.viewer;
+      setIsArtifactsOpen(true);
+      setShowArtifactHistory(false);
+
+      if (previewBlobUrlRef.current) {
+        URL.revokeObjectURL(previewBlobUrlRef.current);
+        previewBlobUrlRef.current = null;
+      }
+
+      if (normalizedUrl) {
+        // For container profiles, delegate host detection to the backend by
+        // calling the local-url-map endpoint.  The backend is the single source of
+        // truth for what constitutes a mappable local host (eliminating the previous
+        // duplicated `isLocalPreviewHost` check on the frontend).
+        let resolvedUrl = normalizedUrl;
+        const isContainerProfile =
+          currentProfile?.environment.type === "container";
+        if (isContainerProfile && currentSessionId) {
+          try {
+            resolvedUrl = await mapContainerLocalArtifactUrl(
+              currentSessionId,
+              normalizedUrl,
+            );
+          } catch {
+            // Backend rejected the URL (not a local host, or missing port, etc.) —
+            // fall through to show the original URL directly.
+          }
+        }
+
+        if (request.viewer === "slidev") {
+          setPreviewPane({
+            kind: "slidev",
+            url: resolvedUrl,
+          });
+          return;
+        }
+
         setPreviewPane({
-          kind: "slidev",
+          kind: "external",
           url: resolvedUrl,
         });
         return;
       }
 
-      setPreviewPane({
-        kind: "external",
-        url: resolvedUrl,
-      });
-      return;
-    }
-
-    try {
-      if (request.viewer === "slidev") {
-        const previewUrl = await prepareSlidevPreview(currentSessionId, previewPath);
-        setPreviewPane({ kind: "slidev", url: previewUrl });
-        return;
-      }
-
-      const response = await fetchArtifactPreview(currentSessionId, previewPath);
-      const contentType = (response.headers.get('content-type') || '').toLowerCase();
-      const ext = previewPath.split('.').pop()?.toLowerCase() || '';
-      const arrayBuffer = await response.arrayBuffer();
-      const bytes = new Uint8Array(arrayBuffer);
-
-      const text =
-        contentType.startsWith('text/') ||
-        contentType.includes('json') ||
-        contentType.includes('xml') ||
-        ['md', 'markdown', 'txt', 'log', 'csv'].includes(ext)
-          ? new TextDecoder().decode(bytes)
-          : '';
-
-      const isMarkdown = contentType.includes("markdown") || ["md", "markdown"].includes(ext);
-      if (isMarkdown) {
-        setPreviewPane({ kind: 'markdown', markdown: text });
-      } else if (contentType.startsWith('text/plain') || ['txt', 'log', 'csv', 'json', 'xml'].includes(ext)) {
-        setPreviewPane({ kind: 'text', text });
-      } else if (ext === 'docx' || contentType.includes('officedocument.wordprocessingml.document')) {
-        const mammoth = await import('mammoth');
-        const htmlResult = await mammoth.default.convertToHtml({ arrayBuffer });
-        const htmlBlob = new Blob([htmlResult.value], { type: 'text/html;charset=utf-8' });
-        const htmlUrl = URL.createObjectURL(htmlBlob);
-        previewBlobUrlRef.current = htmlUrl;
-        setPreviewPane({ kind: 'iframe', url: htmlUrl });
-      } else {
-        const blob = new Blob([bytes], { type: response.headers.get('content-type') || 'application/octet-stream' });
-        const objectUrl = URL.createObjectURL(blob);
-        previewBlobUrlRef.current = objectUrl;
-
-        if (contentType.startsWith('image/')) {
-          setPreviewPane({ kind: 'image', url: objectUrl });
-        } else if (contentType.startsWith('audio/')) {
-          setPreviewPane({ kind: 'audio', url: objectUrl });
-        } else {
-          setPreviewPane({ kind: 'iframe', url: objectUrl });
+      try {
+        if (request.viewer === "slidev") {
+          const previewUrl = await prepareSlidevPreview(
+            currentSessionId,
+            previewPath,
+          );
+          setPreviewPane({ kind: "slidev", url: previewUrl });
+          return;
         }
-      }
-    } catch (error) {
-      const reason =
-        error instanceof Error ? error.message : String(error);
-      setUiError(
-        `Artifact preview failed: ${reason}`,
-      );
-      setPreviewPane({ kind: 'text', text: `Preview failed: ${reason}` });
-    }
-  }, [
-    currentProfile?.environment.type,
-    currentSessionId,
-    normalizeArtifactPath,
-    normalizePreviewUrl,
-  ]);
 
-  const handleOpenPreview = useCallback((target: ArtifactPreviewTarget) => {
-    void openPreview(target);
-  }, [openPreview]);
+        const response = await fetchArtifactPreview(
+          currentSessionId,
+          previewPath,
+        );
+        const contentType = (
+          response.headers.get("content-type") || ""
+        ).toLowerCase();
+        const ext = previewPath.split(".").pop()?.toLowerCase() || "";
+        const arrayBuffer = await response.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+
+        const text =
+          contentType.startsWith("text/") ||
+          contentType.includes("json") ||
+          contentType.includes("xml") ||
+          ["md", "markdown", "txt", "log", "csv"].includes(ext)
+            ? new TextDecoder().decode(bytes)
+            : "";
+
+        const isMarkdown =
+          contentType.includes("markdown") || ["md", "markdown"].includes(ext);
+        if (isMarkdown) {
+          setPreviewPane({ kind: "markdown", markdown: text });
+        } else if (
+          contentType.startsWith("text/plain") ||
+          ["txt", "log", "csv", "json", "xml"].includes(ext)
+        ) {
+          setPreviewPane({ kind: "text", text });
+        } else if (
+          ext === "docx" ||
+          contentType.includes("officedocument.wordprocessingml.document")
+        ) {
+          const mammoth = await import("mammoth");
+          const htmlResult = await mammoth.default.convertToHtml({
+            arrayBuffer,
+          });
+          const htmlBlob = new Blob([htmlResult.value], {
+            type: "text/html;charset=utf-8",
+          });
+          const htmlUrl = URL.createObjectURL(htmlBlob);
+          previewBlobUrlRef.current = htmlUrl;
+          setPreviewPane({ kind: "iframe", url: htmlUrl });
+        } else {
+          const blob = new Blob([bytes], {
+            type:
+              response.headers.get("content-type") ||
+              "application/octet-stream",
+          });
+          const objectUrl = URL.createObjectURL(blob);
+          previewBlobUrlRef.current = objectUrl;
+
+          if (contentType.startsWith("image/")) {
+            setPreviewPane({ kind: "image", url: objectUrl });
+          } else if (contentType.startsWith("audio/")) {
+            setPreviewPane({ kind: "audio", url: objectUrl });
+          } else {
+            setPreviewPane({ kind: "iframe", url: objectUrl });
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        setUiError(`Artifact preview failed: ${reason}`);
+        setPreviewPane({ kind: "text", text: `Preview failed: ${reason}` });
+      }
+    },
+    [
+      currentProfile?.environment.type,
+      currentSessionId,
+      normalizeArtifactPath,
+      normalizePreviewUrl,
+    ],
+  );
+
+  const handleOpenPreview = useCallback(
+    (target: ArtifactPreviewTarget) => {
+      void openPreview(target);
+    },
+    [openPreview],
+  );
 
   useEffect(() => {
     selectedPreviewPathRef.current = selectedPreviewPath;
@@ -607,7 +686,11 @@ export function ChatInterface({
     if (newChatModelId !== "") {
       setNewChatModelId("");
     }
-  }, [newChatModelId, uiConfig.fullConfig?.lastModel, uiConfig.fullConfig?.models.advanced]);
+  }, [
+    newChatModelId,
+    uiConfig.fullConfig?.lastModel,
+    uiConfig.fullConfig?.models.advanced,
+  ]);
 
   useEffect(() => {
     if (currentSession) setTitleInput(currentSession.title);
@@ -619,7 +702,6 @@ export function ChatInterface({
   useEffect(() => {
     setUiError(null);
   }, [currentSessionId]);
-
 
   useEffect(() => {
     setUiError(null);
@@ -686,7 +768,10 @@ export function ChatInterface({
     }
 
     void refreshArtifacts();
-    const banner = createDisconnectBanner(setUiError, 'Artifacts stream disconnected; reconnecting...');
+    const banner = createDisconnectBanner(
+      setUiError,
+      "Artifacts stream disconnected; reconnecting...",
+    );
 
     const unsubscribe = subscribeSessionArtifacts(currentSessionId, {
       onArtifacts: () => {
@@ -721,19 +806,16 @@ export function ChatInterface({
       banner.cleanup();
       unsubscribe();
     };
-  }, [
-    currentSessionId,
-    isPreviewUrl,
-    openPreview,
-    refreshArtifacts,
-  ]);
+  }, [currentSessionId, isPreviewUrl, openPreview, refreshArtifacts]);
 
   useEffect(() => {
     if (!currentSessionId || !selectedPreviewPath || previewPane !== null) {
       return;
     }
     if (!isPreviewUrl(selectedPreviewPath)) {
-      const exists = artifacts.some((artifact) => artifact.path === selectedPreviewPath);
+      const exists = artifacts.some(
+        (artifact) => artifact.path === selectedPreviewPath,
+      );
       if (!exists) {
         return;
       }
@@ -758,7 +840,10 @@ export function ChatInterface({
       return;
     }
 
-    const banner = createDisconnectBanner(setUiError, 'Events stream disconnected; reconnecting...');
+    const banner = createDisconnectBanner(
+      setUiError,
+      "Events stream disconnected; reconnecting...",
+    );
 
     const unsubscribe = subscribeUiEvents({
       sessionId: currentSessionId,
@@ -795,7 +880,11 @@ export function ChatInterface({
   };
 
   useEffect(() => {
-    if (!currentSessionId || chatSurfaceState !== "chat" || !pendingInitialScrollRef.current) {
+    if (
+      !currentSessionId ||
+      chatSurfaceState !== "chat" ||
+      !pendingInitialScrollRef.current
+    ) {
       return;
     }
 
@@ -862,7 +951,8 @@ export function ChatInterface({
 
       changed = true;
       const settledTimeline = settleTimelineSegments(timeline, settledAt);
-      const { thinking, bashExecutions } = summarizeTimelineSegments(settledTimeline);
+      const { thinking, bashExecutions } =
+        summarizeTimelineSegments(settledTimeline);
       return {
         ...message,
         isStreaming: false,
@@ -912,67 +1002,79 @@ export function ChatInterface({
     }
   };
 
-  const removeQueuedMessage = useCallback(async (index: number) => {
-    if (!currentSessionId) {
-      return;
-    }
-    try {
-      const hasPendingImmediate = runtimeSession?.pendingImmediate != null;
-      const kind = hasPendingImmediate && index === 0 ? 'pending_immediate' : 'queued';
-      const queuedIndex = hasPendingImmediate ? index - 1 : index;
-      const runtime = await removePendingSessionMessage({
-        sessionId: currentSessionId,
-        kind,
-        index: kind === 'queued' ? queuedIndex : undefined,
-      });
-      applyRuntime(currentSessionId, runtime);
-    } catch (error) {
-      setUiError(
-        `Failed to remove queued message: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+  const removeQueuedMessage = useCallback(
+    async (index: number) => {
+      if (!currentSessionId) {
+        return;
+      }
+      try {
+        const hasPendingImmediate = runtimeSession?.pendingImmediate != null;
+        const kind =
+          hasPendingImmediate && index === 0 ? "pending_immediate" : "queued";
+        const queuedIndex = hasPendingImmediate ? index - 1 : index;
+        const runtime = await removePendingSessionMessage({
+          sessionId: currentSessionId,
+          kind,
+          index: kind === "queued" ? queuedIndex : undefined,
+        });
+        applyRuntime(currentSessionId, runtime);
+      } catch (error) {
+        setUiError(
+          `Failed to remove queued message: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    },
+    [applyRuntime, currentSessionId, runtimeSession],
+  );
+
+  const steerQueuedMessage = useCallback(
+    (index: number) => {
+      const queued = queuedMessages[index];
+      if (!queued) {
+        return;
+      }
+
+      setInputValue((prev) =>
+        prev.trim().length > 0
+          ? `${queued.content}\n\n${prev}`
+          : queued.content,
       );
-    }
-  }, [applyRuntime, currentSessionId, runtimeSession]);
 
-  const steerQueuedMessage = useCallback((index: number) => {
-    const queued = queuedMessages[index];
-    if (!queued) {
-      return;
-    }
+      if (queued.attachments.length > 0) {
+        const timestamp = Date.now();
+        const restored = queued.attachments.map(
+          (attachment, attachmentIndex) => ({
+            ...attachment,
+            id: `${attachment.id}-queued-${timestamp}-${index}-${attachmentIndex}`,
+          }),
+        );
+        setAttachments((prev) => [...restored, ...prev]);
+      }
 
-    setInputValue((prev) =>
-      prev.trim().length > 0
-        ? `${queued.content}\n\n${prev}`
-        : queued.content,
-    );
+      void removeQueuedMessage(index);
+      window.setTimeout(() => {
+        composerInputRef.current?.focus();
+      }, 0);
+    },
+    [queuedMessages, removeQueuedMessage],
+  );
 
-    if (queued.attachments.length > 0) {
-      const timestamp = Date.now();
-      const restored = queued.attachments.map((attachment, attachmentIndex) => ({
-        ...attachment,
-        id: `${attachment.id}-queued-${timestamp}-${index}-${attachmentIndex}`,
-      }));
-      setAttachments((prev) => [...restored, ...prev]);
-    }
+  const composerPlaceholder =
+    queuedMessages.length > 0
+      ? "Ask for follow-up changes"
+      : isNewChat
+        ? "How can I help you today?"
+        : "Type a message...";
 
-    void removeQueuedMessage(index);
-    window.setTimeout(() => {
-      composerInputRef.current?.focus();
-    }, 0);
-  }, [queuedMessages, removeQueuedMessage]);
-
-  const composerPlaceholder = queuedMessages.length > 0
-    ? "Ask for follow-up changes"
-    : isNewChat
-      ? "How can I help you today?"
-      : "Type a message...";
-
-  const syncSessionRuntime = useCallback(async (sessionId: string) => {
-    const runtime = await fetchSessionRuntime(sessionId);
-    applyRuntime(sessionId, runtime);
-  }, [applyRuntime]);
-
+  const syncSessionRuntime = useCallback(
+    async (sessionId: string) => {
+      const runtime = await fetchSessionRuntime(sessionId);
+      applyRuntime(sessionId, runtime);
+    },
+    [applyRuntime],
+  );
 
   const handleSend = async (options?: {
     sessionIdHint?: string;
@@ -983,17 +1085,23 @@ export function ChatInterface({
     deliveryMode?: "steer" | "queue";
   }) => {
     const includeComposerInput = options?.includeComposerInput ?? true;
-    const composerHasInput = inputValue.trim().length > 0 || attachments.length > 0;
+    const composerHasInput =
+      inputValue.trim().length > 0 || attachments.length > 0;
     if (includeComposerInput && !composerHasInput) return;
 
     const requestedSessionId = options?.sessionIdHint ?? currentSessionId;
     if (!requestedSessionId) {
       const candidateModelId = newChatModelId.trim();
       if (!candidateModelId) {
-        setUiError("No model configured. Please select a model before sending.");
+        setUiError(
+          "No model configured. Please select a model before sending.",
+        );
         return;
       }
-      if (configuredModelIds.size > 0 && !configuredModelIds.has(candidateModelId)) {
+      if (
+        configuredModelIds.size > 0 &&
+        !configuredModelIds.has(candidateModelId)
+      ) {
         setUiError("Selected model is not available in the current profile.");
         return;
       }
@@ -1003,11 +1111,18 @@ export function ChatInterface({
         .sessions.find((session) => session.id === requestedSessionId);
       const targetModelId = targetSession?.model?.trim() ?? "";
       if (!targetModelId) {
-        setUiError("No model configured for this session. Please select a model.");
+        setUiError(
+          "No model configured for this session. Please select a model.",
+        );
         return;
       }
-      if (configuredModelIds.size > 0 && !configuredModelIds.has(targetModelId)) {
-        setUiError("Session model is no longer available. Please choose another model.");
+      if (
+        configuredModelIds.size > 0 &&
+        !configuredModelIds.has(targetModelId)
+      ) {
+        setUiError(
+          "Session model is no longer available. Please choose another model.",
+        );
         return;
       }
     }
@@ -1027,13 +1142,16 @@ export function ChatInterface({
       : runtimeSession;
     const targetGenerating =
       !!targetRuntime &&
-      (targetRuntime.state !== 'idle'
-        || targetRuntime.pendingImmediate != null
-        || (targetRuntime.queuedMessages?.length ?? 0) > 0);
+      (targetRuntime.state !== "idle" ||
+        targetRuntime.pendingImmediate != null ||
+        (targetRuntime.queuedMessages?.length ?? 0) > 0);
     const deliveryMode = options?.deliveryMode ?? "steer";
 
     if (targetGenerating) {
-      if (!includeComposerInput) { setIsSending(false); return; }
+      if (!includeComposerInput) {
+        setIsSending(false);
+        return;
+      }
       const runtimeSessionId = options?.sessionIdHint ?? currentSessionId;
       if (runtimeSessionId) {
         try {
@@ -1045,7 +1163,8 @@ export function ChatInterface({
           });
           applyRuntime(runtimeSessionId, runtime);
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
+          const message =
+            error instanceof Error ? error.message : String(error);
           setUiError(message);
         }
       }
@@ -1068,21 +1187,31 @@ export function ChatInterface({
       }
     }
 
-    if (!sessionId) { setIsSending(false); return; }
-
-    const resolvedSessionModelId = useStore
-      .getState()
-      .sessions.find((session) => session.id === sessionId)
-      ?.model
-      ?.trim() ?? "";
-    if (!resolvedSessionModelId) {
+    if (!sessionId) {
       setIsSending(false);
-      setUiError("No model configured for this session. Please select a model.");
       return;
     }
-    if (configuredModelIds.size > 0 && !configuredModelIds.has(resolvedSessionModelId)) {
+
+    const resolvedSessionModelId =
+      useStore
+        .getState()
+        .sessions.find((session) => session.id === sessionId)
+        ?.model?.trim() ?? "";
+    if (!resolvedSessionModelId) {
       setIsSending(false);
-      setUiError("Session model is no longer available. Please choose another model.");
+      setUiError(
+        "No model configured for this session. Please select a model.",
+      );
+      return;
+    }
+    if (
+      configuredModelIds.size > 0 &&
+      !configuredModelIds.has(resolvedSessionModelId)
+    ) {
+      setIsSending(false);
+      setUiError(
+        "Session model is no longer available. Please choose another model.",
+      );
       return;
     }
 
@@ -1092,12 +1221,20 @@ export function ChatInterface({
         ? [{ content, attachments: atts }]
         : [];
 
-    if (pendingBatch.length === 0) { setIsSending(false); return; }
+    if (pendingBatch.length === 0) {
+      setIsSending(false);
+      return;
+    }
 
     const baseMessages =
-      useStore.getState().sessions.find((session) => session.id === sessionId)?.messages ?? [];
-    const fallbackPrompt = pendingBatch.map((message) => message.content).join("\n\n");
-    const fallbackAttachments = pendingBatch.flatMap((message) => message.attachments);
+      useStore.getState().sessions.find((session) => session.id === sessionId)
+        ?.messages ?? [];
+    const fallbackPrompt = pendingBatch
+      .map((message) => message.content)
+      .join("\n\n");
+    const fallbackAttachments = pendingBatch.flatMap(
+      (message) => message.attachments,
+    );
 
     if (!options?.skipAppendUserMessages) {
       for (const queued of pendingBatch) {
@@ -1126,8 +1263,8 @@ export function ChatInterface({
     let shouldFallbackToSteer = false;
 
     const isActiveSessionStreamMessage = (message: string): boolean =>
-      message.includes("session is already active")
-      || message.includes("session is already streaming");
+      message.includes("session is already active") ||
+      message.includes("session is already streaming");
 
     const isActiveSessionStreamFailure = (error: unknown): boolean =>
       error instanceof ApiError
@@ -1150,7 +1287,9 @@ export function ChatInterface({
       return true;
     };
 
-    const cloneTimelineSegments = (segments: TimelineSegment[]): TimelineSegment[] =>
+    const cloneTimelineSegments = (
+      segments: TimelineSegment[],
+    ): TimelineSegment[] =>
       segments.map((segment) =>
         segment.kind === "bash"
           ? {
@@ -1162,10 +1301,12 @@ export function ChatInterface({
                 ...segment,
                 tool: { ...segment.tool },
               }
-          : { ...segment },
+            : { ...segment },
       );
 
-    const collectBashExecutions = (segments: TimelineSegment[]): BashExecution[] =>
+    const collectBashExecutions = (
+      segments: TimelineSegment[],
+    ): BashExecution[] =>
       segments.flatMap((segment) =>
         segment.kind === "bash"
           ? segment.commands.map((command) => ({ ...command }))
@@ -1174,13 +1315,20 @@ export function ChatInterface({
 
     const collectThinkingText = (segments: TimelineSegment[]): string =>
       segments
-        .filter((segment): segment is Extract<TimelineSegment, { kind: "thinking" }> => segment.kind === "thinking")
+        .filter(
+          (
+            segment,
+          ): segment is Extract<TimelineSegment, { kind: "thinking" }> =>
+            segment.kind === "thinking",
+        )
         .map((segment) => segment.content)
         .join("\n\n")
         .trim();
 
     const isAnyThinkingRunning = (segments: TimelineSegment[]): boolean =>
-      segments.some((segment) => segment.kind === "thinking" && segment.isRunning);
+      segments.some(
+        (segment) => segment.kind === "thinking" && segment.isRunning,
+      );
 
     const closeActiveThinkingSegment = () => {
       if (!activeThinkingSegmentId) {
@@ -1200,7 +1348,6 @@ export function ChatInterface({
     };
 
     try {
-
       const current = useStore
         .getState()
         .sessions.find((s) => s.id === sessionId);
@@ -1210,9 +1357,7 @@ export function ChatInterface({
       const retryBatch = isRetry
         ? collectRetryBatch(current.messages, assistantId)
         : [];
-      const streamingBatch = isRetry
-        ? retryBatch
-        : pendingBatch;
+      const streamingBatch = isRetry ? retryBatch : pendingBatch;
 
       if (streamingBatch.length === 0) return;
 
@@ -1276,8 +1421,11 @@ export function ChatInterface({
         if (!latest) return;
 
         lastTextFlushAt = now;
-        const snapshotTimelineSegments = cloneTimelineSegments(timelineSegments);
-        const snapshotBashExecutions = collectBashExecutions(snapshotTimelineSegments);
+        const snapshotTimelineSegments =
+          cloneTimelineSegments(timelineSegments);
+        const snapshotBashExecutions = collectBashExecutions(
+          snapshotTimelineSegments,
+        );
         const snapshotThinking = collectThinkingText(snapshotTimelineSegments);
         replaceSessionMessages(
           sessionId,
@@ -1322,7 +1470,8 @@ export function ChatInterface({
             ];
           } else {
             timelineSegments = timelineSegments.map((segment) =>
-              segment.kind === "thinking" && segment.id === activeThinkingSegmentId
+              segment.kind === "thinking" &&
+              segment.id === activeThinkingSegmentId
                 ? {
                     ...segment,
                     content: `${segment.content}${chunk}`,
@@ -1341,24 +1490,24 @@ export function ChatInterface({
             typeof tool.arguments === "string"
               ? tool.arguments
               : JSON.stringify(tool.arguments ?? {});
-          let script = '(bash)';
-          let mode: string | undefined;
+          let script = "(bash)";
+          let mode: BashExecution["mode"];
           try {
             const args =
-              typeof tool.arguments === 'string'
+              typeof tool.arguments === "string"
                 ? JSON.parse(tool.arguments)
                 : tool.arguments;
-            script = args?.script ?? args?.command ?? '(bash)';
-            mode = typeof args?.mode === 'string' ? args.mode : undefined;
+            script = args?.script ?? args?.command ?? "(bash)";
+            mode = isBashExecutionMode(args?.mode) ? args.mode : undefined;
           } catch (error) {
-            console.warn('Invalid tool arguments payload', error);
+            console.warn("Invalid tool arguments payload", error);
           }
-          if (typeof script !== 'string') {
+          if (typeof script !== "string") {
             script = String(script);
           }
 
           const browserPattern = /\b(pw|playwright(?:-cli)?)\b/i;
-          if (name.includes('playwright') || browserPattern.test(script)) {
+          if (name.includes("playwright") || browserPattern.test(script)) {
             setIsBrowserOpen(true);
           }
 
@@ -1368,8 +1517,8 @@ export function ChatInterface({
             const nextExec: BashExecution = {
               id: toolId,
               input: script,
-              status: 'running',
-              mode: mode ?? 'default',
+              status: "running",
+              mode: mode ?? "default",
               startedAt,
             };
 
@@ -1457,12 +1606,16 @@ export function ChatInterface({
                   ? {
                       ...command,
                       output,
-                      status: (failed ? "failed" : "done") as BashExecution["status"],
+                      status: (failed
+                        ? "failed"
+                        : "done") as BashExecution["status"],
                       endedAt,
                     }
                   : command,
               );
-              const runningLeft = nextCommands.some((command) => command.status === "running");
+              const runningLeft = nextCommands.some(
+                (command) => command.status === "running",
+              );
               return {
                 ...segment,
                 commands: nextCommands,
@@ -1522,7 +1675,9 @@ export function ChatInterface({
               ? cloneTimelineSegments(timelineSegments)
               : cloneTimelineSegments(assistant.timelineSegments ?? []);
           const finalThinking = collectThinkingText(finalTimelineSegments);
-          const finalBashExecutions = collectBashExecutions(finalTimelineSegments);
+          const finalBashExecutions = collectBashExecutions(
+            finalTimelineSegments,
+          );
           const isEmptyResponse =
             finalContent.trim().length === 0 &&
             finalThinking.trim().length === 0 &&
@@ -1560,7 +1715,8 @@ export function ChatInterface({
             .getState()
             .sessions.find((s) => s.id === sessionId);
           if (latest) {
-            const snapshotTimelineSegments = cloneTimelineSegments(timelineSegments);
+            const snapshotTimelineSegments =
+              cloneTimelineSegments(timelineSegments);
             replaceSessionMessages(
               sessionId,
               latest.messages.map((m) =>
@@ -1569,7 +1725,9 @@ export function ChatInterface({
                       ...m,
                       timelineSegments: snapshotTimelineSegments,
                       thinking: collectThinkingText(snapshotTimelineSegments),
-                      bashExecutions: collectBashExecutions(snapshotTimelineSegments),
+                      bashExecutions: collectBashExecutions(
+                        snapshotTimelineSegments,
+                      ),
                       isStreaming: false,
                       isThinking: false,
                       error: `LLM endpoint error: ${message}`,
@@ -1584,7 +1742,9 @@ export function ChatInterface({
       if (shouldFallbackToSteer) {
         const recovered = await fallbackToSteerQueue();
         if (!recovered) {
-          setUiError("session is already active; send this message via steer or queue instead");
+          setUiError(
+            "session is already active; send this message via steer or queue instead",
+          );
         }
       }
     } catch (error) {
@@ -1602,7 +1762,8 @@ export function ChatInterface({
           .getState()
           .sessions.find((s) => s.id === sessionId);
         if (latest) {
-          const snapshotTimelineSegments = cloneTimelineSegments(timelineSegments);
+          const snapshotTimelineSegments =
+            cloneTimelineSegments(timelineSegments);
           replaceSessionMessages(
             sessionId,
             latest.messages.map((m) =>
@@ -1611,7 +1772,9 @@ export function ChatInterface({
                     ...m,
                     timelineSegments: snapshotTimelineSegments,
                     thinking: collectThinkingText(snapshotTimelineSegments),
-                    bashExecutions: collectBashExecutions(snapshotTimelineSegments),
+                    bashExecutions: collectBashExecutions(
+                      snapshotTimelineSegments,
+                    ),
                     isStreaming: false,
                     isThinking: false,
                     error: errText,
@@ -1632,10 +1795,9 @@ export function ChatInterface({
         .getState()
         .sessions.find((s) => s.id === sessionId);
       if (latest) {
-        const terminalError =
-          !completedNormally
-            ? "LLM endpoint error: stream terminated before a final assistant response"
-            : undefined;
+        const terminalError = !completedNormally
+          ? "LLM endpoint error: stream terminated before a final assistant response"
+          : undefined;
         replaceSessionMessages(
           sessionId,
           latest.messages.map((m) =>
@@ -1708,8 +1870,12 @@ export function ChatInterface({
               (m.isStreaming || m.isThinking)
             ) {
               stopped = true;
-              const timelineSegments = settleTimelineSegments(m.timelineSegments, endedAt);
-              const { thinking, bashExecutions } = summarizeTimelineSegments(timelineSegments);
+              const timelineSegments = settleTimelineSegments(
+                m.timelineSegments,
+                endedAt,
+              );
+              const { thinking, bashExecutions } =
+                summarizeTimelineSegments(timelineSegments);
               return {
                 ...m,
                 timelineSegments,
@@ -1738,7 +1904,10 @@ export function ChatInterface({
     if (!pendingPermission || !currentSessionId) return;
     setIsPermissionSubmitting(true);
     try {
-      const runtime = await respondPermissionRequest(pendingPermission.id, approved);
+      const runtime = await respondPermissionRequest(
+        pendingPermission.id,
+        approved,
+      );
       applyRuntime(currentSessionId, runtime);
     } catch (error) {
       setUiError(
@@ -1755,7 +1924,10 @@ export function ChatInterface({
     if (!pendingWorkspace || !currentSessionId) return;
     setIsWorkspaceSubmitting(true);
     try {
-      const runtime = await respondWorkspaceRequest(pendingWorkspace.id, approved);
+      const runtime = await respondWorkspaceRequest(
+        pendingWorkspace.id,
+        approved,
+      );
       applyRuntime(currentSessionId, runtime);
     } catch (error) {
       setUiError(
@@ -1783,23 +1955,26 @@ export function ChatInterface({
     });
   };
 
-  const handleAskUserSubmit = useCallback(async (answersOverride?: AskUserAnswer[]) => {
-    if (!pendingAskUser || !currentSessionId) return;
-    setIsAskUserSubmitting(true);
-    setUiError(null);
-    try {
-      const runtime = await respondAskUserRequest(
-        pendingAskUser.request.id,
-        answersOverride ?? pendingAskUser.answers,
-      );
-      applyRuntime(currentSessionId, runtime);
-      setPendingAskUser(null);
-    } catch (error) {
-      setUiError(`ask_user submit failed: ${(error as Error).message}`);
-    } finally {
-      setIsAskUserSubmitting(false);
-    }
-  }, [applyRuntime, currentSessionId, pendingAskUser]);
+  const handleAskUserSubmit = useCallback(
+    async (answersOverride?: AskUserAnswer[]) => {
+      if (!pendingAskUser || !currentSessionId) return;
+      setIsAskUserSubmitting(true);
+      setUiError(null);
+      try {
+        const runtime = await respondAskUserRequest(
+          pendingAskUser.request.id,
+          answersOverride ?? pendingAskUser.answers,
+        );
+        applyRuntime(currentSessionId, runtime);
+        setPendingAskUser(null);
+      } catch (error) {
+        setUiError(`ask_user submit failed: ${(error as Error).message}`);
+      } finally {
+        setIsAskUserSubmitting(false);
+      }
+    },
+    [applyRuntime, currentSessionId, pendingAskUser],
+  );
 
   const permissionToneClass = pendingPermission
     ? pendingPermission.mode === "unsafe"
@@ -1886,7 +2061,8 @@ export function ChatInterface({
   const readFileAsDataUrl = async (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+      reader.onload = () =>
+        resolve(typeof reader.result === "string" ? reader.result : "");
       reader.onerror = () =>
         reject(
           new Error(
@@ -1959,8 +2135,11 @@ export function ChatInterface({
   const handlePaste = async (e: React.ClipboardEvent) => {
     const items = Array.from(e.clipboardData.items);
     const text = e.clipboardData.getData("text/plain");
-    const hasFileItem = items.some((item) => item.kind === "file" && item.getAsFile());
-    const shouldAttachLargeText = !hasFileItem && !!text && text.length >= LONG_TEXT_THRESHOLD;
+    const hasFileItem = items.some(
+      (item) => item.kind === "file" && item.getAsFile(),
+    );
+    const shouldAttachLargeText =
+      !hasFileItem && !!text && text.length >= LONG_TEXT_THRESHOLD;
 
     // Prevent default immediately, before async work, so filename/text is never inserted into composer.
     if (hasFileItem || shouldAttachLargeText) {
@@ -1977,7 +2156,8 @@ export function ChatInterface({
       const fileType = classifyFile(file);
       const att: Attachment = {
         id: crypto.randomUUID(),
-        name: file.name || (fileType === "image" ? "Pasted Image" : "Pasted File"),
+        name:
+          file.name || (fileType === "image" ? "Pasted Image" : "Pasted File"),
         type: fileType,
         url: URL.createObjectURL(file),
         uploadDataUrl: await readFileAsDataUrl(file),
@@ -2002,7 +2182,6 @@ export function ChatInterface({
     }
   };
 
-
   const currentModelId = isNewChat ? newChatModelId : currentSession.model;
   const currentReasoningEffort = isNewChat
     ? newChatReasoningEffort
@@ -2022,8 +2201,11 @@ export function ChatInterface({
       }
       const viewportWidth = window.innerWidth;
       const desktopSidebarWidth = isSidebarOpen ? 256 : 0;
-      const maxByViewport = Math.floor(viewportWidth * ARTIFACT_PANEL_MAX_VIEWPORT_RATIO);
-      const maxByChat = viewportWidth - desktopSidebarWidth - ARTIFACT_PANEL_MIN_CHAT_WIDTH;
+      const maxByViewport = Math.floor(
+        viewportWidth * ARTIFACT_PANEL_MAX_VIEWPORT_RATIO,
+      );
+      const maxByChat =
+        viewportWidth - desktopSidebarWidth - ARTIFACT_PANEL_MIN_CHAT_WIDTH;
       const maxWidth = Math.max(
         ARTIFACT_PANEL_MIN_WIDTH,
         Math.min(maxByViewport, maxByChat),
@@ -2123,39 +2305,44 @@ export function ChatInterface({
               variant="ghost"
               size="icon"
               onClick={onToggleSidebar}
-              className={isNewChat ? "text-muted-foreground hover:text-foreground" : "text-muted-foreground hover:text-foreground hidden md:flex"}
+              className={
+                isNewChat
+                  ? "text-muted-foreground hover:text-foreground"
+                  : "text-muted-foreground hover:text-foreground hidden md:flex"
+              }
               title={isSidebarOpen ? "Close sidebar" : "Open sidebar"}
             >
               <PanelLeft className="h-5 w-5" />
             </Button>
           </div>
           <div className="flex items-center gap-2 min-w-0">
-            {!shouldShowWelcome && (isEditingTitle ? (
-              <Input
-                ref={titleInputRef}
-                value={titleInput}
-                onChange={(e) => setTitleInput(e.target.value)}
-                onBlur={handleTitleSubmit}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleTitleSubmit();
-                  if (e.key === "Escape") {
-                    setTitleInput(currentSession.title);
-                    setIsEditingTitle(false);
-                  }
-                }}
-                className="h-auto py-0 w-[300px] text-sm font-medium text-foreground text-center bg-transparent border-none focus-visible:ring-0 px-0"
-              />
-            ) : (
-              <div
-                className="flex items-center gap-2 group cursor-pointer min-w-0"
-                onClick={() => setIsEditingTitle(true)}
-              >
-                <span className="text-sm font-medium text-foreground truncate max-w-[300px]">
-                  {currentSession.title}
-                </span>
-                <Pencil className="h-3 w-3 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-              </div>
-            ))}
+            {!shouldShowWelcome &&
+              (isEditingTitle ? (
+                <Input
+                  ref={titleInputRef}
+                  value={titleInput}
+                  onChange={(e) => setTitleInput(e.target.value)}
+                  onBlur={handleTitleSubmit}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleTitleSubmit();
+                    if (e.key === "Escape") {
+                      setTitleInput(currentSession.title);
+                      setIsEditingTitle(false);
+                    }
+                  }}
+                  className="h-auto py-0 w-[300px] text-sm font-medium text-foreground text-center bg-transparent border-none focus-visible:ring-0 px-0"
+                />
+              ) : (
+                <div
+                  className="flex items-center gap-2 group cursor-pointer min-w-0"
+                  onClick={() => setIsEditingTitle(true)}
+                >
+                  <span className="text-sm font-medium text-foreground truncate max-w-[300px]">
+                    {currentSession.title}
+                  </span>
+                  <Pencil className="h-3 w-3 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                </div>
+              ))}
           </div>
           <div className="flex-1 flex justify-end gap-1">
             {!shouldShowWelcome && (
@@ -2201,7 +2388,7 @@ export function ChatInterface({
           </div>
         </div>
 
-        {chatSurfaceState === 'backend-down' ? (
+        {chatSurfaceState === "backend-down" ? (
           <div className="flex-1 min-h-0 px-4 pt-12">
             <div className="mx-auto w-full max-w-3xl rounded-2xl border border-red-500/45 bg-background/80 p-6 text-center">
               <div className="mx-auto mb-4 flex w-fit items-center justify-center rounded-full bg-red-500/15 p-2.5">
@@ -2223,146 +2410,165 @@ export function ChatInterface({
               </Button>
             </div>
           </div>
-        ) : chatSurfaceState === 'container-preparing' ? (
-            <div className="flex-1 min-h-0 px-4 pt-12">
-              <div className="mx-auto w-full max-w-3xl rounded-2xl border border-border/50 bg-background/70 p-6 text-center">
-                {isContainerPrepareFailed ? (
-                  <div className="mx-auto mb-4 flex w-fit items-center justify-center rounded-full bg-red-500/15 p-2.5">
-                    <CircleX className="h-6 w-6 text-red-500" />
-                  </div>
-                ) : (
-                  <div className="mx-auto mb-4 flex w-fit items-center gap-2">
-                    <span className="h-2.5 w-2.5 rounded-full bg-primary/70 animate-bounce [animation-delay:-240ms]" />
-                    <span className="h-2.5 w-2.5 rounded-full bg-primary/60 animate-bounce [animation-delay:-120ms]" />
-                    <span className="h-2.5 w-2.5 rounded-full bg-primary/50 animate-bounce" />
-                  </div>
-                )}
-                <h2 className="text-lg font-semibold">
-                  {isContainerPrepareFailed
-                    ? "Container workspace unavailable"
-                    : "Preparing container workspace"}
-                </h2>
-                <p className="mt-2 text-sm text-muted-foreground">
-                  {isContainerPrepareFailed
-                    ? "Unable to open chat history right now. Fix the reported error and retry."
-                    : "This profile is not ready yet. New chat and chat history are temporarily unavailable."}
-                </p>
-                <div className="mt-4 rounded-lg bg-muted/50 px-3 py-2 text-left text-xs text-muted-foreground">
-                  {containerPrepareSummary}
+        ) : chatSurfaceState === "container-preparing" ? (
+          <div className="flex-1 min-h-0 px-4 pt-12">
+            <div className="mx-auto w-full max-w-3xl rounded-2xl border border-border/50 bg-background/70 p-6 text-center">
+              {isContainerPrepareFailed ? (
+                <div className="mx-auto mb-4 flex w-fit items-center justify-center rounded-full bg-red-500/15 p-2.5">
+                  <CircleX className="h-6 w-6 text-red-500" />
                 </div>
-                {containerPrepareStatus?.recentLogs && containerPrepareStatus.recentLogs.length > 0 && (
+              ) : (
+                <div className="mx-auto mb-4 flex w-fit items-center gap-2">
+                  <span className="h-2.5 w-2.5 rounded-full bg-primary/70 animate-bounce [animation-delay:-240ms]" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-primary/60 animate-bounce [animation-delay:-120ms]" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-primary/50 animate-bounce" />
+                </div>
+              )}
+              <h2 className="text-lg font-semibold">
+                {isContainerPrepareFailed
+                  ? "Container workspace unavailable"
+                  : "Preparing container workspace"}
+              </h2>
+              <p className="mt-2 text-sm text-muted-foreground">
+                {isContainerPrepareFailed
+                  ? "Unable to open chat history right now. Fix the reported error and retry."
+                  : "This profile is not ready yet. New chat and chat history are temporarily unavailable."}
+              </p>
+              <div className="mt-4 rounded-lg bg-muted/50 px-3 py-2 text-left text-xs text-muted-foreground">
+                {containerPrepareSummary}
+              </div>
+              {containerPrepareStatus?.recentLogs &&
+                containerPrepareStatus.recentLogs.length > 0 && (
                   <div className="mt-3 max-h-40 overflow-auto rounded-lg border border-border/50 bg-background/50 px-3 py-2 text-left font-mono text-[11px] text-muted-foreground">
-                    {containerPrepareStatus.recentLogs.map((line: string, index: number) => (
-                      <div key={`${index}-${line}`} className="truncate">
-                        {line}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {isContainerPrepareFailed && !profileSessionsLoading && (
-                  <div className="mt-4 flex items-center justify-center gap-2">
-                    {requiresManagedPodmanApproval && (
-                      <Button
-                        onClick={() => {
-                          const allowed = window.confirm(
-                            "Allow May to download and install managed Podman for container profiles?",
-                          );
-                          if (!allowed) {
-                            return;
-                          }
-                          void refreshProfileSessions({
-                            allowManagedPodmanDownload: true,
-                          });
-                        }}
-                      >
-                        Allow Podman Download
-                      </Button>
+                    {containerPrepareStatus.recentLogs.map(
+                      (line: string, index: number) => (
+                        <div key={`${index}-${line}`} className="truncate">
+                          {line}
+                        </div>
+                      ),
                     )}
-                    <Button
-                      variant="secondary"
-                      onClick={() => void refreshProfileSessions()}
-                    >
-                      Retry
-                    </Button>
                   </div>
                 )}
-              </div>
-            </div>
-          ) : chatSurfaceState === 'profile-loading' ? (
-            <div className="flex-1 min-h-0 px-4 pt-10">
-              <div className="mx-auto w-full max-w-3xl space-y-4">
-                <div className="h-4 w-40 rounded-full bg-muted/70 animate-pulse" />
-                <div className="space-y-3 rounded-2xl border border-border/50 bg-background/70 p-4">
-                  <div className="h-3 w-3/4 rounded-full bg-muted/60 animate-pulse" />
-                  <div className="h-3 w-5/6 rounded-full bg-muted/50 animate-pulse [animation-delay:120ms]" />
-                  <div className="h-3 w-2/3 rounded-full bg-muted/40 animate-pulse [animation-delay:240ms]" />
-                </div>
-                <div className="space-y-3 rounded-2xl border border-border/40 bg-background/60 p-4">
-                  <div className="h-3 w-2/3 rounded-full bg-muted/60 animate-pulse [animation-delay:160ms]" />
-                  <div className="h-3 w-3/4 rounded-full bg-muted/50 animate-pulse [animation-delay:280ms]" />
-                </div>
-              </div>
-            </div>
-          ) : chatSurfaceState === 'welcome' ? (
-            <div className="flex-1 min-h-0 flex flex-col items-center justify-center px-4 -mt-20">
-              <div className="text-center mb-8">
-                <h1 className="text-3xl font-semibold tracking-tight mb-2">
-                  What shall we think through?
-                </h1>
-                <p className="text-muted-foreground text-sm">
-                  Ask anything. I'm here to help you think, create, and explore.
-                </p>
-              </div>
-            </div>
-          ) : (
-            <div
-              ref={scrollContainerRef}
-              onScroll={handleScroll}
-              className="flex-1 min-h-0 overflow-y-auto"
-            >
-              <div
-                ref={contentRef}
-                className="max-w-3xl mx-auto px-4 space-y-6 pb-6 pt-4"
-              >
-                {messages.map((msg, index) => {
-                  const isLast = index === messages.length - 1;
-                  const retryFromUser = msg.role === "user" && isLast;
-                  const retryFromAssistant = msg.role === "assistant" && !!msg.error;
-
-                  return (
-                    <MessageItem
-                      key={msg.id}
-                      message={msg}
-                      sessionId={currentSessionId ?? undefined}
-                      canRetry={retryFromUser || retryFromAssistant}
-                      onOpenPreview={handleOpenPreview}
-                      onRetry={() => {
-                        const batch = retryFromUser
-                          ? [{ content: msg.content, attachments: msg.attachments ?? [] }]
-                          : collectRetryBatch(messages, msg.id);
-
-                        void handleSend({
-                          sessionIdHint: currentSessionId ?? undefined,
-                          includeComposerInput: false,
-                          retryAssistantId: retryFromAssistant ? msg.id : undefined,
-                          overrideBatch: batch,
-                          skipAppendUserMessages: true,
+              {isContainerPrepareFailed && !profileSessionsLoading && (
+                <div className="mt-4 flex items-center justify-center gap-2">
+                  {requiresManagedPodmanApproval && (
+                    <Button
+                      onClick={() => {
+                        const allowed = window.confirm(
+                          "Allow May to download and install managed Podman for container profiles?",
+                        );
+                        if (!allowed) {
+                          return;
+                        }
+                        void refreshProfileSessions({
+                          allowManagedPodmanDownload: true,
                         });
                       }}
-                    />
-                  );
-                })}
+                    >
+                      Allow Podman Download
+                    </Button>
+                  )}
+                  <Button
+                    variant="secondary"
+                    onClick={() => void refreshProfileSessions()}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : chatSurfaceState === "profile-loading" ? (
+          <div className="flex-1 min-h-0 px-4 pt-10">
+            <div className="mx-auto w-full max-w-3xl space-y-4">
+              <div className="h-4 w-40 rounded-full bg-muted/70 animate-pulse" />
+              <div className="space-y-3 rounded-2xl border border-border/50 bg-background/70 p-4">
+                <div className="h-3 w-3/4 rounded-full bg-muted/60 animate-pulse" />
+                <div className="h-3 w-5/6 rounded-full bg-muted/50 animate-pulse [animation-delay:120ms]" />
+                <div className="h-3 w-2/3 rounded-full bg-muted/40 animate-pulse [animation-delay:240ms]" />
+              </div>
+              <div className="space-y-3 rounded-2xl border border-border/40 bg-background/60 p-4">
+                <div className="h-3 w-2/3 rounded-full bg-muted/60 animate-pulse [animation-delay:160ms]" />
+                <div className="h-3 w-3/4 rounded-full bg-muted/50 animate-pulse [animation-delay:280ms]" />
               </div>
             </div>
-          )}
+          </div>
+        ) : chatSurfaceState === "welcome" ? (
+          <div className="flex-1 min-h-0 flex flex-col items-center justify-center px-4 -mt-20">
+            <div className="text-center mb-8">
+              <h1 className="text-3xl font-semibold tracking-tight mb-2">
+                What shall we think through?
+              </h1>
+              <p className="text-muted-foreground text-sm">
+                Ask anything. I'm here to help you think, create, and explore.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div
+            ref={scrollContainerRef}
+            onScroll={handleScroll}
+            className="flex-1 min-h-0 overflow-y-auto"
+          >
+            <div
+              ref={contentRef}
+              className="max-w-3xl mx-auto px-4 space-y-6 pb-6 pt-4"
+            >
+              {messages.map((msg, index) => {
+                const isLast = index === messages.length - 1;
+                const retryFromUser = msg.role === "user" && isLast;
+                const retryFromAssistant =
+                  msg.role === "assistant" && !!msg.error;
 
-          {todoProgress && todoProgress.items.length > 0 && hasPendingAssistantMessage && (
+                return (
+                  <MessageItem
+                    key={msg.id}
+                    message={msg}
+                    sessionId={currentSessionId ?? undefined}
+                    canRetry={retryFromUser || retryFromAssistant}
+                    onOpenPreview={handleOpenPreview}
+                    onRetry={() => {
+                      const batch = retryFromUser
+                        ? [
+                            {
+                              content: msg.content,
+                              attachments: msg.attachments ?? [],
+                            },
+                          ]
+                        : collectRetryBatch(messages, msg.id);
+
+                      void handleSend({
+                        sessionIdHint: currentSessionId ?? undefined,
+                        includeComposerInput: false,
+                        retryAssistantId: retryFromAssistant
+                          ? msg.id
+                          : undefined,
+                        overrideBatch: batch,
+                        skipAppendUserMessages: true,
+                      });
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {todoProgress &&
+          todoProgress.items.length > 0 &&
+          hasPendingAssistantMessage && (
             <div className="shrink-0 px-4 pb-2">
               <div className="max-w-3xl mx-auto">
                 <div className="rounded-lg border border-border/60 bg-card/80 px-3 py-2.5 text-sm">
                   <div className="flex items-center gap-2 mb-2">
                     <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-                      <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                      <svg
+                        className="h-3.5 w-3.5"
+                        viewBox="0 0 16 16"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.5"
+                      >
                         <rect x="2" y="2" width="12" height="12" rx="2" />
                         <path d="M5 8l2 2 4-4" />
                       </svg>
@@ -2374,17 +2580,30 @@ export function ChatInterface({
                     <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden">
                       <div
                         className="h-full rounded-full bg-primary/70 transition-all duration-300"
-                        style={{ width: `${todoProgress.total > 0 ? (todoProgress.completed / todoProgress.total) * 100 : 0}%` }}
+                        style={{
+                          width: `${todoProgress.total > 0 ? (todoProgress.completed / todoProgress.total) * 100 : 0}%`,
+                        }}
                       />
                     </div>
                   </div>
                   <ul className="space-y-0.5">
                     {todoProgress.items.map((item, i) => (
-                      <li key={i} className="flex items-start gap-1.5 text-xs leading-relaxed">
-                        <span className={`mt-0.5 shrink-0 ${item.checked ? 'text-primary' : 'text-muted-foreground/50'}`}>
-                          {item.checked ? '✓' : '○'}
+                      <li
+                        key={i}
+                        className="flex items-start gap-1.5 text-xs leading-relaxed"
+                      >
+                        <span
+                          className={`mt-0.5 shrink-0 ${item.checked ? "text-primary" : "text-muted-foreground/50"}`}
+                        >
+                          {item.checked ? "✓" : "○"}
                         </span>
-                        <span className={item.checked ? 'text-muted-foreground line-through' : 'text-foreground'}>
+                        <span
+                          className={
+                            item.checked
+                              ? "text-muted-foreground line-through"
+                              : "text-foreground"
+                          }
+                        >
                           {item.text}
                         </span>
                       </li>
@@ -2396,439 +2615,485 @@ export function ChatInterface({
           )}
 
         {showComposer && (
-        <div className="shrink-0 px-4 pb-2 pt-2 bg-transparent w-full z-20 pointer-events-none">
-          <div className="max-w-3xl mx-auto w-full pointer-events-auto">
-            {pendingPermission && (
-            <div className={`mb-3 rounded-lg border px-3 py-2 text-sm ${permissionToneClass}`}>
-              <div className="font-medium">Approval required ({pendingPermission.mode})</div>
-              <div className="mt-1 break-all">{pendingPermission.script}</div>
-              <div className="mt-2 flex gap-2">
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={isPermissionSubmitting}
-                  onClick={() => void handlePermissionDecision(true)}
+          <div className="shrink-0 px-4 pb-2 pt-2 bg-transparent w-full z-20 pointer-events-none">
+            <div className="max-w-3xl mx-auto w-full pointer-events-auto">
+              {pendingPermission && (
+                <div
+                  className={`mb-3 rounded-lg border px-3 py-2 text-sm ${permissionToneClass}`}
                 >
-                  Approve
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={isPermissionSubmitting}
-                  onClick={() => void handlePermissionDecision(false)}
-                >
-                  Deny
-                </Button>
-              </div>
-            </div>
-          )}
-            {pendingWorkspace && (
-            <div className={`mb-3 rounded-lg border px-3 py-2 text-sm ${workspaceToneClass}`}>
-              <div className="font-medium">Workspace access required</div>
-              <div className="mt-1 break-all font-mono text-xs">{pendingWorkspace.path}</div>
-              <div className="mt-2 text-muted-foreground">{pendingWorkspace.reason}</div>
-              <div className="mt-2 flex gap-2">
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={isWorkspaceSubmitting}
-                  onClick={() => void handleWorkspaceDecision(true)}
-                >
-                  Approve
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={isWorkspaceSubmitting}
-                  onClick={() => void handleWorkspaceDecision(false)}
-                >
-                  Deny
-                </Button>
-              </div>
-            </div>
-          )}
-            {pendingAskUser && (
-            <div className="mb-3 rounded-xl border-2 border-primary/40 bg-card px-4 py-3 shadow-xl">
-              <div className="flex items-center justify-between gap-3">
-                <div className="text-sm font-semibold text-foreground">Input required</div>
-                <div className="text-xs text-muted-foreground">
-                  {pendingAskUser.request.questions.length} question{pendingAskUser.request.questions.length > 1 ? "s" : ""}
+                  <div className="font-medium">
+                    Approval required ({pendingPermission.mode})
+                  </div>
+                  <div className="mt-1 break-all">
+                    {pendingPermission.script}
+                  </div>
+                  <div className="mt-2 flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={isPermissionSubmitting}
+                      onClick={() => void handlePermissionDecision(true)}
+                    >
+                      Approve
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={isPermissionSubmitting}
+                      onClick={() => void handlePermissionDecision(false)}
+                    >
+                      Deny
+                    </Button>
+                  </div>
                 </div>
-              </div>
-
-              <div className="mt-3 max-h-[36vh] overflow-y-auto space-y-3 pr-1">
-                {pendingAskUser.request.questions.map((question, idx) => {
-                  const answer = pendingAskUser.answers[idx]?.answer;
-                  const selected = Array.isArray(answer) ? answer : [];
-                  const custom = typeof answer === "string" ? answer : "";
-
-                  return (
-                    <div key={`${question.section}-${idx}`} className="rounded-lg border border-border bg-background p-3">
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="text-sm font-medium text-foreground leading-snug">{question.question}</div>
-                        {question.section ? (
-                          <span className="text-[10px] uppercase tracking-wide text-muted-foreground border border-border rounded-full px-2 py-0.5">
-                            {question.section}
-                          </span>
-                        ) : null}
-                      </div>
-
-                      {question.option.length > 0 && (
-                        <div className="mt-2 flex flex-col gap-2">
-                          {question.option.map((option) => {
-                            const active = selected.includes(option);
-                            return (
-                              <Button
-                                key={option}
-                                size="sm"
-                                variant={active ? "default" : "outline"}
-                                className="h-8 w-full justify-start"
-                                disabled={isAskUserSubmitting}
-                                onClick={() => {
-                                  if (question.multiSelect) {
-                                    const next = active
-                                      ? selected.filter((v) => v !== option)
-                                      : [...selected, option];
-                                    handleAskUserAnswerChange(idx, next.length > 0 ? next : null);
-                                  } else {
-                                    handleAskUserAnswerChange(idx, [option]);
-                                  }
-                                }}
-                              >
-                                {option}
-                              </Button>
-                            );
-                          })}
-                        </div>
-                      )}
-
-                      <Input
-                        value={custom}
-                        onChange={(e) => handleAskUserAnswerChange(idx, e.target.value)}
-                        placeholder="Custom answer (optional)"
-                        className="mt-2 h-9 bg-background"
-                        disabled={isAskUserSubmitting}
-                      />
+              )}
+              {pendingWorkspace && (
+                <div
+                  className={`mb-3 rounded-lg border px-3 py-2 text-sm ${workspaceToneClass}`}
+                >
+                  <div className="font-medium">Workspace access required</div>
+                  <div className="mt-1 break-all font-mono text-xs">
+                    {pendingWorkspace.path}
+                  </div>
+                  <div className="mt-2 text-muted-foreground">
+                    {pendingWorkspace.reason}
+                  </div>
+                  <div className="mt-2 flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={isWorkspaceSubmitting}
+                      onClick={() => void handleWorkspaceDecision(true)}
+                    >
+                      Approve
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={isWorkspaceSubmitting}
+                      onClick={() => void handleWorkspaceDecision(false)}
+                    >
+                      Deny
+                    </Button>
+                  </div>
+                </div>
+              )}
+              {pendingAskUser && (
+                <div className="mb-3 rounded-xl border-2 border-primary/40 bg-card px-4 py-3 shadow-xl">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-foreground">
+                      Input required
                     </div>
-                  );
-                })}
-              </div>
+                    <div className="text-xs text-muted-foreground">
+                      {pendingAskUser.request.questions.length} question
+                      {pendingAskUser.request.questions.length > 1 ? "s" : ""}
+                    </div>
+                  </div>
 
-              <div className="mt-3 flex items-center justify-end gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={isAskUserSubmitting}
-                  onClick={() => {
-                    if (!pendingAskUser) return;
-                    const skipped = pendingAskUser.request.questions.map((q) => ({
-                      section: q.section,
-                      answer: null,
-                    }));
-                    void handleAskUserSubmit(skipped);
-                  }}
-                >
-                  Skip all
-                </Button>
-                <Button
-                  size="sm"
-                  disabled={isAskUserSubmitting}
-                  onClick={() => void handleAskUserSubmit()}
-                >
-                  Submit
-                </Button>
-              </div>
-            </div>
-          )}
-            {uiError && (
-            <div className="mb-3 rounded-lg border border-destructive bg-destructive px-3 py-2 text-sm text-destructive-foreground">
-              {uiError}
-            </div>
-          )}
-            <div className="relative bg-background/60 backdrop-blur-xl rounded-2xl border border-border/50">
-            {attachments.length > 0 && (
-              <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
-                {attachments.map((att) => (
-                  <div key={att.id} className="relative group flex-shrink-0">
-                    <AttachmentPreview attachment={att}>
-                      {att.type === "image" ? (
-                        <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted">
-                          <img
-                            src={att.url}
-                            alt={att.name}
-                            className="h-full w-full object-cover"
+                  <div className="mt-3 max-h-[36vh] overflow-y-auto space-y-3 pr-1">
+                    {pendingAskUser.request.questions.map((question, idx) => {
+                      const answer = pendingAskUser.answers[idx]?.answer;
+                      const selected = Array.isArray(answer) ? answer : [];
+                      const custom = typeof answer === "string" ? answer : "";
+
+                      return (
+                        <div
+                          key={`${question.section}-${idx}`}
+                          className="rounded-lg border border-border bg-background p-3"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="text-sm font-medium text-foreground leading-snug">
+                              {question.question}
+                            </div>
+                            {question.section ? (
+                              <span className="text-[10px] uppercase tracking-wide text-muted-foreground border border-border rounded-full px-2 py-0.5">
+                                {question.section}
+                              </span>
+                            ) : null}
+                          </div>
+
+                          {question.option.length > 0 && (
+                            <div className="mt-2 flex flex-col gap-2">
+                              {question.option.map((option) => {
+                                const active = selected.includes(option);
+                                return (
+                                  <Button
+                                    key={option}
+                                    size="sm"
+                                    variant={active ? "default" : "outline"}
+                                    className="h-8 w-full justify-start"
+                                    disabled={isAskUserSubmitting}
+                                    onClick={() => {
+                                      if (question.multiSelect) {
+                                        const next = active
+                                          ? selected.filter((v) => v !== option)
+                                          : [...selected, option];
+                                        handleAskUserAnswerChange(
+                                          idx,
+                                          next.length > 0 ? next : null,
+                                        );
+                                      } else {
+                                        handleAskUserAnswerChange(idx, [
+                                          option,
+                                        ]);
+                                      }
+                                    }}
+                                  >
+                                    {option}
+                                  </Button>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          <Input
+                            value={custom}
+                            onChange={(e) =>
+                              handleAskUserAnswerChange(idx, e.target.value)
+                            }
+                            placeholder="Custom answer (optional)"
+                            className="mt-2 h-9 bg-background"
+                            disabled={isAskUserSubmitting}
                           />
                         </div>
-                      ) : att.type === "document" || att.type === "pdf" ? (
-                        <div className="h-20 w-44 border rounded-lg overflow-hidden bg-muted/50 p-2.5 flex flex-col gap-1">
-                          <div className="flex items-center gap-1.5">
-                            <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-                            <span className="text-[11px] font-medium truncate">
-                              {att.name}
-                            </span>
-                          </div>
-                          {att.textPreview ? (
-                            <p className="text-[10px] text-muted-foreground/70 leading-tight line-clamp-3 overflow-hidden">
-                              {att.textPreview}
-                            </p>
-                          ) : (
-                            <p className="text-[10px] text-muted-foreground/50 uppercase tracking-wide mt-auto">
-                              {att.type === "pdf" ? "PDF" : "DOCUMENT"}
-                            </p>
-                          )}
-                        </div>
-                      ) : (
-                        <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted flex items-center justify-center">
-                          <File className="h-8 w-8 text-muted-foreground" />
-                        </div>
-                      )}
-                    </AttachmentPreview>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setAttachments((prev) =>
-                          prev.filter((a) => a.id !== att.id),
+                      );
+                    })}
+                  </div>
+
+                  <div className="mt-3 flex items-center justify-end gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={isAskUserSubmitting}
+                      onClick={() => {
+                        if (!pendingAskUser) return;
+                        const skipped = pendingAskUser.request.questions.map(
+                          (q) => ({
+                            section: q.section,
+                            answer: null,
+                          }),
                         );
+                        void handleAskUserSubmit(skipped);
                       }}
-                      className="absolute -top-1 -right-1 bg-destructive text-destructive-foreground rounded-full p-0.5 shadow-sm opacity-0 group-hover:opacity-100 transition-opacity z-10"
                     >
-                      <X className="h-3 w-3" />
-                    </button>
+                      Skip all
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={isAskUserSubmitting}
+                      onClick={() => void handleAskUserSubmit()}
+                    >
+                      Submit
+                    </Button>
                   </div>
-                ))}
-              </div>
-            )}
-
-            {queuedMessages.length > 0 && (
-              <div className="px-3 pt-3 pb-2">
-                <div className="queued-shell rounded-[14px] border">
-                  <div className="queued-header flex items-center justify-between border-b px-4 py-3">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <span className="queued-header-icon inline-flex h-6 w-6 items-center justify-center rounded-md text-cyan-200">
-                        <Clock3 className="h-3.5 w-3.5" />
-                      </span>
-                      <div className="min-w-0">
-                        <div className="queued-header-title text-[10px] uppercase tracking-[0.14em] text-zinc-200/90">
-                          Queued messages
-                        </div>
-                        <div className="queued-header-subtitle truncate text-[11px] text-zinc-500">
-                          Run after current response
-                        </div>
-                      </div>
-                    </div>
-                    <div className="queued-count-pill text-[10px] tabular-nums text-zinc-300">
-                      {queuedMessages.length}
-                    </div>
-                  </div>
-                  <div className="queued-list space-y-2 p-2.5">
-                    {queuedMessages.map((msg, i) => (
+                </div>
+              )}
+              {uiError && (
+                <div className="mb-3 rounded-lg border border-destructive bg-destructive px-3 py-2 text-sm text-destructive-foreground">
+                  {uiError}
+                </div>
+              )}
+              <div className="relative bg-background/60 backdrop-blur-xl rounded-2xl border border-border/50">
+                {attachments.length > 0 && (
+                  <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
+                    {attachments.map((att) => (
                       <div
-                        key={`${currentSessionId ?? 'session'}-${i}`}
-                        className="queued-item group grid grid-cols-[auto,1fr,auto] items-start gap-3.5 rounded-xl px-3 py-3"
+                        key={att.id}
+                        className="relative group flex-shrink-0"
                       >
-                        <div className="queued-order mt-0.5 inline-flex h-6 min-w-6 items-center justify-center rounded-full text-[10px] font-semibold tabular-nums text-zinc-300">
-                          {i + 1}
-                        </div>
-                        <div className="min-w-0 flex-1 space-y-1">
-                          <div className="queued-message-content line-clamp-2 text-[12px] leading-snug text-zinc-100/95">
-                            {msg.content.trim().length > 0 ? msg.content : "Attachment-only message"}
-                          </div>
-                          <div className="queued-meta flex items-center gap-2 text-[10px]">
-                            <span className="inline-flex items-center gap-1">
-                              <Paperclip className="h-3 w-3" />
-                              {msg.attachments.length} attachment{msg.attachments.length > 1 ? "s" : ""}
-                            </span>
-                            <span className="queued-state-pill inline-flex items-center gap-1 rounded-full px-1.5 py-[1px] text-zinc-200">
-                              {msg.deliveryMode === "steer" ? "steer" : "queued"}
-                            </span>
-                          </div>
-                        </div>
-                        <div className="flex shrink-0 items-start gap-1.5 opacity-80 transition-opacity group-hover:opacity-100">
-                          <button
-                            type="button"
-                            onClick={() => steerQueuedMessage(i)}
-                            className="queued-steer h-6 rounded-md border px-2.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-zinc-200 transition-colors"
-                          >
-                            Steer
-                          </button>
-
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <button
-                                type="button"
-                                className="queued-more inline-flex h-6 w-6 items-center justify-center rounded-md border text-zinc-500 transition-colors hover:text-zinc-100"
-                                aria-label="More actions"
-                              >
-                                <MoreHorizontal className="h-4 w-4" />
-                              </button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" className="w-44">
-                              <DropdownMenuItem onClick={() => steerQueuedMessage(i)}>
-                                Steer to composer
-                              </DropdownMenuItem>
-                              <DropdownMenuItem
-                                className="text-destructive focus:text-destructive"
-                                onClick={() => removeQueuedMessage(i)}
-                              >
-                                Remove
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </div>
+                        <AttachmentPreview attachment={att}>
+                          {att.type === "image" ? (
+                            <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted">
+                              <img
+                                src={att.url}
+                                alt={att.name}
+                                className="h-full w-full object-cover"
+                              />
+                            </div>
+                          ) : att.type === "document" || att.type === "pdf" ? (
+                            <div className="h-20 w-44 border rounded-lg overflow-hidden bg-muted/50 p-2.5 flex flex-col gap-1">
+                              <div className="flex items-center gap-1.5">
+                                <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                                <span className="text-[11px] font-medium truncate">
+                                  {att.name}
+                                </span>
+                              </div>
+                              {att.textPreview ? (
+                                <p className="text-[10px] text-muted-foreground/70 leading-tight line-clamp-3 overflow-hidden">
+                                  {att.textPreview}
+                                </p>
+                              ) : (
+                                <p className="text-[10px] text-muted-foreground/50 uppercase tracking-wide mt-auto">
+                                  {att.type === "pdf" ? "PDF" : "DOCUMENT"}
+                                </p>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted flex items-center justify-center">
+                              <File className="h-8 w-8 text-muted-foreground" />
+                            </div>
+                          )}
+                        </AttachmentPreview>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setAttachments((prev) =>
+                              prev.filter((a) => a.id !== att.id),
+                            );
+                          }}
+                          className="absolute -top-1 -right-1 bg-destructive text-destructive-foreground rounded-full p-0.5 shadow-sm opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
                       </div>
                     ))}
                   </div>
+                )}
+
+                {queuedMessages.length > 0 && (
+                  <div className="px-3 pt-3 pb-2">
+                    <div className="queued-shell rounded-[14px] border">
+                      <div className="queued-header flex items-center justify-between border-b px-4 py-3">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="queued-header-icon inline-flex h-6 w-6 items-center justify-center rounded-md text-cyan-200">
+                            <Clock3 className="h-3.5 w-3.5" />
+                          </span>
+                          <div className="min-w-0">
+                            <div className="queued-header-title text-[10px] uppercase tracking-[0.14em] text-zinc-200/90">
+                              Queued messages
+                            </div>
+                            <div className="queued-header-subtitle truncate text-[11px] text-zinc-500">
+                              Run after current response
+                            </div>
+                          </div>
+                        </div>
+                        <div className="queued-count-pill text-[10px] tabular-nums text-zinc-300">
+                          {queuedMessages.length}
+                        </div>
+                      </div>
+                      <div className="queued-list space-y-2 p-2.5">
+                        {queuedMessages.map((msg, i) => (
+                          <div
+                            key={`${currentSessionId ?? "session"}-${i}`}
+                            className="queued-item group grid grid-cols-[auto,1fr,auto] items-start gap-3.5 rounded-xl px-3 py-3"
+                          >
+                            <div className="queued-order mt-0.5 inline-flex h-6 min-w-6 items-center justify-center rounded-full text-[10px] font-semibold tabular-nums text-zinc-300">
+                              {i + 1}
+                            </div>
+                            <div className="min-w-0 flex-1 space-y-1">
+                              <div className="queued-message-content line-clamp-2 text-[12px] leading-snug text-zinc-100/95">
+                                {msg.content.trim().length > 0
+                                  ? msg.content
+                                  : "Attachment-only message"}
+                              </div>
+                              <div className="queued-meta flex items-center gap-2 text-[10px]">
+                                <span className="inline-flex items-center gap-1">
+                                  <Paperclip className="h-3 w-3" />
+                                  {msg.attachments.length} attachment
+                                  {msg.attachments.length > 1 ? "s" : ""}
+                                </span>
+                                <span className="queued-state-pill inline-flex items-center gap-1 rounded-full px-1.5 py-[1px] text-zinc-200">
+                                  {msg.deliveryMode === "steer"
+                                    ? "steer"
+                                    : "queued"}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="flex shrink-0 items-start gap-1.5 opacity-80 transition-opacity group-hover:opacity-100">
+                              <button
+                                type="button"
+                                onClick={() => steerQueuedMessage(i)}
+                                className="queued-steer h-6 rounded-md border px-2.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-zinc-200 transition-colors"
+                              >
+                                Steer
+                              </button>
+
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <button
+                                    type="button"
+                                    className="queued-more inline-flex h-6 w-6 items-center justify-center rounded-md border text-zinc-500 transition-colors hover:text-zinc-100"
+                                    aria-label="More actions"
+                                  >
+                                    <MoreHorizontal className="h-4 w-4" />
+                                  </button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent
+                                  align="end"
+                                  className="w-44"
+                                >
+                                  <DropdownMenuItem
+                                    onClick={() => steerQueuedMessage(i)}
+                                  >
+                                    Steer to composer
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    className="text-destructive focus:text-destructive"
+                                    onClick={() => removeQueuedMessage(i)}
+                                  >
+                                    Remove
+                                  </DropdownMenuItem>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <Textarea
+                  ref={composerInputRef}
+                  value={inputValue}
+                  onChange={(e) => setInputValue(e.target.value)}
+                  onPaste={handlePaste}
+                  onKeyDown={(e) => {
+                    if (e.key === "Tab" && isGenerating) {
+                      e.preventDefault();
+                      if (!canSend) return;
+                      void handleSend({ deliveryMode: "queue" });
+                      return;
+                    }
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      if (!canSend) return;
+                      void handleSend({ deliveryMode: "steer" });
+                    }
+                  }}
+                  placeholder={composerPlaceholder}
+                  className="min-h-[60px] max-h-[200px] w-full resize-none border-0 shadow-none focus-visible:ring-0 bg-transparent py-4 px-3 text-base"
+                  rows={1}
+                  autoFocus={isNewChat}
+                />
+
+                <div className="flex items-center justify-between p-2 pl-3">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="file"
+                      multiple
+                      className="hidden"
+                      ref={fileInputRef}
+                      onChange={handleFileSelect}
+                    />
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 text-muted-foreground hover:text-foreground rounded-lg"
+                        >
+                          <Plus className="h-5 w-5" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="start" className="w-48">
+                        <DropdownMenuItem
+                          onClick={() => fileInputRef.current?.click()}
+                        >
+                          <File className="mr-2 h-4 w-4" />
+                          Upload File
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => fileInputRef.current?.click()}
+                        >
+                          <ImageIcon className="mr-2 h-4 w-4" />
+                          Upload Photo
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={handleScreenshot}>
+                          <Monitor className="mr-2 h-4 w-4" />
+                          Take Screenshot
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <ModelSelector
+                      currentModelId={currentModelId}
+                      currentReasoningEffort={currentReasoningEffort}
+                      onModelChange={(id) => {
+                        if (isNewChat) {
+                          setNewChatModelId(id);
+                          setIsModelUpdating(true);
+                          void setLastModel(id)
+                            .catch((error) => {
+                              setUiError(
+                                `Failed to update default model: ${
+                                  error instanceof Error
+                                    ? error.message
+                                    : String(error)
+                                }`,
+                              );
+                            })
+                            .finally(() => {
+                              setIsModelUpdating(false);
+                            });
+                          return;
+                        }
+                        if (!currentSessionId) {
+                          return;
+                        }
+                        setIsModelUpdating(true);
+                        void updateSessionModel(currentSessionId, id)
+                          .catch((error) => {
+                            setUiError(
+                              `Failed to update session model: ${
+                                error instanceof Error
+                                  ? error.message
+                                  : String(error)
+                              }`,
+                            );
+                          })
+                          .finally(() => {
+                            setIsModelUpdating(false);
+                          });
+                      }}
+                      onReasoningEffortChange={(e) => {
+                        if (isNewChat) {
+                          setNewChatReasoningEffort(e);
+                        } else {
+                          updateSessionReasoningEffort(currentSessionId, e);
+                        }
+                      }}
+                      disabled={isModelUpdating || isSending}
+                      isUpdating={isModelUpdating}
+                    />
+                    {showTokenUsage && (
+                      <ContextInspector
+                        currentSessionId={currentSessionId}
+                        promptTokens={latestStats?.promptTokens}
+                        contextUsedTokens={contextUsedTokens}
+                        contextWindow={contextWindow}
+                        contextUsagePercent={contextUsagePercent}
+                        contextUsageTitle={contextUsageTitle}
+                      />
+                    )}
+                    {showStopButton ? (
+                      <Button
+                        onClick={handleStop}
+                        size="icon"
+                        className="h-8 w-8 bg-destructive text-destructive-foreground rounded-lg hover:bg-destructive/90"
+                      >
+                        <Square className="h-3.5 w-3.5 fill-current" />
+                      </Button>
+                    ) : (
+                      <Button
+                        onClick={() => void handleSend()}
+                        disabled={!canSend}
+                        size="icon"
+                        className={
+                          canSend
+                            ? "h-8 w-8 bg-primary text-primary-foreground rounded-lg"
+                            : "h-8 w-8 bg-muted text-muted-foreground rounded-lg"
+                        }
+                      >
+                        <Send className="h-4 w-4" />
+                      </Button>
+                    )}
+                  </div>
                 </div>
               </div>
-            )}
-
-            <Textarea
-              ref={composerInputRef}
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              onPaste={handlePaste}
-              onKeyDown={(e) => {
-                if (e.key === "Tab" && isGenerating) {
-                  e.preventDefault();
-                  if (!canSend) return;
-                  void handleSend({ deliveryMode: "queue" });
-                  return;
-                }
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  if (!canSend) return;
-                  void handleSend({ deliveryMode: "steer" });
-                }
-              }}
-              placeholder={composerPlaceholder}
-              className="min-h-[60px] max-h-[200px] w-full resize-none border-0 shadow-none focus-visible:ring-0 bg-transparent py-4 px-3 text-base"
-              rows={1}
-              autoFocus={isNewChat}
-            />
-
-            <div className="flex items-center justify-between p-2 pl-3">
-              <div className="flex items-center gap-2">
-                <input
-                  type="file"
-                  multiple
-                  className="hidden"
-                  ref={fileInputRef}
-                  onChange={handleFileSelect}
-                />
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-8 w-8 text-muted-foreground hover:text-foreground rounded-lg"
-                    >
-                      <Plus className="h-5 w-5" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" className="w-48">
-                    <DropdownMenuItem
-                      onClick={() => fileInputRef.current?.click()}
-                    >
-                      <File className="mr-2 h-4 w-4" />
-                      Upload File
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onClick={() => fileInputRef.current?.click()}
-                    >
-                      <ImageIcon className="mr-2 h-4 w-4" />
-                      Upload Photo
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={handleScreenshot}>
-                      <Monitor className="mr-2 h-4 w-4" />
-                      Take Screenshot
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-              <div className="flex items-center gap-2">
-                <ModelSelector
-                  currentModelId={currentModelId}
-                  currentReasoningEffort={currentReasoningEffort}
-                  onModelChange={(id) => {
-                    if (isNewChat) {
-                      setNewChatModelId(id);
-                      setIsModelUpdating(true);
-                      void setLastModel(id)
-                        .catch((error) => {
-                          setUiError(
-                            `Failed to update default model: ${
-                              error instanceof Error ? error.message : String(error)
-                            }`,
-                          );
-                        })
-                        .finally(() => {
-                          setIsModelUpdating(false);
-                        });
-                      return;
-                    }
-                    if (!currentSessionId) {
-                      return;
-                    }
-                    setIsModelUpdating(true);
-                    void updateSessionModel(currentSessionId, id)
-                      .catch((error) => {
-                        setUiError(
-                          `Failed to update session model: ${
-                            error instanceof Error ? error.message : String(error)
-                          }`,
-                        );
-                      })
-                      .finally(() => {
-                        setIsModelUpdating(false);
-                      });
-                  }}
-                  onReasoningEffortChange={(e) => {
-                    if (isNewChat) {
-                      setNewChatReasoningEffort(e);
-                    } else {
-                      updateSessionReasoningEffort(currentSessionId, e);
-                    }
-                  }}
-                  disabled={isModelUpdating || isSending}
-                  isUpdating={isModelUpdating}
-                />
-                {showTokenUsage && (
-                  <ContextInspector
-                    currentSessionId={currentSessionId}
-                    promptTokens={latestStats?.promptTokens}
-                    contextUsedTokens={contextUsedTokens}
-                    contextWindow={contextWindow}
-                    contextUsagePercent={contextUsagePercent}
-                    contextUsageTitle={contextUsageTitle}
-                  />
-                )}
-                {showStopButton ? (
-                  <Button
-                    onClick={handleStop}
-                    size="icon"
-                    className="h-8 w-8 bg-destructive text-destructive-foreground rounded-lg hover:bg-destructive/90"
-                  >
-                    <Square className="h-3.5 w-3.5 fill-current" />
-                  </Button>
-                ) : (
-                  <Button
-                    onClick={() => void handleSend()}
-                    disabled={!canSend}
-                    size="icon"
-                    className={
-                      canSend
-                        ? "h-8 w-8 bg-primary text-primary-foreground rounded-lg"
-                        : "h-8 w-8 bg-muted text-muted-foreground rounded-lg"
-                    }
-                  >
-                    <Send className="h-4 w-4" />
-                  </Button>
-                )}
-              </div>
-            </div>
             </div>
           </div>
-        </div>
         )}
       </div>
       <AnimatePresence initial={false} mode="wait">
