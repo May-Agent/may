@@ -125,6 +125,14 @@ export interface NotificationCallbackPayload {
   callbackMessage?: string | null;
 }
 
+export type TaskTriggerStatus = 'triggered';
+
+export interface TaskTriggerResponse {
+  ok: boolean;
+  status: TaskTriggerStatus;
+  triggered: number;
+}
+
 export interface UiEventsSubscription {
   sessionId?: string;
   profileId?: string;
@@ -1907,9 +1915,12 @@ export async function approveTask(id: string): Promise<void> {
 }
 
 export async function runTask(id: string): Promise<void> {
-  await request<{ ok: boolean }>(`/api/tasks/${encodeURIComponent(id)}/run`, {
-    method: 'POST',
-  });
+  await request<TaskTriggerResponse>(
+    `/api/tasks/${encodeURIComponent(id)}/run`,
+    {
+      method: 'POST',
+    },
+  );
 }
 
 // ── Web Push Notification API ───────────────────────────
