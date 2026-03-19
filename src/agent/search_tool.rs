@@ -22,6 +22,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
 
+use crate::agent::command_words::split_shell_words;
 use crate::agent::search_match::push_unique;
 
 const TABLE_NAME: &str = "file_chunks";
@@ -215,24 +216,30 @@ pub(crate) fn apply_command_form(args: &mut SearchArgs, command: &str) -> anyhow
             "search command must include an action or query"
         ));
     }
-    if let Some(rest) = body.strip_prefix("index ").map(str::trim) {
-        if rest.is_empty() {
-            return Err(anyhow::anyhow!("search index requires a path"));
+
+    let tokens = split_shell_words(body, "search")?;
+    match tokens.as_slice() {
+        [action, path] if action == "index" => {
+            args.action = SearchAction::Index;
+            args.path = Some(path.clone());
         }
-        args.action = SearchAction::Index;
-        args.path = Some(rest.to_string());
-        return Ok(());
-    }
-    if let Some(rest) = body.strip_prefix("query ").map(str::trim) {
-        if rest.is_empty() {
-            return Err(anyhow::anyhow!("search query requires a prompt"));
+        [action, ..] if action == "index" => {
+            return Err(anyhow::anyhow!(
+                "search index accepts exactly one path argument"
+            ));
         }
-        args.action = SearchAction::Query;
-        args.query = Some(rest.to_string());
-        return Ok(());
+        [action, prompt_tokens @ ..] if action == "query" => {
+            if prompt_tokens.is_empty() {
+                return Err(anyhow::anyhow!("search query requires a prompt"));
+            }
+            args.action = SearchAction::Query;
+            args.query = Some(prompt_tokens.join(" "));
+        }
+        _ => {
+            args.action = SearchAction::Query;
+            args.query = Some(tokens.join(" "));
+        }
     }
-    args.action = SearchAction::Query;
-    args.query = Some(body.to_string());
     Ok(())
 }
 

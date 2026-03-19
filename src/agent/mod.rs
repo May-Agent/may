@@ -1,5 +1,6 @@
 //! May agent implementation.
 
+mod command_words;
 mod may;
 pub(crate) mod notify_tool;
 pub(crate) mod register_tool;

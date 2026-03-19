@@ -19,6 +19,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
 
+use crate::agent::command_words::split_shell_words;
 use crate::agent::search_match::{extend_unique, push_unique};
 use crate::db::ChatDb;
 
@@ -503,22 +504,22 @@ fn apply_command_form(
         ));
     }
 
-    let mut tokens = body.split_whitespace();
-    if let (Some(session_id), Some(keyword)) = (tokens.next(), tokens.next()) {
+    let tokens = split_shell_words(body, command_name)?;
+    if let [session_id, keyword, prompt_tokens @ ..] = tokens.as_slice() {
         if keyword == "search" {
-            let prompt = tokens.collect::<Vec<_>>().join(" ");
+            let prompt = prompt_tokens.join(" ");
             if prompt.is_empty() {
                 return Err(anyhow::anyhow!(
                     "invalid session command: missing prompt after 'search'"
                 ));
             }
-            args.session_id = Some(session_id.to_string());
+            args.session_id = Some(session_id.clone());
             args.query = prompt;
             return Ok(());
         }
     }
 
-    args.query = body.to_string();
+    args.query = tokens.join(" ");
     Ok(())
 }
 
@@ -1213,6 +1214,32 @@ mod tests {
         let mut args = base_args();
         apply_command_form(&mut args, "session recall onboarding decision", "session")
             .expect("global command form should parse");
+        assert_eq!(args.session_id, None);
+        assert_eq!(args.query, "recall onboarding decision");
+    }
+
+    #[test]
+    fn parses_quoted_scoped_session_command_form() {
+        let mut args = base_args();
+        apply_command_form(
+            &mut args,
+            "session abc123 search \"investigate spaced failures\"",
+            "session",
+        )
+        .expect("quoted scoped command form should parse");
+        assert_eq!(args.session_id.as_deref(), Some("abc123"));
+        assert_eq!(args.query, "investigate spaced failures");
+    }
+
+    #[test]
+    fn parses_quoted_global_session_command_form() {
+        let mut args = base_args();
+        apply_command_form(
+            &mut args,
+            "session \"recall onboarding decision\"",
+            "session",
+        )
+        .expect("quoted global command form should parse");
         assert_eq!(args.session_id, None);
         assert_eq!(args.query, "recall onboarding decision");
     }
