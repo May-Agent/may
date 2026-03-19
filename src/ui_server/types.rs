@@ -147,9 +147,15 @@ pub(crate) struct BrowserTakeoverResponse {
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskTriggerStatus {
+    Triggered,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct TaskTriggerResponse {
     pub(crate) ok: bool,
-    pub(crate) status: &'static str,
+    pub(crate) status: TaskTriggerStatus,
     pub(crate) triggered: usize,
 }
 

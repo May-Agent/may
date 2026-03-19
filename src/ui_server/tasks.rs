@@ -482,7 +482,7 @@ pub(super) async fn run_task(
 
     Ok(Json(super::types::TaskTriggerResponse {
         ok: true,
-        status: "triggered",
+        status: super::types::TaskTriggerStatus::Triggered,
         triggered: 1,
     }))
 }
@@ -504,7 +504,7 @@ pub(super) async fn invoke_webhook_task(
 
     Ok(Json(super::types::TaskTriggerResponse {
         ok: true,
-        status: "triggered",
+        status: super::types::TaskTriggerStatus::Triggered,
         triggered,
     }))
 }
