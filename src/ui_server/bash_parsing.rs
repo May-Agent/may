@@ -1,10 +1,21 @@
 //! Bash tool event parsing for streaming UI updates.
 
 use super::types::{
-    ApiBashExecution, BASH_TOOL_NAME, BashExecutionStatus, BashStateSnapshot, ToolEventRecord,
+    ApiBashExecution, BASH_TOOL_NAME, BashCommandMode, BashExecutionStatus, BashStateSnapshot,
+    ToolEventRecord,
 };
 
-pub(super) fn parse_bash_start(arguments: &str) -> (String, Option<String>) {
+fn parse_bash_mode(raw: &str) -> BashCommandMode {
+    match raw {
+        "default" => BashCommandMode::Default,
+        "sandboxed" => BashCommandMode::Sandboxed,
+        "unsafe" => BashCommandMode::Unsafe,
+        "ssh" => BashCommandMode::Ssh,
+        other => panic!("invalid bash command mode: {other}"),
+    }
+}
+
+pub(super) fn parse_bash_start(arguments: &str) -> (String, Option<BashCommandMode>) {
     let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok();
     let script = parsed
         .as_ref()
@@ -16,7 +27,7 @@ pub(super) fn parse_bash_start(arguments: &str) -> (String, Option<String>) {
         .as_ref()
         .and_then(|v| v.get("mode"))
         .and_then(|v| v.as_str())
-        .map(ToString::to_string);
+        .map(parse_bash_mode);
     (script, mode)
 }
 
@@ -68,7 +79,7 @@ pub(super) fn update_bash_snapshot_from_tool_event(
                 return;
             }
             let (script, mode) = parse_bash_start(arguments);
-            let mode = mode.unwrap_or_else(|| "default".to_string());
+            let mode = mode.unwrap_or(BashCommandMode::Default);
             snapshot.running_by_call_id.insert(
                 id.clone(),
                 ApiBashExecution {
@@ -92,7 +103,7 @@ pub(super) fn update_bash_snapshot_from_tool_event(
                     input: "(bash)".to_string(),
                     output: None,
                     status: BashExecutionStatus::Done,
-                    mode: "default".to_string(),
+                    mode: BashCommandMode::Default,
                 });
 
             let output = parse_bash_end_output_from_result(result);

@@ -17,7 +17,7 @@ export interface BashExecution {
   input: string;
   output?: string;
   status: 'running' | 'done' | 'failed';
-  mode?: 'default' | 'unsafe' | 'ssh' | string;
+  mode?: 'default' | 'sandboxed' | 'unsafe' | 'ssh';
   startedAt?: number;
   endedAt?: number;
 }
@@ -225,7 +225,7 @@ export interface SessionRuntimeSummaryPayload {
 }
 
 export type PinnedItem =
-  | { type: 'session' } & SessionSummary
+  | ({ type: 'session' } & SessionSummary)
   | {
       type: 'folder';
       id: string;

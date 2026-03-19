@@ -494,6 +494,15 @@ pub(crate) enum BashExecutionStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum BashCommandMode {
+    Default,
+    Sandboxed,
+    Unsafe,
+    Ssh,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ApiBashExecution {
@@ -502,14 +511,12 @@ pub(crate) struct ApiBashExecution {
     #[serde(default)]
     pub(crate) output: Option<String>,
     pub(crate) status: BashExecutionStatus,
-    pub(crate) mode: String,
+    pub(crate) mode: BashCommandMode,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BashStateSnapshot {
-    #[serde(default)]
-    pub(crate) shell_mode_by_id: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub(crate) executions: Vec<ApiBashExecution>,
     #[serde(default)]
