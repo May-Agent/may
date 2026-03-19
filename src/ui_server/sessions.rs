@@ -23,6 +23,45 @@ use super::types::{
     UpdateSessionRequest,
 };
 
+fn session_not_found_error(session_id: &str) -> SkyError {
+    let mut message = String::from("Session ");
+    message.push_str(session_id);
+    message.push_str(" not found");
+    SkyError::msg(message).set_status(StatusCode::NOT_FOUND)
+}
+
+fn context_debug_not_found_error(session_id: &str) -> SkyError {
+    let mut message = String::from("No context debug snapshot for session ");
+    message.push_str(session_id);
+    SkyError::msg(message).set_status(StatusCode::NOT_FOUND)
+}
+
+fn resolve_session_model(
+    state: &UiServerState,
+    session_id: &str,
+    model: Option<String>,
+) -> Result<String, skyzen::Error> {
+    let config = state.config_snapshot();
+    resolve_default_model(&config, model).ok_or_else(|| {
+        let mut message = String::from("no model resolved for session ");
+        message.push_str(session_id);
+        internal_error(message)
+    })
+}
+
+fn parse_json_field<T>(raw: &str, label: &str) -> Result<T, skyzen::Error>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_str(raw).map_err(|error| {
+        let mut message = String::from("invalid ");
+        message.push_str(label);
+        message.push_str(": ");
+        message.push_str(error.to_string().as_str());
+        internal_error(message)
+    })
+}
+
 pub(super) async fn list_sessions(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<ApiSession>>> {
@@ -32,8 +71,11 @@ pub(super) async fn list_sessions(
     let config = state.config_snapshot();
     let mut sessions = Vec::with_capacity(summaries.len());
     for s in summaries {
-        let model = resolve_default_model(&config, s.model.clone())
-            .ok_or_else(|| internal_error(format!("no model resolved for session {}", s.id)))?;
+        let model = resolve_default_model(&config, s.model.clone()).ok_or_else(|| {
+            let mut message = String::from("no model resolved for session ");
+            message.push_str(s.id.as_str());
+            internal_error(message)
+        })?;
         sessions.push(ApiSession::from_summary(s, model, Vec::new()));
     }
 
@@ -52,9 +94,7 @@ pub(super) async fn get_session(
         .get_session(&id)
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| {
-            SkyError::msg(format!("Session {id} not found")).set_status(StatusCode::NOT_FOUND)
-        })?;
+        .ok_or_else(|| session_not_found_error(&id))?;
 
     let mut summary = crate::session::SessionSummary::from_db_model(db_session);
     summary.runtime = db
@@ -63,9 +103,7 @@ pub(super) async fn get_session(
         .map_err(internal_error)?
         .unwrap_or_default();
 
-    let config = state.config_snapshot();
-    let model = resolve_default_model(&config, summary.model.clone())
-        .ok_or_else(|| internal_error(format!("no model resolved for session {id}")))?;
+    let model = resolve_session_model(&state, &id, summary.model.clone())?;
 
     let db_messages = db.get_messages(&id).await.map_err(internal_error)?;
     let messages = map_db_messages(&db_messages);
@@ -84,16 +122,12 @@ pub(super) async fn get_session_context_debug(
         .get_context_debug_snapshot(&id)
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| {
-            SkyError::msg(format!("No context debug snapshot for session {id}"))
-                .set_status(StatusCode::NOT_FOUND)
-        })?;
+        .ok_or_else(|| context_debug_not_found_error(&id))?;
 
-    let prompt_attachments: Vec<String> = serde_json::from_str(&row.prompt_attachments_json)
-        .map_err(|e| internal_error(format!("invalid prompt_attachments_json: {e}")))?;
+    let prompt_attachments: Vec<String> =
+        parse_json_field(&row.prompt_attachments_json, "prompt_attachments_json")?;
     let assembled_messages: Vec<ContextDebugMessage> =
-        serde_json::from_str(&row.assembled_messages_json)
-            .map_err(|e| internal_error(format!("invalid assembled_messages_json: {e}")))?;
+        parse_json_field(&row.assembled_messages_json, "assembled_messages_json")?;
     let window_snapshot = db
         .get_session_context_snapshot(&id)
         .await
@@ -167,17 +201,15 @@ fn build_window_snapshot(
     let metadata_json = snapshot
         .metadata_json
         .ok_or_else(|| internal_error("session context snapshot is missing metadata_json"))?;
-    let stored: crate::session::StoredContextWindowMetadata = serde_json::from_str(&metadata_json)
-        .map_err(|e| internal_error(format!("invalid session context metadata_json: {e}")))?;
+    let stored: crate::session::StoredContextWindowMetadata =
+        parse_json_field(&metadata_json, "session context metadata_json")?;
     let assembled_messages_json = snapshot.assembled_messages_json.ok_or_else(|| {
         internal_error("session context snapshot is missing assembled_messages_json")
     })?;
-    let assembled_messages: Vec<LlmMessage> = serde_json::from_str(&assembled_messages_json)
-        .map_err(|e| {
-            internal_error(format!(
-                "invalid session context assembled_messages_json: {e}"
-            ))
-        })?;
+    let assembled_messages: Vec<LlmMessage> = parse_json_field(
+        &assembled_messages_json,
+        "session context assembled_messages_json",
+    )?;
 
     Ok(SessionContextWindowSnapshotResponse {
         phase: stored.phase,
@@ -282,9 +314,7 @@ pub(super) async fn update_session(
         .get_session(&id)
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| {
-            SkyError::msg(format!("Session {id} not found")).set_status(StatusCode::NOT_FOUND)
-        })?;
+        .ok_or_else(|| session_not_found_error(&id))?;
 
     let mut model_to_persist: Option<String> = None;
     let requested_title = req.title.clone();
@@ -320,12 +350,7 @@ pub(super) async fn update_session(
             .map_err(internal_error)?;
     }
 
-    let model = {
-        let cfg = state.config_snapshot();
-        resolve_default_model(&cfg, next_model.clone()).ok_or_else(|| {
-            internal_error(format!("no model resolved for session {}", session.id))
-        })?
-    };
+    let model = resolve_session_model(&state, session.id.as_str(), next_model.clone())?;
     let runtime = state
         .runtime_service
         .get(&id)
