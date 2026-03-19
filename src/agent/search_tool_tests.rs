@@ -38,6 +38,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_quoted_index_command_form() {
+        let mut args = base_args();
+        apply_command_form(&mut args, "search index \"./docs with spaces\"")
+            .expect("quoted index command should parse");
+        assert_eq!(args.action, SearchAction::Index);
+        assert_eq!(args.path.as_deref(), Some("./docs with spaces"));
+    }
+
+    #[test]
+    fn parses_quoted_query_command_form() {
+        let mut args = base_args();
+        apply_command_form(&mut args, "search query \"concurrency bug\"")
+            .expect("quoted query command should parse");
+        assert_eq!(args.action, SearchAction::Query);
+        assert_eq!(args.query.as_deref(), Some("concurrency bug"));
+    }
+
+    #[test]
     fn chunks_long_text() {
         let content = "a".repeat(6000);
         let chunks = chunk_text(content.as_str());
