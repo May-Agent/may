@@ -57,7 +57,7 @@ pub enum ChatDbError {
 pub struct CreateProfileParams<'a> {
     pub id: &'a str,
     pub name: &'a str,
-    pub environment: &'a str,
+    pub environment: ProfileEnvironmentKind,
     pub container_image: Option<&'a str>,
     pub slug: Option<&'a str>,
     pub icon: Option<&'a str>,
@@ -70,7 +70,7 @@ pub struct CreateProfileParams<'a> {
 pub struct UpdateProfileParams<'a> {
     pub name: Option<&'a str>,
     pub icon: Option<Option<&'a str>>,
-    pub environment: Option<&'a str>,
+    pub environment: Option<ProfileEnvironmentKind>,
     pub container_image: Option<Option<&'a str>>,
     pub container_id: Option<Option<&'a str>>,
     pub sort_order: Option<i32>,
@@ -242,11 +242,29 @@ struct DefaultProfile<'a> {
     location_aware: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProfileEnvironmentKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileEnvironmentKind {
     Local,
     Container,
     Remote,
+}
+
+impl ProfileEnvironmentKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Container => "container",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+impl std::fmt::Display for ProfileEnvironmentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 fn parse_profile_environment(value: &str) -> Result<ProfileEnvironmentKind, ChatDbError> {
@@ -799,7 +817,7 @@ impl ChatDb {
             session_pending_permissions::ActiveModel {
                 request_id: Set(request.id.clone()),
                 session_id: Set(session_id.to_string()),
-                mode: Set(request.request.mode.clone()),
+                mode: Set(request.request.mode.to_string()),
                 script: Set(request.request.script.clone()),
                 created_at: Set(summary
                     .updated_at
@@ -1209,7 +1227,7 @@ impl ChatDb {
     pub async fn session_has_approved_permission_mode(
         &self,
         session_id: &str,
-        mode: &str,
+        mode: PermissionHistoryMode,
     ) -> Result<bool, ChatDbError> {
         let responded_ids = self
             .get_messages_by_role(session_id, MessageRole::PermissionResponse.as_str())
@@ -2176,7 +2194,6 @@ impl ChatDb {
         &self,
         params: CreateProfileParams<'_>,
     ) -> Result<profiles::Model, ChatDbError> {
-        let environment = parse_profile_environment(params.environment)?;
         let now = jiff::Timestamp::now().to_string();
         let max_order = self.max_profile_sort_order().await?;
         let active = profiles::ActiveModel {
@@ -2184,8 +2201,8 @@ impl ChatDb {
             slug: Set(params.slug.map(String::from)),
             name: Set(params.name.to_string()),
             icon: Set(params.icon.map(String::from)),
-            environment: Set(params.environment.to_string()),
-            container_image: Set(match environment {
+            environment: Set(params.environment.as_str().to_string()),
+            container_image: Set(match params.environment {
                 ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote => None,
                 ProfileEnvironmentKind::Container => params.container_image.map(String::from),
             }),
@@ -2223,10 +2240,7 @@ impl ChatDb {
         id: &str,
         params: UpdateProfileParams<'_>,
     ) -> Result<(), ChatDbError> {
-        let next_environment = params
-            .environment
-            .map(parse_profile_environment)
-            .transpose()?;
+        let next_environment = params.environment;
         let now = jiff::Timestamp::now().to_string();
         let mut active = profiles::ActiveModel {
             id: Set(id.to_string()),
@@ -2240,7 +2254,7 @@ impl ChatDb {
             active.icon = Set(ic.map(String::from));
         }
         if let Some(environment) = params.environment {
-            active.environment = Set(environment.to_string());
+            active.environment = Set(environment.as_str().to_string());
         }
         if let Some(container_image) = params.container_image {
             active.container_image = Set(container_image.map(String::from));
@@ -2345,7 +2359,7 @@ impl ChatDb {
                 self.create_profile(CreateProfileParams {
                     id: &id,
                     name: def.name,
-                    environment: def.environment,
+                    environment: parse_profile_environment(def.environment)?,
                     container_image: None,
                     slug: Some(def.slug),
                     icon: Some(def.icon),
@@ -3245,7 +3259,7 @@ mod tests {
         db.create_profile(CreateProfileParams {
             id: profile_id,
             name: "Test",
-            environment: "local",
+            environment: ProfileEnvironmentKind::Local,
             container_image: None,
             slug: None,
             icon: None,
@@ -3348,7 +3362,7 @@ mod tests {
         db.create_profile(CreateProfileParams {
             id: profile_id,
             name: "Test",
-            environment: "local",
+            environment: ProfileEnvironmentKind::Local,
             container_image: None,
             slug: None,
             icon: None,
@@ -3415,7 +3429,7 @@ mod tests {
         db.create_profile(CreateProfileParams {
             id: "daily-id",
             name: "Custom Daily",
-            environment: "container",
+            environment: ProfileEnvironmentKind::Container,
             container_image: Some("custom-image"),
             slug: Some("daily"),
             icon: Some("D"),
@@ -3428,7 +3442,7 @@ mod tests {
         db.create_profile(CreateProfileParams {
             id: "work-id",
             name: "Custom Work",
-            environment: "container",
+            environment: ProfileEnvironmentKind::Container,
             container_image: Some("work-image"),
             slug: Some("work"),
             icon: Some("W"),
@@ -3441,7 +3455,7 @@ mod tests {
         db.create_profile(CreateProfileParams {
             id: "local-id",
             name: "Custom Local",
-            environment: "local",
+            environment: ProfileEnvironmentKind::Local,
             container_image: Some("still-here"),
             slug: Some("local"),
             icon: Some("L"),
@@ -3781,7 +3795,7 @@ mod tests {
             .create_profile(CreateProfileParams {
                 id: "remote-profile",
                 name: "Remote",
-                environment: "remote",
+                environment: ProfileEnvironmentKind::Remote,
                 container_image: None,
                 slug: None,
                 icon: None,
@@ -3812,7 +3826,7 @@ mod tests {
             .create_profile(CreateProfileParams {
                 id: "remote-profile",
                 name: "Remote",
-                environment: "remote",
+                environment: ProfileEnvironmentKind::Remote,
                 container_image: None,
                 slug: None,
                 icon: None,

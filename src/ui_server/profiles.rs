@@ -8,7 +8,7 @@ use skyzen::extract::Query;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
-use crate::db::{ChatDbError, CreateProfileParams, UpdateProfileParams};
+use crate::db::{ChatDbError, CreateProfileParams, ProfileEnvironmentKind, UpdateProfileParams};
 use crate::profile::{ProfileInfo, query_profile_sessions};
 
 use super::error::{bad_request_error, internal_error, json_ok_response, typed_error_response};
@@ -24,7 +24,7 @@ pub(super) struct CreateProfileRequest {
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default = "default_env")]
-    pub environment: String,
+    pub environment: ProfileEnvironmentKind,
     #[serde(default)]
     pub container_image: Option<String>,
     #[serde(default)]
@@ -35,8 +35,8 @@ pub(super) struct CreateProfileRequest {
     pub location_aware: bool,
 }
 
-fn default_env() -> String {
-    "local".to_string()
+fn default_env() -> ProfileEnvironmentKind {
+    ProfileEnvironmentKind::Local
 }
 
 fn map_profile_error(err: ChatDbError) -> skyzen::Error {
@@ -243,7 +243,7 @@ pub(super) struct UpdateProfileRequest {
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
-    pub environment: Option<String>,
+    pub environment: Option<ProfileEnvironmentKind>,
     #[serde(default)]
     pub container_image: Option<String>,
     #[serde(default)]
@@ -307,7 +307,7 @@ pub(super) async fn create_profile(
         .create_profile(CreateProfileParams {
             id: &id,
             name: &req.name,
-            environment: &req.environment,
+            environment: req.environment,
             container_image: req.container_image.as_deref(),
             slug: None,
             icon: req.icon.as_deref(),
@@ -347,7 +347,7 @@ pub(super) async fn update_profile(
         UpdateProfileParams {
             name: req.name.as_deref(),
             icon: req.icon.as_deref().map(Some),
-            environment: req.environment.as_deref(),
+            environment: req.environment,
             container_image: req.container_image.as_deref().map(Some),
             container_id: None,
             sort_order: req.sort_order,
