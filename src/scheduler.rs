@@ -194,14 +194,6 @@ fn task_notification_callback_message(task_name: &str, status: TaskCallbackStatu
     ])
 }
 
-const fn task_runtime_kind_name(kind: TaskRuntimeKind) -> &'static str {
-    match kind {
-        TaskRuntimeKind::Local => "local",
-        TaskRuntimeKind::Container => "container",
-        TaskRuntimeKind::Remote => "remote",
-    }
-}
-
 fn task_script_failure(exit_code: i32, output: &str) -> String {
     let exit_code_text = exit_code.to_string();
     join_text(&[
@@ -527,9 +519,9 @@ impl TaskRuntime {
         if runtime_kind != actual_runtime {
             return Err(join_text(&[
                 "task runtime mismatch: session profile uses ",
-                task_runtime_kind_name(actual_runtime),
+                actual_runtime.as_str(),
                 ", request declared ",
-                task_runtime_kind_name(runtime_kind),
+                runtime_kind.as_str(),
             ]));
         }
 
