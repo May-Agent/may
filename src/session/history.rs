@@ -24,6 +24,8 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 
+use crate::PermissionHistoryMode;
+
 /// Error parsing chat history.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatHistoryError {
@@ -337,7 +339,7 @@ pub struct PermissionRequestData {
     /// Unique request ID.
     pub id: String,
     /// Permission mode requested.
-    pub mode: String,
+    pub mode: PermissionHistoryMode,
     /// The script/command needing permission.
     pub script: String,
 }

@@ -1,6 +1,7 @@
 //! Persisted session runtime state and server-owned pending messages.
 
 use super::SessionPlanState;
+use crate::PermissionRequestMode;
 use crate::xml_fragment::XmlFragment;
 
 /// Persisted runtime state for a session.
@@ -305,7 +306,7 @@ pub struct PersistedAskUserQuestion {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedPermissionRequestPayload {
-    pub mode: String,
+    pub mode: PermissionRequestMode,
     pub script: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
