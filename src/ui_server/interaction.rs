@@ -54,8 +54,12 @@ pub(super) async fn respond_permission_request(
         runtime = super::chat::schedule_waiting_turn_resume(
             &state,
             session_id.as_str(),
-            "permission",
-            if req.approved { "approved" } else { "denied" },
+            super::chat::ResumeRequestKind::Permission,
+            if req.approved {
+                super::chat::ResumeResolution::Approved
+            } else {
+                super::chat::ResumeResolution::Denied
+            },
         )
         .await
         .map_err(internal_error)?;
@@ -116,8 +120,8 @@ pub(super) async fn respond_ask_user_request(
         runtime = super::chat::schedule_waiting_turn_resume(
             &state,
             session_id.as_str(),
-            "ask_user",
-            "answered",
+            super::chat::ResumeRequestKind::AskUser,
+            super::chat::ResumeResolution::Answered,
         )
         .await
         .map_err(internal_error)?;
@@ -168,8 +172,12 @@ pub(super) async fn respond_workspace_request(
         runtime = super::chat::schedule_waiting_turn_resume(
             &state,
             session_id.as_str(),
-            "workspace",
-            if req.approved { "approved" } else { "denied" },
+            super::chat::ResumeRequestKind::Workspace,
+            if req.approved {
+                super::chat::ResumeResolution::Approved
+            } else {
+                super::chat::ResumeResolution::Denied
+            },
         )
         .await
         .map_err(internal_error)?;
