@@ -1,6 +1,7 @@
 //! Profile and folder CRUD endpoints, session pin/archive/move operations.
 
 use std::collections::VecDeque;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use skyzen::Result as SkyResult;
@@ -76,8 +77,10 @@ async fn ensure_profile_environment_ready(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Profile not found"))?;
+    let environment = ProfileEnvironmentKind::from_str(profile.environment.as_str())
+        .map_err(map_profile_error)?;
 
-    if profile.environment == "remote" {
+    if environment == ProfileEnvironmentKind::Remote {
         let config = state.config_snapshot();
         crate::remote_profile::resolve_remote_profile_server(&profile, &config.ssh_servers)
             .map_err(bad_request_error)?;
@@ -85,7 +88,7 @@ async fn ensure_profile_environment_ready(
         return Ok(());
     }
 
-    if profile.environment != "container" {
+    if environment != ProfileEnvironmentKind::Container {
         state.clear_container_prepare_status(profile_id);
         return Ok(());
     }

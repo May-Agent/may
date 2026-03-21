@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -986,8 +987,10 @@ async fn resolve_container_proxy_target(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("profile not found"))?;
+    let environment = crate::db::ProfileEnvironmentKind::from_str(profile.environment.as_str())
+        .map_err(internal_error)?;
 
-    if profile.environment != "container" {
+    if environment != crate::db::ProfileEnvironmentKind::Container {
         return Err(
             skyzen::Error::msg("local-url proxy is only available for container profiles")
                 .set_status(StatusCode::BAD_REQUEST),

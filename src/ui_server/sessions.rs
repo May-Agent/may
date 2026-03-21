@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_fs;
@@ -5,6 +6,7 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
+use crate::db::ProfileEnvironmentKind;
 use crate::session::{
     MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db,
 };
@@ -273,7 +275,9 @@ pub(super) async fn create_session(
                 .await
                 .map_err(internal_error)?
                 .ok_or_else(|| bad_request_error("profile not found"))?;
-            if profile.environment == "container" {
+            let environment = ProfileEnvironmentKind::from_str(profile.environment.as_str())
+                .map_err(internal_error)?;
+            if environment == ProfileEnvironmentKind::Container {
                 SandboxResourceLayout::ContainerMountPoints
             } else {
                 SandboxResourceLayout::Symlinked
