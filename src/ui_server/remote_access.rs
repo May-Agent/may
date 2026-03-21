@@ -3,7 +3,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, BufReader};
+
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::RemoteAccessConfig;
@@ -177,11 +179,10 @@ pub(super) async fn stop_remote_access(
 }
 
 async fn has_local_profile(db: &ChatDb) -> Result<bool, crate::db::ChatDbError> {
-    Ok(db
-        .list_profiles()
-        .await?
-        .iter()
-        .any(|profile| profile.environment == "local"))
+    Ok(db.list_profiles().await?.iter().any(|profile| {
+        crate::db::ProfileEnvironmentKind::from_str(profile.environment.as_str())
+            .is_ok_and(|environment| environment == crate::db::ProfileEnvironmentKind::Local)
+    }))
 }
 
 async fn run_remote_access_actor(

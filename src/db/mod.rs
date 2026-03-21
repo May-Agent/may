@@ -267,6 +267,14 @@ impl std::fmt::Display for ProfileEnvironmentKind {
     }
 }
 
+impl core::str::FromStr for ProfileEnvironmentKind {
+    type Err = ChatDbError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_profile_environment(value)
+    }
+}
+
 fn parse_profile_environment(value: &str) -> Result<ProfileEnvironmentKind, ChatDbError> {
     match value {
         "local" => Ok(ProfileEnvironmentKind::Local),
