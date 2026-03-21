@@ -1893,7 +1893,7 @@ struct PlanMode {
 
 #[derive(Clone, serde::Serialize)]
 struct NetworkRestrictions {
-    mode: String,
+    mode: NetworkPolicyMode,
     hosts: Vec<String>,
 }
 
@@ -2007,7 +2007,7 @@ fn build_network_restrictions_context(
         return None;
     }
     Some(NetworkRestrictions {
-        mode: policy.mode().as_str().to_string(),
+        mode: policy.mode(),
         hosts: policy.hosts().to_vec(),
     })
 }
