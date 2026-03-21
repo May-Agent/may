@@ -16,6 +16,23 @@ pub enum TaskRuntimeKind {
     Remote,
 }
 
+impl TaskRuntimeKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Container => "container",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskRuntimeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct TaskArgs {
     /// Human-readable task name.
