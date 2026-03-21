@@ -1107,7 +1107,7 @@ pub(crate) struct SkillInfoDto {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) dir_name: String,
-    pub(crate) source: String,
+    pub(crate) source: crate::skill::SkillSource,
 }
 
 #[derive(Debug, serde::Deserialize)]

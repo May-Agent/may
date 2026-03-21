@@ -590,7 +590,10 @@ export interface SkillInfo {
   name: string;
   description: string;
   dirName: string;
-  source: string;
+  source:
+    | { type: 'bundled' }
+    | { type: 'github'; owner: string; repo: string }
+    | { type: 'local_path'; path: string };
 }
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
@@ -1712,7 +1715,7 @@ export async function fetchProfiles(): Promise<ProfileInfo[]> {
 export async function createProfile(input: {
   name: string;
   icon?: string;
-  environment?: ProfileEnvironment['type'];
+  environment?: 'local' | 'container' | 'remote';
   containerImage?: string;
   persona?: string;
   preferences?: Record<string, unknown>;
@@ -1730,7 +1733,7 @@ export async function updateProfile(
   input: {
     name?: string;
     icon?: string;
-    environment?: ProfileEnvironment['type'];
+    environment?: 'local' | 'container' | 'remote';
     containerImage?: string;
     sortOrder?: number;
     persona?: string;
