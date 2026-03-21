@@ -103,8 +103,14 @@ export interface NetworkAccessLogEntry {
   id: number;
   sessionId?: string | null;
   profileId?: string | null;
-  source: string;
-  mode: string;
+  source:
+    | 'chat'
+    | 'task_local'
+    | 'task_validation_local'
+    | 'task_remote'
+    | 'task_container'
+    | 'task_validation_container';
+  mode: 'network';
   domain: string;
   port: number;
   allowed: boolean;

@@ -31,7 +31,7 @@ use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
 use crate::copilot::clear_copilot_credentials;
-use crate::db::NetworkAccessLogParams;
+use crate::db::{NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
 use crate::embedding_provider::resolve_embedding_provider;
 use crate::live_response::LiveResponseRegistry;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
@@ -532,8 +532,8 @@ impl MayPermissionHandler {
             .append_network_access_log(NetworkAccessLogParams {
                 session_id: approver.session_id.as_deref(),
                 profile_id: self.profile_id.as_deref(),
-                source: "chat",
-                mode: "network",
+                source: NetworkAccessSource::Chat,
+                mode: NetworkAccessMode::Network,
                 domain,
                 port,
                 allowed,

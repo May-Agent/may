@@ -235,8 +235,8 @@ pub(crate) struct NetworkAccessLogEntryResponse {
     pub(crate) id: i32,
     pub(crate) session_id: Option<String>,
     pub(crate) profile_id: Option<String>,
-    pub(crate) source: String,
-    pub(crate) mode: String,
+    pub(crate) source: crate::db::NetworkAccessSource,
+    pub(crate) mode: crate::db::NetworkAccessMode,
     pub(crate) domain: String,
     pub(crate) port: i32,
     pub(crate) allowed: bool,
@@ -250,8 +250,14 @@ impl From<crate::db::entity::network_access_logs::Model> for NetworkAccessLogEnt
             id: value.id,
             session_id: value.session_id,
             profile_id: value.profile_id,
-            source: value.source,
-            mode: value.mode,
+            source: value
+                .source
+                .parse()
+                .expect("network access log source must be valid"),
+            mode: value
+                .mode
+                .parse()
+                .expect("network access log mode must be valid"),
             domain: value.domain,
             port: value.port,
             allowed: value.allowed,
