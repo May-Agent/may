@@ -519,7 +519,6 @@ impl TaskRuntime {
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let persisted_trigger = normalized.trigger.clone().into_persisted();
-        let trigger_type = persisted_trigger.storage_trigger_type().to_string();
         let model = self
             .db
             .create_scheduled_task(crate::db::CreateScheduledTaskParams {
@@ -527,8 +526,7 @@ impl TaskRuntime {
                 profile_id: &profile_id,
                 session_id: Some(normalized.session_id.as_str()),
                 name: &normalized.name,
-                trigger_kind: persisted_trigger.kind().as_str(),
-                trigger_type: trigger_type.as_str(),
+                trigger: &persisted_trigger,
                 cron_expression: normalized.trigger.cron_expression(),
                 run_at: normalized.trigger.run_at(),
                 script_path: normalized.script.script_path.as_deref(),
@@ -1564,13 +1562,15 @@ mod tests {
             ("task-other-session", Some("session-b"), true),
             ("task-unapproved", Some("session-a"), false),
         ] {
+            let trigger = PersistedTaskTrigger::Event {
+                event_name: "chat.turn.completed".to_string(),
+            };
             db.create_scheduled_task(CreateScheduledTaskParams {
                 id: task_id,
                 profile_id: local_profile.id.as_str(),
                 session_id,
                 name: task_id,
-                trigger_kind: "event",
-                trigger_type: "chat.turn.completed",
+                trigger: &trigger,
                 cron_expression: None,
                 run_at: None,
                 script_path: None,

@@ -266,7 +266,6 @@ pub(super) async fn create_task(
         .map_err(bad_request_error)?;
 
     let persisted_trigger = trigger.clone().into_persisted();
-    let trigger_type = persisted_trigger.storage_trigger_type().to_string();
     let model = state
         .db()
         .create_scheduled_task(CreateScheduledTaskParams {
@@ -274,8 +273,7 @@ pub(super) async fn create_task(
             profile_id: &req.profile_id,
             session_id: req.session_id.as_deref(),
             name: &req.name,
-            trigger_kind: persisted_trigger.kind().as_str(),
-            trigger_type: trigger_type.as_str(),
+            trigger: &persisted_trigger,
             cron_expression: trigger.cron_expression(),
             run_at: trigger.run_at(),
             script_path: normalized_script_path,

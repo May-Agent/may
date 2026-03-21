@@ -22,7 +22,7 @@ use crate::session::{
     PersistedAskUserRequest, PersistedPermissionRequest, PersistedWorkspaceRequest,
     SessionInteractionState, SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
 };
-use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
+use crate::task_trigger::{PersistedTaskTrigger, TRIGGER_KIND_WEBHOOK};
 use crate::xml_fragment::XmlFragment;
 use entity::{
     context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox,
@@ -2768,14 +2768,16 @@ impl ChatDb {
         &self,
         params: CreateScheduledTaskParams<'_>,
     ) -> Result<scheduled_tasks::Model, ChatDbError> {
+        let trigger_kind = params.trigger.kind().as_str();
+        let trigger_type = params.trigger.storage_trigger_type();
         let now = jiff::Timestamp::now().to_string();
         let active = scheduled_tasks::ActiveModel {
             id: Set(params.id.to_string()),
             profile_id: Set(params.profile_id.to_string()),
             session_id: Set(params.session_id.map(String::from)),
             name: Set(params.name.to_string()),
-            trigger_kind: Set(params.trigger_kind.to_string()),
-            trigger_type: Set(params.trigger_type.to_string()),
+            trigger_kind: Set(trigger_kind.to_string()),
+            trigger_type: Set(trigger_type.to_string()),
             cron_expression: Set(params.cron_expression.map(String::from)),
             run_at: Set(params.run_at.map(String::from)),
             script_path: Set(params.script_path.map(String::from)),
@@ -3158,8 +3160,7 @@ pub struct CreateScheduledTaskParams<'a> {
     pub profile_id: &'a str,
     pub session_id: Option<&'a str>,
     pub name: &'a str,
-    pub trigger_kind: &'a str,
-    pub trigger_type: &'a str,
+    pub trigger: &'a PersistedTaskTrigger,
     pub cron_expression: Option<&'a str>,
     pub run_at: Option<&'a str>,
     pub script_path: Option<&'a str>,
@@ -4064,8 +4065,9 @@ mod tests {
             profile_id: "profile-1",
             session_id: Some("session-1"),
             name: "Demo task",
-            trigger_kind: "event",
-            trigger_type: "chat.turn.completed",
+            trigger: &PersistedTaskTrigger::Event {
+                event_name: "chat.turn.completed".to_string(),
+            },
             cron_expression: None,
             run_at: None,
             script_path: None,
