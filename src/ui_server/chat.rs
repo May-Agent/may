@@ -419,9 +419,25 @@ struct BrowserTakeoverAlertXml {
 struct ResumeWaitingTurnXml<'a> {
     #[serde(rename = "@type")]
     alert_type: &'a str,
-    request_kind: &'a str,
-    resolution: &'a str,
+    request_kind: ResumeRequestKind,
+    resolution: ResumeResolution,
     instruction: &'a str,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ResumeRequestKind {
+    Permission,
+    AskUser,
+    Workspace,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ResumeResolution {
+    Approved,
+    Denied,
+    Answered,
 }
 
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> anyhow::Result<String> {
@@ -442,8 +458,8 @@ fn browser_takeover_alert_xml() -> anyhow::Result<String> {
 }
 
 fn resume_waiting_turn_xml(
-    request_kind: &'static str,
-    resolution: &'static str,
+    request_kind: ResumeRequestKind,
+    resolution: ResumeResolution,
 ) -> anyhow::Result<crate::XmlFragment> {
     let xml = serialize_xml(
         "system_alert",
@@ -460,8 +476,8 @@ fn resume_waiting_turn_xml(
 pub(super) async fn schedule_waiting_turn_resume(
     state: &Arc<UiServerState>,
     session_id: &str,
-    request_kind: &'static str,
-    resolution: &'static str,
+    request_kind: ResumeRequestKind,
+    resolution: ResumeResolution,
 ) -> anyhow::Result<crate::session::SessionRuntimeSummary> {
     let pending = PendingUserMessage {
         content: String::new(),
