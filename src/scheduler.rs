@@ -161,12 +161,35 @@ fn task_notification_title(task_name: &str) -> String {
     join_text(&["Task: ", task_name])
 }
 
-fn task_notification_callback_message(task_name: &str, status: &str) -> String {
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskCallbackStatus {
+    Completed,
+    Failed,
+}
+
+impl TaskCallbackStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    const fn notification_body(self) -> &'static str {
+        match self {
+            Self::Completed => "Completed successfully",
+            Self::Failed => "Execution failed",
+        }
+    }
+}
+
+fn task_notification_callback_message(task_name: &str, status: TaskCallbackStatus) -> String {
     join_text(&[
         "Continue from scheduled task \"",
         task_name,
         "\" (",
-        status,
+        status.as_str(),
         "). Review the hidden task result and choose the next action.",
     ])
 }
@@ -209,7 +232,7 @@ fn container_profile_name(profile: &profiles::Model) -> String {
 
 fn task_notification_callback_context(
     task: &scheduled_tasks::Model,
-    status: &'static str,
+    status: TaskCallbackStatus,
     summary: &str,
 ) -> Option<crate::XmlFragment> {
     task.session_id.as_ref()?;
@@ -222,7 +245,7 @@ fn task_notification_callback_context(
             profile_id: task.profile_id.as_str(),
             trigger_kind: task.trigger_kind.as_str(),
             trigger_type: task.trigger_type.as_str(),
-            status,
+            status: status.as_str(),
             summary,
         },
     )
@@ -232,7 +255,7 @@ fn task_notification_callback_context(
 
 fn task_notification_callback_payload(
     task: &scheduled_tasks::Model,
-    status: &'static str,
+    status: TaskCallbackStatus,
     summary: &str,
 ) -> (Option<crate::XmlFragment>, Option<String>) {
     if task.session_id.is_none() {
@@ -816,11 +839,17 @@ impl TaskRuntime {
 
                 if let Some(ref notifier) = self.notifier {
                     let (callback_context_xml, callback_message) =
-                        task_notification_callback_payload(task, "completed", truncated.as_str());
+                        task_notification_callback_payload(
+                            task,
+                            TaskCallbackStatus::Completed,
+                            truncated.as_str(),
+                        );
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
-                        body: "Completed successfully".to_string(),
+                        body: TaskCallbackStatus::Completed
+                            .notification_body()
+                            .to_string(),
                         session_id: task.session_id.clone(),
                         callback_context_xml,
                         callback_message,
@@ -854,11 +883,15 @@ impl TaskRuntime {
 
                 if let Some(ref notifier) = self.notifier {
                     let (callback_context_xml, callback_message) =
-                        task_notification_callback_payload(task, "failed", truncated.as_str());
+                        task_notification_callback_payload(
+                            task,
+                            TaskCallbackStatus::Failed,
+                            truncated.as_str(),
+                        );
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
-                        body: "Execution failed".to_string(),
+                        body: TaskCallbackStatus::Failed.notification_body().to_string(),
                         session_id: task.session_id.clone(),
                         callback_context_xml,
                         callback_message,
