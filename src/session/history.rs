@@ -630,7 +630,7 @@ impl ChatHistory {
 
     /// Check whether network permission was previously approved in this session.
     pub fn has_network_approval(&self) -> bool {
-        self.was_permission_mode_approved("network")
+        self.was_permission_mode_approved(PermissionHistoryMode::Network)
     }
 
     /// Find unanswered permission requests (no matching PermissionResponse).
@@ -670,7 +670,7 @@ impl ChatHistory {
     }
 
     /// Check if a specific permission mode was ever approved in this session's history.
-    pub fn was_permission_mode_approved(&self, mode: &str) -> bool {
+    pub fn was_permission_mode_approved(&self, mode: PermissionHistoryMode) -> bool {
         // Collect all approved response IDs
         let approved_ids: std::collections::HashSet<String> = self
             .messages

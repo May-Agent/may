@@ -1712,7 +1712,7 @@ export async function fetchProfiles(): Promise<ProfileInfo[]> {
 export async function createProfile(input: {
   name: string;
   icon?: string;
-  environment?: string;
+  environment?: ProfileEnvironment['type'];
   containerImage?: string;
   persona?: string;
   preferences?: Record<string, unknown>;
@@ -1730,7 +1730,7 @@ export async function updateProfile(
   input: {
     name?: string;
     icon?: string;
-    environment?: string;
+    environment?: ProfileEnvironment['type'];
     containerImage?: string;
     sortOrder?: number;
     persona?: string;

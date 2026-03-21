@@ -212,7 +212,7 @@ pub enum MayAgentError {
     Workspace(#[from] crate::workspace::WorkspaceConfigError),
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionRequestMode {
     Default,
@@ -407,7 +407,10 @@ impl PermissionApprover {
             && let Some(runtime_service) = &self.runtime_service
             && runtime_service
                 .db()
-                .session_has_approved_permission_mode(&session_id, Self::history_mode(mode))
+                .session_has_approved_permission_mode(
+                    &session_id,
+                    PermissionHistoryMode::from(mode),
+                )
                 .await
                 .map_err(anyhow::Error::from)
                 .map_err(PermissionError::Internal)?
@@ -486,7 +489,10 @@ impl PermissionHandler for PermissionApprover {
                 };
                 !runtime_service
                     .db()
-                    .session_has_approved_permission_mode(session_id, Self::history_mode(mode))
+                    .session_has_approved_permission_mode(
+                        session_id,
+                        PermissionHistoryMode::from(mode),
+                    )
                     .await
                     .unwrap_or(false)
             }
