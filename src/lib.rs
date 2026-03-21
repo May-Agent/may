@@ -36,8 +36,8 @@ pub use aither_agent::ask_user;
 pub use aither_agent::workspace_request;
 
 pub use agent::{
-    AgentEnvironment, MayAgent, PermissionApprover, PermissionRequest, PermissionRequestMode,
-    generate_session_title,
+    AgentEnvironment, MayAgent, PermissionApprover, PermissionHistoryMode, PermissionRequest,
+    PermissionRequestMode, generate_session_title,
 };
 pub use config::MayConfig;
 pub use db::ChatDb;

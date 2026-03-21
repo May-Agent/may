@@ -805,11 +805,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
                 .map(|request| PermissionPollItem {
                     id: request.id,
                     request: crate::agent::PermissionRequest {
-                        mode: request
-                            .request
-                            .mode
-                            .parse()
-                            .expect("persisted permission request mode must be valid"),
+                        mode: request.request.mode,
                         script: request.request.script,
                         session_id: request.request.session_id,
                     },

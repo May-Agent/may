@@ -15,6 +15,7 @@ use sea_orm::{
     sea_query::{Expr, Query, SqliteQueryBuilder},
 };
 
+use crate::PermissionHistoryMode;
 use crate::scheduler::TaskRunStatus;
 use crate::session::{
     BrowserInteractionState, ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage,
@@ -595,7 +596,10 @@ impl ChatDb {
             waiting_permission: permission_row.map(|row| PersistedPermissionRequest {
                 id: row.request_id,
                 request: crate::session::PersistedPermissionRequestPayload {
-                    mode: row.mode,
+                    mode: row
+                        .mode
+                        .parse()
+                        .expect("persisted permission request mode must be valid"),
                     script: row.script,
                     session_id: Some(row.session_id),
                 },
@@ -2016,7 +2020,7 @@ impl ChatDb {
                     if let Ok(req_data) =
                         serde_json::from_str::<PermissionRequestPayload>(&req.content)
                         && req_data.id == data.id
-                        && req_data.mode == "network"
+                        && req_data.mode == PermissionHistoryMode::Network
                     {
                         return Ok(true);
                     }
@@ -3099,7 +3103,7 @@ fn truncate_preview(content: &str) -> String {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PermissionRequestPayload {
     pub id: String,
-    pub mode: String,
+    pub mode: PermissionHistoryMode,
     pub script: String,
 }
 
@@ -3129,6 +3133,7 @@ mod tests {
     use sea_orm::EntityTrait;
     use tempfile::tempdir;
 
+    use crate::PermissionRequestMode;
     use crate::db::entity::{scheduled_task_runs, session_run_leases};
     use crate::profile::ProfileEnvironment;
     use crate::session::{
@@ -3772,7 +3777,7 @@ mod tests {
             Some(PersistedPermissionRequest {
                 id: "perm-1".to_string(),
                 request: PersistedPermissionRequestPayload {
-                    mode: "default".to_string(),
+                    mode: PermissionRequestMode::Default,
                     script: "echo hi".to_string(),
                     session_id: Some(session_id.to_string()),
                 },
@@ -3883,7 +3888,7 @@ mod tests {
             Some(PersistedPermissionRequest {
                 id: "perm-1".to_string(),
                 request: PersistedPermissionRequestPayload {
-                    mode: "default".to_string(),
+                    mode: PermissionRequestMode::Default,
                     script: "echo hi".to_string(),
                     session_id: Some(session_id.to_string()),
                 },

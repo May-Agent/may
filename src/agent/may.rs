@@ -231,6 +231,12 @@ impl PermissionRequestMode {
     }
 }
 
+impl std::fmt::Display for PermissionRequestMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl core::str::FromStr for PermissionRequestMode {
     type Err = String;
 
@@ -248,6 +254,54 @@ impl From<BashMode> for PermissionRequestMode {
     fn from(value: BashMode) -> Self {
         match value {
             BashMode::Sandboxed | BashMode::Network => Self::Default,
+            BashMode::Unsafe => Self::Unsafe,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionHistoryMode {
+    Sandboxed,
+    Network,
+    Unsafe,
+}
+
+impl PermissionHistoryMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sandboxed => "sandboxed",
+            Self::Network => "network",
+            Self::Unsafe => "unsafe",
+        }
+    }
+}
+
+impl std::fmt::Display for PermissionHistoryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::str::FromStr for PermissionHistoryMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "sandboxed" => Ok(Self::Sandboxed),
+            "network" => Ok(Self::Network),
+            "unsafe" => Ok(Self::Unsafe),
+            other => Err(join_text(&["unknown permission history mode: ", other])),
+        }
+    }
+}
+
+impl From<BashMode> for PermissionHistoryMode {
+    fn from(value: BashMode) -> Self {
+        match value {
+            BashMode::Sandboxed => Self::Sandboxed,
+            BashMode::Network => Self::Network,
             BashMode::Unsafe => Self::Unsafe,
         }
     }
@@ -302,18 +356,10 @@ impl PermissionApprover {
         crate::session::PersistedPermissionRequest {
             id: request_id,
             request: crate::session::PersistedPermissionRequestPayload {
-                mode: payload.mode.as_str().to_string(),
+                mode: payload.mode,
                 script: payload.script,
                 session_id: payload.session_id,
             },
-        }
-    }
-
-    fn history_mode(mode: BashMode) -> &'static str {
-        match mode {
-            BashMode::Sandboxed => "sandboxed",
-            BashMode::Network => "network",
-            BashMode::Unsafe => "unsafe",
         }
     }
 
@@ -326,7 +372,7 @@ impl PermissionApprover {
     ) -> Result<(), PermissionError> {
         let content = serde_json::to_string(&crate::session::history::PermissionRequestData {
             id: request_id.to_string(),
-            mode: Self::history_mode(mode).to_string(),
+            mode: PermissionHistoryMode::from(mode),
             script: script.to_string(),
         })
         .map_err(anyhow::Error::from)
