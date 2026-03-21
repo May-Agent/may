@@ -26,9 +26,8 @@ use shell_escape::escape as shell_escape;
 use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKind};
 use crate::config::SshServerConfig;
 use crate::container::lifecycle::ContainerManager;
-use crate::db::ChatDb;
-use crate::db::NetworkAccessLogParams;
 use crate::db::entity::{profiles, scheduled_tasks};
+use crate::db::{ChatDb, NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
 use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
@@ -352,7 +351,7 @@ impl TaskExecutionEnvelope {
 struct SchedulerPermissionHandler {
     db: ChatDb,
     profile_id: String,
-    source: String,
+    source: NetworkAccessSource,
     allow_network: bool,
     network_policy: Option<CompiledNetworkPolicy>,
 }
@@ -384,8 +383,8 @@ impl PermissionHandler for SchedulerPermissionHandler {
             .append_network_access_log(NetworkAccessLogParams {
                 session_id: None,
                 profile_id: Some(self.profile_id.as_str()),
-                source: self.source.as_str(),
-                mode: "network",
+                source: self.source,
+                mode: NetworkAccessMode::Network,
                 domain,
                 port,
                 allowed,
@@ -1042,7 +1041,12 @@ impl TaskRuntime {
         command: String,
     ) -> Result<String, String> {
         let bash_tool = self
-            .local_bash_tool(&task.profile_id, "task_local", script, task.needs_network)
+            .local_bash_tool(
+                &task.profile_id,
+                NetworkAccessSource::TaskLocal,
+                script,
+                task.needs_network,
+            )
             .await?;
         run_bash_script(
             &bash_tool,
@@ -1055,7 +1059,12 @@ impl TaskRuntime {
 
     async fn validate_local(&self, profile_id: &str, script: &TaskScript) -> Result<(), String> {
         let bash_tool = self
-            .local_bash_tool(profile_id, "task_validation_local", script, false)
+            .local_bash_tool(
+                profile_id,
+                NetworkAccessSource::TaskValidationLocal,
+                script,
+                false,
+            )
             .await?;
 
         run_bash_script(
@@ -1071,7 +1080,7 @@ impl TaskRuntime {
     async fn local_bash_tool(
         &self,
         profile_id: &str,
-        source: &str,
+        source: NetworkAccessSource,
         script: &TaskScript,
         allow_network: bool,
     ) -> Result<BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
@@ -1088,7 +1097,7 @@ impl TaskRuntime {
             SchedulerPermissionHandler {
                 db: self.db.clone(),
                 profile_id: profile_id.to_string(),
-                source: source.to_string(),
+                source,
                 allow_network,
                 network_policy,
             },
@@ -1132,7 +1141,7 @@ impl TaskRuntime {
             SchedulerPermissionHandler {
                 db: self.db.clone(),
                 profile_id: profile.id.clone(),
-                source: "task_remote".to_string(),
+                source: NetworkAccessSource::TaskRemote,
                 allow_network: true,
                 network_policy,
             },
@@ -1266,7 +1275,7 @@ impl TaskRuntime {
                 SchedulerPermissionHandler {
                     db: self.db.clone(),
                     profile_id: profile.id.clone(),
-                    source: "task_container".to_string(),
+                    source: NetworkAccessSource::TaskContainer,
                     allow_network: true,
                     network_policy,
                 },
@@ -1379,7 +1388,7 @@ impl TaskRuntime {
                 SchedulerPermissionHandler {
                     db: self.db.clone(),
                     profile_id: profile.id.clone(),
-                    source: "task_validation_container".to_string(),
+                    source: NetworkAccessSource::TaskValidationContainer,
                     allow_network: true,
                     network_policy,
                 },

@@ -96,12 +96,91 @@ pub struct MessageStatsParams {
 pub struct NetworkAccessLogParams<'a> {
     pub session_id: Option<&'a str>,
     pub profile_id: Option<&'a str>,
-    pub source: &'a str,
-    pub mode: &'a str,
+    pub source: NetworkAccessSource,
+    pub mode: NetworkAccessMode,
     pub domain: &'a str,
     pub port: u16,
     pub allowed: bool,
     pub reason: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkAccessSource {
+    Chat,
+    TaskLocal,
+    TaskValidationLocal,
+    TaskRemote,
+    TaskContainer,
+    TaskValidationContainer,
+}
+
+impl NetworkAccessSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::TaskLocal => "task_local",
+            Self::TaskValidationLocal => "task_validation_local",
+            Self::TaskRemote => "task_remote",
+            Self::TaskContainer => "task_container",
+            Self::TaskValidationContainer => "task_validation_container",
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkAccessSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::str::FromStr for NetworkAccessSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "chat" => Ok(Self::Chat),
+            "task_local" => Ok(Self::TaskLocal),
+            "task_validation_local" => Ok(Self::TaskValidationLocal),
+            "task_remote" => Ok(Self::TaskRemote),
+            "task_container" => Ok(Self::TaskContainer),
+            "task_validation_container" => Ok(Self::TaskValidationContainer),
+            other => Err(db_custom_error("unknown network access source: ", &other).to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkAccessMode {
+    Network,
+}
+
+impl NetworkAccessMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkAccessMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::str::FromStr for NetworkAccessMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "network" => Ok(Self::Network),
+            other => Err(db_custom_error("unknown network access mode: ", &other).to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1974,8 +2053,8 @@ impl ChatDb {
             id: NotSet,
             session_id: Set(params.session_id.map(ToOwned::to_owned)),
             profile_id: Set(params.profile_id.map(ToOwned::to_owned)),
-            source: Set(params.source.to_string()),
-            mode: Set(params.mode.to_string()),
+            source: Set(params.source.as_str().to_string()),
+            mode: Set(params.mode.as_str().to_string()),
             domain: Set(params.domain.to_string()),
             port: Set(port),
             allowed: Set(params.allowed),
