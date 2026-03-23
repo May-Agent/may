@@ -64,6 +64,20 @@ impl core::str::FromStr for SessionRuntimeState {
     }
 }
 
+/// Persisted terminal-runtime metadata owned by the server runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalRuntimeState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_notice: Option<String>,
+}
+
 /// Persisted browser interaction state owned by the server runtime.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,16 +89,18 @@ pub struct BrowserInteractionState {
 }
 
 /// Persisted interactive-resource state for a session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInteractionState {
     #[serde(default)]
     pub browser: BrowserInteractionState,
+    #[serde(default)]
+    pub terminal: TerminalRuntimeState,
 }
 
 impl SessionInteractionState {
     #[must_use]
-    pub const fn is_active(self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.browser.takeover_active
     }
 }

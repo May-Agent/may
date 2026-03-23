@@ -42,7 +42,7 @@ pub struct TaskArgs {
     /// Path to a shell script file to execute.
     #[serde(default)]
     pub script_path: Option<String>,
-    /// Inline bash script to execute.
+    /// Inline terminal command payload to execute.
     #[serde(default)]
     pub script_inline: Option<String>,
     /// Required for local(leash) tasks. Ignored for container tasks.

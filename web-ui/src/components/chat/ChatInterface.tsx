@@ -77,7 +77,7 @@ import type {
   Artifact,
   ArtifactPreviewTarget,
   Attachment,
-  BashExecution,
+  TerminalExecution,
   ToolExecution,
   TimelineSegment,
   SessionPlanState,
@@ -121,7 +121,7 @@ function isWebFetchToolName(normalizedName: string): boolean {
   );
 }
 
-function isBashExecutionMode(value: unknown): value is BashExecution["mode"] {
+function isTerminalExecutionMode(value: unknown): value is TerminalExecution["mode"] {
   return (
     value === "default" ||
     value === "sandboxed" ||
@@ -941,7 +941,7 @@ export function ChatInterface({
       const hasRunningTimeline = timeline.some((segment) =>
         segment.kind === "thinking"
           ? segment.isRunning
-          : segment.kind === "bash"
+          : segment.kind === "terminal"
             ? segment.commands.some((command) => command.status === "running")
             : segment.tool.status === "running",
       );
@@ -951,7 +951,7 @@ export function ChatInterface({
 
       changed = true;
       const settledTimeline = settleTimelineSegments(timeline, settledAt);
-      const { thinking, bashExecutions } =
+      const { thinking, terminalExecutions } =
         summarizeTimelineSegments(settledTimeline);
       return {
         ...message,
@@ -959,7 +959,7 @@ export function ChatInterface({
         isThinking: false,
         timelineSegments: settledTimeline,
         thinking,
-        bashExecutions,
+        terminalExecutions,
       };
     });
 
@@ -1256,7 +1256,7 @@ export function ChatInterface({
     let timelineSegments: TimelineSegment[] = [];
     setTodoProgress(null);
     let activeThinkingSegmentId: string | null = null;
-    const bashSegmentByToolId = new Map<string, string>();
+    const terminalSegmentByToolId = new Map<string, string>();
     const toolSegmentByToolId = new Map<string, string>();
     let lastStreamEventKind: "reasoning" | "text" | "tool" | null = null;
     let lastTextFlushAt = 0;
@@ -1291,7 +1291,7 @@ export function ChatInterface({
       segments: TimelineSegment[],
     ): TimelineSegment[] =>
       segments.map((segment) =>
-        segment.kind === "bash"
+        segment.kind === "terminal"
           ? {
               ...segment,
               commands: segment.commands.map((command) => ({ ...command })),
@@ -1304,11 +1304,11 @@ export function ChatInterface({
             : { ...segment },
       );
 
-    const collectBashExecutions = (
+    const collectTerminalExecutions = (
       segments: TimelineSegment[],
-    ): BashExecution[] =>
+    ): TerminalExecution[] =>
       segments.flatMap((segment) =>
-        segment.kind === "bash"
+        segment.kind === "terminal"
           ? segment.commands.map((command) => ({ ...command }))
           : [],
       );
@@ -1377,7 +1377,7 @@ export function ChatInterface({
                   isThinking: true,
                   thinking: "",
                   timelineSegments: [],
-                  bashExecutions: [],
+                  terminalExecutions: [],
                 }
               : m,
           ),
@@ -1395,7 +1395,7 @@ export function ChatInterface({
             isThinking: true,
             thinking: "",
             timelineSegments: [],
-            bashExecutions: [],
+            terminalExecutions: [],
           },
         ]);
       }
@@ -1423,7 +1423,7 @@ export function ChatInterface({
         lastTextFlushAt = now;
         const snapshotTimelineSegments =
           cloneTimelineSegments(timelineSegments);
-        const snapshotBashExecutions = collectBashExecutions(
+        const snapshotTerminalExecutions = collectTerminalExecutions(
           snapshotTimelineSegments,
         );
         const snapshotThinking = collectThinkingText(snapshotTimelineSegments);
@@ -1438,7 +1438,7 @@ export function ChatInterface({
                   isThinking: isAnyThinkingRunning(snapshotTimelineSegments),
                   thinking: snapshotThinking,
                   timelineSegments: snapshotTimelineSegments,
-                  bashExecutions: snapshotBashExecutions,
+                  terminalExecutions: snapshotTerminalExecutions,
                 }
               : m,
           ),
@@ -1490,15 +1490,15 @@ export function ChatInterface({
             typeof tool.arguments === "string"
               ? tool.arguments
               : JSON.stringify(tool.arguments ?? {});
-          let script = "(bash)";
-          let mode: BashExecution["mode"];
+          let script = "(terminal)";
+          let mode: TerminalExecution["mode"];
           try {
             const args =
               typeof tool.arguments === "string"
                 ? JSON.parse(tool.arguments)
                 : tool.arguments;
-            script = args?.script ?? args?.command ?? "(bash)";
-            mode = isBashExecutionMode(args?.mode) ? args.mode : undefined;
+            script = args?.script ?? args?.command ?? "(terminal)";
+            mode = isTerminalExecutionMode(args?.mode) ? args.mode : undefined;
           } catch (error) {
             console.warn("Invalid tool arguments payload", error);
           }
@@ -1511,10 +1511,10 @@ export function ChatInterface({
             setIsBrowserOpen(true);
           }
 
-          if (name === "bash") {
+          if (name === "terminal") {
             closeActiveThinkingSegment();
             const startedAt = Date.now();
-            const nextExec: BashExecution = {
+            const nextExec: TerminalExecution = {
               id: toolId,
               input: script,
               status: "running",
@@ -1525,14 +1525,14 @@ export function ChatInterface({
             const lastSegment = timelineSegments[timelineSegments.length - 1];
             const canAppendToBatch =
               lastStreamEventKind === "tool" &&
-              lastSegment?.kind === "bash" &&
+              lastSegment?.kind === "terminal" &&
               lastSegment.offset === streamedText.length;
 
             let segmentId: string;
-            if (canAppendToBatch && lastSegment.kind === "bash") {
+            if (canAppendToBatch && lastSegment.kind === "terminal") {
               segmentId = lastSegment.id;
               timelineSegments = timelineSegments.map((segment) =>
-                segment.kind === "bash" && segment.id === segmentId
+                segment.kind === "terminal" && segment.id === segmentId
                   ? {
                       ...segment,
                       startedAt: segment.startedAt ?? startedAt,
@@ -1542,12 +1542,12 @@ export function ChatInterface({
                   : segment,
               );
             } else {
-              segmentId = `bash-${toolId}`;
+              segmentId = `terminal-${toolId}`;
               timelineSegments = [
                 ...timelineSegments,
                 {
                   id: segmentId,
-                  kind: "bash",
+                  kind: "terminal",
                   offset: streamedText.length,
                   commands: [nextExec],
                   startedAt,
@@ -1555,7 +1555,7 @@ export function ChatInterface({
               ];
             }
 
-            bashSegmentByToolId.set(toolId, segmentId);
+            terminalSegmentByToolId.set(toolId, segmentId);
             lastStreamEventKind = "tool";
             flushAssistantText(true);
             return;
@@ -1595,10 +1595,10 @@ export function ChatInterface({
               : JSON.stringify(tool?.arguments ?? {});
           const endedAt = Date.now();
           const { output, failed } = parseToolResultPayload(tool.result);
-          const bashSegmentId = bashSegmentByToolId.get(toolId);
-          if (bashSegmentId) {
+          const terminalSegmentId = terminalSegmentByToolId.get(toolId);
+          if (terminalSegmentId) {
             timelineSegments = timelineSegments.map((segment) => {
-              if (segment.kind !== "bash" || segment.id !== bashSegmentId) {
+              if (segment.kind !== "terminal" || segment.id !== terminalSegmentId) {
                 return segment;
               }
               const nextCommands = segment.commands.map((command) =>
@@ -1608,7 +1608,7 @@ export function ChatInterface({
                       output,
                       status: (failed
                         ? "failed"
-                        : "done") as BashExecution["status"],
+                        : "done") as TerminalExecution["status"],
                       endedAt,
                     }
                   : command,
@@ -1675,7 +1675,7 @@ export function ChatInterface({
               ? cloneTimelineSegments(timelineSegments)
               : cloneTimelineSegments(assistant.timelineSegments ?? []);
           const finalThinking = collectThinkingText(finalTimelineSegments);
-          const finalBashExecutions = collectBashExecutions(
+          const finalTerminalExecutions = collectTerminalExecutions(
             finalTimelineSegments,
           );
           const isEmptyResponse =
@@ -1696,7 +1696,7 @@ export function ChatInterface({
                     timelineSegments: finalTimelineSegments,
                     isStreaming: false,
                     isThinking: false,
-                    bashExecutions: finalBashExecutions,
+                    terminalExecutions: finalTerminalExecutions,
                     error: isEmptyResponse
                       ? "LLM endpoint error: empty assistant response"
                       : undefined,
@@ -1725,7 +1725,7 @@ export function ChatInterface({
                       ...m,
                       timelineSegments: snapshotTimelineSegments,
                       thinking: collectThinkingText(snapshotTimelineSegments),
-                      bashExecutions: collectBashExecutions(
+                      terminalExecutions: collectTerminalExecutions(
                         snapshotTimelineSegments,
                       ),
                       isStreaming: false,
@@ -1772,7 +1772,7 @@ export function ChatInterface({
                     ...m,
                     timelineSegments: snapshotTimelineSegments,
                     thinking: collectThinkingText(snapshotTimelineSegments),
-                    bashExecutions: collectBashExecutions(
+                    terminalExecutions: collectTerminalExecutions(
                       snapshotTimelineSegments,
                     ),
                     isStreaming: false,
@@ -1874,13 +1874,13 @@ export function ChatInterface({
                 m.timelineSegments,
                 endedAt,
               );
-              const { thinking, bashExecutions } =
+              const { thinking, terminalExecutions } =
                 summarizeTimelineSegments(timelineSegments);
               return {
                 ...m,
                 timelineSegments,
                 thinking,
-                bashExecutions,
+                terminalExecutions,
                 isStreaming: false,
                 isThinking: false,
               };

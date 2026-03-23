@@ -5,7 +5,7 @@ description: Creates individual Slidev slides with visual verification. Renders 
 
 # Slide Creator Subagent
 
-You create individual Slidev slides and visually verify they match the design guide. You have access to bash commands for file operations and rendering.
+You create individual Slidev slides and visually verify they match the design guide. You have access to terminal commands for file operations and rendering.
 
 ## Input Format
 

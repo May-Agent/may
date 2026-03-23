@@ -7,19 +7,20 @@ use aither_agent::specialized::{SubagentFileMount, SubagentTool};
 use aither_agent::webfetch::WebFetchTool;
 use aither_agent::websearch::WebSearchTool;
 use aither_agent::{
-    Agent, AgentError, AgentEvent, AgentKind, BashAgentBuilder, BrowserBackend, CheckpointContext,
-    CompactResult, HCons, Hook, TurnBoundaryAction, TurnBoundaryContext,
+    Agent, AgentError, AgentEvent, AgentKind, BrowserBackend, CheckpointContext, CompactResult,
+    HCons, Hook, TerminalAgentBuilder, TurnBoundaryAction, TurnBoundaryContext,
 };
 use aither_cloud::{
     CloudProvider, claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI,
 };
 use aither_core::image::{ImageGenerator, Prompt, Size};
-use aither_core::llm::{Message as LlmMessage, Tool, ToolOutput};
+use aither_core::llm::{Message as LlmMessage, Tool, ToolOutput, model::Ability};
 use aither_sandbox::{
-    BashMode, BashTool, ContainerExecHandle, ContainerShellRuntime, ShellRuntimeAvailability,
-    SshServer,
+    ContainerExecHandle, ContainerShellRuntime, ShellRuntimeAvailability, SshServer, TerminalMode,
+    TerminalTool,
     permission::{NoopPermissionHandler, PermissionError, PermissionHandler},
 };
+use askama::Template;
 use executor_core::DefaultExecutor;
 use futures_lite::{Stream, StreamExt};
 
@@ -250,11 +251,11 @@ impl core::str::FromStr for PermissionRequestMode {
     }
 }
 
-impl From<BashMode> for PermissionRequestMode {
-    fn from(value: BashMode) -> Self {
+impl From<TerminalMode> for PermissionRequestMode {
+    fn from(value: TerminalMode) -> Self {
         match value {
-            BashMode::Sandboxed | BashMode::Network => Self::Default,
-            BashMode::Unsafe => Self::Unsafe,
+            TerminalMode::Sandboxed | TerminalMode::Network => Self::Default,
+            TerminalMode::Unsafe => Self::Unsafe,
         }
     }
 }
@@ -297,12 +298,12 @@ impl core::str::FromStr for PermissionHistoryMode {
     }
 }
 
-impl From<BashMode> for PermissionHistoryMode {
-    fn from(value: BashMode) -> Self {
+impl From<TerminalMode> for PermissionHistoryMode {
+    fn from(value: TerminalMode) -> Self {
         match value {
-            BashMode::Sandboxed => Self::Sandboxed,
-            BashMode::Network => Self::Network,
-            BashMode::Unsafe => Self::Unsafe,
+            TerminalMode::Sandboxed => Self::Sandboxed,
+            TerminalMode::Network => Self::Network,
+            TerminalMode::Unsafe => Self::Unsafe,
         }
     }
 }
@@ -367,7 +368,7 @@ impl PermissionApprover {
         db: &crate::db::ChatDb,
         session_id: &str,
         request_id: &str,
-        mode: BashMode,
+        mode: TerminalMode,
         script: &str,
     ) -> Result<(), PermissionError> {
         let content = serde_json::to_string(&crate::session::history::PermissionRequestData {
@@ -394,7 +395,7 @@ impl PermissionApprover {
 
     pub async fn request_and_wait(
         &self,
-        mode: BashMode,
+        mode: TerminalMode,
         script: String,
     ) -> Result<bool, PermissionError> {
         let Some(session_id) = self.session_id.clone() else {
@@ -403,7 +404,7 @@ impl PermissionApprover {
             )));
         };
 
-        if mode == BashMode::Network
+        if mode == TerminalMode::Network
             && let Some(runtime_service) = &self.runtime_service
             && runtime_service
                 .db()
@@ -455,10 +456,10 @@ impl Default for PermissionApprover {
 }
 
 impl PermissionHandler for PermissionApprover {
-    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
+    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
         match mode {
-            BashMode::Sandboxed => Ok(true),
-            BashMode::Network | BashMode::Unsafe => {
+            TerminalMode::Sandboxed => Ok(true),
+            TerminalMode::Network | TerminalMode::Unsafe => {
                 let approved = self.request_and_wait(mode, script.to_string()).await?;
                 if approved {
                     Ok(true)
@@ -476,14 +477,14 @@ impl PermissionHandler for PermissionApprover {
         true
     }
 
-    async fn will_wait_for_approval(&self, mode: BashMode, _script: &str) -> bool {
+    async fn will_wait_for_approval(&self, mode: TerminalMode, _script: &str) -> bool {
         let Some(session_id) = self.session_id.as_deref() else {
             return false;
         };
         match mode {
-            BashMode::Sandboxed => false,
-            BashMode::Unsafe => true,
-            BashMode::Network => {
+            TerminalMode::Sandboxed => false,
+            TerminalMode::Unsafe => true,
+            TerminalMode::Network => {
                 let Some(runtime_service) = &self.runtime_service else {
                     return false;
                 };
@@ -550,7 +551,7 @@ impl MayPermissionHandler {
 }
 
 impl PermissionHandler for MayPermissionHandler {
-    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
+    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
         match &self.approver {
             Some(approver) => approver.check(mode, script).await,
             None => NoopPermissionHandler.check(mode, script).await,
@@ -575,7 +576,7 @@ impl PermissionHandler for MayPermissionHandler {
         allowed
     }
 
-    async fn will_wait_for_approval(&self, mode: BashMode, script: &str) -> bool {
+    async fn will_wait_for_approval(&self, mode: TerminalMode, script: &str) -> bool {
         match &self.approver {
             Some(approver) => approver.will_wait_for_approval(mode, script).await,
             None => {
@@ -640,7 +641,11 @@ impl Hook for ContextSnapshotHook {
             return None;
         };
         let record = match crate::session::ContextSnapshotRecord::from_checkpoint(ctx) {
-            Ok(record) => record,
+            Ok(record) => match db.get_session_runtime(&self.session_id).await {
+                Ok(Some(runtime)) => record.with_terminal_runtime(&runtime),
+                Ok(None) => record,
+                Err(error) => return Some(error.to_string()),
+            },
             Err(error) => return Some(error.to_string()),
         };
         match crate::session::persist_context_snapshot_record(db, &self.session_id, record).await {
@@ -676,11 +681,13 @@ pub enum AgentEnvironment {
 pub struct MayAgentConfig {
     /// The LLM provider.
     pub llm: CloudProvider,
+    /// The concrete model identifier selected for this request.
+    pub model_id: String,
     /// Provider ID selected for this request.
     pub provider_id: String,
     /// Optional embedding provider used for semantic retrieval tools.
     pub search_embedder: Option<aither_cloud::CloudEmbedder>,
-    /// Session sandbox directory (BashTool creates working dir inside).
+    /// Session sandbox directory (TerminalTool creates working dir inside).
     pub sandbox_dir: PathBuf,
     /// May directory (~/.may/).
     pub may_dir: PathBuf,
@@ -698,7 +705,7 @@ pub struct MayAgentConfig {
     pub ask_user_broker: AskUserBroker,
     /// Image generation provider and model.
     pub image_generator: Option<ImageGeneratorConfig>,
-    /// Preconfigured SSH servers available for `bash` ssh mode.
+    /// Preconfigured SSH servers available for `terminal` ssh mode.
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,
@@ -753,6 +760,7 @@ struct ImagineTool {
 struct RuntimeSystemContext {
     memory_path: PathBuf,
     last_memory_content: String,
+    terminal_runtime: Option<TerminalRuntimeContext>,
     workspace: Option<Workspace>,
     browser: Option<Browser>,
     profile_persona: Option<ProfilePersona>,
@@ -769,6 +777,7 @@ impl RuntimeSystemContext {
         Self {
             memory_path,
             last_memory_content: memory_content,
+            terminal_runtime: None,
             workspace: None,
             browser: None,
             profile_persona: None,
@@ -779,6 +788,11 @@ impl RuntimeSystemContext {
             native_voice_input: None,
             platform: None,
         }
+    }
+
+    fn with_terminal_runtime(mut self, terminal_runtime: TerminalRuntimeContext) -> Self {
+        self.terminal_runtime = Some(terminal_runtime);
+        self
     }
 
     fn with_workspace(mut self, workspace: Workspace) -> Self {
@@ -829,6 +843,7 @@ impl RuntimeSystemContext {
     fn reconcile(&mut self, context: &mut aither_agent::Context) {
         let memory = build_memory_context(&self.last_memory_content);
         reconcile_system_block(context, Some(&memory));
+        reconcile_system_block(context, self.terminal_runtime.as_ref());
         reconcile_system_block(context, self.workspace.as_ref());
         reconcile_system_block(context, self.browser.as_ref());
         reconcile_system_block(context, self.profile_persona.as_ref());
@@ -1016,18 +1031,21 @@ impl MayAgent {
 
         let executor = DefaultExecutor;
 
-        // Create bash tool in sandbox dir (BashTool creates its own working directory inside)
-        let bash_tool: BashTool<MayPermissionHandler, DefaultExecutor> = BashTool::new_exact(
-            &config.sandbox_dir,
-            MayPermissionHandler::new(
-                config.permission_approver.clone(),
-                config.network_policy.clone(),
-                config.profile_id.clone(),
-            ),
-            executor,
-        )
-        .await
-        .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
+        // Create the terminal command tool in the sandbox dir.
+        // `TerminalTool` is a legacy type name; execution is terminal-first and
+        // does not guarantee a literal shell implementation for every command.
+        let terminal_tool: TerminalTool<MayPermissionHandler, DefaultExecutor> =
+            TerminalTool::new_exact(
+                &config.sandbox_dir,
+                MayPermissionHandler::new(
+                    config.permission_approver.clone(),
+                    config.network_policy.clone(),
+                    config.profile_id.clone(),
+                ),
+                executor,
+            )
+            .await
+            .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
 
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
@@ -1059,6 +1077,13 @@ impl MayAgent {
         let memory_content = async_fs::read_to_string(&memory_path).await?;
         let mut runtime_system_context =
             RuntimeSystemContext::new(memory_path.clone(), memory_content.clone());
+        let terminal_runtime = build_terminal_runtime_context(
+            &config,
+            &session_paths,
+            aither_models::lookup(config.model_id.as_str()),
+        );
+        runtime_system_context =
+            runtime_system_context.with_terminal_runtime(terminal_runtime.clone());
 
         // Clone LLM for tools that need it before it's moved into the builder
         let fast_llm = config.llm.clone();
@@ -1122,8 +1147,17 @@ impl MayAgent {
         let transcript_file = session_paths.transcript_path();
         let transcript_path = transcript_file.display().to_string();
 
-        let skills_dir = config.sandbox_dir.join("skills");
-        let subagents_dir = config.sandbox_dir.join("subagents");
+        let (skills_dir, subagents_dir) = match config.profile_id.as_deref() {
+            Some(profile_id) => {
+                let profile_home = crate::session::MayHomePaths::new(config.may_dir.clone())
+                    .profile_home(profile_id);
+                (profile_home.skills_dir(), profile_home.subagents_dir())
+            }
+            None => {
+                let home = crate::session::MayHomePaths::new(config.may_dir.clone());
+                (home.skills_dir(), home.subagents_dir())
+            }
+        };
 
         // Shell runtime depends on the environment
         let availability = match &config.environment {
@@ -1147,7 +1181,7 @@ impl MayAgent {
         } else {
             config.max_iterations
         };
-        let mut builder = BashAgentBuilder::new(config.llm, bash_tool)
+        let mut builder = TerminalAgentBuilder::new(config.llm, terminal_tool)
             .tool(websearch)
             .tool(webfetch)
             .tool(ask)
@@ -1185,6 +1219,7 @@ impl MayAgent {
             .transcript_path(transcript_path)
             .transcript(transcript_file)
             .system(build_memory_context(&memory_content))
+            .system(terminal_runtime)
             .max_iterations(effective_max_iterations);
 
         if let Some(voice_hint) = build_native_voice_context(config.native_voice_input) {
@@ -1476,6 +1511,7 @@ impl MayAgent {
 
         let config = MayAgentConfig {
             llm,
+            model_id: model.to_string(),
             provider_id,
             search_embedder,
             sandbox_dir,
@@ -1747,6 +1783,7 @@ async fn build_cloud_provider_from_instance(
             OpenAI::new(api_key)
                 .with_base_url(url)
                 .with_model(model)
+                .with_chat_completions_api()
                 .into()
         }
     };
@@ -1840,6 +1877,25 @@ struct Browser {
     cdp_endpoint: Option<String>,
 }
 
+#[derive(Clone, Template)]
+#[template(path = "terminal_runtime_context.xml", escape = "none")]
+struct TerminalRuntimeContextTemplate {
+    model_id: String,
+    home_directory: String,
+    session_directory: String,
+    current_working_directory: String,
+    home_layout: Vec<String>,
+    session_layout: Vec<String>,
+    command_rules: Vec<String>,
+    modality_support: Vec<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TerminalRuntimeContext {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
 #[derive(Clone, serde::Serialize)]
 struct Workspace {
     sandbox: String,
@@ -1929,6 +1985,86 @@ fn build_browser_context(cdp_endpoint: Option<&str>) -> Browser {
     Browser {
         cdp_endpoint: cdp_endpoint.map(str::to_string),
     }
+}
+
+fn build_terminal_runtime_context(
+    config: &MayAgentConfig,
+    session_paths: &SessionPaths,
+    model_info: Option<&aither_models::ModelEntry>,
+) -> TerminalRuntimeContext {
+    let mut modality_support = Vec::new();
+    if let Some(info) = model_info {
+        modality_support.push(resolved_model_capability(info.id()));
+        if info.has_ability(Ability::Vision) {
+            modality_support.push("Image input is supported natively.".to_string());
+        }
+        if info.has_ability(Ability::Audio) {
+            modality_support.push("Audio input is supported natively.".to_string());
+        }
+        if info.has_ability(Ability::AudioOutput) {
+            modality_support.push("Audio output is supported natively.".to_string());
+        }
+        if info.has_ability(Ability::Video) {
+            modality_support.push("Video input is supported natively.".to_string());
+        }
+        if info.has_ability(Ability::Pdf) {
+            modality_support.push("PDF/document input is supported natively.".to_string());
+        }
+        if info.has_ability(Ability::ComputerUse) {
+            modality_support.push(
+                "Computer-use capable runtime interactions are supported by the model.".to_string(),
+            );
+        }
+    }
+    if modality_support.is_empty() {
+        modality_support.push(
+            "No additional multimodal abilities were resolved for this model; rely on persisted files and CLI tools when media cannot be viewed directly.".to_string(),
+        );
+    }
+
+    let template = TerminalRuntimeContextTemplate {
+        model_id: config.model_id.clone(),
+        home_directory: session_paths.home_root().display().to_string(),
+        session_directory: session_paths.root().display().to_string(),
+        current_working_directory: config.cwd.display().to_string(),
+        home_layout: vec![
+            "/sessions - per-session sandboxes under this home environment".to_string(),
+            "/skills - profile/home-scoped skills, exposed read-only inside the session"
+                .to_string(),
+            "/subagents - profile/home-scoped subagents, exposed read-only inside the session"
+                .to_string(),
+        ],
+        session_layout: vec![
+            "/tmp - disposable temporary files".to_string(),
+            "/artifacts - durable user-facing outputs".to_string(),
+            "/files - durable uploaded or recalled files".to_string(),
+            "/outputs - durable overflow and full command outputs".to_string(),
+            "/data - durable session-owned state".to_string(),
+            "tasks.md - canonical task/plan document for long-running work".to_string(),
+        ],
+        command_rules: vec![
+            "Native tools are only the terminal command tool (`terminal`, legacy wire name), `terminal_kill`, `terminal_input`, and `terminal_read`. Higher-level capabilities such as `websearch`, `webfetch`, `ask`, `environment`, `session`, `task`, and registration commands are CLI commands auto-exposed through IPC, not additional native tools.".to_string(),
+            "The default execution target is the current home environment unless the terminal command tool explicitly targets SSH mode.".to_string(),
+            "Every terminal command call uses the legacy native tool name `terminal` today and must set timeout. timeout=0 means immediate background execution. timeout>0 runs in foreground until timeout and then promotes to a background task if still running.".to_string(),
+            "Background tasks persist output to files. Use terminal_read for incremental reads, terminal_input for stdin, and terminal_kill to stop them.".to_string(),
+            "Preview output may be cleaned or structurally compressed. Use `terminal` with raw=true when exact output fidelity is required.".to_string(),
+            "If output overflows or context compacts, recover full results from files in outputs/ or other referenced session files instead of assuming the inline preview was complete.".to_string(),
+            "Use tasks.md as the canonical working document for multi-step work; it should stay accurate enough to resume after context loss.".to_string(),
+        ],
+        modality_support,
+    };
+    TerminalRuntimeContext {
+        content: template
+            .render()
+            .unwrap_or_else(|error| panic!("failed to render terminal runtime context: {error}")),
+    }
+}
+
+fn resolved_model_capability(model_id: &str) -> String {
+    let mut text = String::with_capacity(model_id.len() + 16);
+    text.push_str("Resolved model: ");
+    text.push_str(model_id);
+    text
 }
 
 fn build_workspace_context(workspace: &MayWorkspace) -> Workspace {
@@ -2120,6 +2256,31 @@ mod tests {
         assert!(
             memory.contains(&build_memory_context_content("after")),
             "unexpected memory block: {memory}"
+        );
+    }
+
+    #[test]
+    fn terminal_runtime_context_is_reconciled_as_system_block() {
+        let dir = tempdir().expect("temp dir should be created");
+        let memory_path = dir.path().join("MEMORY.md");
+        std::fs::write(&memory_path, "remember this").expect("memory file should be written");
+
+        let mut runtime_context =
+            RuntimeSystemContext::new(memory_path, "remember this".to_string())
+                .with_terminal_runtime(super::TerminalRuntimeContext {
+                    content: "<terminal_runtime_context><model_id>demo-model</model_id></terminal_runtime_context>"
+                        .to_string(),
+                });
+        let mut context = aither_agent::Context::default();
+        runtime_context.reconcile(&mut context);
+
+        let terminal_runtime = context
+            .system_blocks()
+            .get("terminal_runtime_context")
+            .expect("terminal runtime block should be present");
+        assert!(
+            terminal_runtime.contains("demo-model"),
+            "unexpected terminal runtime block: {terminal_runtime}"
         );
     }
 }

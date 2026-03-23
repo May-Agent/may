@@ -60,7 +60,7 @@ impl SessionStore {
     }
 
     /// Get path for a session's sandbox directory.
-    /// BashTool will create its own working directory inside this.
+    /// TerminalTool will create its own working directory inside this.
     pub fn sandbox_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
         self.session_dir(id, profile_id)
     }

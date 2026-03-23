@@ -58,13 +58,32 @@ fn parse_cli_mode(args: &[String]) -> CliMode {
     }
 }
 
+fn parse_cli_mode_from_env() -> CliMode {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("ui") => CliMode::Ui(args[2..].to_vec()),
+        Some(_) => {
+            let prompt = std::env::args_os()
+                .skip(1)
+                .map(|part| {
+                    part.into_string().unwrap_or_else(|value| {
+                        panic!("one-shot prompt argument must be valid UTF-8: {:?}", value)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            CliMode::OneShot(prompt)
+        }
+        None => CliMode::Tui,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
     ensure_rustls_provider();
 
-    let args: Vec<String> = std::env::args().collect();
-    let cli_mode = parse_cli_mode(&args);
+    let cli_mode = parse_cli_mode_from_env();
     let is_ui_mode = matches!(cli_mode, CliMode::Ui(_));
 
     // Initialize logging to file (shared by both UI server and TUI modes)
@@ -216,7 +235,8 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
 
     let (workspace_broker, workspace_queue) = workspace_request::channel();
     let (ask_user_broker, ask_user_queue) = ask_user::channel();
-    let local_runtime = LocalSessionRuntime::new(app.session_manager.db().clone());
+    let mut local_runtime = LocalSessionRuntime::new(app.session_manager.db().clone());
+    local_runtime.enable_oneshot_restricted_mode();
     let runtime_deps = RuntimeDeps::new(
         local_runtime,
         workspace_broker,
@@ -518,115 +538,74 @@ fn render_oneshot_event(
     result: &Result<AgentEvent, aither_agent::AgentError>,
 ) -> anyhow::Result<()> {
     match result {
-        Ok(AgentEvent::RunStart {
-            run_id,
-            max_iterations,
-        }) => {
-            writeln!(
-                stderr,
-                "[run_start] run_id={run_id} max_iterations={max_iterations}"
-            )?;
+        Ok(AgentEvent::RunStart { .. }) => {
+            writeln!(stderr, "Running...")?;
         }
         Ok(AgentEvent::Reasoning(text)) => {
             if !text.trim().is_empty() {
-                writeln!(stderr, "[reasoning] {text}")?;
+                writeln!(stderr, "Thinking: {text}")?;
             }
         }
-        Ok(AgentEvent::ToolCallStart {
-            name, arguments, ..
-        }) => {
-            writeln!(stderr, "[tool_start] {name} {arguments}")?;
+        Ok(AgentEvent::ToolCallStart { name, .. }) => {
+            writeln!(stderr, "Tool: {name}")?;
         }
         Ok(AgentEvent::ToolCallEnd { name, result, .. }) => match result {
-            Ok(_) => writeln!(stderr, "[tool_end] {name} ok")?,
-            Err(error) => writeln!(stderr, "[tool_end] {name} error: {error}")?,
+            Ok(_) => writeln!(stderr, "Tool finished: {name}")?,
+            Err(error) => writeln!(stderr, "Tool failed: {name}: {error}")?,
         },
-        Ok(AgentEvent::TurnComplete {
-            turn,
-            has_tool_calls,
-        }) => {
-            writeln!(
-                stderr,
-                "[turn_complete] turn={turn} has_tool_calls={has_tool_calls}"
-            )?;
-        }
-        Ok(AgentEvent::Checkpoint {
-            reason,
-            turn,
-            phase,
-            message_count,
+        Ok(AgentEvent::TurnComplete { .. }) => {}
+        Ok(AgentEvent::Checkpoint { .. }) => {}
+        Ok(AgentEvent::BackgroundTaskStarted {
+            task_id,
+            output_file,
             ..
         }) => {
             writeln!(
                 stderr,
-                "[checkpoint] reason={reason:?} turn={turn} phase={phase:?} messages={message_count}"
+                "Background task started: {task_id} (output: {output_file})"
             )?;
         }
-        Ok(AgentEvent::BackgroundTaskStarted {
-            task_id,
-            output_preview,
-            output_file,
-        }) => {
-            writeln!(
-                stderr,
-                "[background_started] task_id={task_id} output_file={output_file} preview={output_preview}"
-            )?;
-        }
-        Ok(AgentEvent::BackgroundTaskCompleted { task_id, result }) => {
-            writeln!(
-                stderr,
-                "[background_completed] task_id={task_id} result={result}"
-            )?;
+        Ok(AgentEvent::BackgroundTaskCompleted { task_id, .. }) => {
+            writeln!(stderr, "Background task completed: {task_id}")?;
         }
         Ok(AgentEvent::TerminalInputNeeded { task_id, notice }) => {
             writeln!(
                 stderr,
-                "[terminal_input_needed] task_id={task_id:?} notice={notice}"
+                "Terminal input needed{}: {}",
+                task_id
+                    .as_deref()
+                    .map(|id| {
+                        let mut text = String::from(" for ");
+                        text.push_str(id);
+                        text
+                    })
+                    .unwrap_or_default(),
+                notice,
             )?;
         }
-        Ok(AgentEvent::RunPaused {
-            reason,
-            tool_call_id,
-        }) => {
-            writeln!(
-                stderr,
-                "[run_paused] reason={reason:?} tool_call_id={tool_call_id}"
-            )?;
+        Ok(AgentEvent::RunPaused { reason, .. }) => {
+            writeln!(stderr, "Paused: {reason:?}")?;
         }
-        Ok(AgentEvent::RunResumed {
-            reason,
-            tool_call_id,
-        }) => {
-            writeln!(
-                stderr,
-                "[run_resumed] reason={reason:?} tool_call_id={tool_call_id}"
-            )?;
+        Ok(AgentEvent::RunResumed { reason, .. }) => {
+            writeln!(stderr, "Resumed: {reason:?}")?;
         }
-        Ok(AgentEvent::SkillActivated {
-            name,
-            matched_trigger,
-            allowed_tools,
-            resource_paths,
-        }) => {
-            writeln!(
-                stderr,
-                "[skill_activated] name={name} matched_trigger={matched_trigger:?} allowed_tools={allowed_tools:?} resource_paths={resource_paths:?}"
-            )?;
+        Ok(AgentEvent::SkillActivated { name, .. }) => {
+            writeln!(stderr, "Skill activated: {name}")?;
         }
         Ok(AgentEvent::Usage(usage)) => {
             writeln!(
                 stderr,
-                "[usage] prompt={:?} completion={:?} total={:?}",
+                "Usage: prompt={:?} completion={:?} total={:?}",
                 usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
             )?;
         }
         Ok(AgentEvent::Complete { .. }) => {}
         Ok(AgentEvent::Text(_)) => {}
         Ok(AgentEvent::Error(error)) => {
-            writeln!(stderr, "[error] {error}")?;
+            writeln!(stderr, "Error: {error}")?;
         }
         Err(error) => {
-            writeln!(stderr, "[error] {error}")?;
+            writeln!(stderr, "Error: {error}")?;
         }
     }
     stderr.flush()?;

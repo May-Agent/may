@@ -360,6 +360,7 @@ dependencies = [
  "schemars 1.2.0",
  "serde",
  "serde_json",
+ "shell-words",
  "strsim",
  "thiserror 2.0.18",
  "tracing",

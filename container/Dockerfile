@@ -74,17 +74,17 @@ RUN uv pip install --system \
     pillow \
     opencv-python-headless
 
-# Playwright client only (Chromium runs on host, connected via CDP)
-RUN uv pip install --system playwright
-
-# Node.js + CLI tooling (browser automation + ast-grep)
-RUN dnf install -y nodejs npm && dnf clean all
-RUN npm install -g @playwright/cli@latest @ast-grep/cli@latest
-
 # Bun runtime
 RUN curl -fsSL https://bun.sh/install | bash
 
-# leash-ipc binary for IPC command wrappers inside container bash sessions.
+# Playwright client only (Chromium runs on host, connected via CDP)
+RUN uv pip install --system playwright
+
+# JavaScript runtime + CLI tooling (browser automation + ast-grep)
+RUN dnf install -y nodejs && dnf clean all
+RUN bun add --global @playwright/cli@latest @ast-grep/cli@latest
+
+# leash-ipc binary for IPC command wrappers inside container terminal sessions.
 COPY --from=leash-ipc-builder /build/leash-ipc/target/debug/leash-ipc /usr/local/bin/leash-ipc
 RUN chmod +x /usr/local/bin/leash-ipc
 

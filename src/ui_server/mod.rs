@@ -1,6 +1,5 @@
 mod artifacts;
 mod attachments;
-mod bash_parsing;
 mod browser;
 mod chat;
 mod config;
@@ -17,6 +16,7 @@ mod remote_access;
 mod sessions;
 mod state;
 mod tasks;
+mod terminal_parsing;
 mod title_generation;
 mod types;
 

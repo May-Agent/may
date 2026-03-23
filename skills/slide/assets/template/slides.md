@@ -33,7 +33,7 @@ It allows you to create beautiful slides with **Markdown** and **Vue components*
 <v-clicks>
 
 - 📝 **Markdown-based** - Focus on content, style it later
-- 🎨 **Themeable** - Share and reuse themes via npm
+- 🎨 **Themeable** - Share and reuse themes via Bun packages
 - 🧑‍💻 **Developer Friendly** - Built-in code highlighting, live coding
 - 🤹 **Interactive** - Embed Vue components directly
 - 📤 **Exportable** - PDF, PNG, or host as SPA

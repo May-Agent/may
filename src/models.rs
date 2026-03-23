@@ -222,12 +222,16 @@ pub fn ability_to_label(ability: Ability) -> String {
         Ability::ToolUse => "tool_use".to_string(),
         Ability::Vision => "vision".to_string(),
         Ability::Audio => "audio".to_string(),
+        Ability::AudioOutput => "audio_output".to_string(),
         Ability::Video => "video".to_string(),
         Ability::WebSearch => "web_search".to_string(),
         Ability::Pdf => "pdf".to_string(),
         Ability::CodeExecution => "code_execution".to_string(),
         Ability::Reasoning => "reasoning".to_string(),
         Ability::ImageGeneration => "image_generation".to_string(),
+        Ability::ComputerUse => "computer_use".to_string(),
+        Ability::PromptCaching => "prompt_caching".to_string(),
+        Ability::AssistantPrefill => "assistant_prefill".to_string(),
         _ => panic!("unsupported ability variant: {ability:?}"),
     }
 }

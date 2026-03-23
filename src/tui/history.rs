@@ -1,4 +1,4 @@
-//! Input history management (like bash).
+//! Input history management for terminal command recall.
 
 use std::fs;
 use std::path::{Path, PathBuf};

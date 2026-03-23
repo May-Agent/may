@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use aither_core::llm::Tool;
 use aither_sandbox::{
-    BashArgs, BashExecutionMode, BashMode, BashResult, BashTool, BollardContainerExec, Configured,
-    ContainerExecHandle, ContainerLaunchSpec, ContainerShellRuntime, OutputFormat,
-    PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
-    ToolRegistryBuilder, permission::PermissionError,
+    BollardContainerExec, Configured, ContainerExecHandle, ContainerLaunchSpec,
+    ContainerShellRuntime, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
+    ShellSessionRegistry, SshServer, TerminalArgs, TerminalExecutionMode, TerminalMode,
+    TerminalResult, TerminalTool, ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -293,7 +293,7 @@ fn workspace_prepare_error(path: &std::path::Path, error: &impl std::fmt::Displa
     path_error_text("failed to prepare workspace ", path, error)
 }
 
-fn init_bash_tool_error(prefix: &str, error: &impl std::fmt::Display) -> String {
+fn init_terminal_tool_error(prefix: &str, error: &impl std::fmt::Display) -> String {
     prefixed_error(prefix, error)
 }
 
@@ -372,7 +372,7 @@ struct SchedulerPermissionHandler {
 }
 
 impl PermissionHandler for SchedulerPermissionHandler {
-    async fn check(&self, _mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
+    async fn check(&self, _mode: TerminalMode, _script: &str) -> Result<bool, PermissionError> {
         Ok(true)
     }
 
@@ -1063,16 +1063,16 @@ impl TaskRuntime {
         script: &TaskScript,
         command: String,
     ) -> Result<String, String> {
-        let bash_tool = self
-            .local_bash_tool(
+        let terminal_tool = self
+            .local_terminal_tool(
                 &task.profile_id,
                 NetworkAccessSource::TaskLocal,
                 script,
                 task.needs_network,
             )
             .await?;
-        run_bash_script(
-            &bash_tool,
+        run_terminal_command(
+            &terminal_tool,
             local_task_execution_mode(task.needs_network),
             None,
             command,
@@ -1081,8 +1081,8 @@ impl TaskRuntime {
     }
 
     async fn validate_local(&self, profile_id: &str, script: &TaskScript) -> Result<(), String> {
-        let bash_tool = self
-            .local_bash_tool(
+        let terminal_tool = self
+            .local_terminal_tool(
                 profile_id,
                 NetworkAccessSource::TaskValidationLocal,
                 script,
@@ -1090,8 +1090,8 @@ impl TaskRuntime {
             )
             .await?;
 
-        run_bash_script(
-            &bash_tool,
+        run_terminal_command(
+            &terminal_tool,
             local_task_execution_mode(false),
             None,
             build_validation_command(script),
@@ -1100,13 +1100,13 @@ impl TaskRuntime {
         .map(|_| ())
     }
 
-    async fn local_bash_tool(
+    async fn local_terminal_tool(
         &self,
         profile_id: &str,
         source: NetworkAccessSource,
         script: &TaskScript,
         allow_network: bool,
-    ) -> Result<BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
+    ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: true,
             container: false,
@@ -1115,7 +1115,7 @@ impl TaskRuntime {
         let registry =
             Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
-        BashTool::new_exact(
+        TerminalTool::new_exact(
             &script.host_working_dir,
             SchedulerPermissionHandler {
                 db: self.db.clone(),
@@ -1127,7 +1127,9 @@ impl TaskRuntime {
             DefaultExecutor,
         )
         .await
-        .map_err(|error| init_bash_tool_error("failed to initialize local bash tool: ", &error))
+        .map_err(|error| {
+            init_terminal_tool_error("failed to initialize local terminal tool: ", &error)
+        })
         .map(|tool| {
             tool.with_shell_sessions(shell_sessions)
                 .with_writable_paths([script.host_working_dir.clone()])
@@ -1141,11 +1143,11 @@ impl TaskRuntime {
         crate::remote_profile::resolve_remote_profile_server(profile, configured_servers.as_slice())
     }
 
-    async fn remote_bash_tool(
+    async fn remote_terminal_tool(
         &self,
         profile: &profiles::Model,
         working_dir: &std::path::Path,
-    ) -> Result<BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
+    ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
         let ssh_server = self.resolve_remote_server(profile)?;
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
@@ -1159,7 +1161,7 @@ impl TaskRuntime {
         .map_err(|error| prefixed_error("failed to configure remote ssh server: ", &error))?;
         let registry = Arc::new(ToolRegistryBuilder::new().build(working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
-        BashTool::new_exact(
+        TerminalTool::new_exact(
             working_dir,
             SchedulerPermissionHandler {
                 db: self.db.clone(),
@@ -1171,7 +1173,9 @@ impl TaskRuntime {
             DefaultExecutor,
         )
         .await
-        .map_err(|error| init_bash_tool_error("failed to initialize remote bash tool: ", &error))
+        .map_err(|error| {
+            init_terminal_tool_error("failed to initialize remote terminal tool: ", &error)
+        })
         .map(|tool| {
             tool.with_shell_sessions(shell_sessions)
                 .with_writable_paths([working_dir.to_path_buf()])
@@ -1189,8 +1193,8 @@ impl TaskRuntime {
         tokio::fs::create_dir_all(working_dir.join("outputs"))
             .await
             .map_err(|error| workspace_prepare_error(&working_dir, &error))?;
-        let bash_tool = self.remote_bash_tool(profile, &working_dir).await?;
-        run_bash_script(&bash_tool, BashExecutionMode::Ssh, None, command).await
+        let terminal_tool = self.remote_terminal_tool(profile, &working_dir).await?;
+        run_terminal_command(&terminal_tool, TerminalExecutionMode::Ssh, None, command).await
     }
 
     async fn validate_remote(
@@ -1198,12 +1202,12 @@ impl TaskRuntime {
         profile: &profiles::Model,
         script: &TaskScript,
     ) -> Result<(), String> {
-        let bash_tool = self
-            .remote_bash_tool(profile, script.host_working_dir.as_path())
+        let terminal_tool = self
+            .remote_terminal_tool(profile, script.host_working_dir.as_path())
             .await?;
-        run_bash_script(
-            &bash_tool,
-            BashExecutionMode::Ssh,
+        run_terminal_command(
+            &terminal_tool,
+            TerminalExecutionMode::Ssh,
             None,
             build_validation_command(script),
         )
@@ -1292,8 +1296,8 @@ impl TaskRuntime {
         // /workspace inside container.
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
-        let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
-            BashTool::new_exact(
+        let terminal_tool: TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
+            TerminalTool::new_exact(
                 &workspace_dir,
                 SchedulerPermissionHandler {
                     db: self.db.clone(),
@@ -1306,14 +1310,20 @@ impl TaskRuntime {
             )
             .await
             .map_err(|error| {
-                init_bash_tool_error("failed to initialize container bash tool: ", &error)
+                init_terminal_tool_error("failed to initialize container terminal tool: ", &error)
             })?
             .with_shell_sessions(shell_sessions)
             .with_writable_paths([workspace_dir.clone()])
             .with_readable_paths([workspace_dir])
             .with_registry(registry);
 
-        let result = run_bash_script(&bash_tool, BashExecutionMode::Default, None, command).await;
+        let result = run_terminal_command(
+            &terminal_tool,
+            TerminalExecutionMode::Default,
+            None,
+            command,
+        )
+        .await;
         container_manager.touch_activity(&container_id).await;
         result
     }
@@ -1405,8 +1415,8 @@ impl TaskRuntime {
 
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
-        let bash_tool: BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
-            BashTool::new_exact(
+        let terminal_tool: TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
+            TerminalTool::new_exact(
                 &workspace_dir,
                 SchedulerPermissionHandler {
                     db: self.db.clone(),
@@ -1419,16 +1429,16 @@ impl TaskRuntime {
             )
             .await
             .map_err(|error| {
-                init_bash_tool_error("failed to initialize container bash tool: ", &error)
+                init_terminal_tool_error("failed to initialize container terminal tool: ", &error)
             })?
             .with_shell_sessions(shell_sessions)
             .with_writable_paths([workspace_dir.clone()])
             .with_readable_paths([workspace_dir])
             .with_registry(registry);
 
-        let result = run_bash_script(
-            &bash_tool,
-            BashExecutionMode::Default,
+        let result = run_terminal_command(
+            &terminal_tool,
+            TerminalExecutionMode::Default,
             None,
             build_validation_command(script),
         )
@@ -1439,11 +1449,11 @@ impl TaskRuntime {
     }
 }
 
-const fn local_task_execution_mode(needs_network: bool) -> BashExecutionMode {
+const fn local_task_execution_mode(needs_network: bool) -> TerminalExecutionMode {
     if needs_network {
-        BashExecutionMode::Default
+        TerminalExecutionMode::Default
     } else {
-        BashExecutionMode::Sandboxed
+        TerminalExecutionMode::Sandboxed
     }
 }
 
@@ -1466,14 +1476,14 @@ impl TaskScheduler {
     }
 }
 
-async fn run_bash_script(
-    bash_tool: &BashTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
-    mode: BashExecutionMode,
+async fn run_terminal_command(
+    terminal_tool: &TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
+    mode: TerminalExecutionMode,
     ssh_server_id: Option<String>,
     script: String,
 ) -> Result<String, String> {
-    let output = bash_tool
-        .call(BashArgs {
+    let output = terminal_tool
+        .call(TerminalArgs {
             script,
             mode,
             ssh_server_id,
@@ -1483,18 +1493,18 @@ async fn run_bash_script(
             raw: false,
         })
         .await
-        .map_err(|error| prefixed_error("task bash execution failed: ", &error))?;
+        .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
 
     let payload = output
         .as_str()
-        .ok_or_else(|| "task bash execution returned non-text output".to_string())?;
+        .ok_or_else(|| "task terminal execution returned non-text output".to_string())?;
 
-    parse_bash_result(payload)
+    parse_terminal_result(payload)
 }
 
-fn parse_bash_result(payload: &str) -> Result<String, String> {
-    let result: BashResult = serde_json::from_str(payload)
-        .map_err(|error| prefixed_error("failed to parse bash result: ", &error))?;
+fn parse_terminal_result(payload: &str) -> Result<String, String> {
+    let result: TerminalResult = serde_json::from_str(payload)
+        .map_err(|error| prefixed_error("failed to parse terminal result: ", &error))?;
 
     if result.exit_code != 0 {
         return Err(task_script_failure(
@@ -1551,17 +1561,21 @@ fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
 mod tests {
     use super::TaskRuntime;
     use super::local_task_execution_mode;
-    use aither_sandbox::BashExecutionMode;
+    use aither_sandbox::TerminalExecutionMode;
     use tempfile::tempdir;
 
     use crate::db::{ChatDb, CreateScheduledTaskParams};
+    use crate::task_trigger::PersistedTaskTrigger;
 
     #[test]
     fn local_tasks_respect_needs_network_flag() {
-        assert_eq!(local_task_execution_mode(true), BashExecutionMode::Default);
+        assert_eq!(
+            local_task_execution_mode(true),
+            TerminalExecutionMode::Default
+        );
         assert_eq!(
             local_task_execution_mode(false),
-            BashExecutionMode::Sandboxed
+            TerminalExecutionMode::Sandboxed
         );
     }
 

@@ -1,7 +1,7 @@
 import type {
   ArtifactPreviewTarget,
   ArtifactViewerKind,
-  BashExecution,
+  TerminalExecution,
   Message,
   TimelineSegment,
 } from "@/types";
@@ -383,12 +383,12 @@ export function parseToolResultPayload(rawResult: unknown): ParsedToolResult {
     parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : undefined;
-  const hasBashShape =
+  const hasTerminalShape =
     !!parsedObject &&
     (Object.prototype.hasOwnProperty.call(parsedObject, 'stdout') ||
       Object.prototype.hasOwnProperty.call(parsedObject, 'stderr') ||
       Object.prototype.hasOwnProperty.call(parsedObject, 'exit_code'));
-  const hasStructuredBashOutput =
+  const hasStructuredTerminalOutput =
     !!parsedObject &&
     ['stdout', 'stderr'].some((key) => {
       const entry = parsedObject[key];
@@ -421,7 +421,7 @@ export function parseToolResultPayload(rawResult: unknown): ParsedToolResult {
       : undefined;
 
   const output =
-    typeof serializedParsed === 'string' && (hasBashShape || hasStructuredBashOutput)
+    typeof serializedParsed === 'string' && (hasTerminalShape || hasStructuredTerminalOutput)
       ? serializedParsed
       : typeof stdoutText === 'string' && stdoutText.trim().length > 0
       ? stdoutText
@@ -491,10 +491,10 @@ export function settleTimelineSegments(
 
 export function summarizeTimelineSegments(segments: TimelineSegment[]): {
   thinking: string;
-  bashExecutions: BashExecution[];
+  terminalExecutions: TerminalExecution[];
 } {
   const thinkingChunks: string[] = [];
-  const bashExecutions: BashExecution[] = [];
+  const terminalExecutions: TerminalExecution[] = [];
 
   for (const segment of segments) {
     if (segment.kind === "thinking") {
@@ -504,11 +504,11 @@ export function summarizeTimelineSegments(segments: TimelineSegment[]): {
     if (segment.kind === "tool") {
       continue;
     }
-    bashExecutions.push(...segment.commands.map((command) => ({ ...command })));
+    terminalExecutions.push(...segment.commands.map((command) => ({ ...command })));
   }
 
   return {
     thinking: thinkingChunks.join("\n\n").trim(),
-    bashExecutions,
+    terminalExecutions,
   };
 }

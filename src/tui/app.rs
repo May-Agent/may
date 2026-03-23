@@ -2246,15 +2246,15 @@ impl App {
                         self.chat.end_loading();
                         self.chat.end_text();
                         let display = match parse_tool_start(&name, &arguments) {
-                            ToolStartKind::Bash { command, mode } => ToolDisplay::Bash {
+                            ToolStartKind::Terminal { command, mode } => ToolDisplay::Terminal {
                                 command,
                                 mode,
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
                             },
-                            ToolStartKind::Generic { name, arguments } => ToolDisplay::Bash {
+                            ToolStartKind::Generic { name, arguments } => ToolDisplay::Terminal {
                                 command: format!("{} {}", name, arguments),
-                                mode: aither_sandbox::BashMode::Sandboxed,
+                                mode: aither_sandbox::TerminalMode::Sandboxed,
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
                             },

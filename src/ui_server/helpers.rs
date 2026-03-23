@@ -3,7 +3,7 @@
 //! Domain-specific helpers live in their own modules:
 //! - [`super::error`] — error response builders
 //! - [`super::model_resolution`] — model lookup & persistence
-//! - [`super::bash_parsing`] — bash tool event parsing
+//! - [`super::terminal_parsing`] — native terminal-tool event parsing
 //! - [`super::message_mapping`] — DB message → API message conversion
 //! - [`super::attachments`] — attachment processing & uploads
 

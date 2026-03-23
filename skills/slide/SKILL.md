@@ -118,7 +118,7 @@ Do not start a local preview server for normal preview flow. The frontend render
 If user wants PDF:
 
 ```bash
-cd artifacts && npx slidev export slides.md --output slides.pdf
+cd artifacts && bunx slidev export slides.md --output slides.pdf
 ```
 
 ## Reference Files

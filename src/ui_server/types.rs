@@ -223,6 +223,7 @@ pub(crate) struct NotificationMailboxResponse {
 pub(crate) struct NotificationCallbackResponse {
     pub(crate) notification_id: String,
     pub(crate) session_id: Option<String>,
+    pub(crate) profile_id: Option<String>,
     pub(crate) has_callback: bool,
     pub(crate) callback_consumed: bool,
     pub(crate) callback_context_xml: Option<String>,
@@ -489,12 +490,15 @@ pub(crate) struct ApiAttachment {
     pub(crate) text_content: Option<String>,
 }
 
-/// The canonical tool name used by bash execution tracking.
-pub(crate) const BASH_TOOL_NAME: &str = "bash";
+/// Legacy wire name of the native terminal command tool.
+///
+/// Internally May treats this as terminal execution tracking; the protocol
+/// still emits the historical tool name `terminal` for compatibility.
+pub(crate) const TERMINAL_TOOL_NAME: &str = "terminal";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum BashExecutionStatus {
+pub(crate) enum TerminalExecutionStatus {
     Running,
     Done,
     Failed,
@@ -502,7 +506,7 @@ pub(crate) enum BashExecutionStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum BashCommandMode {
+pub(crate) enum TerminalCommandMode {
     Default,
     Sandboxed,
     Unsafe,
@@ -511,22 +515,22 @@ pub(crate) enum BashCommandMode {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ApiBashExecution {
+pub(crate) struct ApiTerminalExecution {
     pub(crate) id: String,
     pub(crate) input: String,
     #[serde(default)]
     pub(crate) output: Option<String>,
-    pub(crate) status: BashExecutionStatus,
-    pub(crate) mode: BashCommandMode,
+    pub(crate) status: TerminalExecutionStatus,
+    pub(crate) mode: TerminalCommandMode,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct BashStateSnapshot {
+pub(crate) struct TerminalStateSnapshot {
     #[serde(default)]
-    pub(crate) executions: Vec<ApiBashExecution>,
+    pub(crate) executions: Vec<ApiTerminalExecution>,
     #[serde(default)]
-    pub(crate) running_by_call_id: std::collections::HashMap<String, ApiBashExecution>,
+    pub(crate) running_by_call_id: std::collections::HashMap<String, ApiTerminalExecution>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -547,7 +551,7 @@ pub(crate) struct ApiMessage {
     #[serde(default)]
     pub(crate) tool_event: Option<serde_json::Value>,
     #[serde(default)]
-    pub(crate) bash_executions: Vec<ApiBashExecution>,
+    pub(crate) terminal_executions: Vec<ApiTerminalExecution>,
     #[serde(default)]
     pub(crate) stats: Option<RequestStats>,
 }
@@ -789,8 +793,23 @@ pub(crate) struct BrowserInteractionResponse {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct TerminalInteractionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) output_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) output_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) input_notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SessionInteractionResponse {
     pub(crate) browser: BrowserInteractionResponse,
+    #[serde(default)]
+    pub(crate) terminal: TerminalInteractionResponse,
 }
 
 impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
@@ -801,6 +820,12 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
             interactions: SessionInteractionResponse {
                 browser: BrowserInteractionResponse {
                     takeover_active: summary.interactions.browser.takeover_active,
+                },
+                terminal: TerminalInteractionResponse {
+                    task_id: summary.interactions.terminal.task_id,
+                    output_file: summary.interactions.terminal.output_file,
+                    output_preview: summary.interactions.terminal.output_preview,
+                    input_notice: summary.interactions.terminal.input_notice,
                 },
             },
             queued_count: summary.queued_count,

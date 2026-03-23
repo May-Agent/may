@@ -31,7 +31,7 @@ pub use runtime::{
     BrowserInteractionState, PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
     PersistedAskUserRequest, PersistedAttachment, PersistedPermissionRequest,
     PersistedPermissionRequestPayload, PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload,
-    SessionInteractionState, SessionRuntimeState, SessionRuntimeSummary,
+    SessionInteractionState, SessionRuntimeState, SessionRuntimeSummary, TerminalRuntimeState,
 };
 pub use runtime_service::SessionRuntimeService;
 pub use store::{SandboxResourceLayout, SessionStore};

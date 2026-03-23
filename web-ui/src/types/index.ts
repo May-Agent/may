@@ -12,7 +12,7 @@ export interface Attachment {
   textPreview?: string;
 }
 
-export interface BashExecution {
+export interface TerminalExecution {
   id: string;
   input: string;
   output?: string;
@@ -42,11 +42,11 @@ export interface ThinkingTimelineSegment {
   endedAt?: number;
 }
 
-export interface BashTimelineSegment {
+export interface TerminalTimelineSegment {
   id: string;
-  kind: 'bash';
+  kind: 'terminal';
   offset: number;
-  commands: BashExecution[];
+  commands: TerminalExecution[];
   startedAt?: number;
   endedAt?: number;
 }
@@ -60,7 +60,7 @@ export interface ToolTimelineSegment {
 
 export type TimelineSegment =
   | ThinkingTimelineSegment
-  | BashTimelineSegment
+  | TerminalTimelineSegment
   | ToolTimelineSegment;
 
 export interface ToolEvent {
@@ -81,7 +81,7 @@ export interface Message {
   timelineSegments?: TimelineSegment[];
   thinking?: string;
   isThinking?: boolean;
-  bashExecutions?: BashExecution[];
+  terminalExecutions?: TerminalExecution[];
   toolEvent?: ToolEvent;
   stats?: {
     providerId?: string;
@@ -214,6 +214,12 @@ export interface SessionRuntimeSummaryPayload {
   interactions?: {
     browser: {
       takeoverActive: boolean;
+    };
+    terminal?: {
+      taskId?: string | null;
+      outputFile?: string | null;
+      outputPreview?: string | null;
+      inputNotice?: string | null;
     };
   };
   queuedCount: number;

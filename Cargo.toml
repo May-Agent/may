@@ -144,3 +144,21 @@ arrow-schema = "56.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+[workspace.lints]
+rust.missing_docs = "warn"
+rust.missing_debug_implementations = "warn"
+clippy.all = "warn"
+clippy.style = "warn"
+clippy.correctness = "warn"
+clippy.complexity = "warn"
+clippy.suspicious = "warn"
+clippy.perf = "warn"
+clippy.pedantic = "warn"
+clippy.nursery = "warn"
+clippy.cargo = "warn"
+clippy.multiple_crate_versions =  { level = "allow", priority = 1 }
+
+
+[lints]
+workspace = true
