@@ -120,7 +120,7 @@ pub(super) async fn browser_stop(
 
 /// WebRTC SDP offer/answer signaling endpoint.
 ///
-/// Client sends an SDP offer (recvonly video + DataChannel).
+/// Client sends an SDP offer (recvonly video + `DataChannel`).
 /// Server responds with SDP answer containing ICE candidates.
 /// After this single round-trip, WebRTC media/data flows directly.
 pub(super) async fn browser_offer(

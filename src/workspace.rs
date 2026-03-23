@@ -56,7 +56,7 @@ impl WorkspaceConfig {
     /// Returns `Ok(default)` if the file does not exist,
     /// but propagates parse errors so corrupt configs are not silently dropped.
     pub fn load(config_path: &Path) -> Result<Self, WorkspaceConfigError> {
-        match fs::read_to_string(&config_path) {
+        match fs::read_to_string(config_path) {
             Ok(content) => Ok(toml::from_str(&content)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(WorkspaceConfigError::Read(e)),
@@ -94,6 +94,7 @@ impl WorkspaceConfig {
     }
 
     /// Check if a path has read/write access.
+    #[must_use] 
     pub fn has_write_access(&self, path: &Path) -> bool {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.workdirs
@@ -141,6 +142,7 @@ impl Workspace {
     }
 
     /// Get all readable directories.
+    #[must_use] 
     pub fn readable_dirs(&self) -> Vec<&PathBuf> {
         let mut dirs = vec![&self.sandbox, &self.cwd];
         for wd in &self.config.workdirs {
@@ -150,6 +152,7 @@ impl Workspace {
     }
 
     /// Get all writable directories.
+    #[must_use] 
     pub fn writable_dirs(&self) -> Vec<&PathBuf> {
         let mut dirs = vec![&self.sandbox];
         for wd in &self.config.workdirs {

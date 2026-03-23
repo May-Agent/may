@@ -110,6 +110,7 @@ pub async fn clear_copilot_credentials() -> Result<(), CopilotTokenError> {
 }
 
 /// Check if a Copilot token exists on disk.
+#[must_use] 
 pub fn has_copilot_token() -> bool {
     token_path().map(|p| p.exists()).unwrap_or(false)
 }

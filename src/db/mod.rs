@@ -1,4 +1,4 @@
-//! Chat history database backed by SQLite via SeaORM.
+//! Chat history database backed by `SQLite` via `SeaORM`.
 //!
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
@@ -320,7 +320,7 @@ fn message_stats_params_from_chat_stats(stats: &ChatMessageStats) -> MessageStat
 
 /// Chat history database.
 ///
-/// Wraps a SeaORM `DatabaseConnection` to a SQLite file.
+/// Wraps a `SeaORM` `DatabaseConnection` to a `SQLite` file.
 #[derive(Debug, Clone)]
 pub struct ChatDb {
     conn: DatabaseConnection,
@@ -562,7 +562,8 @@ impl ChatDb {
     }
 
     /// Get the underlying database connection.
-    pub fn connection(&self) -> &DatabaseConnection {
+    #[must_use] 
+    pub const fn connection(&self) -> &DatabaseConnection {
         &self.conn
     }
 
@@ -678,14 +679,12 @@ impl ChatDb {
         let mut summary = SessionRuntimeSummary {
             state: runtime_row
                 .as_ref()
-                .map(|row| row.state.as_str())
-                .unwrap_or(SessionRuntimeState::Idle.as_str())
+                .map_or(SessionRuntimeState::Idle.as_str(), |row| row.state.as_str())
                 .parse()
                 .unwrap_or(SessionRuntimeState::Idle),
             plan_state: plan_row
                 .as_ref()
-                .map(|row| row.plan_state.as_str())
-                .unwrap_or(SessionPlanState::Disabled.as_str())
+                .map_or(SessionPlanState::Disabled.as_str(), |row| row.plan_state.as_str())
                 .parse()
                 .unwrap_or(SessionPlanState::Disabled),
             interactions: SessionInteractionState {
@@ -1332,7 +1331,7 @@ impl ChatDb {
         Ok(result.rows_affected + snapshot_result.rows_affected + session_result.rows_affected)
     }
 
-    /// List all sessions ordered by updated_at descending.
+    /// List all sessions ordered by `updated_at` descending.
     pub async fn list_sessions(&self) -> Result<Vec<sessions::Model>, ChatDbError> {
         let sessions = sessions::Entity::find()
             .order_by(sessions::Column::UpdatedAt, Order::Desc)
@@ -1523,7 +1522,7 @@ impl ChatDb {
         }
 
         update.and_where(Expr::col(sessions::Column::Id).eq(session_id));
-        let stmt = update.to_owned();
+        let stmt = update.clone();
         let builder = self.conn.get_database_backend();
         self.conn.execute(builder.build(&stmt)).await?;
         Ok(())
@@ -2247,7 +2246,7 @@ impl ChatDb {
         Ok(model)
     }
 
-    /// List all profiles ordered by sort_order.
+    /// List all profiles ordered by `sort_order`.
     pub async fn list_profiles(&self) -> Result<Vec<profiles::Model>, ChatDbError> {
         let rows = profiles::Entity::find()
             .order_by_asc(profiles::Column::SortOrder)
@@ -2320,7 +2319,7 @@ impl ChatDb {
         update.table(sessions::Entity);
         update.value(sessions::Column::ProfileId, Option::<String>::None);
         update.and_where(Expr::col(sessions::Column::ProfileId).eq(id));
-        let stmt = update.to_owned();
+        let stmt = update.clone();
         let builder = self.conn.get_database_backend();
         self.conn.execute(builder.build(&stmt)).await?;
 
@@ -2350,9 +2349,7 @@ impl ChatDb {
     ///
     /// Returns the ID of the first profile (daily).
     pub async fn ensure_default_profiles(&self) -> Result<String, ChatDbError> {
-        let local_hostname = hostname::get()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "local".to_string());
+        let local_hostname = hostname::get().map_or_else(|_| "local".to_string(), |h| h.to_string_lossy().into_owned());
 
         let defaults = [
             DefaultProfile {
@@ -2484,7 +2481,7 @@ impl ChatDb {
         update.value(sessions::Column::Pinned, false);
         update.value(sessions::Column::PinSortOrder, Option::<i32>::None);
         update.and_where(Expr::col(sessions::Column::FolderId).eq(id));
-        let stmt = update.to_owned();
+        let stmt = update.clone();
         let builder = self.conn.get_database_backend();
         self.conn.execute(builder.build(&stmt)).await?;
 
@@ -2529,7 +2526,7 @@ impl ChatDb {
         update.value(sessions::Column::Archived, false);
         update.value(sessions::Column::PinSortOrder, max_order + 1);
         update.and_where(Expr::col(sessions::Column::Id).eq(id));
-        let stmt = update.to_owned();
+        let stmt = update.clone();
         let builder = self.conn.get_database_backend();
         self.conn.execute(builder.build(&stmt)).await?;
         Ok(())
@@ -2543,7 +2540,7 @@ impl ChatDb {
         update.value(sessions::Column::FolderId, Option::<String>::None);
         update.value(sessions::Column::PinSortOrder, Option::<i32>::None);
         update.and_where(Expr::col(sessions::Column::Id).eq(id));
-        let stmt = update.to_owned();
+        let stmt = update.clone();
         let builder = self.conn.get_database_backend();
         self.conn.execute(builder.build(&stmt)).await?;
         Ok(())
@@ -2573,7 +2570,7 @@ impl ChatDb {
         update.value(sessions::Column::FolderId, Option::<String>::None);
         update.value(sessions::Column::PinSortOrder, Option::<i32>::None);
         update.and_where(Expr::col(sessions::Column::Id).eq(id));
-        let stmt = update.to_owned();
+        let stmt = update.clone();
         let builder = self.conn.get_database_backend();
         self.conn.execute(builder.build(&stmt)).await?;
         Ok(())
@@ -2591,7 +2588,7 @@ impl ChatDb {
         update.value(sessions::Column::PinSortOrder, Option::<i32>::None);
         update.value(sessions::Column::UpdatedAt, now.as_str());
         update.and_where(Expr::col(sessions::Column::Id).eq(id));
-        let stmt = update.to_owned();
+        let stmt = update.clone();
         let builder = self.conn.get_database_backend();
         self.conn.execute(builder.build(&stmt)).await?;
         Ok(())
@@ -2658,13 +2655,13 @@ impl ChatDb {
         update.table(sessions::Entity);
         update.value(sessions::Column::FolderId, folder_id.map(String::from));
         update.and_where(Expr::col(sessions::Column::Id).eq(session_id));
-        let stmt = update.to_owned();
+        let stmt = update.clone();
         let builder = self.conn.get_database_backend();
         self.conn.execute(builder.build(&stmt)).await?;
         Ok(())
     }
 
-    /// Set a session's profile_id.
+    /// Set a session's `profile_id`.
     pub async fn set_session_profile(
         &self,
         session_id: &str,
@@ -2674,13 +2671,13 @@ impl ChatDb {
         update.table(sessions::Entity);
         update.value(sessions::Column::ProfileId, profile_id);
         update.and_where(Expr::col(sessions::Column::Id).eq(session_id));
-        let stmt = update.to_owned();
+        let stmt = update.clone();
         let builder = self.conn.get_database_backend();
         self.conn.execute(builder.build(&stmt)).await?;
         Ok(())
     }
 
-    /// List sessions for a specific profile, ordered by updated_at descending.
+    /// List sessions for a specific profile, ordered by `updated_at` descending.
     pub async fn list_sessions_for_profile(
         &self,
         profile_id: &str,

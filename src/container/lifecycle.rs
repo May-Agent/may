@@ -38,6 +38,7 @@ pub struct ContainerManager {
 }
 
 impl ContainerManager {
+    #[must_use] 
     pub fn new(runtime: Arc<ContainerRuntime>, may_dir: PathBuf) -> Self {
         Self {
             runtime,
@@ -47,6 +48,7 @@ impl ContainerManager {
     }
 
     /// Get the underlying runtime.
+    #[must_use] 
     pub fn runtime(&self) -> &ContainerRuntime {
         &self.runtime
     }
@@ -390,11 +392,13 @@ impl ContainerManager {
     }
 
     /// Spawn a background task that auto-stops idle containers.
+    #[must_use] 
     pub fn spawn_auto_stop_task(&self) -> tokio::task::JoinHandle<()> {
         self.spawn_auto_stop_task_with_timeout(DEFAULT_AUTO_STOP_MINUTES)
     }
 
     /// Spawn auto-stop task with a custom timeout.
+    #[must_use] 
     pub fn spawn_auto_stop_task_with_timeout(
         &self,
         timeout_minutes: u64,
@@ -423,7 +427,7 @@ impl ContainerManager {
                         .stop_container(&container_id, Some(opts))
                         .await
                     {
-                        Ok(_) => {
+                        Ok(()) => {
                             let mut next_activity = activity.load().as_ref().clone();
                             next_activity.remove(&container_id);
                             activity.store(Arc::new(next_activity));

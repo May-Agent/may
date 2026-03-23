@@ -146,6 +146,7 @@ pub fn provider_candidates_for_tiers(
     candidates
 }
 
+#[must_use] 
 pub fn provider_candidate_count(config: &MayConfig, model: &str) -> usize {
     provider_candidates_for_model(config, model).len()
 }
@@ -325,6 +326,7 @@ pub struct PermissionApprover {
 }
 
 impl PermissionApprover {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             live_responses: Arc::new(LiveResponseRegistry::new()),
@@ -444,6 +446,7 @@ impl PermissionApprover {
         rx.recv().await.map_err(|_| PermissionError::Interrupted)
     }
 
+    #[must_use] 
     pub fn respond(&self, request_id: &str, approved: bool) -> bool {
         self.live_responses.resolve(request_id, approved)
     }
@@ -589,7 +592,7 @@ impl PermissionHandler for MayPermissionHandler {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PendingSteerHook {
+pub struct PendingSteerHook {
     db: Option<crate::db::ChatDb>,
     session_id: String,
 }
@@ -621,7 +624,7 @@ impl Hook for PendingSteerHook {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ContextSnapshotHook {
+pub struct ContextSnapshotHook {
     db: Option<crate::db::ChatDb>,
     session_id: String,
 }
@@ -655,7 +658,7 @@ impl Hook for ContextSnapshotHook {
     }
 }
 
-/// Execution environment for a MayAgent.
+/// Execution environment for a `MayAgent`.
 pub enum AgentEnvironment {
     /// Native macOS sandbox via leash.
     Local,
@@ -677,7 +680,7 @@ pub enum AgentEnvironment {
     },
 }
 
-/// Configuration for creating a MayAgent.
+/// Configuration for creating a `MayAgent`.
 pub struct MayAgentConfig {
     /// The LLM provider.
     pub llm: CloudProvider,
@@ -687,7 +690,7 @@ pub struct MayAgentConfig {
     pub provider_id: String,
     /// Optional embedding provider used for semantic retrieval tools.
     pub search_embedder: Option<aither_cloud::CloudEmbedder>,
-    /// Session sandbox directory (TerminalTool creates working dir inside).
+    /// Session sandbox directory (`TerminalTool` creates working dir inside).
     pub sandbox_dir: PathBuf,
     /// May directory (~/.may/).
     pub may_dir: PathBuf,
@@ -746,7 +749,7 @@ pub struct ImageGeneratorConfig {
 pub struct ImagineArgs {
     /// Prompt describing the image to generate.
     pub prompt: String,
-    /// Image size as WIDTHxHEIGHT, for example 1024x1024.
+    /// Image size as `WIDTHxHEIGHT`, for example 1024x1024.
     pub size: String,
 }
 
@@ -773,7 +776,7 @@ struct RuntimeSystemContext {
 }
 
 impl RuntimeSystemContext {
-    fn new(memory_path: PathBuf, memory_content: String) -> Self {
+    const fn new(memory_path: PathBuf, memory_content: String) -> Self {
         Self {
             memory_path,
             last_memory_content: memory_content,
@@ -964,21 +967,18 @@ fn build_image_provider(config: &ImageGeneratorConfig) -> aither_core::Result<Cl
         return Err(anyhow::anyhow!(err_api_key_required(&config.provider_id)));
     }
 
-    let provider = match provider_type {
-        ProviderType::Google => {
-            let mut client = Gemini::new(api_key).with_image_model(&config.model);
-            if let Some(url) = base_url {
-                client = client.with_base_url(url);
-            }
-            CloudProvider::Gemini(client)
+    let provider = if provider_type == ProviderType::Google {
+        let mut client = Gemini::new(api_key).with_image_model(&config.model);
+        if let Some(url) = base_url {
+            client = client.with_base_url(url);
         }
-        _ => {
-            let mut client = OpenAI::new(api_key).with_image_model(&config.model);
-            if let Some(url) = base_url {
-                client = client.with_base_url(url);
-            }
-            CloudProvider::OpenAI(client)
+        CloudProvider::Gemini(client)
+    } else {
+        let mut client = OpenAI::new(api_key).with_image_model(&config.model);
+        if let Some(url) = base_url {
+            client = client.with_base_url(url);
         }
+        CloudProvider::OpenAI(client)
     };
 
     Ok(provider)
@@ -992,7 +992,7 @@ fn resolve_image_generator_config(may_config: &MayConfig) -> Option<ImageGenerat
     let provider_id = may_config
         .models
         .provider_for_model(&model, may_config.preferences.strict_model_matching)
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .or_else(|| {
             let resolver = may_config.create_resolver();
             resolver
@@ -1025,7 +1025,7 @@ pub struct MayAgent {
 }
 
 impl MayAgent {
-    /// Create a new MayAgent.
+    /// Create a new `MayAgent`.
     pub async fn new(config: MayAgentConfig) -> Result<Self, MayAgentError> {
         let is_container = matches!(config.environment, AgentEnvironment::Container { .. });
 
@@ -1147,16 +1147,13 @@ impl MayAgent {
         let transcript_file = session_paths.transcript_path();
         let transcript_path = transcript_file.display().to_string();
 
-        let (skills_dir, subagents_dir) = match config.profile_id.as_deref() {
-            Some(profile_id) => {
-                let profile_home = crate::session::MayHomePaths::new(config.may_dir.clone())
-                    .profile_home(profile_id);
-                (profile_home.skills_dir(), profile_home.subagents_dir())
-            }
-            None => {
-                let home = crate::session::MayHomePaths::new(config.may_dir.clone());
-                (home.skills_dir(), home.subagents_dir())
-            }
+        let (skills_dir, subagents_dir) = if let Some(profile_id) = config.profile_id.as_deref() {
+            let profile_home = crate::session::MayHomePaths::new(config.may_dir.clone())
+                .profile_home(profile_id);
+            (profile_home.skills_dir(), profile_home.subagents_dir())
+        } else {
+            let home = crate::session::MayHomePaths::new(config.may_dir.clone());
+            (home.skills_dir(), home.subagents_dir())
         };
 
         // Shell runtime depends on the environment
@@ -1339,7 +1336,7 @@ impl MayAgent {
         })
     }
 
-    /// Create a MayAgent from config file and session.
+    /// Create a `MayAgent` from config file and session.
     pub async fn from_config(
         may_config: &MayConfig,
         sandbox_dir: PathBuf,
@@ -1369,7 +1366,7 @@ impl MayAgent {
         .await
     }
 
-    /// Create a MayAgent from config file with a specific model.
+    /// Create a `MayAgent` from config file with a specific model.
     ///
     /// Provider selection uses an ordered candidate list:
     /// model-mapped provider first (if configured), then explicit providers,
@@ -1541,7 +1538,7 @@ impl MayAgent {
             register_subagents_broker,
             native_voice_input: model_info
                 .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::Audio)),
-            model_context_window: model_info.and_then(|info| info.max_input_tokens()),
+            model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),
         };
 
         Self::new(config).await
@@ -1575,21 +1572,25 @@ impl MayAgent {
     }
 
     /// Get session ID.
-    pub fn session_id(&self) -> &SessionId {
+    #[must_use] 
+    pub const fn session_id(&self) -> &SessionId {
         &self.session_id
     }
 
     /// Get session sandbox directory.
+    #[must_use] 
     pub fn sandbox_dir(&self) -> PathBuf {
         self.sandbox_dir.clone()
     }
 
     /// Selected provider ID for the current request.
+    #[must_use] 
     pub fn provider_id(&self) -> &str {
         &self.provider_id
     }
 
     /// Model context window resolved for this agent.
+    #[must_use] 
     pub const fn model_context_window(&self) -> Option<u32> {
         self.model_context_window
     }
@@ -1692,7 +1693,7 @@ pub async fn build_fast_provider_chain(
     Ok(built)
 }
 
-/// Build a CloudProvider from a ProviderInstance directly.
+/// Build a `CloudProvider` from a `ProviderInstance` directly.
 async fn build_cloud_provider_from_instance(
     id: &str,
     instance: &ProviderInstance,
@@ -1791,7 +1792,7 @@ async fn build_cloud_provider_from_instance(
     Ok(llm)
 }
 
-fn is_copilot_unauthorized(err: &crate::copilot::CopilotTokenError) -> bool {
+const fn is_copilot_unauthorized(err: &crate::copilot::CopilotTokenError) -> bool {
     matches!(
         err,
         crate::copilot::CopilotTokenError::Exchange(

@@ -163,7 +163,7 @@ pub(super) async fn build_prompt_and_attachments(
             });
 
             if attachment.attachment_type == "image" {
-                let url = url::Url::from_file_path(saved_path).map_err(|_| {
+                let url = url::Url::from_file_path(saved_path).map_err(|()| {
                     SkyError::msg("Failed to map image path to URL")
                         .set_status(StatusCode::INTERNAL_SERVER_ERROR)
                 })?;
@@ -192,7 +192,7 @@ pub(super) async fn build_prompt_and_attachments(
                 });
 
                 if attachment.attachment_type == "image" {
-                    let url = url::Url::from_file_path(saved_path).map_err(|_| {
+                    let url = url::Url::from_file_path(saved_path).map_err(|()| {
                         SkyError::msg("Failed to map image path to URL")
                             .set_status(StatusCode::INTERNAL_SERVER_ERROR)
                     })?;
@@ -584,7 +584,7 @@ async fn allocate_upload_path(
         .map_err(internal_error)?;
 
     let clean_ext = ext.trim_start_matches('.');
-    let mut file_name = format!("{}.{}", base_name, clean_ext);
+    let mut file_name = format!("{base_name}.{clean_ext}");
     let mut path = uploads_dir.join(&file_name);
 
     if async_fs::metadata(&path).await.is_ok() {
@@ -592,7 +592,7 @@ async fn allocate_upload_path(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        file_name = format!("{}-{}.{}", base_name, ts, clean_ext);
+        file_name = format!("{base_name}-{ts}.{clean_ext}");
         path = uploads_dir.join(&file_name);
     }
 

@@ -51,6 +51,7 @@ pub struct MessageQueue {
 
 impl MessageQueue {
     /// Create a new message queue.
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
@@ -88,11 +89,13 @@ impl MessageQueue {
     }
 
     /// Check if queue is empty.
+    #[must_use] 
     pub fn is_empty(&self) -> bool {
         self.pending_immediate.is_none() && self.queued.is_empty()
     }
 
     /// Get number of pending messages.
+    #[must_use] 
     pub fn len(&self) -> usize {
         usize::from(self.pending_immediate.is_some()) + self.queued.len()
     }

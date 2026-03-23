@@ -38,7 +38,8 @@ pub struct TerminalCallInfo {
 
 impl TerminalCallInfo {
     /// Create a new terminal call info.
-    pub fn new(command: String) -> Self {
+    #[must_use] 
+    pub const fn new(command: String) -> Self {
         Self {
             command,
             output: String::new(),
@@ -47,18 +48,21 @@ impl TerminalCallInfo {
     }
 
     /// Set the output.
+    #[must_use] 
     pub fn with_output(mut self, output: String) -> Self {
         self.output = output;
         self
     }
 
     /// Set the output file.
+    #[must_use] 
     pub fn with_output_file(mut self, path: PathBuf) -> Self {
         self.output_file = Some(path);
         self
     }
 
     /// Get a truncated preview of the command for inline display (unicode-safe).
+    #[must_use] 
     pub fn command_preview(&self, max_chars: usize) -> &str {
         match self.command.char_indices().nth(max_chars) {
             Some((pos, _)) => &self.command[..pos],
@@ -67,6 +71,7 @@ impl TerminalCallInfo {
     }
 
     /// Get a truncated preview of the output for inline display.
+    #[must_use] 
     pub fn output_preview(&self, max_lines: usize) -> String {
         let mut lines = Vec::with_capacity(max_lines);
         let mut line_iter = self.output.lines();
@@ -122,51 +127,57 @@ pub enum ToolDisplay {
 
 impl ToolDisplay {
     /// Get the most recent terminal call for this tool.
+    #[must_use] 
     pub fn latest_terminal(&self) -> Option<&TerminalCallInfo> {
         match self {
-            ToolDisplay::Search { terminal_info, .. } => terminal_info.as_ref(),
-            ToolDisplay::Fetch { terminal_info, .. } => terminal_info.as_ref(),
-            ToolDisplay::Task { terminal_calls, .. } => terminal_calls.last(),
-            ToolDisplay::Terminal { output, .. } => output.as_ref(),
+            Self::Search { terminal_info, .. } => terminal_info.as_ref(),
+            Self::Fetch { terminal_info, .. } => terminal_info.as_ref(),
+            Self::Task { terminal_calls, .. } => terminal_calls.last(),
+            Self::Terminal { output, .. } => output.as_ref(),
         }
     }
 
     /// Get all terminal calls for this tool.
+    #[must_use] 
     pub fn all_terminal_calls(&self) -> Vec<&TerminalCallInfo> {
         match self {
-            ToolDisplay::Search { terminal_info, .. } => terminal_info.iter().collect(),
-            ToolDisplay::Fetch { terminal_info, .. } => terminal_info.iter().collect(),
-            ToolDisplay::Task { terminal_calls, .. } => terminal_calls.iter().collect(),
-            ToolDisplay::Terminal { output, .. } => output.iter().collect(),
+            Self::Search { terminal_info, .. } => terminal_info.iter().collect(),
+            Self::Fetch { terminal_info, .. } => terminal_info.iter().collect(),
+            Self::Task { terminal_calls, .. } => terminal_calls.iter().collect(),
+            Self::Terminal { output, .. } => output.iter().collect(),
         }
     }
 
     /// Get status reference.
-    pub fn status(&self) -> &ToolStatus {
+    #[must_use] 
+    pub const fn status(&self) -> &ToolStatus {
         match self {
-            ToolDisplay::Search { status, .. } => status,
-            ToolDisplay::Fetch { status, .. } => status,
-            ToolDisplay::Task { status, .. } => status,
-            ToolDisplay::Terminal { status, .. } => status,
+            Self::Search { status, .. } => status,
+            Self::Fetch { status, .. } => status,
+            Self::Task { status, .. } => status,
+            Self::Terminal { status, .. } => status,
         }
     }
 
     /// Check if this is a subagent task.
-    pub fn is_subagent(&self) -> bool {
-        matches!(self, ToolDisplay::Task { .. })
+    #[must_use] 
+    pub const fn is_subagent(&self) -> bool {
+        matches!(self, Self::Task { .. })
     }
 
     /// Get a short type name for display.
+    #[must_use] 
     pub fn type_name(&self) -> &str {
         match self {
-            ToolDisplay::Search { .. } => "search",
-            ToolDisplay::Fetch { .. } => "fetch",
-            ToolDisplay::Task { subagent, .. } => subagent,
-            ToolDisplay::Terminal { .. } => "terminal",
+            Self::Search { .. } => "search",
+            Self::Fetch { .. } => "fetch",
+            Self::Task { subagent, .. } => subagent,
+            Self::Terminal { .. } => "terminal",
         }
     }
 
     /// Check if this tool call is complete (not running).
+    #[must_use] 
     pub fn is_complete(&self) -> bool {
         !matches!(self.status(), ToolStatus::Running)
     }
@@ -219,6 +230,7 @@ pub struct ChatStream {
 
 impl ChatStream {
     /// Create a new empty chat stream.
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
@@ -271,7 +283,7 @@ impl ChatStream {
         // Remove loading or thinking element if present
         if matches!(
             self.elements.last(),
-            Some(ChatElement::Loading { .. }) | Some(ChatElement::Thinking { .. })
+            Some(ChatElement::Loading { .. } | ChatElement::Thinking { .. })
         ) {
             self.elements.pop();
         }
@@ -411,11 +423,13 @@ impl ChatStream {
     }
 
     /// Get all elements.
+    #[must_use] 
     pub fn elements(&self) -> &[ChatElement] {
         &self.elements
     }
 
     /// Get all tool calls with their indices.
+    #[must_use] 
     pub fn tool_calls(&self) -> Vec<(usize, &str, &ToolDisplay)> {
         self.elements
             .iter()
@@ -431,6 +445,7 @@ impl ChatStream {
     }
 
     /// Get a tool call by ID.
+    #[must_use] 
     pub fn get_tool(&self, id: &str) -> Option<&ToolDisplay> {
         self.elements.iter().find_map(|e| {
             if let ChatElement::ToolCall {
@@ -446,6 +461,7 @@ impl ChatStream {
     }
 
     /// Check if currently streaming.
+    #[must_use] 
     pub fn is_streaming(&self) -> bool {
         matches!(
             self.elements.last(),
@@ -457,6 +473,7 @@ impl ChatStream {
     }
 
     /// Get all active elements.
+    #[must_use] 
     pub fn active_elements(&self) -> &[ChatElement] {
         &self.elements
     }
@@ -476,7 +493,7 @@ pub struct InputContext<'a> {
 pub struct StatusContext<'a> {
     /// Model display string.
     pub model: &'a str,
-    /// Token usage info (prompt_tokens, context_window).
+    /// Token usage info (`prompt_tokens`, `context_window`).
     pub usage: Option<(u64, Option<u64>)>,
     /// Queued message count.
     pub queue_count: usize,
@@ -511,7 +528,7 @@ pub struct UnifiedRenderContext<'a> {
     pub status_ctx: Option<StatusContext<'a>>,
     /// Whether terminal supports image rendering
     pub images_supported: bool,
-    /// Output: accumulated image positions (url, line_index) for overlay rendering
+    /// Output: accumulated image positions (url, `line_index`) for overlay rendering
     pub image_positions_out: Option<&'a mut Vec<(String, usize)>>,
 }
 
@@ -542,6 +559,7 @@ pub fn render_unified(
 }
 
 /// Build plain wrapped lines for selection/copy from unified viewport content.
+#[must_use] 
 pub fn build_plain_wrapped_lines_unified(
     chat: &ChatStream,
     width: u16,
@@ -579,9 +597,9 @@ fn build_plain_chat_lines(chat: &ChatStream) -> Vec<Line<'static>> {
             ChatElement::UserMessage { content, .. } => {
                 for (i, line) in content.lines().enumerate() {
                     if i == 0 {
-                        lines.push(Line::from(format!("> {}", line)));
+                        lines.push(Line::from(format!("> {line}")));
                     } else {
-                        lines.push(Line::from(format!("  {}", line)));
+                        lines.push(Line::from(format!("  {line}")));
                     }
                 }
                 lines.push(Line::from(""));
@@ -594,7 +612,7 @@ fn build_plain_chat_lines(chat: &ChatStream) -> Vec<Line<'static>> {
                 lines.push(Line::from(""));
             }
             ChatElement::Error { message } => {
-                lines.push(Line::from(format!("error: {}", message)));
+                lines.push(Line::from(format!("error: {message}")));
                 lines.push(Line::from(""));
             }
             ChatElement::ToolCall { .. }
@@ -674,7 +692,7 @@ fn safe_scroll(scroll: usize, content_height: usize, area_height: u16) -> u16 {
     clamped.min(u16::MAX as usize) as u16
 }
 
-/// Calculate actual visual row count using ratatui's own Paragraph::line_count.
+/// Calculate actual visual row count using ratatui's own `Paragraph::line_count`.
 /// This is the only way to get an exact match with how Paragraph renders wrapped text,
 /// especially for CJK wide characters and word-boundary wrapping.
 fn total_wrapped_lines(lines: &[Line], width: usize) -> usize {
@@ -741,7 +759,7 @@ fn render_impl(
                             Span::raw(line.to_string()),
                         ]));
                     } else {
-                        lines.push(Line::from(format!("  {}", line)));
+                        lines.push(Line::from(format!("  {line}")));
                     }
                 }
 
@@ -760,7 +778,7 @@ fn render_impl(
                             if let Some(path) = saved_path {
                                 format!("[pasted text: {} chars -> {}]", char_count, path.display())
                             } else {
-                                format!("[pasted text: {} chars]", char_count)
+                                format!("[pasted text: {char_count} chars]")
                             }
                         }
                     };
@@ -833,7 +851,7 @@ fn render_impl(
                         TodoStatus::Completed => ("[x]", Style::default().fg(Color::DarkGray)),
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {} ", marker), style),
+                        Span::styled(format!("  {marker} "), style),
                         Span::styled(&item.content, style),
                     ]));
                 }
@@ -863,7 +881,7 @@ fn render_impl(
                     _ => "⠸",
                 };
                 lines.push(Line::from(Span::styled(
-                    format!("{} Waiting for response...", spinner),
+                    format!("{spinner} Waiting for response..."),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -873,7 +891,7 @@ fn render_impl(
                 let text = if *seconds == 0 {
                     "◐ Thinking...".to_string()
                 } else {
-                    format!("◐ Thinking... ({} sec)", seconds)
+                    format!("◐ Thinking... ({seconds} sec)")
                 };
                 lines.push(Line::from(Span::styled(
                     text,
@@ -951,12 +969,11 @@ fn render_impl(
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
+        .map_or(s.len(), |(i, _)| i)
 }
 
 /// Render the input line into the lines vector.
-fn render_input_line<'a>(lines: &mut Vec<Line<'a>>, ctx: InputContext<'_>) {
+fn render_input_line(lines: &mut Vec<Line<'_>>, ctx: InputContext<'_>) {
     let mut spans = Vec::new();
 
     // Prompt
@@ -977,7 +994,7 @@ fn render_input_line<'a>(lines: &mut Vec<Line<'a>>, ctx: InputContext<'_>) {
         if let Attachment::FileReference { path } = att {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
             spans.push(Span::styled(
-                format!("@{} ", name),
+                format!("@{name} "),
                 Style::default().fg(Color::Cyan),
             ));
         }
@@ -988,7 +1005,7 @@ fn render_input_line<'a>(lines: &mut Vec<Line<'a>>, ctx: InputContext<'_>) {
         if let Attachment::PastedText { content, .. } = att {
             let char_count = content.chars().count();
             spans.push(Span::styled(
-                format!("[pasted: {} chars] ", char_count),
+                format!("[pasted: {char_count} chars] "),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -1005,7 +1022,7 @@ fn render_input_line<'a>(lines: &mut Vec<Line<'a>>, ctx: InputContext<'_>) {
 }
 
 /// Render queued messages into the lines vector.
-fn render_queue_lines<'a>(lines: &mut Vec<Line<'a>>, ctx: &QueueContext<'_>, width: u16) {
+fn render_queue_lines(lines: &mut Vec<Line<'_>>, ctx: &QueueContext<'_>, width: u16) {
     let queue_len = ctx.messages.len();
 
     // Header line
@@ -1034,7 +1051,7 @@ fn render_queue_lines<'a>(lines: &mut Vec<Line<'a>>, ctx: &QueueContext<'_>, wid
             .take(max_width)
             .collect();
         let truncated = if msg.chars().count() > max_width || msg.lines().count() > 1 {
-            format!("{}...", preview)
+            format!("{preview}...")
         } else {
             preview
         };
@@ -1055,7 +1072,7 @@ fn render_queue_lines<'a>(lines: &mut Vec<Line<'a>>, ctx: &QueueContext<'_>, wid
 }
 
 /// Render the status bar into the lines vector.
-fn render_status_line<'a>(lines: &mut Vec<Line<'a>>, ctx: &StatusContext<'_>) {
+fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>) {
     // If there's a status message (like Ctrl+C hint), show it prominently
     if let Some(status) = ctx.status_message {
         lines.push(Line::from(Span::styled(
@@ -1082,7 +1099,7 @@ fn render_status_line<'a>(lines: &mut Vec<Line<'a>>, ctx: &StatusContext<'_>) {
         if let Some(window) = context_window {
             parts.push(format!("{}/{}", used, format_number(window as usize)));
         } else {
-            parts.push(format!("{}tok", used));
+            parts.push(format!("{used}tok"));
         }
     }
 
@@ -1135,14 +1152,14 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
         } => {
             let status_text = match status {
                 ToolStatus::Running => "...".to_string(),
-                ToolStatus::Done => results.map_or("".to_string(), |n| format!("{n} results")),
+                ToolStatus::Done => results.map_or(String::new(), |n| format!("{n} results")),
                 ToolStatus::SearchDone(n) => format!("{n} results"),
                 ToolStatus::Failed(e) => format!("failed: {e}"),
             };
             let query_display = if status_text.is_empty() {
-                format!("\"{}\"", query)
+                format!("\"{query}\"")
             } else {
-                format!("\"{}\" {}", query, status_text)
+                format!("\"{query}\" {status_text}")
             };
             lines.push(Line::from(vec![
                 Span::raw(selection_marker),
@@ -1157,7 +1174,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 let preview = info.output_preview(2);
                 for line in preview.lines() {
                     lines.push(Line::from(Span::styled(
-                        format!("    {}", line),
+                        format!("    {line}"),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
@@ -1174,9 +1191,9 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 ToolStatus::Failed(_) => "failed",
             };
             let url_display = if status_text.is_empty() {
-                url.to_string()
+                url.clone()
             } else {
-                format!("{} {}", url, status_text)
+                format!("{url} {status_text}")
             };
             lines.push(Line::from(vec![
                 Span::raw(selection_marker),
@@ -1191,7 +1208,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 let preview = info.output_preview(2);
                 for line in preview.lines() {
                     lines.push(Line::from(Span::styled(
-                        format!("    {}", line),
+                        format!("    {line}"),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
@@ -1216,15 +1233,15 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             };
 
             let prompt_display = if status_text.is_empty() {
-                prompt_preview.clone()
+                prompt_preview
             } else {
-                format!("{} {}", prompt_preview, status_text)
+                format!("{prompt_preview} {status_text}")
             };
 
             lines.push(Line::from(vec![
                 Span::raw(selection_marker),
                 Span::styled(
-                    format!("[subagent:{}] ", subagent),
+                    format!("[subagent:{subagent}] "),
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(prompt_display, selection_style),
@@ -1244,7 +1261,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                     let preview = latest.output_preview(2);
                     for line in preview.lines() {
                         lines.push(Line::from(Span::styled(
-                            format!("      {}", line),
+                            format!("      {line}"),
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
@@ -1260,8 +1277,8 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             let status_text = match status {
                 ToolStatus::Running => Some("running".to_string()),
                 ToolStatus::Done => None,
-                ToolStatus::SearchDone(n) => Some(format!("{} results", n)),
-                ToolStatus::Failed(e) => Some(format!("failed: {}", e)),
+                ToolStatus::SearchDone(n) => Some(format!("{n} results")),
+                ToolStatus::Failed(e) => Some(format!("failed: {e}")),
             };
 
             let mode_prefix = match mode {
@@ -1329,18 +1346,18 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 
     // Header
     let title = match display {
-        ToolDisplay::Search { query, .. } => format!("Search: \"{}\"", query),
-        ToolDisplay::Fetch { url, .. } => format!("Fetch: {}", url),
+        ToolDisplay::Search { query, .. } => format!("Search: \"{query}\""),
+        ToolDisplay::Fetch { url, .. } => format!("Fetch: {url}"),
         ToolDisplay::Task {
             subagent, prompt, ..
-        } => format!("Subagent:{} - {}", subagent, prompt),
+        } => format!("Subagent:{subagent} - {prompt}"),
         ToolDisplay::Terminal { command, mode, .. } => {
             let mode_prefix = match mode {
                 TerminalMode::Unsafe => "[unsafe] ",
                 TerminalMode::Network => "[network] ",
                 TerminalMode::Sandboxed => "",
             };
-            format!("{}$ {}", mode_prefix, command)
+            format!("{mode_prefix}$ {command}")
         }
     };
 
@@ -1357,11 +1374,11 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         }
         ToolStatus::Done => Span::styled("Status: Done", Style::default().fg(Color::Green)),
         ToolStatus::SearchDone(n) => Span::styled(
-            format!("Status: {} results", n),
+            format!("Status: {n} results"),
             Style::default().fg(Color::Green),
         ),
         ToolStatus::Failed(e) => Span::styled(
-            format!("Status: Failed - {}", e),
+            format!("Status: Failed - {e}"),
             Style::default().fg(Color::Red),
         ),
     };

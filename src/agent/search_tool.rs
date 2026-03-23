@@ -86,27 +86,27 @@ pub struct SearchArgs {
     pub include_content: bool,
 }
 
-fn default_action() -> SearchAction {
+const fn default_action() -> SearchAction {
     SearchAction::Query
 }
 
-fn default_search_mode() -> SearchMode {
+const fn default_search_mode() -> SearchMode {
     SearchMode::Hybrid
 }
 
-fn default_output_mode() -> SearchOutputMode {
+const fn default_output_mode() -> SearchOutputMode {
     SearchOutputMode::Files
 }
 
-fn default_limit() -> usize {
+const fn default_limit() -> usize {
     20
 }
 
-fn default_scan_limit() -> usize {
+const fn default_scan_limit() -> usize {
     2000
 }
 
-fn default_fuzzy_distance() -> u32 {
+const fn default_fuzzy_distance() -> u32 {
     1
 }
 
@@ -117,7 +117,7 @@ pub struct SearchTool {
 }
 
 impl SearchTool {
-    pub fn new(sandbox_dir: PathBuf, embedder: Option<CloudEmbedder>) -> Self {
+    pub const fn new(sandbox_dir: PathBuf, embedder: Option<CloudEmbedder>) -> Self {
         Self {
             sandbox_dir,
             embedder,
@@ -205,7 +205,7 @@ impl Tool for SearchTool {
     }
 }
 
-pub(crate) fn apply_command_form(args: &mut SearchArgs, command: &str) -> anyhow::Result<()> {
+pub fn apply_command_form(args: &mut SearchArgs, command: &str) -> anyhow::Result<()> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return Err(anyhow::anyhow!("search command must not be empty"));
@@ -315,7 +315,7 @@ async fn index_path(
 ) -> anyhow::Result<ToolOutput> {
     let canonical = async_fs::canonicalize(PathBuf::from(raw_path.clone()))
         .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve search path {}: {e}", raw_path))?;
+        .map_err(|e| anyhow::anyhow!("failed to resolve search path {raw_path}: {e}"))?;
 
     let mut meta = load_meta(&meta_path).await?;
     let canonical_string = canonical.display().to_string();
@@ -485,9 +485,7 @@ async fn query_index(
         SearchMode::Regex => run_plain_query(&table, &args).await?,
         SearchMode::Text => run_plain_query(&table, &args).await?,
         SearchMode::Hybrid => {
-            if !query_enabled {
-                run_plain_query(&table, &args).await?
-            } else {
+            if query_enabled {
                 let mut merged = Vec::new();
                 let mut fts = run_full_text_query(&table, &args, false).await?;
                 let mut fuzzy = run_full_text_query(&table, &args, true).await?;
@@ -496,6 +494,8 @@ async fn query_index(
                 merged.append(&mut fuzzy);
                 merged.append(&mut plain);
                 merged
+            } else {
+                run_plain_query(&table, &args).await?
             }
         }
         SearchMode::Semantic => unreachable!("semantic search returns earlier"),
@@ -535,12 +535,10 @@ async fn query_index(
         if query_enabled
             && args.search_mode != SearchMode::Fulltext
             && args.search_mode != SearchMode::Fuzzy
-        {
-            if haystack_norm.contains(&query_norm) {
+            && haystack_norm.contains(&query_norm) {
                 row.score += 10.0;
                 push_unique(&mut row.matched_by, SearchMode::Text);
             }
-        }
         if let Some(re) = &regex
             && re.is_match(&haystack)
         {
@@ -549,9 +547,7 @@ async fn query_index(
         }
     }
 
-    candidates = candidates
-        .into_iter()
-        .filter(|row| {
+    candidates.retain(|row| {
             let haystack = [row.relative_path.as_str(), row.content.as_str()].join("\n");
             if query_enabled && args.search_mode == SearchMode::Text {
                 let haystack = if args.case_sensitive {
@@ -568,8 +564,7 @@ async fn query_index(
                 return re.is_match(&haystack);
             }
             true
-        })
-        .collect();
+        });
 
     let mut deduped: HashMap<String, FileMatchRow> = HashMap::new();
     for row in candidates {
@@ -672,7 +667,7 @@ async fn run_semantic_query(
                 modified_at: modified_at.to_string(),
                 chunk_id: result.chunk.index as i64,
                 content: result.chunk.text,
-                score: result.score as f64,
+                score: f64::from(result.score),
                 matched_by: vec![SearchMode::Semantic],
             }))
         })
@@ -819,7 +814,7 @@ async fn read_rows_from_stream(
                         if array.is_null(idx) {
                             0.0
                         } else {
-                            array.value(idx) as f64
+                            f64::from(array.value(idx))
                         }
                     })
                     .collect::<Vec<_>>()
@@ -844,13 +839,13 @@ async fn read_rows_from_stream(
 fn as_string<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a StringArray> {
     column
         .and_then(|value| value.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{}' column", name))
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
 }
 
 fn as_i64<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a Int64Array> {
     column
         .and_then(|value| value.as_any().downcast_ref::<Int64Array>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{}' column", name))
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
 }
 
 async fn collect_searchable_files(roots: &[String]) -> anyhow::Result<Vec<SearchableFile>> {
@@ -958,7 +953,7 @@ async fn read_searchable_file(
     }))
 }
 
-pub(crate) fn chunk_text(content: &str) -> Vec<String> {
+pub fn chunk_text(content: &str) -> Vec<String> {
     let chars: Vec<char> = content.chars().collect();
     if chars.len() <= CHUNK_TARGET_CHARS {
         return vec![content.to_string()];

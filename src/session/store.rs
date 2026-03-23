@@ -32,16 +32,19 @@ pub enum SandboxResourceLayout {
 
 impl SessionStore {
     /// Create a new session store.
-    pub fn new(home_paths: MayHomePaths) -> Self {
+    #[must_use] 
+    pub const fn new(home_paths: MayHomePaths) -> Self {
         Self { home_paths }
     }
 
     /// Get path for a session directory.
+    #[must_use] 
     pub fn session_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
         self.session_paths(id, profile_id).root().to_path_buf()
     }
 
     /// Get typed layout for a session.
+    #[must_use] 
     pub fn session_paths(&self, id: &str, profile_id: Option<&str>) -> SessionPaths {
         match profile_id {
             Some(profile_id) => self.home_paths.profile_home(profile_id).session_paths(id),
@@ -50,22 +53,26 @@ impl SessionStore {
     }
 
     /// Get path for a session's chat history.
+    #[must_use] 
     pub fn chat_path(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
         self.session_paths(id, profile_id).chat_backup_path()
     }
 
     /// Get path for a session's images directory.
+    #[must_use] 
     pub fn images_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
         self.session_paths(id, profile_id).images_dir()
     }
 
     /// Get path for a session's sandbox directory.
-    /// TerminalTool will create its own working directory inside this.
+    /// `TerminalTool` will create its own working directory inside this.
+    #[must_use] 
     pub fn sandbox_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
         self.session_dir(id, profile_id)
     }
 
     /// Check if a session exists.
+    #[must_use] 
     pub fn exists(&self, id: &str, profile_id: Option<&str>) -> bool {
         self.session_dir(id, profile_id).exists()
     }

@@ -3,14 +3,14 @@
 //! Architecture:
 //! 1. chromiumoxide launches Chrome and manages CDP protocol
 //! 2. CDP screencast frames are captured and piped to a dedicated encoding thread
-//! 3. H.264 encoding via OpenH264 with Screen Content mode (optimized for UI/text)
+//! 3. H.264 encoding via `OpenH264` with Screen Content mode (optimized for UI/text)
 //! 4. Encoded video streamed to clients via WebRTC media tracks (RTP/UDP)
-//! 5. User input received via WebRTC DataChannel, forwarded as CDP commands
+//! 5. User input received via WebRTC `DataChannel`, forwarded as CDP commands
 //!
 //! Encoding backend:
-//! - Default: OpenH264 (compiled from C source, Screen Content Real-Time mode)
-//! - Optional: GStreamer (hardware accel via VideoToolbox/NVENC/VAAPI, AV1 SCC)
-//!   Enable with `--features gstreamer`. Requires GStreamer installed on system.
+//! - Default: `OpenH264` (compiled from C source, Screen Content Real-Time mode)
+//! - Optional: `GStreamer` (hardware accel via VideoToolbox/NVENC/VAAPI, AV1 SCC)
+//!   Enable with `--features gstreamer`. Requires `GStreamer` installed on system.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -181,7 +181,7 @@ impl BrowserRuntime {
 /// Manages a browser instance with WebRTC live streaming and input forwarding.
 ///
 /// Video pipeline: CDP screencast → JPEG → H.264 (Screen Content) → WebRTC
-/// Input pipeline: WebRTC DataChannel → JSON → CDP Input.dispatch*
+/// Input pipeline: WebRTC `DataChannel` → JSON → CDP Input.dispatch*
 pub struct BrowserManager {
     config: PlaywrightConfig,
     command_tx: mpsc::UnboundedSender<BrowserCommand>,
@@ -278,6 +278,7 @@ impl BrowserManager {
     }
 
     /// CDP endpoint URL for agent connections (e.g. from container).
+    #[must_use] 
     pub fn cdp_endpoint(&self) -> String {
         format!("http://127.0.0.1:{}", self.config.port)
     }
@@ -307,9 +308,9 @@ impl BrowserManager {
     /// Handle a WebRTC SDP offer from a client. Returns the SDP answer.
     ///
     /// Uses WHEP-style single HTTP round-trip signaling:
-    /// 1. Client creates offer (recvonly video + DataChannel)
+    /// 1. Client creates offer (recvonly video + `DataChannel`)
     /// 2. Server creates answer with video track + ICE candidates
-    /// 3. Connection established, video flows, DataChannel ready for input
+    /// 3. Connection established, video flows, `DataChannel` ready for input
     pub async fn handle_offer(&self, offer_sdp: String) -> Result<String, BrowserError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
@@ -360,12 +361,12 @@ impl BrowserRuntime {
                 .map_err(|e| BrowserError::Browser(e.to_string()))?,
         );
 
-        let max_width = config.screencast_max_width as i64;
+        let max_width = i64::from(config.screencast_max_width);
         let max_height = max_width * 5 / 8;
         page.execute(
             StartScreencastParams::builder()
                 .format(StartScreencastFormat::Jpeg)
-                .quality(config.screencast_quality as i64)
+                .quality(i64::from(config.screencast_quality))
                 .max_width(max_width)
                 .max_height(max_height)
                 .every_nth_frame(1)
@@ -627,8 +628,7 @@ fn encode_loop(
         // Compute inter-frame duration
         let now = Instant::now();
         let duration = last_frame_time
-            .map(|t| now.duration_since(t))
-            .unwrap_or(Duration::from_millis(33));
+            .map_or(Duration::from_millis(33), |t| now.duration_since(t));
         last_frame_time = Some(now);
 
         // Periodic keyframes for new viewers / packet loss recovery
@@ -742,13 +742,12 @@ async fn dispatch_mouse(page: &Page, input: MouseInput) -> Result<(), BrowserErr
     let button = input
         .button
         .as_deref()
-        .map(|b| match b {
+        .map_or(MouseButton::None, |b| match b {
             "left" => MouseButton::Left,
             "right" => MouseButton::Right,
             "middle" => MouseButton::Middle,
             _ => MouseButton::None,
-        })
-        .unwrap_or(MouseButton::None);
+        });
 
     let mut builder = DispatchMouseEventParams::builder()
         .r#type(event_type)
@@ -757,7 +756,7 @@ async fn dispatch_mouse(page: &Page, input: MouseInput) -> Result<(), BrowserErr
         .button(button);
 
     if let Some(count) = input.click_count {
-        builder = builder.click_count(count as i64);
+        builder = builder.click_count(i64::from(count));
     }
     if let Some(dx) = input.delta_x {
         builder = builder.delta_x(dx);
@@ -766,7 +765,7 @@ async fn dispatch_mouse(page: &Page, input: MouseInput) -> Result<(), BrowserErr
         builder = builder.delta_y(dy);
     }
     if let Some(m) = input.modifiers {
-        builder = builder.modifiers(m as i64);
+        builder = builder.modifiers(i64::from(m));
     }
 
     let params = builder.build().map_err(BrowserError::Browser)?;
@@ -801,7 +800,7 @@ async fn dispatch_keyboard(page: &Page, input: KeyboardInput) -> Result<(), Brow
         builder = builder.text(text);
     }
     if let Some(m) = input.modifiers {
-        builder = builder.modifiers(m as i64);
+        builder = builder.modifiers(i64::from(m));
     }
 
     let params = builder.build().map_err(BrowserError::Browser)?;
@@ -815,7 +814,7 @@ async fn dispatch_keyboard(page: &Page, input: KeyboardInput) -> Result<(), Brow
 
 /// Kill stale Chrome processes from previous runs and clean up lock files.
 ///
-/// When the server exits without cleanly shutting down BrowserManager,
+/// When the server exits without cleanly shutting down `BrowserManager`,
 /// Chrome processes survive and hold the CDP port. This function detects
 /// and kills any chromiumoxide-launched Chrome on the target port.
 async fn cleanup_stale_chrome(port: u16) {
@@ -860,7 +859,7 @@ async fn cleanup_stale_chrome(port: u16) {
     .await;
 }
 
-/// Find the browser binary path. Runs in spawn_blocking since it does filesystem I/O.
+/// Find the browser binary path. Runs in `spawn_blocking` since it does filesystem I/O.
 fn find_browser_binary(browser: crate::config::PlaywrightBrowser) -> Option<String> {
     use crate::config::PlaywrightBrowser;
     use std::path::{Path, PathBuf};
@@ -877,13 +876,13 @@ fn find_browser_binary(browser: crate::config::PlaywrightBrowser) -> Option<Stri
             candidates
                 .iter()
                 .find(|p| Path::new(p).exists())
-                .map(|p| p.to_string())
+                .map(std::string::ToString::to_string)
         }
         PlaywrightBrowser::Chromium => {
             let home = dirs::home_dir()?;
             let cache_dir = home.join(".cache/ms-playwright");
-            if cache_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            if cache_dir.exists()
+                && let Ok(entries) = std::fs::read_dir(&cache_dir) {
                     for entry in entries.flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
                         if name.starts_with("chromium-") {
@@ -899,7 +898,6 @@ fn find_browser_binary(browser: crate::config::PlaywrightBrowser) -> Option<Stri
                         }
                     }
                 }
-            }
             let homebrew = PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium");
             if homebrew.exists() {
                 return Some(homebrew.to_string_lossy().to_string());

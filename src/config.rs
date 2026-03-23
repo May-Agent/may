@@ -11,7 +11,7 @@
 //!   just provide access.
 //!
 //! - **Models**: User preferences for which models to use per tier. Each tier (advanced,
-//!   balanced, fast, image_generation) can have multiple models in priority order.
+//!   balanced, fast, `image_generation`) can have multiple models in priority order.
 //!   The system will try providers in order and failover to the next model if all fail.
 //!
 //! - **Preferences**: Global settings like load balancing strategy and warnings.
@@ -57,11 +57,11 @@ use crate::network_policy::NetworkPolicyConfig;
 /// Infer model tier from aither-models metadata.
 ///
 /// Uses model mode, pricing percentiles, and context window as signals.
+#[must_use] 
 pub fn get_model_tier(model_id: &str) -> ModelTier {
     let chat_price_breakpoints = chat_price_breakpoints();
     aither_models::lookup(model_id)
-        .map(|info| infer_model_tier(info, chat_price_breakpoints))
-        .unwrap_or(ModelTier::Balanced)
+        .map_or(ModelTier::Balanced, |info| infer_model_tier(info, chat_price_breakpoints))
 }
 
 fn chat_price_breakpoints() -> Option<(f64, f64)> {
@@ -73,7 +73,7 @@ fn chat_price_breakpoints() -> Option<(f64, f64)> {
         return None;
     }
 
-    prices.sort_by(|a, b| a.total_cmp(b));
+    prices.sort_by(f64::total_cmp);
     let low_index = prices.len() / 3;
     let high_index = (prices.len() * 2) / 3;
     Some((prices[low_index], prices[high_index]))
@@ -146,11 +146,13 @@ pub enum MatchMode {
 
 impl MatchMode {
     /// Create from a `strict_model_matching` preference flag.
-    pub fn from_strict_flag(strict: bool) -> Self {
+    #[must_use] 
+    pub const fn from_strict_flag(strict: bool) -> Self {
         if strict { Self::Strict } else { Self::Relaxed }
     }
 }
 
+#[must_use] 
 pub fn model_ids_match(candidate: &str, requested: &str, mode: MatchMode) -> bool {
     if candidate.eq_ignore_ascii_case(requested) {
         return true;
@@ -185,32 +187,32 @@ pub enum ProviderType {
     /// Anthropic Claude models
     #[default]
     Anthropic,
-    /// OpenAI GPT models
+    /// `OpenAI` GPT models
     OpenAI,
     /// Google Gemini models
     Google,
-    /// GitHub Copilot (OAuth, OpenAI format)
+    /// GitHub Copilot (OAuth, `OpenAI` format)
     Copilot,
-    /// OpenRouter (aggregator, OpenAI format)
+    /// `OpenRouter` (aggregator, `OpenAI` format)
     OpenRouter,
-    /// DeepSeek (OpenAI format)
+    /// `DeepSeek` (`OpenAI` format)
     DeepSeek,
-    /// Ollama (local, OpenAI format)
+    /// Ollama (local, `OpenAI` format)
     Ollama,
-    /// Groq (OpenAI format)
+    /// Groq (`OpenAI` format)
     Groq,
-    /// Together AI (OpenAI format)
+    /// Together AI (`OpenAI` format)
     Together,
     /// Mistral AI
     Mistral,
     /// xAI Grok
     XAI,
-    /// Custom provider (user specifies base_url)
+    /// Custom provider (user specifies `base_url`)
     Custom,
 }
 
 impl ProviderType {
-    fn catalog_provider(self) -> Option<aither_models::Provider> {
+    const fn catalog_provider(self) -> Option<aither_models::Provider> {
         match self {
             Self::Anthropic => Some(aither_models::Provider::Anthropic),
             Self::OpenAI => Some(aither_models::Provider::OpenAI),
@@ -252,23 +254,24 @@ impl ProviderType {
     }
 
     /// All known provider types for UI display.
-    pub const ALL: &'static [ProviderType] = &[
-        ProviderType::Anthropic,
-        ProviderType::OpenAI,
-        ProviderType::Google,
-        ProviderType::Copilot,
-        ProviderType::OpenRouter,
-        ProviderType::DeepSeek,
-        ProviderType::Ollama,
-        ProviderType::Groq,
-        ProviderType::Together,
-        ProviderType::Mistral,
-        ProviderType::XAI,
-        ProviderType::Custom,
+    pub const ALL: &'static [Self] = &[
+        Self::Anthropic,
+        Self::OpenAI,
+        Self::Google,
+        Self::Copilot,
+        Self::OpenRouter,
+        Self::DeepSeek,
+        Self::Ollama,
+        Self::Groq,
+        Self::Together,
+        Self::Mistral,
+        Self::XAI,
+        Self::Custom,
     ];
 
     /// Display name for UI.
-    pub fn display_name(self) -> &'static str {
+    #[must_use] 
+    pub const fn display_name(self) -> &'static str {
         match self {
             Self::Anthropic => "Anthropic (Claude)",
             Self::OpenAI => "OpenAI (GPT)",
@@ -286,7 +289,8 @@ impl ProviderType {
     }
 
     /// Short name for the provider type.
-    pub fn short_name(self) -> &'static str {
+    #[must_use] 
+    pub const fn short_name(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAI => "openai",
@@ -304,7 +308,8 @@ impl ProviderType {
     }
 
     /// Get the API format for this provider type.
-    pub fn api_format(self) -> ApiFormat {
+    #[must_use] 
+    pub const fn api_format(self) -> ApiFormat {
         match self {
             Self::Anthropic => ApiFormat::Anthropic,
             Self::Google => ApiFormat::Gemini,
@@ -313,7 +318,8 @@ impl ProviderType {
     }
 
     /// Get default base URL for this provider type.
-    pub fn base_url(self) -> Option<&'static str> {
+    #[must_use] 
+    pub const fn base_url(self) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some("https://api.anthropic.com"),
             Self::OpenAI => Some("https://api.openai.com/v1"),
@@ -331,7 +337,8 @@ impl ProviderType {
     }
 
     /// Get the provider string for aither-models lookup.
-    pub fn aither_provider(self) -> &'static str {
+    #[must_use] 
+    pub const fn aither_provider(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAI => "openai",
@@ -348,22 +355,26 @@ impl ProviderType {
 
     /// Whether this provider type requires an API key.
     /// Custom providers don't require API keys since they might be local servers.
-    pub fn requires_api_key(self) -> bool {
+    #[must_use] 
+    pub const fn requires_api_key(self) -> bool {
         !matches!(self, Self::Ollama | Self::Copilot | Self::Custom)
     }
 
     /// Whether this provider type requires a base URL to be configured.
-    pub fn requires_base_url(self) -> bool {
+    #[must_use] 
+    pub const fn requires_base_url(self) -> bool {
         matches!(self, Self::Custom)
     }
 
     /// Whether this provider type uses OAuth authentication.
-    pub fn uses_oauth(self) -> bool {
+    #[must_use] 
+    pub const fn uses_oauth(self) -> bool {
         matches!(self, Self::Copilot)
     }
 
     /// Parse provider type from an ID string.
     /// Returns Custom if the ID doesn't match any known provider.
+    #[must_use] 
     pub fn from_id(id: &str) -> Self {
         match id.to_lowercase().as_str() {
             "anthropic" | "claude" => Self::Anthropic,
@@ -383,16 +394,17 @@ impl ProviderType {
 
     /// Check if this provider type can serve a given model.
     ///
-    /// Aggregator providers (OpenRouter, Ollama, Custom) accept any model.
+    /// Aggregator providers (`OpenRouter`, Ollama, Custom) accept any model.
     /// Native providers consult the `aither_models` catalog as the single source
     /// of truth. If the model is unknown (not in the catalog), it is not claimable
     /// by any native provider.
+    #[must_use] 
     pub fn can_serve_model(self, model_id: &str) -> bool {
         if self == Self::OpenRouter || self == Self::Ollama || self == Self::Custom {
             return true;
         }
 
-        let Some(canonical_model_id) = aither_models::lookup(model_id).map(|info| info.id()) else {
+        let Some(canonical_model_id) = aither_models::lookup(model_id).map(aither_models::ModelEntry::id) else {
             return false;
         };
 
@@ -427,14 +439,15 @@ pub enum ModelTier {
 
 impl ModelTier {
     /// All tiers for iteration.
-    pub const ALL: &'static [ModelTier] = &[
-        ModelTier::Advanced,
-        ModelTier::Balanced,
-        ModelTier::Fast,
-        ModelTier::ImageGeneration,
+    pub const ALL: &'static [Self] = &[
+        Self::Advanced,
+        Self::Balanced,
+        Self::Fast,
+        Self::ImageGeneration,
     ];
 
-    pub fn display_name(self) -> &'static str {
+    #[must_use] 
+    pub const fn display_name(self) -> &'static str {
         match self {
             Self::Advanced => "Advanced (Flagship)",
             Self::Balanced => "Balanced",
@@ -443,7 +456,8 @@ impl ModelTier {
         }
     }
 
-    pub fn short_name(self) -> &'static str {
+    #[must_use] 
+    pub const fn short_name(self) -> &'static str {
         match self {
             Self::Advanced => "advanced",
             Self::Balanced => "balanced",
@@ -477,7 +491,7 @@ pub struct ProviderInstance {
     pub enabled: bool,
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -495,6 +509,7 @@ impl Default for ProviderInstance {
 
 impl ProviderInstance {
     /// Create a new provider instance with explicit type.
+    #[must_use] 
     pub fn new(provider_type: ProviderType) -> Self {
         Self {
             provider_type: Some(provider_type),
@@ -515,6 +530,7 @@ impl ProviderInstance {
     }
 
     /// Resolve provider type from ID or explicit type field.
+    #[must_use] 
     pub fn resolve_type(&self, id: &str) -> ProviderType {
         // If explicit type is set, use it
         if let Some(t) = self.provider_type {
@@ -525,6 +541,7 @@ impl ProviderInstance {
     }
 
     /// Get effective base URL.
+    #[must_use] 
     pub fn effective_base_url(&self, id: &str) -> Option<&str> {
         self.base_url
             .as_deref()
@@ -532,6 +549,7 @@ impl ProviderInstance {
     }
 
     /// Get display name.
+    #[must_use] 
     pub fn display_name_for(&self, id: &str) -> String {
         self.display_name
             .clone()
@@ -539,6 +557,7 @@ impl ProviderInstance {
     }
 
     /// Check if this instance is valid/complete.
+    #[must_use] 
     pub fn is_valid(&self, id: &str) -> bool {
         if !self.enabled {
             return false;
@@ -556,6 +575,7 @@ impl ProviderInstance {
     }
 
     /// Check if this provider can serve a model.
+    #[must_use] 
     pub fn can_serve_model(&self, id: &str, model_id: &str) -> bool {
         if !self.is_valid(id) {
             return false;
@@ -572,6 +592,7 @@ impl ProviderInstance {
     ///
     /// Generic proxies can serve arbitrary model IDs and should be appended
     /// after explicit provider/model matches in fallback ordering.
+    #[must_use] 
     pub fn is_generic_model_proxy(&self, id: &str) -> bool {
         let provider_type = self.resolve_type(id);
         if matches!(
@@ -599,8 +620,7 @@ impl ProviderInstance {
         let normalized_explicit = normalize_base_url(explicit_base_url);
         provider_type
             .base_url()
-            .map(|default_url| normalize_base_url(default_url) != normalized_explicit)
-            .unwrap_or(true)
+            .map_or(true, |default_url| normalize_base_url(default_url) != normalized_explicit)
     }
 }
 
@@ -618,7 +638,8 @@ pub enum LoadBalanceStrategy {
 }
 
 impl LoadBalanceStrategy {
-    pub fn display_name(self) -> &'static str {
+    #[must_use] 
+    pub const fn display_name(self) -> &'static str {
         match self {
             Self::RoundRobin => "Round Robin (Even Distribution)",
             Self::FailoverOnly => "Failover Only",
@@ -645,7 +666,7 @@ pub struct ModelsConfig {
     /// Image generation models in priority order
     #[serde(default)]
     pub image_generation: Vec<String>,
-    /// Model to provider mapping (model_id -> provider_id).
+    /// Model to provider mapping (`model_id` -> `provider_id`).
     /// Populated when models are added via the tier picker.
     #[serde(default)]
     pub model_providers: HashMap<String, String>,
@@ -653,6 +674,7 @@ pub struct ModelsConfig {
 
 impl ModelsConfig {
     /// Get models for a tier.
+    #[must_use] 
     pub fn models_for_tier(&self, tier: ModelTier) -> &[String] {
         match tier {
             ModelTier::Advanced => &self.advanced,
@@ -663,7 +685,7 @@ impl ModelsConfig {
     }
 
     /// Get mutable models for a tier.
-    pub fn models_for_tier_mut(&mut self, tier: ModelTier) -> &mut Vec<String> {
+    pub const fn models_for_tier_mut(&mut self, tier: ModelTier) -> &mut Vec<String> {
         match tier {
             ModelTier::Advanced => &mut self.advanced,
             ModelTier::Balanced => &mut self.balanced,
@@ -673,7 +695,8 @@ impl ModelsConfig {
     }
 
     /// Check if any models are configured.
-    pub fn has_any_models(&self) -> bool {
+    #[must_use] 
+    pub const fn has_any_models(&self) -> bool {
         !self.advanced.is_empty()
             || !self.balanced.is_empty()
             || !self.fast.is_empty()
@@ -681,6 +704,7 @@ impl ModelsConfig {
     }
 
     /// Check if no models are configured.
+    #[must_use] 
     pub fn is_empty(&self) -> bool {
         !self.has_any_models()
     }
@@ -698,6 +722,7 @@ impl ModelsConfig {
     }
 
     /// Get the provider ID for a model (if known).
+    #[must_use] 
     pub fn provider_for_model(&self, model_id: &str, strict: bool) -> Option<&str> {
         if let Some(provider) = self.model_providers.get(model_id) {
             return Some(provider.as_str());
@@ -790,7 +815,8 @@ pub enum PlaywrightBrowser {
 }
 
 impl PlaywrightBrowser {
-    pub fn display_name(self) -> &'static str {
+    #[must_use] 
+    pub const fn display_name(self) -> &'static str {
         match self {
             Self::LocalChrome => "Local Chrome",
             Self::Chromium => "Chromium (Playwright)",
@@ -822,15 +848,15 @@ pub struct PlaywrightConfig {
     pub screencast_max_width: u32,
 }
 
-fn default_playwright_port() -> u16 {
+const fn default_playwright_port() -> u16 {
     9222
 }
 
-fn default_screencast_quality() -> u32 {
+const fn default_screencast_quality() -> u32 {
     60
 }
 
-fn default_screencast_max_width() -> u32 {
+const fn default_screencast_max_width() -> u32 {
     1280
 }
 
@@ -917,7 +943,7 @@ pub struct MayConfig {
     pub ssh_servers: Vec<SshServerConfig>,
 }
 
-fn default_max_iterations() -> usize {
+const fn default_max_iterations() -> usize {
     0
 }
 
@@ -982,6 +1008,7 @@ impl MayConfig {
     }
 
     /// Check if configuration is complete enough to use.
+    #[must_use] 
     pub fn is_configured(&self) -> bool {
         // Need at least one valid provider
         let has_provider = self.provider.iter().any(|(id, p)| p.is_valid(id));
@@ -991,6 +1018,7 @@ impl MayConfig {
     }
 
     /// Get a provider by ID.
+    #[must_use] 
     pub fn get_provider(&self, id: &str) -> Option<&ProviderInstance> {
         self.provider.get(id)
     }
@@ -1011,6 +1039,7 @@ impl MayConfig {
     }
 
     /// Get all valid provider IDs that can serve a model.
+    #[must_use] 
     pub fn providers_for_model(&self, model_id: &str) -> Vec<&str> {
         self.provider
             .iter()
@@ -1021,10 +1050,11 @@ impl MayConfig {
 
     /// Get all provider IDs.
     pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
-        self.provider.keys().map(|s| s.as_str())
+        self.provider.keys().map(std::string::String::as_str)
     }
 
     /// Get configured SSH servers.
+    #[must_use] 
     pub fn ssh_servers(&self) -> &[SshServerConfig] {
         &self.ssh_servers
     }
@@ -1046,23 +1076,26 @@ impl MayConfig {
     }
 
     /// Get the first available model for a tier.
+    #[must_use] 
     pub fn default_model_for_tier(&self, tier: ModelTier) -> Option<&str> {
         self.models
             .models_for_tier(tier)
             .first()
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
     }
 
     /// Create a provider resolver for runtime model selection.
+    #[must_use] 
     pub fn create_resolver(&self) -> ProviderResolver {
         ProviderResolver::new(self)
     }
 
     /// Get all available models from configured providers.
     ///
-    /// For known providers (anthropic, openai, google), uses aither_models database.
+    /// For known providers (anthropic, openai, google), uses `aither_models` database.
     /// For providers that can serve any model (openrouter, ollama, custom), includes
     /// all known models since they can proxy to multiple backends.
+    #[must_use] 
     pub fn available_models(&self) -> Vec<AvailableModel> {
         let mut models = Vec::new();
         let mut has_any_model_provider = false;
@@ -1081,16 +1114,13 @@ impl MayConfig {
                 continue;
             }
 
-            let provider_models = match ptype {
-                ProviderType::Copilot => aither_models::all_models()
-                    .filter(|info| ptype.provider_matches_catalog(info.provider()))
-                    .collect::<Vec<_>>(),
-                _ => {
-                    let Some(provider_kind) = ptype.catalog_provider() else {
-                        continue;
-                    };
-                    aither_models::models_for_provider(&provider_kind).collect::<Vec<_>>()
-                }
+            let provider_models = if ptype == ProviderType::Copilot { aither_models::all_models()
+            .filter(|info| ptype.provider_matches_catalog(info.provider()))
+            .collect::<Vec<_>>() } else {
+                let Some(provider_kind) = ptype.catalog_provider() else {
+                    continue;
+                };
+                aither_models::models_for_provider(&provider_kind).collect::<Vec<_>>()
             };
 
             for info in provider_models {
@@ -1153,7 +1183,7 @@ pub struct ProviderResolver {
     strategy: LoadBalanceStrategy,
     /// Round-robin counter per model
     counters: HashMap<String, AtomicUsize>,
-    /// Temporarily failed providers (model_id -> provider_ids).
+    /// Temporarily failed providers (`model_id` -> `provider_ids`).
     /// Uses `RefCell` because `ProviderResolver` is always thread-local (created per-request).
     failed: std::cell::RefCell<HashMap<String, Vec<String>>>,
 }
@@ -1169,6 +1199,7 @@ pub struct SelectedProvider<'a> {
 
 impl ProviderResolver {
     /// Create a new resolver from config.
+    #[must_use] 
     pub fn new(config: &MayConfig) -> Self {
         Self {
             providers: config.provider.clone(),
@@ -1189,7 +1220,7 @@ impl ProviderResolver {
 
         for (id, p) in &self.providers {
             if !p.can_serve_model(id, model_id)
-                || failed_ids.map(|list| list.contains(id)).unwrap_or(false)
+                || failed_ids.is_some_and(|list| list.contains(id))
             {
                 continue;
             }
@@ -1228,8 +1259,7 @@ impl ProviderResolver {
                 let counter = self
                     .counters
                     .get(model_id)
-                    .map(|c| c.fetch_add(1, Ordering::Relaxed))
-                    .unwrap_or(0);
+                    .map_or(0, |c| c.fetch_add(1, Ordering::Relaxed));
                 let idx = counter % available.len();
                 available.get(idx).copied()
             }
@@ -1275,7 +1305,7 @@ impl ProviderResolver {
     pub fn next_model_in_tier(&self, tier: ModelTier, current_model: &str) -> Option<&str> {
         let models = self.models.models_for_tier(tier);
         let current_idx = models.iter().position(|m| m == current_model)?;
-        models.get(current_idx + 1).map(|s| s.as_str())
+        models.get(current_idx + 1).map(std::string::String::as_str)
     }
 
     /// Get the first model in a tier.
@@ -1283,7 +1313,7 @@ impl ProviderResolver {
         self.models
             .models_for_tier(tier)
             .first()
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
     }
 }
 

@@ -63,7 +63,8 @@ impl Default for AskUserQuestionState {
 }
 
 impl AskUserQuestionState {
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self {
             cursor: 0,
             selections: Vec::new(),
@@ -74,7 +75,7 @@ impl AskUserQuestionState {
     }
 }
 
-/// State for the ask_user interaction.
+/// State for the `ask_user` interaction.
 impl std::fmt::Debug for AskUserState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AskUserState")
@@ -98,6 +99,7 @@ pub struct AskUserState {
 }
 
 impl AskUserState {
+    #[must_use] 
     pub fn new(request_id: String, request: AskUserRequest, questions: Vec<Question>) -> Self {
         let states = questions
             .iter()
@@ -113,6 +115,7 @@ impl AskUserState {
     }
 
     /// Current question being displayed.
+    #[must_use] 
     pub fn current(&self) -> Option<&Question> {
         self.questions.get(self.current_question)
     }
@@ -123,18 +126,21 @@ impl AskUserState {
     }
 
     /// Current question's state.
+    #[must_use] 
     pub fn current_state(&self) -> Option<&AskUserQuestionState> {
         self.question_states.get(self.current_question)
     }
 
     /// Total number of items in the list for current question:
     /// options + "Skip" + "Custom answer"
+    #[must_use] 
     pub fn current_item_count(&self) -> usize {
-        self.current().map(|q| q.option.len() + 2).unwrap_or(0)
+        self.current().map_or(0, |q| q.option.len() + 2)
     }
 
     /// Whether there are multiple questions.
-    pub fn is_multi(&self) -> bool {
+    #[must_use] 
+    pub const fn is_multi(&self) -> bool {
         self.questions.len() > 1
     }
 }
@@ -180,14 +186,15 @@ pub enum PasteFilter {
 
 impl PasteFilter {
     /// Filter a string, keeping only valid characters.
+    #[must_use] 
     pub fn filter(self, s: &str) -> String {
         match self {
-            PasteFilter::Any => s.to_string(),
-            PasteFilter::Identifier => s
+            Self::Any => s.to_string(),
+            Self::Identifier => s
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
                 .collect(),
-            PasteFilter::GitHubRepo => s
+            Self::GitHubRepo => s
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '/')
                 .collect(),
@@ -284,14 +291,15 @@ pub enum ConfigSection {
 
 impl ConfigSection {
     /// All sections for iteration.
-    pub const ALL: &'static [ConfigSection] = &[
-        ConfigSection::Providers,
-        ConfigSection::Models,
-        ConfigSection::Preferences,
+    pub const ALL: &'static [Self] = &[
+        Self::Providers,
+        Self::Models,
+        Self::Preferences,
     ];
 
     /// Display name for the section tab.
-    pub fn name(self) -> &'static str {
+    #[must_use] 
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Providers => "Providers",
             Self::Models => "Models",
@@ -300,7 +308,8 @@ impl ConfigSection {
     }
 
     /// Next section (Tab).
-    pub fn next(self) -> Self {
+    #[must_use] 
+    pub const fn next(self) -> Self {
         match self {
             Self::Providers => Self::Models,
             Self::Models => Self::Preferences,
@@ -309,7 +318,8 @@ impl ConfigSection {
     }
 
     /// Previous section (Shift+Tab).
-    pub fn prev(self) -> Self {
+    #[must_use] 
+    pub const fn prev(self) -> Self {
         match self {
             Self::Providers => Self::Preferences,
             Self::Models => Self::Providers,
@@ -328,9 +338,9 @@ pub enum ConfigEditMode {
     Text { input: String, cursor: usize },
     /// Selecting from a list (provider type, model list)
     List { items: Vec<String>, selected: usize },
-    /// Editing a custom provider (name, base_url, api_key)
+    /// Editing a custom provider (name, `base_url`, `api_key`)
     CustomProvider {
-        /// Which field is focused (0=name, 1=base_url, 2=api_key)
+        /// Which field is focused (0=name, `1=base_url`, `2=api_key`)
         focused_field: usize,
         /// Provider name/ID
         name: String,
@@ -384,7 +394,8 @@ impl ConfigState {
     }
 
     /// Get row count for current section.
-    pub fn row_count(&self, _config: &MayConfig) -> usize {
+    #[must_use] 
+    pub const fn row_count(&self, _config: &MayConfig) -> usize {
         match self.section {
             ConfigSection::Providers => self.provider_ids.len() + 1,
             ConfigSection::Models => 4,
@@ -393,7 +404,8 @@ impl ConfigState {
     }
 
     /// Check if currently editing a text field.
-    pub fn is_editing(&self) -> bool {
+    #[must_use] 
+    pub const fn is_editing(&self) -> bool {
         !matches!(self.edit_mode, ConfigEditMode::None)
     }
 
@@ -412,6 +424,7 @@ impl ConfigState {
     }
 
     /// Get current edit text (if in text edit mode).
+    #[must_use] 
     pub fn edit_text(&self) -> Option<(&str, usize)> {
         match &self.edit_mode {
             ConfigEditMode::Text { input, cursor } => Some((input, *cursor)),
@@ -420,7 +433,7 @@ impl ConfigState {
     }
 
     /// Get mutable edit text.
-    pub fn edit_text_mut(&mut self) -> Option<(&mut String, &mut usize)> {
+    pub const fn edit_text_mut(&mut self) -> Option<(&mut String, &mut usize)> {
         match &mut self.edit_mode {
             ConfigEditMode::Text { input, cursor } => Some((input, cursor)),
             _ => None,
@@ -429,6 +442,7 @@ impl ConfigState {
 }
 
 /// Try to detect API key from environment variables for the given provider.
+#[must_use] 
 pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'static str)> {
     let env_vars = match provider {
         ProviderType::Anthropic => &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"][..],

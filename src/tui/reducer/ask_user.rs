@@ -6,7 +6,7 @@ use crate::ask_user::{AnswerValue, QuestionAnswer};
 use crate::tui::app::{App, SendAction};
 use crate::tui::state::AppMode;
 
-pub(crate) fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     let state = match &mut app.mode {
         AppMode::AskUser(s) => s,
         _ => return Ok(None),

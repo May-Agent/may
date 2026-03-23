@@ -17,9 +17,9 @@ pub struct Model {
     pub trigger_kind: String,
     /// Time trigger type: "cron" or "once".
     pub trigger_type: String,
-    /// Cron expression (for trigger_type = "cron").
+    /// Cron expression (for `trigger_type` = "cron").
     pub cron_expression: Option<String>,
-    /// ISO 8601 UTC timestamp for one-time tasks (trigger_type = "once").
+    /// ISO 8601 UTC timestamp for one-time tasks (`trigger_type` = "once").
     pub run_at: Option<String>,
     /// Path to a script file to execute.
     pub script_path: Option<String>,

@@ -41,7 +41,7 @@ enum ContainerMountAccess {
     ReadWrite,
 }
 
-fn default_mount_access() -> ContainerMountAccess {
+const fn default_mount_access() -> ContainerMountAccess {
     ContainerMountAccess::ReadOnly
 }
 

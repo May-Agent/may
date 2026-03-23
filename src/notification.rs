@@ -113,6 +113,7 @@ impl NotificationManager {
     }
 
     /// Get the VAPID public key for browser subscription (base64url-encoded).
+    #[must_use] 
     pub fn public_key(&self) -> &str {
         &self.public_key_base64url
     }
@@ -183,7 +184,7 @@ impl NotificationManager {
             };
 
             match self.client.send(message).await {
-                Ok(_) => {
+                Ok(()) => {
                     sent += 1;
                 }
                 Err(WebPushError::EndpointNotValid(_) | WebPushError::EndpointNotFound(_)) => {

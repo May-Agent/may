@@ -38,21 +38,25 @@ pub struct SubagentManager {
 
 impl SubagentManager {
     /// Create a new manager rooted at `~/.may/subagents`.
+    #[must_use] 
     pub fn new(may_dir: &Path) -> Self {
         Self::from_subagents_dir(MayHomePaths::new(may_dir.to_path_buf()).subagents_dir())
     }
 
     /// Create a manager rooted at one profile home.
+    #[must_use] 
     pub fn from_profile_home(profile_home: &ProfileHomePaths) -> Self {
         Self::from_subagents_dir(profile_home.subagents_dir())
     }
 
     /// Create a manager rooted at an explicit subagents directory.
-    pub fn from_subagents_dir(subagents_dir: PathBuf) -> Self {
+    #[must_use] 
+    pub const fn from_subagents_dir(subagents_dir: PathBuf) -> Self {
         Self { subagents_dir }
     }
 
     /// Get the subagents directory path.
+    #[must_use] 
     pub fn subagents_dir(&self) -> &Path {
         &self.subagents_dir
     }

@@ -20,6 +20,7 @@ pub struct InputHistory {
 
 impl InputHistory {
     /// Create a new history, loading from file if exists.
+    #[must_use] 
     pub fn new(may_dir: &Path) -> Self {
         let history_file = may_dir.join("history");
         let entries = Self::load_from_file(&history_file);
@@ -131,7 +132,8 @@ impl InputHistory {
     }
 
     /// Check if currently navigating history.
-    pub fn is_navigating(&self) -> bool {
+    #[must_use] 
+    pub const fn is_navigating(&self) -> bool {
         self.nav_index.is_some()
     }
 }

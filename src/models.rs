@@ -217,6 +217,7 @@ async fn fetch_models_for_provider(
         .collect())
 }
 
+#[must_use] 
 pub fn ability_to_label(ability: Ability) -> String {
     match ability {
         Ability::ToolUse => "tool_use".to_string(),

@@ -57,6 +57,7 @@ impl ContextSnapshotRecord {
         })
     }
 
+    #[must_use] 
     pub fn with_terminal_runtime(
         mut self,
         runtime: &crate::session::SessionRuntimeSummary,

@@ -39,6 +39,7 @@ impl MemoryProcessor {
     ///
     /// `llm` should be a fast model provider (e.g., Claude Haiku, GPT-4o-mini).
     /// Spawns a periodic background task that processes dirty profiles.
+    #[must_use] 
     pub fn new(db: ChatDb, providers: Vec<MemoryExtractionProvider>) -> Self {
         let worker_db = db.clone();
         tokio::spawn(async move {
@@ -276,11 +277,13 @@ impl ProfileMemories {
     }
 
     /// Check if any memories are present.
-    pub fn is_empty(&self) -> bool {
+    #[must_use] 
+    pub const fn is_empty(&self) -> bool {
         self.preference.is_none() && self.recency.is_none()
     }
 
     /// Format memories as context for agent injection.
+    #[must_use] 
     pub fn to_context_string(&self) -> String {
         let mut parts = Vec::new();
 

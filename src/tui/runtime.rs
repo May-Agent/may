@@ -23,6 +23,7 @@ pub struct LocalSessionRuntime {
 }
 
 impl LocalSessionRuntime {
+    #[must_use] 
     pub fn new(db: ChatDb) -> Self {
         let notify = Arc::new(tokio::sync::Notify::new());
         let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(db, notify));
@@ -35,10 +36,11 @@ impl LocalSessionRuntime {
         }
     }
 
-    pub fn enable_oneshot_restricted_mode(&mut self) {
+    pub const fn enable_oneshot_restricted_mode(&mut self) {
         self.oneshot_restricted = true;
     }
 
+    #[must_use] 
     pub fn permission_approver_for(
         &self,
         session_id: &SessionId,
@@ -382,9 +384,7 @@ fn persisted_attachment_from_tui(
         } => Ok(crate::session::PersistedAttachment {
             id,
             name: saved_path
-                .as_ref()
-                .map(|path| file_name_or_default(path, "pasted.txt"))
-                .unwrap_or_else(|| "pasted.txt".to_string()),
+                .as_ref().map_or_else(|| "pasted.txt".to_string(), |path| file_name_or_default(path, "pasted.txt")),
             attachment_type: "text".to_string(),
             url: saved_path
                 .as_ref()
@@ -440,7 +440,7 @@ async fn tui_attachment_from_persisted(
 
 fn file_url(path: &std::path::Path) -> anyhow::Result<String> {
     url::Url::from_file_path(path)
-        .map_err(|_| anyhow::anyhow!("failed to convert path into file URL"))
+        .map_err(|()| anyhow::anyhow!("failed to convert path into file URL"))
         .map(|url| url.to_string())
 }
 
@@ -448,14 +448,12 @@ fn path_from_attachment_url(url: &str) -> anyhow::Result<std::path::PathBuf> {
     url::Url::parse(url)
         .map_err(anyhow::Error::from)?
         .to_file_path()
-        .map_err(|_| anyhow::anyhow!("attachment URL is not a local file URL"))
+        .map_err(|()| anyhow::anyhow!("attachment URL is not a local file URL"))
 }
 
 fn file_name_or_default(path: &std::path::Path, default_name: &str) -> String {
     path.file_name()
-        .and_then(|name| name.to_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| default_name.to_string())
+        .and_then(|name| name.to_str()).map_or_else(|| default_name.to_string(), ToOwned::to_owned)
 }
 
 fn image_data_url(path: &std::path::Path, data: &[u8]) -> String {
@@ -469,7 +467,7 @@ fn image_data_url(path: &std::path::Path, data: &[u8]) -> String {
 }
 
 fn decode_data_url(data_url: &str) -> anyhow::Result<Vec<u8>> {
-    let Some((_, encoded)) = data_url.split_once(",") else {
+    let Some((_, encoded)) = data_url.split_once(',') else {
         return Err(anyhow::anyhow!("invalid data URL"));
     };
     base64::engine::general_purpose::STANDARD
@@ -487,7 +485,7 @@ pub struct RuntimeDeps {
 }
 
 impl RuntimeDeps {
-    pub fn new(
+    pub const fn new(
         local_runtime: LocalSessionRuntime,
         workspace_broker: WorkspaceRequestBroker,
         ask_user_broker: AskUserBroker,
@@ -592,8 +590,7 @@ impl RuntimeDeps {
         let needs_title = app
             .session_manager
             .current()
-            .map(|s| s.title.is_none())
-            .unwrap_or(false);
+            .is_some_and(|s| s.title.is_none());
 
         if needs_title {
             *title_gen = Some(TitleGenContext {
@@ -959,7 +956,7 @@ fn prepare_message_content(msg: &PendingMessage) -> anyhow::Result<(String, Vec<
     for attachment in &msg.attachments {
         match attachment {
             Attachment::Image { path, .. } => {
-                let url = url::Url::from_file_path(path).map_err(|_| {
+                let url = url::Url::from_file_path(path).map_err(|()| {
                     anyhow::anyhow!(
                         "Failed to convert attachment path to URL: {}",
                         path.display()
@@ -976,7 +973,7 @@ fn prepare_message_content(msg: &PendingMessage) -> anyhow::Result<(String, Vec<
             } => {
                 let char_count = content.chars().count();
                 let xml = build_pasted_text_xml(content, char_count, saved_path.as_ref())?;
-                parts.push(format!("\n{}", xml));
+                parts.push(format!("\n{xml}"));
             }
         }
     }
@@ -1092,7 +1089,7 @@ fn build_pasted_text_xml(
     };
 
     quick_xml::se::to_string(&xml)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize paste XML: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to serialize paste XML: {e}"))
 }
 
 pub async fn send_image_fetch_event(

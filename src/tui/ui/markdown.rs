@@ -26,19 +26,20 @@ impl ImageSupport {
 pub struct MarkdownRenderResult {
     /// Rendered lines
     pub lines: Vec<Line<'static>>,
-    /// Image positions: (url, line_index) for each image
+    /// Image positions: (url, `line_index`) for each image
     pub image_positions: Vec<(String, usize)>,
 }
 
 /// Render markdown text to ratatui lines.
 ///
-/// This is a convenience wrapper that creates a temporary StreamingMarkdown
+/// This is a convenience wrapper that creates a temporary `StreamingMarkdown`
 /// renderer for one-shot rendering. For streaming use cases, prefer using
-/// StreamingMarkdown directly.
+/// `StreamingMarkdown` directly.
 ///
 /// `images_supported` controls how images are rendered:
 /// - true: show loading indicator (actual image rendered as overlay)
 /// - false: show as styled link
+#[must_use] 
 pub fn render_markdown_with_config(text: &str, images: ImageSupport) -> Vec<Line<'static>> {
     let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled());
     renderer.push(text);
@@ -50,6 +51,7 @@ pub fn render_markdown_with_config(text: &str, images: ImageSupport) -> Vec<Line
 ///
 /// Use this when you need to know where images are located in the rendered output
 /// for rendering actual images as overlays.
+#[must_use] 
 pub fn render_markdown_with_positions(text: &str, images: ImageSupport) -> MarkdownRenderResult {
     let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled());
     renderer.push(text);
@@ -62,13 +64,15 @@ pub fn render_markdown_with_positions(text: &str, images: ImageSupport) -> Markd
 
 /// Render markdown text to ratatui lines (no image support).
 /// For image support, use `render_markdown_with_config`.
+#[must_use] 
 pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     render_markdown_with_config(text, ImageSupport::Disabled)
 }
 
 /// Extract image URLs from markdown text.
 ///
-/// Returns a list of (alt_text, url) pairs for all images found.
+/// Returns a list of (`alt_text`, url) pairs for all images found.
+#[must_use] 
 pub fn extract_images(text: &str) -> Vec<(String, String)> {
     let mut renderer = StreamingMarkdown::new();
     renderer.push(text);

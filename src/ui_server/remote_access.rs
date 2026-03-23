@@ -62,7 +62,7 @@ enum RemoteAccessEvent {
 }
 
 #[derive(Clone)]
-pub(crate) struct RemoteAccessManager {
+pub struct RemoteAccessManager {
     command_tx: mpsc::Sender<RemoteAccessCommand>,
     status_rx: watch::Receiver<RemoteAccessStatusResponse>,
 }
@@ -126,7 +126,7 @@ impl RemoteAccessManager {
     }
 }
 
-pub(crate) async fn sync_remote_access_from_state(
+pub async fn sync_remote_access_from_state(
     state: &UiServerState,
 ) -> Result<(), crate::db::ChatDbError> {
     let config = state.config_snapshot().remote_access.clone();

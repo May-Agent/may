@@ -23,7 +23,7 @@ use crate::workspace_request::RequestWorkspaceArgs;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ContainerPrepareStage {
+pub enum ContainerPrepareStage {
     Checking,
     Building,
     Ready,
@@ -31,7 +31,7 @@ pub(crate) enum ContainerPrepareStage {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ContainerPrepareStatus {
+pub struct ContainerPrepareStatus {
     pub(crate) profile_id: String,
     pub(crate) stage: ContainerPrepareStage,
     pub(crate) summary: String,
@@ -39,7 +39,7 @@ pub(crate) struct ContainerPrepareStatus {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ContainerPrepareStatusesPayload {
+pub struct ContainerPrepareStatusesPayload {
     pub(crate) statuses: Vec<ContainerPrepareStatus>,
 }
 
@@ -66,7 +66,7 @@ enum ContainerPrepareCommand {
 }
 
 #[derive(Clone)]
-pub(crate) struct ContainerPrepareTracker {
+pub struct ContainerPrepareTracker {
     tx: tokio::sync::mpsc::UnboundedSender<ContainerPrepareCommand>,
     snapshot_rx: tokio::sync::watch::Receiver<ContainerPrepareSnapshot>,
 }
@@ -159,14 +159,14 @@ impl ContainerPrepareTracker {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TitleGenerationTask {
+pub struct TitleGenerationTask {
     pub(crate) session_id: String,
     pub(crate) user_message: String,
     pub(crate) assistant_response: String,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TitleGenerationQueue {
+pub struct TitleGenerationQueue {
     tx: tokio::sync::mpsc::UnboundedSender<TitleGenerationTask>,
 }
 
@@ -185,21 +185,21 @@ impl TitleGenerationQueue {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct UiToolDispatchers {
+pub struct UiToolDispatchers {
     pub(crate) task: TaskBroker,
     pub(crate) notify: crate::agent::notify_tool::NotifyBroker,
     pub(crate) register_skills: RegisterBroker,
     pub(crate) register_subagents: RegisterBroker,
 }
 
-pub(crate) struct UiToolQueues {
+pub struct UiToolQueues {
     pub(crate) task: TaskQueue,
     pub(crate) notify: crate::agent::notify_tool::NotifyQueue,
     pub(crate) register_skills: RegisterQueue,
     pub(crate) register_subagents: RegisterQueue,
 }
 
-pub(crate) fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
+pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
     let (task, task_queue) = crate::agent::task_tool::channel();
     let (notify, notify_queue) = crate::agent::notify_tool::channel();
     let (register_skills, register_skills_queue) = crate::agent::register_tool::skills_channel();
@@ -223,7 +223,7 @@ pub(crate) fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
 }
 
 #[derive(Debug)]
-pub(crate) struct RefreshableCache<T> {
+pub struct RefreshableCache<T> {
     ttl: Duration,
     inner: ArcSwapOption<CachedValue<T>>,
 }
@@ -282,7 +282,7 @@ enum McpCommand {
 }
 
 #[derive(Clone)]
-pub(crate) struct McpService {
+pub struct McpService {
     tx: tokio::sync::mpsc::UnboundedSender<McpCommand>,
 }
 
@@ -375,7 +375,7 @@ impl McpService {
     }
 }
 
-pub(crate) struct UiServerState {
+pub struct UiServerState {
     pub(crate) db: crate::db::ChatDb,
     pub(crate) default_profile_id: String,
     pub(crate) mcp_service: McpService,
@@ -426,32 +426,32 @@ impl UiServerState {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UiQuestionAnswer {
+pub struct UiQuestionAnswer {
     pub(crate) section: String,
     pub(crate) answer: serde_json::Value,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AskUserRespondRequest {
+pub struct AskUserRespondRequest {
     pub(crate) id: String,
     pub(crate) answers: Vec<UiQuestionAnswer>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AskUserApprover {
+pub struct AskUserApprover {
     live_responses: Arc<LiveResponseRegistry<Vec<QuestionAnswer>>>,
     runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WorkspaceApprover {
+pub struct WorkspaceApprover {
     live_responses: Arc<LiveResponseRegistry<bool>>,
     runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SessionRunCancellationRegistry {
+pub struct SessionRunCancellationRegistry {
     live_responses: Arc<LiveResponseRegistry<()>>,
 }
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
-pub(crate) struct LiveResponseRegistry<Response> {
+pub struct LiveResponseRegistry<Response> {
     senders: ArcSwap<HashMap<String, Sender<Response>>>,
 }
 

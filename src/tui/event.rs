@@ -44,7 +44,7 @@ pub enum AppEvent {
     SkillDeleted(Result<Vec<SkillInfo>, anyhow::Error>),
 
     // ─── Profile operation results ──────────────────────────────────
-    /// Profile list loaded (for ProfileSelect mode)
+    /// Profile list loaded (for `ProfileSelect` mode)
     ProfilesLoaded(Result<Vec<ProfileInfo>, anyhow::Error>),
     /// Profile sessions loaded (pinned/regular/archived groups)
     ProfileSessionsLoaded(Result<ProfileSessions, anyhow::Error>),
@@ -68,6 +68,7 @@ pub struct EventHandler {
 
 impl EventHandler {
     /// Create a new event handler.
+    #[must_use] 
     pub fn new() -> Self {
         let (tx, rx) = async_channel::unbounded();
         let tx_clone = tx.clone();
@@ -104,6 +105,7 @@ impl EventHandler {
     }
 
     /// Get a clone of the sender for sending events from background tasks.
+    #[must_use] 
     pub fn sender(&self) -> EventSender {
         self.tx.clone()
     }

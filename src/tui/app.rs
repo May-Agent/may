@@ -33,8 +33,7 @@ pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../texts/tool_response_se
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
+        .map_or(s.len(), |(i, _)| i)
 }
 
 /// Agent event from aither-agent.
@@ -55,13 +54,13 @@ pub struct App {
     pub input: String,
     /// Input cursor position (character index, not byte index)
     pub cursor: usize,
-    /// Cached character count for input (avoids O(n) .chars().count())
+    /// Cached character count for input (avoids O(n) .`chars().count()`)
     pub input_char_count: usize,
     /// Pending attachments
     pub attachments: Vec<Attachment>,
     /// Chat stream for display
     pub chat: ChatStream,
-    /// Scroll offset in chat (usize::MAX = follow bottom)
+    /// Scroll offset in chat (`usize::MAX` = follow bottom)
     pub scroll: usize,
     /// Whether chat input is shown (hidden during full-screen scroll)
     pub input_visible: bool,
@@ -79,7 +78,7 @@ pub struct App {
     pub background_tasks: usize,
     /// Whether agent is currently processing
     pub processing: bool,
-    /// File picker state (when in FilePicker mode)
+    /// File picker state (when in `FilePicker` mode)
     pub file_picker: Option<FilePicker>,
     /// Image manager for clipboard images
     pub image_manager: Option<ImageManager>,
@@ -89,7 +88,7 @@ pub struct App {
     pub history: InputHistory,
     /// Input completion state
     pub completion: Completion,
-    /// Session list for selection (when in SessionSelect mode)
+    /// Session list for selection (when in `SessionSelect` mode)
     pub session_list: Vec<SessionSummary>,
     /// Selected session index (in filtered list)
     pub session_selected: usize,
@@ -97,7 +96,7 @@ pub struct App {
     pub session_search: String,
     /// Session list scroll offset
     pub session_scroll: usize,
-    /// Currently selected tool ID (for ToolDetail mode)
+    /// Currently selected tool ID (for `ToolDetail` mode)
     pub selected_tool: Option<String>,
     /// Tool selection index in tool list
     pub selected_tool_index: usize,
@@ -119,7 +118,7 @@ pub struct App {
     pub thinking_start: Option<std::time::Instant>,
     /// Copilot OAuth authentication status
     pub copilot_auth_status: Option<CopilotAuthStatus>,
-    /// Tier being edited in TierModelPicker mode
+    /// Tier being edited in `TierModelPicker` mode
     pub tier_picker_tier: Option<ModelTier>,
     /// All available models for tier picker
     pub tier_picker_models: Vec<FetchedModel>,
@@ -184,9 +183,9 @@ pub struct App {
     pub current_profile_id: Option<String>,
     /// Profile sessions for the current profile (pinned/regular/archived)
     pub profile_sessions: Option<ProfileSessions>,
-    /// Selected profile index in ProfileSelect mode
+    /// Selected profile index in `ProfileSelect` mode
     pub profile_selected: usize,
-    /// Whether the archived section is expanded in SessionSelect
+    /// Whether the archived section is expanded in `SessionSelect`
     pub archived_expanded: bool,
 
     /// Event sender for spawning background tasks
@@ -273,14 +272,14 @@ impl App {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         // Build status message for env-detected providers
-        let status = if !env_providers_added.is_empty() {
+        let status = if env_providers_added.is_empty() {
+            None
+        } else {
             let names: Vec<_> = env_providers_added
                 .iter()
                 .map(|(id, _)| id.as_str())
                 .collect();
             Some(format!("Auto-configured from env: {}", names.join(", ")))
-        } else {
-            None
         };
 
         Ok(Self {
@@ -453,7 +452,7 @@ impl App {
     }
 
     /// Check if terminal supports image rendering.
-    pub fn supports_images(&self) -> bool {
+    pub const fn supports_images(&self) -> bool {
         self.image_support.is_some()
     }
 
@@ -577,7 +576,7 @@ impl App {
     }
 
     /// Get the currently active text input field, if any.
-    fn active_text_input(&mut self) -> Option<ActiveTextInput<'_>> {
+    const fn active_text_input(&mut self) -> Option<ActiveTextInput<'_>> {
         // Check mode-specific inputs first
         match &self.mode {
             AppMode::Chat => {
@@ -855,8 +854,7 @@ impl App {
                     // Search in title
                     s.title
                         .as_ref()
-                        .map(|t| t.to_lowercase().contains(&query))
-                        .unwrap_or(false)
+                        .is_some_and(|t| t.to_lowercase().contains(&query))
                         // Search in content preview
                         || s.content_preview.to_lowercase().contains(&query)
                 })
@@ -1472,7 +1470,7 @@ impl App {
         let result = match result {
             Ok(result) => result,
             Err(e) => {
-                self.status = Some(format!("Clipboard paste failed: {}", e));
+                self.status = Some(format!("Clipboard paste failed: {e}"));
                 return Ok(());
             }
         };
@@ -2253,7 +2251,7 @@ impl App {
                                 output: None,
                             },
                             ToolStartKind::Generic { name, arguments } => ToolDisplay::Terminal {
-                                command: format!("{} {}", name, arguments),
+                                command: format!("{name} {arguments}"),
                                 mode: aither_sandbox::TerminalMode::Sandboxed,
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
@@ -2314,7 +2312,7 @@ impl App {
                 tracing::error!("Agent error: {}", e);
                 // Display error to user
                 self.chat.end_loading();
-                self.chat.push_error(&format!("{}", e));
+                self.chat.push_error(&format!("{e}"));
                 self.scroll = usize::MAX;
                 self.input_visible = true;
                 true
@@ -2362,9 +2360,7 @@ impl App {
     /// Get current session ID for display.
     pub fn session_id_display(&self) -> String {
         self.session_manager
-            .current()
-            .map(|s| s.id.to_string())
-            .unwrap_or_else(|| "none".to_string())
+            .current().map_or_else(|| "none".to_string(), |s| s.id.to_string())
     }
 
     /// Get model name for display.
@@ -2385,7 +2381,7 @@ impl App {
     }
 
     /// Get context usage information for display.
-    /// Returns (prompt_tokens, context_window) if available.
+    /// Returns (`prompt_tokens`, `context_window`) if available.
     pub fn context_usage(&self) -> Option<(u32, u32)> {
         let usage = self.usage.as_ref()?;
         let prompt_tokens = usage.prompt_tokens?;
@@ -2418,9 +2414,7 @@ impl App {
                 let workdir = std::env::current_dir().unwrap_or_default();
                 let sandbox = self
                     .session_manager
-                    .current()
-                    .map(|s| s.sandbox_dir.clone())
-                    .unwrap_or_else(|| workdir.clone());
+                    .current().map_or_else(|| workdir.clone(), |s| s.sandbox_dir.clone());
                 self.completion.set_directories(workdir, sandbox);
                 self.completion.start_file(query);
             }
@@ -2476,7 +2470,7 @@ impl App {
                     // Build new input: before @ + @path + space
                     let before: String = self.input.chars().take(at_pos).collect();
                     let after: String = self.input.chars().skip(self.cursor).collect();
-                    self.input = format!("{}@{} {}", before, insert, after);
+                    self.input = format!("{before}@{insert} {after}");
                     self.input_char_count = self.input.chars().count();
                     // Position cursor after the inserted path + space
                     self.cursor = at_pos + 1 + insert.chars().count() + 1;

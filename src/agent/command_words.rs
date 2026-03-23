@@ -1,4 +1,4 @@
-pub(crate) fn split_shell_words(input: &str, label: &str) -> anyhow::Result<Vec<String>> {
+pub fn split_shell_words(input: &str, label: &str) -> anyhow::Result<Vec<String>> {
     shell_words::split(input).map_err(|error| {
         let mut message = String::from(label);
         message.push_str(" command contains invalid shell quoting: ");

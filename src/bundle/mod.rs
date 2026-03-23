@@ -61,6 +61,7 @@ impl Bundle {
     }
 
     /// Get the container build context directory path.
+    #[must_use] 
     pub fn container_context_dir(may_dir: &Path) -> std::path::PathBuf {
         may_dir.join("container")
     }
@@ -118,16 +119,16 @@ impl Bundle {
                 if metadata.is_dir() {
                     return Ok(());
                 }
-                return Err(BundleError::Io(std::io::Error::other(format!(
+                Err(BundleError::Io(std::io::Error::other(format!(
                     "expected directory at {}, found non-directory entry",
                     path.display()
-                ))));
+                ))))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 async_fs::create_dir_all(path).await?;
-                return Ok(());
+                Ok(())
             }
-            Err(error) => return Err(BundleError::Io(error)),
+            Err(error) => Err(BundleError::Io(error)),
         }
     }
 

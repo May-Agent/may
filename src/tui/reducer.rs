@@ -1,4 +1,4 @@
-//! Event reducer for top-level AppEvent handling.
+//! Event reducer for top-level `AppEvent` handling.
 
 pub(super) mod ask_user;
 pub(super) mod manage;
@@ -40,7 +40,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                 }
                 Err(e) => {
                     app.chat
-                        .push_error(&format!("Failed to load sessions: {}", e));
+                        .push_error(&format!("Failed to load sessions: {e}"));
                 }
             }
             Ok(None)
@@ -63,7 +63,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                 }
                 Err(e) => {
                     app.chat
-                        .push_error(&format!("Failed to delete session: {}", e));
+                        .push_error(&format!("Failed to delete session: {e}"));
                 }
             }
             Ok(None)
@@ -79,7 +79,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                 }
                 Err(e) => {
                     app.chat
-                        .push_error(&format!("Failed to load skills: {}", e));
+                        .push_error(&format!("Failed to load skills: {e}"));
                 }
             }
             Ok(None)
@@ -95,7 +95,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                 }
                 Err(e) => {
                     app.chat
-                        .push_error(&format!("Failed to install skill: {}", e));
+                        .push_error(&format!("Failed to install skill: {e}"));
                 }
             }
             Ok(None)
@@ -111,7 +111,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                 }
                 Err(e) => {
                     app.chat
-                        .push_error(&format!("Failed to delete skill: {}", e));
+                        .push_error(&format!("Failed to delete skill: {e}"));
                 }
             }
             Ok(None)
@@ -123,7 +123,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                 }
                 Err(e) => {
                     app.chat
-                        .push_error(&format!("Failed to load profiles: {}", e));
+                        .push_error(&format!("Failed to load profiles: {e}"));
                 }
             }
             Ok(None)
@@ -145,7 +145,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                 }
                 Err(e) => {
                     app.chat
-                        .push_error(&format!("Failed to load profile sessions: {}", e));
+                        .push_error(&format!("Failed to load profile sessions: {e}"));
                 }
             }
             Ok(None)
@@ -153,7 +153,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
         AppEvent::ConfigSaved(result) => {
             if let Err(error) = result {
                 app.chat
-                    .push_error(&format!("Failed to save config: {}", error));
+                    .push_error(&format!("Failed to save config: {error}"));
                 app.status = Some("Config save failed".to_string());
             }
             Ok(None)
