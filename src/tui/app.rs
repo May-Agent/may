@@ -31,9 +31,7 @@ pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../texts/tool_response_se
 
 /// Convert a character index to a byte index in a string.
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map_or(s.len(), |(i, _)| i)
+    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
 }
 
 /// Agent event from aither-agent.
@@ -2360,7 +2358,8 @@ impl App {
     /// Get current session ID for display.
     pub fn session_id_display(&self) -> String {
         self.session_manager
-            .current().map_or_else(|| "none".to_string(), |s| s.id.to_string())
+            .current()
+            .map_or_else(|| "none".to_string(), |s| s.id.to_string())
     }
 
     /// Get model name for display.
@@ -2414,7 +2413,8 @@ impl App {
                 let workdir = std::env::current_dir().unwrap_or_default();
                 let sandbox = self
                     .session_manager
-                    .current().map_or_else(|| workdir.clone(), |s| s.sandbox_dir.clone());
+                    .current()
+                    .map_or_else(|| workdir.clone(), |s| s.sandbox_dir.clone());
                 self.completion.set_directories(workdir, sandbox);
                 self.completion.start_file(query);
             }

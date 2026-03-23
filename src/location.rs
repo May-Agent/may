@@ -40,7 +40,7 @@ impl Default for LocationProvider {
 }
 
 impl LocationProvider {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             cache: ArcSwapOption::empty(),

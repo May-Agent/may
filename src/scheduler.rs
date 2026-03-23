@@ -426,20 +426,20 @@ impl TaskRuntime {
     }
 
     /// Attach a notification manager for sending push notifications on task completion.
-    #[must_use] 
+    #[must_use]
     pub fn with_notifier(mut self, notifier: Arc<NotificationService>) -> Self {
         self.notifier = Some(notifier);
         self
     }
 
     /// Attach container manager for container-profile task execution.
-    #[must_use] 
+    #[must_use]
     pub fn with_container_manager(mut self, container_manager: Arc<ContainerManager>) -> Self {
         self.container_manager = Some(container_manager);
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn with_ssh_servers(self, ssh_servers: Vec<SshServerConfig>) -> Self {
         self.set_ssh_servers(ssh_servers);
         self
@@ -1005,9 +1005,10 @@ impl TaskRuntime {
     async fn cleanup_materialized_execution(&self, cleanup_paths: Vec<PathBuf>) {
         for path in cleanup_paths {
             if let Err(error) = tokio::fs::remove_file(&path).await
-                && error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %path.display(), error = %error, "failed to remove materialized task file");
-                }
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %path.display(), error = %error, "failed to remove materialized task file");
+            }
         }
     }
 
@@ -1460,13 +1461,13 @@ const fn local_task_execution_mode(needs_network: bool) -> TerminalExecutionMode
 }
 
 impl TaskScheduler {
-    #[must_use] 
+    #[must_use]
     pub const fn new(runtime: Arc<TaskRuntime>) -> Self {
         Self { runtime }
     }
 
     /// Spawn the scheduler as a background task.
-    #[must_use] 
+    #[must_use]
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));

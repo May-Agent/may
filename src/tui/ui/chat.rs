@@ -38,7 +38,7 @@ pub struct TerminalCallInfo {
 
 impl TerminalCallInfo {
     /// Create a new terminal call info.
-    #[must_use] 
+    #[must_use]
     pub const fn new(command: String) -> Self {
         Self {
             command,
@@ -48,21 +48,21 @@ impl TerminalCallInfo {
     }
 
     /// Set the output.
-    #[must_use] 
+    #[must_use]
     pub fn with_output(mut self, output: String) -> Self {
         self.output = output;
         self
     }
 
     /// Set the output file.
-    #[must_use] 
+    #[must_use]
     pub fn with_output_file(mut self, path: PathBuf) -> Self {
         self.output_file = Some(path);
         self
     }
 
     /// Get a truncated preview of the command for inline display (unicode-safe).
-    #[must_use] 
+    #[must_use]
     pub fn command_preview(&self, max_chars: usize) -> &str {
         match self.command.char_indices().nth(max_chars) {
             Some((pos, _)) => &self.command[..pos],
@@ -71,7 +71,7 @@ impl TerminalCallInfo {
     }
 
     /// Get a truncated preview of the output for inline display.
-    #[must_use] 
+    #[must_use]
     pub fn output_preview(&self, max_lines: usize) -> String {
         let mut lines = Vec::with_capacity(max_lines);
         let mut line_iter = self.output.lines();
@@ -127,7 +127,7 @@ pub enum ToolDisplay {
 
 impl ToolDisplay {
     /// Get the most recent terminal call for this tool.
-    #[must_use] 
+    #[must_use]
     pub fn latest_terminal(&self) -> Option<&TerminalCallInfo> {
         match self {
             Self::Search { terminal_info, .. } => terminal_info.as_ref(),
@@ -138,7 +138,7 @@ impl ToolDisplay {
     }
 
     /// Get all terminal calls for this tool.
-    #[must_use] 
+    #[must_use]
     pub fn all_terminal_calls(&self) -> Vec<&TerminalCallInfo> {
         match self {
             Self::Search { terminal_info, .. } => terminal_info.iter().collect(),
@@ -149,7 +149,7 @@ impl ToolDisplay {
     }
 
     /// Get status reference.
-    #[must_use] 
+    #[must_use]
     pub const fn status(&self) -> &ToolStatus {
         match self {
             Self::Search { status, .. } => status,
@@ -160,13 +160,13 @@ impl ToolDisplay {
     }
 
     /// Check if this is a subagent task.
-    #[must_use] 
+    #[must_use]
     pub const fn is_subagent(&self) -> bool {
         matches!(self, Self::Task { .. })
     }
 
     /// Get a short type name for display.
-    #[must_use] 
+    #[must_use]
     pub fn type_name(&self) -> &str {
         match self {
             Self::Search { .. } => "search",
@@ -177,7 +177,7 @@ impl ToolDisplay {
     }
 
     /// Check if this tool call is complete (not running).
-    #[must_use] 
+    #[must_use]
     pub fn is_complete(&self) -> bool {
         !matches!(self.status(), ToolStatus::Running)
     }
@@ -230,7 +230,7 @@ pub struct ChatStream {
 
 impl ChatStream {
     /// Create a new empty chat stream.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -423,13 +423,13 @@ impl ChatStream {
     }
 
     /// Get all elements.
-    #[must_use] 
+    #[must_use]
     pub fn elements(&self) -> &[ChatElement] {
         &self.elements
     }
 
     /// Get all tool calls with their indices.
-    #[must_use] 
+    #[must_use]
     pub fn tool_calls(&self) -> Vec<(usize, &str, &ToolDisplay)> {
         self.elements
             .iter()
@@ -445,7 +445,7 @@ impl ChatStream {
     }
 
     /// Get a tool call by ID.
-    #[must_use] 
+    #[must_use]
     pub fn get_tool(&self, id: &str) -> Option<&ToolDisplay> {
         self.elements.iter().find_map(|e| {
             if let ChatElement::ToolCall {
@@ -461,7 +461,7 @@ impl ChatStream {
     }
 
     /// Check if currently streaming.
-    #[must_use] 
+    #[must_use]
     pub fn is_streaming(&self) -> bool {
         matches!(
             self.elements.last(),
@@ -473,7 +473,7 @@ impl ChatStream {
     }
 
     /// Get all active elements.
-    #[must_use] 
+    #[must_use]
     pub fn active_elements(&self) -> &[ChatElement] {
         &self.elements
     }
@@ -559,7 +559,7 @@ pub fn render_unified(
 }
 
 /// Build plain wrapped lines for selection/copy from unified viewport content.
-#[must_use] 
+#[must_use]
 pub fn build_plain_wrapped_lines_unified(
     chat: &ChatStream,
     width: u16,
@@ -967,9 +967,7 @@ fn render_impl(
 
 /// Convert a character index to a byte index in a string.
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map_or(s.len(), |(i, _)| i)
+    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
 }
 
 /// Render the input line into the lines vector.

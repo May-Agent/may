@@ -535,10 +535,11 @@ async fn query_index(
         if query_enabled
             && args.search_mode != SearchMode::Fulltext
             && args.search_mode != SearchMode::Fuzzy
-            && haystack_norm.contains(&query_norm) {
-                row.score += 10.0;
-                push_unique(&mut row.matched_by, SearchMode::Text);
-            }
+            && haystack_norm.contains(&query_norm)
+        {
+            row.score += 10.0;
+            push_unique(&mut row.matched_by, SearchMode::Text);
+        }
         if let Some(re) = &regex
             && re.is_match(&haystack)
         {
@@ -548,23 +549,23 @@ async fn query_index(
     }
 
     candidates.retain(|row| {
-            let haystack = [row.relative_path.as_str(), row.content.as_str()].join("\n");
-            if query_enabled && args.search_mode == SearchMode::Text {
-                let haystack = if args.case_sensitive {
-                    haystack
-                } else {
-                    haystack.to_lowercase()
-                };
-                return haystack.contains(&query_norm);
-            }
-            if regex_enabled {
-                let Some(re) = &regex else {
-                    return false;
-                };
-                return re.is_match(&haystack);
-            }
-            true
-        });
+        let haystack = [row.relative_path.as_str(), row.content.as_str()].join("\n");
+        if query_enabled && args.search_mode == SearchMode::Text {
+            let haystack = if args.case_sensitive {
+                haystack
+            } else {
+                haystack.to_lowercase()
+            };
+            return haystack.contains(&query_norm);
+        }
+        if regex_enabled {
+            let Some(re) = &regex else {
+                return false;
+            };
+            return re.is_match(&haystack);
+        }
+        true
+    });
 
     let mut deduped: HashMap<String, FileMatchRow> = HashMap::new();
     for row in candidates {

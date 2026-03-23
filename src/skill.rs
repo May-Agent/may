@@ -111,25 +111,25 @@ pub struct SkillManager {
 
 impl SkillManager {
     /// Create a new skill manager.
-    #[must_use] 
+    #[must_use]
     pub fn new(may_dir: &Path) -> Self {
         Self::from_skills_dir(MayHomePaths::new(may_dir.to_path_buf()).skills_dir())
     }
 
     /// Create a manager rooted at one profile home.
-    #[must_use] 
+    #[must_use]
     pub fn from_profile_home(profile_home: &ProfileHomePaths) -> Self {
         Self::from_skills_dir(profile_home.skills_dir())
     }
 
     /// Create a manager rooted at an explicit skills directory.
-    #[must_use] 
+    #[must_use]
     pub const fn from_skills_dir(skills_dir: PathBuf) -> Self {
         Self { skills_dir }
     }
 
     /// Get the skills directory path.
-    #[must_use] 
+    #[must_use]
     pub fn skills_dir(&self) -> &Path {
         &self.skills_dir
     }

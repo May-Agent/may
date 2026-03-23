@@ -113,7 +113,7 @@ impl NotificationManager {
     }
 
     /// Get the VAPID public key for browser subscription (base64url-encoded).
-    #[must_use] 
+    #[must_use]
     pub fn public_key(&self) -> &str {
         &self.public_key_base64url
     }

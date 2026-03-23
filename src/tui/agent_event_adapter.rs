@@ -17,7 +17,7 @@ pub enum ToolEndKind {
 }
 
 /// Parse tool-call start payload into a minimal start event.
-#[must_use] 
+#[must_use]
 pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
     if name == "terminal" {
         let args = serde_json::from_str::<TerminalArgs>(arguments)
@@ -43,7 +43,7 @@ const fn display_mode_from_execution_mode(mode: TerminalExecutionMode) -> Termin
 }
 
 /// Parse tool-call completion payload into a minimal end event.
-#[must_use] 
+#[must_use]
 pub fn parse_tool_end(result: &Result<String, String>) -> ToolEndKind {
     match result {
         Ok(output) => {

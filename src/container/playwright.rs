@@ -278,7 +278,7 @@ impl BrowserManager {
     }
 
     /// CDP endpoint URL for agent connections (e.g. from container).
-    #[must_use] 
+    #[must_use]
     pub fn cdp_endpoint(&self) -> String {
         format!("http://127.0.0.1:{}", self.config.port)
     }
@@ -627,8 +627,7 @@ fn encode_loop(
 
         // Compute inter-frame duration
         let now = Instant::now();
-        let duration = last_frame_time
-            .map_or(Duration::from_millis(33), |t| now.duration_since(t));
+        let duration = last_frame_time.map_or(Duration::from_millis(33), |t| now.duration_since(t));
         last_frame_time = Some(now);
 
         // Periodic keyframes for new viewers / packet loss recovery
@@ -882,22 +881,23 @@ fn find_browser_binary(browser: crate::config::PlaywrightBrowser) -> Option<Stri
             let home = dirs::home_dir()?;
             let cache_dir = home.join(".cache/ms-playwright");
             if cache_dir.exists()
-                && let Ok(entries) = std::fs::read_dir(&cache_dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with("chromium-") {
-                            #[cfg(target_os = "macos")]
-                            let binary = entry
-                                .path()
-                                .join("chrome-mac/Chromium.app/Contents/MacOS/Chromium");
-                            #[cfg(not(target_os = "macos"))]
-                            let binary = entry.path().join("chrome-linux/chrome");
-                            if binary.exists() {
-                                return Some(binary.to_string_lossy().to_string());
-                            }
+                && let Ok(entries) = std::fs::read_dir(&cache_dir)
+            {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("chromium-") {
+                        #[cfg(target_os = "macos")]
+                        let binary = entry
+                            .path()
+                            .join("chrome-mac/Chromium.app/Contents/MacOS/Chromium");
+                        #[cfg(not(target_os = "macos"))]
+                        let binary = entry.path().join("chrome-linux/chrome");
+                        if binary.exists() {
+                            return Some(binary.to_string_lossy().to_string());
                         }
                     }
                 }
+            }
             let homebrew = PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium");
             if homebrew.exists() {
                 return Some(homebrew.to_string_lossy().to_string());

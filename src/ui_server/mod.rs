@@ -241,17 +241,45 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn api_routes() -> Route {
-    use artifacts::{get_session_runtime, list_session_artifacts, get_artifact_preview, prepare_slidev_preview, get_slidev_static_asset, get_output_preview, map_container_local_url, stream_session_artifacts};
-    use browser::{browser_status, browser_start, browser_stop, browser_offer, browser_takeover_start, browser_takeover_stop};
-    use chat::{stop_session_run, remove_pending_message, chat, chat_stream, enqueue_chat};
-    use config::{get_ui_config, get_full_config, save_full_config, set_last_model, get_memory, save_memory, add_ssh_server, remove_ssh_server, list_mcp_servers, add_mcp_server, remove_mcp_server, reconnect_mcp_server, list_skills, install_skill, delete_skill, copilot_status, copilot_start, copilot_poll, copilot_logout};
+    use artifacts::{
+        get_artifact_preview, get_output_preview, get_session_runtime, get_slidev_static_asset,
+        list_session_artifacts, map_container_local_url, prepare_slidev_preview,
+        stream_session_artifacts,
+    };
+    use browser::{
+        browser_offer, browser_start, browser_status, browser_stop, browser_takeover_start,
+        browser_takeover_stop,
+    };
+    use chat::{chat, chat_stream, enqueue_chat, remove_pending_message, stop_session_run};
+    use config::{
+        add_mcp_server, add_ssh_server, copilot_logout, copilot_poll, copilot_start,
+        copilot_status, delete_skill, get_full_config, get_memory, get_ui_config, install_skill,
+        list_mcp_servers, list_skills, reconnect_mcp_server, remove_mcp_server, remove_ssh_server,
+        save_full_config, save_memory, set_last_model,
+    };
     use events::stream_events;
-    use interaction::{respond_permission_request, respond_workspace_request, respond_ask_user_request};
-    use notifications::{get_vapid_key, subscribe, unsubscribe, test_notification, list_notification_mailbox, consume_notification_callback, list_network_access_logs};
-    use profiles::{pin_session, unpin_session, archive_session, unarchive_session, move_to_folder, list_profiles, create_profile, update_profile, delete_profile, get_profile_sessions, create_folder, update_folder, delete_folder};
+    use interaction::{
+        respond_ask_user_request, respond_permission_request, respond_workspace_request,
+    };
+    use notifications::{
+        consume_notification_callback, get_vapid_key, list_network_access_logs,
+        list_notification_mailbox, subscribe, test_notification, unsubscribe,
+    };
+    use profiles::{
+        archive_session, create_folder, create_profile, delete_folder, delete_profile,
+        get_profile_sessions, list_profiles, move_to_folder, pin_session, unarchive_session,
+        unpin_session, update_folder, update_profile,
+    };
     use remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
-    use sessions::{list_sessions, create_session, delete_all_sessions, get_session, update_session, delete_session, get_session_tasks, save_session_tasks, get_session_context_debug};
-    use tasks::{list_tasks, create_task, invoke_webhook_task, get_task, update_task, delete_task, approve_task, run_task};
+    use sessions::{
+        create_session, delete_all_sessions, delete_session, get_session,
+        get_session_context_debug, get_session_tasks, list_sessions, save_session_tasks,
+        update_session,
+    };
+    use tasks::{
+        approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
+        run_task, update_task,
+    };
 
     Route::new((
         Route::new((

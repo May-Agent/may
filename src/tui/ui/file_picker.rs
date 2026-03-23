@@ -21,7 +21,7 @@ pub struct FilePicker {
 
 impl FilePicker {
     /// Create a new file picker rooted at the given directory.
-    #[must_use] 
+    #[must_use]
     pub fn new(base_dir: &Path) -> Self {
         let all_files = collect_files(base_dir);
 
@@ -78,7 +78,7 @@ impl FilePicker {
     }
 
     /// Get current query.
-    #[must_use] 
+    #[must_use]
     pub fn query(&self) -> &str {
         &self.query
     }
@@ -119,13 +119,13 @@ impl FilePicker {
     }
 
     /// Get the selected file path.
-    #[must_use] 
+    #[must_use]
     pub fn selected_path(&self) -> Option<&PathBuf> {
         self.matches.get(self.selected)
     }
 
     /// Confirm selection and return the selected path.
-    #[must_use] 
+    #[must_use]
     pub fn confirm(&self) -> Option<PathBuf> {
         self.selected_path().cloned()
     }
@@ -137,13 +137,13 @@ impl FilePicker {
     }
 
     /// Get the selected index.
-    #[must_use] 
+    #[must_use]
     pub const fn selected_index(&self) -> usize {
         self.selected
     }
 
     /// Get total match count.
-    #[must_use] 
+    #[must_use]
     pub const fn match_count(&self) -> usize {
         self.matches.len()
     }

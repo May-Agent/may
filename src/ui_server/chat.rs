@@ -761,9 +761,9 @@ async fn run_agent_loop(
         if attempt == 0 {
             max_retries = provider_candidate_count.saturating_sub(1);
         }
-        let model_context_window = agent
-            .model_context_window()
-            .or_else(|| lookup_model_info(&current_model).and_then(aither_models::ModelEntry::max_input_tokens));
+        let model_context_window = agent.model_context_window().or_else(|| {
+            lookup_model_info(&current_model).and_then(aither_models::ModelEntry::max_input_tokens)
+        });
 
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
         let assistant_id = prefixed_text("assistant-", assistant_uuid.as_str());
@@ -1754,6 +1754,7 @@ async fn prepare_agent_for_request(
         brokers.workspace,
         brokers.ask_user,
         &ctx.current_model,
+        None,
         ctx.profile_id.clone(),
         Some(
             state

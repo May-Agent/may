@@ -162,7 +162,11 @@ pub struct TaskTool {
 
 impl TaskTool {
     #[must_use]
-    pub const fn new(session_id: String, runtime: TaskRuntimeKind, broker: Option<TaskBroker>) -> Self {
+    pub const fn new(
+        session_id: String,
+        runtime: TaskRuntimeKind,
+        broker: Option<TaskBroker>,
+    ) -> Self {
         Self {
             session_id,
             runtime,

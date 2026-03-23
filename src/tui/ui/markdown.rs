@@ -39,7 +39,7 @@ pub struct MarkdownRenderResult {
 /// `images_supported` controls how images are rendered:
 /// - true: show loading indicator (actual image rendered as overlay)
 /// - false: show as styled link
-#[must_use] 
+#[must_use]
 pub fn render_markdown_with_config(text: &str, images: ImageSupport) -> Vec<Line<'static>> {
     let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled());
     renderer.push(text);
@@ -51,7 +51,7 @@ pub fn render_markdown_with_config(text: &str, images: ImageSupport) -> Vec<Line
 ///
 /// Use this when you need to know where images are located in the rendered output
 /// for rendering actual images as overlays.
-#[must_use] 
+#[must_use]
 pub fn render_markdown_with_positions(text: &str, images: ImageSupport) -> MarkdownRenderResult {
     let mut renderer = StreamingMarkdown::with_image_support(images.is_enabled());
     renderer.push(text);
@@ -64,7 +64,7 @@ pub fn render_markdown_with_positions(text: &str, images: ImageSupport) -> Markd
 
 /// Render markdown text to ratatui lines (no image support).
 /// For image support, use `render_markdown_with_config`.
-#[must_use] 
+#[must_use]
 pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     render_markdown_with_config(text, ImageSupport::Disabled)
 }
@@ -72,7 +72,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
 /// Extract image URLs from markdown text.
 ///
 /// Returns a list of (`alt_text`, url) pairs for all images found.
-#[must_use] 
+#[must_use]
 pub fn extract_images(text: &str) -> Vec<(String, String)> {
     let mut renderer = StreamingMarkdown::new();
     renderer.push(text);

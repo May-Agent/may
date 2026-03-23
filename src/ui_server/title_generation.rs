@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::agent::generate_session_title;
-use crate::session::{MayHomePaths, SessionId, SessionStore};
+use crate::session::SessionId;
 
 use super::helpers::truncate_preview;
 use super::state::{TitleGenerationTask, UiServerState};
@@ -114,33 +114,6 @@ async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
         );
         return;
     }
-    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
-    match store
-        .read_history(session_id.as_str(), current.profile_id.as_deref())
-        .await
-    {
-        Ok(mut history) => {
-            history.metadata.title = Some(generated_title.clone());
-            if let Err(error) = store
-                .write_history(session_id.as_str(), current.profile_id.as_deref(), &history)
-                .await
-            {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %error,
-                    "failed to update session backup title"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to load session backup for title update"
-            );
-        }
-    }
-
     state.notify_ui_events();
     tracing::debug!(
         session_id = %session_id,

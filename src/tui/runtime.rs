@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use aither_core::llm::model::ReasoningEffort;
 use aither_sandbox::{BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec};
 use async_channel::Sender;
 use base64::Engine;
@@ -23,7 +24,7 @@ pub struct LocalSessionRuntime {
 }
 
 impl LocalSessionRuntime {
-    #[must_use] 
+    #[must_use]
     pub fn new(db: ChatDb) -> Self {
         let notify = Arc::new(tokio::sync::Notify::new());
         let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(db, notify));
@@ -40,14 +41,16 @@ impl LocalSessionRuntime {
         self.oneshot_restricted = true;
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn permission_approver_for(
         &self,
         session_id: &SessionId,
     ) -> crate::agent::PermissionApprover {
         if self.oneshot_restricted {
-            return crate::agent::PermissionApprover::new()
-                .for_session(session_id.as_str().to_string());
+            return self
+                .permission_approver
+                .for_session(session_id.as_str().to_string())
+                .without_interactive_approval("restricted oneshot mode");
         }
         self.permission_approver
             .for_session(session_id.as_str().to_string())
@@ -383,8 +386,10 @@ fn persisted_attachment_from_tui(
             saved_path,
         } => Ok(crate::session::PersistedAttachment {
             id,
-            name: saved_path
-                .as_ref().map_or_else(|| "pasted.txt".to_string(), |path| file_name_or_default(path, "pasted.txt")),
+            name: saved_path.as_ref().map_or_else(
+                || "pasted.txt".to_string(),
+                |path| file_name_or_default(path, "pasted.txt"),
+            ),
             attachment_type: "text".to_string(),
             url: saved_path
                 .as_ref()
@@ -453,7 +458,8 @@ fn path_from_attachment_url(url: &str) -> anyhow::Result<std::path::PathBuf> {
 
 fn file_name_or_default(path: &std::path::Path, default_name: &str) -> String {
     path.file_name()
-        .and_then(|name| name.to_str()).map_or_else(|| default_name.to_string(), ToOwned::to_owned)
+        .and_then(|name| name.to_str())
+        .map_or_else(|| default_name.to_string(), ToOwned::to_owned)
 }
 
 fn image_data_url(path: &std::path::Path, data: &[u8]) -> String {
@@ -482,6 +488,8 @@ pub struct RuntimeDeps {
     ask_user_broker: AskUserBroker,
     location_provider: Arc<crate::location::LocationProvider>,
     local_runtime: LocalSessionRuntime,
+    oneshot_model: Option<String>,
+    oneshot_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl RuntimeDeps {
@@ -496,7 +504,20 @@ impl RuntimeDeps {
             ask_user_broker,
             location_provider,
             local_runtime,
+            oneshot_model: None,
+            oneshot_reasoning_effort: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_oneshot_overrides(
+        mut self,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        self.oneshot_model = model;
+        self.oneshot_reasoning_effort = reasoning_effort;
+        self
     }
 
     pub async fn start_new_session(
@@ -504,7 +525,10 @@ impl RuntimeDeps {
         app: &mut App,
         worker: &mut Option<AgentWorker>,
     ) -> anyhow::Result<()> {
-        let model = app.config.last_model.clone();
+        let model = self
+            .oneshot_model
+            .clone()
+            .or_else(|| app.config.last_model.clone());
         let (sandbox_dir, session_id, messages) = {
             let session = app
                 .session_manager
@@ -522,7 +546,13 @@ impl RuntimeDeps {
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
         let new_worker = self
-            .build_worker_for_session(app, sandbox_dir, session_id, selected_model.as_str())
+            .build_worker_for_session(
+                app,
+                sandbox_dir,
+                session_id,
+                selected_model.as_str(),
+                self.oneshot_reasoning_effort,
+            )
             .await?;
 
         app.set_current_model(selected_model.as_str());
@@ -548,7 +578,7 @@ impl RuntimeDeps {
 
         let selected_model = SelectedModel::resolve(&app.config, session_model.as_deref())?;
         let new_worker = self
-            .build_worker_for_session(app, sandbox_dir, session_id, selected_model.as_str())
+            .build_worker_for_session(app, sandbox_dir, session_id, selected_model.as_str(), None)
             .await?;
 
         app.set_current_model(selected_model.as_str());
@@ -572,7 +602,7 @@ impl RuntimeDeps {
 
         let selected_model = SelectedModel::new(model)?;
         let new_worker = self
-            .build_worker_for_session(app, sandbox_dir, session_id, selected_model.as_str())
+            .build_worker_for_session(app, sandbox_dir, session_id, selected_model.as_str(), None)
             .await?;
 
         app.set_current_model(selected_model.as_str());
@@ -648,6 +678,7 @@ impl RuntimeDeps {
         sandbox_dir: std::path::PathBuf,
         session_id: SessionId,
         model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> anyhow::Result<AgentWorker> {
         let db = app.session_manager.db().clone();
         let session_id_string = session_id.as_str().to_string();
@@ -732,6 +763,7 @@ impl RuntimeDeps {
             self.workspace_broker.clone(),
             self.ask_user_broker.clone(),
             model,
+            reasoning_effort,
             profile_model.as_ref().map(|profile| profile.id.clone()),
             Some(permission_approver),
             profile_persona,

@@ -62,7 +62,7 @@ pub struct Completion {
 
 impl Completion {
     /// Create a new completion state.
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             mode: CompletionMode::None,
@@ -82,7 +82,7 @@ impl Completion {
     }
 
     /// Check if completion is active.
-    #[must_use] 
+    #[must_use]
     pub fn is_active(&self) -> bool {
         self.mode != CompletionMode::None
     }
@@ -98,19 +98,19 @@ impl Completion {
     }
 
     /// Get the selected index.
-    #[must_use] 
+    #[must_use]
     pub const fn selected(&self) -> usize {
         self.selected
     }
 
     /// Get items count.
-    #[must_use] 
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Check if empty.
-    #[must_use] 
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -170,7 +170,7 @@ impl Completion {
     }
 
     /// Get the selected item for completion.
-    #[must_use] 
+    #[must_use]
     pub fn complete(&self) -> Option<&CompletionItem> {
         self.items.get(self.selected)
     }
@@ -285,12 +285,17 @@ impl Completion {
                 // Compute display path based on location
                 let display_path = if path.starts_with(&self.sandbox) {
                     // Sandbox files: relative path (agent's cwd is sandbox)
-                    path.strip_prefix(&self.sandbox).map_or_else(|_| path.to_string_lossy().to_string(), |p| p.to_string_lossy().to_string())
+                    path.strip_prefix(&self.sandbox).map_or_else(
+                        |_| path.to_string_lossy().to_string(),
+                        |p| p.to_string_lossy().to_string(),
+                    )
                 } else if let Some(ref home) = home_dir {
                     if path.starts_with(home) {
                         // Files under home directory: use ~ prefix
-                        let rel = path
-                            .strip_prefix(home).map_or_else(|_| path.to_string_lossy().to_string(), |p| p.to_string_lossy().to_string());
+                        let rel = path.strip_prefix(home).map_or_else(
+                            |_| path.to_string_lossy().to_string(),
+                            |p| p.to_string_lossy().to_string(),
+                        );
                         format!("~/{rel}")
                     } else {
                         // Absolute path outside home

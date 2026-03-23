@@ -19,9 +19,7 @@ use crate::workspace_request::WorkspaceRequest;
 
 /// Convert character index to byte index for safe string slicing.
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map_or(s.len(), |(i, _)| i)
+    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
 }
 
 /// Render the main layout.
@@ -447,20 +445,17 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                     // Section header
                     let header = match section {
                         "pinned" => {
-                            let count = app
-                                .profile_sessions
-                                .as_ref()
-                                .map_or(0, |ps| {
-                                    ps.pinned
-                                        .iter()
-                                        .map(|item| match item {
-                                            crate::profile::PinnedItem::Session(_) => 1,
-                                            crate::profile::PinnedItem::Folder {
-                                                sessions, ..
-                                            } => sessions.len(),
-                                        })
-                                        .sum::<usize>()
-                                });
+                            let count = app.profile_sessions.as_ref().map_or(0, |ps| {
+                                ps.pinned
+                                    .iter()
+                                    .map(|item| match item {
+                                        crate::profile::PinnedItem::Session(_) => 1,
+                                        crate::profile::PinnedItem::Folder { sessions, .. } => {
+                                            sessions.len()
+                                        }
+                                    })
+                                    .sum::<usize>()
+                            });
                             format!("  Pinned ({count})")
                         }
                         "archived" => {
@@ -1426,10 +1421,7 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
                 "  "
             };
             // Check if this is current model
-            let current = app
-                .current_model
-                .as_deref()
-                .is_some_and(|m| m == model);
+            let current = app.current_model.as_deref().is_some_and(|m| m == model);
             let suffix = if current { " (current)" } else { "" };
             let text = format!("{prefix}{model}{suffix}");
             let style = if idx == app.model_select_index {

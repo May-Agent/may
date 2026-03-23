@@ -64,26 +64,26 @@ impl TerminalImageSupport {
     }
 
     /// Get the detected protocol type.
-    #[must_use] 
+    #[must_use]
     pub const fn protocol(&self) -> ProtocolType {
         self.protocol
     }
 
     /// Get a reference to the picker.
-    #[must_use] 
+    #[must_use]
     pub const fn picker(&self) -> &Picker {
         &self.picker
     }
 
     /// Create an `ImageState` from image data.
-    #[must_use] 
+    #[must_use]
     pub fn create_image_state(&self, image: DynamicImage) -> ImageState {
         let protocol = self.picker.new_resize_protocol(image);
         ImageState { protocol }
     }
 
     /// Create an `ImageState` from raw bytes.
-    #[must_use] 
+    #[must_use]
     pub fn create_image_state_from_bytes(&self, data: &[u8]) -> Option<ImageState> {
         let image = image::load_from_memory(data).ok()?;
         Some(self.create_image_state(image))
@@ -210,7 +210,7 @@ async fn fetch_image_http(url: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Render image placeholder when actual rendering is not possible.
-#[must_use] 
+#[must_use]
 pub fn render_placeholder(alt: &str, url: &str) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![

@@ -61,7 +61,7 @@ impl Bundle {
     }
 
     /// Get the container build context directory path.
-    #[must_use] 
+    #[must_use]
     pub fn container_context_dir(may_dir: &Path) -> std::path::PathBuf {
         may_dir.join("container")
     }

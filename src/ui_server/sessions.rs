@@ -371,23 +371,12 @@ pub(super) async fn update_session(
     let next_model = requested_model.clone().or_else(|| session.model.clone());
 
     if let Some(model) = next_model.clone()
-        && session.model.as_deref() != Some(model.as_str()) {
-            model_to_persist = Some(model);
-        }
+        && session.model.as_deref() != Some(model.as_str())
+    {
+        model_to_persist = Some(model);
+    }
 
     db.update_session(&id, requested_title.as_deref(), requested_model.as_deref())
-        .await
-        .map_err(internal_error)?;
-
-    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
-    let mut history = store
-        .read_history(&id, session.profile_id.as_deref())
-        .await
-        .map_err(internal_error)?;
-    history.metadata.title = next_title.clone();
-    history.metadata.model = next_model.clone();
-    store
-        .write_history(&id, session.profile_id.as_deref(), &history)
         .await
         .map_err(internal_error)?;
 

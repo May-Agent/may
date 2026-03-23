@@ -113,29 +113,10 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 ### Session Storage Format
 
-Sessions stored at `~/.may/sessions/<uuid>/`:
-```
-<uuid>/
-├── chat.txt       # YAML frontmatter message history
-├── workdir/       # Agent sandbox directory
-├── bin/           # Session-specific scripts (request_workspace)
-└── images/        # Saved clipboard images
-```
-
-Chat history format (`chat.txt`):
-```markdown
----
-role: user
-timestamp: 2024-01-15T10:30:00Z
----
-Hello!
-
----
-role: assistant
-timestamp: 2024-01-15T10:30:05Z
----
-Hi! How can I help?
-```
+Session conversation state is stored in the SQLite database at `~/.may/history.db`.
+That includes message history, runtime state, context snapshots, and other session metadata.
+Session directories only hold sandbox-visible artifacts such as `tmp/`, `files/`, `outputs/`, `artifacts/`, `data/`, `skills/`, `subagents/`, and optional `tasks.md`.
+Do not treat `.txt` or `.md` files as the canonical session persistence layer.
 
 ### Event Loop Architecture
 

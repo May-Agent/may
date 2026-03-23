@@ -175,7 +175,7 @@ impl McpConfig {
     }
 
     /// Check if any MCP servers are configured.
-    #[must_use] 
+    #[must_use]
     pub fn has_servers(&self) -> bool {
         !self.mcp_servers.is_empty()
     }
@@ -191,7 +191,7 @@ impl McpConfig {
     }
 
     /// Get a server configuration by name.
-    #[must_use] 
+    #[must_use]
     pub fn get_server(&self, name: &str) -> Option<&MayMcpServerConfig> {
         self.mcp_servers.get(name)
     }
@@ -322,7 +322,7 @@ pub struct McpManager {
 
 impl McpManager {
     /// Create a new MCP manager with the given configuration.
-    #[must_use] 
+    #[must_use]
     pub fn new(config: McpConfig) -> Self {
         // Initialize all servers as disconnected
         let connections = config
@@ -344,7 +344,7 @@ impl McpManager {
     }
 
     /// Get the configuration.
-    #[must_use] 
+    #[must_use]
     pub const fn config(&self) -> &McpConfig {
         &self.config
     }
@@ -472,7 +472,7 @@ impl McpManager {
     }
 
     /// Get connection state for a server.
-    #[must_use] 
+    #[must_use]
     pub fn connection_state(&self, name: &str) -> Option<&McpConnectionState> {
         self.connections.get(name)
     }
@@ -518,7 +518,7 @@ impl McpManager {
     }
 
     /// Get server information for UI display.
-    #[must_use] 
+    #[must_use]
     pub fn server_info(&self) -> Vec<McpServerInfo> {
         self.config
             .mcp_servers
@@ -557,13 +557,13 @@ impl McpManager {
     }
 
     /// Check if any servers are configured.
-    #[must_use] 
+    #[must_use]
     pub fn has_servers(&self) -> bool {
         !self.config.mcp_servers.is_empty()
     }
 
     /// Get the number of connected servers.
-    #[must_use] 
+    #[must_use]
     pub fn connected_count(&self) -> usize {
         self.connections
             .values()
