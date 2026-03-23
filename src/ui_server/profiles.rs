@@ -139,8 +139,10 @@ async fn ensure_profile_environment_ready(
     .map_err(internal_error)?;
 
     if !state.try_begin_container_prepare(profile_id).await {
-        let summary = state
-            .get_container_prepare_status(profile_id).map_or_else(|| "Container image is still preparing".to_string(), |status| status.summary);
+        let summary = state.get_container_prepare_status(profile_id).map_or_else(
+            || "Container image is still preparing".to_string(),
+            |status| status.summary,
+        );
         return Err(ContainerPrepareError::Domain {
             code: ApiErrorCode::ContainerPreparing,
             message: summary,

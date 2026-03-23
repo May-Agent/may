@@ -23,7 +23,10 @@ fn main() {
         return;
     }
 
-    assert!(Path::new("web-ui").exists(), "web-ui directory not found; cannot embed frontend assets");
+    assert!(
+        Path::new("web-ui").exists(),
+        "web-ui directory not found; cannot embed frontend assets"
+    );
 
     let status = Command::new("bun")
         .arg("run")
@@ -32,9 +35,15 @@ fn main() {
         .status()
         .unwrap_or_else(|err| panic!("failed to run bun build for web-ui: {err}"));
 
-    assert!(status.success(), "bun run build failed in web-ui; cannot embed dist assets");
+    assert!(
+        status.success(),
+        "bun run build failed in web-ui; cannot embed dist assets"
+    );
 
-    assert!(Path::new("web-ui/dist/index.html").exists(), "web-ui build did not produce dist/index.html");
+    assert!(
+        Path::new("web-ui/dist/index.html").exists(),
+        "web-ui build did not produce dist/index.html"
+    );
 }
 
 fn watch_path(path: &str) {

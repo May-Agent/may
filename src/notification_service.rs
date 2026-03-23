@@ -17,12 +17,12 @@ pub struct NotificationService {
 }
 
 impl NotificationService {
-    #[must_use] 
+    #[must_use]
     pub const fn new(db: ChatDb, manager: Arc<NotificationManager>) -> Self {
         Self { db, manager }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn public_key(&self) -> &str {
         self.manager.public_key()
     }

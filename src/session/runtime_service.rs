@@ -28,7 +28,7 @@ impl SessionRuntimeService {
         Self { db, notify }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn db(&self) -> ChatDb {
         self.db.clone()
     }

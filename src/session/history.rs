@@ -103,7 +103,7 @@ pub struct SessionSummaryUpdate {
 }
 
 impl MessageRole {
-    #[must_use] 
+    #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::User => "user",
@@ -247,7 +247,7 @@ impl ChatMessage {
     /// Create a permission request message.
     ///
     /// Content is JSON-serialized `PermissionRequestData`.
-    #[must_use] 
+    #[must_use]
     pub fn permission_request(data: &PermissionRequestData) -> Self {
         Self {
             role: MessageRole::PermissionRequest,
@@ -262,7 +262,7 @@ impl ChatMessage {
     /// Create a permission response message.
     ///
     /// Content is JSON-serialized `PermissionResponseData`.
-    #[must_use] 
+    #[must_use]
     pub fn permission_response(data: &PermissionResponseData) -> Self {
         Self {
             role: MessageRole::PermissionResponse,
@@ -277,7 +277,7 @@ impl ChatMessage {
     /// Create an ask-user request message.
     ///
     /// Content is JSON-serialized `AskUserRequestData`.
-    #[must_use] 
+    #[must_use]
     pub fn ask_user_request(data: &AskUserRequestData) -> Self {
         Self {
             role: MessageRole::AskUserRequest,
@@ -292,7 +292,7 @@ impl ChatMessage {
     /// Create a workspace request message.
     ///
     /// Content is JSON-serialized `WorkspaceRequestData`.
-    #[must_use] 
+    #[must_use]
     pub fn workspace_request(data: &WorkspaceRequestData) -> Self {
         Self {
             role: MessageRole::WorkspaceRequest,
@@ -307,7 +307,7 @@ impl ChatMessage {
     /// Create a workspace response message.
     ///
     /// Content is JSON-serialized `WorkspaceResponseData`.
-    #[must_use] 
+    #[must_use]
     pub fn workspace_response(data: &WorkspaceResponseData) -> Self {
         Self {
             role: MessageRole::WorkspaceResponse,
@@ -322,7 +322,7 @@ impl ChatMessage {
     /// Create an ask-user response message.
     ///
     /// Content is JSON-serialized `AskUserResponseData`.
-    #[must_use] 
+    #[must_use]
     pub fn ask_user_response(data: &AskUserResponseData) -> Self {
         Self {
             role: MessageRole::AskUserResponse,
@@ -335,7 +335,7 @@ impl ChatMessage {
     }
 
     /// Try to parse the content as a specific type.
-    #[must_use] 
+    #[must_use]
     pub fn parse_content<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
         serde_json::from_str(&self.content).ok()
     }
@@ -444,13 +444,13 @@ pub struct ChatHistory {
 
 impl ChatHistory {
     /// Create an empty chat history.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create a chat history with metadata.
-    #[must_use] 
+    #[must_use]
     pub const fn with_metadata(metadata: SessionMetadata) -> Self {
         Self {
             metadata,
@@ -551,7 +551,7 @@ impl ChatHistory {
     }
 
     /// Serialize to the markdown format with YAML frontmatter.
-    #[must_use] 
+    #[must_use]
     pub fn serialize(&self) -> String {
         let mut output = String::new();
 
@@ -593,7 +593,7 @@ impl ChatHistory {
     }
 
     /// Get all messages.
-    #[must_use] 
+    #[must_use]
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
     }
@@ -604,13 +604,13 @@ impl ChatHistory {
     }
 
     /// Check if history is empty.
-    #[must_use] 
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
 
     /// Get number of messages.
-    #[must_use] 
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.messages.len()
     }
@@ -618,7 +618,7 @@ impl ChatHistory {
     /// Convert to aither messages.
     ///
     /// Skips interaction messages (permission/ask-user) which are not part of the LLM conversation.
-    #[must_use] 
+    #[must_use]
     pub fn to_aither_messages(&self) -> Vec<aither_core::llm::Message> {
         self.messages
             .iter()
@@ -644,13 +644,13 @@ impl ChatHistory {
     }
 
     /// Check whether network permission was previously approved in this session.
-    #[must_use] 
+    #[must_use]
     pub fn has_network_approval(&self) -> bool {
         self.was_permission_mode_approved(PermissionHistoryMode::Network)
     }
 
     /// Find unanswered permission requests (no matching `PermissionResponse`).
-    #[must_use] 
+    #[must_use]
     pub fn pending_permission_requests(&self) -> Vec<PermissionRequestData> {
         let responded_ids: std::collections::HashSet<String> = self
             .messages
@@ -669,7 +669,7 @@ impl ChatHistory {
     }
 
     /// Find unanswered ask-user requests (no matching `AskUserResponse`).
-    #[must_use] 
+    #[must_use]
     pub fn pending_ask_user_requests(&self) -> Vec<AskUserRequestData> {
         let responded_ids: std::collections::HashSet<String> = self
             .messages
@@ -688,7 +688,7 @@ impl ChatHistory {
     }
 
     /// Check if a specific permission mode was ever approved in this session's history.
-    #[must_use] 
+    #[must_use]
     pub fn was_permission_mode_approved(&self, mode: PermissionHistoryMode) -> bool {
         // Collect all approved response IDs
         let approved_ids: std::collections::HashSet<String> = self

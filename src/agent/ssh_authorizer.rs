@@ -61,11 +61,8 @@ impl SshSessionAuthorizer for MaySshAuthorizer {
         let target = target.to_string();
         let details = details.to_string();
         Box::pin(async move {
-            self.ask_permission(
-                format!("{details} Install leash on {target}?"),
-                "Install",
-            )
-            .await
+            self.ask_permission(format!("{details} Install leash on {target}?"), "Install")
+                .await
         })
     }
 }

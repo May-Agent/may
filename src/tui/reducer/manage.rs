@@ -34,10 +34,7 @@ pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> Result<Option<Se
     Ok(None)
 }
 
-pub fn handle_workspace_confirm_key(
-    app: &mut App,
-    code: KeyCode,
-) -> Result<Option<SendAction>> {
+pub fn handle_workspace_confirm_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     match code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
@@ -64,10 +61,7 @@ pub fn handle_workspace_confirm_key(
     Ok(None)
 }
 
-pub fn handle_permission_confirm_key(
-    app: &mut App,
-    code: KeyCode,
-) -> Result<Option<SendAction>> {
+pub fn handle_permission_confirm_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     match code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);

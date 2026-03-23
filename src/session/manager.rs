@@ -38,7 +38,7 @@ pub struct SessionId(String);
 
 impl SessionId {
     /// Create a new random session ID using four words.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         let petnames = Petnames::default();
         let id = petnames
@@ -53,7 +53,7 @@ impl SessionId {
     }
 
     /// Get the ID as a string.
-    #[must_use] 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -116,7 +116,7 @@ pub struct SessionSummary {
 
 impl SessionSummary {
     /// Convert a DB session model to a summary.
-    #[must_use] 
+    #[must_use]
     pub fn from_db_model(s: crate::db::entity::sessions::Model) -> Self {
         let created_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &s.created_at).ok();
         let updated_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &s.updated_at).ok();
@@ -304,13 +304,13 @@ impl SessionManager {
     }
 
     /// Get the May directory path.
-    #[must_use] 
+    #[must_use]
     pub fn may_dir(&self) -> &Path {
         &self.may_dir
     }
 
     /// Get the database handle.
-    #[must_use] 
+    #[must_use]
     pub const fn db(&self) -> &ChatDb {
         &self.db
     }
@@ -530,26 +530,9 @@ impl SessionManager {
         list_summaries_from_db(&self.db).await
     }
 
-    /// Save current session state to database.
+    /// Save current session state.
     pub async fn save_current(&mut self) -> Result<(), SessionError> {
         self.ensure_persisted().await?;
-        // With DB-backed storage, individual messages are already persisted via append_message.
-        // This method now only needs to sync metadata and write the backup chat.txt.
-        let session = self.current.as_ref().ok_or(SessionError::NoActiveSession)?;
-
-        // Write chat.txt as human-readable backup (non-fatal)
-        if let Err(e) = self
-            .store
-            .write_history(
-                session.id.as_str(),
-                session.profile_id.as_deref(),
-                &session.history,
-            )
-            .await
-        {
-            tracing::warn!("Failed to write chat.txt backup: {}", e);
-        }
-
         Ok(())
     }
 
@@ -560,23 +543,9 @@ impl SessionManager {
         session.title = Some(title.clone());
         session.history.metadata.title = Some(title.clone());
 
-        // Update database
         self.db
             .update_session(session.id.as_str(), Some(&title), None)
             .await?;
-
-        // Write chat.txt backup (non-fatal)
-        if let Err(e) = self
-            .store
-            .write_history(
-                session.id.as_str(),
-                session.profile_id.as_deref(),
-                &session.history,
-            )
-            .await
-        {
-            tracing::warn!("Failed to write chat.txt backup: {}", e);
-        }
 
         Ok(())
     }
@@ -588,29 +557,15 @@ impl SessionManager {
         session.model = Some(model.clone());
         session.history.metadata.model = Some(model.clone());
 
-        // Update database
         self.db
             .update_session(session.id.as_str(), None, Some(&model))
             .await?;
-
-        // Write chat.txt backup (non-fatal)
-        if let Err(e) = self
-            .store
-            .write_history(
-                session.id.as_str(),
-                session.profile_id.as_deref(),
-                &session.history,
-            )
-            .await
-        {
-            tracing::warn!("Failed to write chat.txt backup: {}", e);
-        }
 
         Ok(())
     }
 
     /// Get current session.
-    #[must_use] 
+    #[must_use]
     pub const fn current(&self) -> Option<&Session> {
         self.current.as_ref()
     }
@@ -621,13 +576,13 @@ impl SessionManager {
     }
 
     /// Get the store for direct access.
-    #[must_use] 
+    #[must_use]
     pub const fn store(&self) -> &SessionStore {
         &self.store
     }
 
     /// Get the current profile ID.
-    #[must_use] 
+    #[must_use]
     pub fn current_profile_id(&self) -> Option<&str> {
         self.current_profile_id.as_deref()
     }

@@ -579,7 +579,8 @@ impl ApiSession {
         messages: Vec<ApiMessage>,
     ) -> Self {
         let last_modified = summary
-            .updated_at.map_or_else(|| jiff::Timestamp::now().to_string(), |t| t.to_string());
+            .updated_at
+            .map_or_else(|| jiff::Timestamp::now().to_string(), |t| t.to_string());
         let preview = if summary.content_preview.is_empty() {
             "New conversation started".to_string()
         } else {

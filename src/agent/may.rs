@@ -13,8 +13,12 @@ use aither_agent::{
 use aither_cloud::{
     CloudProvider, claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI,
 };
+use aither_core::LanguageModel;
 use aither_core::image::{ImageGenerator, Prompt, Size};
-use aither_core::llm::{Message as LlmMessage, Tool, ToolOutput, model::Ability};
+use aither_core::llm::{
+    Event as LlmEvent, LLMRequest, Message as LlmMessage, Tool, ToolOutput,
+    model::{Ability, Parameters, Profile as ModelProfile, ReasoningEffort},
+};
 use aither_sandbox::{
     ContainerExecHandle, ContainerShellRuntime, ShellRuntimeAvailability, SshServer, TerminalMode,
     TerminalTool,
@@ -27,7 +31,7 @@ use futures_lite::{Stream, StreamExt};
 use crate::agent::notify_tool::NotifyTool;
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
 use crate::agent::search_tool::SearchTool;
-use crate::agent::session_tool::{EnvironmentTool, SessionTool};
+use crate::agent::session_tool::SessionTool;
 use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
@@ -116,6 +120,37 @@ pub struct ProviderCandidate {
     pub provider_id: String,
 }
 
+#[derive(Clone)]
+struct RequestParameterizedModel<M> {
+    inner: M,
+    parameters: Parameters,
+}
+
+impl<M> RequestParameterizedModel<M> {
+    const fn new(inner: M, parameters: Parameters) -> Self {
+        Self { inner, parameters }
+    }
+}
+
+impl<M> LanguageModel for RequestParameterizedModel<M>
+where
+    M: LanguageModel + Clone,
+{
+    type Error = M::Error;
+
+    fn respond(
+        &self,
+        request: LLMRequest,
+    ) -> impl Stream<Item = Result<LlmEvent, Self::Error>> + Send {
+        self.inner
+            .respond(request.with_parameters(self.parameters.clone()))
+    }
+
+    async fn profile(&self) -> ModelProfile {
+        self.inner.profile().await
+    }
+}
+
 pub fn provider_candidates_for_model(config: &MayConfig, model: &str) -> Vec<ProviderCandidate> {
     ordered_provider_ids_for_model(config, model)
         .into_iter()
@@ -146,7 +181,7 @@ pub fn provider_candidates_for_tiers(
     candidates
 }
 
-#[must_use] 
+#[must_use]
 pub fn provider_candidate_count(config: &MayConfig, model: &str) -> usize {
     provider_candidates_for_model(config, model).len()
 }
@@ -318,20 +353,28 @@ pub struct PermissionRequest {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalMode {
+    Interactive,
+    Unavailable { context: &'static str },
+}
+
 #[derive(Debug, Clone)]
 pub struct PermissionApprover {
     live_responses: Arc<LiveResponseRegistry<bool>>,
     session_id: Option<String>,
     runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
+    approval_mode: ApprovalMode,
 }
 
 impl PermissionApprover {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             live_responses: Arc::new(LiveResponseRegistry::new()),
             session_id: None,
             runtime_service: None,
+            approval_mode: ApprovalMode::Interactive,
         }
     }
 
@@ -340,6 +383,7 @@ impl PermissionApprover {
             live_responses: self.live_responses.clone(),
             session_id: Some(session_id.into()),
             runtime_service: self.runtime_service.clone(),
+            approval_mode: self.approval_mode,
         }
     }
 
@@ -350,6 +394,21 @@ impl PermissionApprover {
     ) -> Self {
         self.runtime_service = Some(runtime_service);
         self
+    }
+
+    #[must_use]
+    pub fn without_interactive_approval(mut self, context: &'static str) -> Self {
+        self.approval_mode = ApprovalMode::Unavailable { context };
+        self
+    }
+
+    fn unavailable_error(mode: TerminalMode, context: &'static str) -> PermissionError {
+        PermissionError::Denied(join_text(&[
+            "sandbox blocked ",
+            mode.description(),
+            " execution; approval is required to escalate this command, but approval is unavailable in ",
+            context,
+        ]))
     }
 
     fn persisted_request(
@@ -400,6 +459,10 @@ impl PermissionApprover {
         mode: TerminalMode,
         script: String,
     ) -> Result<bool, PermissionError> {
+        if let ApprovalMode::Unavailable { context } = self.approval_mode {
+            return Err(Self::unavailable_error(mode, context));
+        }
+
         let Some(session_id) = self.session_id.clone() else {
             return Err(PermissionError::Internal(anyhow::anyhow!(
                 "permission approval requires a bound session id"
@@ -446,7 +509,7 @@ impl PermissionApprover {
         rx.recv().await.map_err(|_| PermissionError::Interrupted)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn respond(&self, request_id: &str, approved: bool) -> bool {
         self.live_responses.resolve(request_id, approved)
     }
@@ -481,6 +544,9 @@ impl PermissionHandler for PermissionApprover {
     }
 
     async fn will_wait_for_approval(&self, mode: TerminalMode, _script: &str) -> bool {
+        if matches!(self.approval_mode, ApprovalMode::Unavailable { .. }) {
+            return false;
+        }
         let Some(session_id) = self.session_id.as_deref() else {
             return false;
         };
@@ -736,6 +802,8 @@ pub struct MayAgentConfig {
     pub native_voice_input: bool,
     /// Model context window resolved from provider metadata.
     pub model_context_window: Option<u32>,
+    /// Request-level parameters applied to each LLM call for this agent.
+    pub request_parameters: Parameters,
 }
 
 #[derive(Clone)]
@@ -1012,9 +1080,9 @@ fn resolve_image_generator_config(may_config: &MayConfig) -> Option<ImageGenerat
 /// The May agent.
 pub struct MayAgent {
     inner: Agent<
-        CloudProvider,
-        CloudProvider,
-        CloudProvider,
+        RequestParameterizedModel<CloudProvider>,
+        RequestParameterizedModel<CloudProvider>,
+        RequestParameterizedModel<CloudProvider>,
         HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>,
     >,
     session_id: SessionId,
@@ -1085,9 +1153,11 @@ impl MayAgent {
         runtime_system_context =
             runtime_system_context.with_terminal_runtime(terminal_runtime.clone());
 
+        let llm = RequestParameterizedModel::new(config.llm, config.request_parameters.clone());
+
         // Clone LLM for tools that need it before it's moved into the builder
-        let fast_llm = config.llm.clone();
-        let subagent_llm = config.llm.clone();
+        let fast_llm = llm.clone();
+        let subagent_llm = llm.clone();
 
         // Create tools
         let websearch = WebSearchTool::default();
@@ -1105,11 +1175,6 @@ impl MayAgent {
         let session_tool = SessionTool::new(
             config.may_dir.clone(),
             config.session_id.as_str().to_string(),
-        );
-        let environment_tool = EnvironmentTool::new(
-            config.may_dir.clone(),
-            config.session_id.as_str().to_string(),
-            config.profile_id.clone(),
         );
         let search_tool =
             SearchTool::new(config.sandbox_dir.clone(), config.search_embedder.clone());
@@ -1144,12 +1209,9 @@ impl MayAgent {
         let pending_steer_hook = PendingSteerHook::new(runtime_db.clone(), &config.session_id);
         let context_snapshot_hook = ContextSnapshotHook::new(runtime_db, &config.session_id);
 
-        let transcript_file = session_paths.transcript_path();
-        let transcript_path = transcript_file.display().to_string();
-
         let (skills_dir, subagents_dir) = if let Some(profile_id) = config.profile_id.as_deref() {
-            let profile_home = crate::session::MayHomePaths::new(config.may_dir.clone())
-                .profile_home(profile_id);
+            let profile_home =
+                crate::session::MayHomePaths::new(config.may_dir.clone()).profile_home(profile_id);
             (profile_home.skills_dir(), profile_home.subagents_dir())
         } else {
             let home = crate::session::MayHomePaths::new(config.may_dir.clone());
@@ -1178,13 +1240,12 @@ impl MayAgent {
         } else {
             config.max_iterations
         };
-        let mut builder = TerminalAgentBuilder::new(config.llm, terminal_tool)
+        let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .tool(websearch)
             .tool(webfetch)
             .tool(ask)
             .tool(ask_user)
             .tool(session_tool)
-            .tool(environment_tool)
             .tool(search_tool)
             .tool(task_tool)
             .tool(imagine)
@@ -1213,8 +1274,6 @@ impl MayAgent {
             ))
             .agent_kind(AgentKind::Coding)
             .persona_prompt(include_str!("../../templates/system.md"))
-            .transcript_path(transcript_path)
-            .transcript(transcript_file)
             .system(build_memory_context(&memory_content))
             .system(terminal_runtime)
             .max_iterations(effective_max_iterations);
@@ -1394,6 +1453,7 @@ impl MayAgent {
             None,
             None,
             None,
+            None,
             SessionPlanState::Disabled,
             None,
             None,
@@ -1415,6 +1475,7 @@ impl MayAgent {
         workspace_request_broker: WorkspaceRequestBroker,
         ask_user_broker: AskUserBroker,
         model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
         profile_id: Option<String>,
         permission_approver: Option<PermissionApprover>,
         profile_persona: Option<String>,
@@ -1487,6 +1548,11 @@ impl MayAgent {
                 .unwrap_or_else(|| MayAgentError::MissingApiKey(err_no_provider(model))));
         };
         let model_info = aither_models::lookup(model);
+        let request_parameters = if let Some(reasoning_effort) = reasoning_effort {
+            Parameters::default().reasoning_effort(reasoning_effort)
+        } else {
+            Parameters::default()
+        };
 
         let search_embedder =
             match resolve_embedding_provider(may_config, Some(provider_id.as_str())) {
@@ -1539,6 +1605,7 @@ impl MayAgent {
             native_voice_input: model_info
                 .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::Audio)),
             model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),
+            request_parameters,
         };
 
         Self::new(config).await
@@ -1572,25 +1639,25 @@ impl MayAgent {
     }
 
     /// Get session ID.
-    #[must_use] 
+    #[must_use]
     pub const fn session_id(&self) -> &SessionId {
         &self.session_id
     }
 
     /// Get session sandbox directory.
-    #[must_use] 
+    #[must_use]
     pub fn sandbox_dir(&self) -> PathBuf {
         self.sandbox_dir.clone()
     }
 
     /// Selected provider ID for the current request.
-    #[must_use] 
+    #[must_use]
     pub fn provider_id(&self) -> &str {
         &self.provider_id
     }
 
     /// Model context window resolved for this agent.
-    #[must_use] 
+    #[must_use]
     pub const fn model_context_window(&self) -> Option<u32> {
         self.model_context_window
     }
@@ -2044,7 +2111,7 @@ fn build_terminal_runtime_context(
             "tasks.md - canonical task/plan document for long-running work".to_string(),
         ],
         command_rules: vec![
-            "Native tools are only the terminal command tool (`terminal`, legacy wire name), `terminal_kill`, `terminal_input`, and `terminal_read`. Higher-level capabilities such as `websearch`, `webfetch`, `ask`, `environment`, `session`, `task`, and registration commands are CLI commands auto-exposed through IPC, not additional native tools.".to_string(),
+            "The native tool currently named `terminal` handles command execution. `terminal_kill`, `terminal_input`, and `terminal_read` manage background terminal jobs. Higher-level capabilities such as `websearch`, `webfetch`, `ask`, `session`, `task`, and registration commands are CLI commands auto-exposed through IPC rather than additional native tools.".to_string(),
             "The default execution target is the current home environment unless the terminal command tool explicitly targets SSH mode.".to_string(),
             "Every terminal command call uses the legacy native tool name `terminal` today and must set timeout. timeout=0 means immediate background execution. timeout>0 runs in foreground until timeout and then promotes to a background task if still running.".to_string(),
             "Background tasks persist output to files. Use terminal_read for incremental reads, terminal_input for stdin, and terminal_kill to stop them.".to_string(),

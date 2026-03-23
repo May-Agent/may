@@ -4,10 +4,7 @@ use crossterm::event::KeyCode;
 use crate::tui::app::{App, SendAction};
 use crate::tui::state::AppMode;
 
-pub fn handle_session_select_key(
-    app: &mut App,
-    code: KeyCode,
-) -> Result<Option<SendAction>> {
+pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     let filtered = app.filtered_sessions();
     let filtered_len = filtered.len();
 
@@ -273,10 +270,7 @@ fn toggle_archive(app: &mut App) {
     });
 }
 
-pub fn handle_profile_select_key(
-    app: &mut App,
-    code: KeyCode,
-) -> Result<Option<SendAction>> {
+pub fn handle_profile_select_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     let profile_count = app.profiles.len();
 
     match code {

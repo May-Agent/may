@@ -562,7 +562,7 @@ impl ChatDb {
     }
 
     /// Get the underlying database connection.
-    #[must_use] 
+    #[must_use]
     pub const fn connection(&self) -> &DatabaseConnection {
         &self.conn
     }
@@ -684,7 +684,9 @@ impl ChatDb {
                 .unwrap_or(SessionRuntimeState::Idle),
             plan_state: plan_row
                 .as_ref()
-                .map_or(SessionPlanState::Disabled.as_str(), |row| row.plan_state.as_str())
+                .map_or(SessionPlanState::Disabled.as_str(), |row| {
+                    row.plan_state.as_str()
+                })
                 .parse()
                 .unwrap_or(SessionPlanState::Disabled),
             interactions: SessionInteractionState {
@@ -2349,7 +2351,10 @@ impl ChatDb {
     ///
     /// Returns the ID of the first profile (daily).
     pub async fn ensure_default_profiles(&self) -> Result<String, ChatDbError> {
-        let local_hostname = hostname::get().map_or_else(|_| "local".to_string(), |h| h.to_string_lossy().into_owned());
+        let local_hostname = hostname::get().map_or_else(
+            |_| "local".to_string(),
+            |h| h.to_string_lossy().into_owned(),
+        );
 
         let defaults = [
             DefaultProfile {
@@ -3253,11 +3258,14 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::PermissionRequestMode;
+    use crate::db::ProfileEnvironmentKind;
     use crate::db::entity::{scheduled_task_runs, session_run_leases};
+    use crate::profile::ProfileEnvironment;
     use crate::session::{
         PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
         PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
         PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload, SessionRuntimeState,
+        TerminalRuntimeState,
     };
     use crate::task_trigger::PersistedTaskTrigger;
 
@@ -3718,7 +3726,7 @@ mod tests {
             total_tokens: Some(30),
             cache_read_tokens: Some(5),
             cache_write_tokens: Some(0),
-            context_window: Some(200000),
+            context_window: Some(200_000),
             elapsed_ms: 42,
             ok: false,
             error: Some("boom"),
@@ -3738,7 +3746,7 @@ mod tests {
         assert_eq!(entries[0].completion_tokens, Some(20));
         assert_eq!(entries[0].total_tokens, Some(30));
         assert_eq!(entries[0].cache_read_tokens, Some(5));
-        assert_eq!(entries[0].context_window, Some(200000));
+        assert_eq!(entries[0].context_window, Some(200_000));
         assert_eq!(entries[0].elapsed_ms, 42);
         assert!(!entries[0].ok);
         assert_eq!(entries[0].error.as_deref(), Some("boom"));

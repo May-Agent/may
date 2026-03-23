@@ -68,7 +68,7 @@ pub struct EventHandler {
 
 impl EventHandler {
     /// Create a new event handler.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         let (tx, rx) = async_channel::unbounded();
         let tx_clone = tx.clone();
@@ -105,7 +105,7 @@ impl EventHandler {
     }
 
     /// Get a clone of the sender for sending events from background tasks.
-    #[must_use] 
+    #[must_use]
     pub fn sender(&self) -> EventSender {
         self.tx.clone()
     }

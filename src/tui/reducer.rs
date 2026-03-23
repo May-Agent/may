@@ -78,8 +78,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                     app.mode = AppMode::SkillManage;
                 }
                 Err(e) => {
-                    app.chat
-                        .push_error(&format!("Failed to load skills: {e}"));
+                    app.chat.push_error(&format!("Failed to load skills: {e}"));
                 }
             }
             Ok(None)
@@ -110,8 +109,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>
                     }
                 }
                 Err(e) => {
-                    app.chat
-                        .push_error(&format!("Failed to delete skill: {e}"));
+                    app.chat.push_error(&format!("Failed to delete skill: {e}"));
                 }
             }
             Ok(None)

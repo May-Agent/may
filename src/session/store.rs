@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use futures_lite::StreamExt;
 
-use super::{ChatHistory, ChatHistoryError, MayHomePaths, SessionPaths};
+use super::{MayHomePaths, SessionPaths};
 use crate::fs_utils::copy_dir_contents_recursive;
 
 /// Session store error.
@@ -12,8 +12,6 @@ use crate::fs_utils::copy_dir_contents_recursive;
 pub enum StoreError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Chat history error: {0}")]
-    History(#[from] ChatHistoryError),
     #[error("Bundle error: {0}")]
     Bundle(#[from] crate::bundle::BundleError),
 }
@@ -32,19 +30,19 @@ pub enum SandboxResourceLayout {
 
 impl SessionStore {
     /// Create a new session store.
-    #[must_use] 
+    #[must_use]
     pub const fn new(home_paths: MayHomePaths) -> Self {
         Self { home_paths }
     }
 
     /// Get path for a session directory.
-    #[must_use] 
+    #[must_use]
     pub fn session_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
         self.session_paths(id, profile_id).root().to_path_buf()
     }
 
     /// Get typed layout for a session.
-    #[must_use] 
+    #[must_use]
     pub fn session_paths(&self, id: &str, profile_id: Option<&str>) -> SessionPaths {
         match profile_id {
             Some(profile_id) => self.home_paths.profile_home(profile_id).session_paths(id),
@@ -52,27 +50,21 @@ impl SessionStore {
         }
     }
 
-    /// Get path for a session's chat history.
-    #[must_use] 
-    pub fn chat_path(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
-        self.session_paths(id, profile_id).chat_backup_path()
-    }
-
     /// Get path for a session's images directory.
-    #[must_use] 
+    #[must_use]
     pub fn images_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
         self.session_paths(id, profile_id).images_dir()
     }
 
     /// Get path for a session's sandbox directory.
     /// `TerminalTool` will create its own working directory inside this.
-    #[must_use] 
+    #[must_use]
     pub fn sandbox_dir(&self, id: &str, profile_id: Option<&str>) -> PathBuf {
         self.session_dir(id, profile_id)
     }
 
     /// Check if a session exists.
-    #[must_use] 
+    #[must_use]
     pub fn exists(&self, id: &str, profile_id: Option<&str>) -> bool {
         self.session_dir(id, profile_id).exists()
     }
@@ -142,33 +134,6 @@ impl SessionStore {
         Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
         self.seed_session_scoped_resources(&paths, profile_id)
             .await?;
-        Ok(())
-    }
-
-    /// Read chat history from disk.
-    pub async fn read_history(
-        &self,
-        id: &str,
-        profile_id: Option<&str>,
-    ) -> Result<ChatHistory, StoreError> {
-        let path = self.chat_path(id, profile_id);
-        if async_fs::metadata(&path).await.is_err() {
-            return Ok(ChatHistory::new());
-        }
-        let content = async_fs::read_to_string(&path).await?;
-        Ok(ChatHistory::parse(&content)?)
-    }
-
-    /// Write chat history to disk.
-    pub async fn write_history(
-        &self,
-        id: &str,
-        profile_id: Option<&str>,
-        history: &ChatHistory,
-    ) -> Result<(), StoreError> {
-        let path = self.chat_path(id, profile_id);
-        let content = history.serialize();
-        async_fs::write(&path, content).await?;
         Ok(())
     }
 

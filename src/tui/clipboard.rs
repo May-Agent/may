@@ -23,7 +23,7 @@ pub enum ImageFormat {
 
 impl ImageFormat {
     /// Get file extension.
-    #[must_use] 
+    #[must_use]
     pub const fn extension(&self) -> &'static str {
         match self {
             Self::Png => "png",
@@ -34,7 +34,7 @@ impl ImageFormat {
     }
 
     /// Detect format from URL or content-type.
-    #[must_use] 
+    #[must_use]
     pub fn from_url(url: &str) -> Option<Self> {
         let lower = url.to_lowercase();
         // Check file extension in URL path
@@ -52,7 +52,7 @@ impl ImageFormat {
     }
 
     /// Detect format from content-type header.
-    #[must_use] 
+    #[must_use]
     pub fn from_content_type(content_type: &str) -> Option<Self> {
         let lower = content_type.to_lowercase();
         if lower.contains("image/png") {
@@ -144,7 +144,7 @@ pub struct ImageManager {
 
 impl ImageManager {
     /// Create a new image manager.
-    #[must_use] 
+    #[must_use]
     pub fn new(session_dir: &Path) -> Self {
         Self {
             session_images_dir: SessionPaths::new(session_dir.to_path_buf()).images_dir(),
@@ -249,7 +249,7 @@ pub fn set_clipboard_text(text: &str) -> Result<(), ImageError> {
 }
 
 /// Check if text is an image URL.
-#[must_use] 
+#[must_use]
 pub fn is_image_url(text: &str) -> Option<Url> {
     let trimmed = text.trim();
 
@@ -341,7 +341,7 @@ pub struct TextManager {
 
 impl TextManager {
     /// Create a new text manager.
-    #[must_use] 
+    #[must_use]
     pub fn new(session_dir: &Path) -> Self {
         Self {
             session_dir: session_dir.join("pastes"),

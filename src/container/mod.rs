@@ -55,7 +55,7 @@ impl std::fmt::Debug for ContainerRuntime {
 
 impl ContainerRuntime {
     /// The hostname that resolves to the host machine from inside a container.
-    #[must_use] 
+    #[must_use]
     pub const fn host_gateway(&self) -> &'static str {
         match self.kind {
             ContainerRuntimeKind::Podman => "host.containers.internal",

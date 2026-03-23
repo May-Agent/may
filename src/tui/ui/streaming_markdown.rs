@@ -40,7 +40,7 @@ impl Default for StreamingMarkdown {
 impl StreamingMarkdown {
     /// Create a new streaming markdown renderer.
     /// Uses default (no image support). For image support, use `with_image_support()`.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             parser: Parser::new(),
@@ -56,7 +56,7 @@ impl StreamingMarkdown {
     }
 
     /// Create a new streaming markdown renderer with explicit image support flag.
-    #[must_use] 
+    #[must_use]
     pub fn with_image_support(images_supported: bool) -> Self {
         Self {
             parser: Parser::new(),
@@ -115,7 +115,7 @@ impl StreamingMarkdown {
     }
 
     /// Get the current raw content.
-    #[must_use] 
+    #[must_use]
     pub fn content(&self) -> &str {
         &self.content
     }
@@ -137,14 +137,14 @@ impl StreamingMarkdown {
     }
 
     /// Get images referenced in the content.
-    #[must_use] 
+    #[must_use]
     pub fn images(&self) -> Vec<(String, String)> {
         self.images.clone()
     }
 
     /// Get image positions: (url, `line_index`) for each image.
     /// The `line_index` is the position in the rendered output where the image should be displayed.
-    #[must_use] 
+    #[must_use]
     pub fn image_positions(&self) -> &[(String, usize)] {
         &self.image_positions
     }
@@ -475,7 +475,7 @@ fn render_inline_element(elem: streamdown_parser::InlineElement) -> Span<'static
 }
 
 /// Extract images from markdown content.
-#[must_use] 
+#[must_use]
 pub fn extract_images(content: &str) -> Vec<(String, String)> {
     let mut parser = Parser::new();
     let mut images = Vec::new();

@@ -94,7 +94,7 @@ impl WorkspaceConfig {
     }
 
     /// Check if a path has read/write access.
-    #[must_use] 
+    #[must_use]
     pub fn has_write_access(&self, path: &Path) -> bool {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.workdirs
@@ -142,7 +142,7 @@ impl Workspace {
     }
 
     /// Get all readable directories.
-    #[must_use] 
+    #[must_use]
     pub fn readable_dirs(&self) -> Vec<&PathBuf> {
         let mut dirs = vec![&self.sandbox, &self.cwd];
         for wd in &self.config.workdirs {
@@ -152,7 +152,7 @@ impl Workspace {
     }
 
     /// Get all writable directories.
-    #[must_use] 
+    #[must_use]
     pub fn writable_dirs(&self) -> Vec<&PathBuf> {
         let mut dirs = vec![&self.sandbox];
         for wd in &self.config.workdirs {

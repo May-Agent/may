@@ -10,6 +10,7 @@ use std::io::Write;
 use std::panic;
 
 use aither_agent::AgentEvent;
+use aither_core::llm::model::ReasoningEffort;
 use anyhow::Context;
 
 use async_channel::TryRecvError;
@@ -47,13 +48,26 @@ fn ensure_rustls_provider() {
 enum CliMode {
     Tui,
     Ui(Vec<String>),
-    OneShot(String),
+    OneShot(OneShotArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OneShotArgs {
+    prompt: String,
+    model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl OneShotArgs {
+    fn help_text() -> &'static str {
+        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may ui [args...]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
+    }
 }
 
 fn parse_cli_mode(args: &[String]) -> CliMode {
     match args.get(1).map(String::as_str) {
         Some("ui") => CliMode::Ui(args[2..].to_vec()),
-        Some(_) => CliMode::OneShot(args[1..].join(" ")),
+        Some(_) => CliMode::OneShot(parse_oneshot_args(&args[1..])),
         None => CliMode::Tui,
     }
 }
@@ -62,19 +76,73 @@ fn parse_cli_mode_from_env() -> CliMode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("ui") => CliMode::Ui(args[2..].to_vec()),
-        Some(_) => {
-            let prompt = std::env::args_os()
-                .skip(1)
-                .map(|part| {
-                    part.into_string().unwrap_or_else(|value| {
-                        panic!("one-shot prompt argument must be valid UTF-8: {value:?}")
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            CliMode::OneShot(prompt)
-        }
+        Some(_) => CliMode::OneShot(parse_oneshot_args_from_env()),
         None => CliMode::Tui,
+    }
+}
+
+fn parse_oneshot_args(args: &[String]) -> OneShotArgs {
+    let mut prompt_parts = Vec::new();
+    let mut model = None;
+    let mut reasoning_effort = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--help" | "-h" => panic!("{}", OneShotArgs::help_text()),
+            "--model" => {
+                let value = args
+                    .get(index + 1)
+                    .unwrap_or_else(|| panic!("--model requires a value"));
+                model = Some(value.clone());
+                index += 2;
+            }
+            "--reasoning-effort" => {
+                let value = args
+                    .get(index + 1)
+                    .unwrap_or_else(|| panic!("--reasoning-effort requires a value"));
+                reasoning_effort = Some(parse_reasoning_effort(value));
+                index += 2;
+            }
+            value => {
+                prompt_parts.push(value.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    let prompt = prompt_parts.join(" ").trim().to_string();
+    if prompt.is_empty() {
+        panic!("oneshot prompt must not be empty");
+    }
+
+    OneShotArgs {
+        prompt,
+        model,
+        reasoning_effort,
+    }
+}
+
+fn parse_oneshot_args_from_env() -> OneShotArgs {
+    let args = std::env::args_os()
+        .skip(1)
+        .map(|part| {
+            part.into_string()
+                .unwrap_or_else(|value| panic!("one-shot argument must be valid UTF-8: {value:?}"))
+        })
+        .collect::<Vec<_>>();
+    parse_oneshot_args(&args)
+}
+
+fn parse_reasoning_effort(value: &str) -> ReasoningEffort {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        _ => panic!(
+            "invalid --reasoning-effort '{}'; expected one of: low, medium, high",
+            value
+        ),
     }
 }
 
@@ -119,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli_mode {
         CliMode::Ui(ui_args) => return may_agent::ui_server::run_ui_server(&ui_args).await,
-        CliMode::OneShot(prompt) => return run_oneshot(prompt).await,
+        CliMode::OneShot(args) => return run_oneshot(args).await,
         CliMode::Tui => {}
     }
 
@@ -176,7 +244,10 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliMode, parse_cli_mode, parse_oneshot_selection};
+    use super::{
+        CliMode, OneShotArgs, parse_cli_mode, parse_oneshot_selection, parse_reasoning_effort,
+    };
+    use aither_core::llm::model::ReasoningEffort;
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
@@ -199,8 +270,39 @@ mod tests {
     fn parse_cli_mode_joins_prompt_into_oneshot() {
         assert_eq!(
             parse_cli_mode(&args(&["may", "fix", "the", "bug"])),
-            CliMode::OneShot("fix the bug".to_string())
+            CliMode::OneShot(OneShotArgs {
+                prompt: "fix the bug".to_string(),
+                model: None,
+                reasoning_effort: None,
+            })
         );
+    }
+
+    #[test]
+    fn parse_cli_mode_accepts_oneshot_flags() {
+        assert_eq!(
+            parse_cli_mode(&args(&[
+                "may",
+                "--model",
+                "gpt-5.4",
+                "--reasoning-effort",
+                "low",
+                "inspect",
+                "repo",
+            ])),
+            CliMode::OneShot(OneShotArgs {
+                prompt: "inspect repo".to_string(),
+                model: Some("gpt-5.4".to_string()),
+                reasoning_effort: Some(ReasoningEffort::Low),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_reasoning_effort_accepts_low_medium_high() {
+        assert_eq!(parse_reasoning_effort("low"), ReasoningEffort::Low);
+        assert_eq!(parse_reasoning_effort("medium"), ReasoningEffort::Medium);
+        assert_eq!(parse_reasoning_effort("high"), ReasoningEffort::High);
     }
 
     #[test]
@@ -226,11 +328,15 @@ mod tests {
     }
 }
 
-async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
+async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     let (event_tx, _event_rx) = async_channel::unbounded();
     let mut app = App::new(event_tx, None).await?;
     if !app.is_configured() {
         anyhow::bail!("May is not configured");
+    }
+
+    if let Some(model) = args.model.as_ref() {
+        app.config.last_model = Some(model.clone());
     }
 
     let (workspace_broker, workspace_queue) = workspace_request::channel();
@@ -242,7 +348,8 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
         workspace_broker,
         ask_user_broker,
         std::sync::Arc::new(may_agent::location::LocationProvider::new()),
-    );
+    )
+    .with_oneshot_overrides(args.model.clone(), args.reasoning_effort);
 
     let mut worker: Option<AgentWorker> = None;
     runtime_deps
@@ -261,7 +368,7 @@ async fn run_oneshot(prompt: String) -> anyhow::Result<()> {
         &mut app,
         worker,
         PendingMessage {
-            content: prompt,
+            content: args.prompt.clone(),
             attachments: Vec::new(),
             queued_at: Timestamp::now(),
             delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
@@ -977,16 +1084,17 @@ where
                     }
                     Some(SendAction::Send(msg)) => {
                         if agent_handle.is_none()
-                            && let Some(w) = worker.as_ref() {
-                                runtime_deps.mark_running(app).await?;
-                                agent_handle = Some(runtime_deps.start_agent_task(
-                                    app,
-                                    w,
-                                    msg,
-                                    &mut pending_title_gen,
-                                )?);
-                                assistant_response.clear();
-                            }
+                            && let Some(w) = worker.as_ref()
+                        {
+                            runtime_deps.mark_running(app).await?;
+                            agent_handle = Some(runtime_deps.start_agent_task(
+                                app,
+                                w,
+                                msg,
+                                &mut pending_title_gen,
+                            )?);
+                            assistant_response.clear();
+                        }
                     }
                     Some(SendAction::EnqueuePending(msg)) => {
                         runtime_deps.enqueue_pending_message(app, msg).await?;

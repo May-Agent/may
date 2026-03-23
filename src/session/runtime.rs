@@ -39,7 +39,6 @@ impl SessionRuntimeState {
     }
 }
 
-
 impl core::str::FromStr for SessionRuntimeState {
     type Err = String;
 
@@ -124,7 +123,6 @@ pub enum PendingUserMessageMode {
     Steer,
     Queue,
 }
-
 
 impl PendingUserMessageMode {
     #[must_use]

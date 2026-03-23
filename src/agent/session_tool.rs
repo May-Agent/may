@@ -168,21 +168,12 @@ pub struct SessionTool {
 }
 
 #[derive(Debug, Clone)]
-pub struct EnvironmentTool {
-    may_dir: PathBuf,
-    current_session_id: String,
-    current_profile_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 struct SearchDefaults {
     current_session_id: String,
-    default_profile_id: Option<String>,
-    include_current_by_default: bool,
 }
 
 impl SessionTool {
-    #[must_use] 
+    #[must_use]
     pub const fn new(may_dir: PathBuf, current_session_id: String) -> Self {
         Self {
             may_dir,
@@ -210,38 +201,6 @@ impl SessionTool {
             &mut args,
             &SearchDefaults {
                 current_session_id: self.current_session_id.clone(),
-                default_profile_id: None,
-                include_current_by_default: false,
-            },
-        );
-        normalize_common_args(args)
-    }
-}
-
-impl EnvironmentTool {
-    #[must_use] 
-    pub const fn new(
-        may_dir: PathBuf,
-        current_session_id: String,
-        current_profile_id: Option<String>,
-    ) -> Self {
-        Self {
-            may_dir,
-            current_session_id,
-            current_profile_id,
-        }
-    }
-
-    fn normalize_args(&self, mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
-        if let Some(command) = args.command.take() {
-            apply_command_form(&mut args, &command, "environment")?;
-        }
-        apply_search_defaults(
-            &mut args,
-            &SearchDefaults {
-                current_session_id: self.current_session_id.clone(),
-                default_profile_id: self.current_profile_id.clone(),
-                include_current_by_default: true,
             },
         );
         normalize_common_args(args)
@@ -267,48 +226,8 @@ impl Tool for SessionTool {
     }
 }
 
-impl Tool for EnvironmentTool {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("environment")
-    }
-
-    type Arguments = SessionArgs;
-
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let args = self.normalize_args(arguments)?;
-        execute_search(
-            self.db_path(),
-            self.index_path(),
-            self.index_meta_path(),
-            args,
-        )
-        .await
-    }
-}
-
-impl EnvironmentTool {
-    fn db_path(&self) -> PathBuf {
-        self.may_dir.join("history.db")
-    }
-
-    fn index_path(&self) -> PathBuf {
-        self.may_dir.join("session_index.lancedb")
-    }
-
-    fn index_meta_path(&self) -> PathBuf {
-        self.may_dir.join(INDEX_META_FILE)
-    }
-}
-
 fn apply_search_defaults(args: &mut SessionArgs, defaults: &SearchDefaults) {
-    if args.profile_id.is_none() {
-        args.profile_id = defaults.default_profile_id.clone();
-    }
-
-    if !args.include_current
-        && !defaults.include_current_by_default
-        && args.exclude_session_id.is_none()
-    {
+    if !args.include_current && args.exclude_session_id.is_none() {
         args.exclude_session_id = Some(defaults.current_session_id.clone());
     }
 }
@@ -415,10 +334,11 @@ async fn execute_search(
         if query_enabled
             && args.search_mode != SessionSearchMode::Fulltext
             && args.search_mode != SessionSearchMode::Fuzzy
-            && haystack_norm.contains(&query_norm) {
-                row.score += 10.0;
-                push_unique(&mut row.matched_by, SessionSearchMode::Text);
-            }
+            && haystack_norm.contains(&query_norm)
+        {
+            row.score += 10.0;
+            push_unique(&mut row.matched_by, SessionSearchMode::Text);
+        }
 
         if let Some(re) = &regex
             && re.is_match(&haystack)
@@ -429,25 +349,25 @@ async fn execute_search(
     }
 
     candidates.retain(|row| {
-            if query_enabled && args.search_mode == SessionSearchMode::Text {
-                let haystack = searchable_text(row, &args.fields);
-                let haystack = if args.case_sensitive {
-                    haystack
-                } else {
-                    haystack.to_lowercase()
-                };
-                return haystack.contains(&query_norm);
-            }
+        if query_enabled && args.search_mode == SessionSearchMode::Text {
+            let haystack = searchable_text(row, &args.fields);
+            let haystack = if args.case_sensitive {
+                haystack
+            } else {
+                haystack.to_lowercase()
+            };
+            return haystack.contains(&query_norm);
+        }
 
-            if regex_enabled {
-                let Some(re) = &regex else {
-                    return false;
-                };
-                return re.is_match(&searchable_text(row, &args.fields));
-            }
+        if regex_enabled {
+            let Some(re) = &regex else {
+                return false;
+            };
+            return re.is_match(&searchable_text(row, &args.fields));
+        }
 
-            true
-        });
+        true
+    });
 
     let mut deduped: HashMap<String, SessionMatchRow> = HashMap::new();
     for row in candidates {
@@ -503,17 +423,18 @@ fn apply_command_form(
 
     let tokens = split_shell_words(body, command_name)?;
     if let [session_id, keyword, prompt_tokens @ ..] = tokens.as_slice()
-        && keyword == "search" {
-            let prompt = prompt_tokens.join(" ");
-            if prompt.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "invalid session command: missing prompt after 'search'"
-                ));
-            }
-            args.session_id = Some(session_id.clone());
-            args.query = prompt;
-            return Ok(());
+        && keyword == "search"
+    {
+        let prompt = prompt_tokens.join(" ");
+        if prompt.is_empty() {
+            return Err(anyhow::anyhow!(
+                "invalid session command: missing prompt after 'search'"
+            ));
         }
+        args.session_id = Some(session_id.clone());
+        args.query = prompt;
+        return Ok(());
+    }
 
     args.query = tokens.join(" ");
     Ok(())
