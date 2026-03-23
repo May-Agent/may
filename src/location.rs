@@ -33,7 +33,14 @@ pub struct LocationProvider {
     cache: ArcSwapOption<CachedLocation>,
 }
 
+impl Default for LocationProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocationProvider {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             cache: ArcSwapOption::empty(),

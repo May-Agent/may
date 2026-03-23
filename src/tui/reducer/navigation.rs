@@ -4,7 +4,7 @@ use crossterm::event::KeyCode;
 use crate::tui::app::{App, SendAction};
 use crate::tui::state::AppMode;
 
-pub(crate) fn handle_session_select_key(
+pub fn handle_session_select_key(
     app: &mut App,
     code: KeyCode,
 ) -> Result<Option<SendAction>> {
@@ -13,12 +13,12 @@ pub(crate) fn handle_session_select_key(
 
     match code {
         KeyCode::Esc => {
-            if !app.session_search.is_empty() {
+            if app.session_search.is_empty() {
+                app.mode = AppMode::Chat;
+            } else {
                 app.session_search.clear();
                 app.session_selected = 0;
                 app.session_scroll = 0;
-            } else {
-                app.mode = AppMode::Chat;
             }
         }
         KeyCode::Up => {
@@ -128,8 +128,7 @@ pub(crate) fn handle_session_select_key(
                             let was_current = app
                                 .session_manager
                                 .current()
-                                .map(|s| s.id.as_str() == deleted_id)
-                                .unwrap_or(false);
+                                .is_some_and(|s| s.id.as_str() == deleted_id);
 
                             let tx = app.event_tx.clone();
                             let db = app.session_manager.db().clone();
@@ -274,7 +273,7 @@ fn toggle_archive(app: &mut App) {
     });
 }
 
-pub(crate) fn handle_profile_select_key(
+pub fn handle_profile_select_key(
     app: &mut App,
     code: KeyCode,
 ) -> Result<Option<SendAction>> {
@@ -313,9 +312,9 @@ fn set_active_profile(app: &mut App, profile_id: String) {
     app.session_manager.set_current_profile(profile_id);
 }
 
-pub(crate) fn handle_help_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_help_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     match code {
-        KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+        KeyCode::Esc | KeyCode::Char('?' | 'q') => {
             app.mode = AppMode::Chat;
         }
         _ => {}
@@ -323,7 +322,7 @@ pub(crate) fn handle_help_key(app: &mut App, code: KeyCode) -> Result<Option<Sen
     Ok(None)
 }
 
-pub(crate) fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = AppMode::Chat;
@@ -345,7 +344,7 @@ pub(crate) fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> Result<Opt
     Ok(None)
 }
 
-pub(crate) fn handle_file_picker_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_file_picker_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     let Some(picker) = app.file_picker.as_mut() else {
         app.mode = AppMode::Chat;
         return Ok(None);

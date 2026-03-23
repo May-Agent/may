@@ -62,7 +62,8 @@ pub struct Completion {
 
 impl Completion {
     /// Create a new completion state.
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self {
             mode: CompletionMode::None,
             query: String::new(),
@@ -81,6 +82,7 @@ impl Completion {
     }
 
     /// Check if completion is active.
+    #[must_use] 
     pub fn is_active(&self) -> bool {
         self.mode != CompletionMode::None
     }
@@ -96,17 +98,20 @@ impl Completion {
     }
 
     /// Get the selected index.
-    pub fn selected(&self) -> usize {
+    #[must_use] 
+    pub const fn selected(&self) -> usize {
         self.selected
     }
 
     /// Get items count.
-    pub fn len(&self) -> usize {
+    #[must_use] 
+    pub const fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Check if empty.
-    pub fn is_empty(&self) -> bool {
+    #[must_use] 
+    pub const fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
@@ -151,7 +156,7 @@ impl Completion {
     }
 
     /// Move selection up.
-    pub fn prev(&mut self) {
+    pub const fn prev(&mut self) {
         if !self.items.is_empty() {
             self.selected = self.selected.saturating_sub(1);
         }
@@ -165,6 +170,7 @@ impl Completion {
     }
 
     /// Get the selected item for completion.
+    #[must_use] 
     pub fn complete(&self) -> Option<&CompletionItem> {
         self.items.get(self.selected)
     }
@@ -221,7 +227,7 @@ impl Completion {
             .build();
 
         for entry in walker.flatten() {
-            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 let path = entry.into_path();
                 // Create a display path relative to the base
                 let display = path
@@ -279,17 +285,13 @@ impl Completion {
                 // Compute display path based on location
                 let display_path = if path.starts_with(&self.sandbox) {
                     // Sandbox files: relative path (agent's cwd is sandbox)
-                    path.strip_prefix(&self.sandbox)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| path.to_string_lossy().to_string())
+                    path.strip_prefix(&self.sandbox).map_or_else(|_| path.to_string_lossy().to_string(), |p| p.to_string_lossy().to_string())
                 } else if let Some(ref home) = home_dir {
                     if path.starts_with(home) {
                         // Files under home directory: use ~ prefix
                         let rel = path
-                            .strip_prefix(home)
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| path.to_string_lossy().to_string());
-                        format!("~/{}", rel)
+                            .strip_prefix(home).map_or_else(|_| path.to_string_lossy().to_string(), |p| p.to_string_lossy().to_string());
+                        format!("~/{rel}")
                     } else {
                         // Absolute path outside home
                         path.to_string_lossy().to_string()

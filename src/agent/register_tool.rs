@@ -72,7 +72,7 @@ pub struct RegisterTool<K: RegisterKind> {
 
 impl<K: RegisterKind> RegisterTool<K> {
     #[must_use]
-    pub fn new(session_id: String, broker: Option<RegisterBroker>) -> Self {
+    pub const fn new(session_id: String, broker: Option<RegisterBroker>) -> Self {
         Self {
             session_id,
             broker,

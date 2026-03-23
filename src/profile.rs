@@ -98,7 +98,8 @@ pub enum ProfileEnvironment {
 
 impl ProfileEnvironment {
     /// Return the string stored in the DB `environment` column.
-    pub fn as_db_str(&self) -> &str {
+    #[must_use] 
+    pub const fn as_db_str(&self) -> &str {
         match self {
             Self::Local => "local",
             Self::Container { .. } => "container",
@@ -122,6 +123,7 @@ pub enum PinnedItem {
 
 impl PinnedItem {
     /// Sort order used for interleaving sessions and folders.
+    #[must_use] 
     pub fn sort_order(&self) -> i32 {
         match self {
             Self::Session(s) => s.pin_sort_order.unwrap_or(0),
@@ -191,7 +193,7 @@ pub async fn query_profile_sessions(
         });
     }
 
-    pinned.sort_by_key(|item| item.sort_order());
+    pinned.sort_by_key(PinnedItem::sort_order);
 
     Ok(ProfileSessions {
         profile,

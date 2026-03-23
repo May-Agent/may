@@ -54,7 +54,7 @@ fn parse_terminal_failed_from_result(result: &Result<String, String>) -> bool {
             };
             let nonzero_exit = parsed
                 .get("exit_code")
-                .and_then(|v| v.as_i64())
+                .and_then(serde_json::Value::as_i64)
                 .is_some_and(|code| code != 0);
             let failed_status = parsed
                 .get("status")

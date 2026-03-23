@@ -56,9 +56,9 @@ pub enum SkillSource {
 impl std::fmt::Display for SkillSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SkillSource::Bundled => write!(f, "bundled"),
-            SkillSource::GitHub { owner, repo } => write!(f, "github:{}/{}", owner, repo),
-            SkillSource::LocalPath { path } => write!(f, "local:{}", path),
+            Self::Bundled => write!(f, "bundled"),
+            Self::GitHub { owner, repo } => write!(f, "github:{owner}/{repo}"),
+            Self::LocalPath { path } => write!(f, "local:{path}"),
         }
     }
 }
@@ -111,21 +111,25 @@ pub struct SkillManager {
 
 impl SkillManager {
     /// Create a new skill manager.
+    #[must_use] 
     pub fn new(may_dir: &Path) -> Self {
         Self::from_skills_dir(MayHomePaths::new(may_dir.to_path_buf()).skills_dir())
     }
 
     /// Create a manager rooted at one profile home.
+    #[must_use] 
     pub fn from_profile_home(profile_home: &ProfileHomePaths) -> Self {
         Self::from_skills_dir(profile_home.skills_dir())
     }
 
     /// Create a manager rooted at an explicit skills directory.
-    pub fn from_skills_dir(skills_dir: PathBuf) -> Self {
+    #[must_use] 
+    pub const fn from_skills_dir(skills_dir: PathBuf) -> Self {
         Self { skills_dir }
     }
 
     /// Get the skills directory path.
+    #[must_use] 
     pub fn skills_dir(&self) -> &Path {
         &self.skills_dir
     }
@@ -203,7 +207,7 @@ impl SkillManager {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<SkillInfo>, SkillError> {
-        let repo_url = format!("https://github.com/{}/{}.git", owner, repo);
+        let repo_url = format!("https://github.com/{owner}/{repo}.git");
         let skills_dir = self.skills_dir.clone();
         let owner = owner.to_string();
         let repo_name = repo.to_string();

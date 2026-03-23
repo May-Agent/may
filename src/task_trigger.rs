@@ -196,7 +196,7 @@ impl PersistedTaskTrigger {
     }
 
     #[must_use]
-    pub fn storage_trigger_type(&self) -> &str {
+    pub const fn storage_trigger_type(&self) -> &str {
         match self {
             Self::Time { trigger_type } => trigger_type.as_str(),
             Self::Event { event_name } => event_name.as_str(),
@@ -246,7 +246,7 @@ pub struct NormalizedTaskTrigger {
 
 impl NormalizedTaskTrigger {
     #[must_use]
-    pub fn kind_str(&self) -> &'static str {
+    pub const fn kind_str(&self) -> &'static str {
         self.kind.as_str()
     }
 

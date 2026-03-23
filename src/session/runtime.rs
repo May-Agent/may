@@ -7,7 +7,9 @@ use crate::xml_fragment::XmlFragment;
 /// Persisted runtime state for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SessionRuntimeState {
+    #[default]
     Idle,
     Running,
     WaitingPermission,
@@ -37,11 +39,6 @@ impl SessionRuntimeState {
     }
 }
 
-impl Default for SessionRuntimeState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 impl core::str::FromStr for SessionRuntimeState {
     type Err = String;
@@ -121,16 +118,13 @@ pub struct PendingUserMessage {
 /// Delivery mode for a pending user message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PendingUserMessageMode {
+    #[default]
     Steer,
     Queue,
 }
 
-impl Default for PendingUserMessageMode {
-    fn default() -> Self {
-        Self::Steer
-    }
-}
 
 impl PendingUserMessageMode {
     #[must_use]
@@ -273,7 +267,7 @@ impl SessionRuntimeSummary {
     }
 
     #[must_use]
-    pub fn has_pending_messages(&self) -> bool {
+    pub const fn has_pending_messages(&self) -> bool {
         self.pending_immediate.is_some() || !self.queued_messages.is_empty()
     }
 

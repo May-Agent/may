@@ -76,7 +76,7 @@ pub struct SessionArgs {
     #[serde(default)]
     pub offset: usize,
 
-    /// Max rows to scan from LanceDB before local post-filtering.
+    /// Max rows to scan from `LanceDB` before local post-filtering.
     #[serde(default = "default_scan_limit")]
     pub scan_limit: usize,
 
@@ -141,23 +141,23 @@ pub struct SessionArgs {
     pub include_archived: bool,
 }
 
-fn default_search_mode() -> SessionSearchMode {
+const fn default_search_mode() -> SessionSearchMode {
     SessionSearchMode::Hybrid
 }
 
-fn default_output_mode() -> SessionOutputMode {
+const fn default_output_mode() -> SessionOutputMode {
     SessionOutputMode::Sessions
 }
 
-fn default_limit() -> usize {
+const fn default_limit() -> usize {
     20
 }
 
-fn default_scan_limit() -> usize {
+const fn default_scan_limit() -> usize {
     2000
 }
 
-fn default_fuzzy_distance() -> u32 {
+const fn default_fuzzy_distance() -> u32 {
     1
 }
 
@@ -182,7 +182,8 @@ struct SearchDefaults {
 }
 
 impl SessionTool {
-    pub fn new(may_dir: PathBuf, current_session_id: String) -> Self {
+    #[must_use] 
+    pub const fn new(may_dir: PathBuf, current_session_id: String) -> Self {
         Self {
             may_dir,
             current_session_id,
@@ -218,7 +219,8 @@ impl SessionTool {
 }
 
 impl EnvironmentTool {
-    pub fn new(
+    #[must_use] 
+    pub const fn new(
         may_dir: PathBuf,
         current_session_id: String,
         current_profile_id: Option<String>,
@@ -359,9 +361,7 @@ async fn execute_search(
         SessionSearchMode::Regex => run_plain_query(&table, &args).await?,
         SessionSearchMode::Text => run_plain_query(&table, &args).await?,
         SessionSearchMode::Hybrid => {
-            if !query_enabled {
-                run_plain_query(&table, &args).await?
-            } else {
+            if query_enabled {
                 let mut merged = Vec::new();
                 let mut fts = run_full_text_query(&table, &args, false).await?;
                 let mut fuzzy = run_full_text_query(&table, &args, true).await?;
@@ -370,6 +370,8 @@ async fn execute_search(
                 merged.append(&mut fuzzy);
                 merged.append(&mut plain);
                 merged
+            } else {
+                run_plain_query(&table, &args).await?
             }
         }
     };
@@ -413,12 +415,10 @@ async fn execute_search(
         if query_enabled
             && args.search_mode != SessionSearchMode::Fulltext
             && args.search_mode != SessionSearchMode::Fuzzy
-        {
-            if haystack_norm.contains(&query_norm) {
+            && haystack_norm.contains(&query_norm) {
                 row.score += 10.0;
                 push_unique(&mut row.matched_by, SessionSearchMode::Text);
             }
-        }
 
         if let Some(re) = &regex
             && re.is_match(&haystack)
@@ -428,9 +428,7 @@ async fn execute_search(
         }
     }
 
-    candidates = candidates
-        .into_iter()
-        .filter(|row| {
+    candidates.retain(|row| {
             if query_enabled && args.search_mode == SessionSearchMode::Text {
                 let haystack = searchable_text(row, &args.fields);
                 let haystack = if args.case_sensitive {
@@ -449,8 +447,7 @@ async fn execute_search(
             }
 
             true
-        })
-        .collect();
+        });
 
     let mut deduped: HashMap<String, SessionMatchRow> = HashMap::new();
     for row in candidates {
@@ -505,8 +502,8 @@ fn apply_command_form(
     }
 
     let tokens = split_shell_words(body, command_name)?;
-    if let [session_id, keyword, prompt_tokens @ ..] = tokens.as_slice() {
-        if keyword == "search" {
+    if let [session_id, keyword, prompt_tokens @ ..] = tokens.as_slice()
+        && keyword == "search" {
             let prompt = prompt_tokens.join(" ");
             if prompt.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -517,7 +514,6 @@ fn apply_command_form(
             args.query = prompt;
             return Ok(());
         }
-    }
 
     args.query = tokens.join(" ");
     Ok(())
@@ -732,7 +728,7 @@ async fn build_index_rows(db: &ChatDb) -> anyhow::Result<Vec<SessionIndexRow>> {
                 timestamp: msg.timestamp.unwrap_or_default(),
                 created_at: created_at.clone(),
                 updated_at: updated_at.clone(),
-                message_id: msg.id as i64,
+                message_id: i64::from(msg.id),
                 message_count,
             });
         }
@@ -1022,7 +1018,7 @@ async fn read_rows_from_stream(
                         if arr.is_null(i) {
                             0.0
                         } else {
-                            arr.value(i) as f64
+                            f64::from(arr.value(i))
                         }
                     })
                     .collect::<Vec<_>>()
@@ -1053,19 +1049,19 @@ async fn read_rows_from_stream(
 fn as_string<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a StringArray> {
     column
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{}' column", name))
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
 }
 
 fn as_i64<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a Int64Array> {
     column
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{}' column", name))
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
 }
 
 fn as_i32<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a Int32Array> {
     column
         .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{}' column", name))
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
 }
 
 fn searchable_text(row: &SessionMatchRow, fields: &[String]) -> String {

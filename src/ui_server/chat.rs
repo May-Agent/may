@@ -204,7 +204,7 @@ impl SessionRunRegistration {
         })
     }
 
-    fn receiver(&self) -> &async_channel::Receiver<()> {
+    const fn receiver(&self) -> &async_channel::Receiver<()> {
         &self.receiver
     }
 
@@ -763,7 +763,7 @@ async fn run_agent_loop(
         }
         let model_context_window = agent
             .model_context_window()
-            .or_else(|| lookup_model_info(&current_model).and_then(|m| m.max_input_tokens()));
+            .or_else(|| lookup_model_info(&current_model).and_then(aither_models::ModelEntry::max_input_tokens));
 
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
         let assistant_id = prefixed_text("assistant-", assistant_uuid.as_str());
@@ -792,15 +792,12 @@ async fn run_agent_loop(
                 let next_event = tokio::select! {
                     biased;
                     cancel = cancel_rx.recv() => {
-                        match cancel {
-                            Ok(()) => {
-                                cancellation_reason = Some("run cancelled by user");
-                                None
-                            }
-                            Err(_) => {
-                                cancellation_reason = Some("run cancellation channel closed unexpectedly");
-                                None
-                            }
+                        if let Ok(()) = cancel {
+                            cancellation_reason = Some("run cancelled by user");
+                            None
+                        } else {
+                            cancellation_reason = Some("run cancellation channel closed unexpectedly");
+                            None
                         }
                     }
                     next = stream.next() => next,
@@ -1273,7 +1270,7 @@ async fn persist_latest_assistant_stats(
         .map_err(anyhow::Error::from)
 }
 
-fn map_llm_role(role: LlmRole) -> &'static str {
+const fn map_llm_role(role: LlmRole) -> &'static str {
     match role {
         LlmRole::User => "user",
         LlmRole::Assistant => "assistant",
@@ -1418,7 +1415,7 @@ async fn resolve_session_context(
         .get_session(session_id.as_str())
         .await
         .map_err(anyhow::Error::from)?
-        .ok_or_else(|| anyhow::anyhow!("Session {} not found", session_id))?;
+        .ok_or_else(|| anyhow::anyhow!("Session {session_id} not found"))?;
     let history = crate::session::load_history_from_db(&db, session_id.as_str()).await?;
 
     let session_model = session.model.clone();
@@ -1428,8 +1425,7 @@ async fn resolve_session_context(
     let provider_candidate_count = crate::agent::provider_candidate_count(&cfg, &current_model);
     if provider_candidate_count == 0 {
         return Err(anyhow::anyhow!(
-            "No provider available for model '{}'",
-            current_model
+            "No provider available for model '{current_model}'"
         ));
     }
     drop(cfg);

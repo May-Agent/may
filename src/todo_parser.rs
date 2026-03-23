@@ -30,7 +30,7 @@ impl TodoChecklist {
 
     /// Total number of items.
     #[must_use]
-    pub fn total(&self) -> usize {
+    pub const fn total(&self) -> usize {
         self.items.len()
     }
 
@@ -42,7 +42,7 @@ impl TodoChecklist {
 
     /// Returns `true` if the checklist is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 }
@@ -73,7 +73,7 @@ fn parse_checklist_line(line: &str) -> Option<TodoChecklistItem> {
     };
 
     let text = after_bracket.trim().to_string();
-    Some(TodoChecklistItem { checked, text })
+    Some(TodoChecklistItem { text, checked })
 }
 
 #[cfg(test)]

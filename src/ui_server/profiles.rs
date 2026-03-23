@@ -36,7 +36,7 @@ pub(super) struct CreateProfileRequest {
     pub location_aware: bool,
 }
 
-fn default_env() -> ProfileEnvironmentKind {
+const fn default_env() -> ProfileEnvironmentKind {
     ProfileEnvironmentKind::Local
 }
 
@@ -140,9 +140,7 @@ async fn ensure_profile_environment_ready(
 
     if !state.try_begin_container_prepare(profile_id).await {
         let summary = state
-            .get_container_prepare_status(profile_id)
-            .map(|status| status.summary)
-            .unwrap_or_else(|| "Container image is still preparing".to_string());
+            .get_container_prepare_status(profile_id).map_or_else(|| "Container image is still preparing".to_string(), |status| status.summary);
         return Err(ContainerPrepareError::Domain {
             code: ApiErrorCode::ContainerPreparing,
             message: summary,
@@ -303,9 +301,9 @@ pub(super) async fn create_profile(
     let preferences_json = req
         .preferences
         .as_ref()
-        .map(|v| serde_json::to_string(v))
+        .map(serde_json::to_string)
         .transpose()
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
     let model = db
         .create_profile(CreateProfileParams {
             id: &id,
@@ -342,9 +340,9 @@ pub(super) async fn update_profile(
     let preferences_json = req
         .preferences
         .as_ref()
-        .map(|v| serde_json::to_string(v))
+        .map(serde_json::to_string)
         .transpose()
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
     db.update_profile(
         &id,
         UpdateProfileParams {

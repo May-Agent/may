@@ -17,13 +17,13 @@ use zenwave::Client;
 use zenwave::ResponseExt;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub(crate) enum ProxyScheme {
+pub enum ProxyScheme {
     Http,
     Https,
 }
 
 impl ProxyScheme {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Http => "http",
             Self::Https => "https",
@@ -40,7 +40,7 @@ impl ProxyScheme {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct LocalUrlProxyUpstream {
+pub struct LocalUrlProxyUpstream {
     pub(crate) scheme: ProxyScheme,
     pub(crate) container_ip: String,
     pub(crate) target_port: u16,
@@ -48,7 +48,7 @@ pub(crate) struct LocalUrlProxyUpstream {
 }
 
 #[derive(Debug, Clone, Eq)]
-pub(crate) struct LocalUrlProxyKey {
+pub struct LocalUrlProxyKey {
     pub(crate) session_id: String,
     pub(crate) scheme: ProxyScheme,
     pub(crate) requested_host: String,
@@ -147,7 +147,7 @@ enum LocalUrlProxyCommand {
     },
 }
 
-pub(crate) struct LocalUrlPortMapper {
+pub struct LocalUrlPortMapper {
     command_tx: mpsc::UnboundedSender<LocalUrlProxyCommand>,
 }
 
@@ -301,8 +301,7 @@ async fn proxy_http_request_impl(
     let path_and_query = request
         .uri()
         .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
+        .map_or("/", zenwave::uri::PathAndQuery::as_str);
     let upstream_url = format!(
         "{}://{}:{}{}",
         upstream.scheme.as_str(),
@@ -322,7 +321,7 @@ async fn proxy_http_request_impl(
         if should_skip_request_header(name) {
             continue;
         }
-        for value in parts.headers.get_all(name).iter() {
+        for value in &parts.headers.get_all(name) {
             upstream_request = upstream_request.header(name.as_str(), value.as_bytes())?;
         }
     }
@@ -351,7 +350,7 @@ async fn proxy_http_request_impl(
         let Ok(header_name) = HeaderName::from_bytes(name.as_str().as_bytes()) else {
             continue;
         };
-        for value in headers.get_all(name).iter() {
+        for value in &headers.get_all(name) {
             let Ok(header_value) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) else {
                 continue;
             };
@@ -403,7 +402,7 @@ fn error_response(status: StatusCode, message: &str) -> HyperResponse<Full<Bytes
     response
 }
 
-pub(crate) fn mapped_url_from_target(mapped_port: u16, target: &url::Url) -> String {
+pub fn mapped_url_from_target(mapped_port: u16, target: &url::Url) -> String {
     let mut mapped = format!("http://localhost:{mapped_port}{}", target.path());
     if let Some(query) = target.query() {
         mapped.push('?');
@@ -412,7 +411,7 @@ pub(crate) fn mapped_url_from_target(mapped_port: u16, target: &url::Url) -> Str
     mapped
 }
 
-pub(crate) fn target_host_header(target: &url::Url, port: u16) -> String {
+pub fn target_host_header(target: &url::Url, port: u16) -> String {
     match target.port() {
         Some(explicit) => format!("{}:{explicit}", target.host_str().unwrap_or("localhost")),
         None => match target.scheme() {
@@ -423,7 +422,7 @@ pub(crate) fn target_host_header(target: &url::Url, port: u16) -> String {
     }
 }
 
-pub(crate) fn parse_local_proxy_target(url: &str) -> anyhow::Result<(url::Url, ProxyScheme, u16)> {
+pub fn parse_local_proxy_target(url: &str) -> anyhow::Result<(url::Url, ProxyScheme, u16)> {
     let parsed = url::Url::parse(url)?;
     let scheme = ProxyScheme::from_str(parsed.scheme())
         .ok_or_else(|| anyhow::anyhow!("local-url map only supports http/https"))?;

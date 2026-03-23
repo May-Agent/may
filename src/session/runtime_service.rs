@@ -24,10 +24,11 @@ impl std::fmt::Debug for SessionRuntimeService {
 }
 
 impl SessionRuntimeService {
-    pub fn new(db: ChatDb, notify: Arc<Notify>) -> Self {
+    pub const fn new(db: ChatDb, notify: Arc<Notify>) -> Self {
         Self { db, notify }
     }
 
+    #[must_use] 
     pub fn db(&self) -> ChatDb {
         self.db.clone()
     }

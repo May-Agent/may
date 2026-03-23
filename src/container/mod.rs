@@ -55,7 +55,8 @@ impl std::fmt::Debug for ContainerRuntime {
 
 impl ContainerRuntime {
     /// The hostname that resolves to the host machine from inside a container.
-    pub fn host_gateway(&self) -> &'static str {
+    #[must_use] 
+    pub const fn host_gateway(&self) -> &'static str {
         match self.kind {
             ContainerRuntimeKind::Podman => "host.containers.internal",
             _ => "host.docker.internal",
@@ -64,7 +65,7 @@ impl ContainerRuntime {
 
     /// Detect and connect to the best available container runtime.
     ///
-    /// Default priority: OrbStack > Podman > Docker.
+    /// Default priority: `OrbStack` > Podman > Docker.
     pub async fn detect() -> Result<Self, ContainerError> {
         Self::detect_with_preference_and_options(
             RuntimePreference::default(),
@@ -264,8 +265,7 @@ async fn extract_podman_binary(
         return extract_podman_binary_from_tar_gz(archive_path, destination).await;
     }
     Err(ContainerError::Bootstrap(format!(
-        "unsupported Podman archive format for {}",
-        archive_name
+        "unsupported Podman archive format for {archive_name}"
     )))
 }
 

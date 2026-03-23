@@ -4,7 +4,7 @@ use crossterm::event::KeyCode;
 use crate::tui::app::{App, SendAction};
 use crate::tui::state::{CopilotAuthStatus, McpAddMode, SkillAddMode, SshAddMode};
 
-pub(crate) fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     match code {
         KeyCode::Esc => {
             app.copilot_auth_status = None;
@@ -34,12 +34,12 @@ pub(crate) fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> Result<Op
     Ok(None)
 }
 
-pub(crate) fn handle_workspace_confirm_key(
+pub fn handle_workspace_confirm_key(
     app: &mut App,
     code: KeyCode,
 ) -> Result<Option<SendAction>> {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::WorkspaceConfirm(state) = mode {
                 return Ok(Some(SendAction::RespondWorkspace {
@@ -49,7 +49,7 @@ pub(crate) fn handle_workspace_confirm_key(
                 }));
             }
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::WorkspaceConfirm(state) = mode {
                 return Ok(Some(SendAction::RespondWorkspace {
@@ -64,12 +64,12 @@ pub(crate) fn handle_workspace_confirm_key(
     Ok(None)
 }
 
-pub(crate) fn handle_permission_confirm_key(
+pub fn handle_permission_confirm_key(
     app: &mut App,
     code: KeyCode,
 ) -> Result<Option<SendAction>> {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::PermissionConfirm(state) = mode {
                 return Ok(Some(SendAction::RespondPermission {
@@ -78,7 +78,7 @@ pub(crate) fn handle_permission_confirm_key(
                 }));
             }
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::PermissionConfirm(state) = mode {
                 return Ok(Some(SendAction::RespondPermission {
@@ -92,7 +92,7 @@ pub(crate) fn handle_permission_confirm_key(
     Ok(None)
 }
 
-pub(crate) fn handle_mcp_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     match app.mcp_add_mode {
         McpAddMode::None => match code {
             KeyCode::Esc => {
@@ -188,7 +188,7 @@ pub(crate) fn handle_mcp_key(app: &mut App, code: KeyCode) -> Result<Option<Send
     Ok(None)
 }
 
-pub(crate) fn handle_ssh_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     match app.ssh_add_mode {
         SshAddMode::None => match code {
             KeyCode::Esc => {
@@ -259,17 +259,17 @@ pub(crate) fn handle_ssh_key(app: &mut App, code: KeyCode) -> Result<Option<Send
     Ok(None)
 }
 
-pub(crate) fn handle_skill_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_skill_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
     match app.skill_add_mode {
         SkillAddMode::None => match code {
             KeyCode::Esc => {
-                if !app.skill_search.is_empty() {
-                    app.skill_search.clear();
-                    app.skill_selected = 0;
-                    app.skill_scroll = 0;
-                } else {
+                if app.skill_search.is_empty() {
                     app.mode = crate::tui::state::AppMode::Chat;
                     app.skill_search.clear();
+                    app.skill_scroll = 0;
+                } else {
+                    app.skill_search.clear();
+                    app.skill_selected = 0;
                     app.skill_scroll = 0;
                 }
             }

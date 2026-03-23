@@ -17,6 +17,7 @@ pub enum ToolEndKind {
 }
 
 /// Parse tool-call start payload into a minimal start event.
+#[must_use] 
 pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
     if name == "terminal" {
         let args = serde_json::from_str::<TerminalArgs>(arguments)
@@ -33,7 +34,7 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
     }
 }
 
-fn display_mode_from_execution_mode(mode: TerminalExecutionMode) -> TerminalMode {
+const fn display_mode_from_execution_mode(mode: TerminalExecutionMode) -> TerminalMode {
     match mode {
         TerminalExecutionMode::Default | TerminalExecutionMode::Ssh => TerminalMode::Network,
         TerminalExecutionMode::Sandboxed => TerminalMode::Sandboxed,
@@ -42,6 +43,7 @@ fn display_mode_from_execution_mode(mode: TerminalExecutionMode) -> TerminalMode
 }
 
 /// Parse tool-call completion payload into a minimal end event.
+#[must_use] 
 pub fn parse_tool_end(result: &Result<String, String>) -> ToolEndKind {
     match result {
         Ok(output) => {
@@ -66,7 +68,7 @@ fn extract_output_text(result: &TerminalResult) -> String {
             if let Some(Content::Text { text, .. }) = content {
                 text.clone()
             } else {
-                format!("[stored: {}]", url)
+                format!("[stored: {url}]")
             }
         }
     }

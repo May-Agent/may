@@ -64,22 +64,26 @@ impl TerminalImageSupport {
     }
 
     /// Get the detected protocol type.
-    pub fn protocol(&self) -> ProtocolType {
+    #[must_use] 
+    pub const fn protocol(&self) -> ProtocolType {
         self.protocol
     }
 
     /// Get a reference to the picker.
-    pub fn picker(&self) -> &Picker {
+    #[must_use] 
+    pub const fn picker(&self) -> &Picker {
         &self.picker
     }
 
-    /// Create an ImageState from image data.
+    /// Create an `ImageState` from image data.
+    #[must_use] 
     pub fn create_image_state(&self, image: DynamicImage) -> ImageState {
         let protocol = self.picker.new_resize_protocol(image);
         ImageState { protocol }
     }
 
-    /// Create an ImageState from raw bytes.
+    /// Create an `ImageState` from raw bytes.
+    #[must_use] 
     pub fn create_image_state_from_bytes(&self, data: &[u8]) -> Option<ImageState> {
         let image = image::load_from_memory(data).ok()?;
         Some(self.create_image_state(image))
@@ -87,7 +91,7 @@ impl TerminalImageSupport {
 }
 
 /// Image state for rendering.
-/// Created via TerminalImageSupport.
+/// Created via `TerminalImageSupport`.
 pub struct ImageState {
     /// The protocol state for rendering
     pub protocol: StatefulProtocol,
@@ -206,6 +210,7 @@ async fn fetch_image_http(url: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Render image placeholder when actual rendering is not possible.
+#[must_use] 
 pub fn render_placeholder(alt: &str, url: &str) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
@@ -216,7 +221,7 @@ pub fn render_placeholder(alt: &str, url: &str) -> Vec<Line<'static>> {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" <{}>", url), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" <{url}>"), Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(""),
     ]

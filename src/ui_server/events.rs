@@ -48,7 +48,7 @@ pub(super) async fn stream_events(
         .map(ToOwned::to_owned);
 
     let (sender, sse) = Sse::channel();
-    let state_cloned = state.clone();
+    let state_cloned = state;
 
     tokio::spawn(async move {
         let mut last_config_sig = String::new();
@@ -135,7 +135,7 @@ pub(super) async fn stream_events(
 
         loop {
             tokio::select! {
-                _ = state_cloned.ui_events_notify.notified() => {
+                () = state_cloned.ui_events_notify.notified() => {
                     if !emit_config_if_changed(
                         &state_cloned,
                         &sender,

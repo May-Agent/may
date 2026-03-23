@@ -99,8 +99,7 @@ async fn collect_session_artifacts(
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
+                    .map_or(0, |d| d.as_nanos());
 
                 entries.push(ArtifactEntry {
                     path: rel_str,
@@ -178,8 +177,7 @@ fn metadata_modified_nanos(metadata: &std::fs::Metadata) -> u128 {
         .modified()
         .ok()
         .and_then(|timestamp| timestamp.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_nanos())
 }
 
 fn etag_value(metadata: &std::fs::Metadata) -> String {
@@ -253,7 +251,7 @@ fn is_slidev_markdown_path(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase())
+            .map(str::to_ascii_lowercase)
             .as_deref(),
         Some("md" | "markdown")
     )
@@ -281,8 +279,7 @@ fn slidev_cache_key(path: &Path, meta: &std::fs::Metadata) -> String {
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     format!("{base}-{}-{modified}", meta.len())
 }
 
@@ -378,13 +375,13 @@ fn extract_missing_slidev_icon(detail: &str) -> Option<MissingSlidevIcon> {
     if !is_valid_iconify_collection(collection) {
         return None;
     }
-    if !is_valid_icon_name(name) {
-        None
-    } else {
+    if is_valid_icon_name(name) {
         Some(MissingSlidevIcon {
             collection: collection.to_string(),
             name: name.to_string(),
         })
+    } else {
+        None
     }
 }
 

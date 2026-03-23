@@ -19,7 +19,7 @@ impl MaySshAuthorizer {
         })
     }
 
-    /// Ask a yes/no permission question via the AskUser UI.
+    /// Ask a yes/no permission question via the `AskUser` UI.
     async fn ask_permission(&self, question: String, allow_label: &str) -> Result<bool, String> {
         let args = AskUserArgs {
             question: Some(question),
@@ -48,7 +48,7 @@ impl SshSessionAuthorizer for MaySshAuthorizer {
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
         let target = target.to_string();
         Box::pin(async move {
-            self.ask_permission(format!("Allow SSH connection to {}?", target), "Allow")
+            self.ask_permission(format!("Allow SSH connection to {target}?"), "Allow")
                 .await
         })
     }
@@ -62,7 +62,7 @@ impl SshSessionAuthorizer for MaySshAuthorizer {
         let details = details.to_string();
         Box::pin(async move {
             self.ask_permission(
-                format!("{} Install leash on {}?", details, target),
+                format!("{details} Install leash on {target}?"),
                 "Install",
             )
             .await

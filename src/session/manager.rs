@@ -38,6 +38,7 @@ pub struct SessionId(String);
 
 impl SessionId {
     /// Create a new random session ID using four words.
+    #[must_use] 
     pub fn new() -> Self {
         let petnames = Petnames::default();
         let id = petnames
@@ -52,6 +53,7 @@ impl SessionId {
     }
 
     /// Get the ID as a string.
+    #[must_use] 
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -84,7 +86,7 @@ pub struct Session {
     /// Profile this session belongs to.
     pub profile_id: Option<String>,
     pub history: ChatHistory,
-    /// Directory where TerminalTool creates its working directory.
+    /// Directory where `TerminalTool` creates its working directory.
     pub sandbox_dir: PathBuf,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -114,6 +116,7 @@ pub struct SessionSummary {
 
 impl SessionSummary {
     /// Convert a DB session model to a summary.
+    #[must_use] 
     pub fn from_db_model(s: crate::db::entity::sessions::Model) -> Self {
         let created_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &s.created_at).ok();
         let updated_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &s.updated_at).ok();
@@ -285,7 +288,7 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    /// Create a new SessionManager, initializing ~/.may/ structure if needed.
+    /// Create a new `SessionManager`, initializing ~/.may/ structure if needed.
     pub async fn new() -> Result<Self, SessionError> {
         let may_dir = MayConfig::may_dir().map_err(|_| SessionError::NoHomeDir)?;
         let (store, db, default_profile_id) = initialize_session_persistence(&may_dir).await?;
@@ -301,12 +304,14 @@ impl SessionManager {
     }
 
     /// Get the May directory path.
+    #[must_use] 
     pub fn may_dir(&self) -> &Path {
         &self.may_dir
     }
 
     /// Get the database handle.
-    pub fn db(&self) -> &ChatDb {
+    #[must_use] 
+    pub const fn db(&self) -> &ChatDb {
         &self.db
     }
 
@@ -469,8 +474,7 @@ impl SessionManager {
         let profile = self.db.get_profile(profile_id).await?;
         let layout = if profile
             .as_ref()
-            .map(|p| p.environment.as_str() == "container")
-            .unwrap_or(false)
+            .is_some_and(|p| p.environment.as_str() == "container")
         {
             SandboxResourceLayout::ContainerMountPoints
         } else {
@@ -606,21 +610,24 @@ impl SessionManager {
     }
 
     /// Get current session.
-    pub fn current(&self) -> Option<&Session> {
+    #[must_use] 
+    pub const fn current(&self) -> Option<&Session> {
         self.current.as_ref()
     }
 
     /// Get current session mutably.
-    pub fn current_mut(&mut self) -> Option<&mut Session> {
+    pub const fn current_mut(&mut self) -> Option<&mut Session> {
         self.current.as_mut()
     }
 
     /// Get the store for direct access.
-    pub fn store(&self) -> &SessionStore {
+    #[must_use] 
+    pub const fn store(&self) -> &SessionStore {
         &self.store
     }
 
     /// Get the current profile ID.
+    #[must_use] 
     pub fn current_profile_id(&self) -> Option<&str> {
         self.current_profile_id.as_deref()
     }

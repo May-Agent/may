@@ -21,7 +21,7 @@ pub struct StreamingMarkdown {
     rendered: Vec<Line<'static>>,
     /// Images found during parsing (alt, url)
     images: Vec<(String, String)>,
-    /// Image positions: (url, line_index) for rendering at correct scroll position
+    /// Image positions: (url, `line_index`) for rendering at correct scroll position
     image_positions: Vec<(String, usize)>,
     /// Current incomplete line (not yet parsed)
     pending_line: String,
@@ -40,6 +40,7 @@ impl Default for StreamingMarkdown {
 impl StreamingMarkdown {
     /// Create a new streaming markdown renderer.
     /// Uses default (no image support). For image support, use `with_image_support()`.
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             parser: Parser::new(),
@@ -55,6 +56,7 @@ impl StreamingMarkdown {
     }
 
     /// Create a new streaming markdown renderer with explicit image support flag.
+    #[must_use] 
     pub fn with_image_support(images_supported: bool) -> Self {
         Self {
             parser: Parser::new(),
@@ -70,7 +72,7 @@ impl StreamingMarkdown {
     }
 
     /// Set whether images are supported (can be used to update after creation).
-    pub fn set_images_supported(&mut self, supported: bool) {
+    pub const fn set_images_supported(&mut self, supported: bool) {
         self.images_supported = supported;
     }
 
@@ -113,6 +115,7 @@ impl StreamingMarkdown {
     }
 
     /// Get the current raw content.
+    #[must_use] 
     pub fn content(&self) -> &str {
         &self.content
     }
@@ -134,12 +137,14 @@ impl StreamingMarkdown {
     }
 
     /// Get images referenced in the content.
+    #[must_use] 
     pub fn images(&self) -> Vec<(String, String)> {
         self.images.clone()
     }
 
-    /// Get image positions: (url, line_index) for each image.
-    /// The line_index is the position in the rendered output where the image should be displayed.
+    /// Get image positions: (url, `line_index`) for each image.
+    /// The `line_index` is the position in the rendered output where the image should be displayed.
+    #[must_use] 
     pub fn image_positions(&self) -> &[(String, usize)] {
         &self.image_positions
     }
@@ -157,7 +162,7 @@ impl StreamingMarkdown {
         }
     }
 
-    fn end_inline_line(&mut self) {
+    const fn end_inline_line(&mut self) {
         self.inline_open = false;
     }
 
@@ -205,7 +210,7 @@ impl StreamingMarkdown {
                         .add_modifier(Modifier::UNDERLINED),
                 ));
                 self.push_inline_span(Span::styled(
-                    format!(" ({})", url),
+                    format!(" ({url})"),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -300,11 +305,11 @@ impl StreamingMarkdown {
                     | streamdown_parser::ListBullet::Asterisk
                     | streamdown_parser::ListBullet::Plus
                     | streamdown_parser::ListBullet::PlusExpand => "• ".to_string(),
-                    streamdown_parser::ListBullet::Ordered(n) => format!("{}. ", n),
+                    streamdown_parser::ListBullet::Ordered(n) => format!("{n}. "),
                 };
                 self.rendered.push(Line::from(vec![
                     Span::styled(
-                        format!("{}{}", indent_str, bullet_str),
+                        format!("{indent_str}{bullet_str}"),
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::raw(content),
@@ -347,7 +352,7 @@ impl StreamingMarkdown {
                     .into_iter()
                     .map(|c| {
                         Span::styled(
-                            format!("│ {} ", c),
+                            format!("│ {c} "),
                             Style::default().add_modifier(Modifier::BOLD),
                         )
                     })
@@ -365,7 +370,7 @@ impl StreamingMarkdown {
                 self.end_inline_line();
                 let spans: Vec<Span> = cells
                     .into_iter()
-                    .map(|c| Span::raw(format!("│ {} ", c)))
+                    .map(|c| Span::raw(format!("│ {c} ")))
                     .collect();
                 self.rendered.push(Line::from(spans));
             }
@@ -387,7 +392,7 @@ impl StreamingMarkdown {
     }
 
     /// Render an image placeholder.
-    /// When terminal supports images: reserves IMAGE_HEIGHT lines for the actual image.
+    /// When terminal supports images: reserves `IMAGE_HEIGHT` lines for the actual image.
     /// When no image support: shows as a styled link format.
     fn render_image_placeholder(&mut self, alt: &str, url: &str) {
         if self.images_supported {
@@ -417,7 +422,7 @@ impl StreamingMarkdown {
                         .fg(Color::Blue)
                         .add_modifier(Modifier::UNDERLINED),
                 ),
-                Span::styled(format!(" ({})", url), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" ({url})"), Style::default().fg(Color::DarkGray)),
             ]));
             self.rendered.push(Line::from(""));
         }
@@ -448,7 +453,7 @@ fn render_inline_element(elem: streamdown_parser::InlineElement) -> Span<'static
             Span::styled(t, Style::default().add_modifier(Modifier::UNDERLINED))
         }
         streamdown_parser::InlineElement::Link { text, url } => Span::styled(
-            format!("{} ({})", text, url),
+            format!("{text} ({url})"),
             Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::UNDERLINED),
@@ -457,19 +462,20 @@ fn render_inline_element(elem: streamdown_parser::InlineElement) -> Span<'static
             // Inline images always render as link-style placeholder
             // (actual images are rendered as overlays, not inline)
             Span::styled(
-                format!("🖼 {} ({})", alt, url),
+                format!("🖼 {alt} ({url})"),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::UNDERLINED),
             )
         }
         streamdown_parser::InlineElement::Footnote(f) => {
-            Span::styled(format!("[^{}]", f), Style::default().fg(Color::DarkGray))
+            Span::styled(format!("[^{f}]"), Style::default().fg(Color::DarkGray))
         }
     }
 }
 
 /// Extract images from markdown content.
+#[must_use] 
 pub fn extract_images(content: &str) -> Vec<(String, String)> {
     let mut parser = Parser::new();
     let mut images = Vec::new();

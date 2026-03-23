@@ -12,7 +12,7 @@ use crate::xml_fragment::XmlFragment;
 /// Machine-readable error codes sent to the frontend, eliminating string-matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ApiErrorCode {
+pub enum ApiErrorCode {
     BadRequest,
     InternalError,
     NotFound,
@@ -24,7 +24,7 @@ pub(crate) enum ApiErrorCode {
 
 /// Structured error body with a machine-readable `code` and human-readable `error` message.
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct ApiErrorBody {
+pub struct ApiErrorBody {
     pub(crate) code: ApiErrorCode,
     pub(crate) error: String,
 }
@@ -33,25 +33,25 @@ pub(crate) struct ApiErrorBody {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SseStartEvent<'a> {
+pub struct SseStartEvent<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) assistant_id: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct SseChunkEvent<'a> {
+pub struct SseChunkEvent<'a> {
     pub(crate) chunk: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct SseToolStartEvent<'a> {
+pub struct SseToolStartEvent<'a> {
     pub(crate) id: &'a str,
     pub(crate) name: &'a str,
     pub(crate) arguments: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct SseToolEndEvent<'a> {
+pub struct SseToolEndEvent<'a> {
     pub(crate) id: &'a str,
     pub(crate) name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,32 +60,32 @@ pub(crate) struct SseToolEndEvent<'a> {
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct SseErrorEvent<'a> {
+pub struct SseErrorEvent<'a> {
     pub(crate) message: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SseDoneEvent {
+pub struct SseDoneEvent {
     pub(crate) session_id: String,
     pub(crate) assistant: ApiMessage,
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct SseHeartbeat {
+pub struct SseHeartbeat {
     pub(crate) ok: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SseTodoUpdateEvent {
+pub struct SseTodoUpdateEvent {
     pub(crate) items: Vec<SseTodoItem>,
     pub(crate) total: usize,
     pub(crate) completed: usize,
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct SseTodoItem {
+pub struct SseTodoItem {
     pub(crate) text: String,
     pub(crate) checked: bool,
 }
@@ -111,7 +111,7 @@ impl From<&crate::todo_parser::TodoChecklist> for SseTodoUpdateEvent {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "stage")]
-pub(crate) enum ToolEventRecord {
+pub enum ToolEventRecord {
     #[serde(rename = "start")]
     Start {
         id: String,
@@ -130,7 +130,7 @@ pub(crate) enum ToolEventRecord {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ConfigEventPayload {
+pub struct ConfigEventPayload {
     pub(crate) ui_font: String,
     pub(crate) ui_theme: String,
     pub(crate) ssh_servers: Vec<SshServerConfig>,
@@ -141,33 +141,33 @@ pub(crate) struct ConfigEventPayload {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct BrowserTakeoverResponse {
+pub struct BrowserTakeoverResponse {
     pub(crate) ok: bool,
     pub(crate) session_id: String,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum TaskTriggerStatus {
+pub enum TaskTriggerStatus {
     Triggered,
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct TaskTriggerResponse {
+pub struct TaskTriggerResponse {
     pub(crate) ok: bool,
     pub(crate) status: TaskTriggerStatus,
     pub(crate) triggered: usize,
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct NotificationSentResponse {
+pub struct NotificationSentResponse {
     pub(crate) ok: bool,
     pub(crate) sent: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum NotificationMailboxStatus {
+pub enum NotificationMailboxStatus {
     Pending,
     Delivered,
     Failed,
@@ -175,7 +175,7 @@ pub(crate) enum NotificationMailboxStatus {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct NotificationMailboxEntryResponse {
+pub struct NotificationMailboxEntryResponse {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) body: String,
@@ -214,13 +214,13 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct NotificationMailboxResponse {
+pub struct NotificationMailboxResponse {
     pub(crate) items: Vec<NotificationMailboxEntryResponse>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct NotificationCallbackResponse {
+pub struct NotificationCallbackResponse {
     pub(crate) notification_id: String,
     pub(crate) session_id: Option<String>,
     pub(crate) profile_id: Option<String>,
@@ -232,7 +232,7 @@ pub(crate) struct NotificationCallbackResponse {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct NetworkAccessLogEntryResponse {
+pub struct NetworkAccessLogEntryResponse {
     pub(crate) id: i32,
     pub(crate) session_id: Option<String>,
     pub(crate) profile_id: Option<String>,
@@ -270,13 +270,13 @@ impl From<crate::db::entity::network_access_logs::Model> for NetworkAccessLogEnt
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct NetworkAccessLogsResponse {
+pub struct NetworkAccessLogsResponse {
     pub(crate) items: Vec<NetworkAccessLogEntryResponse>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RemoteAccessState {
+pub enum RemoteAccessState {
     Disabled,
     Starting,
     Running,
@@ -285,7 +285,7 @@ pub(crate) enum RemoteAccessState {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RemoteAccessStatusResponse {
+pub struct RemoteAccessStatusResponse {
     pub(crate) state: RemoteAccessState,
     pub(crate) enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,13 +298,13 @@ pub(crate) struct RemoteAccessStatusResponse {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RemoteAccessEventPayload {
+pub struct RemoteAccessEventPayload {
     pub(crate) status: RemoteAccessStatusResponse,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionTasksPayload {
+pub struct SessionTasksPayload {
     pub(crate) content: String,
     #[serde(default)]
     pub(crate) plan_state: SessionPlanState,
@@ -312,15 +312,15 @@ pub(crate) struct SessionTasksPayload {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ApiHealth {
+pub struct ApiHealth {
     pub(crate) ok: bool,
 }
 
-pub(crate) const API_OK: ApiHealth = ApiHealth { ok: true };
+pub const API_OK: ApiHealth = ApiHealth { ok: true };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RequestStats {
+pub struct RequestStats {
     #[serde(default)]
     pub(crate) provider_id: Option<String>,
     #[serde(default)]
@@ -341,7 +341,7 @@ pub(crate) struct RequestStats {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RequestLogEntry {
+pub struct RequestLogEntry {
     pub(crate) session_id: String,
     pub(crate) timestamp: String,
     pub(crate) model: String,
@@ -391,7 +391,7 @@ impl From<crate::db::entity::request_logs::Model> for RequestLogEntry {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RequestLogCacheSummary {
+pub struct RequestLogCacheSummary {
     pub(crate) assistant_message_count: u64,
     pub(crate) cache_hit_message_count: u64,
     pub(crate) prompt_tokens_total: u64,
@@ -449,7 +449,7 @@ impl RequestLogEntry {
         }
     }
 
-    pub(crate) fn success(mut self, elapsed_ms: u64) -> Self {
+    pub(crate) const fn success(mut self, elapsed_ms: u64) -> Self {
         self.ok = true;
         self.elapsed_ms = elapsed_ms;
         self
@@ -465,20 +465,20 @@ impl RequestLogEntry {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RequestLogsResponse {
+pub struct RequestLogsResponse {
     pub(crate) logs: Vec<RequestLogEntry>,
     pub(crate) cache_summary: RequestLogCacheSummary,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct MemoryPayload {
+pub struct MemoryPayload {
     pub(crate) content: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ApiAttachment {
+pub struct ApiAttachment {
     pub(crate) id: String,
     pub(crate) name: String,
     #[serde(rename = "type")]
@@ -494,11 +494,11 @@ pub(crate) struct ApiAttachment {
 ///
 /// Internally May treats this as terminal execution tracking; the protocol
 /// still emits the historical tool name `terminal` for compatibility.
-pub(crate) const TERMINAL_TOOL_NAME: &str = "terminal";
+pub const TERMINAL_TOOL_NAME: &str = "terminal";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum TerminalExecutionStatus {
+pub enum TerminalExecutionStatus {
     Running,
     Done,
     Failed,
@@ -506,7 +506,7 @@ pub(crate) enum TerminalExecutionStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum TerminalCommandMode {
+pub enum TerminalCommandMode {
     Default,
     Sandboxed,
     Unsafe,
@@ -515,7 +515,7 @@ pub(crate) enum TerminalCommandMode {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ApiTerminalExecution {
+pub struct ApiTerminalExecution {
     pub(crate) id: String,
     pub(crate) input: String,
     #[serde(default)]
@@ -526,7 +526,7 @@ pub(crate) struct ApiTerminalExecution {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct TerminalStateSnapshot {
+pub struct TerminalStateSnapshot {
     #[serde(default)]
     pub(crate) executions: Vec<ApiTerminalExecution>,
     #[serde(default)]
@@ -535,7 +535,7 @@ pub(crate) struct TerminalStateSnapshot {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ApiMessage {
+pub struct ApiMessage {
     pub(crate) id: String,
     pub(crate) role: String,
     pub(crate) content: String,
@@ -558,7 +558,7 @@ pub(crate) struct ApiMessage {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ApiSession {
+pub struct ApiSession {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) last_modified: String,
@@ -579,9 +579,7 @@ impl ApiSession {
         messages: Vec<ApiMessage>,
     ) -> Self {
         let last_modified = summary
-            .updated_at
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| jiff::Timestamp::now().to_string());
+            .updated_at.map_or_else(|| jiff::Timestamp::now().to_string(), |t| t.to_string());
         let preview = if summary.content_preview.is_empty() {
             "New conversation started".to_string()
         } else {
@@ -618,7 +616,7 @@ impl ApiSession {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CreateSessionRequest {
+pub struct CreateSessionRequest {
     #[serde(default)]
     pub(crate) model: Option<String>,
     #[serde(default)]
@@ -627,7 +625,7 @@ pub(crate) struct CreateSessionRequest {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UpdateSessionRequest {
+pub struct UpdateSessionRequest {
     #[serde(default)]
     pub(crate) title: Option<String>,
     #[serde(default)]
@@ -636,7 +634,7 @@ pub(crate) struct UpdateSessionRequest {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ChatRequest {
+pub struct ChatRequest {
     pub(crate) session_id: String,
     pub(crate) content: String,
     #[serde(default)]
@@ -649,14 +647,14 @@ pub(crate) struct ChatRequest {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ChatResponse {
+pub struct ChatResponse {
     pub(crate) session_id: String,
     pub(crate) assistant: ApiMessage,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RemovePendingMessageRequest {
+pub struct RemovePendingMessageRequest {
     pub(crate) kind: PendingMessageKind,
     #[serde(default)]
     pub(crate) index: Option<usize>,
@@ -664,14 +662,14 @@ pub(crate) struct RemovePendingMessageRequest {
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PendingMessageKind {
+pub enum PendingMessageKind {
     PendingImmediate,
     Queued,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ContextDebugMessage {
+pub struct ContextDebugMessage {
     pub(crate) role: String,
     pub(crate) content: String,
     #[serde(default)]
@@ -684,7 +682,7 @@ pub(crate) struct ContextDebugMessage {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionContextDebugResponse {
+pub struct SessionContextDebugResponse {
     pub(crate) session_id: String,
     pub(crate) timestamp: String,
     pub(crate) model: String,
@@ -699,7 +697,7 @@ pub(crate) struct SessionContextDebugResponse {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionContextWindowSnapshotResponse {
+pub struct SessionContextWindowSnapshotResponse {
     pub(crate) phase: aither_agent::ContextWindowPhase,
     pub(crate) metrics: SessionContextWindowMetricsResponse,
     pub(crate) assembled_messages: Vec<ContextDebugMessage>,
@@ -707,7 +705,7 @@ pub(crate) struct SessionContextWindowSnapshotResponse {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionContextWindowMetricsResponse {
+pub struct SessionContextWindowMetricsResponse {
     pub(crate) usage_fraction: f32,
     pub(crate) selected_model_context_window: Option<u32>,
     pub(crate) fast_model_context_window: Option<u32>,
@@ -737,7 +735,7 @@ impl From<aither_agent::ContextWindowMetrics> for SessionContextWindowMetricsRes
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ModelInfoItem {
+pub struct ModelInfoItem {
     pub(crate) id: String,
     pub(crate) nickname: String,
     pub(crate) context_window: Option<u32>,
@@ -746,7 +744,7 @@ pub(crate) struct ModelInfoItem {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ModelsResponse {
+pub struct ModelsResponse {
     pub(crate) models: Vec<String>,
     #[serde(default)]
     pub(crate) details: Vec<ModelInfoItem>,
@@ -754,7 +752,7 @@ pub(crate) struct ModelsResponse {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ProviderModelsItem {
+pub struct ProviderModelsItem {
     pub(crate) provider_id: String,
     pub(crate) models: Vec<String>,
     #[serde(default)]
@@ -763,13 +761,13 @@ pub(crate) struct ProviderModelsItem {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ProviderModelsResponse {
+pub struct ProviderModelsResponse {
     pub(crate) providers: Vec<ProviderModelsItem>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PermissionPollItem {
+pub struct PermissionPollItem {
     pub(crate) id: String,
     #[serde(flatten)]
     pub(crate) request: crate::agent::PermissionRequest,
@@ -777,7 +775,7 @@ pub(crate) struct PermissionPollItem {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WorkspacePollItem {
+pub struct WorkspacePollItem {
     pub(crate) id: String,
     pub(crate) path: String,
     pub(crate) reason: String,
@@ -787,13 +785,13 @@ pub(crate) struct WorkspacePollItem {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct BrowserInteractionResponse {
+pub struct BrowserInteractionResponse {
     pub(crate) takeover_active: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct TerminalInteractionResponse {
+pub struct TerminalInteractionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -806,7 +804,7 @@ pub(crate) struct TerminalInteractionResponse {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionInteractionResponse {
+pub struct SessionInteractionResponse {
     pub(crate) browser: BrowserInteractionResponse,
     #[serde(default)]
     pub(crate) terminal: TerminalInteractionResponse,
@@ -854,21 +852,21 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PermissionRespondRequest {
+pub struct PermissionRespondRequest {
     pub(crate) id: String,
     pub(crate) approved: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WorkspaceRespondRequest {
+pub struct WorkspaceRespondRequest {
     pub(crate) id: String,
     pub(crate) approved: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UiConfigResponse {
+pub struct UiConfigResponse {
     pub(crate) ssh_servers: Vec<SshServerConfig>,
     pub(crate) max_iterations: usize,
     pub(crate) ui_font: String,
@@ -877,7 +875,7 @@ pub(crate) struct UiConfigResponse {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionRuntimeResponse {
+pub struct SessionRuntimeResponse {
     pub(crate) state: SessionRuntimeState,
     #[serde(default)]
     pub(crate) plan_state: SessionPlanState,
@@ -899,33 +897,33 @@ pub(crate) struct SessionRuntimeResponse {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionRuntimeEventPayload {
+pub struct SessionRuntimeEventPayload {
     pub(crate) session_id: String,
     pub(crate) runtime: SessionRuntimeResponse,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionRuntimeSnapshotItem {
+pub struct SessionRuntimeSnapshotItem {
     pub(crate) session_id: String,
     pub(crate) runtime: SessionRuntimeResponse,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionRuntimesEventPayload {
+pub struct SessionRuntimesEventPayload {
     pub(crate) sessions: Vec<SessionRuntimeSnapshotItem>,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ProfileSessionsEventPayload {
+pub struct ProfileSessionsEventPayload {
     pub(crate) profile_sessions: crate::profile::ProfileSessions,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ArtifactEntry {
+pub struct ArtifactEntry {
     pub(crate) path: String,
     pub(crate) name: String,
     pub(crate) size: u64,
@@ -935,31 +933,31 @@ pub(crate) struct ArtifactEntry {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SessionArtifactsResponse {
+pub struct SessionArtifactsResponse {
     pub(crate) artifacts: Vec<ArtifactEntry>,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ArtifactStreamPayload {
+pub struct ArtifactStreamPayload {
     pub(crate) count: usize,
     pub(crate) signature: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ArtifactPreviewQuery {
+pub struct ArtifactPreviewQuery {
     pub(crate) path: String,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SlidevPreviewResponse {
+pub struct SlidevPreviewResponse {
     pub(crate) preview_url: String,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct IfNoneMatchHeader(pub(crate) Option<String>);
+pub struct IfNoneMatchHeader(pub(crate) Option<String>);
 
 impl skyzen::extract::Extractor for IfNoneMatchHeader {
     type Error = std::convert::Infallible;
@@ -976,7 +974,7 @@ impl skyzen::extract::Extractor for IfNoneMatchHeader {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UiProviderConfig {
+pub struct UiProviderConfig {
     pub(crate) id: String,
     pub(crate) provider_type: ProviderType,
     pub(crate) api_key: Option<String>,
@@ -987,7 +985,7 @@ pub(crate) struct UiProviderConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UiModelsConfig {
+pub struct UiModelsConfig {
     pub(crate) advanced: Vec<String>,
     pub(crate) balanced: Vec<String>,
     pub(crate) fast: Vec<String>,
@@ -997,7 +995,7 @@ pub(crate) struct UiModelsConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UiPreferencesConfig {
+pub struct UiPreferencesConfig {
     pub(crate) load_balance_strategy: LoadBalanceStrategy,
     pub(crate) warn_on_model_change: bool,
     pub(crate) show_token_usage: bool,
@@ -1008,14 +1006,14 @@ pub(crate) struct UiPreferencesConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UiAppearanceConfig {
+pub struct UiAppearanceConfig {
     pub(crate) font: String,
     pub(crate) theme: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UiPlaywrightConfig {
+pub struct UiPlaywrightConfig {
     pub(crate) enabled: bool,
     pub(crate) browser: PlaywrightBrowser,
     pub(crate) port: u16,
@@ -1025,7 +1023,7 @@ pub(crate) struct UiPlaywrightConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UiRemoteAccessConfig {
+pub struct UiRemoteAccessConfig {
     pub(crate) enabled: bool,
     pub(crate) cloudflared_binary: String,
     pub(crate) tunnel_token: Option<String>,
@@ -1047,7 +1045,7 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UiFullConfig {
+pub struct UiFullConfig {
     pub(crate) providers: Vec<UiProviderConfig>,
     pub(crate) models: UiModelsConfig,
     pub(crate) preferences: UiPreferencesConfig,
@@ -1060,14 +1058,14 @@ pub(crate) struct UiFullConfig {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SshServerRequest {
+pub struct SshServerRequest {
     pub(crate) name: String,
     pub(crate) target: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum McpCreateRequest {
+pub enum McpCreateRequest {
     Process {
         name: String,
         command: String,
@@ -1084,25 +1082,25 @@ pub(crate) enum McpCreateRequest {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SkillInstallRequest {
+pub struct SkillInstallRequest {
     pub(crate) repo: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CopilotPollRequest {
+pub struct CopilotPollRequest {
     pub(crate) device_code: String,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CopilotStatusResponse {
+pub struct CopilotStatusResponse {
     pub(crate) authenticated: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CopilotStartResponse {
+pub struct CopilotStartResponse {
     pub(crate) device_code: String,
     pub(crate) user_code: String,
     pub(crate) verification_uri: String,
@@ -1111,14 +1109,14 @@ pub(crate) struct CopilotStartResponse {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CopilotPollResponse {
+pub struct CopilotPollResponse {
     pub(crate) status: CopilotPollStatus,
     pub(crate) message: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CopilotPollStatus {
+pub enum CopilotPollStatus {
     Pending,
     Success,
     Expired,
@@ -1128,7 +1126,7 @@ pub(crate) enum CopilotPollStatus {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SkillInfoDto {
+pub struct SkillInfoDto {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) dir_name: String,
@@ -1137,13 +1135,13 @@ pub(crate) struct SkillInfoDto {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LastModelRequest {
+pub struct LastModelRequest {
     pub(crate) model: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct MemorySaveRequest {
+pub struct MemorySaveRequest {
     pub(crate) content: String,
     #[serde(default)]
     pub(crate) explicit_user_request: bool,
@@ -1151,12 +1149,12 @@ pub(crate) struct MemorySaveRequest {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LocalUrlMapRequest {
+pub struct LocalUrlMapRequest {
     pub(crate) url: String,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LocalUrlMapResponse {
+pub struct LocalUrlMapResponse {
     pub(crate) mapped_url: String,
 }

@@ -105,7 +105,7 @@ impl TaskRunStatus {
 }
 
 impl TaskCatalog {
-    fn from_tasks(tasks: Vec<scheduled_tasks::Model>) -> Self {
+    const fn from_tasks(tasks: Vec<scheduled_tasks::Model>) -> Self {
         Self { tasks }
     }
 }
@@ -263,7 +263,7 @@ fn task_notification_callback_payload(
     )
 }
 
-fn task_db_error(message: String) -> crate::db::ChatDbError {
+const fn task_db_error(message: String) -> crate::db::ChatDbError {
     crate::db::ChatDbError::Db(DbErr::Custom(message))
 }
 
@@ -385,10 +385,10 @@ impl PermissionHandler for SchedulerPermissionHandler {
         let reason = if !self.allow_network {
             Some("needs_network_disabled")
         } else if let Some(policy) = &self.network_policy {
-            if !policy.allows_domain(domain) {
-                Some(policy.mode().as_str())
-            } else {
+            if policy.allows_domain(domain) {
                 None
+            } else {
+                Some(policy.mode().as_str())
             }
         } else {
             None
@@ -426,17 +426,20 @@ impl TaskRuntime {
     }
 
     /// Attach a notification manager for sending push notifications on task completion.
+    #[must_use] 
     pub fn with_notifier(mut self, notifier: Arc<NotificationService>) -> Self {
         self.notifier = Some(notifier);
         self
     }
 
     /// Attach container manager for container-profile task execution.
+    #[must_use] 
     pub fn with_container_manager(mut self, container_manager: Arc<ContainerManager>) -> Self {
         self.container_manager = Some(container_manager);
         self
     }
 
+    #[must_use] 
     pub fn with_ssh_servers(self, ssh_servers: Vec<SshServerConfig>) -> Self {
         self.set_ssh_servers(ssh_servers);
         self
@@ -1001,11 +1004,10 @@ impl TaskRuntime {
 
     async fn cleanup_materialized_execution(&self, cleanup_paths: Vec<PathBuf>) {
         for path in cleanup_paths {
-            if let Err(error) = tokio::fs::remove_file(&path).await {
-                if error.kind() != std::io::ErrorKind::NotFound {
+            if let Err(error) = tokio::fs::remove_file(&path).await
+                && error.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(path = %path.display(), error = %error, "failed to remove materialized task file");
                 }
-            }
         }
     }
 
@@ -1329,7 +1331,7 @@ impl TaskRuntime {
     }
 
     #[must_use]
-    fn invocation_kind(invocation: &TaskInvocation) -> &'static str {
+    const fn invocation_kind(invocation: &TaskInvocation) -> &'static str {
         match invocation {
             TaskInvocation::Time { .. } => "time",
             TaskInvocation::Manual => "manual",
@@ -1458,11 +1460,13 @@ const fn local_task_execution_mode(needs_network: bool) -> TerminalExecutionMode
 }
 
 impl TaskScheduler {
-    pub fn new(runtime: Arc<TaskRuntime>) -> Self {
+    #[must_use] 
+    pub const fn new(runtime: Arc<TaskRuntime>) -> Self {
         Self { runtime }
     }
 
     /// Spawn the scheduler as a background task.
+    #[must_use] 
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1551,7 +1555,7 @@ fn build_validation_command(script: &TaskScript) -> String {
     .expect("task validation template must render")
 }
 
-/// Convert a jiff::Timestamp to chrono::DateTime<chrono::Utc> for cron compatibility.
+/// Convert a `jiff::Timestamp` to `chrono::DateTime`<chrono::Utc> for cron compatibility.
 fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp(ts.as_second(), ts.subsec_nanosecond() as u32)
         .expect("jiff timestamp must fit within chrono DateTime range")

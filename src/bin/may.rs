@@ -3,7 +3,7 @@
 //! Architecture:
 //! - Main thread: Handles UI rendering and terminal events only
 //! - Background tasks: Run agent processing, send events via channels
-//! - Communication: All through async_channel (runtime-agnostic)
+//! - Communication: All through `async_channel` (runtime-agnostic)
 
 use std::io;
 use std::io::Write;
@@ -67,7 +67,7 @@ fn parse_cli_mode_from_env() -> CliMode {
                 .skip(1)
                 .map(|part| {
                     part.into_string().unwrap_or_else(|value| {
-                        panic!("one-shot prompt argument must be valid UTF-8: {:?}", value)
+                        panic!("one-shot prompt argument must be valid UTF-8: {value:?}")
                     })
                 })
                 .collect::<Vec<_>>()
@@ -667,8 +667,7 @@ where
         tracing::warn!("Initial session start failed: {}", e);
         app.mode = may_agent::tui::AppMode::Chat;
         app.status = Some(format!(
-            "Session start failed: {} (open /config to fix provider/model)",
-            e
+            "Session start failed: {e} (open /config to fix provider/model)"
         ));
     }
 
@@ -688,7 +687,7 @@ where
 
 /// The main event loop - handles terminal events and channel messages.
 ///
-/// This loop NEVER directly calls agent.run() or stream.next() - all agent processing
+/// This loop NEVER directly calls `agent.run()` or `stream.next()` - all agent processing
 /// happens in background tasks that communicate via channels.
 #[allow(clippy::too_many_arguments)]
 async fn main_event_loop<B: Backend>(
@@ -977,8 +976,8 @@ where
                         runtime_deps.load_session(app, worker, &id).await?;
                     }
                     Some(SendAction::Send(msg)) => {
-                        if agent_handle.is_none() {
-                            if let Some(w) = worker.as_ref() {
+                        if agent_handle.is_none()
+                            && let Some(w) = worker.as_ref() {
                                 runtime_deps.mark_running(app).await?;
                                 agent_handle = Some(runtime_deps.start_agent_task(
                                     app,
@@ -988,7 +987,6 @@ where
                                 )?);
                                 assistant_response.clear();
                             }
-                        }
                     }
                     Some(SendAction::EnqueuePending(msg)) => {
                         runtime_deps.enqueue_pending_message(app, msg).await?;
@@ -1015,11 +1013,11 @@ where
                     }
                     Some(SendAction::SwitchModel(model)) => {
                         if let Err(e) = runtime_deps.switch_model(app, worker, &model).await {
-                            let err_msg = format!("Failed to switch model: {}", e);
+                            let err_msg = format!("Failed to switch model: {e}");
                             app.chat.push_error(&err_msg);
                         } else {
                             tracing::info!("Switched model to: {}", model);
-                            app.status = Some(format!("Model: {}", model));
+                            app.status = Some(format!("Model: {model}"));
                             if let Err(e) =
                                 app.session_manager.set_current_model(model.clone()).await
                             {
@@ -1065,12 +1063,12 @@ where
                         };
                         match mcp_manager.add_server(&name, config).await {
                             Ok(()) => {
-                                app.status = Some(format!("Added MCP server: {}", name));
+                                app.status = Some(format!("Added MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
                                 tracing::info!("Added MCP server: {}", name);
                             }
                             Err(e) => {
-                                let err_msg = format!("Failed to add MCP server: {}", e);
+                                let err_msg = format!("Failed to add MCP server: {e}");
                                 app.chat.push_error(&err_msg);
                                 tracing::error!("{}", err_msg);
                             }
@@ -1079,7 +1077,7 @@ where
                     Some(SendAction::McpRemove { name }) => {
                         match mcp_manager.remove_server(&name).await {
                             Ok(()) => {
-                                app.status = Some(format!("Removed MCP server: {}", name));
+                                app.status = Some(format!("Removed MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
                                 if app.mcp_selected >= app.mcp_servers.len()
                                     && !app.mcp_servers.is_empty()
@@ -1089,7 +1087,7 @@ where
                                 tracing::info!("Removed MCP server: {}", name);
                             }
                             Err(e) => {
-                                let err_msg = format!("Failed to remove MCP server: {}", e);
+                                let err_msg = format!("Failed to remove MCP server: {e}");
                                 app.chat.push_error(&err_msg);
                                 tracing::error!("{}", err_msg);
                             }
@@ -1098,12 +1096,12 @@ where
                     Some(SendAction::McpReconnect { name }) => {
                         match mcp_manager.reconnect(&name).await {
                             Ok(()) => {
-                                app.status = Some(format!("Reconnected to MCP server: {}", name));
+                                app.status = Some(format!("Reconnected to MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
                                 tracing::info!("Reconnected to MCP server: {}", name);
                             }
                             Err(e) => {
-                                let err_msg = format!("Failed to reconnect to MCP server: {}", e);
+                                let err_msg = format!("Failed to reconnect to MCP server: {e}");
                                 app.chat.push_error(&err_msg);
                                 app.mcp_servers = mcp_manager.server_info();
                                 tracing::error!("{}", err_msg);
@@ -1117,10 +1115,10 @@ where
                                 target,
                             });
                         if let Err(e) = app.config.clone().save().await {
-                            let err_msg = format!("Failed to save SSH server: {}", e);
+                            let err_msg = format!("Failed to save SSH server: {e}");
                             app.chat.push_error(&err_msg);
                         } else {
-                            app.status = Some(format!("Added SSH server: {}", name));
+                            app.status = Some(format!("Added SSH server: {name}"));
                             if app.ssh_selected + 1 < app.config.ssh_servers.len() {
                                 app.ssh_selected = app.config.ssh_servers.len() - 1;
                             }
@@ -1129,10 +1127,10 @@ where
                     Some(SendAction::SshRemove { name }) => {
                         if app.config.remove_ssh_server(&name) {
                             if let Err(e) = app.config.clone().save().await {
-                                let err_msg = format!("Failed to save SSH config: {}", e);
+                                let err_msg = format!("Failed to save SSH config: {e}");
                                 app.chat.push_error(&err_msg);
                             } else {
-                                app.status = Some(format!("Removed SSH server: {}", name));
+                                app.status = Some(format!("Removed SSH server: {name}"));
                                 if app.ssh_selected >= app.config.ssh_servers.len()
                                     && !app.config.ssh_servers.is_empty()
                                 {
@@ -1174,7 +1172,7 @@ where
                             .current_profile_id()
                             .map(ToOwned::to_owned)
                             .expect("session manager must always have a current profile");
-                        app.status = Some(format!("Installing from {}...", repo));
+                        app.status = Some(format!("Installing from {repo}..."));
                         spawn(async move {
                             let home_paths = may_agent::MayHomePaths::new(may_dir);
                             let manager = SkillManager::from_profile_home(
@@ -1207,7 +1205,7 @@ where
                             .current_profile_id()
                             .map(ToOwned::to_owned)
                             .expect("session manager must always have a current profile");
-                        app.status = Some(format!("Deleting {}...", dir_name));
+                        app.status = Some(format!("Deleting {dir_name}..."));
                         spawn(async move {
                             let home_paths = may_agent::MayHomePaths::new(may_dir);
                             let manager = SkillManager::from_profile_home(
@@ -1309,7 +1307,7 @@ where
         match auth::try_get_token(&device_code.device_code).await {
             Ok(token) => {
                 if let Err(e) = save_copilot_token(&token).await {
-                    app.copilot_auth_failed(format!("Failed to save token: {}", e));
+                    app.copilot_auth_failed(format!("Failed to save token: {e}"));
                     wait_for_auth_dismiss(app, events, terminal).await?;
                     return Ok(());
                 }

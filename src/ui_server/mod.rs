@@ -230,7 +230,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
         native::init_logging();
         native::launch(move || {
-            let state = state_for_server.clone();
+            let state = state_for_server;
             async move { build_router(state) }
         });
     })
@@ -241,17 +241,17 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn api_routes() -> Route {
-    use artifacts::*;
-    use browser::*;
-    use chat::*;
-    use config::*;
-    use events::*;
-    use interaction::*;
-    use notifications::*;
-    use profiles::*;
-    use remote_access::*;
-    use sessions::*;
-    use tasks::*;
+    use artifacts::{get_session_runtime, list_session_artifacts, get_artifact_preview, prepare_slidev_preview, get_slidev_static_asset, get_output_preview, map_container_local_url, stream_session_artifacts};
+    use browser::{browser_status, browser_start, browser_stop, browser_offer, browser_takeover_start, browser_takeover_stop};
+    use chat::{stop_session_run, remove_pending_message, chat, chat_stream, enqueue_chat};
+    use config::{get_ui_config, get_full_config, save_full_config, set_last_model, get_memory, save_memory, add_ssh_server, remove_ssh_server, list_mcp_servers, add_mcp_server, remove_mcp_server, reconnect_mcp_server, list_skills, install_skill, delete_skill, copilot_status, copilot_start, copilot_poll, copilot_logout};
+    use events::stream_events;
+    use interaction::{respond_permission_request, respond_workspace_request, respond_ask_user_request};
+    use notifications::{get_vapid_key, subscribe, unsubscribe, test_notification, list_notification_mailbox, consume_notification_callback, list_network_access_logs};
+    use profiles::{pin_session, unpin_session, archive_session, unarchive_session, move_to_folder, list_profiles, create_profile, update_profile, delete_profile, get_profile_sessions, create_folder, update_folder, delete_folder};
+    use remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
+    use sessions::{list_sessions, create_session, delete_all_sessions, get_session, update_session, delete_session, get_session_tasks, save_session_tasks, get_session_context_debug};
+    use tasks::{list_tasks, create_task, invoke_webhook_task, get_task, update_task, delete_task, approve_task, run_task};
 
     Route::new((
         Route::new((

@@ -134,7 +134,7 @@ pub(super) async fn get_session_context_debug(
         .get_session_context_snapshot(&id)
         .await
         .map_err(internal_error)?
-        .map(|snapshot| build_window_snapshot(snapshot))
+        .map(build_window_snapshot)
         .transpose()?;
 
     Ok(Json(SessionContextDebugResponse {
@@ -249,7 +249,7 @@ fn map_context_window_message(message: &LlmMessage) -> ContextDebugMessage {
     }
 }
 
-fn map_llm_role(role: LlmRole) -> &'static str {
+const fn map_llm_role(role: LlmRole) -> &'static str {
     match role {
         LlmRole::User => "user",
         LlmRole::Assistant => "assistant",
@@ -370,11 +370,10 @@ pub(super) async fn update_session(
     let next_title = requested_title.clone().or_else(|| session.title.clone());
     let next_model = requested_model.clone().or_else(|| session.model.clone());
 
-    if let Some(model) = next_model.clone() {
-        if session.model.as_deref() != Some(model.as_str()) {
+    if let Some(model) = next_model.clone()
+        && session.model.as_deref() != Some(model.as_str()) {
             model_to_persist = Some(model);
         }
-    }
 
     db.update_session(&id, requested_title.as_deref(), requested_model.as_deref())
         .await
@@ -418,7 +417,7 @@ pub(super) async fn update_session(
         profile_id: session.profile_id,
         model,
         reasoning_effort: None,
-        runtime: runtime.clone().into(),
+        runtime: runtime.into(),
     }))
 }
 

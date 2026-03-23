@@ -16,6 +16,7 @@ const AUTO_ARCHIVE_CUTOFF: jiff::SignedDuration = jiff::SignedDuration::from_hou
 /// - Not pinned
 /// - Not already archived
 /// - `updated_at` is older than 48 hours
+#[must_use] 
 pub fn spawn_auto_archive(db: ChatDb) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(AUTO_ARCHIVE_INTERVAL);

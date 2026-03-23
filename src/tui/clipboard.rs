@@ -23,7 +23,8 @@ pub enum ImageFormat {
 
 impl ImageFormat {
     /// Get file extension.
-    pub fn extension(&self) -> &'static str {
+    #[must_use] 
+    pub const fn extension(&self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Jpeg => "jpg",
@@ -33,6 +34,7 @@ impl ImageFormat {
     }
 
     /// Detect format from URL or content-type.
+    #[must_use] 
     pub fn from_url(url: &str) -> Option<Self> {
         let lower = url.to_lowercase();
         // Check file extension in URL path
@@ -50,6 +52,7 @@ impl ImageFormat {
     }
 
     /// Detect format from content-type header.
+    #[must_use] 
     pub fn from_content_type(content_type: &str) -> Option<Self> {
         let lower = content_type.to_lowercase();
         if lower.contains("image/png") {
@@ -83,7 +86,7 @@ pub struct ClipboardPasteResult {
 impl ClipboardPasteResult {
     /// Create a result containing an image.
     #[must_use]
-    pub fn image(image: ClipboardImage) -> Self {
+    pub const fn image(image: ClipboardImage) -> Self {
         Self {
             image: Some(image),
             text: None,
@@ -92,7 +95,7 @@ impl ClipboardPasteResult {
 
     /// Create a result containing text.
     #[must_use]
-    pub fn text(text: String) -> Self {
+    pub const fn text(text: String) -> Self {
         Self {
             image: None,
             text: Some(text),
@@ -101,7 +104,7 @@ impl ClipboardPasteResult {
 
     /// Create an empty result.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             image: None,
             text: None,
@@ -110,7 +113,7 @@ impl ClipboardPasteResult {
 
     /// Get the image, if present.
     #[must_use]
-    pub fn image_ref(&self) -> Option<&ClipboardImage> {
+    pub const fn image_ref(&self) -> Option<&ClipboardImage> {
         self.image.as_ref()
     }
 
@@ -128,7 +131,7 @@ impl ClipboardPasteResult {
 
     /// Check whether the result is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.image.is_none() && self.text.is_none()
     }
 }
@@ -141,6 +144,7 @@ pub struct ImageManager {
 
 impl ImageManager {
     /// Create a new image manager.
+    #[must_use] 
     pub fn new(session_dir: &Path) -> Self {
         Self {
             session_images_dir: SessionPaths::new(session_dir.to_path_buf()).images_dir(),
@@ -245,6 +249,7 @@ pub fn set_clipboard_text(text: &str) -> Result<(), ImageError> {
 }
 
 /// Check if text is an image URL.
+#[must_use] 
 pub fn is_image_url(text: &str) -> Option<Url> {
     let trimmed = text.trim();
 
@@ -336,6 +341,7 @@ pub struct TextManager {
 
 impl TextManager {
     /// Create a new text manager.
+    #[must_use] 
     pub fn new(session_dir: &Path) -> Self {
         Self {
             session_dir: session_dir.join("pastes"),
@@ -395,7 +401,7 @@ pub fn markdown_to_basic_html(markdown: &str) -> String {
     }
     out.push_str(&html[i..]);
 
-    format!("<p>{}</p>", out)
+    format!("<p>{out}</p>")
 }
 
 /// Try to write plain text into terminal clipboard via OSC52.
@@ -403,7 +409,7 @@ pub fn copy_via_osc52(text: &str) -> Result<(), ImageError> {
     let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let mut stdout = std::io::stdout();
     stdout
-        .write_all(format!("\x1b]52;c;{}\x07", payload).as_bytes())
+        .write_all(format!("\x1b]52;c;{payload}\x07").as_bytes())
         .map_err(ImageError::Io)?;
     stdout.flush().map_err(ImageError::Io)
 }

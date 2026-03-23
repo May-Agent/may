@@ -21,8 +21,7 @@ use crate::workspace_request::WorkspaceRequest;
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
+        .map_or(s.len(), |(i, _)| i)
 }
 
 /// Render the main layout.
@@ -81,7 +80,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Build usage info for status
     let usage_info = app.usage.as_ref().and_then(|u| {
         u.prompt_tokens
-            .map(|pt| (pt as u64, app.context_window.map(|w| w as u64)))
+            .map(|pt| (u64::from(pt), app.context_window.map(|w| u64::from(w))))
     });
 
     let images_supported = app.supports_images();
@@ -299,7 +298,7 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
     // Build title with profile name
     let profile_label = app
         .current_profile_name()
-        .map(|n| format!(" [{}]", n))
+        .map(|n| format!(" [{n}]"))
         .unwrap_or_default();
     let title = if app.session_search.is_empty() {
         format!("Sessions{} ({})", profile_label, app.session_list.len())
@@ -413,7 +412,7 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         if scroll > 0 {
             session_lines.push(Line::from(Span::styled(
-                format!("  {} more above", scroll),
+                format!("  {scroll} more above"),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -451,7 +450,7 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                             let count = app
                                 .profile_sessions
                                 .as_ref()
-                                .map(|ps| {
+                                .map_or(0, |ps| {
                                     ps.pinned
                                         .iter()
                                         .map(|item| match item {
@@ -461,17 +460,15 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                                             } => sessions.len(),
                                         })
                                         .sum::<usize>()
-                                })
-                                .unwrap_or(0);
-                            format!("  Pinned ({})", count)
+                                });
+                            format!("  Pinned ({count})")
                         }
                         "archived" => {
                             let count = app
                                 .profile_sessions
                                 .as_ref()
-                                .map(|ps| ps.archived.len())
-                                .unwrap_or(0);
-                            format!("  Archived ({})", count)
+                                .map_or(0, |ps| ps.archived.len());
+                            format!("  Archived ({count})")
                         }
                         _ => "  Recent".to_string(),
                     };
@@ -561,14 +558,13 @@ fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
             let count = app
                 .profile_sessions
                 .as_ref()
-                .map(|ps| ps.archived.len())
-                .unwrap_or(0);
+                .map_or(0, |ps| ps.archived.len());
             session_lines.push(Line::from(Span::styled(
                 "  ────────────────────────",
                 Style::default().fg(Color::DarkGray),
             )));
             session_lines.push(Line::from(Span::styled(
-                format!("  Archived ({}) [press 'e' to expand]", count),
+                format!("  Archived ({count}) [press 'e' to expand]"),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -644,13 +640,11 @@ fn render_search_preview(lines: &mut Vec<Line<'_>>, summary: &crate::SessionSumm
         .char_indices()
         .rev()
         .nth(20)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+        .map_or(0, |(i, _)| i);
     let end = summary.content_preview[pos..]
         .char_indices()
         .nth(query_char_count + 40)
-        .map(|(i, _)| pos + i)
-        .unwrap_or(summary.content_preview.len());
+        .map_or(summary.content_preview.len(), |(i, _)| pos + i);
 
     let snippet = summary.content_preview[start..end].replace('\n', " ");
     let snippet_lower = snippet.to_lowercase();
@@ -683,7 +677,7 @@ fn render_search_preview(lines: &mut Vec<Line<'_>>, summary: &crate::SessionSumm
         ]));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("    {}{}{}", prefix, snippet, suffix),
+            format!("    {prefix}{snippet}{suffix}"),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -963,7 +957,7 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
             .take(visible_height)
             .map(|(display_idx, &model_idx)| {
                 let fetched = app.tier_picker_models.get(model_idx);
-                let model_id = fetched.map(|m| m.id.as_str()).unwrap_or("");
+                let model_id = fetched.map_or("", |m| m.id.as_str());
                 // Check if model matches tier (for visual indicator)
                 let info = aither_models::lookup(model_id);
                 let tier_match = app
@@ -981,14 +975,14 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::DarkGray)
                 };
                 let prefix = if display_idx == selected { "> " } else { "  " };
-                ListItem::new(format!("{}{}", prefix, model_id)).style(style)
+                ListItem::new(format!("{prefix}{model_id}")).style(style)
             })
             .collect();
 
         let title = if total > 0 {
-            format!(" {} ({}) ", tier_name, total)
+            format!(" {tier_name} ({total}) ")
         } else {
-            format!(" {} (no models) ", tier_name)
+            format!(" {tier_name} (no models) ")
         };
 
         let list = List::new(items).block(
@@ -1001,7 +995,7 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     // Draw popup border
-    let title = format!(" Select {} Model ", tier_name);
+    let title = format!(" Select {tier_name} Model ");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1100,7 +1094,7 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
                     }
                 } else if let Some(key) = &inst.api_key {
                     let masked: String = key.chars().take(4).collect::<String>() + "****";
-                    format!("{} (configured)", masked)
+                    format!("{masked} (configured)")
                 } else if id == "copilot" {
                     "(OAuth)".to_string()
                 } else {
@@ -1109,7 +1103,7 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "(unknown)".to_string()
             };
-            let text = format!("{}{:<20} {}", prefix, id, status);
+            let text = format!("{prefix}{id:<20} {status}");
             let style = if idx == state.selected {
                 Style::default()
                     .fg(Color::Yellow)
@@ -1134,7 +1128,7 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         Style::default().fg(Color::Green)
     };
-    items.push(ListItem::new(format!("{}+ Add provider...", add_prefix)).style(add_style));
+    items.push(ListItem::new(format!("{add_prefix}+ Add provider...")).style(add_style));
 
     // If in list selection mode, show provider type selector overlay
     if let ConfigEditMode::List {
@@ -1157,7 +1151,7 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     Style::default().fg(Color::White)
                 };
-                ListItem::new(format!("{}{}", prefix, name)).style(style)
+                ListItem::new(format!("{prefix}{name}")).style(style)
             })
             .collect();
 
@@ -1286,7 +1280,7 @@ fn render_providers_section(frame: &mut Frame, area: Rect, app: &App) {
         let masked: String = input.chars().map(|_| '*').collect();
         let cursor_pos = char_to_byte_idx(&masked, cursor);
         let display = format!("{}|{}", &masked[..cursor_pos], &masked[cursor_pos..]);
-        items[state.selected] = ListItem::new(format!("  API Key: {}", display))
+        items[state.selected] = ListItem::new(format!("  API Key: {display}"))
             .style(Style::default().fg(Color::Yellow));
     }
 
@@ -1319,7 +1313,7 @@ fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(idx, (name, value))| {
             let prefix = if idx == state.selected { "> " } else { "  " };
             let display_value = if value.is_empty() { "(not set)" } else { value };
-            let text = format!("{}{:<20} {}", prefix, name, display_value);
+            let text = format!("{prefix}{name:<20} {display_value}");
             let style = if idx == state.selected {
                 Style::default()
                     .fg(Color::Yellow)
@@ -1377,7 +1371,7 @@ fn render_preferences_section(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(idx, (name, value))| {
             let prefix = if idx == state.selected { "> " } else { "  " };
-            let text = format!("{}{:<25} {}", prefix, name, value);
+            let text = format!("{prefix}{name:<25} {value}");
             let style = if idx == state.selected {
                 Style::default()
                     .fg(Color::Yellow)
@@ -1395,7 +1389,7 @@ fn render_preferences_section(frame: &mut Frame, area: Rect, app: &App) {
     {
         let cursor_pos = char_to_byte_idx(input, cursor);
         let display = format!("{}|{}", &input[..cursor_pos], &input[cursor_pos..]);
-        items[0] = ListItem::new(format!("  Max iterations:        {}", display))
+        items[0] = ListItem::new(format!("  Max iterations:        {display}"))
             .style(Style::default().fg(Color::Yellow));
     }
 
@@ -1435,10 +1429,9 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
             let current = app
                 .current_model
                 .as_deref()
-                .map(|m| m == model)
-                .unwrap_or(false);
+                .is_some_and(|m| m == model);
             let suffix = if current { " (current)" } else { "" };
-            let text = format!("{}{}{}", prefix, model, suffix);
+            let text = format!("{prefix}{model}{suffix}");
             let style = if idx == app.model_select_index {
                 Style::default()
                     .fg(Color::Yellow)
@@ -1530,7 +1523,7 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::White),
                 )),
                 Line::from(Span::styled(
-                    format!("   {}", verification_uri),
+                    format!("   {verification_uri}"),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(ratatui::style::Modifier::BOLD),
@@ -1541,7 +1534,7 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::White),
                 )),
                 Line::from(Span::styled(
-                    format!("   {}", user_code),
+                    format!("   {user_code}"),
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(ratatui::style::Modifier::BOLD),
@@ -1584,7 +1577,7 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
-                    format!("  {}", error),
+                    format!("  {error}"),
                     Style::default().fg(Color::Red),
                 )),
                 Line::from(""),
@@ -2118,7 +2111,7 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                 // Show scroll indicator at top if scrolled
                 if scroll > 0 {
                     skill_lines.push(Line::from(Span::styled(
-                        format!("↑ {} more above", scroll),
+                        format!("↑ {scroll} more above"),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
@@ -2135,7 +2128,7 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                     let source_str = match &skill.source {
                         crate::skill::SkillSource::Bundled => String::new(),
                         crate::skill::SkillSource::GitHub { owner, repo } => {
-                            format!(" ({}/{})", owner, repo)
+                            format!(" ({owner}/{repo})")
                         }
                         crate::skill::SkillSource::LocalPath { path } => {
                             format!(" (local:{path})")
@@ -2241,7 +2234,7 @@ fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// Render the AskUser dialog as a bottom overlay.
+/// Render the `AskUser` dialog as a bottom overlay.
 fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     let Some(question) = state.current() else {
         return;
@@ -2255,7 +2248,7 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     let total_items = opt_count + 2;
 
     // Calculate overlay height: question(2) + items + custom_input?(1) + help(1) + border(2)
-    let custom_line = if qs.custom_mode { 1u16 } else { 0 };
+    let custom_line = u16::from(qs.custom_mode);
     let max_height = (area.height * 60) / 100;
     let needed = 2 + total_items as u16 + custom_line + 1 + 2;
     let height = needed.min(max_height);
