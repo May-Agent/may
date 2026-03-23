@@ -84,7 +84,7 @@ pub struct Session {
     /// Profile this session belongs to.
     pub profile_id: Option<String>,
     pub history: ChatHistory,
-    /// Directory where BashTool creates its working directory.
+    /// Directory where TerminalTool creates its working directory.
     pub sandbox_dir: PathBuf,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,

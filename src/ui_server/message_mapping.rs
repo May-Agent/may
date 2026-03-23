@@ -2,15 +2,17 @@
 
 use crate::session::history::MessageRole;
 
-use super::bash_parsing::update_bash_snapshot_from_tool_event;
-use super::types::{ApiMessage, BashStateSnapshot, RequestStats, SkillInfoDto, ToolEventRecord};
+use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
+use super::types::{
+    ApiMessage, RequestStats, SkillInfoDto, TerminalStateSnapshot, ToolEventRecord,
+};
 
-/// Convert DB message rows to API messages, with bash execution tracking.
+/// Convert DB message rows to API messages, with native terminal execution tracking.
 pub(super) fn map_db_messages(
     db_messages: &[crate::db::entity::messages::Model],
 ) -> Vec<ApiMessage> {
     let mut out = Vec::new();
-    let mut snapshot = BashStateSnapshot::default();
+    let mut snapshot = TerminalStateSnapshot::default();
 
     for (idx, msg) in db_messages.iter().enumerate() {
         let Ok(role) = MessageRole::from_str(&msg.role) else {
@@ -19,7 +21,7 @@ pub(super) fn map_db_messages(
         match role {
             MessageRole::Tool => {
                 if let Ok(record) = serde_json::from_str::<ToolEventRecord>(&msg.content) {
-                    update_bash_snapshot_from_tool_event(&mut snapshot, &record);
+                    update_terminal_snapshot_from_tool_event(&mut snapshot, &record);
                 }
                 continue;
             }
@@ -48,7 +50,7 @@ pub(super) fn map_db_messages(
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event: None,
-                    bash_executions: Vec::new(),
+                    terminal_executions: Vec::new(),
                     stats: map_db_message_stats(msg),
                 };
 
@@ -57,7 +59,7 @@ pub(super) fn map_db_messages(
                 {
                     let mut executions = snapshot.executions.clone();
                     executions.extend(snapshot.running_by_call_id.values().cloned());
-                    api_msg.bash_executions = executions;
+                    api_msg.terminal_executions = executions;
                 }
 
                 out.push(api_msg);

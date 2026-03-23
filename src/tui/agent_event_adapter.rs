@@ -1,9 +1,11 @@
-use aither_sandbox::{BashArgs, BashMode, BashResult, Content, OutputEntry};
+use aither_sandbox::{
+    Content, OutputEntry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalResult,
+};
 
 /// Frontend-agnostic start event for a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolStartKind {
-    Bash { command: String, mode: BashMode },
+    Terminal { command: String, mode: TerminalMode },
     Generic { name: String, arguments: String },
 }
 
@@ -16,12 +18,12 @@ pub enum ToolEndKind {
 
 /// Parse tool-call start payload into a minimal start event.
 pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
-    if name == "bash" {
-        let args = serde_json::from_str::<BashArgs>(arguments)
-            .unwrap_or_else(|e| panic!("invalid bash tool args payload: {e}"));
-        ToolStartKind::Bash {
+    if name == "terminal" {
+        let args = serde_json::from_str::<TerminalArgs>(arguments)
+            .unwrap_or_else(|e| panic!("invalid terminal tool args payload: {e}"));
+        ToolStartKind::Terminal {
             command: args.script,
-            mode: BashMode::Sandboxed,
+            mode: display_mode_from_execution_mode(args.mode),
         }
     } else {
         ToolStartKind::Generic {
@@ -31,12 +33,20 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
     }
 }
 
+fn display_mode_from_execution_mode(mode: TerminalExecutionMode) -> TerminalMode {
+    match mode {
+        TerminalExecutionMode::Default | TerminalExecutionMode::Ssh => TerminalMode::Network,
+        TerminalExecutionMode::Sandboxed => TerminalMode::Sandboxed,
+        TerminalExecutionMode::Unsafe => TerminalMode::Unsafe,
+    }
+}
+
 /// Parse tool-call completion payload into a minimal end event.
 pub fn parse_tool_end(result: &Result<String, String>) -> ToolEndKind {
     match result {
         Ok(output) => {
-            if let Ok(bash_result) = serde_json::from_str::<BashResult>(output) {
-                ToolEndKind::Output(extract_output_text(&bash_result))
+            if let Ok(terminal_result) = serde_json::from_str::<TerminalResult>(output) {
+                ToolEndKind::Output(extract_output_text(&terminal_result))
             } else {
                 ToolEndKind::Output(output.clone())
             }
@@ -45,7 +55,7 @@ pub fn parse_tool_end(result: &Result<String, String>) -> ToolEndKind {
     }
 }
 
-fn extract_output_text(result: &BashResult) -> String {
+fn extract_output_text(result: &TerminalResult) -> String {
     match &result.stdout {
         OutputEntry::Empty => String::new(),
         OutputEntry::Inline { content } | OutputEntry::Loaded { content, .. } => match content {
@@ -58,6 +68,25 @@ fn extract_output_text(result: &BashResult) -> String {
             } else {
                 format!("[stored: {}]", url)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ToolStartKind, parse_tool_start};
+    use aither_sandbox::TerminalMode;
+
+    #[test]
+    fn parse_tool_start_uses_actual_execution_mode() {
+        let args = r#"{"script":"echo hi","mode":"unsafe","timeout":5}"#;
+        let start = parse_tool_start("terminal", args);
+        match start {
+            ToolStartKind::Terminal { command, mode } => {
+                assert_eq!(command, "echo hi");
+                assert_eq!(mode, TerminalMode::Unsafe);
+            }
+            ToolStartKind::Generic { .. } => panic!("expected terminal start event"),
         }
     }
 }

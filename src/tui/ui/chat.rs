@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 
-use aither_sandbox::BashMode;
+use aither_sandbox::TerminalMode;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -25,9 +25,9 @@ pub enum ToolStatus {
     Failed(String),
 }
 
-/// Information about a bash command execution.
+/// Information about a terminal command execution.
 #[derive(Debug, Clone)]
-pub struct BashCallInfo {
+pub struct TerminalCallInfo {
     /// The command that was executed.
     pub command: String,
     /// The output (may be truncated, matching what agent sees).
@@ -36,8 +36,8 @@ pub struct BashCallInfo {
     pub output_file: Option<PathBuf>,
 }
 
-impl BashCallInfo {
-    /// Create a new bash call info.
+impl TerminalCallInfo {
+    /// Create a new terminal call info.
     pub fn new(command: String) -> Self {
         Self {
             command,
@@ -87,57 +87,57 @@ impl BashCallInfo {
 /// Display representation of a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolDisplay {
-    /// Web search query.
+    /// Web search query executed through the terminal command tool.
     Search {
         query: String,
         status: ToolStatus,
         results: Option<usize>,
-        /// The underlying bash call info.
-        bash_info: Option<BashCallInfo>,
+        /// The underlying terminal call info.
+        terminal_info: Option<TerminalCallInfo>,
     },
-    /// URL fetch.
+    /// URL fetch executed through the terminal command tool.
     Fetch {
         url: String,
         status: ToolStatus,
-        /// The underlying bash call info.
-        bash_info: Option<BashCallInfo>,
+        /// The underlying terminal call info.
+        terminal_info: Option<TerminalCallInfo>,
     },
     /// Subagent task.
     Task {
         subagent: String,
         prompt: String,
         status: ToolStatus,
-        /// Bash calls made by this subagent (most recent at end).
-        bash_calls: Vec<BashCallInfo>,
+        /// Terminal calls made by this subagent (most recent at end).
+        terminal_calls: Vec<TerminalCallInfo>,
     },
-    /// Direct bash command.
-    Bash {
+    /// Direct terminal command.
+    Terminal {
         command: String,
-        mode: BashMode,
+        mode: TerminalMode,
         status: ToolStatus,
         /// The output from this command.
-        output: Option<BashCallInfo>,
+        output: Option<TerminalCallInfo>,
     },
 }
 
 impl ToolDisplay {
-    /// Get the most recent bash call for this tool.
-    pub fn latest_bash(&self) -> Option<&BashCallInfo> {
+    /// Get the most recent terminal call for this tool.
+    pub fn latest_terminal(&self) -> Option<&TerminalCallInfo> {
         match self {
-            ToolDisplay::Search { bash_info, .. } => bash_info.as_ref(),
-            ToolDisplay::Fetch { bash_info, .. } => bash_info.as_ref(),
-            ToolDisplay::Task { bash_calls, .. } => bash_calls.last(),
-            ToolDisplay::Bash { output, .. } => output.as_ref(),
+            ToolDisplay::Search { terminal_info, .. } => terminal_info.as_ref(),
+            ToolDisplay::Fetch { terminal_info, .. } => terminal_info.as_ref(),
+            ToolDisplay::Task { terminal_calls, .. } => terminal_calls.last(),
+            ToolDisplay::Terminal { output, .. } => output.as_ref(),
         }
     }
 
-    /// Get all bash calls for this tool.
-    pub fn all_bash_calls(&self) -> Vec<&BashCallInfo> {
+    /// Get all terminal calls for this tool.
+    pub fn all_terminal_calls(&self) -> Vec<&TerminalCallInfo> {
         match self {
-            ToolDisplay::Search { bash_info, .. } => bash_info.iter().collect(),
-            ToolDisplay::Fetch { bash_info, .. } => bash_info.iter().collect(),
-            ToolDisplay::Task { bash_calls, .. } => bash_calls.iter().collect(),
-            ToolDisplay::Bash { output, .. } => output.iter().collect(),
+            ToolDisplay::Search { terminal_info, .. } => terminal_info.iter().collect(),
+            ToolDisplay::Fetch { terminal_info, .. } => terminal_info.iter().collect(),
+            ToolDisplay::Task { terminal_calls, .. } => terminal_calls.iter().collect(),
+            ToolDisplay::Terminal { output, .. } => output.iter().collect(),
         }
     }
 
@@ -147,7 +147,7 @@ impl ToolDisplay {
             ToolDisplay::Search { status, .. } => status,
             ToolDisplay::Fetch { status, .. } => status,
             ToolDisplay::Task { status, .. } => status,
-            ToolDisplay::Bash { status, .. } => status,
+            ToolDisplay::Terminal { status, .. } => status,
         }
     }
 
@@ -162,7 +162,7 @@ impl ToolDisplay {
             ToolDisplay::Search { .. } => "search",
             ToolDisplay::Fetch { .. } => "fetch",
             ToolDisplay::Task { subagent, .. } => subagent,
-            ToolDisplay::Bash { .. } => "bash",
+            ToolDisplay::Terminal { .. } => "terminal",
         }
     }
 
@@ -335,35 +335,35 @@ impl ChatStream {
                     ToolDisplay::Search {
                         status: s,
                         results: r,
-                        bash_info,
+                        terminal_info,
                         ..
                     } => {
                         *s = status;
                         *r = results;
                         if let Some(ref out) = output
-                            && let Some(info) = bash_info
+                            && let Some(info) = terminal_info
                         {
                             info.output = out.clone();
                         }
                     }
                     ToolDisplay::Fetch {
                         status: s,
-                        bash_info,
+                        terminal_info,
                         ..
                     } => {
                         *s = status;
                         if let Some(ref out) = output
-                            && let Some(info) = bash_info
+                            && let Some(info) = terminal_info
                         {
                             info.output = out.clone();
                         }
                     }
                     ToolDisplay::Task { status: s, .. } => {
                         *s = status;
-                        // For tasks, output is parsed to extract bash calls
-                        // This is handled separately via update_subagent_bash
+                        // For tasks, output is parsed to extract terminal calls
+                        // This is handled separately via update_subagent_terminal
                     }
-                    ToolDisplay::Bash {
+                    ToolDisplay::Terminal {
                         status: s,
                         command,
                         output: out,
@@ -371,7 +371,7 @@ impl ChatStream {
                     } => {
                         *s = status;
                         if let Some(ref output_text) = output {
-                            *out = Some(BashCallInfo {
+                            *out = Some(TerminalCallInfo {
                                 command: command.clone(),
                                 output: output_text.clone(),
                                 output_file: None,
@@ -384,16 +384,16 @@ impl ChatStream {
         }
     }
 
-    /// Add a bash call to a subagent task.
-    pub fn update_subagent_bash(&mut self, id: &str, bash_info: BashCallInfo) {
+    /// Add a terminal call to a subagent task.
+    pub fn update_subagent_terminal(&mut self, id: &str, terminal_info: TerminalCallInfo) {
         for elem in &mut self.elements {
             if let ChatElement::ToolCall {
                 id: tool_id,
-                display: ToolDisplay::Task { bash_calls, .. },
+                display: ToolDisplay::Task { terminal_calls, .. },
             } = elem
                 && tool_id == id
             {
-                bash_calls.push(bash_info);
+                terminal_calls.push(terminal_info);
                 break;
             }
         }
@@ -1131,7 +1131,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             query,
             status,
             results,
-            bash_info,
+            terminal_info,
         } => {
             let status_text = match status {
                 ToolStatus::Running => "...".to_string(),
@@ -1150,8 +1150,8 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 Span::styled(query_display, selection_style),
             ]));
 
-            // Show bash output preview if available
-            if let Some(info) = bash_info
+            // Show terminal output preview if available
+            if let Some(info) = terminal_info
                 && !info.output.is_empty()
             {
                 let preview = info.output_preview(2);
@@ -1166,7 +1166,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
         ToolDisplay::Fetch {
             url,
             status,
-            bash_info,
+            terminal_info,
         } => {
             let status_text = match status {
                 ToolStatus::Running => "...",
@@ -1184,8 +1184,8 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 Span::styled(url_display, selection_style),
             ]));
 
-            // Show bash output preview if available
-            if let Some(info) = bash_info
+            // Show terminal output preview if available
+            if let Some(info) = terminal_info
                 && !info.output.is_empty()
             {
                 let preview = info.output_preview(2);
@@ -1201,7 +1201,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             subagent,
             prompt,
             status,
-            bash_calls,
+            terminal_calls,
         } => {
             let status_text = match status {
                 ToolStatus::Running => "...",
@@ -1230,8 +1230,8 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 Span::styled(prompt_display, selection_style),
             ]));
 
-            // Show most recent bash call for subagent
-            if let Some(latest) = bash_calls.last() {
+            // Show most recent terminal call for subagent
+            if let Some(latest) = terminal_calls.last() {
                 let cmd_preview = latest.command_preview(60);
                 lines.push(Line::from(vec![
                     Span::raw("    "),
@@ -1251,7 +1251,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 }
             }
         }
-        ToolDisplay::Bash {
+        ToolDisplay::Terminal {
             command,
             mode,
             status,
@@ -1265,9 +1265,9 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             };
 
             let mode_prefix = match mode {
-                BashMode::Unsafe => "[unsafe] ",
-                BashMode::Network => "[network] ",
-                BashMode::Sandboxed => "",
+                TerminalMode::Unsafe => "[unsafe] ",
+                TerminalMode::Network => "[network] ",
+                TerminalMode::Sandboxed => "",
             };
 
             let mut command_lines = command.lines();
@@ -1334,11 +1334,11 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         ToolDisplay::Task {
             subagent, prompt, ..
         } => format!("Subagent:{} - {}", subagent, prompt),
-        ToolDisplay::Bash { command, mode, .. } => {
+        ToolDisplay::Terminal { command, mode, .. } => {
             let mode_prefix = match mode {
-                BashMode::Unsafe => "[unsafe] ",
-                BashMode::Network => "[network] ",
-                BashMode::Sandboxed => "",
+                TerminalMode::Unsafe => "[unsafe] ",
+                TerminalMode::Network => "[network] ",
+                TerminalMode::Sandboxed => "",
             };
             format!("{}$ {}", mode_prefix, command)
         }
@@ -1368,15 +1368,15 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
     lines.push(Line::from(status_line));
     lines.push(Line::from(""));
 
-    // Bash calls
-    let bash_calls = display.all_bash_calls();
-    if bash_calls.is_empty() {
+    // Terminal calls
+    let terminal_calls = display.all_terminal_calls();
+    if terminal_calls.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No bash calls yet.",
+            "No terminal calls yet.",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        for (i, call) in bash_calls.iter().enumerate() {
+        for (i, call) in terminal_calls.iter().enumerate() {
             lines.push(Line::from(Span::styled(
                 format!("─── Command {} ───", i + 1),
                 Style::default().fg(Color::Blue),

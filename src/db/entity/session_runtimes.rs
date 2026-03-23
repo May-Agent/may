@@ -10,6 +10,10 @@ pub struct Model {
     pub state: String,
     pub browser_takeover_active: bool,
     pub browser_takeover_alert_pending: bool,
+    pub terminal_task_id: Option<String>,
+    pub terminal_output_file: Option<String>,
+    pub terminal_output_preview: Option<String>,
+    pub terminal_input_notice: Option<String>,
     pub updated_at: String,
 }
 

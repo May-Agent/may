@@ -1,2 +1,2 @@
 Your persistent memory file: ~/.may/MEMORY.md (current content follows below).
-When the user asks you to remember, forget, or update memory, edit this file directly via bash.
+When the user asks you to remember, forget, or update memory, edit this file directly via terminal commands.

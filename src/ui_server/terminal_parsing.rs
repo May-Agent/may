@@ -1,21 +1,21 @@
-//! Bash tool event parsing for streaming UI updates.
+//! Native terminal-command tool event parsing for streaming UI updates.
 
 use super::types::{
-    ApiBashExecution, BASH_TOOL_NAME, BashCommandMode, BashExecutionStatus, BashStateSnapshot,
-    ToolEventRecord,
+    ApiTerminalExecution, TERMINAL_TOOL_NAME, TerminalCommandMode, TerminalExecutionStatus,
+    TerminalStateSnapshot, ToolEventRecord,
 };
 
-fn parse_bash_mode(raw: &str) -> BashCommandMode {
+fn parse_terminal_mode(raw: &str) -> TerminalCommandMode {
     match raw {
-        "default" => BashCommandMode::Default,
-        "sandboxed" => BashCommandMode::Sandboxed,
-        "unsafe" => BashCommandMode::Unsafe,
-        "ssh" => BashCommandMode::Ssh,
-        other => panic!("invalid bash command mode: {other}"),
+        "default" => TerminalCommandMode::Default,
+        "sandboxed" => TerminalCommandMode::Sandboxed,
+        "unsafe" => TerminalCommandMode::Unsafe,
+        "ssh" => TerminalCommandMode::Ssh,
+        other => panic!("invalid terminal command mode: {other}"),
     }
 }
 
-pub(super) fn parse_bash_start(arguments: &str) -> (String, Option<BashCommandMode>) {
+pub(super) fn parse_terminal_start(arguments: &str) -> (String, Option<TerminalCommandMode>) {
     let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok();
     let script = parsed
         .as_ref()
@@ -27,12 +27,12 @@ pub(super) fn parse_bash_start(arguments: &str) -> (String, Option<BashCommandMo
         .as_ref()
         .and_then(|v| v.get("mode"))
         .and_then(|v| v.as_str())
-        .map(parse_bash_mode);
+        .map(parse_terminal_mode);
     (script, mode)
 }
 
-/// Preserve bash tool output as structured JSON when possible.
-fn parse_bash_end_output_from_result(result: &Result<String, String>) -> Option<String> {
+/// Preserve terminal tool output as structured JSON when possible.
+fn parse_terminal_end_output_from_result(result: &Result<String, String>) -> Option<String> {
     match result {
         Ok(ok_string) => {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ok_string) {
@@ -44,8 +44,8 @@ fn parse_bash_end_output_from_result(result: &Result<String, String>) -> Option<
     }
 }
 
-/// Determine if a bash execution failed from a typed tool result.
-fn parse_bash_failed_from_result(result: &Result<String, String>) -> bool {
+/// Determine if a terminal execution failed from a typed tool result.
+fn parse_terminal_failed_from_result(result: &Result<String, String>) -> bool {
     match result {
         Err(_) => true,
         Ok(ok_string) => {
@@ -65,8 +65,8 @@ fn parse_bash_failed_from_result(result: &Result<String, String>) -> bool {
     }
 }
 
-pub(super) fn update_bash_snapshot_from_tool_event(
-    snapshot: &mut BashStateSnapshot,
+pub(super) fn update_terminal_snapshot_from_tool_event(
+    snapshot: &mut TerminalStateSnapshot,
     record: &ToolEventRecord,
 ) {
     match record {
@@ -75,44 +75,44 @@ pub(super) fn update_bash_snapshot_from_tool_event(
             name,
             arguments,
         } => {
-            if !name.eq_ignore_ascii_case(BASH_TOOL_NAME) {
+            if !name.eq_ignore_ascii_case(TERMINAL_TOOL_NAME) {
                 return;
             }
-            let (script, mode) = parse_bash_start(arguments);
-            let mode = mode.unwrap_or(BashCommandMode::Default);
+            let (script, mode) = parse_terminal_start(arguments);
+            let mode = mode.unwrap_or(TerminalCommandMode::Default);
             snapshot.running_by_call_id.insert(
                 id.clone(),
-                ApiBashExecution {
+                ApiTerminalExecution {
                     id: id.clone(),
                     input: script,
                     output: None,
-                    status: BashExecutionStatus::Running,
+                    status: TerminalExecutionStatus::Running,
                     mode,
                 },
             );
         }
         ToolEventRecord::End { id, name, result } => {
-            if !name.eq_ignore_ascii_case(BASH_TOOL_NAME) {
+            if !name.eq_ignore_ascii_case(TERMINAL_TOOL_NAME) {
                 return;
             }
             let mut exec = snapshot
                 .running_by_call_id
                 .remove(id)
-                .unwrap_or(ApiBashExecution {
+                .unwrap_or(ApiTerminalExecution {
                     id: id.clone(),
-                    input: "(bash)".to_string(),
+                    input: "(terminal)".to_string(),
                     output: None,
-                    status: BashExecutionStatus::Done,
-                    mode: BashCommandMode::Default,
+                    status: TerminalExecutionStatus::Done,
+                    mode: TerminalCommandMode::Default,
                 });
 
-            let output = parse_bash_end_output_from_result(result);
-            let failed = parse_bash_failed_from_result(result);
+            let output = parse_terminal_end_output_from_result(result);
+            let failed = parse_terminal_failed_from_result(result);
             exec.output = output;
             exec.status = if failed {
-                BashExecutionStatus::Failed
+                TerminalExecutionStatus::Failed
             } else {
-                BashExecutionStatus::Done
+                TerminalExecutionStatus::Done
             };
 
             snapshot.executions.push(exec);

@@ -7,7 +7,7 @@ use crate::db::ChatDb;
 use super::{
     PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
     PersistedPermissionRequest, PersistedWorkspaceRequest, SessionPlanState, SessionRuntimeState,
-    SessionRuntimeSummary,
+    SessionRuntimeSummary, TerminalRuntimeState,
 };
 
 #[derive(Clone)]
@@ -221,5 +221,26 @@ impl SessionRuntimeService {
             self.notify_ui();
         }
         Ok(pending)
+    }
+
+    pub async fn set_terminal_runtime(
+        &self,
+        session_id: &str,
+        terminal: TerminalRuntimeState,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let mut summary = self.get(session_id).await?;
+        summary.interactions.terminal = terminal;
+        summary.normalize_state();
+        self.db.write_session_runtime(session_id, &summary).await?;
+        self.notify_ui();
+        Ok(summary)
+    }
+
+    pub async fn clear_terminal_runtime(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        self.set_terminal_runtime(session_id, TerminalRuntimeState::default())
+            .await
     }
 }

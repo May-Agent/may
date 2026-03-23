@@ -16,6 +16,12 @@ interface SessionRuntime {
     browser: {
       takeoverActive: boolean;
     };
+    terminal?: {
+      taskId?: string | null;
+      outputFile?: string | null;
+      outputPreview?: string | null;
+      inputNotice?: string | null;
+    };
   };
   queuedCount: number;
   waitingPermission: PermissionRequest | null;

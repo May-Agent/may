@@ -26,7 +26,7 @@ pub enum AppMode {
     TierModelPicker,
     /// GitHub Copilot OAuth authentication
     CopilotAuth,
-    /// Permission approval dialog for elevated bash modes.
+    /// Permission approval dialog for elevated terminal modes.
     PermissionConfirm(PermissionConfirmState),
     /// Workspace access confirmation dialog
     WorkspaceConfirm(WorkspaceConfirmState),

@@ -64,7 +64,7 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
   );
 }
 
-function detectCodeLanguage(text: string): 'bash' | 'json' | 'text' {
+function detectCodeLanguage(text: string): 'shell' | 'json' | 'text' {
   const trimmed = text.trim();
   if (!trimmed) return 'text';
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
@@ -75,11 +75,11 @@ function detectCodeLanguage(text: string): 'bash' | 'json' | 'text' {
       // fall through
     }
   }
-  if (/(\$\s+|bash|zsh|sh\s)/i.test(trimmed)) return 'bash';
+  if (/(\$\s+|bash|zsh|sh\s|pwsh|powershell)/i.test(trimmed)) return 'shell';
   return 'text';
 }
 
-function formatCodeText(text: string, language: 'bash' | 'json' | 'text'): string {
+function formatCodeText(text: string, language: 'shell' | 'json' | 'text'): string {
   if (language !== 'json') return text;
   try {
     return JSON.stringify(JSON.parse(text), null, 2);
@@ -594,7 +594,7 @@ export function MessageItem({
 }) {
   const isUser = message.role === 'user';
   const isStreaming = !!message.isStreaming;
-  const bashExecutions = message.bashExecutions || [];
+  const terminalExecutions = message.terminalExecutions || [];
   const [isTimelineOpen, setIsTimelineOpen] = useState(false);
   const [expandedTimelineItemIds, setExpandedTimelineItemIds] = useState<Record<string, boolean>>({});
   const hasSeenRunningTimelineRef = useRef(false);
@@ -644,7 +644,7 @@ export function MessageItem({
           endedAt: message.isThinking ? undefined : fallbackStartedAt,
         });
       }
-      for (const command of bashExecutions) {
+      for (const command of terminalExecutions) {
         const parsedOutput = parseCommandOutput(command.output);
         const outputLang = detectCodeLanguage(parsedOutput.text || '');
         items.push({
@@ -679,7 +679,7 @@ export function MessageItem({
         });
         continue;
       }
-      if (segment.kind === 'bash') {
+      if (segment.kind === 'terminal') {
         for (const command of segment.commands) {
           const parsedOutput = parseCommandOutput(command.output);
           const outputLang = detectCodeLanguage(parsedOutput.text || '');
@@ -741,15 +741,15 @@ export function MessageItem({
     }
     return items;
   }, [
-    message.bashExecutions,
+    message.terminalExecutions,
     message.id,
     message.isThinking,
     message.thinking,
     message.timelineSegments,
     message.timestamp,
-    bashExecutions,
+    terminalExecutions,
   ]);
-  const hasImageLikeBashOutput = useMemo(
+  const hasImageLikeTerminalOutput = useMemo(
     () => timelineItems.some((item) => item.type === 'command' && (item.parsedOutput.images.length > 0 || item.parsedOutput.storagePaths.length > 0)),
     [timelineItems],
   );
@@ -764,11 +764,11 @@ export function MessageItem({
     if (!isLikelyBinaryTextPayload(normalized)) {
       return false;
     }
-    if (hasImageLikeBashOutput) {
+    if (hasImageLikeTerminalOutput) {
       return true;
     }
     return normalized.length >= 256;
-  }, [displayContent, hasImageLikeBashOutput, isUser, timelineItems.length]);
+  }, [displayContent, hasImageLikeTerminalOutput, isUser, timelineItems.length]);
   const safeDisplayContent = suppressBinaryContent ? '' : displayContent;
 
   useEffect(() => {

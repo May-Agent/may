@@ -28,7 +28,7 @@ export interface ProfilesSlice {
   createProfile: (input: {
     name: string;
     icon?: string;
-    environment?: string;
+    environment?: 'local' | 'container' | 'remote';
     containerImage?: string;
     persona?: string;
     preferences?: Record<string, unknown>;

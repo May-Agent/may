@@ -1714,7 +1714,7 @@ fn render_permission_confirm(
     let content = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "The agent is requesting elevated bash access:",
+            "The agent is requesting elevated terminal access:",
             Style::default().fg(Color::White),
         )),
         Line::from(""),

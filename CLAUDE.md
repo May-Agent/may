@@ -74,9 +74,9 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **aither-agent**: Core `Agent` abstraction, `BashAgentBuilder`, event streaming (`AgentEvent`)
+- **aither-agent**: Core `Agent` abstraction, `TerminalAgentBuilder` (legacy type name for the terminal-command agent builder), event streaming (`AgentEvent`)
 - **aither-cloud**: Provider implementations (Claude, Gemini, OpenAI) via `CloudProvider` enum
-- **aither-sandbox**: `BashTool`, `BashMode`, `PermissionHandler` trait
+- **aither-sandbox**: `TerminalTool`/`TerminalMode` (legacy names for terminal-command execution), `PermissionHandler` trait
 - **aither-models**: Model metadata database for tier lookups
 - **leash**: Native sandbox for isolated command execution
 
@@ -152,9 +152,12 @@ During streaming:
   - AgentEvent::Complete → ChatStream::end_text()
 ```
 
-# Bash-based tool calling
-From the perspective of LLM, there is only one tool: `bash`. All capabilities are exposed via CLI commands.
-For instance, web search is done by calling `websearch "query"` command in bash.
+# Terminal-first tool calling
+From the perspective of the LLM, there is one native terminal-command tool whose current wire name is still `terminal`.
+That legacy tool name does not imply the runtime guarantees a literal shell implementation.
+
+Everything else is exposed as CLI commands through the terminal tool's IPC bridge rather than as additional native tools.
+For instance, web search is done by executing `websearch "query"` through the terminal tool, not by calling a separate native `websearch` tool.
 
 ### Key Patterns
 

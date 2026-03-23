@@ -21,6 +21,7 @@ use crate::session::{
     BrowserInteractionState, ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage,
     PersistedAskUserRequest, PersistedPermissionRequest, PersistedWorkspaceRequest,
     SessionInteractionState, SessionPlanState, SessionRuntimeState, SessionRuntimeSummary,
+    TerminalRuntimeState,
 };
 use crate::task_trigger::{PersistedTaskTrigger, TRIGGER_KIND_WEBHOOK};
 use crate::xml_fragment::XmlFragment;
@@ -228,6 +229,7 @@ pub(crate) struct PendingWorkspaceLookup {
 pub struct NotificationCallbackConsumeResult {
     pub id: String,
     pub session_id: Option<String>,
+    pub profile_id: Option<String>,
     pub callback_context_xml: Option<String>,
     pub callback_message: Option<String>,
     pub has_callback: bool,
@@ -695,6 +697,20 @@ impl ChatDb {
                         .as_ref()
                         .is_some_and(|row| row.browser_takeover_alert_pending),
                 },
+                terminal: TerminalRuntimeState {
+                    task_id: runtime_row
+                        .as_ref()
+                        .and_then(|row| row.terminal_task_id.clone()),
+                    output_file: runtime_row
+                        .as_ref()
+                        .and_then(|row| row.terminal_output_file.clone()),
+                    output_preview: runtime_row
+                        .as_ref()
+                        .and_then(|row| row.terminal_output_preview.clone()),
+                    input_notice: runtime_row
+                        .as_ref()
+                        .and_then(|row| row.terminal_input_notice.clone()),
+                },
             },
             pending_immediate,
             queued_messages,
@@ -732,7 +748,7 @@ impl ChatDb {
         Ok(summary)
     }
 
-    async fn write_session_runtime_summary(
+    pub async fn write_session_runtime(
         &self,
         session_id: &str,
         summary: &SessionRuntimeSummary,
@@ -746,6 +762,10 @@ impl ChatDb {
                 .interactions
                 .browser
                 .takeover_alert_pending),
+            terminal_task_id: Set(summary.interactions.terminal.task_id.clone()),
+            terminal_output_file: Set(summary.interactions.terminal.output_file.clone()),
+            terminal_output_preview: Set(summary.interactions.terminal.output_preview.clone()),
+            terminal_input_notice: Set(summary.interactions.terminal.input_notice.clone()),
             updated_at: Set(now.clone()),
         };
         session_runtimes::Entity::insert(active_runtime)
@@ -755,6 +775,10 @@ impl ChatDb {
                         session_runtimes::Column::State,
                         session_runtimes::Column::BrowserTakeoverActive,
                         session_runtimes::Column::BrowserTakeoverAlertPending,
+                        session_runtimes::Column::TerminalTaskId,
+                        session_runtimes::Column::TerminalOutputFile,
+                        session_runtimes::Column::TerminalOutputPreview,
+                        session_runtimes::Column::TerminalInputNotice,
                         session_runtimes::Column::UpdatedAt,
                     ])
                     .to_owned(),
@@ -889,8 +913,7 @@ impl ChatDb {
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.state = state;
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await
+        self.write_session_runtime(session_id, &summary).await
     }
 
     pub async fn set_session_plan_state(
@@ -906,8 +929,7 @@ impl ChatDb {
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.plan_state = plan_state;
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -928,8 +950,7 @@ impl ChatDb {
         }
         summary.pending_immediate = Some(message);
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -947,8 +968,7 @@ impl ChatDb {
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.queued_messages.push(message);
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -971,8 +991,7 @@ impl ChatDb {
             None
         };
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(next)
     }
 
@@ -1006,8 +1025,7 @@ impl ChatDb {
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.pending_immediate = None;
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -1030,8 +1048,7 @@ impl ChatDb {
         }
         summary.queued_messages.remove(index);
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -1052,8 +1069,7 @@ impl ChatDb {
             summary.state = SessionRuntimeState::Running;
         }
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -1074,8 +1090,7 @@ impl ChatDb {
             summary.state = SessionRuntimeState::Running;
         }
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -1096,8 +1111,7 @@ impl ChatDb {
             summary.state = SessionRuntimeState::Running;
         }
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -1121,8 +1135,7 @@ impl ChatDb {
         summary.interactions.browser.takeover_active = true;
         summary.interactions.browser.takeover_alert_pending = false;
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -1141,8 +1154,7 @@ impl ChatDb {
         summary.interactions.browser.takeover_active = false;
         summary.interactions.browser.takeover_alert_pending = true;
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(summary)
     }
 
@@ -1161,8 +1173,7 @@ impl ChatDb {
         }
         summary.interactions.browser.takeover_alert_pending = false;
         summary.normalize_state();
-        self.write_session_runtime_summary(session_id, &summary)
-            .await?;
+        self.write_session_runtime(session_id, &summary).await?;
         Ok(true)
     }
 
@@ -1346,6 +1357,7 @@ impl ChatDb {
 
             if expired_terminal_wait {
                 summary.state = SessionRuntimeState::Idle;
+                summary.interactions.terminal = TerminalRuntimeState::default();
             }
             if original_browser_takeover {
                 summary.interactions.browser.takeover_active = false;
@@ -1356,12 +1368,12 @@ impl ChatDb {
                 && summary.state == SessionRuntimeState::Running
             {
                 summary.state = SessionRuntimeState::Idle;
+                summary.interactions.terminal = TerminalRuntimeState::default();
             }
 
             if summary.state != original_state || expired_terminal_wait || original_browser_takeover
             {
-                self.write_session_runtime_summary(&session_id, &summary)
-                    .await?;
+                self.write_session_runtime(&session_id, &summary).await?;
             }
         }
         Ok(())
@@ -1998,9 +2010,17 @@ impl ChatDb {
         if entry.status != "opened" {
             self.mark_notification_mailbox_opened(id).await?;
         }
+        let profile_id = if let Some(session_id) = entry.session_id.as_deref() {
+            self.get_session(session_id)
+                .await?
+                .and_then(|session| session.profile_id)
+        } else {
+            None
+        };
         Ok(NotificationCallbackConsumeResult {
             id: entry.id,
             session_id: entry.session_id,
+            profile_id,
             callback_context_xml: entry.callback_context_xml,
             callback_message: entry.callback_message,
             has_callback,
@@ -3237,12 +3257,12 @@ mod tests {
 
     use crate::PermissionRequestMode;
     use crate::db::entity::{scheduled_task_runs, session_run_leases};
-    use crate::profile::ProfileEnvironment;
     use crate::session::{
         PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
         PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
         PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload, SessionRuntimeState,
     };
+    use crate::task_trigger::PersistedTaskTrigger;
 
     use super::{ChatDb, CreateProfileParams, CreateScheduledTaskParams};
 
@@ -3953,6 +3973,20 @@ mod tests {
         db.set_session_runtime_state(session_id, SessionRuntimeState::WaitingTerminalInput)
             .await
             .expect("waiting terminal input should persist");
+        let mut runtime = db
+            .get_session_runtime(session_id)
+            .await
+            .expect("runtime should load")
+            .expect("runtime should exist");
+        runtime.interactions.terminal = TerminalRuntimeState {
+            task_id: Some("amber-forest-thunder-pearl".to_string()),
+            output_file: Some("outputs/amber-forest-thunder-pearl.txt".to_string()),
+            output_preview: Some("preview".to_string()),
+            input_notice: Some("input needed".to_string()),
+        };
+        db.write_session_runtime(session_id, &runtime)
+            .await
+            .expect("terminal runtime metadata should persist");
 
         db.recover_session_runtimes_after_restart()
             .await
@@ -3965,6 +3999,10 @@ mod tests {
             .expect("runtime should exist");
         assert_eq!(runtime.state, SessionRuntimeState::Idle);
         assert!(!runtime.has_pending_messages());
+        assert_eq!(
+            runtime.interactions.terminal,
+            TerminalRuntimeState::default()
+        );
     }
 
     #[tokio::test]

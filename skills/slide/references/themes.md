@@ -13,7 +13,7 @@ theme: seriph
 Install theme:
 
 ```bash
-npm install @slidev/theme-<name>
+bun add @slidev/theme-<name>
 ```
 
 ## Official Themes
@@ -27,7 +27,7 @@ Built-in minimal theme. No installation required.
 Modern, clean design with serif typography. Good for most presentations.
 
 ```bash
-npm install @slidev/theme-seriph
+bun add @slidev/theme-seriph
 ```
 
 ## Community Themes
@@ -37,7 +37,7 @@ npm install @slidev/theme-seriph
 Apple Keynote-inspired design.
 
 ```bash
-npm install slidev-theme-apple-basic
+bun add slidev-theme-apple-basic
 ```
 
 ### dracula
@@ -45,7 +45,7 @@ npm install slidev-theme-apple-basic
 Dark theme with Dracula color scheme.
 
 ```bash
-npm install slidev-theme-dracula
+bun add slidev-theme-dracula
 ```
 
 ### geist
@@ -53,7 +53,7 @@ npm install slidev-theme-dracula
 Vercel/Geist design system.
 
 ```bash
-npm install slidev-theme-geist
+bun add slidev-theme-geist
 ```
 
 ### penguin
@@ -61,7 +61,7 @@ npm install slidev-theme-geist
 Playful theme with illustrations.
 
 ```bash
-npm install slidev-theme-penguin
+bun add slidev-theme-penguin
 ```
 
 ### bricks
@@ -69,7 +69,7 @@ npm install slidev-theme-penguin
 Clean, professional slides.
 
 ```bash
-npm install slidev-theme-bricks
+bun add slidev-theme-bricks
 ```
 
 ### unicorn
@@ -77,7 +77,7 @@ npm install slidev-theme-bricks
 Colorful gradient theme.
 
 ```bash
-npm install slidev-theme-unicorn
+bun add slidev-theme-unicorn
 ```
 
 ### shibainu
@@ -85,7 +85,7 @@ npm install slidev-theme-unicorn
 Cute theme with shiba inu illustrations.
 
 ```bash
-npm install slidev-theme-shibainu
+bun add slidev-theme-shibainu
 ```
 
 ### academic
@@ -93,7 +93,7 @@ npm install slidev-theme-shibainu
 Academic/research presentation style.
 
 ```bash
-npm install slidev-theme-academic
+bun add slidev-theme-academic
 ```
 
 ## Theme Recommendations

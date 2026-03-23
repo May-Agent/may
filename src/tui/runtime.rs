@@ -19,6 +19,7 @@ use crate::{ChatDb, MayAgent, MayConfig, SessionId, generate_session_title};
 pub struct LocalSessionRuntime {
     runtime_service: Arc<crate::session::SessionRuntimeService>,
     permission_approver: crate::agent::PermissionApprover,
+    oneshot_restricted: bool,
 }
 
 impl LocalSessionRuntime {
@@ -30,13 +31,22 @@ impl LocalSessionRuntime {
         Self {
             runtime_service,
             permission_approver,
+            oneshot_restricted: false,
         }
+    }
+
+    pub fn enable_oneshot_restricted_mode(&mut self) {
+        self.oneshot_restricted = true;
     }
 
     pub fn permission_approver_for(
         &self,
         session_id: &SessionId,
     ) -> crate::agent::PermissionApprover {
+        if self.oneshot_restricted {
+            return crate::agent::PermissionApprover::new()
+                .for_session(session_id.as_str().to_string());
+        }
         self.permission_approver
             .for_session(session_id.as_str().to_string())
     }

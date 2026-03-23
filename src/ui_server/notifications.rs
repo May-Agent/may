@@ -140,6 +140,7 @@ pub(super) async fn consume_notification_callback(
     Ok(Json(super::types::NotificationCallbackResponse {
         notification_id: callback.id,
         session_id: callback.session_id,
+        profile_id: callback.profile_id,
         has_callback: callback.has_callback,
         callback_consumed: callback.callback_consumed,
         callback_context_xml: callback.callback_context_xml,

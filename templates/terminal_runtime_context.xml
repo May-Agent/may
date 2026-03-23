@@ -1,0 +1,17 @@
+Model: {{ model_id }}
+Home environment directory: {{ home_directory }}
+Session directory: {{ session_directory }}
+Current working directory: {{ current_working_directory }}
+
+Home layout:
+{% for item in home_layout %}- {{ item }}
+{% endfor %}
+Session layout:
+{% for item in session_layout %}- {{ item }}
+{% endfor %}
+Command rules:
+{% for item in command_rules %}- {{ item }}
+{% endfor %}
+Modality support:
+{% for item in modality_support %}- {{ item }}
+{% endfor %}

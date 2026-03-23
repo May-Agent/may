@@ -4,7 +4,7 @@ import type {
   Attachment,
   Artifact,
   TimelineSegment,
-  BashExecution,
+  TerminalExecution,
   ProfileInfo,
   ProfileSessions,
   FolderInfo,
@@ -37,6 +37,12 @@ export interface SessionRuntimeStatus {
   interactions?: {
     browser: {
       takeoverActive: boolean;
+    };
+    terminal?: {
+      taskId?: string | null;
+      outputFile?: string | null;
+      outputPreview?: string | null;
+      inputNotice?: string | null;
     };
   };
   queuedCount: number;
@@ -125,6 +131,7 @@ export interface NetworkAccessLogsPayload {
 export interface NotificationCallbackPayload {
   notificationId: string;
   sessionId?: string | null;
+  profileId?: string | null;
   hasCallback: boolean;
   callbackConsumed: boolean;
   callbackContextXml?: string | null;
@@ -648,15 +655,15 @@ function buildTimelineSegments(m: Message): TimelineSegment[] {
     });
   }
 
-  if (Array.isArray(m.bashExecutions) && m.bashExecutions.length > 0) {
+  if (Array.isArray(m.terminalExecutions) && m.terminalExecutions.length > 0) {
     segments.push({
-      id: `${m.id}-bash`,
-      kind: 'bash',
+      id: `${m.id}-terminal`,
+      kind: 'terminal',
       offset: 0,
-      commands: m.bashExecutions,
+      commands: m.terminalExecutions,
       startedAt,
-      endedAt: m.bashExecutions.some(
-        (x: BashExecution) => x.status === 'running',
+      endedAt: m.terminalExecutions.some(
+        (x: TerminalExecution) => x.status === 'running',
       )
         ? undefined
         : startedAt,

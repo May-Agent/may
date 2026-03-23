@@ -285,8 +285,11 @@ function AppShell() {
         const hasCallback = callback.hasCallback;
         const callbackConsumed = callback.callbackConsumed;
 
-        let callbackProfileId: string | null = null;
-        if (requestedSessionId) {
+        let callbackProfileId: string | null =
+          typeof callback.profileId === 'string' && callback.profileId.trim().length > 0
+            ? callback.profileId
+            : null;
+        if (!callbackProfileId && requestedSessionId) {
           const knownSession = store.sessions.find(
             (session) => session.id === requestedSessionId,
           );

@@ -11,8 +11,8 @@ use aither_agent::{BrowserBackend, StaticCdpBrowser};
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole, Usage};
 use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{
-    BashResult, BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, ContainerExecHandle,
-    ContainerLaunchSpec, Content, OutputEntry,
+    BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, ContainerExecHandle, ContainerLaunchSpec,
+    Content, OutputEntry, TerminalResult,
 };
 
 use crate::agent::MayAgent;
@@ -21,12 +21,11 @@ use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
 use crate::session::{
     ChatMessage, ChatMessageStats, MayHomePaths, MessageRole, PendingUserMessage,
-    PersistedAttachment, SessionId, SessionRuntimeState, SessionStore,
+    PersistedAttachment, SessionId, SessionRuntimeState, SessionStore, TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 
 use super::attachments::build_prompt_and_attachments;
-use super::bash_parsing::update_bash_snapshot_from_tool_event;
 use super::error::internal_error;
 use super::helpers::{
     RETRY_BACKOFF_MS, append_history_message, elapsed_ms_saturating, load_session_paths,
@@ -34,12 +33,13 @@ use super::helpers::{
 };
 use super::model_resolution::resolve_default_model;
 use super::state::{UiServerState, UiToolQueues};
+use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::title_generation;
 use super::types::{
-    ApiMessage, BashStateSnapshot, ChatRequest, ChatResponse, ContextDebugMessage,
-    PendingMessageKind, RemovePendingMessageRequest, RequestLogEntry, RequestStats,
-    SessionRuntimeResponse, SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent,
-    SseTodoUpdateEvent, SseToolEndEvent, SseToolStartEvent, ToolEventRecord,
+    ApiMessage, ChatRequest, ChatResponse, ContextDebugMessage, PendingMessageKind,
+    RemovePendingMessageRequest, RequestLogEntry, RequestStats, SessionRuntimeResponse,
+    SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent, SseToolEndEvent,
+    SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
 };
 
 // ── ChatSink trait ──────────────────────────────────────────
@@ -166,7 +166,7 @@ struct AgentRunResult {
     assistant_id: String,
     full_text: String,
     reasoning_text: String,
-    bash_snapshot: BashStateSnapshot,
+    terminal_snapshot: TerminalStateSnapshot,
     usage: Usage,
     provider_id: String,
     model_context_window: Option<u32>,
@@ -321,6 +321,31 @@ async fn clear_running_state_if_needed(
         .map_err(anyhow::Error::from)
 }
 
+async fn set_terminal_runtime_state(
+    state: &Arc<UiServerState>,
+    session_id: &str,
+    terminal: TerminalRuntimeState,
+) -> anyhow::Result<()> {
+    state
+        .runtime_service
+        .set_terminal_runtime(session_id, terminal)
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
+async fn clear_terminal_runtime_state(
+    state: &Arc<UiServerState>,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    state
+        .runtime_service
+        .clear_terminal_runtime(session_id)
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
 fn output_contains_terminal_wait_notice(output: &OutputEntry) -> bool {
     let content = match output {
         OutputEntry::Inline { content } | OutputEntry::Loaded { content, .. } => Some(content),
@@ -339,7 +364,7 @@ fn result_waits_for_terminal_input(result: &Result<String, String>) -> bool {
     let Ok(serialized) = result else {
         return false;
     };
-    let Ok(parsed) = serde_json::from_str::<BashResult>(serialized) else {
+    let Ok(parsed) = serde_json::from_str::<TerminalResult>(serialized) else {
         return false;
     };
     parsed.status.as_deref() == Some("running")
@@ -747,7 +772,7 @@ async fn run_agent_loop(
         let mut segment_text = String::new(); // current text segment, flushed on tool calls
         let mut full_text = String::new(); // accumulated full assistant text
         let mut reasoning_text = String::new();
-        let mut bash_snapshot = BashStateSnapshot::default();
+        let mut terminal_snapshot = TerminalStateSnapshot::default();
         let mut saw_tool_activity = false;
         let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -811,7 +836,7 @@ async fn run_agent_loop(
                         saw_tool_activity = true;
                         if matches!(
                             name.as_str(),
-                            "bash" | "input_terminal" | "kill_terminal" | "read_terminal_delta"
+                            "terminal" | "terminal_input" | "terminal_kill" | "terminal_read"
                         ) {
                             set_session_runtime_state(
                                 state,
@@ -844,7 +869,7 @@ async fn run_agent_loop(
                             )
                             .await?;
                         }
-                        update_bash_snapshot_from_tool_event(&mut bash_snapshot, &record);
+                        update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                         tool_arguments_by_id.insert(id.clone(), arguments.clone());
                         if !sink.on_tool_start(&id, &name, &arguments).await {
                             cancellation_reason = Some("client disconnected during tool stream");
@@ -853,7 +878,7 @@ async fn run_agent_loop(
                     }
                     Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
                         saw_tool_activity = true;
-                        if name == "bash" && result_waits_for_terminal_input(&result) {
+                        if name == "terminal" && result_waits_for_terminal_input(&result) {
                             set_session_runtime_state(
                                 state,
                                 session_id.as_str(),
@@ -874,7 +899,7 @@ async fn run_agent_loop(
                             )
                             .await?;
                         }
-                        update_bash_snapshot_from_tool_event(&mut bash_snapshot, &record);
+                        update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                         let arguments = tool_arguments_by_id.remove(&id);
                         if !sink
                             .on_tool_end(&id, &name, arguments.as_deref(), &result)
@@ -892,6 +917,54 @@ async fn run_agent_loop(
                             cancellation_reason = Some("client disconnected during todo update");
                             break;
                         }
+                    }
+                    Ok(aither_agent::AgentEvent::BackgroundTaskStarted {
+                        task_id,
+                        output_preview,
+                        output_file,
+                    }) => {
+                        saw_tool_activity = true;
+                        set_terminal_runtime_state(
+                            state,
+                            session_id.as_str(),
+                            TerminalRuntimeState {
+                                task_id: Some(task_id),
+                                output_file: Some(output_file),
+                                output_preview: Some(output_preview),
+                                input_notice: None,
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok(aither_agent::AgentEvent::BackgroundTaskCompleted { .. }) => {
+                        saw_tool_activity = true;
+                        clear_terminal_runtime_state(state, session_id.as_str()).await?;
+                        set_session_runtime_state(
+                            state,
+                            session_id.as_str(),
+                            SessionRuntimeState::Running,
+                        )
+                        .await?;
+                    }
+                    Ok(aither_agent::AgentEvent::TerminalInputNeeded { task_id, notice }) => {
+                        saw_tool_activity = true;
+                        set_session_runtime_state(
+                            state,
+                            session_id.as_str(),
+                            SessionRuntimeState::WaitingTerminalInput,
+                        )
+                        .await?;
+                        set_terminal_runtime_state(
+                            state,
+                            session_id.as_str(),
+                            TerminalRuntimeState {
+                                task_id,
+                                output_file: None,
+                                output_preview: None,
+                                input_notice: Some(notice),
+                            },
+                        )
+                        .await?;
                     }
                     Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
                         terminal_error = Some(err);
@@ -966,9 +1039,12 @@ async fn run_agent_loop(
             .await?;
         }
 
+        clear_terminal_runtime_state(state, session_id.as_str()).await?;
+
         let has_assistant_text = !full_text.trim().is_empty();
-        let has_bash_output = !bash_snapshot.executions.is_empty();
-        let has_tool_activity = has_bash_output || saw_tool_activity;
+
+        let has_terminal_output = !terminal_snapshot.executions.is_empty();
+        let has_tool_activity = has_terminal_output || saw_tool_activity;
         if !has_assistant_text && !has_tool_activity {
             let err = "Model returned an empty assistant response";
             record_request_log(
@@ -1005,7 +1081,7 @@ async fn run_agent_loop(
             assistant_id,
             full_text,
             reasoning_text,
-            bash_snapshot,
+            terminal_snapshot,
             usage,
             provider_id,
             model_context_window,
@@ -1050,7 +1126,7 @@ async fn stream_chat_events(
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event: None,
-                    bash_executions: result.bash_snapshot.executions,
+                    terminal_executions: result.terminal_snapshot.executions,
                     stats: Some(RequestStats {
                         provider_id: Some(result.provider_id),
                         prompt_tokens: result.usage.prompt_tokens,
@@ -1126,7 +1202,7 @@ async fn run_chat_collect_with_persistence(
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event: None,
-                    bash_executions: Vec::new(),
+                    terminal_executions: Vec::new(),
                     stats: Some(RequestStats {
                         provider_id: Some(result.provider_id),
                         prompt_tokens: result.usage.prompt_tokens,
