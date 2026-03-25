@@ -9,7 +9,7 @@ pub mod config;
 pub mod container;
 pub mod copilot;
 pub mod db;
-mod embedding_provider;
+pub mod embedding_provider;
 mod fs_utils;
 mod live_response;
 pub mod location;
@@ -20,6 +20,7 @@ pub mod network_policy;
 pub mod notification;
 pub mod notification_service;
 pub mod profile;
+pub mod prompt_mentions;
 pub mod remote_profile;
 pub mod scheduler;
 pub mod session;
@@ -27,6 +28,9 @@ pub mod skill;
 pub mod subagent;
 pub mod task_trigger;
 pub mod tasks;
+pub mod terminal_commands;
+pub mod terminal_permission_handler;
+pub mod tool_dispatch;
 pub mod todo_parser;
 pub mod tui;
 pub mod ui_server;
@@ -37,18 +41,21 @@ pub use aither_agent::workspace_request;
 
 pub use agent::{
     AgentEnvironment, MayAgent, PermissionApprover, PermissionHistoryMode, PermissionRequest,
-    PermissionRequestMode, generate_session_title,
+    PermissionRequestMode, ResolveAgentEnvironmentError, ResolvedProviderRuntime, TaskRuntimeKind,
+    generate_session_title, resolve_agent_environment_for_session, resolve_provider_runtime,
 };
 pub use config::MayConfig;
 pub use db::ChatDb;
 pub use mcp::{MayMcpServerConfig, McpConfig, McpManager, McpServerInfo};
-pub use profile::{PinnedItem, ProfileEnvironment, ProfileInfo, ProfileSessions};
+pub use profile::{HomeEnvironment, PinnedItem, ProfileEnvironment, ProfileInfo, ProfileSessions};
 pub use session::{
     ChatHistory, ChatMessage, MayHomePaths, MessageRole, ProfileHomePaths, Session, SessionId,
     SessionManager, SessionMetadata, SessionPlanState, SessionStore, SessionSummary,
 };
 pub use skill::{SkillInfo, SkillManager, SkillSource};
 pub use subagent::{SubagentInfo, SubagentManager};
+pub use terminal_commands::{SharedTerminalCommandConfig, register_shared_terminal_commands};
+pub use terminal_permission_handler::TerminalPermissionHandler;
 pub use workspace::{Workspace, WorkspaceConfig};
 pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};
 pub use xml_fragment::{XmlFragment, XmlFragmentError};

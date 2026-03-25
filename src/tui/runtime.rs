@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use aither_core::llm::model::ReasoningEffort;
-use aither_sandbox::{BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec};
 use async_channel::Sender;
 use base64::Engine;
 use executor_core::{DefaultExecutor, spawn};
@@ -9,8 +8,7 @@ use serde::Serialize;
 
 use crate::agent::{AgentHandle, AgentWorker, spawn_worker};
 use crate::ask_user::{AskUserBroker, Question, QuestionAnswer};
-use crate::container::ContainerRuntime;
-use crate::container::lifecycle::ContainerManager;
+use crate::tool_dispatch::ToolDispatchers;
 use crate::tui::queue::{LARGE_PASTE_THRESHOLD, PASTE_TRUNCATE_LIMIT};
 use crate::tui::{App, Attachment, PendingMessage};
 use crate::workspace_request::WorkspaceRequestBroker;
@@ -486,6 +484,7 @@ fn decode_data_url(data_url: &str) -> anyhow::Result<Vec<u8>> {
 pub struct RuntimeDeps {
     workspace_broker: WorkspaceRequestBroker,
     ask_user_broker: AskUserBroker,
+    tool_dispatchers: ToolDispatchers,
     location_provider: Arc<crate::location::LocationProvider>,
     local_runtime: LocalSessionRuntime,
     oneshot_model: Option<String>,
@@ -497,11 +496,13 @@ impl RuntimeDeps {
         local_runtime: LocalSessionRuntime,
         workspace_broker: WorkspaceRequestBroker,
         ask_user_broker: AskUserBroker,
+        tool_dispatchers: ToolDispatchers,
         location_provider: Arc<crate::location::LocationProvider>,
     ) -> Self {
         Self {
             workspace_broker,
             ask_user_broker,
+            tool_dispatchers,
             location_provider,
             local_runtime,
             oneshot_model: None,
@@ -734,7 +735,7 @@ impl RuntimeDeps {
             .as_ref()
             .map(|profile| {
                 crate::profile::ProfileInfo::from_db_model(profile.clone())
-                    .map(|info| info.environment)
+                    .map(|info| info.environment.into_kind())
             })
             .transpose()
             .map_err(anyhow::Error::from)?;
@@ -770,10 +771,11 @@ impl RuntimeDeps {
             profile_memories,
             runtime.plan_state,
             location,
-            None,
-            None,
-            None,
-            None,
+            Some(self.tool_dispatchers.task.clone()),
+            Some(self.tool_dispatchers.notify.clone()),
+            self.tool_dispatchers.browser.clone(),
+            Some(self.tool_dispatchers.register_skills.clone()),
+            Some(self.tool_dispatchers.register_subagents.clone()),
             environment,
             0,
         )
@@ -1020,72 +1022,15 @@ async fn resolve_agent_environment_for_tui(
     sandbox_dir: &std::path::Path,
     session_id: &SessionId,
 ) -> anyhow::Result<crate::agent::AgentEnvironment> {
-    match profile_environment {
-        Some(crate::profile::ProfileEnvironment::Container { .. }) => {}
-        Some(crate::profile::ProfileEnvironment::Remote { .. }) => {
-            let profile =
-                profile_model.ok_or_else(|| anyhow::anyhow!("remote profile model is missing"))?;
-            let config_path = may_dir.join("config.toml");
-            let config = crate::config::MayConfig::load_from(&config_path)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to load config.toml for remote profile: {error}")
-                })?;
-            let ssh_server =
-                crate::remote_profile::resolve_remote_profile_server(profile, &config.ssh_servers)
-                    .map_err(anyhow::Error::msg)?;
-            return Ok(crate::agent::AgentEnvironment::Remote { ssh_server });
-        }
-        _ => return Ok(crate::agent::AgentEnvironment::Local),
-    }
-
-    let profile =
-        profile_model.ok_or_else(|| anyhow::anyhow!("container profile model is missing"))?;
-
-    let runtime = ContainerRuntime::detect().await.map_err(|e| {
-        anyhow::anyhow!("No container runtime available for container profile: {e}")
-    })?;
-    let container_manager = ContainerManager::new(Arc::new(runtime), may_dir.to_path_buf());
-
-    let default_image_tag = crate::container::profile::default_image_tag(may_dir, profile)
-        .await
-        .map_err(|e| anyhow::anyhow!("Invalid container profile image tag: {e}"))?;
-    let image_spec =
-        crate::container::profile::image_spec_for_profile(may_dir, profile, &default_image_tag)
-            .map_err(|e| anyhow::anyhow!("Invalid container profile configuration: {e}"))?;
-    let extra_mounts = crate::container::profile::mounts_for_profile(profile)
-        .map_err(|e| anyhow::anyhow!("Invalid container mount configuration: {e}"))?;
-
-    crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
-        .await
-        .map_err(|e| anyhow::anyhow!("Container image build failed: {e}"))?;
-
-    let container_name =
-        crate::container::profile::container_name_for_profile_session(profile, session_id);
-    let mut launch_spec = ContainerLaunchSpec::new(
-        container_name,
-        image_spec.tag.clone(),
-        sandbox_dir.to_path_buf(),
-    );
-    for mount in extra_mounts {
-        launch_spec = launch_spec.with_mount(mount);
-    }
-
-    let container_id = container_manager
-        .ensure_running(&launch_spec)
-        .await
-        .map_err(|e| anyhow::anyhow!("Container start failed: {e}"))?;
-
-    let container_exec = ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
-        container_manager.runtime().client.clone(),
-    ))));
-
-    Ok(crate::agent::AgentEnvironment::Container {
-        container_id,
-        container_ipc_host: container_manager.runtime().host_gateway().to_string(),
-        container_exec,
-        browser_backend: None,
-    })
+    crate::agent::resolve_agent_environment_for_session(
+        profile_environment,
+        profile_model,
+        may_dir,
+        sandbox_dir,
+        session_id,
+    )
+    .await
+    .map_err(anyhow::Error::from)
 }
 
 #[derive(Serialize)]
