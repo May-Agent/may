@@ -25,7 +25,7 @@ pub struct ProfileInfo {
     pub slug: Option<String>,
     pub name: String,
     pub icon: Option<String>,
-    pub environment: ProfileEnvironment,
+    pub environment: HomeEnvironment,
     pub persona: Option<String>,
     pub preferences: Option<serde_json::Value>,
     pub location_aware: bool,
@@ -72,13 +72,49 @@ impl ProfileInfo {
             slug: m.slug,
             name: m.name,
             icon: m.icon,
-            environment,
+            environment: HomeEnvironment::new(environment),
             persona: m.persona,
             preferences,
             location_aware: m.location_aware,
             pinned_limit: m.pinned_limit,
             sort_order: m.sort_order,
         })
+    }
+}
+
+/// The single designated home environment for a profile.
+///
+/// Every profile owns exactly one home environment, and all session sandboxes
+/// and IPC-based terminal commands are rooted in that environment.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(transparent)]
+pub struct HomeEnvironment(ProfileEnvironment);
+
+impl HomeEnvironment {
+    #[must_use]
+    pub const fn new(environment: ProfileEnvironment) -> Self {
+        Self(environment)
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &ProfileEnvironment {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_kind(self) -> ProfileEnvironment {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn as_db_str(&self) -> &str {
+        self.0.as_db_str()
+    }
+}
+
+impl AsRef<ProfileEnvironment> for HomeEnvironment {
+    fn as_ref(&self) -> &ProfileEnvironment {
+        self.kind()
     }
 }
 
@@ -137,15 +173,19 @@ pub async fn query_profile_sessions(
     db: &ChatDb,
     profile_id: &str,
 ) -> Result<ProfileSessions, crate::db::ChatDbError> {
-    let profile_model = db.get_profile(profile_id).await?.ok_or_else(|| {
+    let (profile_model, db_sessions, folders) = tokio::join!(
+        db.get_profile(profile_id),
+        db.list_sessions_for_profile(profile_id),
+        db.list_folders(profile_id),
+    );
+    let profile_model = profile_model?.ok_or_else(|| {
         crate::db::ChatDbError::Db(sea_orm::DbErr::RecordNotFound(format!(
             "Profile not found: {profile_id}"
         )))
     })?;
     let profile = ProfileInfo::from_db_model(profile_model)?;
-
-    let all_sessions = db.list_sessions_for_profile(profile_id).await?;
-    let folders = db.list_folders(profile_id).await?;
+    let all_summaries = crate::session::summarize_db_sessions(db, db_sessions?).await?;
+    let folders = folders?;
 
     // Separate sessions into categories
     let mut pinned_bare: Vec<SessionSummary> = Vec::new();
@@ -154,20 +194,12 @@ pub async fn query_profile_sessions(
     let mut regular: Vec<SessionSummary> = Vec::new();
     let mut archived: Vec<SessionSummary> = Vec::new();
 
-    for s in all_sessions {
-        let mut summary = SessionSummary::from_db_model(s.clone());
-        summary.runtime = db
-            .get_session_runtime(summary.id.as_str())
-            .await?
-            .unwrap_or_default();
-        if s.archived {
+    for summary in all_summaries {
+        if summary.archived {
             archived.push(summary);
-        } else if s.pinned {
-            if let Some(ref fid) = s.folder_id {
-                folder_sessions
-                    .entry(fid.clone())
-                    .or_default()
-                    .push(summary);
+        } else if summary.pinned {
+            if let Some(fid) = summary.folder_id.clone() {
+                folder_sessions.entry(fid).or_default().push(summary);
             } else {
                 pinned_bare.push(summary);
             }
@@ -201,6 +233,41 @@ pub async fn query_profile_sessions(
         regular,
         archived,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HomeEnvironment, ProfileEnvironment, ProfileInfo};
+    use crate::db::entity::profiles;
+
+    fn make_profile_model(environment: &str) -> profiles::Model {
+        profiles::Model {
+            id: "profile-id".to_string(),
+            slug: Some("local".to_string()),
+            name: "Local".to_string(),
+            icon: None,
+            environment: environment.to_string(),
+            container_image: None,
+            container_id: None,
+            persona: None,
+            preferences_json: None,
+            location_aware: false,
+            pinned_limit: 10,
+            sort_order: 0,
+            created_at: "2026-03-24T00:00:00Z".to_string(),
+            updated_at: "2026-03-24T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn profile_info_wraps_environment_as_home_environment() {
+        let info = ProfileInfo::from_db_model(make_profile_model("local"))
+            .expect("local profile should deserialize");
+
+        assert!(matches!(info.environment, HomeEnvironment(_)));
+        assert!(matches!(info.environment.kind(), ProfileEnvironment::Local));
+        assert_eq!(info.environment.as_db_str(), "local");
+    }
 }
 
 /// List all profiles as [`ProfileInfo`].

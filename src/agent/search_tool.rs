@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aither_cloud::CloudEmbedder;
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::{
+    EmbeddingModel,
+    llm::{Tool, ToolResult},
+};
 use aither_rag::{Document, Rag};
 use arrow_array::{
     Array, ArrayRef, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
@@ -24,6 +26,7 @@ use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
 
 use crate::agent::command_words::split_shell_words;
 use crate::agent::search_match::push_unique;
+use crate::embedding_provider::{EmbeddingModelResolution, MayEmbeddingModel};
 
 const TABLE_NAME: &str = "file_chunks";
 const INDEX_META_FILE: &str = "search_index.meta.json";
@@ -113,11 +116,11 @@ const fn default_fuzzy_distance() -> u32 {
 #[derive(Debug, Clone)]
 pub struct SearchTool {
     sandbox_dir: PathBuf,
-    embedder: Option<CloudEmbedder>,
+    embedder: EmbeddingModelResolution,
 }
 
 impl SearchTool {
-    pub const fn new(sandbox_dir: PathBuf, embedder: Option<CloudEmbedder>) -> Self {
+    pub const fn new(sandbox_dir: PathBuf, embedder: EmbeddingModelResolution) -> Self {
         Self {
             sandbox_dir,
             embedder,
@@ -175,17 +178,47 @@ impl SearchTool {
     }
 }
 
+pub(crate) async fn resolve_search_path(
+    sandbox_dir: &Path,
+    raw_path: &str,
+) -> anyhow::Result<PathBuf> {
+    let requested_path = PathBuf::from(raw_path);
+    let resolved_path = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        sandbox_dir.join(requested_path)
+    };
+    async_fs::canonicalize(&resolved_path)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to resolve search path {}: {error}",
+                resolved_path.display()
+            )
+        })
+}
+
 impl Tool for SearchTool {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("search")
     }
 
     type Arguments = SearchArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let args = self.normalize_args(arguments)?;
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+        let mut args = self.normalize_args(arguments)?;
+        if let Some(path) = args.path.as_deref() {
+            args.path = Some(
+                resolve_search_path(self.sandbox_dir.as_path(), path)
+                    .await?
+                    .display()
+                    .to_string(),
+            );
+        }
         if args.action == SearchAction::Index {
             return index_path(
+                self.sandbox_dir.clone(),
                 self.db_path(),
                 self.meta_path(),
                 self.semantic_index_path(),
@@ -249,6 +282,8 @@ struct SearchIndexMeta {
     files_indexed: usize,
     chunks_indexed: usize,
     indexed_at: String,
+    semantic_embedding_model: Option<String>,
+    semantic_embedding_dimensions: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,13 +342,20 @@ struct FileResult {
 }
 
 async fn index_path(
+    sandbox_dir: PathBuf,
     db_path: PathBuf,
     meta_path: PathBuf,
     semantic_index_path: PathBuf,
-    embedder: Option<CloudEmbedder>,
+    embedder: EmbeddingModelResolution,
     raw_path: String,
-) -> anyhow::Result<ToolOutput> {
-    let canonical = async_fs::canonicalize(PathBuf::from(raw_path.clone()))
+) -> anyhow::Result<ToolResult> {
+    let requested_path = PathBuf::from(raw_path.clone());
+    let resolved_path = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        sandbox_dir.join(requested_path)
+    };
+    let canonical = async_fs::canonicalize(&resolved_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to resolve search path {raw_path}: {e}"))?;
 
@@ -367,15 +409,17 @@ async fn index_path(
         .len();
     meta.chunks_indexed = rows.len();
     meta.indexed_at = jiff::Timestamp::now().to_string();
+    meta.semantic_embedding_model = embedder.ready().map(|value| value.selector().to_string());
+    meta.semantic_embedding_dimensions = embedder.ready().map(aither_core::EmbeddingModel::dim);
     async_fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?).await?;
 
-    let semantic_indexed = if let Some(embedder) = embedder {
+    let semantic_indexed = if let Some(embedder) = embedder.clone_ready() {
         rebuild_semantic_index(&semantic_index_path, embedder, &files).await?
     } else {
         false
     };
 
-    ToolOutput::json(&serde_json::json!({
+    ToolResult::json(&serde_json::json!({
         "action": "index",
         "indexed_root": canonical_string,
         "roots": meta.roots,
@@ -401,7 +445,7 @@ async fn load_meta(meta_path: &Path) -> anyhow::Result<SearchIndexMeta> {
 
 async fn rebuild_semantic_index(
     semantic_index_path: &Path,
-    embedder: CloudEmbedder,
+    embedder: MayEmbeddingModel,
     files: &[SearchableFile],
 ) -> anyhow::Result<bool> {
     match async_fs::remove_file(semantic_index_path).await {
@@ -450,9 +494,9 @@ async fn query_index(
     db_path: PathBuf,
     meta_path: PathBuf,
     semantic_index_path: PathBuf,
-    embedder: Option<CloudEmbedder>,
+    embedder: EmbeddingModelResolution,
     args: SearchArgs,
-) -> anyhow::Result<ToolOutput> {
+) -> anyhow::Result<ToolResult> {
     let meta = load_meta(&meta_path).await?;
     if meta.roots.is_empty() {
         return Err(anyhow::anyhow!(
@@ -471,11 +515,16 @@ async fn query_index(
     let query = args.query.clone().expect("validated");
     let query_enabled = query.trim() != "*" && !query.trim().is_empty();
     if args.search_mode == SearchMode::Semantic {
-        let embedder = embedder.ok_or_else(|| {
-            anyhow::anyhow!(
-                "semantic search requires an embedding-capable provider; configure OpenAI-compatible or Google embeddings"
-            )
-        })?;
+        let embedder = embedder.require_ready(
+            "semantic search requires a global models.embedding_model and at least one enabled provider that supports it",
+        )?;
+        if meta.semantic_embedding_model.as_deref() != Some(embedder.selector())
+            || meta.semantic_embedding_dimensions != Some(embedder.dim())
+        {
+            return Err(anyhow::anyhow!(
+                "semantic index was built for a different embedding configuration; run `search index <path>` again"
+            ));
+        }
         return run_semantic_query(semantic_index_path, embedder, args, meta).await;
     }
 
@@ -609,10 +658,10 @@ fn matches_path_prefix(path_filter: Option<&str>, file_path: &str) -> bool {
 
 async fn run_semantic_query(
     semantic_index_path: PathBuf,
-    embedder: CloudEmbedder,
+    embedder: MayEmbeddingModel,
     args: SearchArgs,
     meta: SearchIndexMeta,
-) -> anyhow::Result<ToolOutput> {
+) -> anyhow::Result<ToolResult> {
     let query = args.query.as_deref().expect("validated");
     if query == "*" {
         return Err(anyhow::anyhow!(
@@ -653,7 +702,7 @@ async fn run_semantic_query(
         .search_with_k(query, args.scan_limit)
         .await?
         .into_iter()
-        .map(|result| {
+        .map(|result| -> anyhow::Result<Option<FileMatchRow>> {
             let file_path = require_semantic_metadata(&result.chunk.metadata, "file_path")?;
             if !matches_path_prefix(path_filter, file_path) {
                 return Ok(None);
@@ -1025,7 +1074,7 @@ fn finalize_rows(
     total_matches: usize,
     args: &SearchArgs,
     meta: &SearchIndexMeta,
-) -> anyhow::Result<ToolOutput> {
+) -> anyhow::Result<ToolResult> {
     let start = args.offset.min(rows.len());
     let end = (start + args.limit).min(rows.len());
     let rows = rows[start..end].to_vec();
@@ -1105,7 +1154,7 @@ fn finalize_rows(
         })
     };
 
-    ToolOutput::json(&value)
+    ToolResult::json(&value)
 }
 
 fn truncate_text(input: &str, max_chars: usize) -> String {

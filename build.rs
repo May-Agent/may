@@ -6,13 +6,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MAY_SKIP_WEB_UI_BUILD");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UI");
 
-    watch_path("web-ui/src");
-    watch_path("web-ui/public");
-    watch_path("web-ui/index.html");
-    watch_path("web-ui/package.json");
-    watch_path("web-ui/bun.lock");
-    watch_path("web-ui/tsconfig.json");
-    watch_path("web-ui/vite.config.ts");
+    watch_web_ui_inputs();
 
     let enable_ui = std::env::var_os("CARGO_FEATURE_UI").is_some();
     if !enable_ui {
@@ -46,21 +40,20 @@ fn main() {
     );
 }
 
-fn watch_path(path: &str) {
-    let p = Path::new(path);
-    if !p.exists() {
+fn watch_web_ui_inputs() {
+    let web_ui_dir = Path::new("web-ui");
+    if !web_ui_dir.exists() {
         return;
     }
 
-    if p.is_file() {
-        println!("cargo:rerun-if-changed={path}");
-        return;
-    }
-
-    watch_dir_recursive(p);
+    watch_dir_recursive(web_ui_dir);
 }
 
 fn watch_dir_recursive(dir: &Path) {
+    if should_skip_watch_path(dir) {
+        return;
+    }
+
     if let Some(s) = dir.to_str() {
         println!("cargo:rerun-if-changed={s}");
     }
@@ -71,10 +64,21 @@ fn watch_dir_recursive(dir: &Path) {
 
     for entry in entries.flatten() {
         let path = entry.path();
+        if should_skip_watch_path(&path) {
+            continue;
+        }
+
         if path.is_dir() {
             watch_dir_recursive(&path);
         } else if let Some(s) = path.to_str() {
             println!("cargo:rerun-if-changed={s}");
         }
     }
+}
+
+fn should_skip_watch_path(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("dist" | "node_modules" | ".git")
+    )
 }

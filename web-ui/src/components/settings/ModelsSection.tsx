@@ -169,6 +169,47 @@ export function ModelsSection({ configDraft, setDraft }: ConfigSectionProps) {
           </div>
         </div>
 
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-1">
+            <Label>Embedding Model</Label>
+            <Input
+              value={configDraft.models.embeddingModel ?? ''}
+              onChange={(e) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  models: {
+                    ...prev.models,
+                    embeddingModel: e.target.value || null,
+                  },
+                }))
+              }
+              placeholder="model id, or provider@model to pin one provider"
+            />
+          </div>
+          <div className="space-y-1">
+            <Label>Embedding Dimensions</Label>
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              value={configDraft.models.embeddingDimensions ?? ''}
+              onChange={(e) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  models: {
+                    ...prev.models,
+                    embeddingDimensions:
+                      e.target.value.trim() === ''
+                        ? null
+                        : Number.parseInt(e.target.value, 10),
+                  },
+                }))
+              }
+              placeholder="optional; required by some providers"
+            />
+          </div>
+        </div>
+
         {(Object.keys(TIER_LABELS) as TierKey[]).map((tier) => (
           <div key={tier} className="space-y-1">
             <Label>{TIER_LABELS[tier]}</Label>

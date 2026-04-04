@@ -4,6 +4,22 @@ use super::SessionPlanState;
 use crate::PermissionRequestMode;
 use crate::xml_fragment::XmlFragment;
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+const fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+const fn session_plan_state_is_disabled(value: &SessionPlanState) -> bool {
+    matches!(value, SessionPlanState::Disabled)
+}
+
+const fn session_runtime_state_is_idle(value: &SessionRuntimeState) -> bool {
+    matches!(value, SessionRuntimeState::Idle)
+}
+
 /// Persisted runtime state for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +52,11 @@ impl SessionRuntimeState {
     #[must_use]
     pub const fn is_active(self) -> bool {
         !matches!(self, Self::Idle)
+    }
+
+    #[must_use]
+    pub const fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
     }
 }
 
@@ -74,23 +95,40 @@ pub struct TerminalRuntimeState {
     pub input_notice: Option<String>,
 }
 
+impl TerminalRuntimeState {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.task_id.is_none()
+            && self.output_file.is_none()
+            && self.output_preview.is_none()
+            && self.input_notice.is_none()
+    }
+}
+
 /// Persisted browser interaction state owned by the server runtime.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserInteractionState {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub takeover_active: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub takeover_alert_pending: bool,
+}
+
+impl BrowserInteractionState {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.takeover_active && !self.takeover_alert_pending
+    }
 }
 
 /// Persisted interactive-resource state for a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInteractionState {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BrowserInteractionState::is_empty")]
     pub browser: BrowserInteractionState,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "TerminalRuntimeState::is_empty")]
     pub terminal: TerminalRuntimeState,
 }
 
@@ -98,6 +136,11 @@ impl SessionInteractionState {
     #[must_use]
     pub const fn is_active(&self) -> bool {
         self.browser.takeover_active
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.browser.is_empty() && self.terminal.is_empty()
     }
 }
 
@@ -108,6 +151,8 @@ pub struct PendingUserMessage {
     pub content: String,
     #[serde(default)]
     pub attachments: Vec<PersistedAttachment>,
+    /// Structured hidden context injected as a system message for the next run.
+    /// This is intentionally markup-friendly text, not strict XML.
     #[serde(default)]
     pub hidden_context_xml: Option<XmlFragment>,
     pub created_at: String,
@@ -171,16 +216,17 @@ pub struct PersistedWorkspaceRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSummary {
+    #[serde(default, skip_serializing_if = "session_runtime_state_is_idle")]
     pub state: SessionRuntimeState,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "session_plan_state_is_disabled")]
     pub plan_state: SessionPlanState,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "SessionInteractionState::is_empty")]
     pub interactions: SessionInteractionState,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_immediate: Option<PendingUserMessage>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<PendingUserMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_permission: Option<PersistedPermissionRequest>,
@@ -228,6 +274,19 @@ pub struct PersistedWorkspaceRequestPayload {
 }
 
 impl SessionRuntimeSummary {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.state.is_idle()
+            && !self.plan_state.is_enabled()
+            && self.interactions.is_empty()
+            && self.queued_count == 0
+            && self.pending_immediate.is_none()
+            && self.queued_messages.is_empty()
+            && self.waiting_permission.is_none()
+            && self.waiting_workspace.is_none()
+            && self.waiting_ask_user.is_none()
+    }
+
     /// Keep overflow steer messages ahead of regular queued work.
     pub fn push_overflow_steer(&mut self, message: PendingUserMessage) {
         self.queued_messages.insert(0, message);

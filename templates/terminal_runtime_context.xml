@@ -1,4 +1,6 @@
 Model: {{ model_id }}
+Home environment kind: {{ home_environment_kind }}
+Operating system hint: {{ operating_system }}
 Home environment directory: {{ home_directory }}
 Session directory: {{ session_directory }}
 Current working directory: {{ current_working_directory }}
@@ -11,6 +13,9 @@ Session layout:
 {% endfor %}
 Command rules:
 {% for item in command_rules %}- {{ item }}
+{% endfor %}
+Environment rules:
+{% for item in environment_rules %}- {{ item }}
 {% endfor %}
 Modality support:
 {% for item in modality_support %}- {{ item }}

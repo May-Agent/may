@@ -1,94 +1,12 @@
-import { useEffect, useState } from 'react';
 import { BookOpen } from 'lucide-react';
-import * as api from '@/lib/api';
-import type {
-  NetworkAccessLogEntry,
-  NotificationMailboxEntry,
-  RequestLogCacheSummary,
-  RequestLogEntry,
-} from '@/lib/api';
+import { useStore } from '@/lib/store';
 
 export function LogsSection() {
-  const [requestLogs, setRequestLogs] = useState<RequestLogEntry[]>([]);
-  const [cacheSummary, setCacheSummary] = useState<RequestLogCacheSummary | null>(null);
-  const [mailbox, setMailbox] = useState<NotificationMailboxEntry[]>([]);
-  const [networkLogs, setNetworkLogs] = useState<NetworkAccessLogEntry[]>([]);
-  const [requestLogsError, setRequestLogsError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    let disconnectTimer: number | null = null;
-
-    const clearDisconnectError = () => {
-      if (disconnectTimer != null) {
-        window.clearTimeout(disconnectTimer);
-        disconnectTimer = null;
-      }
-      setRequestLogsError((prev) =>
-        prev === 'Logs event stream disconnected; reconnecting...' ? null : prev,
-      );
-    };
-
-    const loadLogs = async () => {
-      try {
-        const payload = await api.fetchRequestLogs();
-        const mailboxPayload = await api.fetchNotificationMailbox();
-        const networkPayload = await api.fetchNetworkAccessLogs();
-        if (!cancelled) {
-          setRequestLogs(payload.logs);
-          setCacheSummary(payload.cacheSummary);
-          setMailbox(mailboxPayload.items);
-          setNetworkLogs(networkPayload.items);
-          setRequestLogsError(null);
-          clearDisconnectError();
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setRequestLogsError(error instanceof Error ? error.message : String(error));
-        }
-      }
-    };
-
-    void loadLogs();
-    const unsubscribe = api.subscribeUiEvents({
-      onOpen: clearDisconnectError,
-      onHeartbeat: clearDisconnectError,
-      onRequestLogs: (payload) => {
-        if (cancelled) return;
-        setRequestLogs(payload.logs);
-        setCacheSummary(payload.cacheSummary);
-        setRequestLogsError(null);
-        clearDisconnectError();
-      },
-      onNotificationMailbox: (payload) => {
-        if (cancelled) return;
-        setMailbox(payload.items);
-        clearDisconnectError();
-      },
-      onNetworkAccessLogs: (payload) => {
-        if (cancelled) return;
-        setNetworkLogs(payload.items);
-        clearDisconnectError();
-      },
-      onError: () => {
-        if (disconnectTimer != null) return;
-        disconnectTimer = window.setTimeout(() => {
-          disconnectTimer = null;
-          if (!cancelled) {
-            setRequestLogsError('Logs event stream disconnected; reconnecting...');
-          }
-        }, 1200);
-      },
-    });
-
-    return () => {
-      cancelled = true;
-      if (disconnectTimer != null) {
-        window.clearTimeout(disconnectTimer);
-      }
-      unsubscribe();
-    };
-  }, []);
+  const requestLogs = useStore((state) => state.requestLogs);
+  const cacheSummary = useStore((state) => state.requestLogCacheSummary);
+  const mailbox = useStore((state) => state.notificationMailbox);
+  const networkLogs = useStore((state) => state.networkAccessLogs);
+  const requestLogsError = useStore((state) => state.backendUnavailableReason);
 
   return (
     <section className="space-y-4">

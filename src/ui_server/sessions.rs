@@ -10,6 +10,7 @@ use crate::db::ProfileEnvironmentKind;
 use crate::session::{
     MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db,
 };
+use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error};
@@ -67,6 +68,12 @@ where
 pub(super) async fn list_sessions(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<ApiSession>>> {
+    Ok(Json(list_api_sessions(state.as_ref()).await?))
+}
+
+pub(super) async fn list_api_sessions(
+    state: &UiServerState,
+) -> Result<Vec<ApiSession>, skyzen::Error> {
     let db = state.db();
     let summaries = list_summaries_from_db(&db).await.map_err(internal_error)?;
 
@@ -81,7 +88,7 @@ pub(super) async fn list_sessions(
         sessions.push(ApiSession::from_summary(s, model, Vec::new()));
     }
 
-    Ok(Json(sessions))
+    Ok(sessions)
 }
 
 pub(super) async fn get_session(
@@ -346,7 +353,7 @@ pub(super) async fn create_session(
     persist_last_model(&state, &model)
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
 
     Ok(Json(ApiSession::new_empty(id, model, resolved_profile_id)))
 }
@@ -392,7 +399,7 @@ pub(super) async fn update_session(
         .get(&id)
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
 
     Ok(Json(ApiSession {
         id,
@@ -427,7 +434,7 @@ pub(super) async fn delete_session(
         .delete_session(&id, profile_id.as_deref())
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -444,7 +451,7 @@ pub(super) async fn delete_all_sessions(
         .delete_all_session_dirs()
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
     Ok(Json(ApiHealth { ok: true }))
 }
 

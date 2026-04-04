@@ -848,7 +848,7 @@ pub(super) async fn stream_session_artifacts(
         .watch(&artifacts_root, RecursiveMode::Recursive)
         .map_err(internal_error)?;
 
-    tokio::spawn(async move {
+    state.tokio_handle.spawn(async move {
         let _watcher = watcher;
         let mut last_sig = String::new();
         let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(15));

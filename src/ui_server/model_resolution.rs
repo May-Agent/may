@@ -1,6 +1,7 @@
 //! Model resolution and persistence helpers.
 
 use crate::config::MayConfig;
+use crate::ui_event_bus::UiEventTopics;
 
 use super::state::UiServerState;
 
@@ -49,5 +50,5 @@ pub(super) async fn persist_last_model(state: &UiServerState, model: &str) -> an
         .save()
         .await
         .map_err(anyhow::Error::from)
-        .inspect(|()| state.notify_ui_events())
+        .inspect(|()| state.notify_ui_events(UiEventTopics::CONFIG))
 }

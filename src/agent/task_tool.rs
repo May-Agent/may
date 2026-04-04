@@ -1,7 +1,7 @@
 use aither_agent::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -45,7 +45,7 @@ pub struct TaskArgs {
     /// Inline terminal command payload to execute.
     #[serde(default)]
     pub script_inline: Option<String>,
-    /// Required for local(leash) tasks. Ignored for container tasks.
+    /// Required for local(heel) tasks. Ignored for container tasks.
     #[serde(default)]
     pub needs_network: Option<bool>,
 }
@@ -112,7 +112,7 @@ impl TaskCreateRequest {
 
         let needs_network = match self.runtime {
             TaskRuntimeKind::Local => self.args.needs_network.ok_or_else(|| {
-                "local(leash) task must explicitly set needs_network to true or false".to_string()
+                "local(heel) task must explicitly set needs_network to true or false".to_string()
             })?,
             TaskRuntimeKind::Container | TaskRuntimeKind::Remote => false,
         };
@@ -181,8 +181,9 @@ impl Tool for TaskTool {
     }
 
     type Arguments = TaskArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         let broker = self
             .broker
             .as_ref()
@@ -195,7 +196,7 @@ impl Tool for TaskTool {
         let response = broker.request(request).await?;
         let model = response.map_err(anyhow::Error::msg)?;
 
-        ToolOutput::json(&TaskToolResponse {
+        ToolResult::json(&TaskToolResponse {
             ok: true,
             task_id: model.task_id,
             profile_id: model.profile_id,

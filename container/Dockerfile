@@ -1,9 +1,3 @@
-# Build leash-ipc CLI used by container-side IPC command wrappers.
-FROM rust:1.85-bookworm AS leash-ipc-builder
-WORKDIR /build/leash-ipc
-COPY leash-ipc /build/leash-ipc
-RUN cargo build --bin leash-ipc
-
 # May workspace container
 # Fedora-based environment with Python/uv, data science libs, CJK fonts, and dev tools.
 FROM fedora:41
@@ -84,9 +78,9 @@ RUN uv pip install --system playwright
 RUN dnf install -y nodejs && dnf clean all
 RUN bun add --global @playwright/cli@latest @ast-grep/cli@latest
 
-# leash-ipc binary for IPC command wrappers inside container terminal sessions.
-COPY --from=leash-ipc-builder /build/leash-ipc/target/debug/leash-ipc /usr/local/bin/leash-ipc
-RUN chmod +x /usr/local/bin/leash-ipc
+# Prebuilt heel binary for IPC command wrappers inside container terminal sessions.
+COPY heel/bin/heel /usr/local/bin/heel
+RUN chmod +x /usr/local/bin/heel
 
 # Entrypoint generates playwright-cli.json from BROWSER_CDP_ENDPOINT
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

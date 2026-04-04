@@ -67,6 +67,21 @@ impl MayHomePaths {
     }
 
     #[must_use]
+    pub fn browser_dir(&self) -> PathBuf {
+        self.root.join("browser")
+    }
+
+    #[must_use]
+    pub fn browser_cache_dir(&self) -> PathBuf {
+        self.browser_dir().join("cache")
+    }
+
+    #[must_use]
+    pub fn browser_profile_dir(&self) -> PathBuf {
+        self.browser_dir().join("profile")
+    }
+
+    #[must_use]
     pub fn session_paths(&self, session_id: &str) -> SessionPaths {
         SessionPaths::new(self.sessions_dir().join(session_id))
     }

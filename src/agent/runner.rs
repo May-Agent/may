@@ -44,6 +44,7 @@ enum WorkerCommand {
     /// Run a prompt.
     Run {
         prompt: String,
+        hidden_context: Option<String>,
         attachments: Vec<url::Url>,
         event_tx: Sender<TuiEvent>,
     },
@@ -75,13 +76,19 @@ impl AgentWorker {
     ///
     /// Returns a handle to receive events from this run.
     #[must_use]
-    pub fn run(&self, prompt: String, attachments: Vec<url::Url>) -> AgentHandle {
+    pub fn run(
+        &self,
+        prompt: String,
+        hidden_context: Option<String>,
+        attachments: Vec<url::Url>,
+    ) -> AgentHandle {
         const ERR_WORKER_CHANNEL_CLOSED: &str =
             include_str!("../texts/agent_worker_channel_closed.txt");
         let (event_tx, event_rx) = unbounded();
         self.command_tx
             .try_send(WorkerCommand::Run {
                 prompt,
+                hidden_context,
                 attachments,
                 event_tx,
             })
@@ -175,12 +182,19 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>, sn
         match command {
             WorkerCommand::Run {
                 prompt,
+                hidden_context,
                 attachments,
                 event_tx,
             } => {
-                let completed =
-                    run_agent_prompt(&mut agent, &prompt, attachments, &command_rx, &event_tx)
-                        .await;
+                let completed = run_agent_prompt(
+                    &mut agent,
+                    &prompt,
+                    hidden_context.as_deref(),
+                    attachments,
+                    &command_rx,
+                    &event_tx,
+                )
+                .await;
                 if completed {
                     let session_id = agent.session_id().as_str().to_string();
                     let _ = crate::session::persist_agent_context_snapshot(
@@ -219,12 +233,14 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>, sn
 async fn run_agent_prompt(
     agent: &mut MayAgent,
     prompt: &str,
+    hidden_context: Option<&str>,
     attachments: Vec<url::Url>,
     command_rx: &Receiver<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
 ) -> bool {
     agent.sync_runtime_context().await;
-    let mut stream = std::pin::pin!(agent.run(prompt, attachments));
+    let mut stream =
+        std::pin::pin!(agent.run_with_hidden_context(prompt, hidden_context, attachments,));
 
     loop {
         // Race between stream event and cancel command

@@ -1,4 +1,5 @@
 ---
+version: 1
 name: plan
 description: Design implementation plans
 ---

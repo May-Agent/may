@@ -1,9 +1,10 @@
 //! Model fetching from provider APIs.
 
-use aither_cloud::{
-    ClaudeProvider, CloudModelProvider, CopilotProvider, GeminiProvider, OpenAIProvider,
-};
+use aither_cloud::{ClaudeProvider, CloudModelProvider, CopilotProvider, GeminiProvider};
 use aither_core::llm::{LanguageModelProvider, model::Ability};
+use aither_models::lookup as lookup_model_info;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use serde::Deserialize;
 
 use crate::config::{MayConfig, ProviderInstance, ProviderType};
 
@@ -12,6 +13,8 @@ use crate::config::{MayConfig, ProviderInstance, ProviderType};
 pub enum ModelFetchError {
     #[error("Provider error: {0}")]
     Provider(#[from] anyhow::Error),
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
     #[error("Copilot not authenticated")]
     CopilotNotAuthenticated,
     #[error("Copilot auth error: {0}")]
@@ -130,6 +133,22 @@ async fn fetch_models_for_provider(
     let api_key = instance.api_key.as_deref().unwrap_or("");
     let base_url = instance.effective_base_url(id);
 
+    if matches!(
+        ptype,
+        ProviderType::OpenAI
+            | ProviderType::OpenRouter
+            | ProviderType::DeepSeek
+            | ProviderType::Groq
+            | ProviderType::Together
+            | ProviderType::Mistral
+            | ProviderType::XAI
+            | ProviderType::Ollama
+            | ProviderType::LMStudio
+            | ProviderType::Custom
+    ) {
+        return fetch_openai_compatible_models(id, api_key, base_url).await;
+    }
+
     let provider: CloudModelProvider = match ptype {
         ProviderType::Anthropic => {
             let mut p = ClaudeProvider::new(api_key);
@@ -153,7 +172,6 @@ async fn fetch_models_for_provider(
                 .base_url(credentials.api_endpoint)
                 .into()
         }
-        // OpenAI-compatible providers
         ProviderType::OpenAI
         | ProviderType::OpenRouter
         | ProviderType::DeepSeek
@@ -162,13 +180,8 @@ async fn fetch_models_for_provider(
         | ProviderType::Mistral
         | ProviderType::XAI
         | ProviderType::Ollama
-        | ProviderType::Custom => {
-            let mut p = OpenAIProvider::new(api_key);
-            if let Some(url) = base_url {
-                p = p.base_url(url);
-            }
-            p.into()
-        }
+        | ProviderType::LMStudio
+        | ProviderType::Custom => unreachable!("handled above"),
     };
 
     let profiles = provider
@@ -215,6 +228,88 @@ async fn fetch_models_for_provider(
             }
         })
         .collect())
+}
+
+async fn fetch_openai_compatible_models(
+    id: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> Result<Vec<FetchedModel>, ModelFetchError> {
+    let base_url = base_url.unwrap_or("https://api.openai.com/v1");
+    let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut headers = HeaderMap::new();
+    if !api_key.is_empty() {
+        let token = format!("Bearer {api_key}");
+        let value = HeaderValue::from_str(&token)
+            .expect("authorization header constructed from configured API key must be valid");
+        headers.insert(AUTHORIZATION, value);
+    }
+
+    let response = reqwest::Client::new()
+        .get(endpoint)
+        .headers(headers)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<OpenAiModelListResponse>()
+        .await?;
+
+    Ok(response
+        .data
+        .into_iter()
+        .map(|model| {
+            let model_id = model.id;
+            let context_window = model
+                .context_length
+                .or(model.max_tokens)
+                .or(model.input_token_limit)
+                .or_else(|| {
+                    lookup_model_info(&model_id)
+                        .and_then(aither_models::ModelEntry::max_input_tokens)
+                });
+            let nickname = model
+                .description
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| aither_models::lookup(&model_id).map(|info| info.id().to_string()))
+                .unwrap_or_else(|| model_id.clone());
+
+            let abilities = aither_models::lookup(&model_id)
+                .map(|info| {
+                    info.abilities()
+                        .iter()
+                        .map(|ability| ability_to_label(*ability))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            FetchedModel {
+                id: model_id,
+                nickname,
+                context_window,
+                abilities,
+                provider_id: id.to_string(),
+            }
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelListResponse {
+    data: Vec<OpenAiModelDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelDescriptor {
+    id: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    context_length: Option<u32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default, alias = "inputTokenLimit", alias = "input_token_limit")]
+    input_token_limit: Option<u32>,
 }
 
 #[must_use]

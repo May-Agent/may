@@ -1,7 +1,5 @@
 use std::ops::Deref;
 
-use quick_xml::Reader;
-use quick_xml::events::Event;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -11,10 +9,8 @@ pub struct XmlFragment(String);
 
 #[derive(Debug, thiserror::Error)]
 pub enum XmlFragmentError {
-    #[error("XML fragment must not be empty")]
+    #[error("context fragment must not be empty")]
     Empty,
-    #[error("invalid XML fragment: {0}")]
-    Invalid(String),
 }
 
 pub fn serialize_tagged_xml<T: Serialize>(
@@ -34,8 +30,6 @@ impl XmlFragment {
         if trimmed.is_empty() {
             return Err(XmlFragmentError::Empty);
         }
-
-        validate_xml_fragment(trimmed)?;
         Ok(Self(trimmed.to_string()))
     }
 
@@ -100,16 +94,30 @@ impl TryFrom<&str> for XmlFragment {
     }
 }
 
-fn validate_xml_fragment(fragment: &str) -> Result<(), XmlFragmentError> {
-    let wrapped = ["<may-fragment-root>", fragment, "</may-fragment-root>"].concat();
-    let mut reader = Reader::from_str(&wrapped);
-    reader.config_mut().trim_text(false);
+#[cfg(test)]
+mod tests {
+    use super::XmlFragment;
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Eof) => return Ok(()),
-            Ok(_) => {}
-            Err(error) => return Err(XmlFragmentError::Invalid(error.to_string())),
-        }
+    #[test]
+    fn parse_accepts_plain_text_context() {
+        let fragment = XmlFragment::parse("resume from previous result")
+            .expect("plain text should be accepted");
+        assert_eq!(fragment.as_ref(), "resume from previous result");
+    }
+
+    #[test]
+    fn parse_accepts_xml_like_markup_without_balanced_xml_validation() {
+        let fragment = XmlFragment::parse("<system-alert type=\"hint\">retry via terminal")
+            .expect("xml-like context markup should be accepted without strict xml validation");
+        assert_eq!(
+            fragment.as_ref(),
+            "<system-alert type=\"hint\">retry via terminal"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_empty_content() {
+        let error = XmlFragment::parse("   ").expect_err("empty content must still fail");
+        assert_eq!(error.to_string(), "context fragment must not be empty");
     }
 }

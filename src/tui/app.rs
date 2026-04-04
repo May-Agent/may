@@ -24,7 +24,7 @@ use super::completion::{Completion, CompletionMode};
 use super::event::{AppEvent, EventSender};
 use super::history::InputHistory;
 use super::queue::{Attachment, LARGE_PASTE_THRESHOLD, MessageQueue, PendingMessage};
-use super::ui::chat::{ChatElement, ChatStream, ToolDisplay, clamp_column_by_width};
+use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
 
 pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../texts/tool_response_send_failed.txt");
@@ -2176,6 +2176,7 @@ impl App {
 
         let msg = PendingMessage {
             content,
+            hidden_context_xml: None,
             attachments,
             queued_at: jiff::Timestamp::now(),
             delivery_mode,
@@ -2195,11 +2196,6 @@ impl App {
 
         // Add user message to chat
         self.chat.push_user(&msg.content, msg.attachments.clone());
-
-        // Add to session history
-        if let Some(session) = self.session_manager.current_mut() {
-            session.history.push(ChatMessage::user(&msg.content));
-        }
 
         // Scroll to bottom
         self.scroll = usize::MAX;
@@ -2321,29 +2317,6 @@ impl App {
     /// Called when agent stream ends.
     pub fn finish_processing(&mut self) {
         self.processing = false;
-
-        // Save assistant response to history
-        let assistant_content = self
-            .chat
-            .elements()
-            .iter()
-            .rev()
-            .find_map(|e| {
-                if let ChatElement::AssistantText { content, .. } = e {
-                    Some(content.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
-        if let Some(session) = self.session_manager.current_mut() {
-            session
-                .history
-                .push(ChatMessage::assistant(&assistant_content));
-        }
-
-        // Note: History is saved asynchronously in src/bin/may.rs after finish_processing returns
     }
 
     /// Get next queued message if any.

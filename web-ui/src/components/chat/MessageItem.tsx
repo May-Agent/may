@@ -607,7 +607,6 @@ export function MessageItem({
   const [tasksError, setTasksError] = useState<string | null>(null);
   const [tasksPlanState, setTasksPlanState] = useState<SessionPlanState>('disabled');
   const setSessionPlanState = useStore((state) => state.setSessionPlanState);
-  const refreshProfileSessions = useStore((state) => state.refreshProfileSessions);
   const components = useMemo(
     () => makeComponents(isUser, isStreaming),
     [isUser, isStreaming]
@@ -835,7 +834,6 @@ export function MessageItem({
       setTasksPlanState(payload.planState);
       setTasksEditing(nextEditing);
       setSessionPlanState(sessionId, payload.planState);
-      void refreshProfileSessions();
     } catch (error) {
       setTasksError(error instanceof Error ? error.message : String(error));
     } finally {

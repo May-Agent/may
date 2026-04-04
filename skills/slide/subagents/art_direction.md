@@ -1,4 +1,5 @@
 ---
+version: 1
 name: art_direction
 description: Creates design guide and slide outline for presentations. Defines visual direction including theme, colors, typography, and layout recommendations.
 ---

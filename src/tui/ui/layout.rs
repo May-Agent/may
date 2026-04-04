@@ -706,7 +706,7 @@ fn render_profile_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         let selected = i == app.profile_selected;
         let is_current = Some(profile.id.as_str()) == app.current_profile_id.as_deref();
 
-        let env_indicator = match &profile.environment {
+        let env_indicator = match profile.environment.kind() {
             crate::profile::ProfileEnvironment::Local => "",
             crate::profile::ProfileEnvironment::Container { .. } => " [container]",
             crate::profile::ProfileEnvironment::Remote { .. } => " [remote]",

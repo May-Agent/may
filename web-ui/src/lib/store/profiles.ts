@@ -159,43 +159,35 @@ export const createProfilesSlice: StateCreator<AppState, [], [], ProfilesSlice> 
 
   pinSession: async (sessionId) => {
     await api.pinSession(sessionId);
-    await get().refreshProfileSessions();
   },
 
   unpinSession: async (sessionId) => {
     await api.unpinSession(sessionId);
-    await get().refreshProfileSessions();
   },
 
   archiveSession: async (sessionId) => {
     await api.archiveSession(sessionId);
-    await get().refreshProfileSessions();
   },
 
   unarchiveSession: async (sessionId) => {
     await api.unarchiveSession(sessionId);
-    await get().refreshProfileSessions();
   },
 
   moveSessionToFolder: async (sessionId, folderId) => {
     await api.moveSessionToFolder(sessionId, folderId);
-    await get().refreshProfileSessions();
   },
 
   createFolder: async (name) => {
     const profileId = get().currentProfileId;
     if (!profileId) return;
     await api.createFolder(profileId, name);
-    await get().refreshProfileSessions();
   },
 
   updateFolder: async (id, input) => {
     await api.updateFolder(id, input);
-    await get().refreshProfileSessions();
   },
 
   deleteFolder: async (id) => {
     await api.deleteFolder(id);
-    await get().refreshProfileSessions();
   },
 });

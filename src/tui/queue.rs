@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use jiff::Timestamp;
 
 use crate::session::PendingUserMessageMode;
+use crate::xml_fragment::XmlFragment;
 
 /// Threshold for auto-saving pasted text to file (chars).
 pub const LARGE_PASTE_THRESHOLD: usize = 4000;
@@ -34,6 +35,8 @@ pub enum Attachment {
 pub struct PendingMessage {
     /// Message content
     pub content: String,
+    /// Structured hidden context injected as a system message for the next run.
+    pub hidden_context_xml: Option<XmlFragment>,
     /// Attachments
     pub attachments: Vec<Attachment>,
     /// When the message was queued
@@ -115,6 +118,7 @@ mod tests {
     fn message(content: &str, mode: PendingUserMessageMode) -> PendingMessage {
         PendingMessage {
             content: content.to_string(),
+            hidden_context_xml: None,
             attachments: Vec::new(),
             queued_at: Timestamp::now(),
             delivery_mode: mode,

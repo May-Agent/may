@@ -1,3 +1,4 @@
+use aither_core::llm::ToolResult;
 use aither_sandbox::{
     Content, OutputEntry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalResult,
 };
@@ -44,16 +45,19 @@ const fn display_mode_from_execution_mode(mode: TerminalExecutionMode) -> Termin
 
 /// Parse tool-call completion payload into a minimal end event.
 #[must_use]
-pub fn parse_tool_end(result: &Result<String, String>) -> ToolEndKind {
-    match result {
-        Ok(output) => {
-            if let Ok(terminal_result) = serde_json::from_str::<TerminalResult>(output) {
-                ToolEndKind::Output(extract_output_text(&terminal_result))
-            } else {
-                ToolEndKind::Output(output.clone())
-            }
-        }
-        Err(e) => ToolEndKind::Error(e.clone()),
+pub fn parse_tool_end(result: &ToolResult) -> ToolEndKind {
+    if result.is_error() {
+        return ToolEndKind::Error(result.error_message().unwrap_or("tool failed").to_string());
+    }
+
+    let output = match result.render_for_model() {
+        Ok(output) => output,
+        Err(error) => return ToolEndKind::Error(error.to_string()),
+    };
+    if let Ok(terminal_result) = serde_json::from_str::<TerminalResult>(&output) {
+        ToolEndKind::Output(extract_output_text(&terminal_result))
+    } else {
+        ToolEndKind::Output(output)
     }
 }
 
@@ -64,7 +68,7 @@ fn extract_output_text(result: &TerminalResult) -> String {
             Content::Text { text, .. } => text.clone(),
             Content::Image { .. } => "[image]".to_string(),
         },
-        OutputEntry::Stored { url, content } => {
+        OutputEntry::Stored { url, content, .. } => {
             if let Some(Content::Text { text, .. }) = content {
                 text.clone()
             } else {

@@ -13,6 +13,7 @@
 //!   Enable with `--features gstreamer`. Requires `GStreamer` installed on system.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,9 +27,14 @@ use chromiumoxide::cdp::browser_protocol::page::{
     EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
 };
 use chromiumoxide::page::Page;
+use chromiumoxide_fetcher::{
+    BrowserFetcher, BrowserFetcherOptions, BrowserKind as ManagedBrowserKind,
+    BrowserVersion as ManagedBrowserVersion, Channel as ManagedBrowserChannel,
+};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
+use walkdir::WalkDir;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
@@ -45,7 +51,8 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-use crate::config::PlaywrightConfig;
+use crate::browser_service::BrowserPageSnapshot;
+use crate::config::{BrowserBackendKind, BrowserConfig as MayBrowserConfig};
 
 // ── Error ──────────────────────────────────────────────────────────────────────
 
@@ -53,12 +60,16 @@ use crate::config::PlaywrightConfig;
 pub enum BrowserError {
     #[error("Browser not running")]
     NotRunning,
+    #[error("Managed browser runtime is not provisioned")]
+    NotProvisioned,
     #[error("Browser: {0}")]
     Browser(String),
     #[error("WebRTC: {0}")]
     WebRtc(String),
     #[error("Encoder: {0}")]
     Encoder(String),
+    #[error("Provisioning: {0}")]
+    Provisioning(String),
 }
 
 // ── DataChannel input messages ─────────────────────────────────────────────────
@@ -115,15 +126,31 @@ struct EncodedSample {
 struct BrowserSession {
     browser: Browser,
     page: Arc<Page>,
+    owns_browser_process: bool,
     _handler: tokio::task::JoinHandle<()>,
     _cdp_reader: tokio::task::JoinHandle<()>,
     _sample_writer: tokio::task::JoinHandle<()>,
     _audio_writer: tokio::task::JoinHandle<()>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct BrowserRuntimeSnapshot {
     running: bool,
+    peer_count: usize,
+    cdp_endpoint: Option<Arc<str>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedBrowserListenerState {
+    NotListening,
+    Managed,
+    ExternalProcess,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserVersionMetadata {
+    web_socket_debugger_url: Option<String>,
 }
 
 enum BrowserCommand {
@@ -136,6 +163,10 @@ enum BrowserCommand {
     HandleOffer {
         offer_sdp: String,
         reply: oneshot::Sender<Result<String, BrowserError>>,
+    },
+    ReadPage {
+        url: String,
+        reply: oneshot::Sender<Result<BrowserPageSnapshot, BrowserError>>,
     },
     DropPeer {
         peer_id: String,
@@ -168,6 +199,11 @@ impl BrowserRuntime {
     fn publish_snapshot(&self, snapshot_tx: &watch::Sender<BrowserRuntimeSnapshot>) {
         let _ = snapshot_tx.send(BrowserRuntimeSnapshot {
             running: self.session.is_some(),
+            peer_count: self.peers.len(),
+            cdp_endpoint: self
+                .session
+                .as_ref()
+                .map(|session| Arc::<str>::from(session.browser.websocket_address().as_str())),
         });
     }
 
@@ -183,14 +219,16 @@ impl BrowserRuntime {
 /// Video pipeline: CDP screencast → JPEG → H.264 (Screen Content) → WebRTC
 /// Input pipeline: WebRTC `DataChannel` → JSON → CDP Input.dispatch*
 pub struct BrowserManager {
-    config: PlaywrightConfig,
     command_tx: mpsc::UnboundedSender<BrowserCommand>,
     snapshot_rx: watch::Receiver<BrowserRuntimeSnapshot>,
 }
 
 impl BrowserManager {
     /// Create a new browser manager. Sets up the WebRTC API and shared video track.
-    pub fn new(config: PlaywrightConfig) -> Result<Self, BrowserError> {
+    pub fn new(config: MayBrowserConfig, may_dir: PathBuf) -> Result<Self, BrowserError> {
+        config
+            .validate()
+            .map_err(|error| BrowserError::Browser(error.to_string()))?;
         // Register default codecs: H.264, VP8, VP9, AV1 — SDP negotiation picks the best
         let mut media_engine = MediaEngine::default();
         media_engine
@@ -234,6 +272,7 @@ impl BrowserManager {
         let actor_tx = command_tx.clone();
         let (snapshot_tx, snapshot_rx) = watch::channel(BrowserRuntimeSnapshot::default());
         let config_for_actor = config.clone();
+        let may_dir_for_actor = may_dir.clone();
 
         tokio::spawn(async move {
             let mut runtime = BrowserRuntime::new(video_track, audio_track, api);
@@ -242,7 +281,9 @@ impl BrowserManager {
             while let Some(command) = command_rx.recv().await {
                 match command {
                     BrowserCommand::Start { reply } => {
-                        let result = runtime.start(&config_for_actor).await;
+                        let result = runtime
+                            .start(&config_for_actor, may_dir_for_actor.as_path())
+                            .await;
                         runtime.publish_snapshot(&snapshot_tx);
                         let _ = reply.send(result);
                     }
@@ -253,6 +294,9 @@ impl BrowserManager {
                     }
                     BrowserCommand::HandleOffer { offer_sdp, reply } => {
                         let _ = reply.send(runtime.handle_offer(offer_sdp, actor_tx.clone()).await);
+                    }
+                    BrowserCommand::ReadPage { url, reply } => {
+                        let _ = reply.send(runtime.read_page(url.as_str()).await);
                     }
                     BrowserCommand::DropPeer { peer_id } => {
                         runtime.drop_peer(peer_id.as_str());
@@ -266,7 +310,6 @@ impl BrowserManager {
         });
 
         Ok(Self {
-            config,
             command_tx,
             snapshot_rx,
         })
@@ -277,10 +320,20 @@ impl BrowserManager {
         self.snapshot_rx.borrow().running
     }
 
-    /// CDP endpoint URL for agent connections (e.g. from container).
+    /// Number of active WebRTC peers currently attached to the managed runtime.
     #[must_use]
-    pub fn cdp_endpoint(&self) -> String {
-        format!("http://127.0.0.1:{}", self.config.port)
+    pub fn active_peer_count(&self) -> usize {
+        self.snapshot_rx.borrow().peer_count
+    }
+
+    /// CDP websocket endpoint URL for agent connections.
+    #[must_use]
+    pub fn cdp_endpoint(&self) -> Option<String> {
+        self.snapshot_rx
+            .borrow()
+            .cdp_endpoint
+            .as_ref()
+            .map(ToString::to_string)
     }
 
     /// Launch the browser and start the encoding pipeline.
@@ -323,34 +376,146 @@ impl BrowserManager {
             BrowserError::Browser("browser actor dropped offer handling reply".to_string())
         })?
     }
+
+    pub async fn read_page(&self, url: String) -> Result<BrowserPageSnapshot, BrowserError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(BrowserCommand::ReadPage {
+                url,
+                reply: reply_tx,
+            })
+            .map_err(|_| BrowserError::Browser("browser actor unexpectedly closed".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            BrowserError::Browser("browser actor dropped page read reply".to_string())
+        })?
+    }
+}
+
+pub async fn provision_managed_browser(may_dir: &Path) -> Result<PathBuf, BrowserError> {
+    let cache_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_cache_dir();
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|error| BrowserError::Provisioning(error.to_string()))?;
+
+    let options = BrowserFetcherOptions::builder()
+        .with_path(cache_dir)
+        .with_kind(ManagedBrowserKind::Chrome)
+        .with_version(ManagedBrowserVersion::Channel(
+            ManagedBrowserChannel::Stable,
+        ))
+        .build()
+        .map_err(|error| BrowserError::Provisioning(error.to_string()))?;
+
+    let installation = BrowserFetcher::new(options)
+        .fetch()
+        .await
+        .map_err(|error| BrowserError::Provisioning(error.to_string()))?;
+
+    Ok(installation.executable_path)
+}
+
+pub async fn prepare_browser_runtime(
+    config: &MayBrowserConfig,
+    may_dir: &Path,
+) -> Result<(), BrowserError> {
+    config
+        .validate()
+        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+    if config.requires_managed_runtime() {
+        let _ = provision_managed_browser(may_dir).await?;
+    }
+    Ok(())
+}
+
+#[must_use]
+pub fn provisioned_browser_executable(may_dir: &Path) -> Option<PathBuf> {
+    managed_browser_executable(may_dir).map(PathBuf::from)
+}
+
+pub async fn stop_managed_browser(port: u16, may_dir: &Path) {
+    cleanup_stale_chrome(port).await;
+    cleanup_profile_lock_files(
+        crate::session::MayHomePaths::new(may_dir.to_path_buf())
+            .browser_profile_dir()
+            .as_path(),
+    )
+    .await;
 }
 
 impl BrowserRuntime {
-    async fn start(&mut self, config: &PlaywrightConfig) -> Result<(), BrowserError> {
+    async fn start(
+        &mut self,
+        config: &MayBrowserConfig,
+        may_dir: &Path,
+    ) -> Result<(), BrowserError> {
         if self.session.is_some() {
             return Ok(());
         }
 
-        cleanup_stale_chrome(config.port).await;
+        let (browser, mut handler, owns_browser_process) = match config.backend {
+            BrowserBackendKind::Managed => {
+                match inspect_managed_browser_listener_state(config.port).await? {
+                    ManagedBrowserListenerState::Managed => {
+                        let endpoint =
+                            resolve_local_browser_websocket_endpoint(config.port).await?;
+                        let (browser, handler) = Browser::connect(endpoint)
+                            .await
+                            .map_err(|error| BrowserError::Browser(error.to_string()))?;
+                        (browser, handler, false)
+                    }
+                    ManagedBrowserListenerState::ExternalProcess => {
+                        return Err(BrowserError::Browser(format!(
+                            "browser port {} is already in use by a non-May process",
+                            config.port
+                        )));
+                    }
+                    ManagedBrowserListenerState::NotListening => {
+                        cleanup_stale_chrome(config.port).await;
 
-        let browser_kind = config.browser;
-        let binary_path = tokio::task::spawn_blocking(move || find_browser_binary(browser_kind))
-            .await
-            .map_err(|e| BrowserError::Browser(e.to_string()))?;
+                        let may_dir = may_dir.to_path_buf();
+                        let browser_paths = tokio::task::spawn_blocking(move || {
+                            let home = crate::session::MayHomePaths::new(may_dir);
+                            (
+                                managed_browser_executable(home.root()),
+                                home.browser_profile_dir(),
+                            )
+                        })
+                        .await
+                        .map_err(|e| BrowserError::Browser(e.to_string()))?;
+                        let (binary_path, profile_dir) = browser_paths;
+                        cleanup_profile_lock_files(profile_dir.as_path()).await;
+                        tokio::fs::create_dir_all(&profile_dir)
+                            .await
+                            .map_err(|error| BrowserError::Browser(error.to_string()))?;
 
-        let mut builder = BrowserConfig::builder()
-            .port(config.port)
-            .arg("--remote-allow-origins=*")
-            .arg("--remote-debugging-address=0.0.0.0");
+                        let mut builder = BrowserConfig::builder()
+                            .new_headless_mode()
+                            .port(config.port)
+                            .arg("--remote-allow-origins=*")
+                            .arg("--remote-debugging-address=0.0.0.0")
+                            .user_data_dir(profile_dir);
 
-        if let Some(path) = binary_path {
-            builder = builder.chrome_executable(path);
-        }
+                        let path = binary_path.ok_or(BrowserError::NotProvisioned)?;
+                        builder = builder.chrome_executable(path);
 
-        let browser_config = builder.build().map_err(BrowserError::Browser)?;
-        let (browser, mut handler) = Browser::launch(browser_config)
-            .await
-            .map_err(|e| BrowserError::Browser(e.to_string()))?;
+                        let browser_config = builder.build().map_err(BrowserError::Browser)?;
+                        let (browser, handler) = Browser::launch(browser_config)
+                            .await
+                            .map_err(|error| BrowserError::Browser(error.to_string()))?;
+                        (browser, handler, true)
+                    }
+                }
+            }
+            BrowserBackendKind::RemoteCdp => {
+                let endpoint = config
+                    .remote_cdp_endpoint()
+                    .map_err(|error| BrowserError::Browser(error.to_string()))?;
+                let (browser, handler) = Browser::connect(endpoint)
+                    .await
+                    .map_err(|error| BrowserError::Browser(error.to_string()))?;
+                (browser, handler, false)
+            }
+        };
 
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
@@ -386,13 +551,14 @@ impl BrowserRuntime {
         self.session = Some(BrowserSession {
             browser,
             page,
+            owns_browser_process,
             _handler: handler_task,
             _cdp_reader: cdp_reader,
             _sample_writer: sample_writer,
             _audio_writer: audio_writer,
         });
 
-        tracing::info!(port = config.port, "Browser started with WebRTC streaming");
+        tracing::info!(backend = ?config.backend, "Browser started with WebRTC streaming");
         Ok(())
     }
 
@@ -407,7 +573,11 @@ impl BrowserRuntime {
             session._sample_writer.abort();
             session._audio_writer.abort();
             session._handler.abort();
-            let _ = session.browser.close().await;
+            if session.owns_browser_process {
+                let _ = session.browser.close().await;
+            } else {
+                let _ = session.page.as_ref().clone().close().await;
+            }
             tracing::info!("Browser stopped");
         }
 
@@ -494,6 +664,108 @@ impl BrowserRuntime {
         self.peers.insert(peer_id, peer_connection);
         Ok(local_desc.sdp)
     }
+
+    async fn read_page(&self, url: &str) -> Result<BrowserPageSnapshot, BrowserError> {
+        let page = self
+            .session
+            .as_ref()
+            .ok_or(BrowserError::NotRunning)?
+            .page
+            .clone();
+        read_page_snapshot(page, url).await
+    }
+}
+
+async fn inspect_managed_browser_listener_state(
+    port: u16,
+) -> Result<ManagedBrowserListenerState, BrowserError> {
+    tokio::task::spawn_blocking(move || inspect_managed_browser_listener_state_blocking(port))
+        .await
+        .map_err(|error| BrowserError::Browser(error.to_string()))?
+}
+
+fn inspect_managed_browser_listener_state_blocking(
+    port: u16,
+) -> Result<ManagedBrowserListenerState, BrowserError> {
+    let output = std::process::Command::new("lsof")
+        .args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"])
+        .output()
+        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return Ok(ManagedBrowserListenerState::NotListening);
+    }
+
+    let pids = String::from_utf8_lossy(&output.stdout);
+    if pids.trim().is_empty() {
+        return Ok(ManagedBrowserListenerState::NotListening);
+    }
+
+    for pid in pids.split_whitespace() {
+        let command = std::process::Command::new("ps")
+            .args(["-p", pid, "-o", "args="])
+            .output()
+            .map_err(|error| BrowserError::Browser(error.to_string()))?;
+        if !command.status.success() {
+            return Err(BrowserError::Browser(format!("ps failed for pid {pid}")));
+        }
+        if String::from_utf8_lossy(&command.stdout).contains("chromiumoxide-runner") {
+            return Ok(ManagedBrowserListenerState::Managed);
+        }
+    }
+
+    Ok(ManagedBrowserListenerState::ExternalProcess)
+}
+
+async fn resolve_local_browser_websocket_endpoint(port: u16) -> Result<String, BrowserError> {
+    let mut endpoint = String::from("http://127.0.0.1:");
+    endpoint.push_str(&port.to_string());
+    endpoint.push_str("/json/version");
+    let response = reqwest::get(endpoint.as_str())
+        .await
+        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(BrowserError::Browser(format!(
+            "browser debugger metadata request to {} returned HTTP {}",
+            endpoint,
+            response.status()
+        )));
+    }
+    let metadata: BrowserVersionMetadata = response
+        .json()
+        .await
+        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+    metadata.web_socket_debugger_url.ok_or_else(|| {
+        BrowserError::Browser(format!(
+            "browser debugger metadata at {} did not include webSocketDebuggerUrl",
+            endpoint
+        ))
+    })
+}
+
+async fn read_page_snapshot(
+    page: Arc<Page>,
+    url: &str,
+) -> Result<BrowserPageSnapshot, BrowserError> {
+    let trimmed_url = url.trim();
+    if trimmed_url.is_empty() {
+        return Err(BrowserError::Browser(
+            "browser read requires a non-empty url".to_string(),
+        ));
+    }
+
+    page.goto(trimmed_url)
+        .await
+        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    let snapshot: BrowserPageSnapshot = page
+        .evaluate("() => { const norm = (value) => typeof value === 'string' ? value.replace(/\\s+/g, ' ').trim() : ''; const headings = Array.from(document.querySelectorAll('h1, h2, h3')).map((node) => norm(node.innerText)).filter(Boolean).slice(0, 8); const bodyText = norm(document.body ? document.body.innerText : '').slice(0, 4000); return { url: location.href, title: norm(document.title), mainHeading: headings.length > 0 ? headings[0] : null, headings, textExcerpt: bodyText }; }")
+        .await
+        .map_err(|error| BrowserError::Browser(error.to_string()))?
+        .into_value()
+        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+
+    Ok(snapshot)
 }
 
 async fn start_encoding_pipeline(
@@ -858,51 +1130,37 @@ async fn cleanup_stale_chrome(port: u16) {
     .await;
 }
 
-/// Find the browser binary path. Runs in `spawn_blocking` since it does filesystem I/O.
-fn find_browser_binary(browser: crate::config::PlaywrightBrowser) -> Option<String> {
-    use crate::config::PlaywrightBrowser;
-    use std::path::{Path, PathBuf};
+async fn cleanup_profile_lock_files(profile_dir: &Path) {
+    let profile_dir = profile_dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+            let path = profile_dir.join(name);
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    })
+    .await;
+}
 
-    match browser {
-        PlaywrightBrowser::LocalChrome => {
-            let candidates = [
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "/usr/bin/google-chrome",
-                "/usr/bin/google-chrome-stable",
-                "/usr/bin/chromium-browser",
-                "/usr/bin/chromium",
-            ];
-            candidates
-                .iter()
-                .find(|p| Path::new(p).exists())
-                .map(std::string::ToString::to_string)
-        }
-        PlaywrightBrowser::Chromium => {
-            let home = dirs::home_dir()?;
-            let cache_dir = home.join(".cache/ms-playwright");
-            if cache_dir.exists()
-                && let Ok(entries) = std::fs::read_dir(&cache_dir)
-            {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with("chromium-") {
-                        #[cfg(target_os = "macos")]
-                        let binary = entry
-                            .path()
-                            .join("chrome-mac/Chromium.app/Contents/MacOS/Chromium");
-                        #[cfg(not(target_os = "macos"))]
-                        let binary = entry.path().join("chrome-linux/chrome");
-                        if binary.exists() {
-                            return Some(binary.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
-            let homebrew = PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium");
-            if homebrew.exists() {
-                return Some(homebrew.to_string_lossy().to_string());
-            }
-            None
-        }
+/// Resolve the provisioned browser binary path. Runs in `spawn_blocking` since it does filesystem I/O.
+fn managed_browser_executable(may_dir: &Path) -> Option<String> {
+    let cache_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_cache_dir();
+    if !cache_dir.exists() {
+        return None;
     }
+
+    let binary_name = if cfg!(target_os = "macos") {
+        "Google Chrome for Testing"
+    } else if cfg!(target_os = "windows") {
+        "chrome.exe"
+    } else {
+        "chrome"
+    };
+
+    WalkDir::new(cache_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().is_file() && entry.file_name() == binary_name)
+        .map(|entry| entry.path().to_string_lossy().to_string())
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { Clock3, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -23,6 +23,7 @@ export function TasksSection() {
     runTask,
     profiles,
     currentProfileId,
+    refreshProfiles,
   } = useStore();
 
   const [taskName, setTaskName] = useState('');
@@ -36,10 +37,22 @@ export function TasksSection() {
   const [taskNeedsNetwork, setTaskNeedsNetwork] = useState(false);
   const [taskProfileOverrideId, setTaskProfileOverrideId] = useState<string | null>(null);
   const [taskFormError, setTaskFormError] = useState<string | null>(null);
+  const idBase = useId();
+  const profileSelectId = `${idBase}-task-profile`;
+  const taskNameId = `${idBase}-task-name`;
+  const triggerKindId = `${idBase}-task-trigger-kind`;
+  const triggerTypeId = `${idBase}-task-trigger-type`;
+  const eventNameId = `${idBase}-task-event-name`;
+  const runAtId = `${idBase}-task-run-at`;
+  const cronId = `${idBase}-task-cron`;
+  const scriptPathId = `${idBase}-task-script-path`;
+  const scriptInlineId = `${idBase}-task-script-inline`;
+  const needsNetworkId = `${idBase}-task-needs-network`;
 
   useEffect(() => {
+    void refreshProfiles();
     void refreshTasks();
-  }, [refreshTasks]);
+  }, [refreshProfiles, refreshTasks]);
 
   const defaultTaskProfileId = currentProfileId ?? profiles[0]?.id ?? '';
   const taskProfileId = useMemo(() => {
@@ -174,9 +187,9 @@ export function TasksSection() {
       <div className="rounded border p-4 space-y-3">
         <div className="grid gap-3 md:grid-cols-2">
           <div className="space-y-1">
-            <Label>Profile</Label>
+            <Label htmlFor={profileSelectId}>Profile</Label>
             <Select value={taskProfileId} onValueChange={setTaskProfileOverrideId}>
-              <SelectTrigger>
+              <SelectTrigger id={profileSelectId} aria-label="Profile">
                 <SelectValue placeholder="Select profile" />
               </SelectTrigger>
               <SelectContent>
@@ -190,8 +203,9 @@ export function TasksSection() {
           </div>
 
           <div className="space-y-1">
-            <Label>Name</Label>
+            <Label htmlFor={taskNameId}>Name</Label>
             <Input
+              id={taskNameId}
               value={taskName}
               onChange={(e) => setTaskName(e.target.value)}
               placeholder="Daily report"
@@ -199,12 +213,12 @@ export function TasksSection() {
           </div>
 
           <div className="space-y-1">
-            <Label>Trigger Kind</Label>
+            <Label htmlFor={triggerKindId}>Trigger Kind</Label>
             <Select
               value={taskTriggerKind}
               onValueChange={(v) => setTaskTriggerKind(v as TaskTriggerKind)}
             >
-              <SelectTrigger>
+              <SelectTrigger id={triggerKindId} aria-label="Trigger Kind">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -219,12 +233,12 @@ export function TasksSection() {
 
           {taskTriggerKind === 'time' && (
             <div className="space-y-1">
-              <Label>Trigger</Label>
+              <Label htmlFor={triggerTypeId}>Trigger</Label>
               <Select
                 value={taskTriggerType}
                 onValueChange={(v) => setTaskTriggerType(v as TimeTriggerType)}
               >
-                <SelectTrigger>
+                <SelectTrigger id={triggerTypeId} aria-label="Trigger">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -240,8 +254,9 @@ export function TasksSection() {
 
           {taskTriggerKind === 'time' && taskTriggerType === 'once' && (
             <div className="space-y-1">
-              <Label>Run At (UTC ISO8601)</Label>
+              <Label htmlFor={runAtId}>Run At (UTC ISO8601)</Label>
               <Input
+                id={runAtId}
                 value={taskRunAt}
                 onChange={(e) => setTaskRunAt(e.target.value)}
                 placeholder="2026-02-15T06:00:00Z"
@@ -251,8 +266,9 @@ export function TasksSection() {
 
           {taskTriggerKind === 'time' && taskTriggerType === 'cron' && (
             <div className="space-y-1">
-              <Label>Cron Expression</Label>
+              <Label htmlFor={cronId}>Cron Expression</Label>
               <Input
+                id={cronId}
                 value={taskCron}
                 onChange={(e) => setTaskCron(e.target.value)}
                 placeholder="0 6 * * *"
@@ -262,8 +278,9 @@ export function TasksSection() {
 
           {taskTriggerKind === 'event' && (
             <div className="space-y-1">
-              <Label>Event Name</Label>
+              <Label htmlFor={eventNameId}>Event Name</Label>
               <Input
+                id={eventNameId}
                 value={taskEventName}
                 onChange={(e) => setTaskEventName(e.target.value)}
                 placeholder="chat.turn.completed"
@@ -279,8 +296,9 @@ export function TasksSection() {
           )}
 
           <div className="space-y-1 md:col-span-2">
-            <Label>Script Path</Label>
+            <Label htmlFor={scriptPathId}>Script Path</Label>
             <Input
+              id={scriptPathId}
               value={taskScriptPath}
               onChange={(e) => setTaskScriptPath(e.target.value)}
               placeholder="/absolute/path/to/script.sh"
@@ -288,8 +306,9 @@ export function TasksSection() {
           </div>
 
           <div className="space-y-1 md:col-span-2">
-            <Label>Inline Script</Label>
+            <Label htmlFor={scriptInlineId}>Inline Script</Label>
             <Textarea
+              id={scriptInlineId}
               value={taskScriptInline}
               onChange={(e) => setTaskScriptInline(e.target.value)}
               placeholder="#!/usr/bin/env bash"
@@ -300,13 +319,14 @@ export function TasksSection() {
 
         <div className="flex items-center gap-3">
           <input
+            id={needsNetworkId}
             type="checkbox"
             checked={taskNeedsNetwork}
             onChange={(e) => setTaskNeedsNetwork(e.target.checked)}
           />
-          <span className="text-xs text-muted-foreground">
-            Leash task requires network access
-          </span>
+          <Label htmlFor={needsNetworkId} className="text-xs text-muted-foreground">
+            Heel task requires network access
+          </Label>
         </div>
 
         {taskFormError && (
@@ -314,7 +334,7 @@ export function TasksSection() {
         )}
 
         <div className="flex gap-2">
-          <Button onClick={() => void handleCreateTask()}>
+          <Button onClick={() => void handleCreateTask()} disabled={!taskProfileId}>
             <Plus className="h-4 w-4 mr-2" />
             Create Task
           </Button>

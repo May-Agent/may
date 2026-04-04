@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::db::ChatDb;
 use crate::notification::{NotificationManager, NotificationPayload};
+use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use crate::xml_fragment::XmlFragment;
 
 const MAILBOX_STATUS_PENDING: &str = "pending";
@@ -14,12 +15,21 @@ const MAILBOX_STATUS_FAILED: &str = "failed";
 pub struct NotificationService {
     db: ChatDb,
     manager: Arc<NotificationManager>,
+    ui_event_bus: UiEventBus,
 }
 
 impl NotificationService {
     #[must_use]
-    pub const fn new(db: ChatDb, manager: Arc<NotificationManager>) -> Self {
-        Self { db, manager }
+    pub const fn new(
+        db: ChatDb,
+        manager: Arc<NotificationManager>,
+        ui_event_bus: UiEventBus,
+    ) -> Self {
+        Self {
+            db,
+            manager,
+            ui_event_bus,
+        }
     }
 
     #[must_use]
@@ -93,6 +103,8 @@ impl NotificationService {
                         delivered_at.as_deref(),
                     )
                     .await?;
+                self.ui_event_bus
+                    .publish(UiEventTopics::NOTIFICATION_MAILBOX);
                 Ok(sent_count)
             }
             Err(error) => {
@@ -106,6 +118,8 @@ impl NotificationService {
                         None,
                     )
                     .await?;
+                self.ui_event_bus
+                    .publish(UiEventTopics::NOTIFICATION_MAILBOX);
                 Err(NotificationServiceError::Notification(error))
             }
         }
@@ -152,6 +166,8 @@ impl NotificationService {
                             delivered_at.as_deref(),
                         )
                         .await?;
+                    self.ui_event_bus
+                        .publish(UiEventTopics::NOTIFICATION_MAILBOX);
                 }
                 Err(error) => {
                     let error_text = error.to_string();
@@ -164,6 +180,8 @@ impl NotificationService {
                             None,
                         )
                         .await?;
+                    self.ui_event_bus
+                        .publish(UiEventTopics::NOTIFICATION_MAILBOX);
                 }
             }
         }
@@ -175,7 +193,7 @@ impl NotificationService {
 pub enum NotificationServiceError {
     #[error("database error: {0}")]
     Db(#[from] crate::db::ChatDbError),
-    #[error("invalid XML fragment: {0}")]
+    #[error("invalid context fragment: {0}")]
     InvalidXml(#[from] crate::xml_fragment::XmlFragmentError),
     #[error("notification transport error: {0}")]
     Notification(#[from] crate::notification::NotificationError),

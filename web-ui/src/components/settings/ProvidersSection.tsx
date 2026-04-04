@@ -1,4 +1,4 @@
-import { createElement, useCallback, useEffect, useState } from 'react';
+import { createElement, useCallback, useEffect, useRef, useState } from 'react';
 import { Boxes, Plus, Trash2, ExternalLink } from 'lucide-react';
 import * as api from '@/lib/api';
 import { Button } from '@/components/ui/button';
@@ -13,19 +13,45 @@ import {
   type ConfigSectionProps,
 } from './constants';
 
+type CopilotAuthState = {
+  authenticated: boolean;
+  loading: boolean;
+  authorizing: boolean;
+  userCode?: string;
+  verificationUri?: string;
+  message?: string;
+};
+
+function describeCopilotAuthStatus(status: api.CopilotAuthEvent['status']): string {
+  switch (status) {
+    case 'pending':
+      return 'Waiting for authorization...';
+    case 'success':
+      return 'Copilot connected';
+    case 'expired':
+      return 'Device code expired. Please restart authentication.';
+    case 'denied':
+      return 'Authorization denied by user.';
+    case 'error':
+      return 'Copilot authorization failed';
+  }
+}
+
 export function ProvidersSection({ configDraft, setDraft }: ConfigSectionProps) {
   const [newProviderType, setNewProviderType] = useState<UiProviderConfig['providerType']>('openai');
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
   const [providerModels, setProviderModels] = useState<Record<string, api.ModelDetailsItem[]>>({});
-  const [copilotAuth, setCopilotAuth] = useState<{
-    authenticated: boolean;
-    loading: boolean;
-    polling: boolean;
-    deviceCode?: string;
-    userCode?: string;
-    verificationUri?: string;
-    message?: string;
-  }>({ authenticated: false, loading: false, polling: false });
+  const [copilotAuth, setCopilotAuth] = useState<CopilotAuthState>({
+    authenticated: false,
+    loading: false,
+    authorizing: false,
+  });
+  const copilotAuthStreamRef = useRef<(() => void) | null>(null);
+
+  const closeCopilotAuthStream = useCallback(() => {
+    copilotAuthStreamRef.current?.();
+    copilotAuthStreamRef.current = null;
+  }, []);
 
   const fetchProviderModelsWithRetry = useCallback(async (): Promise<ProviderModelsItem[]> => {
     const maxAttempts = 4;
@@ -72,37 +98,7 @@ export function ProvidersSection({ configDraft, setDraft }: ConfigSectionProps) 
     return () => { cancelled = true; };
   }, []);
 
-  useEffect(() => {
-    if (!copilotAuth.polling || !copilotAuth.deviceCode) return;
-    let cancelled = false;
-    const timer = window.setInterval(async () => {
-      if (cancelled) return;
-      try {
-        const res = await api.pollCopilotAuth(copilotAuth.deviceCode!);
-        if (cancelled) return;
-        if (res.status === 'pending') return;
-        if (res.status === 'success') {
-          setCopilotAuth((s) => ({
-            ...s,
-            polling: false,
-            authenticated: true,
-            message: 'Copilot connected',
-          }));
-          return;
-        }
-        setCopilotAuth((s) => ({
-          ...s,
-          polling: false,
-          message: res.message ?? `Copilot auth ${res.status}`,
-        }));
-      } catch (e) {
-        if (!cancelled) {
-          setCopilotAuth((s) => ({ ...s, polling: false, message: (e as Error).message }));
-        }
-      }
-    }, 2500);
-    return () => { cancelled = true; window.clearInterval(timer); };
-  }, [copilotAuth.polling, copilotAuth.deviceCode]);
+  useEffect(() => closeCopilotAuthStream, [closeCopilotAuthStream]);
 
   useEffect(() => {
     let cancelled = false;
@@ -127,20 +123,64 @@ export function ProvidersSection({ configDraft, setDraft }: ConfigSectionProps) 
   }, [configDraft?.providers.length, fetchProviderModelsWithRetry]);
 
   const startCopilotOAuth = async () => {
-    setCopilotAuth((s) => ({ ...s, loading: true, message: undefined }));
+    closeCopilotAuthStream();
+    setCopilotAuth((s) => ({
+      ...s,
+      loading: true,
+      authorizing: false,
+      authenticated: false,
+      message: undefined,
+    }));
     try {
       const start = await api.startCopilotAuth();
+      const stopCopilotAuthStream = api.subscribeCopilotAuth({
+        deviceCode: start.deviceCode,
+        interval: start.interval,
+        onEvent: (event) => {
+          if (event.status !== 'pending') {
+            copilotAuthStreamRef.current = null;
+          }
+          setCopilotAuth((s) => ({
+            ...s,
+            authenticated: event.status === 'success',
+            loading: false,
+            authorizing: event.status === 'pending',
+            userCode: event.status === 'pending' ? s.userCode : undefined,
+            verificationUri: event.status === 'pending' ? s.verificationUri : undefined,
+            message: event.message ?? describeCopilotAuthStatus(event.status),
+          }));
+        },
+        onError: () => {
+          copilotAuthStreamRef.current = null;
+          setCopilotAuth((s) => ({
+            ...s,
+            authenticated: false,
+            loading: false,
+            authorizing: false,
+            message: 'Copilot authorization stream failed',
+          }));
+        },
+      });
+      copilotAuthStreamRef.current = () => {
+        stopCopilotAuthStream();
+        copilotAuthStreamRef.current = null;
+      };
       setCopilotAuth((s) => ({
         ...s,
         loading: false,
-        polling: true,
-        deviceCode: start.deviceCode,
+        authorizing: true,
         userCode: start.userCode,
         verificationUri: start.verificationUri,
+        message: 'Waiting for authorization...',
       }));
       window.open(start.verificationUri, '_blank', 'noopener,noreferrer');
     } catch (e) {
-      setCopilotAuth((s) => ({ ...s, loading: false, message: (e as Error).message }));
+      setCopilotAuth((s) => ({
+        ...s,
+        loading: false,
+        authorizing: false,
+        message: (e as Error).message,
+      }));
     }
   };
 
@@ -232,8 +272,17 @@ export function ProvidersSection({ configDraft, setDraft }: ConfigSectionProps) 
               provider={selectedProvider}
               providerModels={selectedProviderModels}
               copilotAuth={copilotAuth}
-              setCopilotAuth={setCopilotAuth}
               onStartCopilotOAuth={startCopilotOAuth}
+              onLogoutCopilot={async () => {
+                closeCopilotAuthStream();
+                await api.logoutCopilot();
+                setCopilotAuth({
+                  authenticated: false,
+                  loading: false,
+                  authorizing: false,
+                  message: 'Signed out',
+                });
+              }}
               setDraft={setDraft}
               setSelectedProviderId={setSelectedProviderId}
             />
@@ -248,16 +297,16 @@ function ProviderDetail({
   provider,
   providerModels,
   copilotAuth,
-  setCopilotAuth,
   onStartCopilotOAuth,
+  onLogoutCopilot,
   setDraft,
   setSelectedProviderId,
 }: {
   provider: UiProviderConfig;
   providerModels: api.ModelDetailsItem[];
-  copilotAuth: { authenticated: boolean; loading: boolean; polling: boolean; userCode?: string; verificationUri?: string; message?: string };
-  setCopilotAuth: React.Dispatch<React.SetStateAction<typeof copilotAuth>>;
+  copilotAuth: CopilotAuthState;
   onStartCopilotOAuth: () => Promise<void>;
+  onLogoutCopilot: () => Promise<void>;
   setDraft: ConfigSectionProps['setDraft'];
   setSelectedProviderId: React.Dispatch<React.SetStateAction<string | null>>;
 }) {
@@ -361,7 +410,7 @@ function ProviderDetail({
           <div className="text-xs text-muted-foreground">
             {copilotAuth.authenticated
               ? 'Connected'
-              : copilotAuth.polling
+              : copilotAuth.authorizing
                 ? 'Waiting for authorization...'
                 : 'Not connected'}
           </div>
@@ -375,16 +424,13 @@ function ProviderDetail({
           )}
           {copilotAuth.message && <div className="text-xs text-muted-foreground">{copilotAuth.message}</div>}
           <div className="flex gap-2">
-            <Button size="sm" onClick={() => void onStartCopilotOAuth()} disabled={copilotAuth.loading || copilotAuth.polling}>
+            <Button size="sm" onClick={() => void onStartCopilotOAuth()} disabled={copilotAuth.loading || copilotAuth.authorizing}>
               <ExternalLink className="h-3 w-3 mr-1" /> Sign in
             </Button>
             <Button
               size="sm"
               variant="outline"
-              onClick={async () => {
-                await api.logoutCopilot();
-                setCopilotAuth((s) => ({ ...s, authenticated: false, polling: false, message: 'Signed out' }));
-              }}
+              onClick={() => void onLogoutCopilot()}
             >
               Sign out
             </Button>

@@ -7,6 +7,8 @@ use skyzen::Result as SkyResult;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
+use crate::ui_event_bus::UiEventTopics;
+
 use super::error::{bad_request_error, internal_error};
 use super::state::UiServerState;
 
@@ -135,7 +137,7 @@ pub(super) async fn consume_notification_callback(
             }
             other => internal_error(other),
         })?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::NOTIFICATION_MAILBOX);
 
     Ok(Json(super::types::NotificationCallbackResponse {
         notification_id: callback.id,

@@ -1,4 +1,5 @@
 import type { ProfileInfo, ProfileSessions, Session, SessionSummary } from '@/types';
+import type { UiConfig } from '@/lib/api';
 import { ApiError } from '@/lib/api';
 import * as api from '@/lib/api';
 import { useRuntimeStore } from '@/lib/runtimeStore';
@@ -41,6 +42,22 @@ export function backendUnavailableReasonFromError(error: unknown): string | null
     return error.message;
   }
   return null;
+}
+
+export function buildUiConfigState(
+  config: UiConfig,
+): Pick<AppState, 'settings' | 'uiConfig'> {
+  return {
+    settings: {
+      font: config.uiFont,
+      theme: config.uiTheme,
+    },
+    uiConfig: {
+      sshServers: config.sshServers,
+      maxIterations: config.maxIterations,
+      fullConfig: config.fullConfig,
+    },
+  };
 }
 
 export function isContainerTransientBlockedCode(code: string | null): boolean {

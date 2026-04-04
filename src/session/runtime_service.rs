@@ -1,8 +1,5 @@
-use std::sync::Arc;
-
-use tokio::sync::Notify;
-
 use crate::db::ChatDb;
+use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 
 use super::{
     PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
@@ -13,7 +10,7 @@ use super::{
 #[derive(Clone)]
 pub struct SessionRuntimeService {
     db: ChatDb,
-    notify: Arc<Notify>,
+    ui_event_bus: UiEventBus,
 }
 
 impl std::fmt::Debug for SessionRuntimeService {
@@ -24,8 +21,8 @@ impl std::fmt::Debug for SessionRuntimeService {
 }
 
 impl SessionRuntimeService {
-    pub const fn new(db: ChatDb, notify: Arc<Notify>) -> Self {
-        Self { db, notify }
+    pub const fn new(db: ChatDb, ui_event_bus: UiEventBus) -> Self {
+        Self { db, ui_event_bus }
     }
 
     #[must_use]
@@ -33,8 +30,12 @@ impl SessionRuntimeService {
         self.db.clone()
     }
 
-    fn notify_ui(&self) {
-        self.notify.notify_waiters();
+    fn publish_ui(&self, topics: UiEventTopics) {
+        self.ui_event_bus.publish(topics);
+    }
+
+    pub fn publish_ui_events(&self, topics: UiEventTopics) {
+        self.publish_ui(topics);
     }
 
     pub async fn get(
@@ -54,7 +55,7 @@ impl SessionRuntimeService {
         state: SessionRuntimeState,
     ) -> Result<(), crate::db::ChatDbError> {
         self.db.set_session_runtime_state(session_id, state).await?;
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(())
     }
 
@@ -67,7 +68,7 @@ impl SessionRuntimeService {
             .db
             .set_session_plan_state(session_id, plan_state)
             .await?;
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
     }
 
@@ -84,7 +85,7 @@ impl SessionRuntimeService {
                 .set_pending_immediate_message(session_id, message)
                 .await?
         };
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
     }
 
@@ -93,13 +94,16 @@ impl SessionRuntimeService {
         profile_id: &str,
     ) -> Result<Vec<(String, SessionRuntimeSummary)>, crate::db::ChatDbError> {
         let sessions = self.db.list_sessions_for_profile(profile_id).await?;
+        let session_ids = sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        let mut runtime_by_session = self.db.list_session_runtime_summaries(&session_ids).await?;
         let mut runtimes = Vec::with_capacity(sessions.len());
         for session in sessions {
             let session_id = session.id;
-            let runtime = self
-                .db
-                .get_session_runtime(&session_id)
-                .await?
+            let runtime = runtime_by_session
+                .remove(session_id.as_str())
                 .unwrap_or_default();
             runtimes.push((session_id, runtime));
         }
@@ -114,7 +118,7 @@ impl SessionRuntimeService {
             .db
             .take_next_dispatchable_pending_message(session_id)
             .await?;
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(next)
     }
 
@@ -123,7 +127,7 @@ impl SessionRuntimeService {
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.clear_pending_immediate_message(session_id).await?;
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
     }
 
@@ -133,7 +137,7 @@ impl SessionRuntimeService {
         index: usize,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.remove_queued_message_at(session_id, index).await?;
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
     }
 
@@ -143,7 +147,7 @@ impl SessionRuntimeService {
         request: Option<PersistedPermissionRequest>,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.set_waiting_permission(session_id, request).await?;
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
     }
 
@@ -153,7 +157,7 @@ impl SessionRuntimeService {
         request: Option<PersistedWorkspaceRequest>,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.set_waiting_workspace(session_id, request).await?;
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
     }
 
@@ -163,7 +167,7 @@ impl SessionRuntimeService {
         request: Option<PersistedAskUserRequest>,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.set_waiting_ask_user(session_id, request).await?;
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
     }
 
@@ -184,7 +188,11 @@ impl SessionRuntimeService {
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.set_browser_takeover_owner(session_id).await?;
-        self.notify_ui();
+        self.publish_ui(
+            UiEventTopics::SESSION_RUNTIME
+                | UiEventTopics::SESSION_RUNTIMES
+                | UiEventTopics::BROWSER_STATUS,
+        );
         Ok(summary)
     }
 
@@ -193,7 +201,11 @@ impl SessionRuntimeService {
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.clear_browser_takeover_owner(session_id).await?;
-        self.notify_ui();
+        self.publish_ui(
+            UiEventTopics::SESSION_RUNTIME
+                | UiEventTopics::SESSION_RUNTIMES
+                | UiEventTopics::BROWSER_STATUS,
+        );
         Ok(summary)
     }
 
@@ -219,7 +231,7 @@ impl SessionRuntimeService {
             .take_browser_takeover_alert_pending(session_id)
             .await?;
         if pending {
-            self.notify_ui();
+            self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         }
         Ok(pending)
     }
@@ -233,7 +245,7 @@ impl SessionRuntimeService {
         summary.interactions.terminal = terminal;
         summary.normalize_state();
         self.db.write_session_runtime(session_id, &summary).await?;
-        self.notify_ui();
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
     }
 

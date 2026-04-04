@@ -1,4 +1,5 @@
 ---
+version: 1
 name: slide_creator
 description: Creates individual Slidev slides with visual verification. Renders slide as PNG and verifies it matches the art direction before returning.
 ---
@@ -43,8 +44,10 @@ EOF
 
 ### Step 2: Render to PNG
 
+Use the May-managed browser/runtime for rendering. Do not install or manage Playwright browser binaries from the agent side.
+
 ```bash
-cd artifacts/temp && npx slidev export --format png slide_N.md --timeout 30000
+cd artifacts/temp && bunx @slidev/cli export --format png slide_N.md --timeout 30000
 ```
 
 This creates `slide_N-001.png`.

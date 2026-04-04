@@ -24,7 +24,7 @@ pub use layout::{MayHomePaths, ProfileHomePaths, SessionPaths};
 pub use manager::{
     Session, SessionError, SessionId, SessionManager, SessionSummary,
     initialize_session_persistence, list_summaries_from_db, load_history_from_db,
-    reconcile_container_profile_sessions,
+    reconcile_container_profile_sessions, summarize_db_sessions,
 };
 pub use plan::SessionPlanState;
 pub use runtime::{

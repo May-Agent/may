@@ -223,11 +223,11 @@ function AppShell() {
   const {
     settings,
     loadInitialData,
-    refreshRuntimeSettings,
-    refreshFullConfig,
+    refreshConfig,
     refreshMcpServers,
     refreshSkills,
     currentProfileId,
+    currentSessionId,
     markBackendUnavailable,
     clearBackendUnavailable,
   } = useStore();
@@ -238,15 +238,13 @@ function AppShell() {
 
   useEffect(() => {
     if (location.pathname === '/settings') {
-      void refreshRuntimeSettings();
-      void refreshFullConfig();
+      void refreshConfig();
       void refreshMcpServers();
       void refreshSkills();
     }
   }, [
     location.pathname,
-    refreshRuntimeSettings,
-    refreshFullConfig,
+    refreshConfig,
     refreshMcpServers,
     refreshSkills,
   ]);
@@ -396,9 +394,17 @@ function AppShell() {
   }, [location.pathname, location.search, navigate]);
 
   useEffect(() => {
+    const isChatRoute = location.pathname.startsWith('/chat');
+    const isSettingsRoute = location.pathname === '/settings';
     const unsubscribeEvents = subscribeUiEvents({
-      profileId: currentProfileId ?? undefined,
+      sessionId: isChatRoute ? currentSessionId ?? undefined : undefined,
+      profileId: isChatRoute ? currentProfileId ?? undefined : undefined,
       onOpen: () => {},
+      onBrowserStatus: isChatRoute
+        ? (status) => {
+            useStore.getState().setBrowserStatus(status);
+          }
+        : undefined,
       onConfig: (data) => {
         clearBackendUnavailable();
         useStore.setState((state) => {
@@ -426,33 +432,65 @@ function AppShell() {
           };
         });
       },
-      onContainerPrepare: (payload) => {
-        clearBackendUnavailable();
-        useStore.getState().setContainerPrepareStatuses(payload.statuses);
-      },
-      onRemoteAccess: ({ status }) => {
-        useStore.getState().setRemoteAccessStatus(status);
-      },
-      onProfileSessions: ({ profileSessions }) => {
-        clearBackendUnavailable();
-        useRuntimeStore.getState().applyRuntimes(
-          flattenProfileSessions(profileSessions).map((session) => ({
-            sessionId: session.id,
-            runtime: session.runtime,
-          })),
-        );
-        useStore.setState({
-          profileSessions,
-          profileSessionsLoading: false,
-          profileAccessBlockedReason: null,
-          profileAccessBlockedCode: null,
-          backendUnavailableReason: null,
-        });
-      },
-      onSessionRuntimes: ({ sessions }) => {
-        clearBackendUnavailable();
-        useRuntimeStore.getState().applyRuntimes(sessions);
-      },
+      onContainerPrepare: isChatRoute
+        ? (payload) => {
+            clearBackendUnavailable();
+            useStore.getState().setContainerPrepareStatuses(payload.statuses);
+          }
+        : undefined,
+      onRemoteAccess: isSettingsRoute
+        ? ({ status }) => {
+            useStore.getState().setRemoteAccessStatus(status);
+          }
+        : undefined,
+      onRequestLogs: isSettingsRoute
+        ? (payload) => {
+            clearBackendUnavailable();
+            useStore.getState().setRequestLogs(payload);
+          }
+        : undefined,
+      onNotificationMailbox: isSettingsRoute
+        ? (payload) => {
+            clearBackendUnavailable();
+            useStore.getState().setNotificationMailbox(payload);
+          }
+        : undefined,
+      onNetworkAccessLogs: isSettingsRoute
+        ? (payload) => {
+            clearBackendUnavailable();
+            useStore.getState().setNetworkAccessLogs(payload);
+          }
+        : undefined,
+      onProfileSessions: isChatRoute
+        ? ({ profileSessions }) => {
+            clearBackendUnavailable();
+            useRuntimeStore.getState().applyRuntimes(
+              flattenProfileSessions(profileSessions).map((session) => ({
+                sessionId: session.id,
+                runtime: session.runtime,
+              })),
+            );
+            useStore.setState({
+              profileSessions,
+              profileSessionsLoading: false,
+              profileAccessBlockedReason: null,
+              profileAccessBlockedCode: null,
+              backendUnavailableReason: null,
+            });
+          }
+        : undefined,
+      onSessionRuntimes: isChatRoute
+        ? ({ sessions }) => {
+            clearBackendUnavailable();
+            useRuntimeStore.getState().applyRuntimes(sessions);
+          }
+        : undefined,
+      onSessionRuntime: isChatRoute
+        ? ({ sessionId, runtime }) => {
+            clearBackendUnavailable();
+            useRuntimeStore.getState().applyRuntime(sessionId, runtime);
+          }
+        : undefined,
       onHeartbeat: () => {},
       onError: () => {
         markBackendUnavailable('Backend event stream disconnected');
@@ -462,7 +500,13 @@ function AppShell() {
     return () => {
       unsubscribeEvents();
     };
-  }, [clearBackendUnavailable, currentProfileId, markBackendUnavailable]);
+  }, [
+    clearBackendUnavailable,
+    currentProfileId,
+    currentSessionId,
+    location.pathname,
+    markBackendUnavailable,
+  ]);
 
   useEffect(() => {
     if (settings.font && !settings.font.startsWith('Source Han')) {

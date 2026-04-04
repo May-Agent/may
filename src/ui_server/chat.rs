@@ -8,7 +8,7 @@ use skyzen::responder::Sse;
 use skyzen::utils::{Json, State};
 
 use aither_agent::{BrowserBackend, StaticCdpBrowser};
-use aither_core::llm::{Message as LlmMessage, Role as LlmRole, Usage};
+use aither_core::llm::{Message as LlmMessage, Role as LlmRole, ToolResult, Usage};
 use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{
     BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, ContainerExecHandle, ContainerLaunchSpec,
@@ -19,11 +19,14 @@ use crate::agent::MayAgent;
 use crate::ask_user;
 use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
+use crate::prompt_mentions;
 use crate::session::{
-    ChatMessage, ChatMessageStats, MayHomePaths, MessageRole, PendingUserMessage,
-    PersistedAttachment, SessionId, SessionRuntimeState, SessionStore, TerminalRuntimeState,
+    ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths, MessageRole, PendingUserMessage,
+    PersistedAttachment, SessionId, SessionPaths, SessionRuntimeState, SessionStore,
+    TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
+use crate::ui_event_bus::UiEventTopics;
 
 use super::attachments::build_prompt_and_attachments;
 use super::error::internal_error;
@@ -57,7 +60,7 @@ trait ChatSink {
         id: &str,
         name: &str,
         arguments: Option<&str>,
-        result: &Result<String, String>,
+        result: &ToolResult,
     ) -> bool;
     async fn on_todo_update(&mut self, event: &SseTodoUpdateEvent) -> bool;
     async fn on_error(&mut self, message: &str) -> bool;
@@ -104,7 +107,7 @@ impl ChatSink for SseSink {
         id: &str,
         name: &str,
         arguments: Option<&str>,
-        result: &Result<String, String>,
+        result: &ToolResult,
     ) -> bool {
         send_event(
             &self.0,
@@ -144,13 +147,7 @@ impl ChatSink for CollectSink {
     async fn on_tool_start(&mut self, _: &str, _: &str, _: &str) -> bool {
         true
     }
-    async fn on_tool_end(
-        &mut self,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
-        _: &Result<String, String>,
-    ) -> bool {
+    async fn on_tool_end(&mut self, _: &str, _: &str, _: Option<&str>, _: &ToolResult) -> bool {
         true
     }
     async fn on_todo_update(&mut self, _: &SseTodoUpdateEvent) -> bool {
@@ -360,11 +357,14 @@ fn output_contains_terminal_wait_notice(output: &OutputEntry) -> bool {
         .is_some_and(|text| text.starts_with(CONTAINER_STDIN_BLOCKED_NOTICE))
 }
 
-fn result_waits_for_terminal_input(result: &Result<String, String>) -> bool {
-    let Ok(serialized) = result else {
+fn result_waits_for_terminal_input(result: &ToolResult) -> bool {
+    if result.is_error() {
+        return false;
+    }
+    let Ok(serialized) = result.render_for_model() else {
         return false;
     };
-    let Ok(parsed) = serde_json::from_str::<TerminalResult>(serialized) else {
+    let Ok(parsed) = serde_json::from_str::<TerminalResult>(&serialized) else {
         return false;
     };
     parsed.status.as_deref() == Some("running")
@@ -372,7 +372,8 @@ fn result_waits_for_terminal_input(result: &Result<String, String>) -> bool {
 }
 
 fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
-    tokio::spawn(async move {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
         let Some(run_registration) =
             SessionRunRegistration::try_new(state.clone(), session_id.clone()).await
         else {
@@ -546,14 +547,18 @@ async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) 
     {
         tracing::warn!(error = %error, "failed to persist request log");
     }
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::REQUEST_LOGS);
 }
 
 pub(super) async fn chat(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ChatResponse>> {
-    let response = run_chat_collect(state, req).await?;
+    let tokio_handle = state.tokio_handle.clone();
+    let response = tokio_handle
+        .spawn(async move { run_chat_collect(state, req).await })
+        .await
+        .map_err(|_| internal_error("chat task panicked before producing a response"))??;
     Ok(Json(response))
 }
 
@@ -658,7 +663,8 @@ pub(super) async fn chat_stream(
     };
     let (sender, sse) = Sse::channel();
 
-    tokio::spawn(async move {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
         if let Err(err) =
             stream_chat_events(state.clone(), req, sender.clone(), run_registration).await
         {
@@ -680,12 +686,14 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: U
     let UiToolQueues {
         task,
         notify,
+        browser,
         register_skills,
         register_subagents,
     } = queues;
 
     let task_state = state.clone();
-    tokio::spawn(async move {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
         while let Some(request) = task.next().await {
             let result = handle_task_request(&task_state, request.args.clone()).await;
             let _ = request.respond(result);
@@ -693,7 +701,8 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: U
     });
 
     let notification_service = state.notification_service.clone();
-    tokio::spawn(async move {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
         while let Some(request) = notify.next().await {
             let result =
                 handle_notify_request(notification_service.clone(), request.args.clone()).await;
@@ -701,8 +710,18 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: U
         }
     });
 
+    let browser_state = state.clone();
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
+        while let Some(request) = browser.next().await {
+            let result = handle_browser_request(&browser_state, request.args.clone()).await;
+            let _ = request.respond(result);
+        }
+    });
+
     let register_skills_state = state.clone();
-    tokio::spawn(async move {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
         while let Some(request) = register_skills.next().await {
             let result =
                 handle_register_skills_request(&register_skills_state, request.args.clone()).await;
@@ -710,7 +729,8 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: U
         }
     });
 
-    tokio::spawn(async move {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
         while let Some(request) = register_subagents.next().await {
             let result = handle_register_subagents_request(&state, request.args.clone()).await;
             let _ = request.respond(result);
@@ -732,6 +752,7 @@ async fn run_agent_loop(
 ) -> anyhow::Result<AgentRunResult> {
     let mut attempt = 0usize;
     let mut max_retries = 0usize;
+    let mut turn_hidden_context_xml: Option<String> = None;
 
     loop {
         let PreparedAgent {
@@ -740,6 +761,7 @@ async fn run_agent_loop(
             current_model,
             provider_id,
             profile_id,
+            hidden_context_xml,
             prompt,
             attachments,
             provider_candidate_count,
@@ -760,6 +782,9 @@ async fn run_agent_loop(
         };
         if attempt == 0 {
             max_retries = provider_candidate_count.saturating_sub(1);
+        }
+        if let Some(hidden_context_xml) = hidden_context_xml {
+            turn_hidden_context_xml = Some(hidden_context_xml);
         }
         let model_context_window = agent.model_context_window().or_else(|| {
             lookup_model_info(&current_model).and_then(aither_models::ModelEntry::max_input_tokens)
@@ -787,7 +812,11 @@ async fn run_agent_loop(
         let mut cancellation_reason: Option<&'static str> = None;
         {
             agent.sync_runtime_context().await;
-            let mut stream = std::pin::pin!(agent.run(&prompt, attachments));
+            let mut stream = std::pin::pin!(agent.run_with_hidden_context(
+                &prompt,
+                turn_hidden_context_xml.as_deref(),
+                attachments,
+            ));
             loop {
                 let next_event = tokio::select! {
                     biased;
@@ -1341,7 +1370,8 @@ fn enqueue_event_triggered_tasks(
     let session_id = session_id.as_str().to_string();
     let profile_id = profile_id.map(ToOwned::to_owned);
 
-    tokio::spawn(async move {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
         if let Err(e) = state
             .task_runtime
             .dispatch_event(
@@ -1365,7 +1395,7 @@ struct SessionContext {
     sandbox_dir: std::path::PathBuf,
     history_messages: Vec<LlmMessage>,
     context_snapshot: Option<crate::session::PersistedContextSnapshot>,
-    incremental_messages: Vec<LlmMessage>,
+    hidden_context_xml: Option<String>,
     profile_persona: Option<String>,
     profile_memories: Option<crate::memory::ProfileMemories>,
     profile_model: Option<crate::db::entity::profiles::Model>,
@@ -1380,6 +1410,7 @@ struct PreparedAgent {
     current_model: String,
     provider_id: String,
     profile_id: Option<String>,
+    hidden_context_xml: Option<String>,
     prompt: String,
     attachments: Vec<url::Url>,
     provider_candidate_count: usize,
@@ -1390,6 +1421,7 @@ struct ToolBrokers {
     ask_user: ask_user::AskUserBroker,
     task: crate::agent::task_tool::TaskBroker,
     notify: crate::agent::notify_tool::NotifyBroker,
+    browser: crate::agent::browser_tool::BrowserBroker,
     register_skills: crate::agent::register_tool::RegisterBroker,
     register_subagents: crate::agent::register_tool::RegisterBroker,
 }
@@ -1441,7 +1473,8 @@ async fn resolve_session_context(
     let profile_environment = profile_model
         .as_ref()
         .map(|profile| {
-            crate::profile::ProfileInfo::from_db_model(profile.clone()).map(|info| info.environment)
+            crate::profile::ProfileInfo::from_db_model(profile.clone())
+                .map(|info| info.environment.into_kind())
         })
         .transpose()
         .map_err(anyhow::Error::from)?;
@@ -1475,46 +1508,86 @@ async fn resolve_session_context(
         None
     };
 
-    let mut incremental_messages = Vec::new();
+    let mut hidden_context_parts = Vec::<String>::new();
     if persist_user_message {
         if take_over_alert_pending(state, &session_id).await {
-            let takeover_alert = browser_takeover_alert_xml()?;
-            db.append_chat_message(
-                session_id.as_str(),
-                &ChatMessage::hidden_context(takeover_alert.clone()),
+            push_hidden_context_part(
+                &db,
+                &session_id,
+                &history,
+                &mut hidden_context_parts,
+                browser_takeover_alert_xml()?,
+                persist_user_message,
             )
+            .await?;
+        }
+    }
+
+    if let Some(hidden_context_xml) = req
+        .hidden_context_xml
+        .as_deref()
+        .map(str::trim)
+        .filter(|xml| !xml.is_empty())
+    {
+        push_hidden_context_part(
+            &db,
+            &session_id,
+            &history,
+            &mut hidden_context_parts,
+            hidden_context_xml.to_string(),
+            persist_user_message,
+        )
+        .await?;
+    }
+
+    if let Some(session_mentions_xml) =
+        prompt_mentions::build_session_mentions_xml(&db, &req.content)
             .await
-            .map_err(anyhow::Error::from)?;
-            incremental_messages.push(LlmMessage::system(takeover_alert));
-        }
+            .map_err(anyhow::Error::from)?
+    {
+        push_hidden_context_part(
+            &db,
+            &session_id,
+            &history,
+            &mut hidden_context_parts,
+            session_mentions_xml,
+            persist_user_message,
+        )
+        .await?;
+    }
 
-        if let Some(hidden_context_xml) = req
-            .hidden_context_xml
-            .as_deref()
-            .map(str::trim)
-            .filter(|xml| !xml.is_empty())
-        {
-            let hidden_context_already_present = history.messages().iter().any(|msg| {
-                matches!(msg.role, MessageRole::HiddenContext) && msg.content == hidden_context_xml
-            });
-            if !hidden_context_already_present {
-                db.append_chat_message(
-                    session_id.as_str(),
-                    &ChatMessage::hidden_context(hidden_context_xml.to_string()),
-                )
-                .await
-                .map_err(anyhow::Error::from)?;
-                incremental_messages.push(LlmMessage::system(hidden_context_xml.to_string()));
-            }
-        }
+    let session_paths =
+        session_paths_for_session(state, session.profile_id.as_deref(), &session_id);
+    if let Some(file_mentions_xml) =
+        prompt_mentions::build_file_mentions_xml(&session_paths.files_dir(), &req.content, 400)
+            .await
+            .map_err(|error| match error {
+                prompt_mentions::PromptMentionError::AbsolutePath
+                | prompt_mentions::PromptMentionError::ParentTraversal => {
+                    anyhow::anyhow!(error.to_string())
+                }
+                _ => anyhow::Error::from(error),
+            })?
+    {
+        push_hidden_context_part(
+            &db,
+            &session_id,
+            &history,
+            &mut hidden_context_parts,
+            file_mentions_xml,
+            persist_user_message,
+        )
+        .await?;
+    }
 
+    if persist_user_message {
         let needs_title = session.title.is_none();
         if needs_title {
             let title = truncate_preview(&req.content);
             db.update_session(session_id.as_str(), Some(title.as_str()), None)
                 .await
                 .map_err(anyhow::Error::from)?;
-            state.notify_ui_events();
+            state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
         }
         db.append_chat_message(session_id.as_str(), &ChatMessage::user(req.content.clone()))
             .await
@@ -1531,7 +1604,8 @@ async fn resolve_session_context(
         sandbox_dir,
         history_messages,
         context_snapshot,
-        incremental_messages,
+        hidden_context_xml: (!hidden_context_parts.is_empty())
+            .then(|| hidden_context_parts.join("\n\n")),
         profile_persona,
         profile_memories,
         profile_model,
@@ -1539,6 +1613,55 @@ async fn resolve_session_context(
         profile_id: session.profile_id,
         plan_state: runtime.plan_state,
     })
+}
+
+fn session_paths_for_session(
+    state: &UiServerState,
+    profile_id: Option<&str>,
+    session_id: &SessionId,
+) -> SessionPaths {
+    let home_paths = MayHomePaths::new(state.may_dir.clone());
+    match profile_id {
+        Some(profile_id) => home_paths
+            .profile_home(profile_id)
+            .session_paths(session_id.as_str()),
+        None => home_paths.session_paths(session_id.as_str()),
+    }
+}
+
+async fn push_hidden_context_part(
+    db: &crate::db::ChatDb,
+    session_id: &SessionId,
+    history: &ChatHistory,
+    hidden_context_parts: &mut Vec<String>,
+    content: String,
+    persist_user_message: bool,
+) -> anyhow::Result<()> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let already_queued = hidden_context_parts.iter().any(|part| part == trimmed);
+    if persist_user_message
+        && !already_queued
+        && !history.messages().iter().any(|message| {
+            matches!(message.role, MessageRole::HiddenContext) && message.content == trimmed
+        })
+    {
+        db.append_chat_message(
+            session_id.as_str(),
+            &ChatMessage::hidden_context(trimmed.to_string()),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    }
+
+    if !already_queued {
+        hidden_context_parts.push(trimmed.to_string());
+    }
+
+    Ok(())
 }
 
 async fn setup_agent_environment(
@@ -1598,16 +1721,24 @@ async fn setup_agent_environment(
             let host_gateway = container_manager.runtime().host_gateway();
 
             let mut extra_env = Vec::new();
-            let browser_backend: Option<Arc<dyn BrowserBackend>> = if let Some(ref bm) =
-                state.browser_manager
+            let browser_backend: Option<Arc<dyn BrowserBackend>> = if let Some(bm) =
+                state.browser_manager()
             {
                 if let Err(e) = bm.start().await {
                     tracing::warn!(error = %e, "Failed to auto-start browser for container session");
                     None
                 } else {
                     let config = state.config_snapshot();
-                    let port = config.playwright.port.to_string();
-                    let endpoint = join_text(&["http://", host_gateway, ":", port.as_str()]);
+                    let endpoint = if config.browser.requires_managed_runtime() {
+                        let port = config.browser.port.to_string();
+                        join_text(&["http://", host_gateway, ":", port.as_str()])
+                    } else {
+                        bm.cdp_endpoint().unwrap_or_else(|| {
+                            panic!(
+                                "browser manager reported running remote backend without cdp endpoint"
+                            )
+                        })
+                    };
                     extra_env.push(prefixed_text("BROWSER_CDP_ENDPOINT=", endpoint.as_str()));
                     Some(Arc::new(StaticCdpBrowser::new(endpoint)))
                 }
@@ -1681,7 +1812,8 @@ fn spawn_ask_user_forwarder(
     let (ask_user_broker, ask_user_queue) = ask_user::channel();
     let ask_user_approver = state.ask_user_approver.clone();
     let ask_user_session_id = session_id.as_str().to_string();
-    tokio::spawn(async move {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
         while let Some(request) = ask_user_queue.next().await {
             ask_user_approver
                 .enqueue(request, Some(ask_user_session_id.clone()))
@@ -1698,7 +1830,8 @@ fn spawn_workspace_forwarder(
     let (workspace_broker, workspace_queue) = crate::workspace_request::channel();
     let workspace_approver = state.workspace_approver.clone();
     let workspace_session_id = session_id.as_str().to_string();
-    tokio::spawn(async move {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
         while let Some(request) = workspace_queue.next().await {
             let approved = match workspace_approver
                 .request_and_wait(workspace_session_id.as_str(), request.args.request.clone())
@@ -1722,6 +1855,7 @@ fn build_tool_brokers(state: &Arc<UiServerState>, session_id: &SessionId) -> Too
         ask_user: spawn_ask_user_forwarder(state, session_id),
         task: state.tool_dispatchers.task.clone(),
         notify: state.tool_dispatchers.notify.clone(),
+        browser: state.tool_dispatchers.browser.clone(),
         register_skills: state.tool_dispatchers.register_skills.clone(),
         register_subagents: state.tool_dispatchers.register_subagents.clone(),
     }
@@ -1767,6 +1901,7 @@ async fn prepare_agent_for_request(
         location,
         Some(brokers.task),
         Some(brokers.notify),
+        state.browser_manager().map(|_| brokers.browser),
         Some(brokers.register_skills),
         Some(brokers.register_subagents),
         environment,
@@ -1785,9 +1920,6 @@ async fn prepare_agent_for_request(
         )? {
             agent.push_message(message);
         }
-        for message in ctx.incremental_messages {
-            agent.push_message(message);
-        }
     } else {
         for message in ctx.history_messages {
             agent.push_message(message);
@@ -1800,7 +1932,11 @@ async fn prepare_agent_for_request(
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let preview_messages = agent
-        .preview_request_messages(&prompt, attachments.iter().cloned())
+        .preview_request_messages_with_hidden_context(
+            &prompt,
+            ctx.hidden_context_xml.as_deref(),
+            attachments.iter().cloned(),
+        )
         .await;
     persist_context_debug_snapshot(
         state,
@@ -1819,6 +1955,7 @@ async fn prepare_agent_for_request(
         current_model: ctx.current_model,
         provider_id,
         profile_id: ctx.profile_id,
+        hidden_context_xml: ctx.hidden_context_xml,
         prompt,
         attachments,
         provider_candidate_count: ctx.provider_candidate_count,
@@ -1885,9 +2022,6 @@ async fn handle_task_request(
         .task_runtime
         .create_task_from_tool_request(request)
         .await;
-    if result.is_ok() {
-        state.notify_ui_events();
-    }
     result
 }
 
@@ -1912,6 +2046,82 @@ async fn handle_notify_request(
         })?;
 
     Ok(crate::agent::notify_tool::NotifyResult { sent })
+}
+
+async fn handle_browser_request(
+    state: &Arc<UiServerState>,
+    request: crate::agent::browser_tool::BrowserRequest,
+) -> Result<crate::agent::browser_tool::BrowserResult, String> {
+    let _session_id = request.session_id;
+    let Some(browser_manager) = state.browser_manager() else {
+        return Err("browser command is unavailable in this runtime".to_string());
+    };
+
+    match request.args {
+        crate::agent::browser_tool::BrowserArgs::Status => {
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: browser_manager.is_running().await,
+                cdp_endpoint: None,
+                page: None,
+            })
+        }
+        crate::agent::browser_tool::BrowserArgs::Start => {
+            browser_manager
+                .start()
+                .await
+                .map_err(|error| error.to_string())?;
+            state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: true,
+                cdp_endpoint: browser_manager.cdp_endpoint(),
+                page: None,
+            })
+        }
+        crate::agent::browser_tool::BrowserArgs::Stop => {
+            browser_manager
+                .stop()
+                .await
+                .map_err(|error| error.to_string())?;
+            state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: false,
+                cdp_endpoint: None,
+                page: None,
+            })
+        }
+        crate::agent::browser_tool::BrowserArgs::CdpEndpoint => {
+            if !browser_manager.is_running().await {
+                browser_manager
+                    .start()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+            }
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: true,
+                cdp_endpoint: browser_manager.cdp_endpoint(),
+                page: None,
+            })
+        }
+        crate::agent::browser_tool::BrowserArgs::Read { url } => {
+            if !browser_manager.is_running().await {
+                browser_manager
+                    .start()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+            }
+            let page = browser_manager
+                .read_page(url)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(crate::agent::browser_tool::BrowserResult {
+                running: true,
+                cdp_endpoint: browser_manager.cdp_endpoint(),
+                page: Some(page),
+            })
+        }
+    }
 }
 
 async fn handle_register_skills_request(

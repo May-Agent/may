@@ -6,7 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                    # Build debug
-cargo build --release          # Build release
 cargo run --bin may            # Run TUI application
 cargo test                     # Run all tests
 cargo test test_name           # Run specific test
@@ -49,6 +48,7 @@ cargo run --features ui --bin may -- ui --port 8787
 ```
 
 - Enabling feature `ui` triggers `build.rs` to run `bun run build` and embed `web-ui/dist`.
+- `build.rs` watches the `web-ui` tree and ignores generated/dependency directories, so frontend source updates trigger a fresh embed build.
 - Use this for release-like verification, not daily inner-loop debugging.
 
 ## Architecture Overview
@@ -70,15 +70,15 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 │                      aither framework                        │
 │  aither-agent   aither-cloud   aither-sandbox   aither-core │
 │                                                              │
-│  + leash (native sandbox)                                    │
+│  + heel (native sandbox)                                    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **aither-agent**: Core `Agent` abstraction, `TerminalAgentBuilder` (legacy type name for the terminal-command agent builder), event streaming (`AgentEvent`)
+- **aither-agent**: Core `Agent` abstraction, `TerminalAgentBuilder`, event streaming (`AgentEvent`)
 - **aither-cloud**: Provider implementations (Claude, Gemini, OpenAI) via `CloudProvider` enum
 - **aither-sandbox**: `TerminalTool`/`TerminalMode` (legacy names for terminal-command execution), `PermissionHandler` trait
 - **aither-models**: Model metadata database for tier lookups
-- **leash**: Native sandbox for isolated command execution
+- **heel**: Native sandbox for isolated command execution
 
 ### Module Structure
 
@@ -134,11 +134,14 @@ During streaming:
 ```
 
 # Terminal-first tool calling
-From the perspective of the LLM, there is one native terminal-command tool whose current wire name is still `terminal`.
-That legacy tool name does not imply the runtime guarantees a literal shell implementation.
+There is one native terminal command tool, `terminal`, for executing commands.
+This describes command execution capability and does not imply a specific shell implementation.
 
 Everything else is exposed as CLI commands through the terminal tool's IPC bridge rather than as additional native tools.
-For instance, web search is done by executing `websearch "query"` through the terminal tool, not by calling a separate native `websearch` tool.
+For instance, web search is done by executing `websearch "query"` through the terminal tool, not by calling a separate native `websearch` tool. High-frequency browser work should use the May-managed `browser` command rather than ad-hoc shell recipes or direct browser installers.
+
+If the agent ends up using the same non-native workflow frequently, promote that workflow into a proper `Tool` implementation and let May auto-convert it into a terminal command through the existing Tool-trait CLI bridge.
+Do not leave high-frequency capabilities as ad-hoc shell snippets the agent has to reconstruct manually every time.
 
 ### Key Patterns
 

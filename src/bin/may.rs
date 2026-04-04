@@ -40,6 +40,9 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
+use may_agent::browser_service::{
+    BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus,
+};
 use may_agent::session::{SessionPaths, initialize_session_persistence};
 use may_agent::tui::runtime::{LocalSessionRuntime, RuntimeDeps, TitleGenContext};
 use may_agent::tui::{App, AppEvent, EventHandler, PendingMessage, SendAction, ui};
@@ -96,6 +99,7 @@ enum BrowserCliCommand {
     Targets,
     Contexts,
     Endpoint,
+    Read { url: String },
     Provision,
     Kill,
     Service { socket_path: std::path::PathBuf },
@@ -123,7 +127,7 @@ impl ExecArgs {
 
 impl BrowserCliArgs {
     fn help_text() -> &'static str {
-        "Usage: may browser <status|targets|contexts|endpoint|provision|kill>\n\nInspect or maintain the May-managed browser runtime used for browser automation."
+        "Usage: may browser <status|targets|contexts|endpoint|read <url>|provision|kill>\n\nInspect or maintain the May-managed browser runtime used for browser automation."
     }
 }
 
@@ -156,6 +160,16 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
         "endpoint" => BrowserCliCommand::Endpoint,
         "provision" => BrowserCliCommand::Provision,
         "kill" => BrowserCliCommand::Kill,
+        "read" => {
+            let url = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| panic!("may browser read requires <url>"));
+            if args.len() > 2 {
+                panic!("may browser read accepts exactly one url");
+            }
+            BrowserCliCommand::Read { url }
+        }
         "service" => {
             let mut socket_path = None;
             let mut index = 1;
@@ -177,11 +191,15 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
             }
         }
         other => panic!(
-            "invalid browser command '{}'; expected one of: status, targets, contexts, endpoint, provision, kill",
+            "invalid browser command '{}'; expected one of: status, targets, contexts, endpoint, read, provision, kill",
             other
         ),
     };
-    if !matches!(command, BrowserCliCommand::Service { .. }) && args.len() > 1 {
+    if !matches!(
+        command,
+        BrowserCliCommand::Service { .. } | BrowserCliCommand::Read { .. }
+    ) && args.len() > 1
+    {
         panic!("may browser accepts exactly one subcommand");
     }
     BrowserCliArgs { command }
@@ -355,6 +373,7 @@ fn parse_terminal_execution_mode(value: &str) -> TerminalExecutionMode {
 async fn main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
     ensure_rustls_provider();
+    may_agent::configure_heel_binary();
 
     let cli_mode = parse_cli_mode_from_env();
     let is_ui_mode = matches!(cli_mode, CliMode::Ui(_));
@@ -507,12 +526,14 @@ enum BrowserListenerState {
     NotListening,
     Managed,
     ExternalProcess,
+    RemoteEndpoint,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserStatusOutput {
     enabled: bool,
+    backend: may_agent::config::BrowserBackendKind,
     running: bool,
     cdp_endpoint: Option<String>,
     provisioned_executable: Option<String>,
@@ -545,34 +566,17 @@ struct BrowserVersionMetadata {
     web_socket_debugger_url: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "command", rename_all = "kebab-case")]
-enum BrowserServiceRequest {
-    Status,
-    EnsureStarted,
-    Stop,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserServiceStatus {
-    running: bool,
-    cdp_endpoint: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum BrowserServiceResponse {
-    Ok { payload: BrowserServiceStatus },
-    Stopped,
-    Error { message: String },
-}
-
 #[derive(serde::Serialize)]
 struct OneShotNonInteractiveAlert<'a> {
     #[serde(rename = "@type")]
     alert_type: &'a str,
     message: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct OneShotPromptInput {
+    content: String,
+    hidden_context_xml: Option<may_agent::XmlFragment>,
 }
 
 fn render_json_stdout<T: serde::Serialize>(value: &T) -> Result<(), BrowserCliError> {
@@ -608,6 +612,12 @@ async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
             render_json_stdout(&serde_json::json!({ "cdpEndpoint": status.cdp_endpoint }))?;
         }
         BrowserCliCommand::Provision => {
+            if !config.browser.requires_managed_runtime() {
+                return Err(BrowserCliError::BrowserService(
+                    "browser provision is only valid for the managed local browser backend"
+                        .to_string(),
+                ));
+            }
             let path = may_agent::container::browser::provision_managed_browser(&may_dir)
                 .await
                 .map_err(BrowserCliError::ProvisionBrowser)?;
@@ -617,7 +627,7 @@ async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
             }))?;
         }
         BrowserCliCommand::Kill => {
-            stop_browser_service(&socket_path, config.browser.port)
+            stop_browser_service(&socket_path, &config.browser, &may_dir)
                 .await
                 .map_err(BrowserCliError::BrowserService)?;
             render_json_stdout(&serde_json::json!({
@@ -629,11 +639,14 @@ async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
             let daemon_status = browser_service_status(&socket_path)
                 .await
                 .map_err(BrowserCliError::BrowserService)?;
-            let listener_state = if daemon_status.as_ref().is_some_and(|status| status.running) {
-                BrowserListenerState::Managed
-            } else {
-                inspect_browser_listener_state(config.browser.port).await?
-            };
+            let listener_state =
+                if config.browser.backend == may_agent::config::BrowserBackendKind::RemoteCdp {
+                    BrowserListenerState::RemoteEndpoint
+                } else if daemon_status.as_ref().is_some_and(|status| status.running) {
+                    BrowserListenerState::Managed
+                } else {
+                    inspect_browser_listener_state(config.browser.port).await?
+                };
             let targets = match daemon_status.as_ref() {
                 Some(status) if status.running => Some(
                     fetch_browser_targets(status.cdp_endpoint.as_deref().ok_or_else(|| {
@@ -645,11 +658,15 @@ async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
                 ),
                 _ => None,
             };
-            let provisioned_executable =
-                may_agent::container::browser::provisioned_browser_executable(&may_dir)
-                    .map(|path| path.display().to_string());
+            let provisioned_executable = config
+                .browser
+                .requires_managed_runtime()
+                .then(|| may_agent::container::browser::provisioned_browser_executable(&may_dir))
+                .flatten()
+                .map(|path| path.display().to_string());
             render_json_stdout(&BrowserStatusOutput {
                 enabled: config.browser.enabled,
+                backend: config.browser.backend,
                 running: daemon_status.as_ref().is_some_and(|status| status.running),
                 cdp_endpoint: daemon_status.and_then(|status| status.cdp_endpoint),
                 provisioned_executable,
@@ -696,6 +713,37 @@ async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
                 })
                 .collect::<Vec<_>>();
             render_json_stdout(&contexts)?;
+        }
+        BrowserCliCommand::Read { url } => {
+            let status = ensure_browser_service_started(may_dir.as_path(), &config.browser)
+                .await
+                .map_err(BrowserCliError::BrowserService)?;
+            let response =
+                send_browser_service_request(&socket_path, BrowserServiceRequest::Read { url })
+                    .await
+                    .map_err(BrowserCliError::BrowserService)?;
+            match response {
+                Some(BrowserServiceResponse::ReadOk { payload }) => {
+                    render_json_stdout(&serde_json::json!({
+                        "running": status.running,
+                        "cdpEndpoint": status.cdp_endpoint,
+                        "page": payload,
+                    }))?;
+                }
+                Some(BrowserServiceResponse::Error { message }) => {
+                    return Err(BrowserCliError::BrowserService(message));
+                }
+                Some(BrowserServiceResponse::Ok { .. }) => {
+                    return Err(BrowserCliError::BrowserService(
+                        "browser service returned status payload for read request".to_string(),
+                    ));
+                }
+                Some(BrowserServiceResponse::Stopped) | None => {
+                    return Err(BrowserCliError::BrowserService(
+                        "browser service stopped while reading page".to_string(),
+                    ));
+                }
+            }
         }
     }
 
@@ -753,35 +801,71 @@ async fn run_browser_service(
                 },
                 false,
             ),
-            BrowserServiceRequest::EnsureStarted => {
+            BrowserServiceRequest::EnsureStarted => match async {
                 if !browser_manager.is_running().await {
-                    may_agent::container::browser::provision_managed_browser(&may_dir)
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    may_agent::container::browser::prepare_browser_runtime(
+                        &config.browser,
+                        &may_dir,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
                     browser_manager
                         .start()
                         .await
                         .map_err(|error| error.to_string())?;
                 }
-                (
-                    BrowserServiceResponse::Ok {
-                        payload: BrowserServiceStatus {
-                            running: true,
-                            cdp_endpoint: browser_manager.cdp_endpoint(),
-                        },
+                Ok::<BrowserServiceResponse, String>(BrowserServiceResponse::Ok {
+                    payload: BrowserServiceStatus {
+                        running: true,
+                        cdp_endpoint: browser_manager.cdp_endpoint(),
                     },
-                    false,
-                )
+                })
             }
-            BrowserServiceRequest::Stop => {
+            .await
+            {
+                Ok(response) => (response, false),
+                Err(message) => (BrowserServiceResponse::Error { message }, false),
+            },
+            BrowserServiceRequest::Stop => match async {
                 if browser_manager.is_running().await {
                     browser_manager
                         .stop()
                         .await
                         .map_err(|error| error.to_string())?;
                 }
-                (BrowserServiceResponse::Stopped, true)
+                Ok::<BrowserServiceResponse, String>(BrowserServiceResponse::Stopped)
             }
+            .await
+            {
+                Ok(response) => (response, true),
+                Err(message) => (BrowserServiceResponse::Error { message }, false),
+            },
+            BrowserServiceRequest::Read { url } => match async {
+                if !browser_manager.is_running().await {
+                    may_agent::container::browser::prepare_browser_runtime(
+                        &config.browser,
+                        &may_dir,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    browser_manager
+                        .start()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                let page = browser_manager
+                    .read_page(url)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<BrowserServiceResponse, String>(BrowserServiceResponse::ReadOk {
+                    payload: page,
+                })
+            }
+            .await
+            {
+                Ok(response) => (response, false),
+                Err(message) => (BrowserServiceResponse::Error { message }, false),
+            },
         };
         let response_bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
         tokio::io::AsyncWriteExt::write_all(&mut stream, &response_bytes)
@@ -812,6 +896,9 @@ async fn browser_service_status(
         BrowserServiceResponse::Ok { payload } => Ok(Some(payload)),
         BrowserServiceResponse::Stopped => Ok(None),
         BrowserServiceResponse::Error { message } => Err(message),
+        BrowserServiceResponse::ReadOk { .. } => {
+            Err("browser service returned page payload for status request".to_string())
+        }
     }
 }
 
@@ -840,6 +927,10 @@ async fn ensure_browser_service_started(
             Ok(Some(BrowserServiceResponse::Stopped)) => {
                 last_error = Some("browser service stopped before startup completed".to_string());
             }
+            Ok(Some(BrowserServiceResponse::ReadOk { .. })) => {
+                last_error =
+                    Some("browser service returned page payload for startup request".to_string());
+            }
             Ok(None) => {}
             Err(error) => last_error = Some(error),
         }
@@ -849,14 +940,23 @@ async fn ensure_browser_service_started(
     Err(last_error.unwrap_or_else(|| "browser service did not become ready".to_string()))
 }
 
-async fn stop_browser_service(socket_path: &std::path::Path, port: u16) -> Result<(), String> {
+async fn stop_browser_service(
+    socket_path: &std::path::Path,
+    config: &may_agent::config::BrowserConfig,
+    may_dir: &std::path::Path,
+) -> Result<(), String> {
     match send_browser_service_request(socket_path, BrowserServiceRequest::Stop).await? {
         Some(BrowserServiceResponse::Stopped) | None => {
-            may_agent::container::browser::stop_managed_browser(port).await;
+            if config.requires_managed_runtime() {
+                may_agent::container::browser::stop_managed_browser(config.port, &may_dir).await;
+            }
             Ok(())
         }
         Some(BrowserServiceResponse::Ok { .. }) => Ok(()),
         Some(BrowserServiceResponse::Error { message }) => Err(message),
+        Some(BrowserServiceResponse::ReadOk { .. }) => {
+            Err("browser service returned page payload for stop request".to_string())
+        }
     }
 }
 
@@ -1150,7 +1250,7 @@ impl aither_sandbox::SshSessionAuthorizer for NoopSshAuthorizer {
         Box::pin(async { Ok(true) })
     }
 
-    fn authorize_leash_install(
+    fn authorize_heel_install(
         &self,
         _target: &str,
         _details: &str,
@@ -1361,7 +1461,7 @@ async fn build_exec_terminal_tool(
 
     let runtime_service = std::sync::Arc::new(may_agent::session::SessionRuntimeService::new(
         context.db.clone(),
-        std::sync::Arc::new(tokio::sync::Notify::new()),
+        may_agent::ui_event_bus::UiEventBus::new(),
     ));
     let network_policy = may_config
         .preferences
@@ -1666,6 +1766,8 @@ mod tests {
 }
 
 async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
+    const ONESHOT_IDLE_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
     let (event_tx, _event_rx) = async_channel::unbounded();
     let mut app = App::new(event_tx, None).await?;
     if !app.is_configured() {
@@ -1711,21 +1813,25 @@ async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
 
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = String::new();
+    let mut active_tool_calls = std::collections::HashSet::<String>::new();
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     runtime_deps.mark_running(&app).await?;
     let prompt = build_oneshot_prompt_with_mentions(&app, &args.prompt).await?;
-    let handle = runtime_deps.start_agent_task(
-        &mut app,
-        worker,
-        PendingMessage {
-            content: prompt,
-            attachments: Vec::new(),
-            queued_at: Timestamp::now(),
-            delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
-        },
-        &mut pending_title_gen,
-    )?;
+    let handle = runtime_deps
+        .start_agent_task(
+            &mut app,
+            worker,
+            PendingMessage {
+                content: prompt.content,
+                hidden_context_xml: prompt.hidden_context_xml,
+                attachments: Vec::new(),
+                queued_at: Timestamp::now(),
+                delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
+            },
+            &mut pending_title_gen,
+        )
+        .await?;
     let mut agent_handle = Some(handle);
 
     loop {
@@ -1745,14 +1851,38 @@ async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         let Some(handle) = agent_handle.as_ref() else {
             break;
         };
-        let next = futures_lite::future::or(
+        let event_future = futures_lite::future::or(
             async { ask_user_queue.next().await.map(Event::AskUser) },
             futures_lite::future::or(
                 async { workspace_queue.next().await.map(Event::Workspace) },
                 async { handle.recv().await.map(Event::Agent) },
             ),
-        )
-        .await;
+        );
+        let next = if assistant_response.is_empty() || !active_tool_calls.is_empty() {
+            event_future.await
+        } else {
+            match tokio::time::timeout(ONESHOT_IDLE_FINISH_TIMEOUT, event_future).await {
+                Ok(event) => event,
+                Err(_) => {
+                    if let Some(handle) = agent_handle.take() {
+                        handle.cancel();
+                    }
+                    runtime_deps
+                        .finish_agent_task(
+                            &mut app,
+                            &mut agent_handle,
+                            &mut pending_title_gen,
+                            &assistant_response,
+                        )
+                        .await;
+                    if !assistant_response.ends_with('\n') {
+                        stdout.write_all(b"\n")?;
+                        stdout.flush()?;
+                    }
+                    return Ok(());
+                }
+            }
+        };
         let Some(event) = next else {
             break;
         };
@@ -1789,6 +1919,12 @@ async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 request.respond(approved).map_err(anyhow::Error::from)?;
             }
             Event::Agent(TuiEvent::Agent(result)) => {
+                if let Ok(AgentEvent::ToolCallStart { id, .. }) = &result {
+                    active_tool_calls.insert(id.clone());
+                }
+                if let Ok(AgentEvent::ToolCallEnd { id, .. }) = &result {
+                    active_tool_calls.remove(id);
+                }
                 if let Ok(AgentEvent::Text(ref text)) = result {
                     assistant_response.push_str(text);
                     stdout.write_all(text.as_bytes())?;
@@ -1934,26 +2070,31 @@ fn prompt_oneshot_workspace(
     }
 }
 
-async fn build_oneshot_prompt_with_mentions(app: &App, prompt: &str) -> anyhow::Result<String> {
-    let mut content = prompt.to_string();
-    content.push_str("\n\n");
-    content.push_str(&may_agent::xml_fragment::serialize_tagged_xml(
+async fn build_oneshot_prompt_with_mentions(
+    app: &App,
+    prompt: &str,
+) -> anyhow::Result<OneShotPromptInput> {
+    let mut hidden_context_parts = vec![may_agent::xml_fragment::serialize_tagged_xml(
         "system_alert",
         &OneShotNonInteractiveAlert {
             alert_type: "oneshot_noninteractive",
-            message: "This is a non-interactive oneshot run. Do not use ask_user or any workflow that requires stdin. Make a reasonable assumption when possible; if interaction is truly required, explain the blocker and stop.",
+            message: "Non-interactive oneshot run. Do not use ask_user or wait for stdin. Make a reasonable assumption when possible; if interaction is truly required, explain the blocker and stop.",
         },
-    )?);
+    )?];
     let Some(session) = app.session_manager.current() else {
-        return Ok(content);
+        return Ok(OneShotPromptInput {
+            content: prompt.to_string(),
+            hidden_context_xml: Some(may_agent::XmlFragment::parse(
+                hidden_context_parts.join("\n\n"),
+            )?),
+        });
     };
 
     let db = app.session_manager.db();
     if let Ok(Some(session_mentions_xml)) =
         may_agent::prompt_mentions::build_session_mentions_xml(&db, prompt).await
     {
-        content.push_str("\n\n");
-        content.push_str(&session_mentions_xml);
+        hidden_context_parts.push(session_mentions_xml);
     }
 
     let session_paths = may_agent::session::SessionPaths::new(session.sandbox_dir.clone());
@@ -1961,11 +2102,15 @@ async fn build_oneshot_prompt_with_mentions(app: &App, prompt: &str) -> anyhow::
     if let Ok(Some(file_mentions_xml)) =
         may_agent::prompt_mentions::build_file_mentions_xml(&files_dir, prompt, 400).await
     {
-        content.push_str("\n\n");
-        content.push_str(&file_mentions_xml);
+        hidden_context_parts.push(file_mentions_xml);
     }
 
-    Ok(content)
+    Ok(OneShotPromptInput {
+        content: prompt.to_string(),
+        hidden_context_xml: Some(may_agent::XmlFragment::parse(
+            hidden_context_parts.join("\n\n"),
+        )?),
+    })
 }
 
 fn prompt_oneshot_permission(
@@ -2278,8 +2423,11 @@ where
             && let Some(w) = worker.as_ref()
         {
             runtime_deps.mark_running(app).await?;
-            agent_handle =
-                Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
+            agent_handle = Some(
+                runtime_deps
+                    .start_agent_task(app, w, msg, &mut pending_title_gen)
+                    .await?,
+            );
             assistant_response.clear();
             continue;
         }
@@ -2493,12 +2641,11 @@ where
                             && let Some(w) = worker.as_ref()
                         {
                             runtime_deps.mark_running(app).await?;
-                            agent_handle = Some(runtime_deps.start_agent_task(
-                                app,
-                                w,
-                                msg,
-                                &mut pending_title_gen,
-                            )?);
+                            agent_handle = Some(
+                                runtime_deps
+                                    .start_agent_task(app, w, msg, &mut pending_title_gen)
+                                    .await?,
+                            );
                             assistant_response.clear();
                         }
                     }

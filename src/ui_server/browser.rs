@@ -12,10 +12,12 @@ use skyzen::{Result as SkyResult, StatusCode};
 
 use super::state::UiServerState;
 use super::types::BrowserTakeoverResponse;
+use crate::ui_event_bus::UiEventTopics;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BrowserStatus {
+    enabled: bool,
     running: bool,
     cdp_endpoint: Option<String>,
     takeover_session_id: Option<String>,
@@ -42,6 +44,7 @@ pub(super) struct BrowserTakeoverRequest {
 pub(super) async fn browser_status(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<BrowserStatus>> {
+    let enabled = state.config_snapshot().browser.enabled;
     let takeover_session_id = state
         .runtime_service
         .find_browser_takeover_session()
@@ -49,8 +52,9 @@ pub(super) async fn browser_status(
         .map_err(|error| {
             skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
-    let Some(ref bm) = state.browser_manager else {
+    let Some(bm) = state.browser_manager() else {
         return Ok(Json(BrowserStatus {
+            enabled,
             running: false,
             cdp_endpoint: None,
             takeover_session_id,
@@ -58,12 +62,9 @@ pub(super) async fn browser_status(
     };
     let running = bm.is_running().await;
     Ok(Json(BrowserStatus {
+        enabled,
         running,
-        cdp_endpoint: if running {
-            Some(bm.cdp_endpoint())
-        } else {
-            None
-        },
+        cdp_endpoint: if running { bm.cdp_endpoint() } else { None },
         takeover_session_id,
     }))
 }
@@ -71,7 +72,7 @@ pub(super) async fn browser_status(
 pub(super) async fn browser_start(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<BrowserStatus>> {
-    let Some(ref bm) = state.browser_manager else {
+    let Some(bm) = state.browser_manager() else {
         return Err(skyzen::Error::msg("Browser automation is not enabled")
             .set_status(StatusCode::NOT_FOUND));
     };
@@ -79,10 +80,12 @@ pub(super) async fn browser_start(
     bm.start().await.map_err(|e| {
         skyzen::Error::msg(e.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
+    state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
 
     Ok(Json(BrowserStatus {
+        enabled: true,
         running: true,
-        cdp_endpoint: Some(bm.cdp_endpoint()),
+        cdp_endpoint: bm.cdp_endpoint(),
         takeover_session_id: state
             .runtime_service
             .find_browser_takeover_session()
@@ -96,7 +99,7 @@ pub(super) async fn browser_start(
 pub(super) async fn browser_stop(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<BrowserStatus>> {
-    let Some(ref bm) = state.browser_manager else {
+    let Some(bm) = state.browser_manager() else {
         return Err(skyzen::Error::msg("Browser automation is not enabled")
             .set_status(StatusCode::NOT_FOUND));
     };
@@ -104,8 +107,10 @@ pub(super) async fn browser_stop(
     bm.stop().await.map_err(|e| {
         skyzen::Error::msg(e.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
+    state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
 
     Ok(Json(BrowserStatus {
+        enabled: true,
         running: false,
         cdp_endpoint: None,
         takeover_session_id: state
@@ -127,7 +132,7 @@ pub(super) async fn browser_offer(
     State(state): State<Arc<UiServerState>>,
     Json(req): Json<WebRtcOfferRequest>,
 ) -> SkyResult<Json<WebRtcAnswerResponse>> {
-    let Some(ref bm) = state.browser_manager else {
+    let Some(bm) = state.browser_manager() else {
         return Err(skyzen::Error::msg("Browser automation is not enabled")
             .set_status(StatusCode::NOT_FOUND));
     };
@@ -185,7 +190,6 @@ pub(super) async fn browser_takeover_stop(
         .map_err(|error| {
             skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
-
     Ok(Json(BrowserTakeoverResponse {
         ok: true,
         session_id,

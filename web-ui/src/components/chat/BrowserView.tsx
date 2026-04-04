@@ -7,6 +7,7 @@ import {
   browserTakeoverStart,
   browserTakeoverStop,
 } from '@/lib/api';
+import { useStore } from '@/lib/store';
 import { Globe, Loader2, ArrowRight, X } from 'lucide-react';
 
 /** Minimum interval between mouse-move dispatches (ms). */
@@ -25,11 +26,13 @@ interface InputMessage {
 }
 
 export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
-  const [running, setRunning] = useState(false);
   const [loading, setLoading] = useState(false);
   const [urlInput, setUrlInput] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  const browserStatus = useStore((state) => state.browserStatus);
+  const browserEnabled = browserStatus?.enabled ?? false;
+  const running = browserStatus?.running ?? false;
   const videoRef = useRef<HTMLVideoElement>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
@@ -39,8 +42,6 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
   const reconnectAttemptRef = useRef(0);
   const hasOpenedRef = useRef(false);
 
-  // Browser lifecycle is managed by May backend:
-  // opening this panel ensures browser is running; closing panel only detaches UI.
   useEffect(() => {
     if (!open) {
       if (!hasOpenedRef.current) {
@@ -60,30 +61,20 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
     }
 
     hasOpenedRef.current = true;
-    let cancelled = false;
+    setError(null);
+  }, [open]);
+
+  const handleStartBrowser = useCallback(async () => {
     setLoading(true);
     setError(null);
-    void startBrowser()
-      .then((status) => {
-        if (!cancelled) {
-          setRunning(status.running);
-        }
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : String(e));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
+    try {
+      await startBrowser();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   const releaseTakeover = useCallback(async () => {
     const activeSessionId = takeoverSessionRef.current;
@@ -375,7 +366,9 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            <span>{running ? 'Managed by May' : 'Stopped'}</span>
+            <span>
+              {!browserEnabled ? 'Disabled' : running ? 'Managed by May' : 'Stopped'}
+            </span>
           </div>
           <Button variant="ghost" size="icon" className="h-8 w-8" onClick={onClose}>
             <X className="h-4 w-4" />
@@ -413,10 +406,24 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
         {!running ? (
           <div className="text-center text-muted-foreground">
             <Globe className="mx-auto mb-3 h-12 w-12 opacity-30" />
-            <p className="text-sm">Browser is not running.</p>
-            <p className="mt-1 text-xs">
-              May starts it automatically when Playwright is invoked.
+            <p className="text-sm">
+              {browserEnabled ? 'Browser is not running.' : 'Browser is disabled in settings.'}
             </p>
+            <p className="mt-1 text-xs">
+              {browserEnabled
+                ? 'May manages the browser lifetime. Start it explicitly if you need a live session.'
+                : 'Enable the browser feature in settings to let May provision and manage the runtime.'}
+            </p>
+            {browserEnabled && (
+              <Button
+                className="mt-4"
+                onClick={() => void handleStartBrowser()}
+                disabled={loading}
+              >
+                {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Start Browser
+              </Button>
+            )}
           </div>
         ) : (
           <video

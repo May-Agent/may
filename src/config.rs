@@ -176,6 +176,12 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("Failed to serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error(
+        "legacy config section `[playwright]` is no longer supported; rename it to `[browser]`"
+    )]
+    LegacyPlaywrightSection,
+    #[error("invalid browser config: {0}")]
+    InvalidBrowserConfig(String),
 }
 
 /// LLM provider types.
@@ -200,6 +206,8 @@ pub enum ProviderType {
     DeepSeek,
     /// Ollama (local, `OpenAI` format)
     Ollama,
+    /// LM Studio local server (`OpenAI` format)
+    LMStudio,
     /// Groq (`OpenAI` format)
     Groq,
     /// Together AI (`OpenAI` format)
@@ -223,7 +231,7 @@ impl ProviderType {
             Self::XAI => Some(aither_models::Provider::XAI),
             Self::Groq => Some(aither_models::Provider::Groq),
             Self::Together => Some(aither_models::Provider::Together),
-            Self::OpenRouter | Self::Ollama | Self::Custom | Self::Copilot => None,
+            Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom | Self::Copilot => None,
         }
     }
 
@@ -263,6 +271,7 @@ impl ProviderType {
         Self::OpenRouter,
         Self::DeepSeek,
         Self::Ollama,
+        Self::LMStudio,
         Self::Groq,
         Self::Together,
         Self::Mistral,
@@ -281,6 +290,7 @@ impl ProviderType {
             Self::OpenRouter => "OpenRouter",
             Self::DeepSeek => "DeepSeek",
             Self::Ollama => "Ollama (Local)",
+            Self::LMStudio => "LM Studio",
             Self::Groq => "Groq",
             Self::Together => "Together AI",
             Self::Mistral => "Mistral AI",
@@ -300,6 +310,7 @@ impl ProviderType {
             Self::OpenRouter => "openrouter",
             Self::DeepSeek => "deepseek",
             Self::Ollama => "ollama",
+            Self::LMStudio => "lmstudio",
             Self::Groq => "groq",
             Self::Together => "together",
             Self::Mistral => "mistral",
@@ -329,6 +340,7 @@ impl ProviderType {
             Self::OpenRouter => Some("https://openrouter.ai/api/v1"),
             Self::DeepSeek => Some("https://api.deepseek.com/v1"),
             Self::Ollama => Some("http://localhost:11434/v1"),
+            Self::LMStudio => Some("http://127.0.0.1:1234/v1"),
             Self::Groq => Some("https://api.groq.com/openai/v1"),
             Self::Together => Some("https://api.together.xyz/v1"),
             Self::Mistral => Some("https://api.mistral.ai/v1"),
@@ -350,7 +362,7 @@ impl ProviderType {
             Self::XAI => "xai",
             Self::Groq => "groq",
             Self::Together => "together",
-            Self::OpenRouter | Self::Ollama | Self::Custom => "unknown",
+            Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom => "unknown",
         }
     }
 
@@ -358,7 +370,10 @@ impl ProviderType {
     /// Custom providers don't require API keys since they might be local servers.
     #[must_use]
     pub const fn requires_api_key(self) -> bool {
-        !matches!(self, Self::Ollama | Self::Copilot | Self::Custom)
+        !matches!(
+            self,
+            Self::Ollama | Self::LMStudio | Self::Copilot | Self::Custom
+        )
     }
 
     /// Whether this provider type requires a base URL to be configured.
@@ -385,6 +400,7 @@ impl ProviderType {
             "openrouter" => Self::OpenRouter,
             "deepseek" => Self::DeepSeek,
             "ollama" => Self::Ollama,
+            "lmstudio" | "lm-studio" => Self::LMStudio,
             "groq" => Self::Groq,
             "together" => Self::Together,
             "mistral" => Self::Mistral,
@@ -401,7 +417,11 @@ impl ProviderType {
     /// by any native provider.
     #[must_use]
     pub fn can_serve_model(self, model_id: &str) -> bool {
-        if self == Self::OpenRouter || self == Self::Ollama || self == Self::Custom {
+        if self == Self::OpenRouter
+            || self == Self::Ollama
+            || self == Self::LMStudio
+            || self == Self::Custom
+        {
             return true;
         }
 
@@ -600,7 +620,10 @@ impl ProviderInstance {
         let provider_type = self.resolve_type(id);
         if matches!(
             provider_type,
-            ProviderType::OpenRouter | ProviderType::Ollama | ProviderType::Custom
+            ProviderType::OpenRouter
+                | ProviderType::Ollama
+                | ProviderType::LMStudio
+                | ProviderType::Custom
         ) {
             return true;
         }
@@ -669,6 +692,12 @@ pub struct ModelsConfig {
     /// Image generation models in priority order
     #[serde(default)]
     pub image_generation: Vec<String>,
+    /// Global embedding model used for semantic search/indexing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    /// Optional explicit embedding dimensions for providers that require it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimensions: Option<usize>,
     /// Model to provider mapping (`model_id` -> `provider_id`).
     /// Populated when models are added via the tier picker.
     #[serde(default)]
@@ -740,6 +769,14 @@ impl ModelsConfig {
             .find(|(saved, _)| model_ids_match(saved, model_id, MatchMode::Relaxed))
             .map(|(_, provider)| provider.as_str())
     }
+
+    #[must_use]
+    pub fn embedding_model(&self) -> Option<&str> {
+        self.embedding_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -806,43 +843,39 @@ fn default_ui_theme() -> String {
     "system".to_string()
 }
 
-/// Which browser to use for Playwright / browser automation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Browser automation configuration.
+///
+/// When enabled, May connects sessions to a browser runtime that May owns and
+/// manages. The runtime may be provisioned locally by May or exposed through a
+/// remote CDP endpoint. Agents use the May-managed `browser` command and must
+/// not install or manage browser binaries themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PlaywrightBrowser {
-    /// Use the system-installed Google Chrome.
-    #[default]
-    LocalChrome,
-    /// Use Playwright-managed Chromium (downloaded via `npx playwright install chromium`).
-    Chromium,
+pub enum BrowserBackendKind {
+    Managed,
+    RemoteCdp,
 }
 
-impl PlaywrightBrowser {
-    #[must_use]
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::LocalChrome => "Local Chrome",
-            Self::Chromium => "Chromium (Playwright)",
-        }
+impl Default for BrowserBackendKind {
+    fn default() -> Self {
+        Self::Managed
     }
 }
 
-/// Playwright / browser automation configuration.
-///
-/// When enabled, May launches a browser on the host with a CDP debug port.
-/// The agent in a container connects via Playwright's `connect_over_cdp`,
-/// while the Web UI streams a live view via CDP screencast.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaywrightConfig {
+pub struct BrowserConfig {
     /// Whether browser automation is enabled.
     #[serde(default)]
     pub enabled: bool,
-    /// Which browser to use.
+    /// How May reaches the browser runtime.
     #[serde(default)]
-    pub browser: PlaywrightBrowser,
+    pub backend: BrowserBackendKind,
     /// CDP remote debugging port on the host.
-    #[serde(default = "default_playwright_port")]
+    #[serde(default = "default_browser_port")]
     pub port: u16,
+    /// CDP endpoint for a remotely managed browser runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_cdp_endpoint: Option<String>,
     /// JPEG quality for screencast frames (1-100). Lower = less bandwidth.
     #[serde(default = "default_screencast_quality")]
     pub screencast_quality: u32,
@@ -851,8 +884,8 @@ pub struct PlaywrightConfig {
     pub screencast_max_width: u32,
 }
 
-const fn default_playwright_port() -> u16 {
-    9222
+const fn default_browser_port() -> u16 {
+    39222
 }
 
 const fn default_screencast_quality() -> u32 {
@@ -863,15 +896,51 @@ const fn default_screencast_max_width() -> u32 {
     1280
 }
 
-impl Default for PlaywrightConfig {
+impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            browser: PlaywrightBrowser::default(),
-            port: default_playwright_port(),
+            backend: BrowserBackendKind::Managed,
+            port: default_browser_port(),
+            remote_cdp_endpoint: None,
             screencast_quality: default_screencast_quality(),
             screencast_max_width: default_screencast_max_width(),
         }
+    }
+}
+
+impl BrowserConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.backend == BrowserBackendKind::RemoteCdp
+            && self
+                .remote_cdp_endpoint
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(ConfigError::InvalidBrowserConfig(
+                "browser.remote_cdp_endpoint is required when browser.backend = \"remote_cdp\""
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn requires_managed_runtime(&self) -> bool {
+        matches!(self.backend, BrowserBackendKind::Managed)
+    }
+
+    pub fn remote_cdp_endpoint(&self) -> Result<&str, ConfigError> {
+        self.remote_cdp_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ConfigError::InvalidBrowserConfig(
+                    "browser.remote_cdp_endpoint is required when browser.backend = \"remote_cdp\""
+                        .to_string(),
+                )
+            })
     }
 }
 
@@ -932,9 +1001,9 @@ pub struct MayConfig {
     /// UI appearance settings.
     #[serde(default)]
     pub appearance: Appearance,
-    /// Playwright / browser automation settings.
+    /// Managed browser automation settings.
     #[serde(default)]
-    pub playwright: PlaywrightConfig,
+    pub browser: BrowserConfig,
     /// Remote access settings.
     #[serde(default)]
     pub remote_access: RemoteAccessConfig,
@@ -958,7 +1027,7 @@ impl Default for MayConfig {
             models: ModelsConfig::default(),
             preferences: Preferences::default(),
             appearance: Appearance::default(),
-            playwright: PlaywrightConfig::default(),
+            browser: BrowserConfig::default(),
             remote_access: RemoteAccessConfig::default(),
             last_model: None,
             ssh_servers: Vec::new(),
@@ -988,7 +1057,12 @@ impl MayConfig {
     /// Load configuration from a specific path.
     pub async fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match async_fs::read_to_string(path).await {
-            Ok(content) => Ok(toml::from_str(&content)?),
+            Ok(content) => {
+                reject_legacy_config_sections(&content)?;
+                let config: Self = toml::from_str(&content)?;
+                config.validate()?;
+                Ok(config)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(ConfigError::Read(error)),
         }
@@ -1002,12 +1076,17 @@ impl MayConfig {
 
     /// Save configuration to a specific path.
     pub async fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
+        self.validate()?;
         if let Some(parent) = path.parent() {
             async_fs::create_dir_all(parent).await?;
         }
         let content = toml::to_string_pretty(self)?;
         async_fs::write(path, content).await?;
         Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.browser.validate()
     }
 
     /// Check if configuration is complete enough to use.
@@ -1163,6 +1242,14 @@ impl MayConfig {
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
     }
+}
+
+fn reject_legacy_config_sections(content: &str) -> Result<(), ConfigError> {
+    let document = toml::from_str::<toml::Value>(content).map_err(ConfigError::Parse)?;
+    if document.get("playwright").is_some() {
+        return Err(ConfigError::LegacyPlaywrightSection);
+    }
+    Ok(())
 }
 
 /// An available model from a configured provider.
@@ -1362,12 +1449,54 @@ mod tests {
     }
 
     #[test]
+    fn test_browser_config_defaults_to_managed_backend() {
+        let config = MayConfig::default();
+        assert_eq!(config.browser.backend, BrowserBackendKind::Managed);
+        assert!(config.browser.requires_managed_runtime());
+    }
+
+    #[test]
+    fn test_browser_config_requires_remote_endpoint_for_remote_backend() {
+        let mut config = MayConfig::default();
+        config.browser.enabled = true;
+        config.browser.backend = BrowserBackendKind::RemoteCdp;
+        let error = config
+            .validate()
+            .expect_err("remote browser must require endpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("browser.remote_cdp_endpoint is required")
+        );
+    }
+
+    #[test]
+    fn test_browser_config_accepts_remote_backend_with_endpoint() {
+        let mut config = MayConfig::default();
+        config.browser.enabled = true;
+        config.browser.backend = BrowserBackendKind::RemoteCdp;
+        config.browser.remote_cdp_endpoint = Some("wss://browser.example/ws".to_string());
+        config
+            .validate()
+            .expect("remote browser config should validate");
+        assert_eq!(
+            config
+                .browser
+                .remote_cdp_endpoint()
+                .expect("endpoint must resolve"),
+            "wss://browser.example/ws"
+        );
+    }
+
+    #[test]
     fn test_provider_type_from_id() {
         assert_eq!(ProviderType::from_id("anthropic"), ProviderType::Anthropic);
         assert_eq!(ProviderType::from_id("claude"), ProviderType::Anthropic);
         assert_eq!(ProviderType::from_id("openai"), ProviderType::OpenAI);
         assert_eq!(ProviderType::from_id("google"), ProviderType::Google);
         assert_eq!(ProviderType::from_id("gemini"), ProviderType::Google);
+        assert_eq!(ProviderType::from_id("lmstudio"), ProviderType::LMStudio);
+        assert_eq!(ProviderType::from_id("lm-studio"), ProviderType::LMStudio);
         assert_eq!(
             ProviderType::from_id("openrouter"),
             ProviderType::OpenRouter
@@ -1391,6 +1520,10 @@ mod tests {
         // Ollama doesn't need API key
         let ollama = ProviderInstance::default();
         assert!(ollama.is_valid("ollama"));
+
+        // LM Studio doesn't need API key
+        let lmstudio = ProviderInstance::new(ProviderType::LMStudio);
+        assert!(lmstudio.is_valid("lmstudio"));
 
         // Custom needs base_url (but not API key - might be local server)
         let custom_invalid = ProviderInstance::default();
@@ -1416,6 +1549,9 @@ mod tests {
         assert!(ProviderType::OpenRouter.can_serve_model(anthropic_model));
         assert!(ProviderType::OpenRouter.can_serve_model("gpt-4o"));
 
+        // LM Studio can serve arbitrary local model ids
+        assert!(ProviderType::LMStudio.can_serve_model("qwen3-embedding-0.6b-dwq"));
+
         // Copilot can serve OpenAI and Anthropic models, but not Google models
         assert!(ProviderType::Copilot.can_serve_model("gpt-4o"));
         assert!(ProviderType::Copilot.can_serve_model(anthropic_model));
@@ -1433,6 +1569,10 @@ mod tests {
             .with_base_url("https://proxy.example.com/v1");
         assert!(proxy.is_generic_model_proxy("proxy-openai"));
         assert!(proxy.can_serve_model("proxy-openai", "gemini-3-flash-preview"));
+
+        let lmstudio = ProviderInstance::new(ProviderType::LMStudio);
+        assert!(lmstudio.is_generic_model_proxy("lmstudio"));
+        assert!(lmstudio.can_serve_model("lmstudio", "qwen3-embedding-0.6b-dwq"));
     }
 
     #[test]

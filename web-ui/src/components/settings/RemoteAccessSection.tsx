@@ -1,4 +1,3 @@
-import { useEffect } from 'react';
 import { Shield } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -13,10 +12,6 @@ export function RemoteAccessSection({ configDraft, setDraft }: ConfigSectionProp
     startRemoteAccess,
     stopRemoteAccess,
   } = useStore();
-
-  useEffect(() => {
-    void refreshRemoteAccessStatus();
-  }, [refreshRemoteAccessStatus]);
 
   if (!configDraft) {
     return <div className="text-sm text-muted-foreground">Loading config...</div>;

@@ -2,13 +2,9 @@
 
 use std::{borrow::Cow, collections::HashSet, path::PathBuf, sync::Arc};
 
-use aither_agent::sandbox::builtin::AskCommand;
-use aither_agent::specialized::{SubagentFileMount, SubagentTool};
-use aither_agent::webfetch::WebFetchTool;
-use aither_agent::websearch::WebSearchTool;
 use aither_agent::{
     Agent, AgentError, AgentEvent, AgentKind, BrowserBackend, CheckpointContext, CompactResult,
-    HCons, Hook, TerminalAgentBuilder, TurnBoundaryAction, TurnBoundaryContext,
+    HCons, Hook, SubagentDefinition, TerminalAgentBuilder, TurnBoundaryAction, TurnBoundaryContext,
 };
 use aither_cloud::{
     CloudProvider, claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI,
@@ -16,33 +12,34 @@ use aither_cloud::{
 use aither_core::LanguageModel;
 use aither_core::image::{ImageGenerator, Prompt, Size};
 use aither_core::llm::{
-    Event as LlmEvent, LLMRequest, Message as LlmMessage, Tool, ToolOutput,
+    Event as LlmEvent, LLMRequest, Message as LlmMessage, Tool, ToolResult,
     model::{Ability, Parameters, Profile as ModelProfile, ReasoningEffort},
 };
 use aither_sandbox::{
     ContainerExecHandle, ContainerShellRuntime, ShellRuntimeAvailability, SshServer, TerminalMode,
     TerminalTool,
-    permission::{NoopPermissionHandler, PermissionError, PermissionHandler},
+    permission::{PermissionError, PermissionHandler},
 };
 use askama::Template;
 use executor_core::DefaultExecutor;
 use futures_lite::{Stream, StreamExt};
 
-use crate::agent::notify_tool::NotifyTool;
-use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
-use crate::agent::search_tool::SearchTool;
-use crate::agent::session_tool::SessionTool;
-use crate::agent::task_tool::{TaskRuntimeKind, TaskTool};
+use crate::agent::browser_tool::BrowserBroker;
+use crate::agent::register_tool::RegisterBroker;
+use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
 use crate::copilot::clear_copilot_credentials;
-use crate::db::{NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
-use crate::embedding_provider::resolve_embedding_provider;
+use crate::embedding_provider::{EmbeddingModelResolution, resolve_embedding_model};
 use crate::live_response::LiveResponseRegistry;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{MessageRole, SessionId, SessionPaths, SessionPlanState};
+use crate::skill::SkillManager;
+use crate::subagent::SubagentManager;
+use crate::terminal_commands::{SharedTerminalCommandConfig, register_shared_terminal_commands};
+use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
-use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
+use crate::workspace_request::WorkspaceRequestBroker;
 
 // Error message templates
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
@@ -186,6 +183,101 @@ pub fn provider_candidate_count(config: &MayConfig, model: &str) -> usize {
     provider_candidates_for_model(config, model).len()
 }
 
+pub struct ResolvedProviderRuntime {
+    pub provider_id: String,
+    pub llm: CloudProvider,
+    pub search_embedder: EmbeddingModelResolution,
+}
+
+pub async fn resolve_provider_runtime(
+    may_config: &MayConfig,
+    model: &str,
+    provider_attempt: usize,
+) -> Result<ResolvedProviderRuntime, MayAgentError> {
+    let provider_candidates = provider_candidates_for_model(may_config, model);
+    let candidate_count = provider_candidates.len();
+    if candidate_count == 0 {
+        return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
+    }
+    let start_index = provider_attempt % candidate_count;
+    let mut last_provider_error: Option<MayAgentError> = None;
+
+    let mut selected_provider: Option<(String, CloudProvider)> = None;
+    for offset in 0..candidate_count {
+        let index = (start_index + offset) % candidate_count;
+        let provider_id = provider_candidates[index].provider_id.clone();
+        let Some(provider_instance) = may_config.provider.get(&provider_id).cloned() else {
+            continue;
+        };
+
+        if let Err(error) = validate_generic_provider_model_support(
+            may_config,
+            &provider_id,
+            &provider_instance,
+            model,
+        )
+        .await
+        {
+            tracing::warn!(
+                model,
+                provider_id,
+                error = %error,
+                "provider candidate rejected during model support validation"
+            );
+            last_provider_error = Some(error);
+            continue;
+        }
+
+        match build_cloud_provider_from_instance(&provider_id, &provider_instance, model).await {
+            Ok(llm) => {
+                selected_provider = Some((provider_id, llm));
+                break;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    model,
+                    provider_id,
+                    error = %error,
+                    "failed to initialize provider candidate for model"
+                );
+                last_provider_error = Some(error);
+            }
+        }
+    }
+
+    let (provider_id, llm) = if let Some(selected) = selected_provider {
+        selected
+    } else {
+        return Err(last_provider_error
+            .unwrap_or_else(|| MayAgentError::MissingApiKey(err_no_provider(model))));
+    };
+
+    let search_embedder =
+        EmbeddingModelResolution::from_result(resolve_embedding_model(may_config).await);
+    match &search_embedder {
+        EmbeddingModelResolution::Ready(resolved) => {
+            tracing::debug!(
+                embedding_model = resolved.model_id(),
+                provider_ids = %resolved.provider_ids().join(", "),
+                "resolved embedding provider for semantic search"
+            );
+        }
+        EmbeddingModelResolution::Disabled => {}
+        EmbeddingModelResolution::Failed(error) => {
+            tracing::debug!(
+                error = %error,
+                "semantic search embedder resolution failed"
+            );
+        }
+    }
+
+    Ok(ResolvedProviderRuntime {
+        provider_id,
+        llm,
+        search_embedder,
+    })
+}
+
 async fn validate_generic_provider_model_support(
     config: &MayConfig,
     provider_id: &str,
@@ -247,6 +339,8 @@ pub enum MayAgentError {
     CopilotToken(#[from] crate::copilot::CopilotTokenError),
     #[error("Workspace config error: {0}")]
     Workspace(#[from] crate::workspace::WorkspaceConfigError),
+    #[error("MCP error: {0}")]
+    Mcp(#[from] crate::mcp::McpConnectionLoadError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -397,6 +491,16 @@ impl PermissionApprover {
     }
 
     #[must_use]
+    pub fn runtime_service(&self) -> Option<Arc<crate::session::SessionRuntimeService>> {
+        self.runtime_service.clone()
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    #[must_use]
     pub fn without_interactive_approval(mut self, context: &'static str) -> Self {
         self.approval_mode = ApprovalMode::Unavailable { context };
         self
@@ -524,8 +628,8 @@ impl Default for PermissionApprover {
 impl PermissionHandler for PermissionApprover {
     async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
         match mode {
-            TerminalMode::Sandboxed => Ok(true),
-            TerminalMode::Network | TerminalMode::Unsafe => {
+            TerminalMode::Sandboxed | TerminalMode::Network => Ok(true),
+            TerminalMode::Unsafe => {
                 let approved = self.request_and_wait(mode, script.to_string()).await?;
                 if approved {
                     Ok(true)
@@ -547,112 +651,9 @@ impl PermissionHandler for PermissionApprover {
         if matches!(self.approval_mode, ApprovalMode::Unavailable { .. }) {
             return false;
         }
-        let Some(session_id) = self.session_id.as_deref() else {
-            return false;
-        };
         match mode {
-            TerminalMode::Sandboxed => false,
+            TerminalMode::Sandboxed | TerminalMode::Network => false,
             TerminalMode::Unsafe => true,
-            TerminalMode::Network => {
-                let Some(runtime_service) = &self.runtime_service else {
-                    return false;
-                };
-                !runtime_service
-                    .db()
-                    .session_has_approved_permission_mode(
-                        session_id,
-                        PermissionHistoryMode::from(mode),
-                    )
-                    .await
-                    .unwrap_or(false)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct MayPermissionHandler {
-    approver: Option<PermissionApprover>,
-    network_policy: Option<CompiledNetworkPolicy>,
-    profile_id: Option<String>,
-}
-
-impl MayPermissionHandler {
-    const fn new(
-        approver: Option<PermissionApprover>,
-        network_policy: Option<CompiledNetworkPolicy>,
-        profile_id: Option<String>,
-    ) -> Self {
-        Self {
-            approver,
-            network_policy,
-            profile_id,
-        }
-    }
-
-    async fn append_network_audit_log(
-        &self,
-        domain: &str,
-        port: u16,
-        allowed: bool,
-        reason: Option<&str>,
-    ) {
-        let Some(approver) = &self.approver else {
-            return;
-        };
-        let Some(runtime_service) = approver.runtime_service.clone() else {
-            return;
-        };
-        let _ = runtime_service
-            .db()
-            .append_network_access_log(NetworkAccessLogParams {
-                session_id: approver.session_id.as_deref(),
-                profile_id: self.profile_id.as_deref(),
-                source: NetworkAccessSource::Chat,
-                mode: NetworkAccessMode::Network,
-                domain,
-                port,
-                allowed,
-                reason,
-            })
-            .await;
-    }
-}
-
-impl PermissionHandler for MayPermissionHandler {
-    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
-        match &self.approver {
-            Some(approver) => approver.check(mode, script).await,
-            None => NoopPermissionHandler.check(mode, script).await,
-        }
-    }
-
-    async fn check_domain(&self, domain: &str, port: u16) -> bool {
-        if let Some(policy) = &self.network_policy
-            && !policy.allows_domain(domain)
-        {
-            tracing::warn!(domain, port, mode = %policy.mode().as_str(), "blocked outbound domain by configured network policy");
-            self.append_network_audit_log(domain, port, false, Some(policy.mode().as_str()))
-                .await;
-            return false;
-        }
-        let allowed = match &self.approver {
-            Some(approver) => approver.check_domain(domain, port).await,
-            None => NoopPermissionHandler.check_domain(domain, port).await,
-        };
-        self.append_network_audit_log(domain, port, allowed, None)
-            .await;
-        allowed
-    }
-
-    async fn will_wait_for_approval(&self, mode: TerminalMode, script: &str) -> bool {
-        match &self.approver {
-            Some(approver) => approver.will_wait_for_approval(mode, script).await,
-            None => {
-                NoopPermissionHandler
-                    .will_wait_for_approval(mode, script)
-                    .await
-            }
         }
     }
 }
@@ -726,7 +727,7 @@ impl Hook for ContextSnapshotHook {
 
 /// Execution environment for a `MayAgent`.
 pub enum AgentEnvironment {
-    /// Native macOS sandbox via leash.
+    /// Native macOS sandbox via heel.
     Local,
     /// Local home environment with one designated remote SSH target.
     Remote {
@@ -755,7 +756,7 @@ pub struct MayAgentConfig {
     /// Provider ID selected for this request.
     pub provider_id: String,
     /// Optional embedding provider used for semantic retrieval tools.
-    pub search_embedder: Option<aither_cloud::CloudEmbedder>,
+    pub search_embedder: EmbeddingModelResolution,
     /// Session sandbox directory (`TerminalTool` creates working dir inside).
     pub sandbox_dir: PathBuf,
     /// May directory (~/.may/).
@@ -778,7 +779,7 @@ pub struct MayAgentConfig {
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,
-    /// Execution environment (local leash sandbox or container).
+    /// Execution environment (local heel sandbox or container).
     pub environment: AgentEnvironment,
     /// Optional profile persona overlay injected into the agent context.
     pub profile_persona: Option<String>,
@@ -794,6 +795,8 @@ pub struct MayAgentConfig {
     pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
     /// Optional broker for `notify` command requests.
     pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
+    /// Optional broker for `browser` command requests.
+    pub browser_broker: Option<BrowserBroker>,
     /// Optional broker for `register-skills` command requests.
     pub register_skills_broker: Option<RegisterBroker>,
     /// Optional broker for `register-subagents` command requests.
@@ -833,6 +836,8 @@ struct RuntimeSystemContext {
     last_memory_content: String,
     terminal_runtime: Option<TerminalRuntimeContext>,
     workspace: Option<Workspace>,
+    remote_environment: Option<RemoteEnvironmentContext>,
+    container_environment: Option<ContainerEnvironmentContext>,
     browser: Option<Browser>,
     profile_persona: Option<ProfilePersona>,
     profile_memories: Option<ProfileMemories>,
@@ -850,6 +855,8 @@ impl RuntimeSystemContext {
             last_memory_content: memory_content,
             terminal_runtime: None,
             workspace: None,
+            remote_environment: None,
+            container_environment: None,
             browser: None,
             profile_persona: None,
             profile_memories: None,
@@ -868,6 +875,19 @@ impl RuntimeSystemContext {
 
     fn with_workspace(mut self, workspace: Workspace) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    fn with_remote_environment(mut self, remote_environment: RemoteEnvironmentContext) -> Self {
+        self.remote_environment = Some(remote_environment);
+        self
+    }
+
+    fn with_container_environment(
+        mut self,
+        container_environment: ContainerEnvironmentContext,
+    ) -> Self {
+        self.container_environment = Some(container_environment);
         self
     }
 
@@ -916,6 +936,8 @@ impl RuntimeSystemContext {
         reconcile_system_block(context, Some(&memory));
         reconcile_system_block(context, self.terminal_runtime.as_ref());
         reconcile_system_block(context, self.workspace.as_ref());
+        reconcile_system_block(context, self.remote_environment.as_ref());
+        reconcile_system_block(context, self.container_environment.as_ref());
         reconcile_system_block(context, self.browser.as_ref());
         reconcile_system_block(context, self.profile_persona.as_ref());
         reconcile_system_block(context, self.profile_memories.as_ref());
@@ -955,8 +977,9 @@ impl Tool for ImagineTool {
     }
 
     type Arguments = ImagineArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         let generator = self
             .generator
             .as_ref()
@@ -998,7 +1021,7 @@ impl Tool for ImagineTool {
         let mut artifact_path = String::with_capacity(filename.len() + 10);
         artifact_path.push_str("artifacts/");
         artifact_path.push_str(filename.as_str());
-        Ok(ToolOutput::text(artifact_path))
+        Ok(ToolResult::text(artifact_path))
     }
 }
 
@@ -1100,12 +1123,10 @@ impl MayAgent {
         let executor = DefaultExecutor;
 
         // Create the terminal command tool in the sandbox dir.
-        // `TerminalTool` is a legacy type name; execution is terminal-first and
-        // does not guarantee a literal shell implementation for every command.
-        let terminal_tool: TerminalTool<MayPermissionHandler, DefaultExecutor> =
+        let terminal_tool: TerminalTool<TerminalPermissionHandler, DefaultExecutor> =
             TerminalTool::new_exact(
                 &config.sandbox_dir,
-                MayPermissionHandler::new(
+                TerminalPermissionHandler::for_agent(
                     config.permission_approver.clone(),
                     config.network_policy.clone(),
                     config.profile_id.clone(),
@@ -1155,52 +1176,19 @@ impl MayAgent {
 
         let llm = RequestParameterizedModel::new(config.llm, config.request_parameters.clone());
 
-        // Clone LLM for tools that need it before it's moved into the builder
-        let fast_llm = llm.clone();
-        let subagent_llm = llm.clone();
+        // Clone LLM for terminal IPC commands before moving it into the builder.
+        let terminal_command_llm = llm.clone();
 
         // Create tools
-        let websearch = WebSearchTool::default();
-        let webfetch = WebFetchTool::new();
-        let ask = AskCommand::new(fast_llm);
-        let request_workspace = RequestWorkspaceTool::new(
-            config.session_id.as_str().to_string(),
-            config.workspace_request_broker,
-        );
         let ssh_authorizer_broker = config.ask_user_broker.clone();
         let ask_user = AskUserTool::new(
             config.session_id.as_str().to_string(),
             config.ask_user_broker,
         );
-        let session_tool = SessionTool::new(
-            config.may_dir.clone(),
-            config.session_id.as_str().to_string(),
-        );
-        let search_tool =
-            SearchTool::new(config.sandbox_dir.clone(), config.search_embedder.clone());
-        let task_tool = TaskTool::new(
-            config.session_id.as_str().to_string(),
-            match &config.environment {
-                AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
-                AgentEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
-                AgentEnvironment::Local => TaskRuntimeKind::Local,
-            },
-            config.task_broker,
-        );
         let imagine = ImagineTool {
             generator: config.image_generator,
             artifacts_dir: session_paths.artifacts_dir(),
         };
-        let notify_tool = NotifyTool::new(config.notify_broker);
-        let register_skills_tool = RegisterTool::<Skills>::new(
-            config.session_id.as_str().to_string(),
-            config.register_skills_broker,
-        );
-        let register_subagents_tool = RegisterTool::<Subagents>::new(
-            config.session_id.as_str().to_string(),
-            config.register_subagents_broker,
-        );
-        let subagent_tool = SubagentTool::new(subagent_llm).with_builtins();
         let runtime_db = config
             .permission_approver
             .as_ref()
@@ -1241,21 +1229,37 @@ impl MayAgent {
             config.max_iterations
         };
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
-            .tool(websearch)
-            .tool(webfetch)
-            .tool(ask)
             .tool(ask_user)
-            .tool(session_tool)
-            .tool(search_tool)
-            .tool(task_tool)
             .tool(imagine)
-            .tool(notify_tool)
-            .tool(register_skills_tool)
-            .tool(register_subagents_tool)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook);
-        if !is_container {
-            builder = builder.tool(request_workspace);
+        let terminal_command_factory = builder.terminal_tool_factory();
+        let shared_terminal_commands = register_shared_terminal_commands(
+            builder.tool_registry_mut(),
+            SharedTerminalCommandConfig {
+                llm: terminal_command_llm,
+                session_id: config.session_id.as_str().to_string(),
+                may_dir: config.may_dir.clone(),
+                sandbox_dir: config.sandbox_dir.clone(),
+                search_embedder: config.search_embedder.clone(),
+                task_runtime: match &config.environment {
+                    AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
+                    AgentEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
+                    AgentEnvironment::Local => TaskRuntimeKind::Local,
+                },
+                task_broker: config.task_broker.clone(),
+                notify_broker: config.notify_broker.clone(),
+                browser_broker: config.browser_broker.clone(),
+                register_skills_broker: config.register_skills_broker.clone(),
+                register_subagents_broker: config.register_subagents_broker.clone(),
+                workspace_request_broker: (!is_container)
+                    .then_some(config.workspace_request_broker.clone()),
+                terminal_tool_factory: Some(terminal_command_factory),
+            },
+        )
+        .await?;
+        for (name, description) in &shared_terminal_commands {
+            builder = builder.tool_description(name.clone(), description.clone());
         }
         if is_container {
             builder = builder.with_skills_readable_only(&skills_dir).await?;
@@ -1264,15 +1268,18 @@ impl MayAgent {
             builder = builder.with_skills(&skills_dir).await?;
             builder = builder.with_subagents(&subagents_dir).await?;
         }
+        let base_system_prompt =
+            build_base_system_prompt(&shared_terminal_commands, &skills_dir, &subagents_dir)
+                .await?;
         builder = builder
-            .with_default_prompt()
+            .system_prompt_raw(base_system_prompt)
             .shell_runtime_availability(availability)
             .ssh_servers(ssh_servers)
             .ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
                 config.session_id.as_str().to_string(),
                 ssh_authorizer_broker,
             ))
-            .agent_kind(AgentKind::Coding)
+            .agent_kind(AgentKind::Chatbot)
             .persona_prompt(include_str!("../../templates/system.md"))
             .system(build_memory_context(&memory_content))
             .system(terminal_runtime)
@@ -1323,6 +1330,16 @@ impl MayAgent {
             builder = builder.system(location_context);
         }
 
+        let browser_enabled = config.browser_broker.is_some()
+            || matches!(
+                config.environment,
+                AgentEnvironment::Container {
+                    browser_backend: Some(_),
+                    ..
+                }
+            );
+        let mut browser_cdp_endpoint = None;
+
         // Environment-specific configuration
         match config.environment {
             AgentEnvironment::Container {
@@ -1331,6 +1348,10 @@ impl MayAgent {
                 container_exec,
                 browser_backend,
             } => {
+                let container_context = build_container_environment_context(&config.cwd);
+                runtime_system_context =
+                    runtime_system_context.with_container_environment(container_context.clone());
+                builder = builder.system(container_context);
                 builder = builder.container_runtime(ContainerShellRuntime::new(
                     container_id,
                     container_ipc_host,
@@ -1343,10 +1364,7 @@ impl MayAgent {
                             &error,
                         ))
                     })?;
-                    let browser_context = build_browser_context(Some(endpoint.as_str()));
-                    runtime_system_context =
-                        runtime_system_context.with_browser(browser_context.clone());
-                    builder = builder.system(browser_context);
+                    browser_cdp_endpoint = Some(endpoint);
                 }
             }
             AgentEnvironment::Local => {
@@ -1362,26 +1380,19 @@ impl MayAgent {
             }
             AgentEnvironment::Remote { ssh_server } => {
                 let remote_context = build_remote_environment_context(&workspace, &ssh_server);
+                runtime_system_context =
+                    runtime_system_context.with_remote_environment(remote_context.clone());
                 builder = builder.system(remote_context);
             }
         }
 
+        let browser_context =
+            build_browser_context(browser_enabled, browser_cdp_endpoint.as_deref());
+        runtime_system_context = runtime_system_context.with_browser(browser_context.clone());
+        builder = builder.system(browser_context);
+
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
-
-        // Configure SubagentTool with explicit roots so file-based subagents resolve
-        // correctly in both local and container profiles.
-        let subagent_tool = subagent_tool
-            .with_base_dir(actual_sandbox_dir.clone())
-            .with_file_mounts([
-                SubagentFileMount::new(PathBuf::from("."), actual_sandbox_dir.clone()),
-                SubagentFileMount::new(
-                    PathBuf::from("subagents"),
-                    actual_sandbox_dir.join("subagents"),
-                ),
-                SubagentFileMount::new(PathBuf::from("skills"), actual_sandbox_dir.join("skills")),
-            ]);
-        builder = builder.tool(subagent_tool);
 
         let agent = builder.build();
 
@@ -1460,6 +1471,7 @@ impl MayAgent {
             None,
             None,
             None,
+            None,
             AgentEnvironment::Local,
             0,
         )
@@ -1484,69 +1496,16 @@ impl MayAgent {
         location: Option<crate::location::LocationInfo>,
         task_broker: Option<crate::agent::task_tool::TaskBroker>,
         notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
+        browser_broker: Option<BrowserBroker>,
         register_skills_broker: Option<RegisterBroker>,
         register_subagents_broker: Option<RegisterBroker>,
         environment: AgentEnvironment,
         provider_attempt: usize,
     ) -> Result<Self, MayAgentError> {
-        let provider_candidates = provider_candidates_for_model(may_config, model);
-        let candidate_count = provider_candidates.len();
-        if candidate_count == 0 {
-            return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
-        }
-        let start_index = provider_attempt % candidate_count;
-        let mut last_provider_error: Option<MayAgentError> = None;
-
-        let mut selected_provider: Option<(String, CloudProvider)> = None;
-        for offset in 0..candidate_count {
-            let index = (start_index + offset) % candidate_count;
-            let provider_id = provider_candidates[index].provider_id.clone();
-            let Some(provider_instance) = may_config.provider.get(&provider_id).cloned() else {
-                continue;
-            };
-
-            if let Err(error) = validate_generic_provider_model_support(
-                may_config,
-                &provider_id,
-                &provider_instance,
-                model,
-            )
-            .await
-            {
-                tracing::warn!(
-                    model,
-                    provider_id,
-                    error = %error,
-                    "provider candidate rejected during model support validation"
-                );
-                last_provider_error = Some(error);
-                continue;
-            }
-
-            match build_cloud_provider_from_instance(&provider_id, &provider_instance, model).await
-            {
-                Ok(llm) => {
-                    selected_provider = Some((provider_id, llm));
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        model,
-                        provider_id,
-                        error = %error,
-                        "failed to initialize provider candidate for model"
-                    );
-                    last_provider_error = Some(error);
-                }
-            }
-        }
-
-        let (provider_id, llm) = if let Some(selected) = selected_provider {
-            selected
-        } else {
-            return Err(last_provider_error
-                .unwrap_or_else(|| MayAgentError::MissingApiKey(err_no_provider(model))));
-        };
+        let resolved_provider =
+            resolve_provider_runtime(may_config, model, provider_attempt).await?;
+        let provider_id = resolved_provider.provider_id;
+        let llm = resolved_provider.llm;
         let model_info = aither_models::lookup(model);
         let request_parameters = if let Some(reasoning_effort) = reasoning_effort {
             Parameters::default().reasoning_effort(reasoning_effort)
@@ -1554,29 +1513,11 @@ impl MayAgent {
             Parameters::default()
         };
 
-        let search_embedder =
-            match resolve_embedding_provider(may_config, Some(provider_id.as_str())) {
-                Ok(resolved) => {
-                    tracing::debug!(
-                        provider_id = %resolved.provider_id,
-                        "resolved embedding provider for semantic search"
-                    );
-                    Some(resolved.embedder)
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "semantic search will remain lexical because no embedding provider resolved"
-                    );
-                    None
-                }
-            };
-
         let config = MayAgentConfig {
             llm,
             model_id: model.to_string(),
             provider_id,
-            search_embedder,
+            search_embedder: resolved_provider.search_embedder,
             sandbox_dir,
             may_dir,
             cwd,
@@ -1600,6 +1541,7 @@ impl MayAgent {
             location,
             task_broker,
             notify_broker,
+            browser_broker,
             register_skills_broker,
             register_subagents_broker,
             native_voice_input: model_info
@@ -1617,12 +1559,31 @@ impl MayAgent {
         prompt: &str,
         attachments: impl IntoIterator<Item = url::Url>,
     ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+        self.inner.clear_transient_system_messages();
+        self.inner.run(prompt, attachments)
+    }
+
+    /// Run a query and persist per-turn hidden context as a regular system message.
+    pub fn run_with_hidden_context(
+        &mut self,
+        prompt: &str,
+        hidden_context: Option<&str>,
+        attachments: impl IntoIterator<Item = url::Url>,
+    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+        self.inner.clear_transient_system_messages();
+        if let Some(hidden_context) = hidden_context
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            self.inner.push_message(LlmMessage::system(hidden_context));
+        }
         self.inner.run(prompt, attachments)
     }
 
     /// One-shot query.
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
         self.sync_runtime_context().await;
+        self.inner.clear_transient_system_messages();
         self.inner.query(prompt).await
     }
 
@@ -1633,9 +1594,32 @@ impl MayAgent {
         attachments: impl IntoIterator<Item = url::Url>,
     ) -> Vec<LlmMessage> {
         self.sync_runtime_context().await;
+        self.inner.clear_transient_system_messages();
         self.inner
             .preview_request_messages(prompt, attachments)
             .await
+    }
+
+    /// Preview the exact request message sequence for the next turn with hidden context.
+    pub async fn preview_request_messages_with_hidden_context(
+        &mut self,
+        prompt: &str,
+        hidden_context: Option<&str>,
+        attachments: impl IntoIterator<Item = url::Url>,
+    ) -> Vec<LlmMessage> {
+        self.sync_runtime_context().await;
+        let messages = hidden_context
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| vec![text.to_string()])
+            .unwrap_or_default();
+        self.inner.set_transient_system_messages(messages);
+        let preview = self
+            .inner
+            .preview_request_messages(prompt, attachments)
+            .await;
+        self.inner.clear_transient_system_messages();
+        preview
     }
 
     /// Get session ID.
@@ -1833,6 +1817,14 @@ async fn build_cloud_provider_from_instance(
                 .with_model(model)
                 .into()
         }
+        ProviderType::LMStudio => {
+            let url = base_url.unwrap_or("http://127.0.0.1:1234/v1");
+            OpenAI::new(api_key)
+                .with_base_url(url)
+                .with_model(model)
+                .with_chat_completions_api()
+                .into()
+        }
         ProviderType::Groq | ProviderType::Together | ProviderType::Mistral | ProviderType::XAI => {
             let mut client = OpenAI::new(api_key).with_model(model);
             if let Some(url) = base_url {
@@ -1939,22 +1931,36 @@ const NATIVE_VOICE_AVAILABLE_HINT: &str = "Native voice input is available in th
 const PLAN_MODE_DRAFT_HINT: &str = include_str!("../texts/plan_mode_draft.txt");
 const PLAN_MODE_APPROVED_HINT: &str = include_str!("../texts/plan_mode_approved.txt");
 
+#[derive(Clone, Template)]
+#[template(path = "browser_context.xml", escape = "none")]
+struct BrowserTemplate {
+    enabled: bool,
+    cdp_endpoint: Option<String>,
+    instructions: String,
+}
+
 #[derive(Clone, serde::Serialize)]
 struct Browser {
+    enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     cdp_endpoint: Option<String>,
+    #[serde(rename = "$text")]
+    content: String,
 }
 
 #[derive(Clone, Template)]
 #[template(path = "terminal_runtime_context.xml", escape = "none")]
 struct TerminalRuntimeContextTemplate {
     model_id: String,
+    home_environment_kind: String,
+    operating_system: String,
     home_directory: String,
     session_directory: String,
     current_working_directory: String,
     home_layout: Vec<String>,
     session_layout: Vec<String>,
     command_rules: Vec<String>,
+    environment_rules: Vec<String>,
     modality_support: Vec<String>,
 }
 
@@ -1964,11 +1970,20 @@ struct TerminalRuntimeContext {
     content: String,
 }
 
-#[derive(Clone, serde::Serialize)]
-struct Workspace {
+#[derive(Clone, Template)]
+#[template(path = "workspace_context.xml", escape = "none")]
+struct WorkspaceTemplate {
+    operating_system: String,
     sandbox: String,
     cwd: String,
+    permission_rules: Vec<String>,
     workdirs: Vec<WorkspaceDirEntry>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct Workspace {
+    #[serde(rename = "$text")]
+    content: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -2041,17 +2056,84 @@ struct Platform {
     content: String,
 }
 
-#[derive(Clone, serde::Serialize)]
-struct RemoteEnvironmentContext {
+#[derive(Clone, Template)]
+#[template(path = "remote_environment_context.xml", escape = "none")]
+struct RemoteEnvironmentContextTemplate {
+    operating_system: String,
     sandbox: String,
     cwd: String,
     ssh_server_id: String,
     ssh_target: String,
+    permission_rules: Vec<String>,
 }
 
-fn build_browser_context(cdp_endpoint: Option<&str>) -> Browser {
-    Browser {
+#[derive(Clone, serde::Serialize)]
+struct RemoteEnvironmentContext {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(Clone, Template)]
+#[template(path = "container_environment_context.xml", escape = "none")]
+struct ContainerEnvironmentContextTemplate {
+    operating_system: String,
+    cwd: String,
+    permission_rules: Vec<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ContainerEnvironmentContext {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(Clone)]
+struct BaseSystemCommand {
+    name: String,
+    description: String,
+}
+
+#[derive(Clone)]
+struct BaseSystemSkill {
+    dir_name: String,
+    name: String,
+    description: String,
+}
+
+#[derive(Clone)]
+struct BaseSystemSubagent {
+    id: String,
+    description: String,
+}
+
+#[derive(Clone, Template)]
+#[template(path = "base_system.md", escape = "none")]
+struct BaseSystemTemplate {
+    has_commands: bool,
+    commands: Vec<BaseSystemCommand>,
+    has_skills: bool,
+    skills: Vec<BaseSystemSkill>,
+    has_subagents: bool,
+    subagents: Vec<BaseSystemSubagent>,
+}
+
+fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> Browser {
+    let instructions = if enabled {
+        "Browser automation is enabled for this session and May owns the runtime lifecycle. The browser may be backed by a local managed runtime or a remote managed runtime, but it is never the user's personal browser. For web browsing, use the `browser` command itself, especially `browser read <url>`. `browser read` returns a structured page snapshot with fields such as `url`, `title`, `mainHeading`, `headings`, and `textExcerpt`; for straightforward page facts, one read is usually enough. Prefer answering directly from the `browser read` result instead of post-processing it with extra shell commands unless you truly need additional computation. Do not install Playwright, do not launch Chrome yourself, and do not rely on a visible desktop browser window.".to_string()
+    } else {
+        "Browser automation is disabled for this session. Do not install Playwright or launch browser runtimes yourself. If browser automation is needed, ask the user to enable the browser feature in settings.".to_string()
+    };
+    let template = BrowserTemplate {
+        enabled,
         cdp_endpoint: cdp_endpoint.map(str::to_string),
+        instructions,
+    };
+    Browser {
+        enabled,
+        cdp_endpoint: cdp_endpoint.map(str::to_string),
+        content: template
+            .render()
+            .unwrap_or_else(|error| panic!("failed to render browser context: {error}")),
     }
 }
 
@@ -2092,6 +2174,8 @@ fn build_terminal_runtime_context(
 
     let template = TerminalRuntimeContextTemplate {
         model_id: config.model_id.clone(),
+        home_environment_kind: home_environment_kind_label(&config.environment).to_string(),
+        operating_system: operating_system_hint(&config.environment).to_string(),
         home_directory: session_paths.home_root().display().to_string(),
         session_directory: session_paths.root().display().to_string(),
         current_working_directory: config.cwd.display().to_string(),
@@ -2101,24 +2185,35 @@ fn build_terminal_runtime_context(
                 .to_string(),
             "/subagents - profile/home-scoped subagents, exposed read-only inside the session"
                 .to_string(),
+            "workspace.toml - May-managed workspace grants for this home environment".to_string(),
         ],
         session_layout: vec![
             "/tmp - disposable temporary files".to_string(),
-            "/artifacts - durable user-facing outputs".to_string(),
+            "/artifacts - durable user-facing outputs; put deliverables here instead of tmp/"
+                .to_string(),
             "/files - durable uploaded or recalled files".to_string(),
             "/outputs - durable overflow and full command outputs".to_string(),
             "/data - durable session-owned state".to_string(),
+            "/skills - read-only profile skills mounted into this session".to_string(),
+            "/subagents - read-only profile subagents mounted into this session".to_string(),
             "tasks.md - canonical task/plan document for long-running work".to_string(),
         ],
         command_rules: vec![
-            "The native tool currently named `terminal` handles command execution. `terminal_kill`, `terminal_input`, and `terminal_read` manage background terminal jobs. Higher-level capabilities such as `websearch`, `webfetch`, `ask`, `session`, `task`, and registration commands are CLI commands auto-exposed through IPC rather than additional native tools.".to_string(),
-            "The default execution target is the current home environment unless the terminal command tool explicitly targets SSH mode.".to_string(),
-            "Every terminal command call uses the legacy native tool name `terminal` today and must set timeout. timeout=0 means immediate background execution. timeout>0 runs in foreground until timeout and then promotes to a background task if still running.".to_string(),
-            "Background tasks persist output to files. Use terminal_read for incremental reads, terminal_input for stdin, and terminal_kill to stop them.".to_string(),
-            "Preview output may be cleaned or structurally compressed. Use `terminal` with raw=true when exact output fidelity is required.".to_string(),
-            "If output overflows or context compacts, recover full results from files in outputs/ or other referenced session files instead of assuming the inline preview was complete.".to_string(),
+            "The only native execution tool is `terminal`. `terminal_kill`, `terminal_input`, and `terminal_read` manage background terminal jobs. Higher-level capabilities are terminal CLI commands exposed through the IPC bridge rather than extra native tools; rely on runtime tool descriptions and command `--help` output instead of assuming a static command list.".to_string(),
+            "Issue at most one tool call per assistant turn. If you need multiple operations or parallel work, compose them inside one terminal command with shell control flow, pipelines, or background jobs instead of emitting multiple tool calls in the same response.".to_string(),
+            "IPC-backed commands are only valid when executed inside this profile's home environment. If you get a system-alert because you tried to call a non-existent direct tool, immediately retry through `terminal` with the corresponding CLI command.".to_string(),
+            "Commands run in the current session home environment by default unless you explicitly target another environment. Treat the home environment as the place where profile-scoped state, IPC commands, and durable session directories live.".to_string(),
+            "Every terminal command call must set timeout. timeout=0 means immediate background execution. timeout>0 runs in foreground until timeout and then promotes to a background task if still running.".to_string(),
+            "Inline command results are previews, not guaranteed byte-for-byte raw output. May may clean, fold, summarize, or structurally compress large outputs before putting them in context.".to_string(),
+            "When exact fidelity matters, call `terminal` with raw=true. If output overflows, the complete result is persisted under session outputs/ and only a preview plus file reference is returned inline.".to_string(),
+            "Treat context as memory and the filesystem as disk. After compaction, restart, or long runs, recover prior tool results from outputs/, data/, files/, artifacts/, or tasks.md instead of assuming the inline preview was complete.".to_string(),
+            "For large saved outputs, use normal shell tools such as `head`, `tail`, `sed`, `rg`, `jq`, or the `ask` command against files to recall only the relevant slice.".to_string(),
+            "Background tasks persist output to files. Use terminal_read for incremental reads, terminal_input for stdin when the process needs user input, and terminal_kill to stop them.".to_string(),
+            "For image-producing commands, set expect=image and optionally resolution=auto|low|medium|high|native. If omitted, May picks a preview resolution from the source media.".to_string(),
+            "When you create a user-facing file, write it under artifacts/ so it survives and can be surfaced cleanly to the user.".to_string(),
             "Use tasks.md as the canonical working document for multi-step work; it should stay accurate enough to resume after context loss.".to_string(),
         ],
+        environment_rules: environment_runtime_rules(&config.environment),
         modality_support,
     };
     TerminalRuntimeContext {
@@ -2136,15 +2231,27 @@ fn resolved_model_capability(model_id: &str) -> String {
 }
 
 fn build_workspace_context(workspace: &MayWorkspace) -> Workspace {
-    Workspace {
+    let template = WorkspaceTemplate {
+        operating_system: operating_system_hint(&AgentEnvironment::Local).to_string(),
         sandbox: workspace.sandbox.display().to_string(),
         cwd: workspace.cwd.display().to_string(),
+        permission_rules: vec![
+            "You are on the user's real local machine inside the profile home environment.".to_string(),
+            "The session sandbox is the default writable workspace. Stay there unless there is a concrete reason to touch another host path.".to_string(),
+            "Within May-approved workspace roots you may read and write normally. Outside them, prefer inspection first and request approval before host-level side effects.".to_string(),
+            "Because this is the user's actual computer, treat destructive or irreversible commands as dangerous and seek approval before running them.".to_string(),
+        ],
         workdirs: workspace
             .config
             .workdirs
             .iter()
             .map(WorkspaceDirEntry::from)
             .collect(),
+    };
+    Workspace {
+        content: template
+            .render()
+            .unwrap_or_else(|error| panic!("failed to render workspace context: {error}")),
     }
 }
 
@@ -2152,11 +2259,159 @@ fn build_remote_environment_context(
     workspace: &MayWorkspace,
     ssh_server: &crate::config::SshServerConfig,
 ) -> RemoteEnvironmentContext {
-    RemoteEnvironmentContext {
+    let template = RemoteEnvironmentContextTemplate {
+        operating_system: operating_system_hint(&AgentEnvironment::Remote {
+            ssh_server: ssh_server.clone(),
+        })
+        .to_string(),
         sandbox: workspace.sandbox.display().to_string(),
         cwd: workspace.cwd.display().to_string(),
         ssh_server_id: ssh_server.name.clone(),
         ssh_target: ssh_server.target.clone(),
+        permission_rules: vec![
+            "This profile's home environment is the bound SSH target, so unqualified terminal commands default to that remote machine.".to_string(),
+            "Treat the remote host as real infrastructure. Inspect before mutating, and ask for approval before privileged or potentially destructive changes.".to_string(),
+            "Remote shell, filesystem layout, and operating system details are not guaranteed. Detect them on-host before using shell-specific or OS-specific commands.".to_string(),
+        ],
+    };
+    RemoteEnvironmentContext {
+        content: template
+            .render()
+            .unwrap_or_else(|error| panic!("failed to render remote environment context: {error}")),
+    }
+}
+
+fn build_container_environment_context(cwd: &std::path::Path) -> ContainerEnvironmentContext {
+    let template = ContainerEnvironmentContextTemplate {
+        operating_system: "linux (managed container runtime)".to_string(),
+        cwd: cwd.display().to_string(),
+        permission_rules: vec![
+            "This profile's home environment is a managed container rather than the user's host machine.".to_string(),
+            "Use terminal commands aggressively; the container filesystem is the primary writable workspace unless a specific command reports otherwise.".to_string(),
+            "Persist anything important into durable session directories such as data/, outputs/, files/, or artifacts/ because container-global state may disappear.".to_string(),
+            "Do not assume desktop automation or host-specific tools exist inside the container unless you verify them.".to_string(),
+        ],
+    };
+    ContainerEnvironmentContext {
+        content: template.render().unwrap_or_else(|error| {
+            panic!("failed to render container environment context: {error}")
+        }),
+    }
+}
+
+async fn build_base_system_prompt(
+    shared_terminal_commands: &[(String, String)],
+    skills_dir: &std::path::Path,
+    subagents_dir: &std::path::Path,
+) -> Result<String, MayAgentError> {
+    let mut commands = shared_terminal_commands
+        .iter()
+        .map(|(name, description)| BaseSystemCommand {
+            name: name.clone(),
+            description: description.clone(),
+        })
+        .collect::<Vec<_>>();
+    commands.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let skills = SkillManager::from_skills_dir(skills_dir.to_path_buf())
+        .list_skills()
+        .await
+        .map_err(|error| {
+            MayAgentError::Sandbox(format!("failed to load skill prompt metadata: {error}"))
+        })?
+        .into_iter()
+        .map(|skill| BaseSystemSkill {
+            dir_name: skill.dir_name,
+            name: skill.name,
+            description: skill.description,
+        })
+        .collect::<Vec<_>>();
+
+    let mut subagents = load_prompt_subagents(subagents_dir).await?;
+    subagents.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let template = BaseSystemTemplate {
+        has_commands: !commands.is_empty(),
+        commands,
+        has_skills: !skills.is_empty(),
+        skills,
+        has_subagents: !subagents.is_empty(),
+        subagents,
+    };
+    template.render().map_err(|error| {
+        MayAgentError::Sandbox(format!("failed to render base system prompt: {error}"))
+    })
+}
+
+async fn load_prompt_subagents(
+    subagents_dir: &std::path::Path,
+) -> Result<Vec<BaseSystemSubagent>, MayAgentError> {
+    let manager = SubagentManager::from_subagents_dir(subagents_dir.to_path_buf());
+    let path = manager.subagents_dir();
+    if async_fs::metadata(path).await.is_err() {
+        return Ok(Vec::new());
+    }
+
+    let defs = SubagentDefinition::load_from_dir_async(path)
+        .await
+        .map_err(|error| {
+            MayAgentError::Sandbox(format!("failed to load subagent prompt metadata: {error}"))
+        })?;
+
+    Ok(defs
+        .into_iter()
+        .map(|def| BaseSystemSubagent {
+            id: def.id,
+            description: def.description,
+        })
+        .collect())
+}
+
+fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static str {
+    match environment {
+        AgentEnvironment::Local => "local",
+        AgentEnvironment::Remote { .. } => "remote",
+        AgentEnvironment::Container { .. } => "container",
+    }
+}
+
+fn operating_system_hint(environment: &AgentEnvironment) -> &'static str {
+    match environment {
+        AgentEnvironment::Local => host_operating_system_label(),
+        AgentEnvironment::Remote { .. } => "unknown until detected on the remote host",
+        AgentEnvironment::Container { .. } => "linux (managed container runtime)",
+    }
+}
+
+fn host_operating_system_label() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        "windows" => "Windows",
+        other => other,
+    }
+}
+
+fn environment_runtime_rules(environment: &AgentEnvironment) -> Vec<String> {
+    match environment {
+        AgentEnvironment::Local => vec![
+            "This home environment runs on the user's local machine. Default to the session sandbox and approved workspace roots for writes.".to_string(),
+            "Outside approved writable paths, treat the host as read-mostly and request approval before side effects.".to_string(),
+            "Host automation must respect the local operating system and user presence.".to_string(),
+        ],
+        AgentEnvironment::Remote { ssh_server } => vec![
+            format!(
+                "This home environment is the remote SSH target `{}` (`{}`).",
+                ssh_server.name, ssh_server.target
+            ),
+            "Treat the remote machine as real infrastructure and avoid assuming its shell, package manager, or OS family until you verify them on-host.".to_string(),
+            "Prefer explicit, auditable commands and ask for approval before privileged or destructive operations.".to_string(),
+        ],
+        AgentEnvironment::Container { .. } => vec![
+            "This home environment runs inside a managed container. Prefer direct terminal usage and assume the filesystem is writable unless a command says otherwise.".to_string(),
+            "Container state outside the durable session directories may be ephemeral, so persist anything important into session files.".to_string(),
+            "The container is isolated from the user's host machine, but you should still avoid needless destructive commands inside it.".to_string(),
+        ],
     }
 }
 
@@ -2262,10 +2517,7 @@ fn global_memory_file_path(may_dir: &std::path::Path) -> PathBuf {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{
-        ProfilePersona, RuntimeSystemContext, Workspace, WorkspaceDirEntry,
-        build_memory_context_content,
-    };
+    use super::{ProfilePersona, RuntimeSystemContext, Workspace, build_memory_context_content};
 
     #[test]
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
@@ -2280,12 +2532,7 @@ mod tests {
             content: "stale persona".to_string(),
         });
         context.insert_system(&Workspace {
-            sandbox: "/tmp/old".to_string(),
-            cwd: "/tmp/old".to_string(),
-            workdirs: vec![WorkspaceDirEntry {
-                path: "/tmp/old".to_string(),
-                description: "stale".to_string(),
-            }],
+            content: "stale workspace".to_string(),
         });
 
         runtime_context.reconcile(&mut context);
@@ -2315,6 +2562,7 @@ mod tests {
         runtime_context.reconcile(&mut context);
 
         std::fs::write(&memory_path, "after").expect("memory file should be updated");
+        tokio_test::block_on(runtime_context.sync_memory_file());
         runtime_context.reconcile(&mut context);
 
         let memory = context
