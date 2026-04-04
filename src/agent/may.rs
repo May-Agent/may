@@ -343,6 +343,12 @@ pub enum MayAgentError {
     Mcp(#[from] crate::mcp::McpConnectionLoadError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown permission request mode: {value}")]
+pub struct PermissionRequestModeParseError {
+    value: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionRequestMode {
@@ -369,14 +375,16 @@ impl std::fmt::Display for PermissionRequestMode {
 }
 
 impl core::str::FromStr for PermissionRequestMode {
-    type Err = String;
+    type Err = PermissionRequestModeParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "default" => Ok(Self::Default),
             "unsafe" => Ok(Self::Unsafe),
             "ssh" => Ok(Self::Ssh),
-            other => Err(join_text(&["unknown permission request mode: ", other])),
+            other => Err(PermissionRequestModeParseError {
+                value: other.to_string(),
+            }),
         }
     }
 }
@@ -409,6 +417,12 @@ impl PermissionHistoryMode {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown permission history mode: {value}")]
+pub struct PermissionHistoryModeParseError {
+    value: String,
+}
+
 impl std::fmt::Display for PermissionHistoryMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -416,14 +430,16 @@ impl std::fmt::Display for PermissionHistoryMode {
 }
 
 impl core::str::FromStr for PermissionHistoryMode {
-    type Err = String;
+    type Err = PermissionHistoryModeParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "sandboxed" => Ok(Self::Sandboxed),
             "network" => Ok(Self::Network),
             "unsafe" => Ok(Self::Unsafe),
-            other => Err(join_text(&["unknown permission history mode: ", other])),
+            other => Err(PermissionHistoryModeParseError {
+                value: other.to_string(),
+            }),
         }
     }
 }
@@ -830,6 +846,34 @@ struct ImagineTool {
     artifacts_dir: PathBuf,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ImagineToolError {
+    #[error("no image_generation model configured")]
+    MissingGenerator,
+    #[error("selected provider does not support image generation")]
+    UnsupportedProvider,
+    #[error("image generation returned no data")]
+    EmptyResponse,
+    #[error("invalid size format: expected WIDTHxHEIGHT")]
+    InvalidSizeFormat,
+    #[error("invalid width in size")]
+    InvalidWidth,
+    #[error("invalid height in size")]
+    InvalidHeight,
+    #[error("size must be greater than 0")]
+    NonPositiveSize,
+    #[error("{0}")]
+    MissingApiKey(String),
+    #[error("failed to create image provider: {0}")]
+    BuildProvider(String),
+    #[error("image generation failed: {0}")]
+    Generate(String),
+    #[error("failed to prepare artifacts directory: {0}")]
+    CreateArtifactsDir(std::io::Error),
+    #[error("failed to write generated image: {0}")]
+    WriteImage(std::io::Error),
+}
+
 #[derive(Clone)]
 struct RuntimeSystemContext {
     memory_path: PathBuf,
@@ -980,10 +1024,19 @@ impl Tool for ImagineTool {
     type Res = ToolResult;
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+        match self.generate_image(arguments).await {
+            Ok(artifact_path) => Ok(ToolResult::text(artifact_path)),
+            Err(error) => Ok(ToolResult::error(error.to_string())),
+        }
+    }
+}
+
+impl ImagineTool {
+    async fn generate_image(&self, arguments: ImagineArgs) -> Result<String, ImagineToolError> {
         let generator = self
             .generator
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no image_generation model configured"))?;
+            .ok_or(ImagineToolError::MissingGenerator)?;
 
         let size = parse_imagine_size(&arguments.size)?;
         let prompt = Prompt::new(arguments.prompt);
@@ -995,67 +1048,71 @@ impl Tool for ImagineTool {
             CloudProvider::OpenAI(provider) => {
                 let mut stream = std::pin::pin!(provider.create(prompt, size));
                 while let Some(chunk) = stream.next().await {
-                    latest = Some(chunk.map_err(|e| anyhow::anyhow!(e.to_string()))?);
+                    latest = Some(chunk.map_err(|error| {
+                        ImagineToolError::Generate(error.to_string())
+                    })?);
                 }
             }
             CloudProvider::Gemini(provider) => {
                 let mut stream = std::pin::pin!(provider.create(prompt, size));
                 while let Some(chunk) = stream.next().await {
-                    latest = Some(chunk.map_err(|e| anyhow::anyhow!(e.to_string()))?);
+                    latest = Some(chunk.map_err(|error| {
+                        ImagineToolError::Generate(error.to_string())
+                    })?);
                 }
             }
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "selected provider does not support image generation"
-                ));
-            }
+            _ => return Err(ImagineToolError::UnsupportedProvider),
         }
 
-        let image = latest.ok_or_else(|| anyhow::anyhow!("image generation returned no data"))?;
+        let image = latest.ok_or(ImagineToolError::EmptyResponse)?;
         let mut filename = uuid::Uuid::new_v4().to_string();
         filename.push_str(".png");
         let path = self.artifacts_dir.join(&filename);
-        async_fs::create_dir_all(&self.artifacts_dir).await?;
-        async_fs::write(&path, image).await?;
+        async_fs::create_dir_all(&self.artifacts_dir)
+            .await
+            .map_err(ImagineToolError::CreateArtifactsDir)?;
+        async_fs::write(&path, image)
+            .await
+            .map_err(ImagineToolError::WriteImage)?;
 
         let mut artifact_path = String::with_capacity(filename.len() + 10);
         artifact_path.push_str("artifacts/");
         artifact_path.push_str(filename.as_str());
-        Ok(ToolResult::text(artifact_path))
+        Ok(artifact_path)
     }
 }
 
-fn parse_imagine_size(raw: &str) -> aither_core::Result<Size> {
+fn parse_imagine_size(raw: &str) -> Result<Size, ImagineToolError> {
     let value = raw.trim();
     let Some((w, h)) = value.split_once('x') else {
-        return Err(anyhow::anyhow!(
-            "invalid size format: expected WIDTHxHEIGHT"
-        ));
+        return Err(ImagineToolError::InvalidSizeFormat);
     };
 
     let width: u32 = w
         .trim()
         .parse()
-        .map_err(|_| anyhow::anyhow!("invalid width in size"))?;
+        .map_err(|_| ImagineToolError::InvalidWidth)?;
     let height: u32 = h
         .trim()
         .parse()
-        .map_err(|_| anyhow::anyhow!("invalid height in size"))?;
+        .map_err(|_| ImagineToolError::InvalidHeight)?;
 
     if width == 0 || height == 0 {
-        return Err(anyhow::anyhow!("size must be greater than 0"));
+        return Err(ImagineToolError::NonPositiveSize);
     }
 
     Ok(Size::new(width, height))
 }
 
-fn build_image_provider(config: &ImageGeneratorConfig) -> aither_core::Result<CloudProvider> {
+fn build_image_provider(config: &ImageGeneratorConfig) -> Result<CloudProvider, ImagineToolError> {
     let provider_type = config.provider.resolve_type(&config.provider_id);
     let api_key = config.provider.api_key.as_deref().unwrap_or("");
     let base_url = config.provider.effective_base_url(&config.provider_id);
 
     if provider_type.requires_api_key() && api_key.is_empty() {
-        return Err(anyhow::anyhow!(err_api_key_required(&config.provider_id)));
+        return Err(ImagineToolError::MissingApiKey(err_api_key_required(
+            &config.provider_id,
+        )));
     }
 
     let provider = if provider_type == ProviderType::Google {

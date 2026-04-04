@@ -8,6 +8,7 @@ use serde::Serialize;
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::agent::generate_session_title;
+use crate::session::AttachmentKind;
 
 use super::error::{bad_request_error, internal_error};
 use super::helpers::load_session_paths;
@@ -27,7 +28,7 @@ struct AttachmentXml {
     #[serde(rename = "@name")]
     name: String,
     #[serde(rename = "@type")]
-    attachment_type: String,
+    attachment_type: AttachmentKind,
     #[serde(rename = "@path", skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     #[serde(rename = "@offloaded", skip_serializing_if = "Option::is_none")]
@@ -69,13 +70,15 @@ pub(super) async fn build_prompt_and_attachments(
 
     for attachment in &req.attachments {
         let required_modality =
-            AttachmentModality::for_attachment_type(&attachment.attachment_type);
+            AttachmentModality::for_attachment_type(attachment.attachment_type);
         let supported = required_modality
             .as_ref()
             .is_none_or(|modality| modality_support.supports(modality));
 
         let upload_data_url = attachment.upload_data_url.as_deref().or_else(|| {
-            if attachment.attachment_type == "image" && attachment.url.starts_with("data:") {
+            if attachment.attachment_type == AttachmentKind::Image
+                && attachment.url.starts_with("data:")
+            {
                 Some(attachment.url.as_str())
             } else {
                 None
@@ -120,7 +123,7 @@ pub(super) async fn build_prompt_and_attachments(
                 reason: None,
             });
 
-            if attachment.attachment_type == "image" {
+            if attachment.attachment_type == AttachmentKind::Image {
                 let url = url::Url::from_file_path(saved_path).map_err(|()| {
                     SkyError::msg("Failed to map image path to URL")
                         .set_status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -142,14 +145,14 @@ pub(super) async fn build_prompt_and_attachments(
                     save_large_pasted_text(state, &req.session_id, text).await?;
                 xml_items.push(AttachmentXml {
                     name: attachment.name.clone(),
-                    attachment_type: "document".to_string(),
+                    attachment_type: AttachmentKind::Document,
                     path: Some(relative_path),
                     offloaded: None,
                     required_modality: None,
                     reason: None,
                 });
 
-                if attachment.attachment_type == "image" {
+                if attachment.attachment_type == AttachmentKind::Image {
                     let url = url::Url::from_file_path(saved_path).map_err(|()| {
                         SkyError::msg("Failed to map image path to URL")
                             .set_status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -209,12 +212,12 @@ enum AttachmentModality {
 }
 
 impl AttachmentModality {
-    fn for_attachment_type(attachment_type: &str) -> Option<Self> {
+    fn for_attachment_type(attachment_type: AttachmentKind) -> Option<Self> {
         match attachment_type {
-            "image" => Some(Self::Vision),
-            "audio" => Some(Self::Audio),
-            "video" => Some(Self::Video),
-            "pdf" => Some(Self::Pdf),
+            AttachmentKind::Image => Some(Self::Vision),
+            AttachmentKind::Audio => Some(Self::Audio),
+            AttachmentKind::Video => Some(Self::Video),
+            AttachmentKind::Pdf => Some(Self::Pdf),
             _ => None,
         }
     }

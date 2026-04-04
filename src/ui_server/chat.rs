@@ -12,7 +12,7 @@ use aither_core::llm::{Message as LlmMessage, Role as LlmRole, ToolResult, Usage
 use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{
     BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, ContainerExecHandle, ContainerLaunchSpec,
-    Content, OutputEntry, TerminalResult,
+    Content, OutputEntry,
 };
 
 use crate::agent::MayAgent;
@@ -29,17 +29,19 @@ use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 use crate::ui_event_bus::UiEventTopics;
 
 use super::attachments::build_prompt_and_attachments;
-use super::error::internal_error;
+use super::error::{internal_error, json_ok_response, typed_error_response};
 use super::helpers::{
     RETRY_BACKOFF_MS, append_history_message, elapsed_ms_saturating, load_session_paths,
     send_event, truncate_preview,
 };
 use super::model_resolution::resolve_default_model;
 use super::state::{UiServerState, UiToolQueues};
-use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
+use super::terminal_parsing::{
+    TerminalTaskStatus, parse_terminal_result_payload, update_terminal_snapshot_from_tool_event,
+};
 use super::title_generation;
 use super::types::{
-    ApiMessage, ChatRequest, ChatResponse, ContextDebugMessage, PendingMessageKind,
+    ApiErrorCode, ApiMessage, ChatRequest, ChatResponse, ContextDebugMessage, PendingMessageKind,
     RemovePendingMessageRequest, RequestLogEntry, RequestStats, SessionRuntimeResponse,
     SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent, SseToolEndEvent,
     SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
@@ -361,13 +363,10 @@ fn result_waits_for_terminal_input(result: &ToolResult) -> bool {
     if result.is_error() {
         return false;
     }
-    let Ok(serialized) = result.render_for_model() else {
+    let Some(parsed) = parse_terminal_result_payload(result) else {
         return false;
     };
-    let Ok(parsed) = serde_json::from_str::<TerminalResult>(&serialized) else {
-        return false;
-    };
-    parsed.status.as_deref() == Some("running")
+    parsed.status == Some(TerminalTaskStatus::Running)
         && output_contains_terminal_wait_notice(&parsed.stdout)
 }
 
@@ -553,13 +552,21 @@ async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) 
 pub(super) async fn chat(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Json<ChatResponse>> {
+) -> SkyResult<skyzen::Response> {
     let tokio_handle = state.tokio_handle.clone();
-    let response = tokio_handle
+    let result = tokio_handle
         .spawn(async move { run_chat_collect(state, req).await })
         .await
-        .map_err(|_| internal_error("chat task panicked before producing a response"))??;
-    Ok(Json(response))
+        .map_err(|_| internal_error("chat task panicked before producing a response"))?;
+    match result {
+        Ok(response) => json_ok_response(&response),
+        Err(ChatCollectError::Preparation(error)) => Ok(typed_error_response(
+            error.status(),
+            error.api_code(),
+            error,
+        )),
+        Err(ChatCollectError::Sky(error)) => Err(error),
+    }
 }
 
 pub(super) async fn enqueue_chat(
@@ -777,7 +784,7 @@ async fn run_agent_loop(
             Ok(prepared) => prepared,
             Err(error) => {
                 let _ = sink.on_error(&error.to_string()).await;
-                return Err(error);
+                return Err(error.into());
             }
         };
         if attempt == 0 {
@@ -1185,15 +1192,16 @@ async fn run_chat_collect_with_persistence(
     req: ChatRequest,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
-) -> SkyResult<ChatResponse> {
+) -> Result<ChatResponse, ChatCollectError> {
     let Some(run_registration) =
         SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await
     else {
-        return Err(active_session_conflict_error());
+        return Err(ChatCollectError::Sky(active_session_conflict_error()));
     };
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running)
         .await
-        .map_err(internal_error)?;
+        .map_err(internal_error)
+        .map_err(ChatCollectError::from)?;
     let mut sink = CollectSink;
     let result = run_agent_loop(
         &state,
@@ -1210,7 +1218,8 @@ async fn run_chat_collect_with_persistence(
             run_registration.close().await;
             clear_running_state_if_needed(&state, &req.session_id)
                 .await
-                .map_err(internal_error)?;
+                .map_err(internal_error)
+                .map_err(ChatCollectError::from)?;
 
             Ok(ChatResponse {
                 session_id: req.session_id,
@@ -1246,13 +1255,20 @@ async fn run_chat_collect_with_persistence(
             run_registration.close().await;
             clear_running_state_if_needed(&state, &req.session_id)
                 .await
-                .map_err(internal_error)?;
-            Err(internal_error(error))
+                .map_err(internal_error)
+                .map_err(ChatCollectError::from)?;
+            match error.downcast::<UiChatPreparationError>() {
+                Ok(error) => Err(ChatCollectError::Preparation(error)),
+                Err(error) => Err(ChatCollectError::Sky(internal_error(error))),
+            }
         }
     }
 }
 
-async fn run_chat_collect(state: Arc<UiServerState>, req: ChatRequest) -> SkyResult<ChatResponse> {
+async fn run_chat_collect(
+    state: Arc<UiServerState>,
+    req: ChatRequest,
+) -> Result<ChatResponse, ChatCollectError> {
     run_chat_collect_with_persistence(state, req, true, true).await
 }
 
@@ -1426,6 +1442,184 @@ struct ToolBrokers {
     register_subagents: crate::agent::register_tool::RegisterBroker,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum UiChatPreparationError {
+    #[error("Browser takeover is active for this session; wait until user returns control")]
+    BrowserTakeoverActive,
+    #[error("Session {0} not found")]
+    SessionNotFound(SessionId),
+    #[error("failed to load session: {0}")]
+    LoadSession(#[source] crate::db::ChatDbError),
+    #[error("failed to load session history: {0}")]
+    LoadHistory(#[source] crate::session::SessionError),
+    #[error("No model configured")]
+    MissingModelConfiguration,
+    #[error("No provider available for model '{model}'")]
+    NoProviderAvailable { model: String },
+    #[error("failed to load profile: {0}")]
+    LoadProfile(#[source] crate::db::ChatDbError),
+    #[error("failed to parse profile environment: {0}")]
+    ParseProfileEnvironment(#[source] crate::db::ChatDbError),
+    #[error("failed to load profile memories: {0}")]
+    LoadProfileMemories(#[source] crate::db::ChatDbError),
+    #[error("failed to load session runtime: {0}")]
+    LoadRuntime(#[source] crate::db::ChatDbError),
+    #[error("failed to load session context snapshot: {0}")]
+    LoadContextSnapshot(#[source] crate::db::ChatDbError),
+    #[error("failed to parse persisted session context snapshot: {0}")]
+    ParseContextSnapshot(#[source] anyhow::Error),
+    #[error("failed to serialize browser takeover alert: {0}")]
+    BuildTakeoverAlert(#[source] anyhow::Error),
+    #[error("failed to build session mentions: {0}")]
+    BuildSessionMentions(#[source] crate::prompt_mentions::PromptMentionError),
+    #[error("{0}")]
+    InvalidFileMentionPath(crate::prompt_mentions::PromptMentionError),
+    #[error("failed to build file mentions: {0}")]
+    BuildFileMentions(#[source] crate::prompt_mentions::PromptMentionError),
+    #[error("failed to update session title: {0}")]
+    UpdateSessionTitle(#[source] crate::db::ChatDbError),
+    #[error("failed to append user message: {0}")]
+    AppendUserMessage(#[source] crate::db::ChatDbError),
+    #[error("failed to persist hidden context: {0}")]
+    PersistHiddenContext(#[source] crate::db::ChatDbError),
+    #[error("container profile model is missing")]
+    MissingContainerProfileModel,
+    #[error("failed to reconcile container session layout: {0}")]
+    ReconcileContainerLayout(#[source] crate::session::StoreError),
+    #[error("no container runtime available for container profile: {0}")]
+    ResolveContainerRuntime(#[source] crate::container::ContainerError),
+    #[error("invalid container profile image tag: {0}")]
+    InvalidContainerImageTag(#[source] crate::container::ContainerError),
+    #[error("invalid container profile configuration: {0}")]
+    InvalidContainerProfileConfiguration(#[source] crate::container::ContainerError),
+    #[error("invalid container mount configuration: {0}")]
+    InvalidContainerMountConfiguration(#[source] crate::container::ContainerError),
+    #[error("container image build failed: {0}")]
+    EnsureContainerImage(#[source] crate::container::ContainerError),
+    #[error("container start failed: {0}")]
+    StartContainer(#[source] crate::container::ContainerError),
+    #[error("remote profile model is missing")]
+    MissingRemoteProfileModel,
+    #[error("{0}")]
+    ResolveRemoteServer(String),
+    #[error("location fetch failed: {0}")]
+    LoadLocation(#[source] anyhow::Error),
+    #[error("failed to create agent: {0}")]
+    BuildAgent(#[from] crate::agent::MayAgentError),
+    #[error("failed to restore agent checkpoint: {0}")]
+    RestoreCheckpoint(#[source] aither_agent::AgentError),
+    #[error("failed to apply history delta after restored checkpoint: {0}")]
+    ApplyHistoryDelta(#[source] anyhow::Error),
+    #[error("failed to build prompt attachments: {0}")]
+    BuildPrompt(skyzen::Error),
+    #[error("failed to persist context debug snapshot: {0}")]
+    PersistContextDebugSnapshot(#[source] anyhow::Error),
+}
+
+impl UiChatPreparationError {
+    fn api_code(&self) -> ApiErrorCode {
+        match self {
+            Self::BrowserTakeoverActive => ApiErrorCode::BrowserTakeoverActive,
+            Self::SessionNotFound(_) => ApiErrorCode::SessionNotFound,
+            Self::MissingModelConfiguration => ApiErrorCode::ModelNotConfigured,
+            Self::NoProviderAvailable { .. } => ApiErrorCode::ProviderUnavailable,
+            Self::InvalidFileMentionPath(_) => ApiErrorCode::BadRequest,
+            Self::MissingContainerProfileModel
+            | Self::MissingRemoteProfileModel
+            | Self::ResolveRemoteServer(_)
+            | Self::ParseProfileEnvironment(_)
+            | Self::InvalidContainerImageTag(_)
+            | Self::InvalidContainerProfileConfiguration(_)
+            | Self::InvalidContainerMountConfiguration(_) => {
+                ApiErrorCode::ProfileConfigurationInvalid
+            }
+            Self::ResolveContainerRuntime(_) => ApiErrorCode::ContainerRuntimeUnavailable,
+            Self::EnsureContainerImage(_) => ApiErrorCode::ContainerBuildFailed,
+            Self::StartContainer(_) => ApiErrorCode::ContainerStartFailed,
+            Self::LoadLocation(_) => ApiErrorCode::LocationUnavailable,
+            Self::LoadSession(_)
+            | Self::LoadHistory(_)
+            | Self::LoadProfile(_)
+            | Self::LoadProfileMemories(_)
+            | Self::LoadRuntime(_)
+            | Self::LoadContextSnapshot(_)
+            | Self::ParseContextSnapshot(_)
+            | Self::BuildTakeoverAlert(_)
+            | Self::BuildSessionMentions(_)
+            | Self::BuildFileMentions(_)
+            | Self::UpdateSessionTitle(_)
+            | Self::AppendUserMessage(_)
+            | Self::PersistHiddenContext(_)
+            | Self::ReconcileContainerLayout(_)
+            | Self::BuildAgent(_)
+            | Self::RestoreCheckpoint(_)
+            | Self::ApplyHistoryDelta(_)
+            | Self::BuildPrompt(_)
+            | Self::PersistContextDebugSnapshot(_) => ApiErrorCode::InternalError,
+        }
+    }
+
+    fn status(&self) -> skyzen::StatusCode {
+        match self {
+            Self::BrowserTakeoverActive => skyzen::StatusCode::CONFLICT,
+            Self::SessionNotFound(_) => skyzen::StatusCode::NOT_FOUND,
+            Self::MissingModelConfiguration
+            | Self::NoProviderAvailable { .. }
+            | Self::InvalidFileMentionPath(_)
+            | Self::MissingContainerProfileModel
+            | Self::MissingRemoteProfileModel
+            | Self::ResolveRemoteServer(_)
+            | Self::ParseProfileEnvironment(_)
+            | Self::InvalidContainerImageTag(_)
+            | Self::InvalidContainerProfileConfiguration(_)
+            | Self::InvalidContainerMountConfiguration(_)
+            | Self::ResolveContainerRuntime(_)
+            | Self::EnsureContainerImage(_)
+            | Self::StartContainer(_)
+            | Self::LoadLocation(_) => skyzen::StatusCode::BAD_REQUEST,
+            Self::LoadSession(_)
+            | Self::LoadHistory(_)
+            | Self::LoadProfile(_)
+            | Self::LoadProfileMemories(_)
+            | Self::LoadRuntime(_)
+            | Self::LoadContextSnapshot(_)
+            | Self::ParseContextSnapshot(_)
+            | Self::BuildTakeoverAlert(_)
+            | Self::BuildSessionMentions(_)
+            | Self::BuildFileMentions(_)
+            | Self::UpdateSessionTitle(_)
+            | Self::AppendUserMessage(_)
+            | Self::PersistHiddenContext(_)
+            | Self::ReconcileContainerLayout(_)
+            | Self::BuildAgent(_)
+            | Self::RestoreCheckpoint(_)
+            | Self::ApplyHistoryDelta(_)
+            | Self::BuildPrompt(_)
+            | Self::PersistContextDebugSnapshot(_) => skyzen::StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+enum ChatCollectError {
+    Preparation(UiChatPreparationError),
+    Sky(skyzen::Error),
+}
+
+impl std::fmt::Display for ChatCollectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preparation(error) => std::fmt::Display::fmt(error, f),
+            Self::Sky(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl From<skyzen::Error> for ChatCollectError {
+    fn from(error: skyzen::Error) -> Self {
+        Self::Sky(error)
+    }
+}
+
 // ── Agent preparation: decomposed steps ───────────────────
 
 async fn resolve_session_context(
@@ -1433,39 +1627,39 @@ async fn resolve_session_context(
     req: &ChatRequest,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
-) -> anyhow::Result<SessionContext> {
+) -> Result<SessionContext, UiChatPreparationError> {
     let session_id = SessionId::from_string(req.session_id.clone());
 
     if is_takeover_active_for_session(state, &session_id).await {
-        return Err(anyhow::anyhow!(
-            "Browser takeover is active for this session; wait until user returns control"
-        ));
+        return Err(UiChatPreparationError::BrowserTakeoverActive);
     }
 
     let db = state.db();
     let session = db
         .get_session(session_id.as_str())
         .await
-        .map_err(anyhow::Error::from)?
-        .ok_or_else(|| anyhow::anyhow!("Session {session_id} not found"))?;
-    let history = crate::session::load_history_from_db(&db, session_id.as_str()).await?;
+        .map_err(UiChatPreparationError::LoadSession)?
+        .ok_or_else(|| UiChatPreparationError::SessionNotFound(session_id.clone()))?;
+    let history = crate::session::load_history_from_db(&db, session_id.as_str())
+        .await
+        .map_err(UiChatPreparationError::LoadHistory)?;
 
     let session_model = session.model.clone();
     let cfg = state.config_snapshot();
     let current_model = resolve_default_model(&cfg, session_model)
-        .ok_or_else(|| anyhow::anyhow!("No model configured"))?;
+        .ok_or(UiChatPreparationError::MissingModelConfiguration)?;
     let provider_candidate_count = crate::agent::provider_candidate_count(&cfg, &current_model);
     if provider_candidate_count == 0 {
-        return Err(anyhow::anyhow!(
-            "No provider available for model '{current_model}'"
-        ));
+        return Err(UiChatPreparationError::NoProviderAvailable {
+            model: current_model.clone(),
+        });
     }
     drop(cfg);
 
     let profile_model = if let Some(profile_id) = session.profile_id.clone() {
         db.get_profile(&profile_id)
             .await
-            .map_err(anyhow::Error::from)?
+            .map_err(UiChatPreparationError::LoadProfile)?
     } else {
         None
     };
@@ -1477,12 +1671,12 @@ async fn resolve_session_context(
                 .map(|info| info.environment.into_kind())
         })
         .transpose()
-        .map_err(anyhow::Error::from)?;
+        .map_err(UiChatPreparationError::ParseProfileEnvironment)?;
 
     let profile_memories = if let Some(ref profile) = profile_model {
         let memories = crate::memory::ProfileMemories::load(&db, &profile.id)
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(UiChatPreparationError::LoadProfileMemories)?;
         if memories.is_empty() {
             None
         } else {
@@ -1494,16 +1688,17 @@ async fn resolve_session_context(
     let runtime = db
         .get_session_runtime(session_id.as_str())
         .await
-        .map_err(anyhow::Error::from)?
+        .map_err(UiChatPreparationError::LoadRuntime)?
         .unwrap_or_default();
 
     let history_messages = history.to_aither_messages();
     let context_snapshot = if use_persisted_context_snapshot {
         db.get_session_context_snapshot(session_id.as_str())
             .await
-            .map_err(anyhow::Error::from)?
+            .map_err(UiChatPreparationError::LoadContextSnapshot)?
             .map(crate::session::parse_persisted_context_snapshot)
-            .transpose()?
+            .transpose()
+            .map_err(UiChatPreparationError::ParseContextSnapshot)?
     } else {
         None
     };
@@ -1516,10 +1711,11 @@ async fn resolve_session_context(
                 &session_id,
                 &history,
                 &mut hidden_context_parts,
-                browser_takeover_alert_xml()?,
+                browser_takeover_alert_xml().map_err(UiChatPreparationError::BuildTakeoverAlert)?,
                 persist_user_message,
             )
-            .await?;
+            .await
+            .map_err(UiChatPreparationError::PersistHiddenContext)?;
         }
     }
 
@@ -1537,13 +1733,14 @@ async fn resolve_session_context(
             hidden_context_xml.to_string(),
             persist_user_message,
         )
-        .await?;
+        .await
+        .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
 
     if let Some(session_mentions_xml) =
         prompt_mentions::build_session_mentions_xml(&db, &req.content)
             .await
-            .map_err(anyhow::Error::from)?
+            .map_err(UiChatPreparationError::BuildSessionMentions)?
     {
         push_hidden_context_part(
             &db,
@@ -1553,7 +1750,8 @@ async fn resolve_session_context(
             session_mentions_xml,
             persist_user_message,
         )
-        .await?;
+        .await
+        .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
 
     let session_paths =
@@ -1564,9 +1762,9 @@ async fn resolve_session_context(
             .map_err(|error| match error {
                 prompt_mentions::PromptMentionError::AbsolutePath
                 | prompt_mentions::PromptMentionError::ParentTraversal => {
-                    anyhow::anyhow!(error.to_string())
+                    UiChatPreparationError::InvalidFileMentionPath(error)
                 }
-                _ => anyhow::Error::from(error),
+                _ => UiChatPreparationError::BuildFileMentions(error),
             })?
     {
         push_hidden_context_part(
@@ -1577,7 +1775,8 @@ async fn resolve_session_context(
             file_mentions_xml,
             persist_user_message,
         )
-        .await?;
+        .await
+        .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
 
     if persist_user_message {
@@ -1586,12 +1785,12 @@ async fn resolve_session_context(
             let title = truncate_preview(&req.content);
             db.update_session(session_id.as_str(), Some(title.as_str()), None)
                 .await
-                .map_err(anyhow::Error::from)?;
+                .map_err(UiChatPreparationError::UpdateSessionTitle)?;
             state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
         }
         db.append_chat_message(session_id.as_str(), &ChatMessage::user(req.content.clone()))
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(UiChatPreparationError::AppendUserMessage)?;
     }
 
     let sandbox_dir = SessionStore::new(MayHomePaths::new(state.may_dir.clone()))
@@ -1636,7 +1835,7 @@ async fn push_hidden_context_part(
     hidden_context_parts: &mut Vec<String>,
     content: String,
     persist_user_message: bool,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::db::ChatDbError> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -1653,8 +1852,7 @@ async fn push_hidden_context_part(
             session_id.as_str(),
             &ChatMessage::hidden_context(trimmed.to_string()),
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     }
 
     if !already_queued {
@@ -1667,16 +1865,16 @@ async fn push_hidden_context_part(
 async fn setup_agent_environment(
     state: &Arc<UiServerState>,
     ctx: &SessionContext,
-) -> anyhow::Result<(
+) -> Result<(
     crate::agent::AgentEnvironment,
     Option<crate::location::LocationInfo>,
-)> {
+), UiChatPreparationError> {
     let environment = match ctx.profile_environment.as_ref() {
         Some(crate::profile::ProfileEnvironment::Container { .. }) => {
             let profile = ctx
                 .profile_model
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("container profile model is missing"))?;
+                .ok_or(UiChatPreparationError::MissingContainerProfileModel)?;
             let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
             store
                 .reconcile_container_mount_points(
@@ -1684,35 +1882,29 @@ async fn setup_agent_environment(
                     ctx.profile_id.as_deref(),
                 )
                 .await
-                .map_err(|error| {
-                    anyhow::anyhow!("Failed to reconcile container session layout: {error}")
-                })?;
+                .map_err(UiChatPreparationError::ReconcileContainerLayout)?;
             let container_manager =
                 state
                     .resolve_container_manager(false)
                     .await
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "No container runtime available for container profile: {error}"
-                        )
-                    })?;
+                    .map_err(UiChatPreparationError::ResolveContainerRuntime)?;
             let default_image_tag =
                 crate::container::profile::default_image_tag(&state.may_dir, profile)
                     .await
-                    .map_err(|e| anyhow::anyhow!("Invalid container profile image tag: {e}"))?;
+                    .map_err(UiChatPreparationError::InvalidContainerImageTag)?;
 
             let image_spec = crate::container::profile::image_spec_for_profile(
                 &state.may_dir,
                 profile,
                 &default_image_tag,
             )
-            .map_err(|e| anyhow::anyhow!("Invalid container profile configuration: {e}"))?;
+            .map_err(UiChatPreparationError::InvalidContainerProfileConfiguration)?;
             let extra_mounts = crate::container::profile::mounts_for_profile(profile)
-                .map_err(|e| anyhow::anyhow!("Invalid container mount configuration: {e}"))?;
+                .map_err(UiChatPreparationError::InvalidContainerMountConfiguration)?;
 
             crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
                 .await
-                .map_err(|e| anyhow::anyhow!("Container image build failed: {e}"))?;
+                .map_err(UiChatPreparationError::EnsureContainerImage)?;
 
             let container_name = crate::container::profile::container_name_for_profile_session(
                 profile,
@@ -1761,7 +1953,7 @@ async fn setup_agent_environment(
             let container_id = container_manager
                 .ensure_running(&launch_spec)
                 .await
-                .map_err(|e| anyhow::anyhow!("Container start failed: {e}"))?;
+                .map_err(UiChatPreparationError::StartContainer)?;
 
             let container_ipc_host = host_gateway.to_string();
             let container_exec =
@@ -1780,11 +1972,11 @@ async fn setup_agent_environment(
             let profile = ctx
                 .profile_model
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("remote profile model is missing"))?;
+                .ok_or(UiChatPreparationError::MissingRemoteProfileModel)?;
             let config = state.config_snapshot();
             let ssh_server =
                 crate::remote_profile::resolve_remote_profile_server(profile, &config.ssh_servers)
-                    .map_err(|error| anyhow::anyhow!(error))?;
+                    .map_err(UiChatPreparationError::ResolveRemoteServer)?;
             crate::agent::AgentEnvironment::Remote { ssh_server }
         }
         _ => crate::agent::AgentEnvironment::Local,
@@ -1796,7 +1988,7 @@ async fn setup_agent_environment(
                 .location_provider
                 .get()
                 .await
-                .map_err(|e| anyhow::anyhow!("Location fetch failed: {e}"))?,
+                .map_err(UiChatPreparationError::LoadLocation)?,
         )
     } else {
         None
@@ -1867,7 +2059,7 @@ async fn prepare_agent_for_request(
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
     provider_attempt: usize,
-) -> anyhow::Result<PreparedAgent> {
+) -> Result<PreparedAgent, UiChatPreparationError> {
     let ctx = resolve_session_context(
         state,
         req,
@@ -1908,16 +2100,18 @@ async fn prepare_agent_for_request(
         provider_attempt,
     )
     .await
-    .map_err(anyhow::Error::from)?;
+    .map_err(UiChatPreparationError::BuildAgent)?;
 
     if let Some(snapshot) = ctx.context_snapshot.as_ref() {
         agent
             .restore_checkpoint(snapshot.checkpoint.clone())
-            .map_err(anyhow::Error::from)?;
+            .map_err(UiChatPreparationError::RestoreCheckpoint)?;
         for message in crate::session::history_delta_since_snapshot(
             &ctx.history_messages,
             snapshot.history_message_count,
-        )? {
+        )
+        .map_err(UiChatPreparationError::ApplyHistoryDelta)?
+        {
             agent.push_message(message);
         }
     } else {
@@ -1930,7 +2124,7 @@ async fn prepare_agent_for_request(
 
     let (prompt, attachments) = build_prompt_and_attachments(state, req, &ctx.current_model)
         .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        .map_err(UiChatPreparationError::BuildPrompt)?;
     let preview_messages = agent
         .preview_request_messages_with_hidden_context(
             &prompt,
@@ -1947,7 +2141,8 @@ async fn prepare_agent_for_request(
         &attachments,
         &preview_messages,
     )
-    .await?;
+    .await
+    .map_err(UiChatPreparationError::PersistContextDebugSnapshot)?;
 
     Ok(PreparedAgent {
         session_id: ctx.session_id,

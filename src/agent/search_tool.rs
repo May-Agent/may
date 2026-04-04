@@ -34,6 +34,97 @@ const MAX_FILE_BYTES: usize = 1024 * 1024;
 const CHUNK_TARGET_CHARS: usize = 2400;
 const CHUNK_OVERLAP_CHARS: usize = 240;
 
+#[derive(Debug, thiserror::Error)]
+pub enum SearchToolError {
+    #[error("search index requires a non-empty path")]
+    MissingIndexPath,
+    #[error("search query requires a non-empty query")]
+    MissingQuery,
+    #[error("search command must not be empty")]
+    EmptyCommand,
+    #[error("search command must include an action or query")]
+    MissingActionOrQuery,
+    #[error("search index accepts exactly one path argument")]
+    InvalidIndexCommandArity,
+    #[error("search query requires a prompt")]
+    MissingQueryPrompt,
+    #[error("failed to resolve search path {path}: {source}")]
+    ResolvePath {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("search index contains no text chunks; choose a text or code file/directory")]
+    IndexContainsNoText,
+    #[error("failed to read search index metadata {path}: {source}")]
+    LoadIndexMetadata {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse search index metadata {path}: {source}")]
+    ParseIndexMetadata {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to remove stale semantic index {path}: {source}")]
+    RemoveStaleSemanticIndex {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("search index is empty; run `search index <path>` first")]
+    EmptyIndex,
+    #[error("search index is missing; run `search index <path>` again")]
+    MissingIndexTable,
+    #[error(
+        "semantic search requires a global models.embedding_model and at least one enabled provider that supports it"
+    )]
+    SemanticEmbeddingUnavailable,
+    #[error("semantic index was built for a different embedding configuration; run `search index <path>` again")]
+    SemanticEmbeddingMismatch,
+    #[error("invalid regex pattern: {0}")]
+    InvalidRegexPattern(#[source] regex::Error),
+    #[error("semantic search does not support wildcard queries")]
+    SemanticWildcardUnsupported,
+    #[error("semantic index is missing; run `search index <path>` again")]
+    MissingSemanticIndex,
+    #[error("failed to inspect semantic index {path}: {source}")]
+    InspectSemanticIndex {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("semantic index entry is missing '{key}' metadata")]
+    MissingSemanticMetadata { key: &'static str },
+    #[error("missing or invalid '{name}' column; expected {expected}")]
+    InvalidColumn {
+        name: &'static str,
+        expected: &'static str,
+    },
+    #[error("failed to walk searchable files under {root}: {source}")]
+    WalkFiles {
+        root: PathBuf,
+        #[source]
+        source: ignore::Error,
+    },
+    #[error("failed to join searchable file scan task: {0}")]
+    JoinFileScan(#[source] tokio::task::JoinError),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("LanceDB error: {0}")]
+    LanceDb(#[from] lancedb::Error),
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] arrow_schema::ArrowError),
+    #[error("RAG error: {0}")]
+    Rag(#[from] aither_rag::error::RagError),
+    #[error("Lance error: {0}")]
+    Lance(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchAction {
@@ -143,7 +234,7 @@ impl SearchTool {
         self.index_dir().join("semantic.redb")
     }
 
-    fn normalize_args(&self, mut args: SearchArgs) -> anyhow::Result<SearchArgs> {
+    fn normalize_args(&self, mut args: SearchArgs) -> Result<SearchArgs, SearchToolError> {
         if let Some(command) = args.command.take() {
             apply_command_form(&mut args, &command)?;
         }
@@ -159,7 +250,7 @@ impl SearchTool {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             else {
-                return Err(anyhow::anyhow!("search index requires a non-empty path"));
+                return Err(SearchToolError::MissingIndexPath);
             };
             args.path = Some(path.to_string());
         } else {
@@ -169,7 +260,7 @@ impl SearchTool {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             else {
-                return Err(anyhow::anyhow!("search query requires a non-empty query"));
+                return Err(SearchToolError::MissingQuery);
             };
             args.query = Some(query.to_string());
         }
@@ -181,7 +272,7 @@ impl SearchTool {
 pub(crate) async fn resolve_search_path(
     sandbox_dir: &Path,
     raw_path: &str,
-) -> anyhow::Result<PathBuf> {
+) -> Result<PathBuf, SearchToolError> {
     let requested_path = PathBuf::from(raw_path);
     let resolved_path = if requested_path.is_absolute() {
         requested_path
@@ -190,11 +281,9 @@ pub(crate) async fn resolve_search_path(
     };
     async_fs::canonicalize(&resolved_path)
         .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to resolve search path {}: {error}",
-                resolved_path.display()
-            )
+        .map_err(|source| SearchToolError::ResolvePath {
+            path: resolved_path,
+            source,
         })
 }
 
@@ -207,63 +296,69 @@ impl Tool for SearchTool {
     type Res = ToolResult;
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
-        let mut args = self.normalize_args(arguments)?;
-        if let Some(path) = args.path.as_deref() {
-            args.path = Some(
-                resolve_search_path(self.sandbox_dir.as_path(), path)
-                    .await?
-                    .display()
-                    .to_string(),
-            );
-        }
-        if args.action == SearchAction::Index {
-            return index_path(
-                self.sandbox_dir.clone(),
+        let result = async {
+            let mut args = self.normalize_args(arguments)?;
+            if let Some(path) = args.path.as_deref() {
+                args.path = Some(
+                    resolve_search_path(self.sandbox_dir.as_path(), path)
+                        .await
+                        ?
+                        .display()
+                        .to_string(),
+                );
+            }
+            if args.action == SearchAction::Index {
+                return index_path(
+                    self.sandbox_dir.clone(),
+                    self.db_path(),
+                    self.meta_path(),
+                    self.semantic_index_path(),
+                    self.embedder.clone(),
+                    args.path.expect("validated"),
+                )
+                .await;
+            }
+            query_index(
                 self.db_path(),
                 self.meta_path(),
                 self.semantic_index_path(),
                 self.embedder.clone(),
-                args.path.expect("validated"),
+                args,
             )
-            .await;
+            .await
         }
-        query_index(
-            self.db_path(),
-            self.meta_path(),
-            self.semantic_index_path(),
-            self.embedder.clone(),
-            args,
-        )
-        .await
+        .await;
+
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => Ok(ToolResult::error(error.to_string())),
+        }
     }
 }
 
-pub fn apply_command_form(args: &mut SearchArgs, command: &str) -> anyhow::Result<()> {
+pub fn apply_command_form(args: &mut SearchArgs, command: &str) -> Result<(), SearchToolError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
-        return Err(anyhow::anyhow!("search command must not be empty"));
+        return Err(SearchToolError::EmptyCommand);
     }
     let body = trimmed.strip_prefix("search ").unwrap_or(trimmed).trim();
     if body.is_empty() {
-        return Err(anyhow::anyhow!(
-            "search command must include an action or query"
-        ));
+        return Err(SearchToolError::MissingActionOrQuery);
     }
 
-    let tokens = split_shell_words(body, "search")?;
+    let tokens = split_shell_words(body, "search")
+        .map_err(|_| SearchToolError::MissingActionOrQuery)?;
     match tokens.as_slice() {
         [action, path] if action == "index" => {
             args.action = SearchAction::Index;
             args.path = Some(path.clone());
         }
         [action, ..] if action == "index" => {
-            return Err(anyhow::anyhow!(
-                "search index accepts exactly one path argument"
-            ));
+            return Err(SearchToolError::InvalidIndexCommandArity);
         }
         [action, prompt_tokens @ ..] if action == "query" => {
             if prompt_tokens.is_empty() {
-                return Err(anyhow::anyhow!("search query requires a prompt"));
+                return Err(SearchToolError::MissingQueryPrompt);
             }
             args.action = SearchAction::Query;
             args.query = Some(prompt_tokens.join(" "));
@@ -348,16 +443,8 @@ async fn index_path(
     semantic_index_path: PathBuf,
     embedder: EmbeddingModelResolution,
     raw_path: String,
-) -> anyhow::Result<ToolResult> {
-    let requested_path = PathBuf::from(raw_path.clone());
-    let resolved_path = if requested_path.is_absolute() {
-        requested_path
-    } else {
-        sandbox_dir.join(requested_path)
-    };
-    let canonical = async_fs::canonicalize(&resolved_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve search path {raw_path}: {e}"))?;
+) -> Result<ToolResult, SearchToolError> {
+    let canonical = resolve_search_path(sandbox_dir.as_path(), raw_path.as_str()).await?;
 
     let mut meta = load_meta(&meta_path).await?;
     let canonical_string = canonical.display().to_string();
@@ -369,9 +456,7 @@ async fn index_path(
     let files = collect_searchable_files(&meta.roots).await?;
     let rows = build_rows(&files);
     if rows.is_empty() {
-        return Err(anyhow::anyhow!(
-            "search index contains no text chunks; choose a text or code file/directory"
-        ));
+        return Err(SearchToolError::IndexContainsNoText);
     }
 
     async_fs::create_dir_all(
@@ -419,7 +504,7 @@ async fn index_path(
         false
     };
 
-    ToolResult::json(&serde_json::json!({
+    Ok(ToolResult::json_value(serde_json::json!({
         "action": "index",
         "indexed_root": canonical_string,
         "roots": meta.roots,
@@ -427,19 +512,24 @@ async fn index_path(
         "chunks_indexed": meta.chunks_indexed,
         "semantic_indexed": semantic_indexed,
         "indexed_at": meta.indexed_at,
-    }))
+    })))
 }
 
-async fn load_meta(meta_path: &Path) -> anyhow::Result<SearchIndexMeta> {
+async fn load_meta(meta_path: &Path) -> Result<SearchIndexMeta, SearchToolError> {
     match async_fs::read_to_string(meta_path).await {
-        Ok(content) => Ok(serde_json::from_str(&content)?),
+        Ok(content) => serde_json::from_str(&content).map_err(|source| {
+            SearchToolError::ParseIndexMetadata {
+                path: meta_path.to_path_buf(),
+                source,
+            }
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(SearchIndexMeta::default())
         }
-        Err(error) => Err(anyhow::anyhow!(
-            "failed to read search index metadata {}: {error}",
-            meta_path.display()
-        )),
+        Err(source) => Err(SearchToolError::LoadIndexMetadata {
+            path: meta_path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -447,15 +537,15 @@ async fn rebuild_semantic_index(
     semantic_index_path: &Path,
     embedder: MayEmbeddingModel,
     files: &[SearchableFile],
-) -> anyhow::Result<bool> {
+) -> Result<bool, SearchToolError> {
     match async_fs::remove_file(semantic_index_path).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "failed to remove stale semantic index {}: {error}",
-                semantic_index_path.display()
-            ));
+        Err(source) => {
+            return Err(SearchToolError::RemoveStaleSemanticIndex {
+                path: semantic_index_path.to_path_buf(),
+                source,
+            });
         }
     }
 
@@ -496,34 +586,31 @@ async fn query_index(
     semantic_index_path: PathBuf,
     embedder: EmbeddingModelResolution,
     args: SearchArgs,
-) -> anyhow::Result<ToolResult> {
+) -> Result<ToolResult, SearchToolError> {
     let meta = load_meta(&meta_path).await?;
     if meta.roots.is_empty() {
-        return Err(anyhow::anyhow!(
-            "search index is empty; run `search index <path>` first"
-        ));
+        return Err(SearchToolError::EmptyIndex);
     }
 
     let conn = connect(db_path.to_string_lossy().as_ref())
         .execute()
         .await?;
-    let table =
-        conn.open_table(TABLE_NAME).execute().await.map_err(|_| {
-            anyhow::anyhow!("search index is missing; run `search index <path>` again")
-        })?;
+    let table = conn
+        .open_table(TABLE_NAME)
+        .execute()
+        .await
+        .map_err(|_| SearchToolError::MissingIndexTable)?;
 
     let query = args.query.clone().expect("validated");
     let query_enabled = query.trim() != "*" && !query.trim().is_empty();
     if args.search_mode == SearchMode::Semantic {
-        let embedder = embedder.require_ready(
-            "semantic search requires a global models.embedding_model and at least one enabled provider that supports it",
-        )?;
+        let embedder = embedder
+            .clone_ready()
+            .ok_or(SearchToolError::SemanticEmbeddingUnavailable)?;
         if meta.semantic_embedding_model.as_deref() != Some(embedder.selector())
             || meta.semantic_embedding_dimensions != Some(embedder.dim())
         {
-            return Err(anyhow::anyhow!(
-                "semantic index was built for a different embedding configuration; run `search index <path>` again"
-            ));
+            return Err(SearchToolError::SemanticEmbeddingMismatch);
         }
         return run_semantic_query(semantic_index_path, embedder, args, meta).await;
     }
@@ -564,7 +651,7 @@ async fn query_index(
             RegexBuilder::new(&pattern)
                 .case_insensitive(!args.case_sensitive)
                 .build()
-                .map_err(|e| anyhow::anyhow!("invalid regex pattern: {e}"))?,
+                .map_err(SearchToolError::InvalidRegexPattern)?,
         )
     } else {
         None
@@ -644,12 +731,12 @@ async fn query_index(
 
 fn require_semantic_metadata<'a>(
     metadata: &'a aither_rag::Metadata,
-    key: &str,
-) -> anyhow::Result<&'a str> {
+    key: &'static str,
+) -> Result<&'a str, SearchToolError> {
     metadata
         .get(key)
         .map(String::as_str)
-        .ok_or_else(|| anyhow::anyhow!("semantic index entry is missing '{key}' metadata"))
+        .ok_or(SearchToolError::MissingSemanticMetadata { key })
 }
 
 fn matches_path_prefix(path_filter: Option<&str>, file_path: &str) -> bool {
@@ -661,26 +748,22 @@ async fn run_semantic_query(
     embedder: MayEmbeddingModel,
     args: SearchArgs,
     meta: SearchIndexMeta,
-) -> anyhow::Result<ToolResult> {
+) -> Result<ToolResult, SearchToolError> {
     let query = args.query.as_deref().expect("validated");
     if query == "*" {
-        return Err(anyhow::anyhow!(
-            "semantic search does not support wildcard queries"
-        ));
+        return Err(SearchToolError::SemanticWildcardUnsupported);
     }
 
     match async_fs::metadata(&semantic_index_path).await {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow::anyhow!(
-                "semantic index is missing; run `search index <path>` again"
-            ));
+            return Err(SearchToolError::MissingSemanticIndex);
         }
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "failed to inspect semantic index {}: {error}",
-                semantic_index_path.display()
-            ));
+        Err(source) => {
+            return Err(SearchToolError::InspectSemanticIndex {
+                path: semantic_index_path,
+                source,
+            });
         }
     }
 
@@ -702,7 +785,7 @@ async fn run_semantic_query(
         .search_with_k(query, args.scan_limit)
         .await?
         .into_iter()
-        .map(|result| -> anyhow::Result<Option<FileMatchRow>> {
+        .map(|result| -> Result<Option<FileMatchRow>, SearchToolError> {
             let file_path = require_semantic_metadata(&result.chunk.metadata, "file_path")?;
             if !matches_path_prefix(path_filter, file_path) {
                 return Ok(None);
@@ -721,7 +804,7 @@ async fn run_semantic_query(
                 matched_by: vec![SearchMode::Semantic],
             }))
         })
-        .collect::<anyhow::Result<Vec<_>>>()?
+        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -770,7 +853,10 @@ fn prefix_match_pattern(value: &str) -> String {
     pattern
 }
 
-async fn run_plain_query(table: &Table, args: &SearchArgs) -> anyhow::Result<Vec<FileMatchRow>> {
+async fn run_plain_query(
+    table: &Table,
+    args: &SearchArgs,
+) -> Result<Vec<FileMatchRow>, SearchToolError> {
     let mut query = table
         .query()
         .select(Select::columns(&[
@@ -794,7 +880,7 @@ async fn run_full_text_query(
     table: &Table,
     args: &SearchArgs,
     fuzzy: bool,
-) -> anyhow::Result<Vec<FileMatchRow>> {
+) -> Result<Vec<FileMatchRow>, SearchToolError> {
     let query_text = args.query.clone().expect("validated");
     if query_text.trim() == "*" || query_text.trim().is_empty() {
         return run_plain_query(table, args).await;
@@ -809,7 +895,8 @@ async fn run_full_text_query(
         "content".to_string(),
         "relative_path".to_string(),
         "file_name".to_string(),
-    ])?;
+    ])
+    .map_err(|error| SearchToolError::Lance(error.to_string()))?;
 
     let mut query = table
         .query()
@@ -845,7 +932,7 @@ async fn run_full_text_query(
 
 async fn read_rows_from_stream(
     stream: &mut lancedb::arrow::SendableRecordBatchStream,
-) -> anyhow::Result<Vec<FileMatchRow>> {
+) -> Result<Vec<FileMatchRow>, SearchToolError> {
     let mut rows = Vec::new();
     while let Some(batch_res) = stream.next().await {
         let batch = batch_res?;
@@ -886,19 +973,31 @@ async fn read_rows_from_stream(
     Ok(rows)
 }
 
-fn as_string<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a StringArray> {
+fn as_string<'a>(
+    column: Option<&'a ArrayRef>,
+    name: &'static str,
+) -> Result<&'a StringArray, SearchToolError> {
     column
         .and_then(|value| value.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
+        .ok_or(SearchToolError::InvalidColumn {
+            name,
+            expected: "utf8",
+        })
 }
 
-fn as_i64<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a Int64Array> {
+fn as_i64<'a>(
+    column: Option<&'a ArrayRef>,
+    name: &'static str,
+) -> Result<&'a Int64Array, SearchToolError> {
     column
         .and_then(|value| value.as_any().downcast_ref::<Int64Array>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
+        .ok_or(SearchToolError::InvalidColumn {
+            name,
+            expected: "int64",
+        })
 }
 
-async fn collect_searchable_files(roots: &[String]) -> anyhow::Result<Vec<SearchableFile>> {
+async fn collect_searchable_files(roots: &[String]) -> Result<Vec<SearchableFile>, SearchToolError> {
     let mut files_out = Vec::new();
     for root in roots {
         let root_path = PathBuf::from(root);
@@ -912,20 +1011,24 @@ async fn collect_searchable_files(roots: &[String]) -> anyhow::Result<Vec<Search
         }
 
         let root_path_clone = root_path.clone();
-        let files = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<PathBuf>> {
+        let files = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>, SearchToolError> {
             let mut files = Vec::new();
             let mut walk = WalkBuilder::new(&root_path_clone);
             walk.standard_filters(true);
             walk.hidden(false);
             for entry in walk.build() {
-                let entry = entry?;
+                let entry = entry.map_err(|source| SearchToolError::WalkFiles {
+                    root: root_path_clone.clone(),
+                    source,
+                })?;
                 if entry.file_type().is_some_and(|kind| kind.is_file()) {
                     files.push(entry.into_path());
                 }
             }
             Ok(files)
         })
-        .await??;
+        .await
+        .map_err(SearchToolError::JoinFileScan)??;
 
         for file in files {
             if let Some(searchable) =
@@ -962,7 +1065,7 @@ fn build_rows(files: &[SearchableFile]) -> Vec<FileChunkRow> {
 async fn read_searchable_file(
     root_path: &Path,
     file_path: &Path,
-) -> anyhow::Result<Option<SearchableFile>> {
+) -> Result<Option<SearchableFile>, SearchToolError> {
     let bytes = async_fs::read(file_path).await?;
     if bytes.len() > MAX_FILE_BYTES || is_probably_binary(&bytes) {
         return Ok(None);
@@ -1028,7 +1131,7 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
 
 fn rows_to_record_reader(
     rows: &[FileChunkRow],
-) -> anyhow::Result<Box<dyn RecordBatchReader + Send>> {
+) -> Result<Box<dyn RecordBatchReader + Send>, SearchToolError> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("root_path", DataType::Utf8, false),
         Field::new("file_path", DataType::Utf8, false),
@@ -1074,7 +1177,7 @@ fn finalize_rows(
     total_matches: usize,
     args: &SearchArgs,
     meta: &SearchIndexMeta,
-) -> anyhow::Result<ToolResult> {
+) -> Result<ToolResult, SearchToolError> {
     let start = args.offset.min(rows.len());
     let end = (start + args.limit).min(rows.len());
     let rows = rows[start..end].to_vec();
@@ -1154,7 +1257,7 @@ fn finalize_rows(
         })
     };
 
-    ToolResult::json(&value)
+    Ok(ToolResult::json_value(value))
 }
 
 fn truncate_text(input: &str, max_chars: usize) -> String {
