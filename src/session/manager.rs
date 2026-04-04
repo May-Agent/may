@@ -111,6 +111,10 @@ pub struct SessionSummary {
     /// Content preview for searching (concatenated messages).
     pub content_preview: String,
     /// Persisted runtime summary for refresh-safe UI state.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::session::SessionRuntimeSummary::is_empty"
+    )]
     pub runtime: SessionRuntimeSummary,
 }
 
@@ -213,12 +217,23 @@ pub async fn load_history_from_db(
 /// useful for spawned tasks that only need a `ChatDb` clone.
 pub async fn list_summaries_from_db(db: &ChatDb) -> Result<Vec<SessionSummary>, SessionError> {
     let db_sessions = db.list_sessions().await?;
+    Ok(summarize_db_sessions(db, db_sessions).await?)
+}
+
+pub async fn summarize_db_sessions(
+    db: &ChatDb,
+    db_sessions: Vec<crate::db::entity::sessions::Model>,
+) -> Result<Vec<SessionSummary>, ChatDbError> {
+    let session_ids = db_sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    let mut runtime_by_session = db.list_session_runtime_summaries(&session_ids).await?;
     let mut summaries = Vec::with_capacity(db_sessions.len());
     for session in db_sessions {
         let mut summary = SessionSummary::from_db_model(session);
-        summary.runtime = db
-            .get_session_runtime(summary.id.as_str())
-            .await?
+        summary.runtime = runtime_by_session
+            .remove(summary.id.as_str())
             .unwrap_or_default();
         summaries.push(summary);
     }
@@ -241,6 +256,9 @@ pub async fn initialize_session_persistence(
     let store = SessionStore::new(home_paths.clone());
     let db = ChatDb::open(&home_paths.db_file()).await?;
     let default_profile_id = db.ensure_default_profiles().await?;
+    for profile in db.list_profiles().await? {
+        store.sync_profile_scoped_resources(&profile.id).await?;
+    }
     reconcile_container_profile_sessions(&store, &db).await?;
     Ok((store, db, default_profile_id))
 }

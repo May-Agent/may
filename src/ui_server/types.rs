@@ -1,11 +1,28 @@
 use crate::config::{
-    LoadBalanceStrategy, PlaywrightBrowser, ProviderType, RemoteAccessConfig, SshServerConfig,
+    BrowserBackendKind, LoadBalanceStrategy, ProviderType, RemoteAccessConfig, SshServerConfig,
 };
 use crate::network_policy::NetworkPolicyMode;
 use crate::session::{
     PendingUserMessage, PendingUserMessageMode, SessionPlanState, SessionRuntimeState,
 };
 use crate::xml_fragment::XmlFragment;
+use aither_core::llm::ToolResult;
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+const fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+const fn session_plan_state_is_disabled(value: &SessionPlanState) -> bool {
+    matches!(value, SessionPlanState::Disabled)
+}
+
+const fn session_runtime_state_is_idle(value: &SessionRuntimeState) -> bool {
+    matches!(value, SessionRuntimeState::Idle)
+}
 
 // ── Typed API Errors ────────────────────────────────────────
 
@@ -56,7 +73,7 @@ pub struct SseToolEndEvent<'a> {
     pub(crate) name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) arguments: Option<&'a str>,
-    pub(crate) result: &'a Result<String, String>,
+    pub(crate) result: &'a ToolResult,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -122,19 +139,19 @@ pub enum ToolEventRecord {
     End {
         id: String,
         name: String,
-        result: Result<String, String>,
+        result: ToolResult,
     },
 }
 
 // ── Config SSE Event Payload ────────────────────────────────
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConfigEventPayload {
-    pub(crate) ui_font: String,
-    pub(crate) ui_theme: String,
-    pub(crate) ssh_servers: Vec<SshServerConfig>,
-    pub(crate) max_iterations: usize,
+pub struct BrowserStatusEventPayload {
+    pub(crate) enabled: bool,
+    pub(crate) running: bool,
+    pub(crate) cdp_endpoint: Option<String>,
+    pub(crate) takeover_session_id: Option<String>,
 }
 
 // ── Generic OK Responses ────────────────────────────────────
@@ -490,10 +507,9 @@ pub struct ApiAttachment {
     pub(crate) text_content: Option<String>,
 }
 
-/// Legacy wire name of the native terminal command tool.
+/// Native terminal command tool name.
 ///
-/// Internally May treats this as terminal execution tracking; the protocol
-/// still emits the historical tool name `terminal` for compatibility.
+/// This identifies the terminal command execution tool in the protocol.
 pub const TERMINAL_TOOL_NAME: &str = "terminal";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -563,11 +579,13 @@ pub struct ApiSession {
     pub(crate) title: String,
     pub(crate) last_modified: String,
     pub(crate) preview: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) messages: Vec<ApiMessage>,
     pub(crate) profile_id: Option<String>,
     pub(crate) model: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "SessionRuntimeResponse::is_empty")]
     pub(crate) runtime: SessionRuntimeResponse,
 }
 
@@ -640,6 +658,8 @@ pub struct ChatRequest {
     pub(crate) content: String,
     #[serde(default)]
     pub(crate) attachments: Vec<ApiAttachment>,
+    /// Structured hidden context fragment for the next turn.
+    /// XML-like tags are allowed, but strict XML validity is not required.
     #[serde(default)]
     pub(crate) hidden_context_xml: Option<XmlFragment>,
     #[serde(default)]
@@ -787,7 +807,15 @@ pub struct WorkspacePollItem {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserInteractionResponse {
+    #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) takeover_active: bool,
+}
+
+impl BrowserInteractionResponse {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.takeover_active
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -803,12 +831,30 @@ pub struct TerminalInteractionResponse {
     pub(crate) input_notice: Option<String>,
 }
 
+impl TerminalInteractionResponse {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.task_id.is_none()
+            && self.output_file.is_none()
+            && self.output_preview.is_none()
+            && self.input_notice.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInteractionResponse {
+    #[serde(default, skip_serializing_if = "BrowserInteractionResponse::is_empty")]
     pub(crate) browser: BrowserInteractionResponse,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "TerminalInteractionResponse::is_empty")]
     pub(crate) terminal: TerminalInteractionResponse,
+}
+
+impl SessionInteractionResponse {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.browser.is_empty() && self.terminal.is_empty()
+    }
 }
 
 impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
@@ -865,28 +911,53 @@ pub struct WorkspaceRespondRequest {
     pub(crate) approved: bool,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiConfigResponse {
     pub(crate) ssh_servers: Vec<SshServerConfig>,
     pub(crate) max_iterations: usize,
     pub(crate) ui_font: String,
     pub(crate) ui_theme: String,
+    pub(crate) full_config: UiFullConfig,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapProfileSessionsError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) code: Option<ApiErrorCode>,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiBootstrapResponse {
+    pub(crate) sessions: Vec<ApiSession>,
+    pub(crate) profiles: Vec<crate::profile::ProfileInfo>,
+    pub(crate) default_profile_id: String,
+    pub(crate) config: UiConfigResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_profile_sessions: Option<crate::profile::ProfileSessions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_profile_sessions_error: Option<BootstrapProfileSessionsError>,
+    #[serde(default)]
+    pub(crate) default_profile_skills: Vec<SkillInfoDto>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeResponse {
+    #[serde(default, skip_serializing_if = "session_runtime_state_is_idle")]
     pub(crate) state: SessionRuntimeState,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "session_plan_state_is_disabled")]
     pub(crate) plan_state: SessionPlanState,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "SessionInteractionResponse::is_empty")]
     pub(crate) interactions: SessionInteractionResponse,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub(crate) queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_immediate: Option<PendingUserMessage>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) queued_messages: Vec<PendingUserMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) waiting_permission: Option<PermissionPollItem>,
@@ -896,10 +967,26 @@ pub struct SessionRuntimeResponse {
     pub(crate) waiting_ask_user: Option<crate::session::PersistedAskUserRequest>,
 }
 
+impl SessionRuntimeResponse {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self.state, SessionRuntimeState::Idle)
+            && matches!(self.plan_state, SessionPlanState::Disabled)
+            && self.interactions.is_empty()
+            && self.queued_count == 0
+            && self.pending_immediate.is_none()
+            && self.queued_messages.is_empty()
+            && self.waiting_permission.is_none()
+            && self.waiting_workspace.is_none()
+            && self.waiting_ask_user.is_none()
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeEventPayload {
     pub(crate) session_id: String,
+    #[serde(default, skip_serializing_if = "SessionRuntimeResponse::is_empty")]
     pub(crate) runtime: SessionRuntimeResponse,
 }
 
@@ -907,6 +994,7 @@ pub struct SessionRuntimeEventPayload {
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSnapshotItem {
     pub(crate) session_id: String,
+    #[serde(default, skip_serializing_if = "SessionRuntimeResponse::is_empty")]
     pub(crate) runtime: SessionRuntimeResponse,
 }
 
@@ -991,6 +1079,8 @@ pub struct UiModelsConfig {
     pub(crate) balanced: Vec<String>,
     pub(crate) fast: Vec<String>,
     pub(crate) image_generation: Vec<String>,
+    pub(crate) embedding_model: Option<String>,
+    pub(crate) embedding_dimensions: Option<usize>,
     pub(crate) model_providers: std::collections::HashMap<String, String>,
 }
 
@@ -1014,10 +1104,11 @@ pub struct UiAppearanceConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UiPlaywrightConfig {
+pub struct UiBrowserConfig {
     pub(crate) enabled: bool,
-    pub(crate) browser: PlaywrightBrowser,
+    pub(crate) backend: BrowserBackendKind,
     pub(crate) port: u16,
+    pub(crate) remote_cdp_endpoint: Option<String>,
     pub(crate) screencast_quality: u32,
     pub(crate) screencast_max_width: u32,
 }
@@ -1044,7 +1135,7 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
     }
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiFullConfig {
     pub(crate) providers: Vec<UiProviderConfig>,
@@ -1053,7 +1144,7 @@ pub struct UiFullConfig {
     pub(crate) appearance: UiAppearanceConfig,
     pub(crate) last_model: Option<String>,
     pub(crate) max_iterations: usize,
-    pub(crate) playwright: UiPlaywrightConfig,
+    pub(crate) browser: UiBrowserConfig,
     pub(crate) remote_access: UiRemoteAccessConfig,
 }
 
@@ -1087,12 +1178,6 @@ pub struct SkillInstallRequest {
     pub(crate) repo: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CopilotPollRequest {
-    pub(crate) device_code: String,
-}
-
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotStatusResponse {
@@ -1110,14 +1195,14 @@ pub struct CopilotStartResponse {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CopilotPollResponse {
-    pub(crate) status: CopilotPollStatus,
+pub struct CopilotAuthEvent {
+    pub(crate) status: CopilotAuthStatus,
     pub(crate) message: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CopilotPollStatus {
+pub enum CopilotAuthStatus {
     Pending,
     Success,
     Expired,

@@ -4,6 +4,7 @@
 
 pub mod entity;
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use sea_orm::ConnectionTrait;
@@ -40,7 +41,7 @@ pub enum ChatDbError {
     Db(#[from] DbErr),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Invalid XML fragment: {0}")]
+    #[error("Invalid context fragment: {0}")]
     InvalidXml(#[from] crate::xml_fragment::XmlFragmentError),
     #[error("Invalid profile environment: {0}")]
     InvalidProfileEnvironment(String),
@@ -109,6 +110,7 @@ pub struct NetworkAccessLogParams<'a> {
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccessSource {
     Chat,
+    Exec,
     TaskLocal,
     TaskValidationLocal,
     TaskRemote,
@@ -121,6 +123,7 @@ impl NetworkAccessSource {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Chat => "chat",
+            Self::Exec => "exec",
             Self::TaskLocal => "task_local",
             Self::TaskValidationLocal => "task_validation_local",
             Self::TaskRemote => "task_remote",
@@ -142,6 +145,7 @@ impl core::str::FromStr for NetworkAccessSource {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "chat" => Ok(Self::Chat),
+            "exec" => Ok(Self::Exec),
             "task_local" => Ok(Self::TaskLocal),
             "task_validation_local" => Ok(Self::TaskValidationLocal),
             "task_remote" => Ok(Self::TaskRemote),
@@ -612,56 +616,68 @@ impl ChatDb {
         Ok(session)
     }
 
-    /// Get the persisted runtime summary for a session.
-    pub async fn get_session_runtime(
-        &self,
-        id: &str,
-    ) -> Result<Option<SessionRuntimeSummary>, ChatDbError> {
-        let session = self.get_session(id).await?;
-        if session.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(self.load_session_runtime_summary(id).await?))
+    fn pending_user_message_from_row(
+        row: session_pending_messages::Model,
+    ) -> Result<PendingUserMessage, ChatDbError> {
+        Ok(PendingUserMessage {
+            content: row.content,
+            attachments: serde_json::from_str(&row.attachments_json)?,
+            hidden_context_xml: row.hidden_context_xml.map(XmlFragment::parse).transpose()?,
+            created_at: row.created_at,
+            delivery_mode: row.delivery_mode.parse().unwrap_or_default(),
+        })
     }
 
-    async fn load_session_runtime_summary(
-        &self,
-        session_id: &str,
-    ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let runtime_row = session_runtimes::Entity::find_by_id(session_id)
-            .one(&self.conn)
-            .await?;
-        let message_rows = session_pending_messages::Entity::find()
-            .filter(session_pending_messages::Column::SessionId.eq(session_id))
-            .order_by(session_pending_messages::Column::Id, Order::Asc)
-            .all(&self.conn)
-            .await?;
-        let permission_row = session_pending_permissions::Entity::find()
-            .filter(session_pending_permissions::Column::SessionId.eq(session_id))
-            .one(&self.conn)
-            .await?;
-        let workspace_row = session_pending_workspace::Entity::find()
-            .filter(session_pending_workspace::Column::SessionId.eq(session_id))
-            .one(&self.conn)
-            .await?;
-        let ask_user_row = session_pending_ask_user::Entity::find()
-            .filter(session_pending_ask_user::Column::SessionId.eq(session_id))
-            .one(&self.conn)
-            .await?;
-        let plan_row = session_plans::Entity::find_by_id(session_id)
-            .one(&self.conn)
-            .await?;
+    fn persisted_permission_request_from_row(
+        row: session_pending_permissions::Model,
+    ) -> PersistedPermissionRequest {
+        PersistedPermissionRequest {
+            id: row.request_id,
+            request: crate::session::PersistedPermissionRequestPayload {
+                mode: row
+                    .mode
+                    .parse()
+                    .expect("persisted permission request mode must be valid"),
+                script: row.script,
+                session_id: Some(row.session_id),
+            },
+        }
+    }
 
+    fn persisted_workspace_request_from_row(
+        row: session_pending_workspace::Model,
+    ) -> PersistedWorkspaceRequest {
+        PersistedWorkspaceRequest {
+            id: row.request_id,
+            request: crate::session::PersistedWorkspaceRequestPayload {
+                path: row.path,
+                reason: row.reason,
+                session_id: Some(row.session_id),
+            },
+        }
+    }
+
+    fn persisted_ask_user_request_from_row(
+        row: session_pending_ask_user::Model,
+    ) -> Result<PersistedAskUserRequest, ChatDbError> {
+        Ok(PersistedAskUserRequest {
+            id: row.request_id,
+            questions: serde_json::from_str(&row.questions_json)?,
+        })
+    }
+
+    fn build_session_runtime_summary(
+        runtime_row: Option<session_runtimes::Model>,
+        message_rows: Vec<session_pending_messages::Model>,
+        permission_row: Option<session_pending_permissions::Model>,
+        workspace_row: Option<session_pending_workspace::Model>,
+        ask_user_row: Option<session_pending_ask_user::Model>,
+        plan_row: Option<session_plans::Model>,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let mut steer_messages = Vec::new();
         let mut queued_messages = Vec::new();
         for row in message_rows {
-            let message = PendingUserMessage {
-                content: row.content,
-                attachments: serde_json::from_str(&row.attachments_json)?,
-                hidden_context_xml: row.hidden_context_xml.map(XmlFragment::parse).transpose()?,
-                created_at: row.created_at,
-                delivery_mode: row.delivery_mode.parse().unwrap_or_default(),
-            };
+            let message = Self::pending_user_message_from_row(row)?;
             if message.delivery_mode == crate::session::PendingUserMessageMode::Steer {
                 steer_messages.push(message);
             } else {
@@ -715,38 +731,147 @@ impl ChatDb {
             },
             pending_immediate,
             queued_messages,
-            waiting_permission: permission_row.map(|row| PersistedPermissionRequest {
-                id: row.request_id,
-                request: crate::session::PersistedPermissionRequestPayload {
-                    mode: row
-                        .mode
-                        .parse()
-                        .expect("persisted permission request mode must be valid"),
-                    script: row.script,
-                    session_id: Some(row.session_id),
-                },
-            }),
-            waiting_workspace: workspace_row.map(|row| PersistedWorkspaceRequest {
-                id: row.request_id,
-                request: crate::session::PersistedWorkspaceRequestPayload {
-                    path: row.path,
-                    reason: row.reason,
-                    session_id: Some(row.session_id),
-                },
-            }),
+            waiting_permission: permission_row.map(Self::persisted_permission_request_from_row),
+            waiting_workspace: workspace_row.map(Self::persisted_workspace_request_from_row),
             waiting_ask_user: ask_user_row
-                .map(|row| -> Result<PersistedAskUserRequest, ChatDbError> {
-                    Ok(PersistedAskUserRequest {
-                        id: row.request_id,
-                        questions: serde_json::from_str(&row.questions_json)?,
-                    })
-                })
+                .map(Self::persisted_ask_user_request_from_row)
                 .transpose()?,
             updated_at: runtime_row.map(|row| row.updated_at),
             ..Default::default()
         };
         summary.normalize_state();
         Ok(summary)
+    }
+
+    /// Get the persisted runtime summary for a session.
+    pub async fn get_session_runtime(
+        &self,
+        id: &str,
+    ) -> Result<Option<SessionRuntimeSummary>, ChatDbError> {
+        let session = self.get_session(id).await?;
+        if session.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.load_session_runtime_summary(id).await?))
+    }
+
+    async fn load_session_runtime_summary(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let runtime_row = session_runtimes::Entity::find_by_id(session_id)
+            .one(&self.conn)
+            .await?;
+        let message_rows = session_pending_messages::Entity::find()
+            .filter(session_pending_messages::Column::SessionId.eq(session_id))
+            .order_by(session_pending_messages::Column::Id, Order::Asc)
+            .all(&self.conn)
+            .await?;
+        let permission_row = session_pending_permissions::Entity::find()
+            .filter(session_pending_permissions::Column::SessionId.eq(session_id))
+            .one(&self.conn)
+            .await?;
+        let workspace_row = session_pending_workspace::Entity::find()
+            .filter(session_pending_workspace::Column::SessionId.eq(session_id))
+            .one(&self.conn)
+            .await?;
+        let ask_user_row = session_pending_ask_user::Entity::find()
+            .filter(session_pending_ask_user::Column::SessionId.eq(session_id))
+            .one(&self.conn)
+            .await?;
+        let plan_row = session_plans::Entity::find_by_id(session_id)
+            .one(&self.conn)
+            .await?;
+        Self::build_session_runtime_summary(
+            runtime_row,
+            message_rows,
+            permission_row,
+            workspace_row,
+            ask_user_row,
+            plan_row,
+        )
+    }
+
+    pub async fn list_session_runtime_summaries(
+        &self,
+        session_ids: &[String],
+    ) -> Result<HashMap<String, SessionRuntimeSummary>, ChatDbError> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let runtime_rows = session_runtimes::Entity::find()
+            .filter(session_runtimes::Column::SessionId.is_in(session_ids.iter().cloned()))
+            .all(&self.conn)
+            .await?;
+        let message_rows = session_pending_messages::Entity::find()
+            .filter(session_pending_messages::Column::SessionId.is_in(session_ids.iter().cloned()))
+            .order_by_asc(session_pending_messages::Column::SessionId)
+            .order_by_asc(session_pending_messages::Column::Id)
+            .all(&self.conn)
+            .await?;
+        let permission_rows = session_pending_permissions::Entity::find()
+            .filter(
+                session_pending_permissions::Column::SessionId.is_in(session_ids.iter().cloned()),
+            )
+            .all(&self.conn)
+            .await?;
+        let workspace_rows = session_pending_workspace::Entity::find()
+            .filter(session_pending_workspace::Column::SessionId.is_in(session_ids.iter().cloned()))
+            .all(&self.conn)
+            .await?;
+        let ask_user_rows = session_pending_ask_user::Entity::find()
+            .filter(session_pending_ask_user::Column::SessionId.is_in(session_ids.iter().cloned()))
+            .all(&self.conn)
+            .await?;
+        let plan_rows = session_plans::Entity::find()
+            .filter(session_plans::Column::SessionId.is_in(session_ids.iter().cloned()))
+            .all(&self.conn)
+            .await?;
+
+        let mut runtime_by_session = runtime_rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let mut messages_by_session =
+            HashMap::<String, Vec<session_pending_messages::Model>>::new();
+        for row in message_rows {
+            messages_by_session
+                .entry(row.session_id.clone())
+                .or_default()
+                .push(row);
+        }
+        let mut permission_by_session = permission_rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let mut workspace_by_session = workspace_rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let mut ask_user_by_session = ask_user_rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let mut plan_by_session = plan_rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+
+        let mut summaries = HashMap::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let summary = Self::build_session_runtime_summary(
+                runtime_by_session.remove(session_id),
+                messages_by_session.remove(session_id).unwrap_or_default(),
+                permission_by_session.remove(session_id),
+                workspace_by_session.remove(session_id),
+                ask_user_by_session.remove(session_id),
+                plan_by_session.remove(session_id),
+            )?;
+            summaries.insert(session_id.clone(), summary);
+        }
+
+        Ok(summaries)
     }
 
     pub async fn write_session_runtime(
@@ -3842,7 +3967,7 @@ mod tests {
 
         let info = crate::profile::ProfileInfo::from_db_model(model)
             .expect("remote profile should deserialize");
-        match info.environment {
+        match info.environment.kind() {
             ProfileEnvironment::Remote { ssh_server_id } => assert_eq!(ssh_server_id, "prod"),
             other => panic!("expected remote environment, got {other:?}"),
         }

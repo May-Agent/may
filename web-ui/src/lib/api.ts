@@ -3,6 +3,8 @@ import type {
   Message,
   Attachment,
   Artifact,
+  PinnedItem,
+  SessionSummary,
   TimelineSegment,
   TerminalExecution,
   ProfileInfo,
@@ -78,6 +80,11 @@ export interface UiConfigEventPayload {
   fullConfig?: UiFullConfig;
 }
 
+export interface BootstrapProfileSessionsError {
+  code?: string | null;
+  message: string;
+}
+
 export type ContainerPrepareStage =
   | 'checking'
   | 'building'
@@ -150,6 +157,7 @@ export interface UiEventsSubscription {
   sessionId?: string;
   profileId?: string;
   onOpen?: () => void;
+  onBrowserStatus?: (payload: BrowserStatus) => void;
   onConfig?: (payload: UiConfigEventPayload) => void;
   onContainerPrepare?: (payload: ContainerPrepareEventPayload) => void;
   onRemoteAccess?: (payload: { status: RemoteAccessStatus }) => void;
@@ -165,6 +173,18 @@ export interface UiEventsSubscription {
   onHeartbeat?: () => void;
   onError?: () => void;
 }
+
+type UiEventTopic =
+  | 'browser_status'
+  | 'config'
+  | 'container_prepare'
+  | 'network_access_logs'
+  | 'notification_mailbox'
+  | 'profile_sessions'
+  | 'remote_access'
+  | 'request_logs'
+  | 'session_runtime'
+  | 'session_runtimes';
 
 export type AskUserAnswerValue = string[] | string | null;
 
@@ -183,6 +203,7 @@ export interface UiConfig {
   maxIterations: number;
   uiFont: string;
   uiTheme: 'light' | 'dark' | 'system';
+  fullConfig: UiFullConfig;
 }
 
 export type ProviderType =
@@ -193,6 +214,7 @@ export type ProviderType =
   | 'openrouter'
   | 'deepseek'
   | 'ollama'
+  | 'lmstudio'
   | 'groq'
   | 'together'
   | 'mistral'
@@ -520,6 +542,8 @@ export interface UiModelsConfig {
   balanced: string[];
   fast: string[];
   imageGeneration: string[];
+  embeddingModel: string | null;
+  embeddingDimensions: number | null;
   modelProviders: Record<string, string>;
 }
 
@@ -532,10 +556,11 @@ export interface UiPreferencesConfig {
   networkPolicyHosts: string[];
 }
 
-export interface UiPlaywrightConfig {
+export interface UiBrowserConfig {
   enabled: boolean;
-  browser: 'local_chrome' | 'chromium';
+  backend: 'managed' | 'remote_cdp';
   port: number;
+  remoteCdpEndpoint?: string | null;
   screencastQuality: number;
   screencastMaxWidth: number;
 }
@@ -558,7 +583,7 @@ export interface UiFullConfig {
   };
   lastModel: string | null;
   maxIterations: number;
-  playwright: UiPlaywrightConfig;
+  browser: UiBrowserConfig;
   remoteAccess: UiRemoteAccessConfig;
 }
 
@@ -681,10 +706,90 @@ function enrichMessage(m: Message): Message {
   };
 }
 
+function normalizeRuntime(
+  runtime: SessionRuntimeStatus | null | undefined,
+): SessionRuntimeStatus {
+  const browserTakeoverActive =
+    runtime?.interactions?.browser?.takeoverActive ?? false;
+  const terminal = runtime?.interactions?.terminal;
+  const normalizedTerminal =
+    terminal &&
+    (terminal.taskId != null
+      || terminal.outputFile != null
+      || terminal.outputPreview != null
+      || terminal.inputNotice != null)
+      ? {
+          taskId: terminal.taskId ?? null,
+          outputFile: terminal.outputFile ?? null,
+          outputPreview: terminal.outputPreview ?? null,
+          inputNotice: terminal.inputNotice ?? null,
+        }
+      : undefined;
+
+  return {
+    state: runtime?.state ?? 'idle',
+    planState: runtime?.planState ?? 'disabled',
+    interactions:
+      browserTakeoverActive || normalizedTerminal
+        ? {
+            browser: {
+              takeoverActive: browserTakeoverActive,
+            },
+            terminal: normalizedTerminal,
+          }
+        : undefined,
+    queuedCount: runtime?.queuedCount ?? 0,
+    pendingImmediate: runtime?.pendingImmediate ?? null,
+    queuedMessages: runtime?.queuedMessages ?? [],
+    waitingPermission: runtime?.waitingPermission ?? null,
+    waitingWorkspace: runtime?.waitingWorkspace ?? null,
+    waitingAskUser: runtime?.waitingAskUser ?? null,
+  };
+}
+
+function normalizeSessionSummary(session: SessionSummary): SessionSummary {
+  return {
+    ...session,
+    runtime: normalizeRuntime(session.runtime),
+  };
+}
+
+function normalizePinnedItem(item: PinnedItem): PinnedItem {
+  if (item.type === 'session') {
+    return {
+      ...item,
+      runtime: normalizeRuntime(item.runtime),
+    };
+  }
+  return {
+    ...item,
+    sessions: item.sessions.map(normalizeSessionSummary),
+  };
+}
+
+function normalizeProfileSessions(profileSessions: ProfileSessions): ProfileSessions {
+  return {
+    ...profileSessions,
+    pinned: profileSessions.pinned.map(normalizePinnedItem),
+    regular: profileSessions.regular.map(normalizeSessionSummary),
+    archived: profileSessions.archived.map(normalizeSessionSummary),
+  };
+}
+
+function normalizeRuntimeSnapshot(
+  snapshot: SessionRuntimeSnapshot,
+): SessionRuntimeSnapshot {
+  return {
+    ...snapshot,
+    runtime: normalizeRuntime(snapshot.runtime),
+  };
+}
+
 function enrichSession(s: Session): Session {
   return {
     ...s,
-    messages: s.messages.map(enrichMessage),
+    messages: (s.messages ?? []).map(enrichMessage),
+    runtime: normalizeRuntime(s.runtime),
   };
 }
 
@@ -869,6 +974,29 @@ async function requestResponse(
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await requestResponse(url, init);
   return (await res.json()) as T;
+}
+
+export interface BootstrapPayload {
+  sessions: Session[];
+  profiles: ProfileInfo[];
+  defaultProfileId: string;
+  config: UiConfig;
+  defaultProfileSessions?: ProfileSessions | null;
+  defaultProfileSessionsError?: BootstrapProfileSessionsError | null;
+  defaultProfileSkills: SkillInfo[];
+}
+
+// ── Bootstrap API ────────────────────────────────────────
+
+export async function fetchBootstrap(): Promise<BootstrapPayload> {
+  const data = await request<BootstrapPayload>('/api/bootstrap');
+  return {
+    ...data,
+    sessions: data.sessions.map(enrichSession),
+    defaultProfileSessions: data.defaultProfileSessions
+      ? normalizeProfileSessions(data.defaultProfileSessions)
+      : data.defaultProfileSessions,
+  };
 }
 
 // ── Session API ──────────────────────────────────────────
@@ -1096,12 +1224,13 @@ export async function enqueueChat(input: {
     })),
   };
 
-  return request<SessionRuntimeStatus>('/api/chat/enqueue', {
+  const data = await request<SessionRuntimeStatus>('/api/chat/enqueue', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify(payload),
     signal: input.signal,
   });
+  return normalizeRuntime(data);
 }
 
 // ── Models API ───────────────────────────────────────────
@@ -1142,21 +1271,23 @@ export async function fetchNetworkAccessLogs(): Promise<NetworkAccessLogsPayload
 export async function fetchSessionRuntime(
   sessionId: string,
 ): Promise<SessionRuntimeStatus> {
-  return request<SessionRuntimeStatus>(
+  const data = await request<SessionRuntimeStatus>(
     `/api/sessions/${encodeURIComponent(sessionId)}/runtime`,
   );
+  return normalizeRuntime(data);
 }
 
 export async function stopSessionRun(
   sessionId: string,
 ): Promise<SessionRuntimeStatus> {
-  return request<SessionRuntimeStatus>(
+  const data = await request<SessionRuntimeStatus>(
     `/api/sessions/${encodeURIComponent(sessionId)}/stop`,
     {
       method: 'POST',
       headers: JSON_HEADERS,
     },
   );
+  return normalizeRuntime(data);
 }
 
 export async function removePendingSessionMessage(input: {
@@ -1164,7 +1295,7 @@ export async function removePendingSessionMessage(input: {
   kind: 'pending_immediate' | 'queued';
   index?: number;
 }): Promise<SessionRuntimeStatus> {
-  return request<SessionRuntimeStatus>(
+  const data = await request<SessionRuntimeStatus>(
     `/api/sessions/${encodeURIComponent(input.sessionId)}/runtime/pending`,
     {
       method: 'DELETE',
@@ -1175,6 +1306,7 @@ export async function removePendingSessionMessage(input: {
       }),
     },
   );
+  return normalizeRuntime(data);
 }
 
 export async function fetchSessionContextDebug(
@@ -1301,43 +1433,42 @@ export async function respondPermissionRequest(
   id: string,
   approved: boolean,
 ): Promise<SessionRuntimeStatus> {
-  return request<SessionRuntimeStatus>('/api/permissions/respond', {
+  const data = await request<SessionRuntimeStatus>('/api/permissions/respond', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ id, approved }),
   });
+  return normalizeRuntime(data);
 }
 
 export async function respondWorkspaceRequest(
   id: string,
   approved: boolean,
 ): Promise<SessionRuntimeStatus> {
-  return request<SessionRuntimeStatus>('/api/workspace/respond', {
+  const data = await request<SessionRuntimeStatus>('/api/workspace/respond', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ id, approved }),
   });
+  return normalizeRuntime(data);
 }
 
 export async function respondAskUserRequest(
   id: string,
   answers: AskUserAnswer[],
 ): Promise<SessionRuntimeStatus> {
-  return request<SessionRuntimeStatus>('/api/ask-user/respond', {
+  const data = await request<SessionRuntimeStatus>('/api/ask-user/respond', {
     method: 'POST',
     headers: JSON_HEADERS,
     body: JSON.stringify({ id, answers }),
   });
+  return normalizeRuntime(data);
 }
 
 // ── Config API ───────────────────────────────────────────
 
 export async function fetchUiConfig(): Promise<UiConfig> {
   return request<UiConfig>('/api/config');
-}
-
-export async function fetchFullConfig(): Promise<UiFullConfig> {
-  return request<UiFullConfig>('/api/config/full');
 }
 
 export async function saveFullConfig(config: UiFullConfig): Promise<void> {
@@ -1463,9 +1594,18 @@ export interface CopilotStartResponse {
   interval: number;
 }
 
-export interface CopilotPollResponse {
+export interface CopilotAuthEvent {
   status: 'pending' | 'success' | 'expired' | 'denied' | 'error';
   message?: string | null;
+}
+
+export interface CopilotAuthSubscription {
+  deviceCode: string;
+  interval: number;
+  onEvent: (event: CopilotAuthEvent) => void;
+  onOpen?: () => void;
+  onHeartbeat?: () => void;
+  onError?: () => void;
 }
 
 export async function fetchCopilotStatus(): Promise<{
@@ -1482,14 +1622,62 @@ export async function startCopilotAuth(): Promise<CopilotStartResponse> {
   });
 }
 
-export async function pollCopilotAuth(
-  deviceCode: string,
-): Promise<CopilotPollResponse> {
-  return request<CopilotPollResponse>('/api/copilot/poll', {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ deviceCode }),
+export function subscribeCopilotAuth(
+  options: CopilotAuthSubscription,
+): () => void {
+  const deviceCode = options.deviceCode.trim();
+  if (!deviceCode) {
+    throw new Error('deviceCode is required');
+  }
+  if (!Number.isInteger(options.interval) || options.interval <= 0) {
+    throw new Error('interval must be greater than 0');
+  }
+
+  const params = new URLSearchParams({
+    deviceCode,
+    interval: String(options.interval),
   });
+  const source = new EventSource(`/api/copilot/stream?${params.toString()}`);
+  let closed = false;
+
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    source.close();
+  };
+
+  source.onopen = () => {
+    options.onOpen?.();
+  };
+
+  source.addEventListener('copilot_auth', (ev) => {
+    try {
+      const event = JSON.parse(ev.data) as CopilotAuthEvent;
+      options.onEvent(event);
+      if (event.status !== 'pending') {
+        close();
+      }
+    } catch (error) {
+      console.error(
+        'invalid copilot auth payload',
+        error instanceof Error ? error.message : String(error),
+      );
+      options.onError?.();
+      close();
+    }
+  });
+
+  source.addEventListener('heartbeat', () => {
+    options.onHeartbeat?.();
+  });
+
+  source.onerror = () => {
+    if (closed) return;
+    options.onError?.();
+    close();
+  };
+
+  return close;
 }
 
 export async function logoutCopilot(): Promise<void> {
@@ -1561,11 +1749,27 @@ export function subscribeSessionArtifacts(
 
 export function subscribeUiEvents(options: UiEventsSubscription): () => void {
   const params = new URLSearchParams();
+  const topics: UiEventTopic[] = [];
+
+  if (options.onBrowserStatus) topics.push('browser_status');
+  if (options.onConfig) topics.push('config');
+  if (options.onContainerPrepare) topics.push('container_prepare');
+  if (options.onNetworkAccessLogs) topics.push('network_access_logs');
+  if (options.onNotificationMailbox) topics.push('notification_mailbox');
+  if (options.onProfileSessions) topics.push('profile_sessions');
+  if (options.onRemoteAccess) topics.push('remote_access');
+  if (options.onRequestLogs) topics.push('request_logs');
+  if (options.onSessionRuntime) topics.push('session_runtime');
+  if (options.onSessionRuntimes) topics.push('session_runtimes');
+
   if (options.sessionId && options.sessionId.trim()) {
     params.set('sessionId', options.sessionId.trim());
   }
   if (options.profileId && options.profileId.trim()) {
     params.set('profileId', options.profileId.trim());
+  }
+  if (topics.length > 0) {
+    params.set('topics', topics.join(','));
   }
 
   const query = params.toString();
@@ -1575,6 +1779,11 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
     onOpen: options.onOpen,
     onError: options.onError,
     listeners: {
+      browser_status: buildSSEListener<BrowserStatus>(
+        'browser_status',
+        options.onBrowserStatus,
+        options.onError,
+      ),
       config: buildSSEListener<UiConfigEventPayload>(
         'config',
         options.onConfig,
@@ -1615,7 +1824,7 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
         options.onProfileSessions
           ? (data) =>
               options.onProfileSessions!({
-                profileSessions: data.profileSessions,
+                profileSessions: normalizeProfileSessions(data.profileSessions),
               })
           : undefined,
         options.onError,
@@ -1629,7 +1838,7 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
           ? (data) =>
               options.onSessionRuntime!({
                 sessionId: data.sessionId,
-                runtime: data.runtime,
+                runtime: normalizeRuntime(data.runtime),
               })
           : undefined,
         options.onError,
@@ -1640,7 +1849,9 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
         'session_runtimes',
         options.onSessionRuntimes
           ? (data) =>
-              options.onSessionRuntimes!({ sessions: data.sessions ?? [] })
+              options.onSessionRuntimes!({
+                sessions: (data.sessions ?? []).map(normalizeRuntimeSnapshot),
+              })
           : undefined,
         options.onError,
       ),
@@ -1654,6 +1865,7 @@ export function subscribeUiEvents(options: UiEventsSubscription): () => void {
 // ── Browser Live View API ─────────────────────────────────
 
 export interface BrowserStatus {
+  enabled: boolean;
   running: boolean;
   cdpEndpoint: string | null;
   takeoverSessionId: string | null;
@@ -1777,7 +1989,8 @@ export async function fetchProfileSessions(
   const endpoint = query
     ? `/api/profiles/${encodeURIComponent(profileId)}/sessions?${query}`
     : `/api/profiles/${encodeURIComponent(profileId)}/sessions`;
-  return request<ProfileSessions>(endpoint);
+  const data = await request<ProfileSessions>(endpoint);
+  return normalizeProfileSessions(data);
 }
 
 // ── Folder API ───────────────────────────────────────────

@@ -1,5 +1,7 @@
 //! Native terminal-command tool event parsing for streaming UI updates.
 
+use aither_core::llm::ToolResult;
+
 use super::types::{
     ApiTerminalExecution, TERMINAL_TOOL_NAME, TerminalCommandMode, TerminalExecutionStatus,
     TerminalStateSnapshot, ToolEventRecord,
@@ -32,37 +34,36 @@ pub(super) fn parse_terminal_start(arguments: &str) -> (String, Option<TerminalC
 }
 
 /// Preserve terminal tool output as structured JSON when possible.
-fn parse_terminal_end_output_from_result(result: &Result<String, String>) -> Option<String> {
-    match result {
-        Ok(ok_string) => {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ok_string) {
-                return Some(parsed.to_string());
-            }
-            Some(ok_string.clone())
-        }
-        Err(err_string) => Some(err_string.clone()),
+fn parse_terminal_end_output_from_result(result: &ToolResult) -> Option<String> {
+    let Ok(serialized) = result.render_for_model() else {
+        return None;
+    };
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&serialized) {
+        return Some(parsed.to_string());
     }
+    Some(serialized)
 }
 
 /// Determine if a terminal execution failed from a typed tool result.
-fn parse_terminal_failed_from_result(result: &Result<String, String>) -> bool {
-    match result {
-        Err(_) => true,
-        Ok(ok_string) => {
-            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ok_string) else {
-                return false;
-            };
-            let nonzero_exit = parsed
-                .get("exit_code")
-                .and_then(serde_json::Value::as_i64)
-                .is_some_and(|code| code != 0);
-            let failed_status = parsed
-                .get("status")
-                .and_then(|v| v.as_str())
-                .is_some_and(|status| status.eq_ignore_ascii_case("failed"));
-            nonzero_exit || failed_status
-        }
+fn parse_terminal_failed_from_result(result: &ToolResult) -> bool {
+    if result.is_error() {
+        return true;
     }
+    let Ok(serialized) = result.render_for_model() else {
+        return true;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&serialized) else {
+        return false;
+    };
+    let nonzero_exit = parsed
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|code| code != 0);
+    let failed_status = parsed
+        .get("status")
+        .and_then(|v| v.as_str())
+        .is_some_and(|status| status.eq_ignore_ascii_case("failed"));
+    nonzero_exit || failed_status
 }
 
 pub(super) fn update_terminal_snapshot_from_tool_event(

@@ -2,6 +2,7 @@ import type { StateCreator } from 'zustand';
 import * as api from '@/lib/api';
 import { buildModelCatalog } from '@/lib/constants';
 import type { AppState } from './index';
+import { buildUiConfigState } from './shared';
 
 export interface SettingsSlice {
   settings: {
@@ -16,8 +17,7 @@ export interface SettingsSlice {
   memoryContent: string;
 
   updateSettings: (settings: Partial<AppState['settings']>) => void;
-  refreshRuntimeSettings: () => Promise<void>;
-  refreshFullConfig: () => Promise<void>;
+  refreshConfig: () => Promise<void>;
   refreshModelsFromProviders: () => Promise<void>;
   saveFullConfig: (config: api.UiFullConfig) => Promise<void>;
   setLastModel: (model: string) => Promise<void>;
@@ -40,24 +40,9 @@ export const createSettingsSlice: StateCreator<AppState, [], [], SettingsSlice> 
     set((state) => ({ settings: { ...state.settings, ...settings } }));
   },
 
-  refreshRuntimeSettings: async () => {
+  refreshConfig: async () => {
     const config = await api.fetchUiConfig();
-    set((state) => ({
-      settings: {
-        font: config.uiFont,
-        theme: config.uiTheme,
-      },
-      uiConfig: {
-        ...state.uiConfig,
-        sshServers: config.sshServers,
-        maxIterations: config.maxIterations,
-      },
-    }));
-  },
-
-  refreshFullConfig: async () => {
-    const fullConfig = await api.fetchFullConfig();
-    set((state) => ({ uiConfig: { ...state.uiConfig, fullConfig } }));
+    set(buildUiConfigState(config));
   },
 
   refreshModelsFromProviders: async () => {
@@ -67,7 +52,18 @@ export const createSettingsSlice: StateCreator<AppState, [], [], SettingsSlice> 
 
   saveFullConfig: async (fullConfig) => {
     await api.saveFullConfig(fullConfig);
-    set((state) => ({ uiConfig: { ...state.uiConfig, fullConfig } }));
+    set((state) => ({
+      settings: {
+        ...state.settings,
+        font: fullConfig.appearance.font,
+        theme: fullConfig.appearance.theme,
+      },
+      uiConfig: {
+        ...state.uiConfig,
+        maxIterations: fullConfig.maxIterations,
+        fullConfig,
+      },
+    }));
   },
 
   setLastModel: async (model) => {
@@ -84,12 +80,12 @@ export const createSettingsSlice: StateCreator<AppState, [], [], SettingsSlice> 
 
   addSshServer: async (name, target) => {
     await api.addSshServer(name, target);
-    await get().refreshRuntimeSettings();
+    await get().refreshConfig();
   },
 
   removeSshServer: async (name) => {
     await api.removeSshServer(name);
-    await get().refreshRuntimeSettings();
+    await get().refreshConfig();
   },
 
   refreshMemory: async () => {

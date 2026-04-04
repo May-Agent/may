@@ -4,7 +4,7 @@ use aither_agent::tool_request::{
     ToolRequestBroker, ToolRequestQueue, bounded_channel as bounded_tool_request_channel,
     channel as tool_request_channel,
 };
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -95,8 +95,9 @@ impl<K: RegisterKind> Tool for RegisterTool<K> {
     }
 
     type Arguments = RegisterPathArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         let broker = self
             .broker
             .as_ref()
@@ -109,7 +110,7 @@ impl<K: RegisterKind> Tool for RegisterTool<K> {
         let response = broker.request(request).await?;
         let result = response.map_err(anyhow::Error::msg)?;
 
-        ToolOutput::json(&serde_json::json!({
+        ToolResult::json(&serde_json::json!({
             "ok": true,
             "registered": result.registered,
             "approval_required": true

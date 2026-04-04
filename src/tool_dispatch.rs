@@ -8,6 +8,7 @@ use crate::agent::notify_tool::{NotifyArgs, NotifyBroker, NotifyResult};
 use crate::agent::register_tool::{RegisterBroker, RegisterRequest, RegisterResult};
 use crate::agent::task_tool::TaskBroker;
 use crate::ask_user::{AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload, Question};
+use crate::browser_service::{BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus};
 use crate::config::{BrowserConfig, SshServerConfig};
 use crate::network_policy::NetworkPolicyConfig;
 use crate::notification::NotificationManager;
@@ -70,18 +71,23 @@ impl BrowserServiceRuntime {
 
 impl ToolDispatchers {
     pub async fn spawn(config: ToolDispatchConfig) -> Result<Self, ToolDispatchError> {
+        let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
         let notification_manager = Arc::new(
             NotificationManager::new(config.may_dir.as_path(), config.db.clone())
                 .await
                 .map_err(ToolDispatchError::InitializeNotificationManager)?,
         );
-        let notification_service =
-            Arc::new(NotificationService::new(config.db.clone(), notification_manager));
+        let notification_service = Arc::new(NotificationService::new(
+            config.db.clone(),
+            notification_manager,
+            ui_event_bus.clone(),
+        ));
         let task_runtime = Arc::new(
             TaskRuntime::load(config.db.clone(), config.may_dir.clone())
                 .await
                 .map_err(ToolDispatchError::LoadTaskRuntime)?
                 .with_notifier(notification_service.clone())
+                .with_ui_event_bus(ui_event_bus)
                 .with_ssh_servers(config.ssh_servers.clone())
                 .with_network_policy(config.network_policy.clone())
                 .map_err(ToolDispatchError::ConfigureTaskRuntime)?,
@@ -96,7 +102,9 @@ impl ToolDispatchers {
         let (task, task_queue) = crate::agent::task_channel();
         tokio::spawn(async move {
             while let Some(request) = task_queue.next().await {
-                let result = task_runtime.create_task_from_tool_request(request.args.clone()).await;
+                let result = task_runtime
+                    .create_task_from_tool_request(request.args.clone())
+                    .await;
                 let _ = request.respond(result);
             }
         });
@@ -128,7 +136,8 @@ impl ToolDispatchers {
             None
         };
 
-        let (register_skills, register_skills_queue) = crate::agent::register_tool::skills_channel();
+        let (register_skills, register_skills_queue) =
+            crate::agent::register_tool::skills_channel();
         let registration_for_skills = registration.clone();
         tokio::spawn(async move {
             while let Some(request) = register_skills_queue.next().await {
@@ -219,6 +228,7 @@ async fn handle_browser_request(
                         None
                     }
                 }),
+                page: None,
             })
         }
         crate::agent::BrowserArgs::Start => {
@@ -230,6 +240,7 @@ async fn handle_browser_request(
             Ok(BrowserResult {
                 running: true,
                 cdp_endpoint: status.cdp_endpoint,
+                page: None,
             })
         }
         crate::agent::BrowserArgs::Stop => {
@@ -241,6 +252,7 @@ async fn handle_browser_request(
             Ok(BrowserResult {
                 running: false,
                 cdp_endpoint: None,
+                page: None,
             })
         }
         crate::agent::BrowserArgs::CdpEndpoint => {
@@ -252,7 +264,32 @@ async fn handle_browser_request(
             Ok(BrowserResult {
                 running: true,
                 cdp_endpoint: status.cdp_endpoint,
+                page: None,
             })
+        }
+        crate::agent::BrowserArgs::Read { url } => {
+            let request = BrowserServiceRequest::Read { url };
+            let status = ensure_browser_service_started(
+                browser_service.may_dir.as_path(),
+                &browser_service.browser_config,
+            )
+            .await?;
+            let response =
+                query_browser_service(browser_service.socket_path().as_path(), &request).await?;
+            match response {
+                Some(BrowserServiceResponse::ReadOk { payload }) => Ok(BrowserResult {
+                    running: true,
+                    cdp_endpoint: status.cdp_endpoint,
+                    page: Some(payload),
+                }),
+                Some(BrowserServiceResponse::Error { message }) => Err(message),
+                Some(BrowserServiceResponse::Ok { .. }) => {
+                    Err("browser service returned status payload for read request".to_string())
+                }
+                Some(BrowserServiceResponse::Stopped) | None => {
+                    Err("browser service stopped while reading page".to_string())
+                }
+            }
         }
     }
 }
@@ -261,14 +298,22 @@ async fn handle_register_skills_request(
     runtime: &RegistrationRuntime,
     request: RegisterRequest,
 ) -> Result<RegisterResult, String> {
-    handle_register_request(runtime, request, "skill", "skills", |skills_dir, source| async move {
-        let manager = SkillManager::from_skills_dir(skills_dir);
-        let info = manager
-            .register_from_local_path(&source)
-            .await
-            .map_err(|error| path_error_text("failed to register skill from ", &source, &error))?;
-        Ok(vec![info.dir_name])
-    })
+    handle_register_request(
+        runtime,
+        request,
+        "skill",
+        "skills",
+        |skills_dir, source| async move {
+            let manager = SkillManager::from_skills_dir(skills_dir);
+            let info = manager
+                .register_from_local_path(&source)
+                .await
+                .map_err(|error| {
+                    path_error_text("failed to register skill from ", &source, &error)
+                })?;
+            Ok(vec![info.dir_name])
+        },
+    )
     .await
 }
 
@@ -283,9 +328,12 @@ async fn handle_register_subagents_request(
         "subagents",
         |subagents_dir, source| async move {
             let manager = SubagentManager::from_subagents_dir(subagents_dir);
-            let infos = manager.register_from_local_path(&source).await.map_err(|error| {
-                path_error_text("failed to register subagents from ", &source, &error)
-            })?;
+            let infos = manager
+                .register_from_local_path(&source)
+                .await
+                .map_err(|error| {
+                    path_error_text("failed to register subagents from ", &source, &error)
+                })?;
             Ok(infos.into_iter().map(|item| item.file_name).collect())
         },
     )
@@ -304,12 +352,9 @@ where
     Fut: Future<Output = Result<Vec<String>, String>>,
 {
     let source = resolve_registration_source_path(runtime.cwd.as_path(), &request.path).await?;
-    let target_dir = resolve_registration_target_dir(
-        runtime,
-        request.session_id.as_str(),
-        target_dir_name,
-    )
-    .await?;
+    let target_dir =
+        resolve_registration_target_dir(runtime, request.session_id.as_str(), target_dir_name)
+            .await?;
     request_registration_approval(
         runtime,
         request.session_id.as_str(),
@@ -338,7 +383,13 @@ async fn resolve_registration_target_dir(
     let session_paths = store.session_paths(session_id, session.profile_id.as_deref());
     tokio::fs::create_dir_all(session_paths.root())
         .await
-        .map_err(|error| path_error_text("failed to create session root ", session_paths.root(), &error))?;
+        .map_err(|error| {
+            path_error_text(
+                "failed to create session root ",
+                session_paths.root(),
+                &error,
+            )
+        })?;
     Ok(session_paths.home_root().join(target_dir_name))
 }
 
@@ -353,9 +404,9 @@ async fn resolve_registration_source_path(cwd: &Path, raw_path: &str) -> Result<
     } else {
         cwd.join(path)
     };
-    let canonical = tokio::fs::canonicalize(&candidate)
-        .await
-        .map_err(|error| path_error_text("failed to resolve registration path ", &candidate, &error))?;
+    let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
+        path_error_text("failed to resolve registration path ", &candidate, &error)
+    })?;
     let project_root = tokio::fs::canonicalize(cwd)
         .await
         .map_err(|error| path_error_text("failed to resolve project root ", cwd, &error))?;
@@ -377,7 +428,8 @@ async fn request_registration_approval(
     source_label: &str,
     target_dir_name: &str,
 ) -> Result<(), String> {
-    let question = build_registration_approval_message(session_id, source, source_label, target_dir_name);
+    let question =
+        build_registration_approval_message(session_id, source, source_label, target_dir_name);
     let response = runtime
         .ask_user_broker
         .request(AskUserRequestPayload {
@@ -468,6 +520,9 @@ async fn browser_service_status(
         Some(BrowserServiceResponse::Ok { payload }) => Ok(Some(payload)),
         Some(BrowserServiceResponse::Stopped) => Ok(None),
         Some(BrowserServiceResponse::Error { message }) => Err(message),
+        Some(BrowserServiceResponse::ReadOk { .. }) => {
+            Err("browser service returned page payload for status request".to_string())
+        }
         None => Ok(None),
     }
 }
@@ -488,6 +543,9 @@ async fn ensure_browser_service_started(
                 Err("browser service returned a stopped state".to_string())
             }
             BrowserServiceResponse::Error { message } => Err(message),
+            BrowserServiceResponse::ReadOk { .. } => {
+                Err("browser service returned page payload for startup request".to_string())
+            }
         };
     }
 
@@ -501,9 +559,7 @@ async fn ensure_browser_service_started(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    command
-        .spawn()
-        .map_err(|error| error.to_string())?;
+    command.spawn().map_err(|error| error.to_string())?;
 
     let mut last_error = None;
     for _ in 0..50 {
@@ -515,6 +571,10 @@ async fn ensure_browser_service_started(
             Ok(Some(BrowserServiceResponse::Error { message })) => last_error = Some(message),
             Ok(Some(BrowserServiceResponse::Stopped)) => {
                 last_error = Some("browser service stopped before startup completed".to_string());
+            }
+            Ok(Some(BrowserServiceResponse::ReadOk { .. })) => {
+                last_error =
+                    Some("browser service returned page payload for startup request".to_string());
             }
             Ok(None) => {}
             Err(error) => last_error = Some(error),
@@ -532,30 +592,10 @@ async fn stop_browser_service(socket_path: &Path, _port: u16) -> Result<(), Stri
             Ok(())
         }
         Some(BrowserServiceResponse::Error { message }) => Err(message),
+        Some(BrowserServiceResponse::ReadOk { .. }) => {
+            Err("browser service returned page payload for stop request".to_string())
+        }
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "command", rename_all = "kebab-case")]
-enum BrowserServiceRequest {
-    Status,
-    EnsureStarted,
-    Stop,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserServiceStatus {
-    running: bool,
-    cdp_endpoint: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum BrowserServiceResponse {
-    Ok { payload: BrowserServiceStatus },
-    Stopped,
-    Error { message: String },
 }
 
 async fn query_browser_service(

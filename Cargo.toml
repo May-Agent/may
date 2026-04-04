@@ -66,6 +66,7 @@ chrono = "0.4"
 shell-escape = "0.1"
 shell-words = "1.1"
 arc-swap = "1"
+fastrand = "2"
 
 # Web Push notifications
 web-push = "0.11"
@@ -75,6 +76,7 @@ thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
 url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Markdown parsing (incremental/streaming)
 streamdown-parser = "0.1"
@@ -101,6 +103,7 @@ http-body-util = "0.1"
 
 # Browser automation (CDP) and WebRTC live streaming
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
+chromiumoxide_fetcher = "0.9.1"
 webrtc = "0.17"
 openh264 = "0.9"
 
@@ -135,6 +138,8 @@ globset = "0.4"
 notify = "8"
 fs_extra = "1.3"
 sqlparser = "0.58.0"
+walkdir = "2"
+cargo_metadata = "0.21"
 
 # Session retrieval index
 lancedb = { version = "0.23.1", default-features = false }

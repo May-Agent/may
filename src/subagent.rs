@@ -1,6 +1,6 @@
 //! Subagent registration and discovery.
 //!
-//! Subagents are Markdown files with YAML frontmatter, stored in
+//! Subagents are Markdown files with versioned YAML frontmatter, stored in
 //! `~/.may/subagents/`. Registration is explicit and validated before copy.
 
 use std::path::{Path, PathBuf};
@@ -181,7 +181,7 @@ mod tests {
         let source = temp.path().join("worker.md");
         tokio::fs::write(
             &source,
-            "---\nname: worker\ndescription: test worker\n---\n\nYou are a worker.",
+            "---\nversion: 1\nname: worker\ndescription: test worker\n---\n\nYou are a worker.",
         )
         .await
         .expect("write source");
@@ -195,5 +195,24 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "worker");
         assert!(manager.subagents_dir().join("worker.md").exists());
+    }
+
+    #[test]
+    fn bundled_subagent_files_use_current_definition_version() {
+        for path in [
+            "src/bundle/subagents/explore.md",
+            "src/bundle/subagents/plan.md",
+            "src/bundle/subagents/research.md",
+            "skills/slide/subagents/art_direction.md",
+            "skills/slide/subagents/slide_creator.md",
+        ] {
+            let content = std::fs::read_to_string(path).expect("read subagent file");
+            let definition = SubagentDefinition::parse(&content)
+                .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"));
+            assert!(
+                !definition.id.trim().is_empty(),
+                "subagent id must not be empty for {path}"
+            );
+        }
     }
 }

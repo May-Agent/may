@@ -450,7 +450,10 @@ pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'stat
         ProviderType::Together => &["TOGETHER_API_KEY"][..],
         ProviderType::Mistral => &["MISTRAL_API_KEY"][..],
         ProviderType::XAI => &["XAI_API_KEY", "GROK_API_KEY"][..],
-        ProviderType::Copilot | ProviderType::Ollama | ProviderType::Custom => return None,
+        ProviderType::Copilot
+        | ProviderType::Ollama
+        | ProviderType::LMStudio
+        | ProviderType::Custom => return None,
     };
 
     for var_name in env_vars {

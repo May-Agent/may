@@ -1,6 +1,7 @@
 //! Scheduled task REST API.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::mem;
 use std::sync::Arc;
 
@@ -238,10 +239,42 @@ pub(super) async fn list_tasks(
     ))
 }
 
+async fn spawn_on_tokio<T>(
+    state: &Arc<UiServerState>,
+    operation: &'static str,
+    future: impl Future<Output = SkyResult<T>> + Send + 'static,
+) -> SkyResult<T>
+where
+    T: Send + 'static,
+{
+    state
+        .tokio_handle
+        .clone()
+        .spawn(future)
+        .await
+        .map_err(|_| {
+            internal_error(format!(
+                "{operation} task panicked before producing a response"
+            ))
+        })?
+}
+
 pub(super) async fn create_task(
     Json(req): Json<CreateTaskRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ScheduledTaskResponse>> {
+    let response = spawn_on_tokio(&state, "task create", {
+        let state = state.clone();
+        async move { run_create_task(state, req).await }
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn run_create_task(
+    state: Arc<UiServerState>,
+    req: CreateTaskRequest,
+) -> SkyResult<ScheduledTaskResponse> {
     let id = uuid::Uuid::new_v4().to_string();
     let trigger = normalize_create_trigger(&req)?;
     let normalized_script_path = req
@@ -287,9 +320,7 @@ pub(super) async fn create_task(
         .reload_active_tasks()
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
-
-    Ok(Json(ScheduledTaskResponse::from_model(model)))
+    Ok(ScheduledTaskResponse::from_model(model))
 }
 
 pub(super) async fn get_task(
@@ -314,7 +345,19 @@ pub(super) async fn update_task(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ScheduledTaskResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let response = spawn_on_tokio(&state, "task update", {
+        let state = state.clone();
+        async move { run_update_task(state, id, req).await }
+    })
+    .await?;
+    Ok(Json(response))
+}
 
+async fn run_update_task(
+    state: Arc<UiServerState>,
+    id: String,
+    req: UpdateTaskRequest,
+) -> SkyResult<ScheduledTaskResponse> {
     let db = state.db();
     let current = db
         .get_scheduled_task(&id)
@@ -408,15 +451,13 @@ pub(super) async fn update_task(
         .reload_active_tasks()
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
-
     let model = db
         .get_scheduled_task(&id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Task not found"))?;
 
-    Ok(Json(ScheduledTaskResponse::from_model(model)))
+    Ok(ScheduledTaskResponse::from_model(model))
 }
 
 pub(super) async fn delete_task(
@@ -424,7 +465,15 @@ pub(super) async fn delete_task(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
+    spawn_on_tokio(&state, "task delete", {
+        let state = state.clone();
+        async move { run_delete_task(state, id).await }
+    })
+    .await?;
+    Ok(Json(super::types::API_OK))
+}
 
+async fn run_delete_task(state: Arc<UiServerState>, id: String) -> SkyResult<()> {
     state
         .db()
         .delete_scheduled_task(&id)
@@ -435,8 +484,7 @@ pub(super) async fn delete_task(
         .reload_active_tasks()
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
-    Ok(Json(super::types::API_OK))
+    Ok(())
 }
 
 pub(super) async fn approve_task(
@@ -444,7 +492,15 @@ pub(super) async fn approve_task(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
+    spawn_on_tokio(&state, "task approve", {
+        let state = state.clone();
+        async move { run_approve_task(state, id).await }
+    })
+    .await?;
+    Ok(Json(super::types::API_OK))
+}
 
+async fn run_approve_task(state: Arc<UiServerState>, id: String) -> SkyResult<()> {
     state
         .db()
         .approve_scheduled_task(&id)
@@ -455,8 +511,7 @@ pub(super) async fn approve_task(
         .reload_active_tasks()
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
-    Ok(Json(super::types::API_OK))
+    Ok(())
 }
 
 pub(super) async fn run_task(
@@ -464,7 +519,18 @@ pub(super) async fn run_task(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<super::types::TaskTriggerResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let response = spawn_on_tokio(&state, "task run", {
+        let state = state.clone();
+        async move { run_manual_task(state, id).await }
+    })
+    .await?;
+    Ok(Json(response))
+}
 
+async fn run_manual_task(
+    state: Arc<UiServerState>,
+    id: String,
+) -> SkyResult<super::types::TaskTriggerResponse> {
     let task = state
         .db()
         .get_scheduled_task(&id)
@@ -478,11 +544,11 @@ pub(super) async fn run_task(
         .await
         .map_err(internal_error)?;
 
-    Ok(Json(super::types::TaskTriggerResponse {
+    Ok(super::types::TaskTriggerResponse {
         ok: true,
         status: super::types::TaskTriggerStatus::Triggered,
         triggered: 1,
-    }))
+    })
 }
 
 pub(super) async fn invoke_webhook_task(
@@ -491,18 +557,31 @@ pub(super) async fn invoke_webhook_task(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<super::types::TaskTriggerResponse>> {
     let token = params.get("token").map_err(bad_request_error)?.to_string();
+    let response = spawn_on_tokio(&state, "task webhook", {
+        let state = state.clone();
+        async move { run_invoke_webhook_task(state, token, webhook_request.0).await }
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn run_invoke_webhook_task(
+    state: Arc<UiServerState>,
+    token: String,
+    webhook_request: TaskWebhookRequest,
+) -> SkyResult<super::types::TaskTriggerResponse> {
     let triggered = state
         .task_runtime
-        .dispatch_webhook(token, webhook_request.0)
+        .dispatch_webhook(token, webhook_request)
         .await
         .map_err(internal_error)?;
     if triggered == 0 {
         return Err(bad_request_error("Webhook task not found"));
     }
 
-    Ok(Json(super::types::TaskTriggerResponse {
+    Ok(super::types::TaskTriggerResponse {
         ok: true,
         status: super::types::TaskTriggerStatus::Triggered,
         triggered,
-    }))
+    })
 }

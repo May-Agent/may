@@ -18,7 +18,6 @@ import {
   saveSessionTasks,
   stopSessionRun,
   streamChat,
-  subscribeUiEvents,
   subscribeSessionArtifacts,
   type AskUserAnswer,
   type AskUserRequest,
@@ -258,12 +257,11 @@ export function ChatInterface({
           planState: nextPlanState,
         });
         setSessionPlanState(currentSessionId, saved.planState);
-        void refreshProfileSessions();
       } catch (error) {
         setUiError(error instanceof Error ? error.message : String(error));
       }
     },
-    [currentSessionId, refreshProfileSessions, setSessionPlanState],
+    [currentSessionId, setSessionPlanState],
   );
   const shouldShowWelcome = isNewChat || messages.length === 0;
   const chatSurfaceState =
@@ -711,19 +709,7 @@ export function ChatInterface({
   useEffect(() => {
     if (!currentSessionId) return;
     useRuntimeStore.getState().ensureSession(currentSessionId);
-    void (async () => {
-      try {
-        const runtime = await fetchSessionRuntime(currentSessionId);
-        applyRuntime(currentSessionId, runtime);
-      } catch (error) {
-        setUiError(
-          `Failed to fetch runtime state: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    })();
-  }, [applyRuntime, currentSessionId]);
+  }, [currentSessionId]);
 
   useEffect(() => {
     if (!pendingAskUserRequest) {
@@ -839,31 +825,7 @@ export function ChatInterface({
       setPendingAskUser(null);
       return;
     }
-
-    const banner = createDisconnectBanner(
-      setUiError,
-      "Events stream disconnected; reconnecting...",
-    );
-
-    const unsubscribe = subscribeUiEvents({
-      sessionId: currentSessionId,
-      onOpen: () => banner.clear(),
-      onSessionRuntime: ({ sessionId, runtime }) => {
-        banner.clear();
-        if (sessionId !== currentSessionId) {
-          return;
-        }
-        applyRuntime(sessionId, runtime);
-      },
-      onError: () => banner.schedule(),
-      onHeartbeat: () => banner.clear(),
-    });
-
-    return () => {
-      banner.cleanup();
-      unsubscribe();
-    };
-  }, [applyRuntime, currentSessionId]);
+  }, [currentSessionId]);
 
   useEffect(() => {
     userScrolledUpRef.current = false;
@@ -1506,11 +1468,6 @@ export function ChatInterface({
             script = String(script);
           }
 
-          const browserPattern = /\b(pw|playwright(?:-cli)?)\b/i;
-          if (name.includes("playwright") || browserPattern.test(script)) {
-            setIsBrowserOpen(true);
-          }
-
           if (name === "terminal") {
             closeActiveThinkingSegment();
             const startedAt = Date.now();
@@ -1828,11 +1785,6 @@ export function ChatInterface({
           }`,
         );
       });
-      if (completedNormally) {
-        void (async () => {
-          await refreshProfileSessions();
-        })();
-      }
     }
   };
 

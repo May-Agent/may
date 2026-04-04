@@ -1,11 +1,12 @@
 //! Container runtime detection and management for Docker-compatible engines.
 //!
 //! Provides container-based sandbox isolation as an alternative to the native
-//! leash sandbox.
+//! heel sandbox.
 
+pub mod browser;
+pub mod heel;
 pub mod image;
 pub mod lifecycle;
-pub mod playwright;
 pub mod profile;
 
 use std::path::{Path, PathBuf};

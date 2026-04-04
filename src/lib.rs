@@ -4,6 +4,7 @@
 //! with session management, persistent chat history, and sandboxed execution.
 
 pub mod agent;
+pub mod browser_service;
 pub mod bundle;
 pub mod config;
 pub mod container;
@@ -11,6 +12,7 @@ pub mod copilot;
 pub mod db;
 pub mod embedding_provider;
 mod fs_utils;
+mod heel_binary;
 mod live_response;
 pub mod location;
 pub mod mcp;
@@ -30,9 +32,10 @@ pub mod task_trigger;
 pub mod tasks;
 pub mod terminal_commands;
 pub mod terminal_permission_handler;
-pub mod tool_dispatch;
 pub mod todo_parser;
+pub mod tool_dispatch;
 pub mod tui;
+pub mod ui_event_bus;
 pub mod ui_server;
 pub mod workspace;
 pub mod xml_fragment;
@@ -46,6 +49,7 @@ pub use agent::{
 };
 pub use config::MayConfig;
 pub use db::ChatDb;
+pub use heel_binary::configure_heel_binary;
 pub use mcp::{MayMcpServerConfig, McpConfig, McpManager, McpServerInfo};
 pub use profile::{HomeEnvironment, PinnedItem, ProfileEnvironment, ProfileInfo, ProfileSessions};
 pub use session::{

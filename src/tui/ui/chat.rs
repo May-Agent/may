@@ -1281,7 +1281,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
 
             let mode_prefix = match mode {
                 TerminalMode::Unsafe => "[unsafe] ",
-                TerminalMode::Network => "[network] ",
+                TerminalMode::Network => "[default] ",
                 TerminalMode::Sandboxed => "",
             };
 
@@ -1352,7 +1352,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         ToolDisplay::Terminal { command, mode, .. } => {
             let mode_prefix = match mode {
                 TerminalMode::Unsafe => "[unsafe] ",
-                TerminalMode::Network => "[network] ",
+                TerminalMode::Network => "[default] ",
                 TerminalMode::Sandboxed => "",
             };
             format!("{mode_prefix}$ {command}")

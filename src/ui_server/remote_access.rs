@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::RemoteAccessConfig;
 use crate::db::ChatDb;
+use crate::ui_event_bus::UiEventBus;
 
 use super::error::{bad_request_error, internal_error};
 use super::state::UiServerState;
@@ -75,14 +76,10 @@ impl std::fmt::Debug for RemoteAccessManager {
 }
 
 impl RemoteAccessManager {
-    pub(crate) fn new(ui_events_notify: Arc<tokio::sync::Notify>) -> Self {
+    pub(crate) fn new(ui_event_bus: UiEventBus) -> Self {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (status_tx, status_rx) = watch::channel(RemoteAccessRuntime::default().status);
-        tokio::spawn(run_remote_access_actor(
-            command_rx,
-            status_tx,
-            ui_events_notify,
-        ));
+        tokio::spawn(run_remote_access_actor(command_rx, status_tx, ui_event_bus));
         Self {
             command_tx,
             status_rx,
@@ -188,7 +185,7 @@ async fn has_local_profile(db: &ChatDb) -> Result<bool, crate::db::ChatDbError> 
 async fn run_remote_access_actor(
     mut command_rx: mpsc::Receiver<RemoteAccessCommand>,
     status_tx: watch::Sender<RemoteAccessStatusResponse>,
-    ui_events_notify: Arc<tokio::sync::Notify>,
+    ui_event_bus: UiEventBus,
 ) {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut runtime = RemoteAccessRuntime::default();
@@ -205,7 +202,7 @@ async fn run_remote_access_actor(
                             &mut child,
                             &event_tx,
                             &status_tx,
-                            &ui_events_notify,
+                            &ui_event_bus,
                             config,
                             has_local_profile,
                         ).await;
@@ -216,7 +213,7 @@ async fn run_remote_access_actor(
                             &mut runtime,
                             &mut child,
                             &status_tx,
-                            &ui_events_notify,
+                            &ui_event_bus,
                         ).await;
                         let _ = response.send(result);
                     }
@@ -230,7 +227,7 @@ async fn run_remote_access_actor(
                 if line.to_ascii_lowercase().contains("error") {
                     runtime.status.last_error = Some(line);
                 }
-                publish_remote_access_status(&runtime.status, &status_tx, &ui_events_notify);
+                publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
             }
             _ = tick.tick() => {
                 if let Some(process) = child.as_mut() {
@@ -253,7 +250,7 @@ async fn run_remote_access_actor(
                                     code.to_string().as_str(),
                                 )
                             });
-                            publish_remote_access_status(&runtime.status, &status_tx, &ui_events_notify);
+                            publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -261,7 +258,7 @@ async fn run_remote_access_actor(
                             child = None;
                             runtime.status.state = RemoteAccessState::Error;
                             runtime.status.last_error = Some(error.to_string());
-                            publish_remote_access_status(&runtime.status, &status_tx, &ui_events_notify);
+                            publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
                         }
                     }
                 }
@@ -276,7 +273,7 @@ async fn sync_remote_access_runtime(
     child: &mut Option<tokio::process::Child>,
     event_tx: &mpsc::UnboundedSender<RemoteAccessEvent>,
     status_tx: &watch::Sender<RemoteAccessStatusResponse>,
-    ui_events_notify: &Arc<tokio::sync::Notify>,
+    ui_event_bus: &UiEventBus,
     config: RemoteAccessConfig,
     has_local_profile: bool,
 ) -> Result<(), String> {
@@ -284,11 +281,11 @@ async fn sync_remote_access_runtime(
     runtime.status.public_url = config.public_url.clone();
 
     if !config.enabled {
-        stop_remote_access_runtime(runtime, child, status_tx, ui_events_notify).await?;
+        stop_remote_access_runtime(runtime, child, status_tx, ui_event_bus).await?;
         runtime.status.enabled = false;
         runtime.status.state = RemoteAccessState::Disabled;
         runtime.status.last_error = None;
-        publish_remote_access_status(&runtime.status, status_tx, ui_events_notify);
+        publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
         return Ok(());
     }
 
@@ -301,16 +298,16 @@ async fn sync_remote_access_runtime(
     {
         runtime.status.state = RemoteAccessState::Running;
         runtime.status.last_error = None;
-        publish_remote_access_status(&runtime.status, status_tx, ui_events_notify);
+        publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
         return Ok(());
     }
 
-    stop_remote_access_runtime(runtime, child, status_tx, ui_events_notify).await?;
+    stop_remote_access_runtime(runtime, child, status_tx, ui_event_bus).await?;
     runtime.status.enabled = true;
     runtime.status.public_url = Some(launch_spec.public_url.clone());
     runtime.status.state = RemoteAccessState::Starting;
     runtime.status.last_error = None;
-    publish_remote_access_status(&runtime.status, status_tx, ui_events_notify);
+    publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
 
     let mut process = tokio::process::Command::new(launch_spec.cloudflared_binary.as_str())
         .arg("tunnel")
@@ -340,7 +337,7 @@ async fn sync_remote_access_runtime(
     runtime.status.last_error = None;
     runtime.launch_spec = Some(launch_spec);
     *child = Some(process);
-    publish_remote_access_status(&runtime.status, status_tx, ui_events_notify);
+    publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
     Ok(())
 }
 
@@ -348,7 +345,7 @@ async fn stop_remote_access_runtime(
     runtime: &mut RemoteAccessRuntime,
     child: &mut Option<tokio::process::Child>,
     status_tx: &watch::Sender<RemoteAccessStatusResponse>,
-    ui_events_notify: &Arc<tokio::sync::Notify>,
+    ui_event_bus: &UiEventBus,
 ) -> Result<(), String> {
     if let Some(mut process) = child.take() {
         if let Err(error) = process.start_kill() {
@@ -365,7 +362,7 @@ async fn stop_remote_access_runtime(
     } else {
         RemoteAccessState::Disabled
     };
-    publish_remote_access_status(&runtime.status, status_tx, ui_events_notify);
+    publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
     Ok(())
 }
 
@@ -455,10 +452,10 @@ fn prefixed_text(prefix: &str, suffix: &str) -> String {
 fn publish_remote_access_status(
     status: &RemoteAccessStatusResponse,
     status_tx: &watch::Sender<RemoteAccessStatusResponse>,
-    ui_events_notify: &Arc<tokio::sync::Notify>,
+    ui_event_bus: &UiEventBus,
 ) {
     status_tx.send_replace(status.clone());
-    ui_events_notify.notify_waiters();
+    ui_event_bus.publish(crate::ui_event_bus::UiEventTopics::REMOTE_ACCESS);
 }
 
 #[cfg(test)]

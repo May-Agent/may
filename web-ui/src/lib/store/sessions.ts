@@ -5,6 +5,7 @@ import { buildModelCatalog, type Model } from '@/lib/constants';
 import { useRuntimeStore } from '@/lib/runtimeStore';
 import type { AppState } from './index';
 import {
+  buildUiConfigState,
   sortSessions,
   backendUnavailableReasonFromError,
   errorMessage,
@@ -50,13 +51,16 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
     if (get().loaded) return;
 
     try {
-      const [sessions, modelPayload, uiConfig, fullConfig, profiles] = await Promise.all([
-        api.fetchSessions(),
-        api.fetchModels(),
-        api.fetchUiConfig(),
-        api.fetchFullConfig(),
-        api.fetchProfiles(),
-      ]);
+      const bootstrap = await api.fetchBootstrap();
+      const {
+        sessions,
+        profiles,
+        defaultProfileId,
+        config,
+        defaultProfileSessions,
+        defaultProfileSessionsError,
+        defaultProfileSkills,
+      } = bootstrap;
 
       const sorted = sortSessions(sessions);
       useRuntimeStore.getState().applyRuntimes(
@@ -65,32 +69,48 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
           runtime: session.runtime,
         })),
       );
-      const defaultProfile = profiles[0] ?? null;
+      const defaultProfile =
+        profiles.find((profile) => profile.id === defaultProfileId)
+        ?? profiles[0]
+        ?? null;
+      const isDefaultContainerProfile =
+        defaultProfile != null
+          && isContainerProfile(defaultProfile.id, profiles);
+      const profileAccessBlockedReason =
+        isDefaultContainerProfile
+          ? (defaultProfileSessionsError?.message ?? null)
+          : null;
+      const profileAccessBlockedCode =
+        isDefaultContainerProfile
+          ? (defaultProfileSessionsError?.code ?? null)
+          : null;
+      const backendUnavailableReason =
+        !isDefaultContainerProfile && defaultProfileSessionsError
+          ? defaultProfileSessionsError.message
+          : null;
       set({
         sessions: sorted,
-        models: buildModelCatalog(modelPayload.models, modelPayload.details),
-        modelsLoaded: true,
-        settings: {
-          font: uiConfig.uiFont,
-          theme: uiConfig.uiTheme,
-        },
-        uiConfig: {
-          sshServers: uiConfig.sshServers,
-          maxIterations: uiConfig.maxIterations,
-          fullConfig,
-        },
+        ...buildUiConfigState(config),
         profiles,
         currentProfileId: defaultProfile?.id ?? null,
-        profileSessionsLoading: defaultProfile != null,
-        backendUnavailableReason: null,
+        profileSessions: defaultProfileSessions ?? null,
+        profileSessionsLoading: false,
+        profileAccessBlockedReason,
+        profileAccessBlockedCode,
+        backendUnavailableReason,
+        skills: defaultProfileSkills,
         loaded: true,
         currentSessionId: null,
       });
 
-      if (defaultProfile) {
-        void get().refreshSkills();
-        await get().refreshProfileSessions();
-      }
+      void api.fetchModels().then((modelPayload) => {
+        set({
+          models: buildModelCatalog(modelPayload.models, modelPayload.details),
+          modelsLoaded: true,
+        });
+      }).catch((error) => {
+        console.error('failed to load models during app bootstrap', error);
+      });
     } catch (error) {
       set({
         backendUnavailableReason:
@@ -119,7 +139,6 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
       sessions: sortSessions([session, ...state.sessions]),
       currentSessionId: session.id,
     }));
-    void get().refreshProfileSessions();
     return session.id;
   },
 
@@ -189,7 +208,6 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
           : state.currentSessionId;
       return { sessions, currentSessionId: nextId };
     });
-    void get().refreshProfileSessions();
   },
 
   updateSessionTitle: async (sessionId, title) => {
@@ -199,7 +217,6 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
         s.id === sessionId ? { ...s, title: updated.title } : s,
       ),
     }));
-    void get().refreshProfileSessions();
   },
 
   updateSessionModel: async (sessionId, model) => {
@@ -287,6 +304,5 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
       sessions: sorted,
       currentSessionId: sorted[0]?.id ?? null,
     });
-    void get().refreshProfileSessions();
   },
 });

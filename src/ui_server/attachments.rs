@@ -10,7 +10,7 @@ use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 use crate::agent::generate_session_title;
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::{load_session_paths, parse_safe_relative_path, truncate_preview_with_limit};
+use super::helpers::load_session_paths;
 use super::state::UiServerState;
 use super::types::{ApiAttachment, ChatRequest};
 
@@ -50,48 +50,6 @@ struct UnsupportedModalityAlertXml {
     alert_type: String,
     message: String,
     offloaded_attachments: AttachmentsXml,
-}
-
-#[derive(Serialize)]
-struct SessionMentionXml {
-    #[serde(rename = "@id")]
-    id: String,
-    #[serde(rename = "@title")]
-    title: String,
-    #[serde(rename = "@model")]
-    model: String,
-    #[serde(rename = "recent_user_message", default)]
-    recent_user_messages: Vec<TextXmlBlockOwned>,
-}
-
-#[derive(Serialize)]
-struct SessionMentionsXml {
-    #[serde(rename = "session")]
-    sessions: Vec<SessionMentionXml>,
-}
-
-#[derive(Serialize)]
-struct TextXmlBlockOwned {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-#[derive(Serialize)]
-struct FileMentionXml {
-    #[serde(rename = "@path")]
-    path: String,
-    #[serde(rename = "@name")]
-    name: String,
-    #[serde(rename = "@content_type", skip_serializing_if = "Option::is_none")]
-    content_type: Option<String>,
-    #[serde(rename = "preview", skip_serializing_if = "Option::is_none")]
-    preview: Option<TextXmlBlockOwned>,
-}
-
-#[derive(Serialize)]
-struct FileMentionsXml {
-    #[serde(rename = "file")]
-    files: Vec<FileMentionXml>,
 }
 
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> SkyResult<String> {
@@ -237,26 +195,6 @@ pub(super) async fn build_prompt_and_attachments(
         )?);
     }
 
-    if let Some(context_xml) = req
-        .hidden_context_xml
-        .as_deref()
-        .map(str::trim)
-        .filter(|xml| !xml.is_empty())
-    {
-        prompt.push_str("\n\n");
-        prompt.push_str(context_xml);
-    }
-
-    if let Some(session_mentions_xml) = build_session_mentions_xml(state, req).await? {
-        prompt.push_str("\n\n");
-        prompt.push_str(&session_mentions_xml);
-    }
-
-    if let Some(file_mentions_xml) = build_file_mentions_xml(state, req).await? {
-        prompt.push_str("\n\n");
-        prompt.push_str(&file_mentions_xml);
-    }
-
     Ok((prompt, attachments))
 }
 
@@ -348,150 +286,6 @@ fn build_offloaded_attachment_xml(
         required_modality: Some(modality.label().to_string()),
         reason: Some(["model:", model_id, " lacks ", modality.label()].concat()),
     }
-}
-
-// ── Session mentions ─────────────────────────────────────────
-
-async fn build_session_mentions_xml(
-    state: &UiServerState,
-    req: &ChatRequest,
-) -> SkyResult<Option<String>> {
-    let mention_ids = extract_session_mention_ids(&req.content);
-    if mention_ids.is_empty() {
-        return Ok(None);
-    }
-
-    let db = state.db();
-
-    let mut entries = Vec::new();
-    for session_id in mention_ids {
-        if let Some(session) = db.get_session(&session_id).await.map_err(internal_error)? {
-            let title = session.title.unwrap_or_else(|| "Untitled".to_string());
-            let model = session.model.unwrap_or_else(|| "unknown".to_string());
-            let recent_user_messages = db
-                .get_messages(&session_id)
-                .await
-                .map_err(internal_error)?
-                .into_iter()
-                .rev()
-                .filter(|message| message.role == "user")
-                .take(4)
-                .map(|message| TextXmlBlockOwned {
-                    content: truncate_preview_with_limit(&message.content, 160),
-                })
-                .collect::<Vec<_>>();
-            entries.push(SessionMentionXml {
-                id: session.id,
-                title,
-                model,
-                recent_user_messages,
-            });
-        }
-    }
-
-    if entries.is_empty() {
-        return Ok(None);
-    }
-
-    serialize_xml(
-        "session_mentions",
-        &SessionMentionsXml { sessions: entries },
-    )
-    .map(Some)
-}
-
-fn extract_session_mention_ids(content: &str) -> Vec<String> {
-    static MENTION_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"@session[:/]([A-Za-z0-9][A-Za-z0-9_-]{5,127})")
-            .expect("session mention regex must be valid")
-    });
-    let mention_re = &*MENTION_RE;
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for captures in mention_re.captures_iter(content) {
-        if let Some(m) = captures.get(1) {
-            let value = m.as_str().to_string();
-            if seen.insert(value.clone()) {
-                out.push(value);
-            }
-        }
-    }
-    out
-}
-
-async fn build_file_mentions_xml(
-    state: &UiServerState,
-    req: &ChatRequest,
-) -> SkyResult<Option<String>> {
-    let relative_paths = extract_file_mention_paths(&req.content);
-    if relative_paths.is_empty() {
-        return Ok(None);
-    }
-
-    let files_dir = load_session_paths(state, req.session_id.as_str())
-        .await?
-        .files_dir();
-    let mut files = Vec::new();
-    for relative_path in relative_paths {
-        let validated = parse_relative_file_mention(relative_path.as_str())?;
-        let full_path = files_dir.join(&validated);
-        let metadata = match async_fs::metadata(&full_path).await {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-
-        let content_type = mime_guess::from_path(&full_path)
-            .first_raw()
-            .map(ToOwned::to_owned);
-        let preview = match async_fs::read_to_string(&full_path).await {
-            Ok(content) => Some(TextXmlBlockOwned {
-                content: truncate_preview_with_limit(content.as_str(), 400),
-            }),
-            Err(_) => None,
-        };
-        let name = validated
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or(validated.as_os_str().to_str().unwrap_or("file"))
-            .to_string();
-        files.push(FileMentionXml {
-            path: validated.to_string_lossy().replace('\\', "/"),
-            name,
-            content_type,
-            preview,
-        });
-    }
-
-    if files.is_empty() {
-        return Ok(None);
-    }
-
-    serialize_xml("file_mentions", &FileMentionsXml { files }).map(Some)
-}
-
-fn extract_file_mention_paths(content: &str) -> Vec<String> {
-    static MENTION_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"@file[:/]([^\s]+)").expect("file mention regex must be valid")
-    });
-    let mention_re = &*MENTION_RE;
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for captures in mention_re.captures_iter(content) {
-        if let Some(matched) = captures.get(1) {
-            let value = matched.as_str().to_string();
-            if seen.insert(value.clone()) {
-                out.push(value);
-            }
-        }
-    }
-    out
-}
-
-fn parse_relative_file_mention(raw: &str) -> SkyResult<PathBuf> {
-    parse_safe_relative_path(raw, "file mention path")
 }
 
 // ── Upload helpers ───────────────────────────────────────────
@@ -642,38 +436,5 @@ fn sanitize_upload_stem(raw: &str) -> String {
         "upload".to_string()
     } else {
         cleaned
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{extract_file_mention_paths, parse_relative_file_mention};
-
-    #[test]
-    fn extract_file_mentions_deduplicates_paths() {
-        let mentions = extract_file_mention_paths(
-            "check @file:notes/today.md and @file/notes/today.md plus @file:notes/log.txt",
-        );
-        assert_eq!(
-            mentions,
-            vec!["notes/today.md".to_string(), "notes/log.txt".to_string(),]
-        );
-    }
-
-    #[test]
-    fn parse_relative_file_mention_rejects_parent_traversal() {
-        let error = parse_relative_file_mention("../secrets.txt")
-            .expect_err("parent traversal must be rejected");
-        assert!(
-            error.to_string().contains("path traversal is not allowed"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn parse_relative_file_mention_accepts_nested_relative_paths() {
-        let path = parse_relative_file_mention("docs/guide.md")
-            .expect("nested relative file mention must be accepted");
-        assert_eq!(path, std::path::PathBuf::from("docs/guide.md"));
     }
 }

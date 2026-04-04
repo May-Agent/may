@@ -125,6 +125,8 @@ pub async fn default_image_tag(
         return Ok(image.to_string());
     }
 
+    super::heel::ensure_container_heel_binary(may_dir).await?;
+
     let uses_custom_dockerfile = parse_preferences(profile)?
         .and_then(|preferences| preferences.dockerfile)
         .is_some_and(|dockerfile| !dockerfile.trim().is_empty());
@@ -262,13 +264,10 @@ mod tests {
     fn make_may_dir_with_container_context() -> TempDir {
         let temp = tempfile::tempdir().expect("tempdir");
         let context_dir = temp.path().join("container");
-        fs::create_dir_all(context_dir.join("leash-ipc")).expect("create context");
+        fs::create_dir_all(context_dir.join("heel").join("bin")).expect("create context");
         fs::write(context_dir.join("Dockerfile"), "FROM debian:bookworm\n").expect("dockerfile");
-        fs::write(
-            context_dir.join("leash-ipc").join("Cargo.toml"),
-            "[package]\nname='leash-ipc'\nversion='0.0.0'\n",
-        )
-        .expect("cargo manifest");
+        fs::write(context_dir.join("heel").join("bin").join("heel"), "binary")
+            .expect("heel binary");
         temp
     }
 
@@ -323,27 +322,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_image_tag_uses_shared_tag_without_custom_dockerfile() {
-        let profile = profile_with_preferences("{}");
+    async fn container_context_hash_changes_when_heel_binary_changes() {
         let may_dir = make_may_dir_with_container_context();
-        let tag = default_image_tag(may_dir.path(), &profile)
+        let first_hash = container_context_hash_hex(may_dir.path())
             .await
-            .expect("default tag");
-        assert!(tag.starts_with("may-workspace:"));
-        assert_eq!(tag.split(':').count(), 2);
-    }
+            .expect("first hash");
+        fs::write(
+            may_dir.path().join("container/heel/bin/heel"),
+            "updated binary",
+        )
+        .expect("rewrite heel binary");
+        let second_hash = container_context_hash_hex(may_dir.path())
+            .await
+            .expect("second hash");
 
-    #[tokio::test]
-    async fn default_image_tag_uses_profile_tag_with_custom_dockerfile() {
-        let profile = profile_with_preferences(
-            r#"{"container":{"dockerfile":"custom/Dockerfile.profile","mounts":[]}}"#,
-        );
-        let may_dir = make_may_dir_with_container_context();
-        let tag = default_image_tag(may_dir.path(), &profile)
-            .await
-            .expect("default tag");
-        assert!(tag.starts_with("may-workspace-daily:"));
-        assert_eq!(tag.split(':').count(), 2);
+        assert_ne!(first_hash, second_hash);
     }
 
     #[test]

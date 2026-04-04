@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::agent::generate_session_title;
 use crate::session::SessionId;
+use crate::ui_event_bus::UiEventTopics;
 
 use super::helpers::truncate_preview;
 use super::state::{TitleGenerationTask, UiServerState};
@@ -114,7 +115,7 @@ async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
         );
         return;
     }
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     tracing::debug!(
         session_id = %session_id,
         title = %generated_title,

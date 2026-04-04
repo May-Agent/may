@@ -36,12 +36,14 @@ use crate::task_trigger::{
     PersistedTaskTrigger, TaskInvocation, TaskTriggerResponse, TaskWebhookRequest, TimeTriggerType,
     normalize_event_name,
 };
+use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 
 /// Shared task execution facility used by the scheduler, REST API, and agent tools.
 #[derive(Clone)]
 pub struct TaskRuntime {
     db: ChatDb,
     notifier: Option<Arc<NotificationService>>,
+    ui_event_bus: Option<UiEventBus>,
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
     ssh_servers: Arc<ArcSwap<Vec<SshServerConfig>>>,
@@ -365,6 +367,7 @@ impl TaskExecutionEnvelope {
 #[derive(Debug, Clone)]
 struct SchedulerPermissionHandler {
     db: ChatDb,
+    ui_event_bus: Option<UiEventBus>,
     profile_id: String,
     source: NetworkAccessSource,
     allow_network: bool,
@@ -377,21 +380,12 @@ impl PermissionHandler for SchedulerPermissionHandler {
     }
 
     async fn check_domain(&self, domain: &str, port: u16) -> bool {
-        let allowed = self.allow_network
-            && self
-                .network_policy
-                .as_ref()
-                .is_none_or(|policy| policy.allows_domain(domain));
         let reason = if !self.allow_network {
             Some("needs_network_disabled")
-        } else if let Some(policy) = &self.network_policy {
-            if policy.allows_domain(domain) {
-                None
-            } else {
-                Some(policy.mode().as_str())
-            }
         } else {
-            None
+            self.network_policy
+                .as_ref()
+                .map(|policy| policy.mode().as_str())
         };
         let _ = self
             .db
@@ -402,11 +396,14 @@ impl PermissionHandler for SchedulerPermissionHandler {
                 mode: NetworkAccessMode::Network,
                 domain,
                 port,
-                allowed,
+                allowed: true,
                 reason,
             })
             .await;
-        allowed
+        if let Some(ui_event_bus) = self.ui_event_bus.as_ref() {
+            ui_event_bus.publish(UiEventTopics::NETWORK_ACCESS_LOGS);
+        }
+        true
     }
 }
 
@@ -415,6 +412,7 @@ impl TaskRuntime {
         let runtime = Self {
             db,
             notifier: None,
+            ui_event_bus: None,
             may_dir,
             container_manager: None,
             ssh_servers: Arc::new(ArcSwap::from_pointee(Vec::new())),
@@ -429,6 +427,12 @@ impl TaskRuntime {
     #[must_use]
     pub fn with_notifier(mut self, notifier: Arc<NotificationService>) -> Self {
         self.notifier = Some(notifier);
+        self
+    }
+
+    #[must_use]
+    pub fn with_ui_event_bus(mut self, ui_event_bus: UiEventBus) -> Self {
+        self.ui_event_bus = Some(ui_event_bus);
         self
     }
 
@@ -514,7 +518,7 @@ impl TaskRuntime {
             .ok_or_else(|| profile_not_found_error(profile_id.as_str()))?;
         let profile_info = ProfileInfo::from_db_model(profile.clone())
             .map_err(|error| invalid_profile_error(profile_id.as_str(), &error))?;
-        let actual_runtime = match profile_info.environment {
+        let actual_runtime = match profile_info.environment.kind() {
             ProfileEnvironment::Local => TaskRuntimeKind::Local,
             ProfileEnvironment::Container { .. } => TaskRuntimeKind::Container,
             ProfileEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
@@ -790,7 +794,7 @@ impl TaskRuntime {
             .resolve_script_source(script_path, script_inline)
             .await?;
 
-        match profile_info.environment {
+        match profile_info.environment.kind() {
             ProfileEnvironment::Local => self.validate_local(&profile.id, &script).await,
             ProfileEnvironment::Container { .. } => self.validate_container(profile, &script).await,
             ProfileEnvironment::Remote { .. } => self.validate_remote(profile, &script).await,
@@ -923,7 +927,7 @@ impl TaskRuntime {
             .materialize_task_execution(task, &script, invocation)
             .await?;
 
-        let result = match profile_info.environment {
+        let result = match profile_info.environment.kind() {
             ProfileEnvironment::Local => {
                 self.execute_local(task, &script, materialized.command.clone())
                     .await
@@ -1122,6 +1126,7 @@ impl TaskRuntime {
             &script.host_working_dir,
             SchedulerPermissionHandler {
                 db: self.db.clone(),
+                ui_event_bus: self.ui_event_bus.clone(),
                 profile_id: profile_id.to_string(),
                 source,
                 allow_network,
@@ -1168,6 +1173,7 @@ impl TaskRuntime {
             working_dir,
             SchedulerPermissionHandler {
                 db: self.db.clone(),
+                ui_event_bus: self.ui_event_bus.clone(),
                 profile_id: profile.id.clone(),
                 source: NetworkAccessSource::TaskRemote,
                 allow_network: true,
@@ -1304,6 +1310,7 @@ impl TaskRuntime {
                 &workspace_dir,
                 SchedulerPermissionHandler {
                     db: self.db.clone(),
+                    ui_event_bus: self.ui_event_bus.clone(),
                     profile_id: profile.id.clone(),
                     source: NetworkAccessSource::TaskContainer,
                     allow_network: true,
@@ -1423,6 +1430,7 @@ impl TaskRuntime {
                 &workspace_dir,
                 SchedulerPermissionHandler {
                     db: self.db.clone(),
+                    ui_event_bus: self.ui_event_bus.clone(),
                     profile_id: profile.id.clone(),
                     source: NetworkAccessSource::TaskValidationContainer,
                     allow_network: true,
@@ -1493,6 +1501,7 @@ async fn run_terminal_command(
             mode,
             ssh_server_id,
             expect: OutputFormat::Text,
+            resolution: aither_sandbox::MediaResolution::Auto,
             timeout: 300,
             max_lines: 800,
             raw: false,
@@ -1500,11 +1509,17 @@ async fn run_terminal_command(
         .await
         .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
 
+    if output.is_error() {
+        return Err(output
+            .error_message()
+            .unwrap_or("task terminal execution failed")
+            .to_string());
+    }
     let payload = output
-        .as_str()
-        .ok_or_else(|| "task terminal execution returned non-text output".to_string())?;
+        .render_for_model()
+        .map_err(|error| prefixed_error("failed to render terminal tool result: ", &error))?;
 
-    parse_terminal_result(payload)
+    parse_terminal_result(&payload)
 }
 
 fn parse_terminal_result(payload: &str) -> Result<String, String> {

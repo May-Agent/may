@@ -9,7 +9,12 @@ export interface ServicesSlice {
   skills: api.SkillInfo[];
   scheduledTasks: ScheduledTask[];
   pushEnabled: boolean;
+  browserStatus: api.BrowserStatus | null;
   remoteAccessStatus: api.RemoteAccessStatus | null;
+  requestLogs: api.RequestLogEntry[];
+  requestLogCacheSummary: api.RequestLogCacheSummary | null;
+  notificationMailbox: api.NotificationMailboxEntry[];
+  networkAccessLogs: api.NetworkAccessLogEntry[];
 
   refreshMcpServers: () => Promise<void>;
   addMcpServer: (input: api.McpServerCreateRequest) => Promise<void>;
@@ -23,6 +28,10 @@ export interface ServicesSlice {
   enablePush: () => Promise<void>;
   disablePush: () => Promise<void>;
   sendTestNotification: () => Promise<void>;
+  setBrowserStatus: (status: api.BrowserStatus) => void;
+  setRequestLogs: (payload: api.RequestLogsPayload) => void;
+  setNotificationMailbox: (payload: api.NotificationMailboxPayload) => void;
+  setNetworkAccessLogs: (payload: api.NetworkAccessLogsPayload) => void;
   refreshRemoteAccessStatus: () => Promise<void>;
   setRemoteAccessStatus: (status: api.RemoteAccessStatus) => void;
   startRemoteAccess: () => Promise<void>;
@@ -56,7 +65,12 @@ export const createServicesSlice: StateCreator<
   skills: [],
   scheduledTasks: [],
   pushEnabled: false,
+  browserStatus: null,
   remoteAccessStatus: null,
+  requestLogs: [],
+  requestLogCacheSummary: null,
+  notificationMailbox: [],
+  networkAccessLogs: [],
 
   refreshMcpServers: async () => {
     const mcpServers = await api.fetchMcpServers();
@@ -142,6 +156,25 @@ export const createServicesSlice: StateCreator<
     await api.sendTestNotification();
   },
 
+  setBrowserStatus: (browserStatus) => {
+    set({ browserStatus });
+  },
+
+  setRequestLogs: (payload) => {
+    set({
+      requestLogs: payload.logs,
+      requestLogCacheSummary: payload.cacheSummary,
+    });
+  },
+
+  setNotificationMailbox: (payload) => {
+    set({ notificationMailbox: payload.items });
+  },
+
+  setNetworkAccessLogs: (payload) => {
+    set({ networkAccessLogs: payload.items });
+  },
+
   refreshRemoteAccessStatus: async () => {
     const remoteAccessStatus = await api.fetchRemoteAccessStatus();
     set({ remoteAccessStatus });
@@ -153,12 +186,10 @@ export const createServicesSlice: StateCreator<
 
   startRemoteAccess: async () => {
     await api.startRemoteAccess();
-    await get().refreshRemoteAccessStatus();
   },
 
   stopRemoteAccess: async () => {
     await api.stopRemoteAccess();
-    await get().refreshRemoteAccessStatus();
   },
 
   refreshTasks: async () => {

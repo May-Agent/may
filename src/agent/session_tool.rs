@@ -3,7 +3,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::{
+    EmbeddingModel,
+    llm::{Tool, ToolResult},
+};
+use aither_rag::{Document, Rag};
 use arrow_array::{
     Array, ArrayRef, Float32Array, Int32Array, Int64Array, RecordBatch, RecordBatchIterator,
     RecordBatchReader, StringArray,
@@ -22,15 +26,17 @@ use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
 use crate::agent::command_words::split_shell_words;
 use crate::agent::search_match::{extend_unique, push_unique};
 use crate::db::ChatDb;
+use crate::embedding_provider::{EmbeddingModelResolution, MayEmbeddingModel};
 
 const TABLE_NAME: &str = "session_messages";
 const INDEX_META_FILE: &str = "session_index.meta.json";
+const SEMANTIC_INDEX_FILE: &str = "session_index.semantic.redb";
 
 /// Search across May sessions and messages.
 ///
 /// Query rules:
 /// - Use `*` as query to disable text match and only apply filters.
-/// - `search_mode`: `hybrid` | `text` | `regex` | `fulltext` | `fuzzy`.
+/// - `search_mode`: `hybrid` | `text` | `regex` | `fulltext` | `fuzzy` | `semantic`.
 /// - Default excludes current session so you can inspect other sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -40,6 +46,7 @@ pub enum SessionSearchMode {
     Regex,
     Fulltext,
     Fuzzy,
+    Semantic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -60,7 +67,7 @@ pub struct SessionArgs {
     /// Query string. Use `*` for filter-only listing.
     pub query: String,
 
-    /// Search mode: `hybrid`, `text`, `regex`, `fulltext`, `fuzzy`.
+    /// Search mode: `hybrid`, `text`, `regex`, `fulltext`, `fuzzy`, `semantic`.
     #[serde(default = "default_search_mode")]
     pub search_mode: SessionSearchMode,
 
@@ -165,6 +172,7 @@ const fn default_fuzzy_distance() -> u32 {
 pub struct SessionTool {
     may_dir: PathBuf,
     current_session_id: String,
+    embedder: EmbeddingModelResolution,
 }
 
 #[derive(Debug, Clone)]
@@ -174,10 +182,15 @@ struct SearchDefaults {
 
 impl SessionTool {
     #[must_use]
-    pub const fn new(may_dir: PathBuf, current_session_id: String) -> Self {
+    pub const fn new(
+        may_dir: PathBuf,
+        current_session_id: String,
+        embedder: EmbeddingModelResolution,
+    ) -> Self {
         Self {
             may_dir,
             current_session_id,
+            embedder,
         }
     }
 
@@ -191,6 +204,10 @@ impl SessionTool {
 
     fn index_meta_path(&self) -> PathBuf {
         self.may_dir.join(INDEX_META_FILE)
+    }
+
+    fn semantic_index_path(&self) -> PathBuf {
+        self.may_dir.join(SEMANTIC_INDEX_FILE)
     }
 
     fn normalize_args(&self, mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
@@ -213,13 +230,16 @@ impl Tool for SessionTool {
     }
 
     type Arguments = SessionArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         let args = self.normalize_args(arguments)?;
         execute_search(
             self.db_path(),
             self.index_path(),
             self.index_meta_path(),
+            self.semantic_index_path(),
+            self.embedder.clone(),
             args,
         )
         .await
@@ -265,14 +285,31 @@ async fn execute_search(
     db_path: PathBuf,
     index_path: PathBuf,
     index_meta_path: PathBuf,
+    semantic_index_path: PathBuf,
+    embedder: EmbeddingModelResolution,
     args: SessionArgs,
-) -> aither_core::Result<ToolOutput> {
+) -> aither_core::Result<ToolResult> {
     let query_enabled = args.query.trim() != "*" && !args.query.trim().is_empty();
 
     let db = ChatDb::open(&db_path).await?;
     let fingerprint = compute_fingerprint(&db).await?;
 
-    let table = ensure_index(&index_path, &index_meta_path, &db, &fingerprint).await?;
+    let table = ensure_index(
+        &index_path,
+        &index_meta_path,
+        &semantic_index_path,
+        &db,
+        &fingerprint,
+        embedder.clone(),
+    )
+    .await?;
+
+    if args.search_mode == SessionSearchMode::Semantic {
+        let embedder = embedder.require_ready(
+            "session semantic search requires a global models.embedding_model and at least one enabled provider that supports it",
+        )?;
+        return run_semantic_query(semantic_index_path, embedder, args).await;
+    }
 
     let mut candidates = match args.search_mode {
         SessionSearchMode::Fulltext => run_full_text_query(&table, &args, false).await?,
@@ -293,6 +330,7 @@ async fn execute_search(
                 run_plain_query(&table, &args).await?
             }
         }
+        SessionSearchMode::Semantic => unreachable!("semantic search handled earlier"),
     };
 
     let query_norm = if args.case_sensitive {
@@ -445,6 +483,8 @@ struct SessionIndexMeta {
     session_count: usize,
     total_messages: usize,
     latest_updated_at: String,
+    semantic_embedding_model: Option<String>,
+    semantic_embedding_dimensions: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -467,8 +507,10 @@ struct SessionIndexRow {
 #[derive(Debug, Clone)]
 struct SessionMatchRow {
     session_id: String,
+    profile_id: String,
     title: String,
     model: String,
+    archived: bool,
     role: String,
     content: String,
     preview: String,
@@ -549,20 +591,28 @@ async fn compute_fingerprint(db: &ChatDb) -> anyhow::Result<SessionIndexMeta> {
         session_count,
         total_messages,
         latest_updated_at,
+        semantic_embedding_model: None,
+        semantic_embedding_dimensions: None,
     })
 }
 
 async fn ensure_index(
     index_path: &Path,
     meta_path: &Path,
+    semantic_index_path: &Path,
     db: &ChatDb,
     fingerprint: &SessionIndexMeta,
+    embedder: EmbeddingModelResolution,
 ) -> anyhow::Result<Table> {
     let conn = connect(index_path.to_string_lossy().as_ref())
         .execute()
         .await?;
 
     let mut should_rebuild = true;
+    let semantic_index_missing = matches!(
+        async_fs::metadata(semantic_index_path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
     let table_names = conn.table_names().execute().await?;
     let has_table = table_names.iter().any(|name| name == TABLE_NAME);
 
@@ -604,12 +654,95 @@ async fn ensure_index(
             .execute()
             .await?;
 
-        async_fs::write(meta_path, serde_json::to_vec_pretty(fingerprint)?).await?;
+        let next_meta = SessionIndexMeta {
+            session_count: fingerprint.session_count,
+            total_messages: fingerprint.total_messages,
+            latest_updated_at: fingerprint.latest_updated_at.clone(),
+            semantic_embedding_model: embedder.ready().map(|value| value.selector().to_string()),
+            semantic_embedding_dimensions: embedder.ready().map(aither_core::EmbeddingModel::dim),
+        };
+        async_fs::write(meta_path, serde_json::to_vec_pretty(&next_meta)?).await?;
+        if let Some(embedder) = embedder.clone_ready() {
+            rebuild_semantic_index(semantic_index_path, embedder, &rows).await?;
+        }
 
         Ok(table)
     } else {
+        if let Some(embedder) = embedder.clone_ready() {
+            let saved_meta = async_fs::read_to_string(meta_path)
+                .await
+                .ok()
+                .and_then(|raw| serde_json::from_str::<SessionIndexMeta>(&raw).ok());
+            let semantic_needs_rebuild = semantic_index_missing
+                || saved_meta.as_ref().is_none_or(|meta| {
+                    meta.semantic_embedding_model.as_deref() != Some(embedder.selector())
+                        || meta.semantic_embedding_dimensions != Some(embedder.dim())
+                });
+            if semantic_needs_rebuild {
+                let rows = build_index_rows(db).await?;
+                rebuild_semantic_index(semantic_index_path, embedder.clone(), &rows).await?;
+                let next_meta = SessionIndexMeta {
+                    session_count: fingerprint.session_count,
+                    total_messages: fingerprint.total_messages,
+                    latest_updated_at: fingerprint.latest_updated_at.clone(),
+                    semantic_embedding_model: Some(embedder.selector().to_string()),
+                    semantic_embedding_dimensions: Some(embedder.dim()),
+                };
+                async_fs::write(meta_path, serde_json::to_vec_pretty(&next_meta)?).await?;
+            }
+        }
         Ok(conn.open_table(TABLE_NAME).execute().await?)
     }
+}
+
+async fn rebuild_semantic_index(
+    semantic_index_path: &Path,
+    embedder: MayEmbeddingModel,
+    rows: &[SessionIndexRow],
+) -> anyhow::Result<()> {
+    match async_fs::remove_file(semantic_index_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "failed to remove stale session semantic index {}: {error}",
+                semantic_index_path.display()
+            ));
+        }
+    }
+
+    let rag = Rag::builder(embedder)
+        .index_path(semantic_index_path.to_path_buf())
+        .code_chunking(2400)
+        .top_k(2000)
+        .deduplication(false)
+        .auto_save(false)
+        .build()?;
+
+    for row in rows {
+        let mut metadata = aither_rag::Metadata::new();
+        metadata.insert("session_id".to_string(), row.session_id.clone());
+        metadata.insert("profile_id".to_string(), row.profile_id.clone());
+        metadata.insert("title".to_string(), row.title.clone());
+        metadata.insert("model".to_string(), row.model.clone());
+        metadata.insert("archived".to_string(), row.archived.clone());
+        metadata.insert("role".to_string(), row.role.clone());
+        metadata.insert("preview".to_string(), row.preview.clone());
+        metadata.insert("timestamp".to_string(), row.timestamp.clone());
+        metadata.insert("updated_at".to_string(), row.updated_at.clone());
+        metadata.insert("message_id".to_string(), row.message_id.to_string());
+        metadata.insert("message_count".to_string(), row.message_count.to_string());
+
+        rag.insert(Document::with_metadata(
+            format!("{}:{}", row.session_id, row.message_id),
+            row.content.clone(),
+            metadata,
+        ))
+        .await?;
+    }
+
+    rag.save()?;
+    Ok(())
 }
 
 async fn build_index_rows(db: &ChatDb) -> anyhow::Result<Vec<SessionIndexRow>> {
@@ -911,6 +1044,138 @@ async fn run_full_text_query(
     Ok(rows)
 }
 
+fn require_semantic_metadata<'a>(
+    metadata: &'a aither_rag::Metadata,
+    key: &str,
+) -> anyhow::Result<&'a str> {
+    metadata
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow::anyhow!("session semantic index entry is missing '{key}' metadata"))
+}
+
+fn row_matches_session_filters(row: &SessionMatchRow, args: &SessionArgs) -> bool {
+    if let Some(session_id) = &args.session_id
+        && &row.session_id != session_id
+    {
+        return false;
+    }
+    if let Some(excluded) = &args.exclude_session_id
+        && &row.session_id == excluded
+    {
+        return false;
+    }
+    if let Some(model) = &args.model
+        && &row.model != model
+    {
+        return false;
+    }
+    if let Some(profile_id) = &args.profile_id
+        && &row.profile_id != profile_id
+    {
+        return false;
+    }
+    if let Some(role) = &args.role
+        && &row.role != role
+    {
+        return false;
+    }
+    if let Some(since) = &args.since
+        && &row.timestamp < since
+    {
+        return false;
+    }
+    if let Some(until) = &args.until
+        && &row.timestamp > until
+    {
+        return false;
+    }
+    if let Some(title_contains) = &args.title_contains {
+        let title = if args.case_sensitive {
+            row.title.clone()
+        } else {
+            row.title.to_lowercase()
+        };
+        let needle = if args.case_sensitive {
+            title_contains.clone()
+        } else {
+            title_contains.to_lowercase()
+        };
+        if !title.contains(&needle) {
+            return false;
+        }
+    }
+    args.include_archived || !row.archived
+}
+
+async fn run_semantic_query(
+    semantic_index_path: PathBuf,
+    embedder: MayEmbeddingModel,
+    args: SessionArgs,
+) -> anyhow::Result<ToolResult> {
+    if args.query.trim() == "*" {
+        return Err(anyhow::anyhow!(
+            "session semantic search does not support wildcard queries"
+        ));
+    }
+
+    match async_fs::metadata(&semantic_index_path).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow::anyhow!(
+                "session semantic index is missing; rerun the query after indexing data"
+            ));
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "failed to inspect session semantic index {}: {error}",
+                semantic_index_path.display()
+            ));
+        }
+    }
+
+    let rag = Rag::builder(embedder)
+        .index_path(semantic_index_path)
+        .code_chunking(2400)
+        .top_k(args.scan_limit)
+        .deduplication(false)
+        .auto_save(false)
+        .build()?;
+    rag.load()?;
+
+    let rows = rag
+        .search_with_k(args.query.as_str(), args.scan_limit)
+        .await?
+        .into_iter()
+        .map(|result| -> anyhow::Result<SessionMatchRow> {
+            let metadata = &result.chunk.metadata;
+            Ok(SessionMatchRow {
+                session_id: require_semantic_metadata(metadata, "session_id")?.to_string(),
+                profile_id: require_semantic_metadata(metadata, "profile_id")?.to_string(),
+                title: require_semantic_metadata(metadata, "title")?.to_string(),
+                model: require_semantic_metadata(metadata, "model")?.to_string(),
+                archived: require_semantic_metadata(metadata, "archived")? == "1",
+                role: require_semantic_metadata(metadata, "role")?.to_string(),
+                content: result.chunk.text,
+                preview: require_semantic_metadata(metadata, "preview")?.to_string(),
+                timestamp: require_semantic_metadata(metadata, "timestamp")?.to_string(),
+                updated_at: require_semantic_metadata(metadata, "updated_at")?.to_string(),
+                message_id: require_semantic_metadata(metadata, "message_id")?.parse::<i64>()?,
+                message_count: require_semantic_metadata(metadata, "message_count")?
+                    .parse::<i32>()?,
+                score: f64::from(result.score),
+                matched_by: vec![SessionSearchMode::Semantic],
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|row| row_matches_session_filters(row, &args))
+        .collect::<Vec<_>>();
+
+    let total_matches = rows.len();
+    finalize_rows_with_total(rows, total_matches, &args)
+}
+
 async fn read_rows_from_stream(
     stream: &mut lancedb::arrow::SendableRecordBatchStream,
 ) -> anyhow::Result<Vec<SessionMatchRow>> {
@@ -922,6 +1187,8 @@ async fn read_rows_from_stream(
         let session_id = as_string(batch.column_by_name("session_id"), "session_id")?;
         let title = as_string(batch.column_by_name("title"), "title")?;
         let model = as_string(batch.column_by_name("model"), "model")?;
+        let profile_id = as_string(batch.column_by_name("profile_id"), "profile_id")?;
+        let archived = as_string(batch.column_by_name("archived"), "archived")?;
         let role = as_string(batch.column_by_name("role"), "role")?;
         let content = as_string(batch.column_by_name("content"), "content")?;
         let preview = as_string(batch.column_by_name("preview"), "preview")?;
@@ -949,8 +1216,10 @@ async fn read_rows_from_stream(
         for i in 0..batch.num_rows() {
             rows.push(SessionMatchRow {
                 session_id: session_id.value(i).to_string(),
+                profile_id: profile_id.value(i).to_string(),
                 title: title.value(i).to_string(),
                 model: model.value(i).to_string(),
+                archived: archived.value(i) == "1",
                 role: role.value(i).to_string(),
                 content: content.value(i).to_string(),
                 preview: preview.value(i).to_string(),
@@ -1017,7 +1286,7 @@ fn finalize_rows_with_total(
     rows: Vec<SessionMatchRow>,
     total_matches: usize,
     args: &SessionArgs,
-) -> anyhow::Result<ToolOutput> {
+) -> anyhow::Result<ToolResult> {
     let start = args.offset.min(rows.len());
     let end = (start + args.limit).min(rows.len());
     let rows = rows[start..end].to_vec();
@@ -1079,7 +1348,7 @@ fn finalize_rows_with_total(
         })
     };
 
-    ToolOutput::json(&value)
+    ToolResult::json(&value)
 }
 
 #[cfg(test)]

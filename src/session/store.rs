@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use blocking::unblock;
 use futures_lite::StreamExt;
 
 use super::{MayHomePaths, SessionPaths};
@@ -201,17 +202,17 @@ impl SessionStore {
 
     async fn seed_profile_scoped_resources(&self, profile_id: &str) -> Result<(), StoreError> {
         let profile_home = self.home_paths.profile_home(profile_id);
-        Self::copy_dir_contents_if_target_empty(
-            &self.home_paths.skills_dir(),
-            &profile_home.skills_dir(),
-        )
-        .await?;
-        Self::copy_dir_contents_if_target_empty(
+        Self::sync_dir_contents(&self.home_paths.skills_dir(), &profile_home.skills_dir()).await?;
+        Self::sync_dir_contents(
             &self.home_paths.subagents_dir(),
             &profile_home.subagents_dir(),
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn sync_profile_scoped_resources(&self, profile_id: &str) -> Result<(), StoreError> {
+        self.seed_profile_scoped_resources(profile_id).await
     }
 
     async fn seed_session_scoped_resources(
@@ -230,31 +231,18 @@ impl SessionStore {
                 self.home_paths.subagents_dir(),
             ),
         };
-        Self::copy_dir_contents_if_target_empty(&skills_dir, &paths.skills_dir()).await?;
-        Self::copy_dir_contents_if_target_empty(&subagents_dir, &paths.subagents_dir()).await?;
+        Self::sync_dir_contents(&skills_dir, &paths.skills_dir()).await?;
+        Self::sync_dir_contents(&subagents_dir, &paths.subagents_dir()).await?;
         Ok(())
     }
 
-    async fn copy_dir_contents_if_target_empty(
-        source: &Path,
-        target: &Path,
-    ) -> Result<(), StoreError> {
+    async fn sync_dir_contents(source: &Path, target: &Path) -> Result<(), StoreError> {
         if async_fs::metadata(source).await.is_err() {
-            return Ok(());
-        }
-        if !Self::is_dir_empty(target).await? {
             return Ok(());
         }
         let source = source.to_path_buf();
         let target = target.to_path_buf();
-        tokio::task::spawn_blocking(move || copy_dir_contents_recursive(&source, &target))
-            .await
-            .map_err(|error| StoreError::Io(std::io::Error::other(error.to_string())))??;
+        unblock(move || copy_dir_contents_recursive(&source, &target)).await?;
         Ok(())
-    }
-
-    async fn is_dir_empty(path: &Path) -> Result<bool, StoreError> {
-        let mut entries = async_fs::read_dir(path).await?;
-        Ok(entries.next().await.is_none())
     }
 }

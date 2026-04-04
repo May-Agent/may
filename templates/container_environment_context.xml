@@ -1,0 +1,11 @@
+<container_environment>
+<environment>container</environment>
+<operating_system>{{ operating_system }}</operating_system>
+<cwd>{{ cwd }}</cwd>
+<description>
+This profile's home environment is a managed container.
+</description>
+<permission_rules>
+{% for rule in permission_rules %}<rule>{{ rule }}</rule>
+{% endfor %}</permission_rules>
+</container_environment>

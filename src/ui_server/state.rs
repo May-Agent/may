@@ -5,12 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::time::Instant as TokioInstant;
 
 use super::local_url_mapper::LocalUrlPortMapper;
-use super::types::{ModelsResponse, ProviderModelsResponse};
 use crate::agent::PermissionApprover;
+use crate::agent::browser_tool::{BrowserBroker, BrowserQueue};
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::register_tool::RegisterQueue;
 use crate::agent::task_tool::{TaskBroker, TaskQueue};
@@ -19,6 +20,7 @@ use crate::config::MayConfig;
 use crate::live_response::LiveResponseRegistry;
 use crate::mcp::{MayMcpServerConfig, McpManager, McpServerInfo};
 use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
+use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use crate::workspace_request::RequestWorkspaceArgs;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
@@ -79,7 +81,7 @@ impl std::fmt::Debug for ContainerPrepareTracker {
 }
 
 impl ContainerPrepareTracker {
-    pub(crate) fn new(ui_events_notify: Arc<tokio::sync::Notify>) -> Self {
+    pub(crate) fn new(ui_event_bus: UiEventBus) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (snapshot_tx, snapshot_rx) =
             tokio::sync::watch::channel(ContainerPrepareSnapshot::default());
@@ -97,12 +99,12 @@ impl ContainerPrepareTracker {
                     ContainerPrepareCommand::SetStatus { status } => {
                         snapshot.statuses.insert(status.profile_id.clone(), status);
                         snapshot_tx.send_replace(snapshot.clone());
-                        ui_events_notify.notify_waiters();
+                        ui_event_bus.publish(UiEventTopics::CONTAINER_PREPARE);
                     }
                     ContainerPrepareCommand::ClearStatus { profile_id } => {
                         snapshot.statuses.remove(profile_id.as_str());
                         snapshot_tx.send_replace(snapshot.clone());
-                        ui_events_notify.notify_waiters();
+                        ui_event_bus.publish(UiEventTopics::CONTAINER_PREPARE);
                     }
                 }
             }
@@ -188,6 +190,7 @@ impl TitleGenerationQueue {
 pub struct UiToolDispatchers {
     pub(crate) task: TaskBroker,
     pub(crate) notify: crate::agent::notify_tool::NotifyBroker,
+    pub(crate) browser: BrowserBroker,
     pub(crate) register_skills: RegisterBroker,
     pub(crate) register_subagents: RegisterBroker,
 }
@@ -195,6 +198,7 @@ pub struct UiToolDispatchers {
 pub struct UiToolQueues {
     pub(crate) task: TaskQueue,
     pub(crate) notify: crate::agent::notify_tool::NotifyQueue,
+    pub(crate) browser: BrowserQueue,
     pub(crate) register_skills: RegisterQueue,
     pub(crate) register_subagents: RegisterQueue,
 }
@@ -202,6 +206,7 @@ pub struct UiToolQueues {
 pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
     let (task, task_queue) = crate::agent::task_tool::channel();
     let (notify, notify_queue) = crate::agent::notify_tool::channel();
+    let (browser, browser_queue) = crate::agent::browser_tool::channel();
     let (register_skills, register_skills_queue) = crate::agent::register_tool::skills_channel();
     let (register_subagents, register_subagents_queue) =
         crate::agent::register_tool::subagents_channel();
@@ -210,12 +215,14 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
         UiToolDispatchers {
             task,
             notify,
+            browser,
             register_skills,
             register_subagents,
         },
         UiToolQueues {
             task: task_queue,
             notify: notify_queue,
+            browser: browser_queue,
             register_skills: register_skills_queue,
             register_subagents: register_subagents_queue,
         },
@@ -226,6 +233,7 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
 pub struct RefreshableCache<T> {
     ttl: Duration,
     inner: ArcSwapOption<CachedValue<T>>,
+    refresh_lock: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -239,6 +247,7 @@ impl<T: Clone> RefreshableCache<T> {
         Self {
             ttl,
             inner: ArcSwapOption::empty(),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -247,6 +256,13 @@ impl<T: Clone> RefreshableCache<T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
+        if let Some(cached) = self.inner.load_full()
+            && cached.updated_at.elapsed() < self.ttl
+        {
+            return cached.value.clone();
+        }
+
+        let _refresh_guard = self.refresh_lock.lock().await;
         if let Some(cached) = self.inner.load_full()
             && cached.updated_at.elapsed() < self.ttl
         {
@@ -376,6 +392,7 @@ impl McpService {
 }
 
 pub struct UiServerState {
+    pub(crate) tokio_handle: tokio::runtime::Handle,
     pub(crate) db: crate::db::ChatDb,
     pub(crate) default_profile_id: String,
     pub(crate) mcp_service: McpService,
@@ -384,13 +401,12 @@ pub struct UiServerState {
     pub(crate) ask_user_approver: AskUserApprover,
     pub(crate) tool_dispatchers: UiToolDispatchers,
     pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,
-    pub(crate) models_cache: RefreshableCache<ModelsResponse>,
-    pub(crate) provider_models_cache: RefreshableCache<ProviderModelsResponse>,
+    pub(crate) fetched_models_cache: RefreshableCache<Vec<crate::models::FetchedModel>>,
     pub(crate) config: ArcSwap<MayConfig>,
-    pub(crate) ui_events_notify: Arc<tokio::sync::Notify>,
+    pub(crate) ui_event_bus: UiEventBus,
     pub(crate) container_prepare: ContainerPrepareTracker,
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
-    pub(crate) browser_manager: Option<Arc<crate::container::playwright::BrowserManager>>,
+    pub(crate) browser_manager: ArcSwapOption<crate::container::browser::BrowserManager>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
     pub(crate) notification_service: Arc<crate::notification_service::NotificationService>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
@@ -421,6 +437,17 @@ impl UiServerState {
         let _ = update(&mut config);
         self.config.store(Arc::new(config.clone()));
         config
+    }
+
+    pub(crate) fn browser_manager(&self) -> Option<Arc<crate::container::browser::BrowserManager>> {
+        self.browser_manager.load_full()
+    }
+
+    pub(crate) fn set_browser_manager(
+        &self,
+        browser_manager: Option<Arc<crate::container::browser::BrowserManager>>,
+    ) {
+        self.browser_manager.store(browser_manager);
     }
 }
 
@@ -657,8 +684,8 @@ impl WorkspaceApprover {
 }
 
 impl UiServerState {
-    pub(crate) fn notify_ui_events(&self) {
-        self.ui_events_notify.notify_waiters();
+    pub(crate) fn notify_ui_events(&self, topics: UiEventTopics) {
+        self.ui_event_bus.publish(topics);
     }
 
     pub(crate) async fn resolve_container_manager(

@@ -1,5 +1,6 @@
 mod artifacts;
 mod attachments;
+mod bootstrap;
 mod browser;
 mod chat;
 mod config;
@@ -98,13 +99,22 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         }
     };
 
-    // Initialize browser manager when Playwright is enabled
-    let browser_manager = if config.playwright.enabled {
-        tracing::info!("Playwright browser integration enabled");
-        match crate::container::playwright::BrowserManager::new(config.playwright.clone()) {
-            Ok(bm) => Some(Arc::new(bm)),
-            Err(e) => {
-                tracing::error!("Failed to initialize browser manager: {e}");
+    // Initialize the May-managed browser runtime only when the feature is enabled.
+    let browser_manager = if config.browser.enabled {
+        tracing::info!(backend = ?config.browser.backend, "Browser integration enabled");
+        match crate::container::browser::prepare_browser_runtime(&config.browser, &may_dir).await {
+            Ok(_) => match crate::container::browser::BrowserManager::new(
+                config.browser.clone(),
+                may_dir.clone(),
+            ) {
+                Ok(manager) => Some(Arc::new(manager)),
+                Err(error) => {
+                    tracing::error!("Failed to initialize browser manager: {error}");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::error!("Failed to provision managed browser runtime: {error}");
                 None
             }
         }
@@ -124,13 +134,13 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         .context("failed to reconcile persisted session run leases after restart")?;
     let (title_generation_queue, title_generation_rx) =
         crate::ui_server::state::TitleGenerationQueue::new();
-    let ui_events_notify = Arc::new(tokio::sync::Notify::new());
+    let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
     let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
         db_for_archive.clone(),
-        ui_events_notify.clone(),
+        ui_event_bus.clone(),
     ));
     let remote_access_manager = Arc::new(remote_access::RemoteAccessManager::new(
-        ui_events_notify.clone(),
+        ui_event_bus.clone(),
     ));
     let permission_approver =
         crate::agent::PermissionApprover::new().with_runtime_service(runtime_service.clone());
@@ -162,6 +172,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let notification_service = Arc::new(crate::notification_service::NotificationService::new(
         db_for_archive.clone(),
         notification_manager.clone(),
+        ui_event_bus.clone(),
     ));
     notification_service
         .redeliver_pending()
@@ -172,6 +183,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
             .await
             .context("failed to load task runtime state")?
             .with_notifier(notification_service.clone())
+            .with_ui_event_bus(ui_event_bus.clone())
             .with_ssh_servers(config.ssh_servers.clone())
             .with_network_policy(config.preferences.network_policy.clone())
             .map_err(|error| anyhow!(error))?;
@@ -179,9 +191,10 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
     let task_runtime = Arc::new(task_runtime);
-    let container_prepare = state::ContainerPrepareTracker::new(ui_events_notify.clone());
+    let container_prepare = state::ContainerPrepareTracker::new(ui_event_bus.clone());
 
     let state = Arc::new(UiServerState {
+        tokio_handle: tokio::runtime::Handle::current(),
         db: db_for_archive.clone(),
         default_profile_id,
         mcp_service: state::McpService::spawn(mcp_manager),
@@ -190,13 +203,12 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         ask_user_approver,
         tool_dispatchers,
         run_cancellation_registry: SessionRunCancellationRegistry::new(),
-        models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
-        provider_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
+        fetched_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         config: arc_swap::ArcSwap::from_pointee(config),
-        ui_events_notify,
+        ui_event_bus,
         container_prepare,
         container_manager,
-        browser_manager,
+        browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
         remote_access_manager,
         notification_service: notification_service.clone(),
         memory_processor,
@@ -246,16 +258,17 @@ fn api_routes() -> Route {
         list_session_artifacts, map_container_local_url, prepare_slidev_preview,
         stream_session_artifacts,
     };
+    use bootstrap::get_bootstrap;
     use browser::{
         browser_offer, browser_start, browser_status, browser_stop, browser_takeover_start,
         browser_takeover_stop,
     };
     use chat::{chat, chat_stream, enqueue_chat, remove_pending_message, stop_session_run};
     use config::{
-        add_mcp_server, add_ssh_server, copilot_logout, copilot_poll, copilot_start,
-        copilot_status, delete_skill, get_full_config, get_memory, get_ui_config, install_skill,
-        list_mcp_servers, list_skills, reconnect_mcp_server, remove_mcp_server, remove_ssh_server,
-        save_full_config, save_memory, set_last_model,
+        add_mcp_server, add_ssh_server, copilot_logout, copilot_start, copilot_status,
+        copilot_stream, delete_skill, get_memory, get_ui_config, install_skill, list_mcp_servers,
+        list_skills, reconnect_mcp_server, remove_mcp_server, remove_ssh_server, save_full_config,
+        save_memory, set_last_model,
     };
     use events::stream_events;
     use interaction::{
@@ -284,6 +297,7 @@ fn api_routes() -> Route {
     Route::new((
         Route::new((
             "/health".at(health),
+            "/bootstrap".at(get_bootstrap),
             "/models".route(Route::new((
                 "".at(models),
                 "/by-provider".at(models_by_provider),
@@ -348,7 +362,6 @@ fn api_routes() -> Route {
             "/ask-user".route(Route::new(("/respond".post(respond_ask_user_request),))),
             "/config".route(Route::new((
                 "".at(get_ui_config),
-                "/full".at(get_full_config),
                 "/full".post(save_full_config),
                 "/last-model".post(set_last_model),
             ))),
@@ -383,7 +396,7 @@ fn api_routes() -> Route {
             "/copilot".route(Route::new((
                 "/status".at(copilot_status),
                 "/start".post(copilot_start),
-                "/poll".post(copilot_poll),
+                "/stream".at(copilot_stream),
                 "/logout".post(copilot_logout),
             ))),
             "/browser".route(Route::new((
@@ -460,14 +473,19 @@ async fn get_request_logs(
 }
 
 async fn models(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<ModelsResponse>> {
-    let config = (*state.config_snapshot()).clone();
-    let result = state
-        .models_cache
-        .get_or_refresh(move || async move {
-            let fetched = fetch_all_models(&config).await;
+    let tokio_handle = state.tokio_handle.clone();
+    let result = tokio_handle
+        .spawn(async move {
+            let config = (*state.config_snapshot()).clone();
+            let refresh_config = config.clone();
+            let fetched = state
+                .fetched_models_cache
+                .get_or_refresh(move || async move { fetch_all_models(&refresh_config).await })
+                .await;
             build_models_response(&config, fetched, true)
         })
         .await;
+    let result = result.map_err(internal_error)?;
     Ok(Json(result))
 }
 
@@ -549,14 +567,19 @@ fn build_models_response(
 async fn models_by_provider(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ProviderModelsResponse>> {
-    let config = (*state.config_snapshot()).clone();
-    let result = state
-        .provider_models_cache
-        .get_or_refresh(move || async move {
-            let fetched = fetch_all_models(&config).await;
+    let tokio_handle = state.tokio_handle.clone();
+    let result = tokio_handle
+        .spawn(async move {
+            let config = (*state.config_snapshot()).clone();
+            let refresh_config = config.clone();
+            let fetched = state
+                .fetched_models_cache
+                .get_or_refresh(move || async move { fetch_all_models(&refresh_config).await })
+                .await;
             build_provider_models_response(fetched)
         })
         .await;
+    let result = result.map_err(internal_error)?;
     Ok(Json(result))
 }
 

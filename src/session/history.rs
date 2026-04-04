@@ -78,7 +78,7 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
-    /// Hidden system context persisted for future turns but not shown in UI.
+    /// Hidden per-turn context stored for audit/debugging but filtered from normal UI recall.
     HiddenContext,
     Tool,
     /// Agent requests permission to run a command.
@@ -617,7 +617,10 @@ impl ChatHistory {
 
     /// Convert to aither messages.
     ///
-    /// Skips interaction messages (permission/ask-user) which are not part of the LLM conversation.
+    /// Rebuild durable LLM history from persisted chat messages.
+    ///
+    /// Interaction metadata stays filtered, while hidden context is restored as
+    /// system context and tool messages keep their original tool-call IDs.
     #[must_use]
     pub fn to_aither_messages(&self) -> Vec<aither_core::llm::Message> {
         self.messages
@@ -627,10 +630,14 @@ impl ChatHistory {
                 match m.role {
                     MessageRole::User => Some(Message::user(&m.content)),
                     MessageRole::Assistant => Some(Message::assistant(&m.content)),
-                    MessageRole::System | MessageRole::HiddenContext => {
-                        Some(Message::system(&m.content))
+                    MessageRole::System => Some(Message::system(&m.content)),
+                    MessageRole::HiddenContext => Some(Message::system(&m.content)),
+                    MessageRole::Tool => {
+                        let tool_call_id = m.tool_call_id.as_deref().unwrap_or_else(|| {
+                            panic!("tool history entry is missing tool_call_id: {}", m.content)
+                        });
+                        Some(Message::tool(tool_call_id, &m.content))
                     }
-                    MessageRole::Tool => Some(Message::user(&m.content)),
                     // Interaction messages are metadata, not LLM context
                     MessageRole::PermissionRequest
                     | MessageRole::PermissionResponse
@@ -712,6 +719,37 @@ impl ChatHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aither_core::llm::Role;
+
+    #[test]
+    fn hidden_context_replays_as_system_message() {
+        let mut history = ChatHistory::new();
+        history.messages_mut().push(ChatMessage::hidden_context(
+            "<system_alert>notice</system_alert>",
+        ));
+        history.messages_mut().push(ChatMessage::user("hello"));
+        history.messages_mut().push(ChatMessage::assistant("world"));
+
+        let messages = history.to_aither_messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role(), Role::System);
+        assert_eq!(messages[1].role(), Role::User);
+        assert_eq!(messages[2].role(), Role::Assistant);
+        assert_eq!(messages[0].content(), "<system_alert>notice</system_alert>");
+    }
+
+    #[test]
+    fn tool_messages_preserve_tool_call_id_when_replayed() {
+        let mut history = ChatHistory::new();
+        history
+            .messages_mut()
+            .push(ChatMessage::tool("call_123", "{\"ok\":true}"));
+
+        let messages = history.to_aither_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role(), Role::Tool);
+        assert_eq!(messages[0].tool_call_id(), Some("call_123"));
+    }
 
     #[test]
     fn test_parse_empty() {

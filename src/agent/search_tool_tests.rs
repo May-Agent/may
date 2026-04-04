@@ -69,4 +69,22 @@ mod tests {
             .expect("search modes should serialize");
         assert_eq!(value, serde_json::json!(["fulltext", "regex"]));
     }
+
+    #[tokio::test]
+    async fn resolves_relative_query_path_against_sandbox() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_dir = temp.path().join("session");
+        let indexed_dir = sandbox_dir.join("data").join("semantic-test");
+        std::fs::create_dir_all(&indexed_dir).expect("create indexed dir");
+        std::fs::write(indexed_dir.join("note.md"), "hello").expect("write note");
+
+        let resolved = resolve_search_path(sandbox_dir.as_path(), "data/semantic-test")
+            .await
+            .expect("resolve relative path");
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&indexed_dir).expect("canonical indexed dir")
+        );
+    }
 }

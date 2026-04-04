@@ -24,6 +24,19 @@ pub enum McpConfigError {
     Connection(#[from] McpError),
 }
 
+/// MCP connection loading error for terminal-command registration.
+#[derive(Debug, thiserror::Error)]
+pub enum McpConnectionLoadError {
+    #[error(transparent)]
+    Config(#[from] McpConfigError),
+    #[error("failed to connect MCP server '{server}': {source}")]
+    Connect {
+        server: String,
+        #[source]
+        source: McpError,
+    },
+}
+
 /// MCP server configuration (serializable version).
 ///
 /// This mirrors `McpServerConfig` from aither-mcp but adds Serialize support.
@@ -570,4 +583,28 @@ impl McpManager {
             .filter(|s| s.is_connected())
             .count()
     }
+}
+
+/// Load all configured MCP servers from the given May home and return live connections.
+///
+/// This is the single runtime path for May's automatic MCP -> terminal-command conversion.
+/// Every connected MCP tool is expected to be exposed through the schema-driven IPC command
+/// registry rather than a bespoke native tool path.
+pub async fn load_active_mcp_connections(
+    may_dir: &Path,
+) -> Result<Vec<McpConnection>, McpConnectionLoadError> {
+    let config_path = may_dir.join("mcp.json");
+    let config = McpConfig::load_from(&config_path).await?;
+    if !config.has_servers() {
+        return Ok(Vec::new());
+    }
+
+    let mut manager = McpManager::new(config);
+    for (server, result) in manager.connect_all().await {
+        if let Err(source) = result {
+            return Err(McpConnectionLoadError::Connect { server, source });
+        }
+    }
+
+    Ok(manager.take_connections())
 }

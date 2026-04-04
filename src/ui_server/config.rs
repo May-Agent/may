@@ -1,25 +1,30 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
+use skyzen::responder::Sse;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
+use tokio::time::MissedTickBehavior;
 
 use crate::config::{MayConfig, ProviderInstance, SshServerConfig};
 use crate::copilot::{clear_copilot_credentials, has_copilot_token, save_copilot_token};
 use crate::mcp::MayMcpServerConfig;
 use crate::session::MayHomePaths;
 use crate::skill::SkillManager;
+use crate::ui_event_bus::UiEventTopics;
 
 use super::error::{bad_request_error, internal_error};
+use super::helpers::send_event;
 use super::message_mapping::map_skill;
 use super::model_resolution::persist_last_model;
 use super::state::UiServerState;
 use super::types::{
-    ApiHealth, CopilotPollRequest, CopilotPollResponse, CopilotStartResponse,
-    CopilotStatusResponse, LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest,
-    SkillInfoDto, SkillInstallRequest, SshServerRequest, UiAppearanceConfig, UiConfigResponse,
-    UiFullConfig, UiModelsConfig, UiPlaywrightConfig, UiPreferencesConfig, UiProviderConfig,
+    ApiHealth, CopilotAuthEvent, CopilotAuthStatus, CopilotStartResponse, CopilotStatusResponse,
+    LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest, SkillInfoDto,
+    SkillInstallRequest, SseHeartbeat, SshServerRequest, UiAppearanceConfig, UiBrowserConfig,
+    UiConfigResponse, UiFullConfig, UiModelsConfig, UiPreferencesConfig, UiProviderConfig,
     UiRemoteAccessConfig,
 };
 
@@ -29,28 +34,44 @@ pub(super) struct SkillScopeQuery {
     profile_id: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CopilotAuthStreamQuery {
+    device_code: String,
+    interval: u64,
+}
+
 fn scoped_skill_manager(state: &UiServerState, profile_id: &str) -> SkillManager {
     let home_paths = MayHomePaths::new(state.may_dir.clone());
     SkillManager::from_profile_home(&home_paths.profile_home(profile_id))
+}
+
+pub(super) async fn list_skills_for_profile(
+    state: &UiServerState,
+    profile_id: &str,
+) -> Result<Vec<SkillInfoDto>, skyzen::Error> {
+    let skills = scoped_skill_manager(state, profile_id)
+        .list_skills()
+        .await
+        .map_err(internal_error)?;
+    Ok(skills.into_iter().map(map_skill).collect::<Vec<_>>())
 }
 
 pub(super) async fn get_ui_config(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<UiConfigResponse>> {
     let config = state.config_snapshot();
-    Ok(Json(UiConfigResponse {
+    Ok(Json(build_ui_config_response(&config)))
+}
+
+pub(super) fn build_ui_config_response(config: &MayConfig) -> UiConfigResponse {
+    UiConfigResponse {
         ssh_servers: config.ssh_servers.clone(),
         max_iterations: config.max_iterations,
         ui_font: config.appearance.font.clone(),
         ui_theme: config.appearance.theme.clone(),
-    }))
-}
-
-pub(super) async fn get_full_config(
-    State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Json<UiFullConfig>> {
-    let config = state.config_snapshot();
-    Ok(Json(build_ui_full_config(&config)))
+        full_config: build_ui_full_config(config),
+    }
 }
 
 pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
@@ -75,6 +96,8 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             balanced: config.models.balanced.clone(),
             fast: config.models.fast.clone(),
             image_generation: config.models.image_generation.clone(),
+            embedding_model: config.models.embedding_model.clone(),
+            embedding_dimensions: config.models.embedding_dimensions,
             model_providers: config.models.model_providers.clone(),
         },
         preferences: UiPreferencesConfig {
@@ -91,12 +114,13 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
         },
         last_model: config.last_model.clone(),
         max_iterations: config.max_iterations,
-        playwright: UiPlaywrightConfig {
-            enabled: config.playwright.enabled,
-            browser: config.playwright.browser,
-            port: config.playwright.port,
-            screencast_quality: config.playwright.screencast_quality,
-            screencast_max_width: config.playwright.screencast_max_width,
+        browser: UiBrowserConfig {
+            enabled: config.browser.enabled,
+            backend: config.browser.backend,
+            port: config.browser.port,
+            remote_cdp_endpoint: config.browser.remote_cdp_endpoint.clone(),
+            screencast_quality: config.browser.screencast_quality,
+            screencast_max_width: config.browser.screencast_max_width,
         },
         remote_access: UiRemoteAccessConfig::from(&config.remote_access),
     }
@@ -106,23 +130,73 @@ pub(super) async fn save_full_config(
     Json(req): Json<UiFullConfig>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ApiHealth>> {
+    let tokio_handle = state.tokio_handle.clone();
+    let response = tokio_handle
+        .spawn({
+            let state = state.clone();
+            async move { run_save_full_config(state, req).await }
+        })
+        .await
+        .map_err(|_| internal_error("config save task panicked before producing a response"))??;
+    Ok(Json(response))
+}
+
+async fn run_save_full_config(
+    state: Arc<UiServerState>,
+    req: UiFullConfig,
+) -> SkyResult<ApiHealth> {
+    let previous_browser_manager = state.browser_manager();
+    let next_browser_manager = if req.browser.enabled {
+        let next_browser_config = crate::config::BrowserConfig {
+            enabled: req.browser.enabled,
+            backend: req.browser.backend,
+            port: req.browser.port,
+            remote_cdp_endpoint: req
+                .browser
+                .remote_cdp_endpoint
+                .clone()
+                .filter(|value| !value.trim().is_empty()),
+            screencast_quality: req.browser.screencast_quality,
+            screencast_max_width: req.browser.screencast_max_width,
+        };
+        next_browser_config.validate().map_err(bad_request_error)?;
+        crate::container::browser::prepare_browser_runtime(&next_browser_config, &state.may_dir)
+            .await
+            .map_err(internal_error)?;
+        Some(Arc::new(
+            crate::container::browser::BrowserManager::new(
+                next_browser_config,
+                state.may_dir.clone(),
+            )
+            .map_err(internal_error)?,
+        ))
+    } else {
+        None
+    };
+
     let updated = state.update_config(|config| {
         let mut provider_map = std::collections::HashMap::new();
-        for p in req.providers {
+        for p in &req.providers {
             let mut instance = ProviderInstance::new(p.provider_type);
-            instance.api_key = p.api_key.filter(|v| !v.trim().is_empty());
-            instance.base_url = p.base_url.filter(|v| !v.trim().is_empty());
-            instance.display_name = p.display_name.filter(|v| !v.trim().is_empty());
+            instance.api_key = p.api_key.clone().filter(|v| !v.trim().is_empty());
+            instance.base_url = p.base_url.clone().filter(|v| !v.trim().is_empty());
+            instance.display_name = p.display_name.clone().filter(|v| !v.trim().is_empty());
             instance.enabled = p.enabled;
-            provider_map.insert(p.id, instance);
+            provider_map.insert(p.id.clone(), instance);
         }
 
         config.provider = provider_map;
-        config.models.advanced = req.models.advanced;
-        config.models.balanced = req.models.balanced;
-        config.models.fast = req.models.fast;
-        config.models.image_generation = req.models.image_generation;
-        config.models.model_providers = req.models.model_providers;
+        config.models.advanced = req.models.advanced.clone();
+        config.models.balanced = req.models.balanced.clone();
+        config.models.fast = req.models.fast.clone();
+        config.models.image_generation = req.models.image_generation.clone();
+        config.models.embedding_model = req
+            .models
+            .embedding_model
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        config.models.embedding_dimensions = req.models.embedding_dimensions;
+        config.models.model_providers = req.models.model_providers.clone();
         config.preferences.load_balance_strategy = req.preferences.load_balance_strategy;
         config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
         config.preferences.show_token_usage = req.preferences.show_token_usage;
@@ -131,28 +205,35 @@ pub(super) async fn save_full_config(
         config.preferences.network_policy.hosts = req
             .preferences
             .network_policy_hosts
-            .into_iter()
+            .iter()
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty())
             .collect();
-        config.appearance.font = req.appearance.font;
+        config.appearance.font = req.appearance.font.clone();
         config.appearance.theme = req.appearance.theme;
-        config.last_model = req.last_model;
+        config.last_model = req.last_model.clone();
         config.max_iterations = req.max_iterations;
-        config.playwright.enabled = req.playwright.enabled;
-        config.playwright.browser = req.playwright.browser;
-        config.playwright.port = req.playwright.port;
-        config.playwright.screencast_quality = req.playwright.screencast_quality;
-        config.playwright.screencast_max_width = req.playwright.screencast_max_width;
+        config.browser.enabled = req.browser.enabled;
+        config.browser.backend = req.browser.backend;
+        config.browser.port = req.browser.port;
+        config.browser.remote_cdp_endpoint = req
+            .browser
+            .remote_cdp_endpoint
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        config.browser.screencast_quality = req.browser.screencast_quality;
+        config.browser.screencast_max_width = req.browser.screencast_max_width;
         config.remote_access.enabled = req.remote_access.enabled;
-        config.remote_access.cloudflared_binary = req.remote_access.cloudflared_binary;
+        config.remote_access.cloudflared_binary = req.remote_access.cloudflared_binary.clone();
         config.remote_access.tunnel_token = req
             .remote_access
             .tunnel_token
+            .clone()
             .filter(|value| !value.trim().is_empty());
         config.remote_access.public_url = req
             .remote_access
             .public_url
+            .clone()
             .filter(|value| !value.trim().is_empty());
         config.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
     });
@@ -165,6 +246,13 @@ pub(super) async fn save_full_config(
 
     let ssh_servers = updated.ssh_servers.clone();
     updated.save().await.map_err(internal_error)?;
+    if let Some(previous_browser_manager) = previous_browser_manager {
+        previous_browser_manager
+            .stop()
+            .await
+            .map_err(internal_error)?;
+    }
+    state.set_browser_manager(next_browser_manager);
     state.task_runtime.set_ssh_servers(ssh_servers);
     state
         .task_runtime
@@ -173,8 +261,8 @@ pub(super) async fn save_full_config(
     super::remote_access::sync_remote_access_from_state(&state)
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
-    Ok(Json(ApiHealth { ok: true }))
+    state.notify_ui_events(UiEventTopics::CONFIG | UiEventTopics::BROWSER_STATUS);
+    Ok(ApiHealth { ok: true })
 }
 
 pub(super) async fn set_last_model(
@@ -233,7 +321,7 @@ pub(super) async fn add_ssh_server(
     let ssh_servers = updated.ssh_servers.clone();
     updated.save().await.map_err(internal_error)?;
     state.task_runtime.set_ssh_servers(ssh_servers);
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -248,7 +336,7 @@ pub(super) async fn remove_ssh_server(
     let ssh_servers = updated.ssh_servers.clone();
     updated.save().await.map_err(internal_error)?;
     state.task_runtime.set_ssh_servers(ssh_servers);
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }
 
@@ -372,11 +460,9 @@ pub(super) async fn list_skills(
     Query(query): Query<SkillScopeQuery>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<Vec<SkillInfoDto>>> {
-    let skills = scoped_skill_manager(&state, query.profile_id.as_str())
-        .list_skills()
-        .await
-        .map_err(internal_error)?;
-    Ok(Json(skills.into_iter().map(map_skill).collect::<Vec<_>>()))
+    Ok(Json(
+        list_skills_for_profile(state.as_ref(), query.profile_id.as_str()).await?,
+    ))
 }
 
 pub(super) async fn install_skill(
@@ -425,33 +511,95 @@ pub(super) async fn copilot_start() -> SkyResult<Json<CopilotStartResponse>> {
     }))
 }
 
-pub(super) async fn copilot_poll(
-    Json(req): Json<CopilotPollRequest>,
-) -> SkyResult<Json<CopilotPollResponse>> {
-    match aither_copilot::auth::try_get_token(&req.device_code).await {
-        Ok(token) => {
-            save_copilot_token(&token).await.map_err(internal_error)?;
-            Ok(Json(CopilotPollResponse {
-                status: super::types::CopilotPollStatus::Success,
+pub(super) async fn copilot_stream(
+    Query(query): Query<CopilotAuthStreamQuery>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Sse> {
+    let device_code = query.device_code.trim().to_string();
+    if device_code.is_empty() {
+        return Err(bad_request_error("deviceCode is required"));
+    }
+    if query.interval == 0 {
+        return Err(bad_request_error("interval must be greater than 0"));
+    }
+
+    let poll_interval = Duration::from_secs(query.interval);
+    let heartbeat_interval = Duration::from_secs(15);
+    let (sender, sse) = Sse::channel();
+
+    state.tokio_handle.spawn(async move {
+        let mut poll_tick = tokio::time::interval(poll_interval);
+        poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut heartbeat = tokio::time::interval(heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let _ = poll_tick.tick().await;
+        let _ = heartbeat.tick().await;
+
+        if !send_event(
+            &sender,
+            "copilot_auth",
+            &CopilotAuthEvent {
+                status: CopilotAuthStatus::Pending,
                 message: None,
-            }))
+            },
+        )
+        .await
+        {
+            return;
         }
-        Err(aither_copilot::CopilotError::AuthorizationPending) => Ok(Json(CopilotPollResponse {
-            status: super::types::CopilotPollStatus::Pending,
+
+        loop {
+            tokio::select! {
+                _ = poll_tick.tick() => {
+                    let event = poll_copilot_auth_event(device_code.as_str()).await;
+                    let is_terminal = !matches!(event.status, CopilotAuthStatus::Pending);
+                    if !send_event(&sender, "copilot_auth", &event).await {
+                        break;
+                    }
+                    if is_terminal {
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if !send_event(&sender, "heartbeat", &SseHeartbeat { ok: true }).await {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(sse)
+}
+
+async fn poll_copilot_auth_event(device_code: &str) -> CopilotAuthEvent {
+    match aither_copilot::auth::try_get_token(device_code).await {
+        Ok(token) => match save_copilot_token(&token).await {
+            Ok(()) => CopilotAuthEvent {
+                status: CopilotAuthStatus::Success,
+                message: None,
+            },
+            Err(error) => CopilotAuthEvent {
+                status: CopilotAuthStatus::Error,
+                message: Some(error.to_string()),
+            },
+        },
+        Err(aither_copilot::CopilotError::AuthorizationPending) => CopilotAuthEvent {
+            status: CopilotAuthStatus::Pending,
             message: None,
-        })),
-        Err(aither_copilot::CopilotError::DeviceCodeExpired) => Ok(Json(CopilotPollResponse {
-            status: super::types::CopilotPollStatus::Expired,
+        },
+        Err(aither_copilot::CopilotError::DeviceCodeExpired) => CopilotAuthEvent {
+            status: CopilotAuthStatus::Expired,
             message: Some("Device code expired. Please restart authentication.".to_string()),
-        })),
-        Err(aither_copilot::CopilotError::AccessDenied) => Ok(Json(CopilotPollResponse {
-            status: super::types::CopilotPollStatus::Denied,
+        },
+        Err(aither_copilot::CopilotError::AccessDenied) => CopilotAuthEvent {
+            status: CopilotAuthStatus::Denied,
             message: Some("Authorization denied by user.".to_string()),
-        })),
-        Err(err) => Ok(Json(CopilotPollResponse {
-            status: super::types::CopilotPollStatus::Error,
+        },
+        Err(err) => CopilotAuthEvent {
+            status: CopilotAuthStatus::Error,
             message: Some(err.to_string()),
-        })),
+        },
     }
 }
 

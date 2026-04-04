@@ -2,7 +2,7 @@
 //!
 //! Skills and subagents are embedded in the binary and extracted
 //! to the canonical May home on first run.
-//! Local/leash session sandboxes get symlinks pointing to their home-scoped resources.
+//! Local/heel session sandboxes get symlinks pointing to their home-scoped resources.
 //! Container sessions use mount points managed by container lifecycle code.
 
 use std::path::Path;
@@ -17,9 +17,8 @@ use crate::session::SessionPaths;
 static SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
 static SUBAGENTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/bundle/subagents");
 
-// Embed container build context: Dockerfile + leash-ipc source
+// Embed container build context managed by May.
 static CONTAINER_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/container");
-static LEASH_IPC_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../native-sandbox/ipc");
 
 /// Bundle extraction error.
 #[derive(Debug, thiserror::Error)]
@@ -38,12 +37,15 @@ impl Bundle {
         let skills_dir = may_dir.join("skills");
         let subagents_dir = may_dir.join("subagents");
         let container_dir = may_dir.join("container");
-        let leash_ipc_dir = container_dir.join("leash-ipc");
+        let heel_dir = container_dir.join("heel");
+        let heel_bin_dir = heel_dir.join("bin");
 
         Self::ensure_materialized_dir(&skills_dir).await?;
         Self::ensure_materialized_dir(&subagents_dir).await?;
-        async_fs::create_dir_all(&container_dir).await?;
-        async_fs::create_dir_all(&leash_ipc_dir).await?;
+        Self::ensure_materialized_dir(&container_dir).await?;
+        Self::ensure_materialized_dir(&heel_dir).await?;
+        Self::remove_legacy_heel_source_tree(&heel_dir).await?;
+        async_fs::create_dir_all(&heel_bin_dir).await?;
 
         // Built-in resources must stay in lockstep with the running binary.
         // Always overwrite bundled content to avoid stale skills/subagents after upgrades.
@@ -51,11 +53,9 @@ impl Bundle {
 
         Self::extract_dir_overwrite(&SUBAGENTS_DIR, &subagents_dir).await?;
 
-        // Extract container build context (Dockerfile + leash-ipc source).
-        // Container files are always overwritten since they are managed by the binary,
-        // not user-modifiable.
+        // Extract container build context. Managed files are always overwritten since they
+        // are owned by the running May binary rather than user content.
         Self::extract_dir_overwrite(&CONTAINER_DIR, &container_dir).await?;
-        Self::extract_dir_overwrite(&LEASH_IPC_DIR, &leash_ipc_dir).await?;
 
         Ok(())
     }
@@ -66,7 +66,7 @@ impl Bundle {
         may_dir.join("container")
     }
 
-    /// Create symlinks in a local/leash session sandbox pointing to its home-scoped resources.
+    /// Create symlinks in a local/heel session sandbox pointing to its home-scoped resources.
     pub async fn create_sandbox_home_symlinks(
         sandbox_dir: &Path,
         home_root: &Path,
@@ -128,6 +128,35 @@ impl Bundle {
                 async_fs::create_dir_all(path).await?;
                 Ok(())
             }
+            Err(error) => Err(BundleError::Io(error)),
+        }
+    }
+
+    async fn remove_legacy_heel_source_tree(heel_dir: &Path) -> Result<(), BundleError> {
+        for legacy_entry in [
+            "Cargo.lock",
+            "Cargo.toml",
+            "cli",
+            "nodejs",
+            "src",
+            "templates",
+        ] {
+            Self::remove_path_if_exists(&heel_dir.join(legacy_entry)).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_path_if_exists(path: &Path) -> Result<(), BundleError> {
+        match async_fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.is_dir() => {
+                async_fs::remove_dir_all(path).await?;
+                Ok(())
+            }
+            Ok(_) => {
+                async_fs::remove_file(path).await?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(BundleError::Io(error)),
         }
     }

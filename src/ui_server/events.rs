@@ -6,14 +6,18 @@ use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
 use skyzen::responder::Sse;
 use skyzen::utils::State;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::time::MissedTickBehavior;
 
 use crate::profile::query_profile_sessions;
+use crate::ui_event_bus::UiEventTopics;
 
+use super::config::build_ui_config_response;
+use super::error::bad_request_error;
 use super::helpers::send_event;
 use super::state::UiServerState;
 use super::types::{
-    ConfigEventPayload, NetworkAccessLogEntryResponse, NetworkAccessLogsResponse,
+    BrowserStatusEventPayload, NetworkAccessLogEntryResponse, NetworkAccessLogsResponse,
     NotificationMailboxEntryResponse, NotificationMailboxResponse, ProfileSessionsEventPayload,
     RemoteAccessEventPayload, RequestLogsResponse, SessionRuntimeEventPayload,
     SessionRuntimeSnapshotItem, SessionRuntimesEventPayload, SseHeartbeat,
@@ -28,6 +32,22 @@ pub(super) struct EventsQuery {
     session_id: Option<String>,
     #[serde(default)]
     profile_id: Option<String>,
+    #[serde(default)]
+    topics: Option<String>,
+}
+
+#[derive(Default)]
+struct EventSignatures {
+    config: String,
+    request_logs: String,
+    notification_mailbox: String,
+    network_access_logs: String,
+    container_prepare: String,
+    browser_status: String,
+    session_runtime: String,
+    session_runtimes: String,
+    profile_sessions: String,
+    remote_access: String,
 }
 
 pub(super) async fn stream_events(
@@ -46,176 +66,73 @@ pub(super) async fn stream_events(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let subscribed_topics = query
+        .topics
+        .as_deref()
+        .map(UiEventTopics::from_csv)
+        .transpose()
+        .map_err(|error| bad_request_error(error.to_string()))?
+        .unwrap_or(UiEventTopics::ALL);
 
     let (sender, sse) = Sse::channel();
-    let state_cloned = state;
+    let state_cloned = state.clone();
+    let mut topic_rx = state.ui_event_bus.subscribe();
 
-    tokio::spawn(async move {
-        let mut last_config_sig = String::new();
-        let mut last_request_logs_sig = String::new();
-        let mut last_notification_mailbox_sig = String::new();
-        let mut last_network_access_logs_sig = String::new();
-        let mut last_container_prepare_sig = String::new();
-        let mut last_runtime_sig = String::new();
-        let mut last_profile_runtime_sig = String::new();
-        let mut last_profile_sessions_sig = String::new();
-        let mut last_remote_access_sig = String::new();
+    state.tokio_handle.spawn(async move {
+        let mut signatures = EventSignatures::default();
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // Ignore the first immediate tick; we emit initial state immediately below.
         let _ = heartbeat.tick().await;
 
-        if !emit_config_if_changed(&state_cloned, &sender, &mut last_config_sig).await {
-            return;
-        }
-        if !emit_request_logs_if_changed(&state_cloned, &sender, &mut last_request_logs_sig).await {
-            return;
-        }
-        if !emit_notification_mailbox_if_changed(
-            &state_cloned,
-            &sender,
-            &mut last_notification_mailbox_sig,
-        )
-        .await
-        {
-            return;
-        }
-        if !emit_network_access_logs_if_changed(
-            &state_cloned,
-            &sender,
-            &mut last_network_access_logs_sig,
-        )
-        .await
-        {
-            return;
-        }
-        if !emit_container_prepare_if_changed(
-            &state_cloned,
-            &sender,
-            &mut last_container_prepare_sig,
-        )
-        .await
-        {
-            return;
-        }
-        if !emit_session_runtime_if_changed(
+        if !emit_topics_if_changed(
             &state_cloned,
             &sender,
             session_id.as_deref(),
-            &mut last_runtime_sig,
-        )
-        .await
-        {
-            return;
-        }
-        if !emit_session_runtimes_if_changed(
-            &state_cloned,
-            &sender,
             profile_id.as_deref(),
-            &mut last_profile_runtime_sig,
+            subscribed_topics,
+            &mut signatures,
         )
         .await
-        {
-            return;
-        }
-        if !emit_profile_sessions_if_changed(
-            &state_cloned,
-            &sender,
-            profile_id.as_deref(),
-            &mut last_profile_sessions_sig,
-        )
-        .await
-        {
-            return;
-        }
-        if !emit_remote_access_if_changed(&state_cloned, &sender, &mut last_remote_access_sig).await
         {
             return;
         }
 
         loop {
             tokio::select! {
-                () = state_cloned.ui_events_notify.notified() => {
-                    if !emit_config_if_changed(
-                        &state_cloned,
-                        &sender,
-                        &mut last_config_sig,
-                    ).await {
-                        break;
+                changed = topic_rx.recv() => {
+                    let mut dirty_topics = match changed {
+                        Ok(topics) => topics & subscribed_topics,
+                        Err(RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "UI event stream lagged; forcing subscribed-topic resync");
+                            subscribed_topics
+                        }
+                        Err(RecvError::Closed) => break,
+                    };
+                    loop {
+                        match topic_rx.try_recv() {
+                            Ok(extra_topics) => {
+                                dirty_topics |= extra_topics & subscribed_topics;
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "UI event stream lagged during coalescing; forcing subscribed-topic resync");
+                                dirty_topics = subscribed_topics;
+                                break;
+                            }
+                            Err(TryRecvError::Closed) => return,
+                        }
                     }
-                    if !emit_request_logs_if_changed(
-                        &state_cloned,
-                        &sender,
-                        &mut last_request_logs_sig,
-                    )
-                    .await
-                    {
-                        break;
+                    if dirty_topics.is_empty() {
+                        continue;
                     }
-                    if !emit_notification_mailbox_if_changed(
-                        &state_cloned,
-                        &sender,
-                        &mut last_notification_mailbox_sig,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    if !emit_network_access_logs_if_changed(
-                        &state_cloned,
-                        &sender,
-                        &mut last_network_access_logs_sig,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    if !emit_container_prepare_if_changed(
-                        &state_cloned,
-                        &sender,
-                        &mut last_container_prepare_sig,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    if !emit_session_runtime_if_changed(
+                    if !emit_topics_if_changed(
                         &state_cloned,
                         &sender,
                         session_id.as_deref(),
-                        &mut last_runtime_sig,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    if !emit_session_runtimes_if_changed(
-                        &state_cloned,
-                        &sender,
                         profile_id.as_deref(),
-                        &mut last_profile_runtime_sig,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    if !emit_profile_sessions_if_changed(
-                        &state_cloned,
-                        &sender,
-                        profile_id.as_deref(),
-                        &mut last_profile_sessions_sig,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    if !emit_remote_access_if_changed(
-                        &state_cloned,
-                        &sender,
-                        &mut last_remote_access_sig,
-                    )
-                    .await
-                    {
+                        dirty_topics,
+                        &mut signatures,
+                    ).await {
                         break;
                     }
                 }
@@ -231,6 +148,92 @@ pub(super) async fn stream_events(
     Ok(sse)
 }
 
+async fn emit_topics_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    session_filter: Option<&str>,
+    profile_filter: Option<&str>,
+    topics: UiEventTopics,
+    signatures: &mut EventSignatures,
+) -> bool {
+    if topics.contains(UiEventTopics::CONFIG)
+        && !emit_config_if_changed(state, sender, &mut signatures.config).await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::REQUEST_LOGS)
+        && !emit_request_logs_if_changed(state, sender, &mut signatures.request_logs).await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::NOTIFICATION_MAILBOX)
+        && !emit_notification_mailbox_if_changed(
+            state,
+            sender,
+            &mut signatures.notification_mailbox,
+        )
+        .await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::NETWORK_ACCESS_LOGS)
+        && !emit_network_access_logs_if_changed(state, sender, &mut signatures.network_access_logs)
+            .await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::CONTAINER_PREPARE)
+        && !emit_container_prepare_if_changed(state, sender, &mut signatures.container_prepare)
+            .await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::BROWSER_STATUS)
+        && !emit_browser_status_if_changed(state, sender, &mut signatures.browser_status).await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::SESSION_RUNTIME)
+        && !emit_session_runtime_if_changed(
+            state,
+            sender,
+            session_filter,
+            &mut signatures.session_runtime,
+        )
+        .await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::SESSION_RUNTIMES)
+        && !emit_session_runtimes_if_changed(
+            state,
+            sender,
+            profile_filter,
+            &mut signatures.session_runtimes,
+        )
+        .await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::PROFILE_SESSIONS)
+        && !emit_profile_sessions_if_changed(
+            state,
+            sender,
+            profile_filter,
+            &mut signatures.profile_sessions,
+        )
+        .await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::REMOTE_ACCESS)
+        && !emit_remote_access_if_changed(state, sender, &mut signatures.remote_access).await
+    {
+        return false;
+    }
+    true
+}
+
 async fn emit_config_if_changed(
     state: &Arc<UiServerState>,
     sender: &skyzen::responder::sse::Sender,
@@ -238,12 +241,7 @@ async fn emit_config_if_changed(
 ) -> bool {
     let config_payload = {
         let config = state.config_snapshot();
-        ConfigEventPayload {
-            ui_font: config.appearance.font.clone(),
-            ui_theme: config.appearance.theme.clone(),
-            ssh_servers: config.ssh_servers.clone(),
-            max_iterations: config.max_iterations,
-        }
+        build_ui_config_response(&config)
     };
     if let Ok(sig) = serde_json::to_string(&config_payload)
         && sig != *last_config_sig
@@ -290,6 +288,48 @@ async fn emit_request_logs_if_changed(
             return false;
         }
         *last_logs_sig = sig;
+    }
+    true
+}
+
+async fn emit_browser_status_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    last_browser_status_sig: &mut String,
+) -> bool {
+    let takeover_session_id = match state.runtime_service.find_browser_takeover_session().await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load browser takeover status");
+            None
+        }
+    };
+    let browser_manager = state.browser_manager();
+    let enabled = state.config_snapshot().browser.enabled;
+    let running = if let Some(manager) = browser_manager.as_ref() {
+        manager.is_running().await
+    } else {
+        false
+    };
+    let payload = BrowserStatusEventPayload {
+        enabled,
+        running,
+        cdp_endpoint: if running {
+            browser_manager
+                .as_ref()
+                .and_then(|manager| manager.cdp_endpoint())
+        } else {
+            None
+        },
+        takeover_session_id,
+    };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_browser_status_sig
+    {
+        if !send_event(sender, "browser_status", &payload).await {
+            return false;
+        }
+        *last_browser_status_sig = sig;
     }
     true
 }

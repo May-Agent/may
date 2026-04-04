@@ -1,2 +1,7 @@
 - Please read entire Claude.md file for guidance on working with this codebase
 - Use modern techniques and best practices, for instance, use bun instead of npm
+- Never concat strings by hand, utilize type-safed template
+- Agent context is expensive. Keep injected agent-facing context minimal and strictly task-operational.
+- Do not inject implementer-facing constraints, Codex instructions, AGENTS.md rules, or user instructions that are only meant for the coding agent into the runtime agent context.
+- When tuning prompts or runtime context, only include information the runtime agent must know to act correctly in that session. Keep framework-authoring notes and meta guidance in code/comments/docs instead of the agent prompt.
+- Do not inject generic prompting slogans or obvious meta advice into agent context. If a sentence does not change concrete runtime behavior, remove it.

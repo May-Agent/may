@@ -12,7 +12,7 @@ use crate::tool_dispatch::ToolDispatchers;
 use crate::tui::queue::{LARGE_PASTE_THRESHOLD, PASTE_TRUNCATE_LIMIT};
 use crate::tui::{App, Attachment, PendingMessage};
 use crate::workspace_request::WorkspaceRequestBroker;
-use crate::{ChatDb, MayAgent, MayConfig, SessionId, generate_session_title};
+use crate::{ChatDb, ChatMessage, MayAgent, MayConfig, SessionId, generate_session_title};
 
 #[derive(Debug, Clone)]
 pub struct LocalSessionRuntime {
@@ -24,8 +24,10 @@ pub struct LocalSessionRuntime {
 impl LocalSessionRuntime {
     #[must_use]
     pub fn new(db: ChatDb) -> Self {
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(db, notify));
+        let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
+            db,
+            crate::ui_event_bus::UiEventBus::new(),
+        ));
         let permission_approver =
             crate::agent::PermissionApprover::new().with_runtime_service(runtime_service.clone());
         Self {
@@ -334,7 +336,7 @@ fn pending_message_to_runtime(
             .iter()
             .map(persisted_attachment_from_tui)
             .collect::<anyhow::Result<Vec<_>>>()?,
-        hidden_context_xml: None,
+        hidden_context_xml: message.hidden_context_xml.clone(),
         created_at: message.queued_at.to_string(),
         delivery_mode: message.delivery_mode,
     })
@@ -349,6 +351,7 @@ async fn pending_message_from_runtime(
     }
     Ok(PendingMessage {
         content: message.content,
+        hidden_context_xml: message.hidden_context_xml,
         attachments,
         queued_at: message
             .created_at
@@ -611,7 +614,7 @@ impl RuntimeDeps {
         Ok(())
     }
 
-    pub fn start_agent_task(
+    pub async fn start_agent_task(
         &self,
         app: &mut App,
         worker: &AgentWorker,
@@ -629,9 +632,25 @@ impl RuntimeDeps {
             });
         }
 
+        if let Some(hidden_context_xml) = msg.hidden_context_xml.as_ref() {
+            app.session_manager
+                .append_message(ChatMessage::hidden_context(hidden_context_xml.to_string()))
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
+
+        app.session_manager
+            .append_message(ChatMessage::user(&msg.content))
+            .await
+            .map_err(anyhow::Error::from)?;
+
         let (prompt, image_urls) = prepare_message_content(&msg)?;
         app.start_processing(&msg);
-        Ok(worker.run(prompt, image_urls))
+        Ok(worker.run(
+            prompt,
+            msg.hidden_context_xml.as_ref().map(ToString::to_string),
+            image_urls,
+        ))
     }
 
     pub async fn finish_agent_task(
@@ -647,6 +666,15 @@ impl RuntimeDeps {
             .map(|session| session.id.clone());
         *agent_handle = None;
         app.finish_processing();
+
+        if !assistant_response.is_empty()
+            && let Err(error) = app
+                .session_manager
+                .append_message(ChatMessage::assistant(assistant_response))
+                .await
+        {
+            tracing::warn!(error = %error, "failed to persist assistant message");
+        }
 
         if let Err(e) = app.session_manager.save_current().await {
             tracing::warn!("Failed to save session history: {}", e);

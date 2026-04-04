@@ -25,7 +25,7 @@ pub struct Model {
     pub script_path: Option<String>,
     /// Inline script content to execute.
     pub script_inline: Option<String>,
-    /// Whether this task requires network access (leash-only flag).
+    /// Whether this task requires network access (heel-only flag).
     #[sea_orm(default_value = "0")]
     pub needs_network: bool,
     /// Whether the task has been approved for execution.

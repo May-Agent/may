@@ -8,6 +8,7 @@ pub fn copy_dir_contents_recursive(source: &Path, target: &Path) -> Result<(), s
     let mut options = CopyOptions::new();
     options.copy_inside = true;
     options.content_only = true;
+    options.overwrite = true;
 
     fs_extra::dir::copy(source, target, &options)
         .map(|_| ())

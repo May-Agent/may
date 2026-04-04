@@ -147,14 +147,14 @@ export function PreferencesSection({ configDraft, setDraft }: ConfigSectionProps
           >
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="disabled">disabled</SelectItem>
+              <SelectItem value="disabled">unsafe</SelectItem>
               <SelectItem value="restricted">restricted</SelectItem>
-              <SelectItem value="allow_list">allow_list</SelectItem>
-              <SelectItem value="deny_list">deny_list</SelectItem>
+              <SelectItem value="allow_list">networked (allow list)</SelectItem>
+              <SelectItem value="deny_list">networked (deny list)</SelectItem>
             </SelectContent>
           </Select>
           <p className="text-xs text-muted-foreground">
-            `restricted` blocks all outbound domains. `allow_list` and `deny_list` use glob patterns such as `*.example.com`.
+            `unsafe` keeps unrestricted compatibility. `restricted` audits a fully locked-down profile. `networked` audits traffic with host glob rules such as `*.example.com`.
           </p>
         </div>
 

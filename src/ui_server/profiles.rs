@@ -11,6 +11,7 @@ use skyzen::utils::{Json, State};
 
 use crate::db::{ChatDbError, CreateProfileParams, ProfileEnvironmentKind, UpdateProfileParams};
 use crate::profile::{ProfileInfo, query_profile_sessions};
+use crate::ui_event_bus::UiEventTopics;
 
 use super::error::{bad_request_error, internal_error, json_ok_response, typed_error_response};
 use super::state::{ContainerPrepareStage, ContainerPrepareStatus, UiServerState};
@@ -53,7 +54,7 @@ fn map_profile_error(err: ChatDbError) -> skyzen::Error {
 ///
 /// Separates domain errors (which carry a machine-readable [`ApiErrorCode`]) from
 /// infrastructure errors (which remain as [`skyzen::Error`]).
-enum ContainerPrepareError {
+pub(super) enum ContainerPrepareError {
     /// Container-specific error with a machine-readable code for the frontend.
     Domain { code: ApiErrorCode, message: String },
     /// Infrastructure error (DB failures, serialization, etc.).
@@ -66,7 +67,7 @@ impl From<skyzen::Error> for ContainerPrepareError {
     }
 }
 
-async fn ensure_profile_environment_ready(
+pub(super) async fn ensure_profile_environment_ready(
     state: &Arc<UiServerState>,
     db: &crate::db::ChatDb,
     profile_id: &str,
@@ -323,7 +324,6 @@ pub(super) async fn create_profile(
     super::remote_access::sync_remote_access_from_state(&state)
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
 
     Ok(Json(
         ProfileInfo::from_db_model(model).map_err(map_profile_error)?,
@@ -370,7 +370,6 @@ pub(super) async fn update_profile(
     super::remote_access::sync_remote_access_from_state(&state)
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
 
     Ok(Json(
         ProfileInfo::from_db_model(model).map_err(map_profile_error)?,
@@ -389,7 +388,6 @@ pub(super) async fn delete_profile(
     super::remote_access::sync_remote_access_from_state(&state)
         .await
         .map_err(internal_error)?;
-    state.notify_ui_events();
     Ok(Json(super::types::API_OK))
 }
 
@@ -454,7 +452,7 @@ pub(super) async fn create_folder(
         .create_folder(&folder_id, &profile_id, &req.name)
         .await
         .map_err(map_profile_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
 
     Ok(Json(FolderResponse {
         id: model.id,
@@ -481,7 +479,7 @@ pub(super) async fn update_folder(
             .await
             .map_err(internal_error)?;
     }
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
 
     Ok(Json(super::types::API_OK))
 }
@@ -495,7 +493,7 @@ pub(super) async fn delete_folder(
     let db = state.db();
 
     db.delete_folder(&id).await.map_err(internal_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }
 
@@ -510,7 +508,7 @@ pub(super) async fn pin_session(
     let db = state.db();
 
     db.pin_session(&id).await.map_err(map_profile_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }
 
@@ -523,7 +521,7 @@ pub(super) async fn unpin_session(
     let db = state.db();
 
     db.unpin_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }
 
@@ -536,7 +534,7 @@ pub(super) async fn archive_session(
     let db = state.db();
 
     db.archive_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }
 
@@ -549,7 +547,7 @@ pub(super) async fn unarchive_session(
     let db = state.db();
 
     db.unarchive_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }
 
@@ -565,6 +563,6 @@ pub(super) async fn move_to_folder(
     db.move_session_to_folder(&id, req.folder_id.as_deref())
         .await
         .map_err(map_profile_error)?;
-    state.notify_ui_events();
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }

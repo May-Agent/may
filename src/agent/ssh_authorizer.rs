@@ -53,7 +53,7 @@ impl SshSessionAuthorizer for MaySshAuthorizer {
         })
     }
 
-    fn authorize_leash_install(
+    fn authorize_heel_install(
         &self,
         target: &str,
         details: &str,
@@ -61,7 +61,7 @@ impl SshSessionAuthorizer for MaySshAuthorizer {
         let target = target.to_string();
         let details = details.to_string();
         Box::pin(async move {
-            self.ask_permission(format!("{details} Install leash on {target}?"), "Install")
+            self.ask_permission(format!("{details} Install heel on {target}?"), "Install")
                 .await
         })
     }
