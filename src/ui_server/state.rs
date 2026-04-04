@@ -452,10 +452,30 @@ impl UiServerState {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum UiAnswerInput {
+    Selected(Vec<String>),
+    Custom(String),
+    Skipped(()),
+}
+
+impl From<UiAnswerInput> for AnswerValue {
+    fn from(value: UiAnswerInput) -> Self {
+        match value {
+            UiAnswerInput::Selected(selected) if selected.is_empty() => Self::Skipped,
+            UiAnswerInput::Selected(selected) => Self::Selected(selected),
+            UiAnswerInput::Custom(custom) if custom.trim().is_empty() => Self::Skipped,
+            UiAnswerInput::Custom(custom) => Self::Custom(custom),
+            UiAnswerInput::Skipped(()) => Self::Skipped,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiQuestionAnswer {
     pub(crate) section: String,
-    pub(crate) answer: serde_json::Value,
+    pub(crate) answer: UiAnswerInput,
 }
 
 #[derive(Debug, serde::Deserialize)]

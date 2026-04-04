@@ -3,7 +3,8 @@ use crate::config::{
 };
 use crate::network_policy::NetworkPolicyMode;
 use crate::session::{
-    PendingUserMessage, PendingUserMessageMode, SessionPlanState, SessionRuntimeState,
+    AttachmentKind, PendingUserMessage, PendingUserMessageMode, SessionPlanState,
+    SessionRuntimeState,
 };
 use crate::xml_fragment::XmlFragment;
 use aither_core::llm::ToolResult;
@@ -33,10 +34,17 @@ pub enum ApiErrorCode {
     BadRequest,
     InternalError,
     NotFound,
+    BrowserTakeoverActive,
+    SessionNotFound,
+    ModelNotConfigured,
+    ProviderUnavailable,
+    ProfileConfigurationInvalid,
     ContainerPreparing,
     ContainerBuildFailed,
+    ContainerStartFailed,
     ContainerRuntimeUnavailable,
     ManagedPodmanApprovalRequired,
+    LocationUnavailable,
 }
 
 /// Structured error body with a machine-readable `code` and human-readable `error` message.
@@ -499,7 +507,7 @@ pub struct ApiAttachment {
     pub(crate) id: String,
     pub(crate) name: String,
     #[serde(rename = "type")]
-    pub(crate) attachment_type: String,
+    pub(crate) attachment_type: AttachmentKind,
     pub(crate) url: String,
     #[serde(default)]
     pub(crate) upload_data_url: Option<String>,

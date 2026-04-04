@@ -60,8 +60,14 @@ impl SessionRuntimeState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown session runtime state: {value}")]
+pub struct SessionRuntimeStateParseError {
+    value: String,
+}
+
 impl core::str::FromStr for SessionRuntimeState {
-    type Err = String;
+    type Err = SessionRuntimeStateParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
@@ -71,12 +77,9 @@ impl core::str::FromStr for SessionRuntimeState {
             "waiting_workspace" => Ok(Self::WaitingWorkspace),
             "waiting_ask_user" => Ok(Self::WaitingAskUser),
             "waiting_terminal_input" => Ok(Self::WaitingTerminalInput),
-            other => {
-                let mut message = String::with_capacity(31 + other.len());
-                message.push_str("unknown session runtime state: ");
-                message.push_str(other);
-                Err(message)
-            }
+            other => Err(SessionRuntimeStateParseError {
+                value: other.to_string(),
+            }),
         }
     }
 }
@@ -179,19 +182,22 @@ impl PendingUserMessageMode {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown pending user message mode: {value}")]
+pub struct PendingUserMessageModeParseError {
+    value: String,
+}
+
 impl core::str::FromStr for PendingUserMessageMode {
-    type Err = String;
+    type Err = PendingUserMessageModeParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "steer" => Ok(Self::Steer),
             "queue" => Ok(Self::Queue),
-            other => {
-                let mut message = String::with_capacity(35 + other.len());
-                message.push_str("unknown pending user message mode: ");
-                message.push_str(other);
-                Err(message)
-            }
+            other => Err(PendingUserMessageModeParseError {
+                value: other.to_string(),
+            }),
         }
     }
 }
@@ -345,13 +351,40 @@ impl SessionRuntimeSummary {
 }
 
 /// Persisted attachment shape for pending user messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Image,
+    File,
+    Text,
+    Document,
+    Pdf,
+    Audio,
+    Video,
+}
+
+impl AttachmentKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::File => "file",
+            Self::Text => "text",
+            Self::Document => "document",
+            Self::Pdf => "pdf",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedAttachment {
     pub id: String,
     pub name: String,
     #[serde(rename = "type")]
-    pub attachment_type: String,
+    pub attachment_type: AttachmentKind,
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_data_url: Option<String>,

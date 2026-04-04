@@ -8,7 +8,7 @@ use crate::session::history::{AskUserResponseData, PermissionResponseData, Works
 use crate::session::{ChatMessage, SessionId};
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::{append_history_message, parse_ui_answer_value};
+use super::helpers::append_history_message;
 use super::state::{AskUserRespondRequest, UiServerState};
 use super::types::{PermissionRespondRequest, SessionRuntimeResponse, WorkspaceRespondRequest};
 
@@ -85,7 +85,7 @@ pub(super) async fn respond_ask_user_request(
         .into_iter()
         .map(|answer| QuestionAnswer {
             section: answer.section,
-            answer: parse_ui_answer_value(answer.answer),
+            answer: answer.answer.into(),
         })
         .collect::<Vec<_>>();
 

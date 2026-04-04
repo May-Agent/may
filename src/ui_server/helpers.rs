@@ -13,7 +13,6 @@ use std::sync::Arc;
 use serde::Serialize;
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
-use crate::ask_user::AnswerValue;
 use crate::session::{ChatMessage, MayHomePaths, SessionId, SessionPaths};
 
 use super::error::{bad_request_error, internal_error};
@@ -81,31 +80,6 @@ pub(super) fn parse_arg_value(args: &[String], key: &str) -> Option<String> {
         }
     }
     None
-}
-
-pub(super) fn parse_ui_answer_value(value: serde_json::Value) -> AnswerValue {
-    match value {
-        serde_json::Value::Null => AnswerValue::Skipped,
-        serde_json::Value::String(s) => {
-            if s.trim().is_empty() {
-                AnswerValue::Skipped
-            } else {
-                AnswerValue::Custom(s)
-            }
-        }
-        serde_json::Value::Array(items) => {
-            let selected = items
-                .into_iter()
-                .filter_map(|item| item.as_str().map(ToString::to_string))
-                .collect::<Vec<_>>();
-            if selected.is_empty() {
-                AnswerValue::Skipped
-            } else {
-                AnswerValue::Selected(selected)
-            }
-        }
-        _ => AnswerValue::Skipped,
-    }
 }
 
 /// Convert `Duration::as_millis()` (u128) to u64 with saturation.

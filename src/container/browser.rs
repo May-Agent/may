@@ -56,20 +56,95 @@ use crate::config::{BrowserBackendKind, BrowserConfig as MayBrowserConfig};
 
 // ── Error ──────────────────────────────────────────────────────────────────────
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BrowserInputError {
+    #[error("navigate input requires a non-empty url")]
+    EmptyNavigationUrl,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
     #[error("Browser not running")]
     NotRunning,
     #[error("Managed browser runtime is not provisioned")]
     NotProvisioned,
-    #[error("Browser: {0}")]
-    Browser(String),
-    #[error("WebRTC: {0}")]
-    WebRtc(String),
-    #[error("Encoder: {0}")]
-    Encoder(String),
-    #[error("Provisioning: {0}")]
-    Provisioning(String),
+    #[error("browser actor unexpectedly closed while handling {operation}")]
+    ActorClosed { operation: &'static str },
+    #[error("browser operation failed during {operation}")]
+    BrowserOperation {
+        operation: &'static str,
+        #[source]
+        source: BoxError,
+    },
+    #[error("webrtc operation failed during {operation}")]
+    WebRtcOperation {
+        operation: &'static str,
+        #[source]
+        source: BoxError,
+    },
+    #[error("encoder operation failed during {operation}")]
+    EncoderOperation {
+        operation: &'static str,
+        #[source]
+        source: BoxError,
+    },
+    #[error("provisioning operation failed during {operation}")]
+    ProvisioningOperation {
+        operation: &'static str,
+        #[source]
+        source: BoxError,
+    },
+    #[error("browser input payload is invalid")]
+    InvalidInputPayload {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(transparent)]
+    InvalidInput(#[from] BrowserInputError),
+}
+
+impl BrowserError {
+    fn browser_operation(
+        operation: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::BrowserOperation {
+            operation,
+            source: Box::new(source),
+        }
+    }
+
+    fn web_rtc_operation(
+        operation: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::WebRtcOperation {
+            operation,
+            source: Box::new(source),
+        }
+    }
+
+    fn encoder_operation(
+        operation: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::EncoderOperation {
+            operation,
+            source: Box::new(source),
+        }
+    }
+
+    fn provisioning_operation(
+        operation: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::ProvisioningOperation {
+            operation,
+            source: Box::new(source),
+        }
+    }
 }
 
 // ── DataChannel input messages ─────────────────────────────────────────────────
@@ -84,12 +159,50 @@ enum InputMessage {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+enum MouseEventType {
+    MousePressed,
+    MouseReleased,
+    MouseMoved,
+    MouseWheel,
+}
+
+impl From<MouseEventType> for DispatchMouseEventType {
+    fn from(value: MouseEventType) -> Self {
+        match value {
+            MouseEventType::MousePressed => Self::MousePressed,
+            MouseEventType::MouseReleased => Self::MouseReleased,
+            MouseEventType::MouseMoved => Self::MouseMoved,
+            MouseEventType::MouseWheel => Self::MouseWheel,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MouseButtonInput {
+    Left,
+    Right,
+    Middle,
+}
+
+impl From<MouseButtonInput> for MouseButton {
+    fn from(value: MouseButtonInput) -> Self {
+        match value {
+            MouseButtonInput::Left => Self::Left,
+            MouseButtonInput::Right => Self::Right,
+            MouseButtonInput::Middle => Self::Middle,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MouseInput {
-    event_type: String,
+    event_type: MouseEventType,
     x: f64,
     y: f64,
     #[serde(default)]
-    button: Option<String>,
+    button: Option<MouseButtonInput>,
     #[serde(default)]
     click_count: Option<i32>,
     #[serde(default)]
@@ -102,8 +215,28 @@ struct MouseInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+enum KeyboardEventType {
+    KeyDown,
+    KeyUp,
+    Char,
+    RawKeyDown,
+}
+
+impl From<KeyboardEventType> for DispatchKeyEventType {
+    fn from(value: KeyboardEventType) -> Self {
+        match value {
+            KeyboardEventType::KeyDown => Self::KeyDown,
+            KeyboardEventType::KeyUp => Self::KeyUp,
+            KeyboardEventType::Char => Self::Char,
+            KeyboardEventType::RawKeyDown => Self::RawKeyDown,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct KeyboardInput {
-    event_type: String,
+    event_type: KeyboardEventType,
     #[serde(default)]
     key: Option<String>,
     #[serde(default)]
@@ -228,16 +361,18 @@ impl BrowserManager {
     pub fn new(config: MayBrowserConfig, may_dir: PathBuf) -> Result<Self, BrowserError> {
         config
             .validate()
-            .map_err(|error| BrowserError::Browser(error.to_string()))?;
+            .map_err(|error| BrowserError::browser_operation("validate browser config", error))?;
         // Register default codecs: H.264, VP8, VP9, AV1 — SDP negotiation picks the best
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
-            .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
+            .map_err(|error| BrowserError::web_rtc_operation("register default codecs", error))?;
 
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media_engine)
-            .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
+            .map_err(|error| {
+                BrowserError::web_rtc_operation("register default interceptors", error)
+            })?;
 
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -341,10 +476,12 @@ impl BrowserManager {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(BrowserCommand::Start { reply: reply_tx })
-            .map_err(|_| BrowserError::Browser("browser actor unexpectedly closed".to_string()))?;
+            .map_err(|_| BrowserError::ActorClosed { operation: "start browser" })?;
         reply_rx
             .await
-            .map_err(|_| BrowserError::Browser("browser actor dropped start reply".to_string()))?
+            .map_err(|_| BrowserError::ActorClosed {
+                operation: "await start reply",
+            })?
     }
 
     /// Stop the browser and clean up all resources.
@@ -352,10 +489,12 @@ impl BrowserManager {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(BrowserCommand::Stop { reply: reply_tx })
-            .map_err(|_| BrowserError::Browser("browser actor unexpectedly closed".to_string()))?;
+            .map_err(|_| BrowserError::ActorClosed { operation: "stop browser" })?;
         reply_rx
             .await
-            .map_err(|_| BrowserError::Browser("browser actor dropped stop reply".to_string()))?
+            .map_err(|_| BrowserError::ActorClosed {
+                operation: "await stop reply",
+            })?
     }
 
     /// Handle a WebRTC SDP offer from a client. Returns the SDP answer.
@@ -371,9 +510,11 @@ impl BrowserManager {
                 offer_sdp,
                 reply: reply_tx,
             })
-            .map_err(|_| BrowserError::Browser("browser actor unexpectedly closed".to_string()))?;
-        reply_rx.await.map_err(|_| {
-            BrowserError::Browser("browser actor dropped offer handling reply".to_string())
+            .map_err(|_| BrowserError::ActorClosed {
+                operation: "handle webrtc offer",
+            })?;
+        reply_rx.await.map_err(|_| BrowserError::ActorClosed {
+            operation: "await webrtc offer reply",
         })?
     }
 
@@ -384,9 +525,11 @@ impl BrowserManager {
                 url,
                 reply: reply_tx,
             })
-            .map_err(|_| BrowserError::Browser("browser actor unexpectedly closed".to_string()))?;
-        reply_rx.await.map_err(|_| {
-            BrowserError::Browser("browser actor dropped page read reply".to_string())
+            .map_err(|_| BrowserError::ActorClosed {
+                operation: "read browser page",
+            })?;
+        reply_rx.await.map_err(|_| BrowserError::ActorClosed {
+            operation: "await page read reply",
         })?
     }
 }
@@ -395,7 +538,7 @@ pub async fn provision_managed_browser(may_dir: &Path) -> Result<PathBuf, Browse
     let cache_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_cache_dir();
     tokio::fs::create_dir_all(&cache_dir)
         .await
-        .map_err(|error| BrowserError::Provisioning(error.to_string()))?;
+        .map_err(|error| BrowserError::provisioning_operation("create browser cache dir", error))?;
 
     let options = BrowserFetcherOptions::builder()
         .with_path(cache_dir)
@@ -404,12 +547,14 @@ pub async fn provision_managed_browser(may_dir: &Path) -> Result<PathBuf, Browse
             ManagedBrowserChannel::Stable,
         ))
         .build()
-        .map_err(|error| BrowserError::Provisioning(error.to_string()))?;
+        .map_err(|error| {
+            BrowserError::provisioning_operation("build browser fetcher options", error)
+        })?;
 
     let installation = BrowserFetcher::new(options)
         .fetch()
         .await
-        .map_err(|error| BrowserError::Provisioning(error.to_string()))?;
+        .map_err(|error| BrowserError::provisioning_operation("fetch managed browser", error))?;
 
     Ok(installation.executable_path)
 }
@@ -420,7 +565,7 @@ pub async fn prepare_browser_runtime(
 ) -> Result<(), BrowserError> {
     config
         .validate()
-        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("validate browser runtime config", error))?;
     if config.requires_managed_runtime() {
         let _ = provision_managed_browser(may_dir).await?;
     }
@@ -460,14 +605,22 @@ impl BrowserRuntime {
                             resolve_local_browser_websocket_endpoint(config.port).await?;
                         let (browser, handler) = Browser::connect(endpoint)
                             .await
-                            .map_err(|error| BrowserError::Browser(error.to_string()))?;
+                            .map_err(|error| {
+                                BrowserError::browser_operation(
+                                    "connect to managed browser endpoint",
+                                    error,
+                                )
+                            })?;
                         (browser, handler, false)
                     }
                     ManagedBrowserListenerState::ExternalProcess => {
-                        return Err(BrowserError::Browser(format!(
-                            "browser port {} is already in use by a non-May process",
-                            config.port
-                        )));
+                        return Err(BrowserError::browser_operation(
+                            "validate managed browser listener ownership",
+                            std::io::Error::other(format!(
+                                "browser port {} is already in use by a non-May process",
+                                config.port
+                            )),
+                        ));
                     }
                     ManagedBrowserListenerState::NotListening => {
                         cleanup_stale_chrome(config.port).await;
@@ -481,12 +634,22 @@ impl BrowserRuntime {
                             )
                         })
                         .await
-                        .map_err(|e| BrowserError::Browser(e.to_string()))?;
+                        .map_err(|error| {
+                            BrowserError::browser_operation(
+                                "resolve managed browser paths",
+                                std::io::Error::other(error.to_string()),
+                            )
+                        })?;
                         let (binary_path, profile_dir) = browser_paths;
                         cleanup_profile_lock_files(profile_dir.as_path()).await;
                         tokio::fs::create_dir_all(&profile_dir)
                             .await
-                            .map_err(|error| BrowserError::Browser(error.to_string()))?;
+                            .map_err(|error| {
+                                BrowserError::browser_operation(
+                                    "create browser profile dir",
+                                    error,
+                                )
+                            })?;
 
                         let mut builder = BrowserConfig::builder()
                             .new_headless_mode()
@@ -498,10 +661,20 @@ impl BrowserRuntime {
                         let path = binary_path.ok_or(BrowserError::NotProvisioned)?;
                         builder = builder.chrome_executable(path);
 
-                        let browser_config = builder.build().map_err(BrowserError::Browser)?;
+                        let browser_config = builder.build().map_err(|error| {
+                            BrowserError::browser_operation(
+                                "build browser launch config",
+                                std::io::Error::other(error),
+                            )
+                        })?;
                         let (browser, handler) = Browser::launch(browser_config)
                             .await
-                            .map_err(|error| BrowserError::Browser(error.to_string()))?;
+                            .map_err(|error| {
+                                BrowserError::browser_operation(
+                                    "launch managed browser",
+                                    error,
+                                )
+                            })?;
                         (browser, handler, true)
                     }
                 }
@@ -509,10 +682,14 @@ impl BrowserRuntime {
             BrowserBackendKind::RemoteCdp => {
                 let endpoint = config
                     .remote_cdp_endpoint()
-                    .map_err(|error| BrowserError::Browser(error.to_string()))?;
+                    .map_err(|error| {
+                        BrowserError::browser_operation("resolve remote cdp endpoint", error)
+                    })?;
                 let (browser, handler) = Browser::connect(endpoint)
                     .await
-                    .map_err(|error| BrowserError::Browser(error.to_string()))?;
+                    .map_err(|error| {
+                        BrowserError::browser_operation("connect to remote cdp endpoint", error)
+                    })?;
                 (browser, handler, false)
             }
         };
@@ -523,7 +700,7 @@ impl BrowserRuntime {
             browser
                 .new_page("about:blank")
                 .await
-                .map_err(|e| BrowserError::Browser(e.to_string()))?,
+                .map_err(|error| BrowserError::browser_operation("open blank page", error))?,
         );
 
         let max_width = i64::from(config.screencast_max_width);
@@ -538,7 +715,7 @@ impl BrowserRuntime {
                 .build(),
         )
         .await
-        .map_err(|e| BrowserError::Browser(e.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("start screencast", error))?;
 
         let (cdp_reader, sample_writer) = start_encoding_pipeline(
             page.clone(),
@@ -608,17 +785,19 @@ impl BrowserRuntime {
             self.webrtc_api
                 .new_peer_connection(config)
                 .await
-                .map_err(|e| BrowserError::WebRtc(e.to_string()))?,
+                .map_err(|error| {
+                    BrowserError::web_rtc_operation("create peer connection", error)
+                })?,
         );
 
         let video_rtp_sender = peer_connection
             .add_track(Arc::clone(&self.video_track) as Arc<dyn TrackLocal + Send + Sync>)
             .await
-            .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
+            .map_err(|error| BrowserError::web_rtc_operation("add video track", error))?;
         let audio_rtp_sender = peer_connection
             .add_track(Arc::clone(&self.audio_track) as Arc<dyn TrackLocal + Send + Sync>)
             .await
-            .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
+            .map_err(|error| BrowserError::web_rtc_operation("add audio track", error))?;
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 1500];
@@ -635,30 +814,38 @@ impl BrowserRuntime {
         setup_peer_connection_lifecycle(&peer_connection, peer_id.clone(), peer_events);
 
         let offer = RTCSessionDescription::offer(offer_sdp)
-            .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
+            .map_err(|error| BrowserError::web_rtc_operation("parse offer", error))?;
         peer_connection
             .set_remote_description(offer)
             .await
-            .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
+            .map_err(|error| BrowserError::web_rtc_operation("set remote description", error))?;
 
         let answer = peer_connection
             .create_answer(None)
             .await
-            .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
+            .map_err(|error| BrowserError::web_rtc_operation("create answer", error))?;
 
         let mut gather_complete = peer_connection.gathering_complete_promise().await;
 
         peer_connection
             .set_local_description(answer)
             .await
-            .map_err(|e| BrowserError::WebRtc(e.to_string()))?;
+            .map_err(|error| BrowserError::web_rtc_operation("set local description", error))?;
 
         tokio::time::timeout(Duration::from_secs(10), gather_complete.recv())
             .await
-            .map_err(|_| BrowserError::WebRtc("ICE gathering timed out".to_string()))?;
+            .map_err(|_| {
+                BrowserError::web_rtc_operation(
+                    "wait for ice gathering",
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "ICE gathering timed out"),
+                )
+            })?;
 
         let local_desc = peer_connection.local_description().await.ok_or_else(|| {
-            BrowserError::WebRtc("No local description after gathering".to_string())
+            BrowserError::web_rtc_operation(
+                "read local description",
+                std::io::Error::other("no local description after gathering"),
+            )
         })?;
 
         self.peers.insert(peer_id, peer_connection);
@@ -681,7 +868,12 @@ async fn inspect_managed_browser_listener_state(
 ) -> Result<ManagedBrowserListenerState, BrowserError> {
     tokio::task::spawn_blocking(move || inspect_managed_browser_listener_state_blocking(port))
         .await
-        .map_err(|error| BrowserError::Browser(error.to_string()))?
+        .map_err(|error| {
+            BrowserError::browser_operation(
+                "inspect managed browser listener state",
+                std::io::Error::other(error.to_string()),
+            )
+        })?
 }
 
 fn inspect_managed_browser_listener_state_blocking(
@@ -690,7 +882,7 @@ fn inspect_managed_browser_listener_state_blocking(
     let output = std::process::Command::new("lsof")
         .args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"])
         .output()
-        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("run lsof", error))?;
     if !output.status.success() && output.stdout.is_empty() {
         return Ok(ManagedBrowserListenerState::NotListening);
     }
@@ -704,9 +896,12 @@ fn inspect_managed_browser_listener_state_blocking(
         let command = std::process::Command::new("ps")
             .args(["-p", pid, "-o", "args="])
             .output()
-            .map_err(|error| BrowserError::Browser(error.to_string()))?;
+            .map_err(|error| BrowserError::browser_operation("run ps", error))?;
         if !command.status.success() {
-            return Err(BrowserError::Browser(format!("ps failed for pid {pid}")));
+            return Err(BrowserError::browser_operation(
+                "inspect listening pid command line",
+                std::io::Error::other(format!("ps failed for pid {pid}")),
+            ));
         }
         if String::from_utf8_lossy(&command.stdout).contains("chromiumoxide-runner") {
             return Ok(ManagedBrowserListenerState::Managed);
@@ -722,23 +917,29 @@ async fn resolve_local_browser_websocket_endpoint(port: u16) -> Result<String, B
     endpoint.push_str("/json/version");
     let response = reqwest::get(endpoint.as_str())
         .await
-        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("fetch browser version metadata", error))?;
     if !response.status().is_success() {
-        return Err(BrowserError::Browser(format!(
-            "browser debugger metadata request to {} returned HTTP {}",
-            endpoint,
-            response.status()
-        )));
+        return Err(BrowserError::browser_operation(
+            "validate browser version metadata response",
+            std::io::Error::other(format!(
+                "browser debugger metadata request to {} returned HTTP {}",
+                endpoint,
+                response.status()
+            )),
+        ));
     }
     let metadata: BrowserVersionMetadata = response
         .json()
         .await
-        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("decode browser version metadata", error))?;
     metadata.web_socket_debugger_url.ok_or_else(|| {
-        BrowserError::Browser(format!(
-            "browser debugger metadata at {} did not include webSocketDebuggerUrl",
-            endpoint
-        ))
+        BrowserError::browser_operation(
+            "read browser websocket endpoint",
+            std::io::Error::other(format!(
+                "browser debugger metadata at {} did not include webSocketDebuggerUrl",
+                endpoint
+            )),
+        )
     })
 }
 
@@ -748,22 +949,20 @@ async fn read_page_snapshot(
 ) -> Result<BrowserPageSnapshot, BrowserError> {
     let trimmed_url = url.trim();
     if trimmed_url.is_empty() {
-        return Err(BrowserError::Browser(
-            "browser read requires a non-empty url".to_string(),
-        ));
+        return Err(BrowserError::InvalidInput(BrowserInputError::EmptyNavigationUrl));
     }
 
     page.goto(trimmed_url)
         .await
-        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("navigate page for read", error))?;
     tokio::time::sleep(Duration::from_millis(3000)).await;
 
     let snapshot: BrowserPageSnapshot = page
         .evaluate("() => { const norm = (value) => typeof value === 'string' ? value.replace(/\\s+/g, ' ').trim() : ''; const headings = Array.from(document.querySelectorAll('h1, h2, h3')).map((node) => norm(node.innerText)).filter(Boolean).slice(0, 8); const bodyText = norm(document.body ? document.body.innerText : '').slice(0, 4000); return { url: location.href, title: norm(document.title), mainHeading: headings.length > 0 ? headings[0] : null, headings, textExcerpt: bodyText }; }")
         .await
-        .map_err(|error| BrowserError::Browser(error.to_string()))?
+        .map_err(|error| BrowserError::browser_operation("evaluate page snapshot script", error))?
         .into_value()
-        .map_err(|error| BrowserError::Browser(error.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("decode page snapshot", error))?;
 
     Ok(snapshot)
 }
@@ -776,7 +975,7 @@ async fn start_encoding_pipeline(
     let mut event_stream = page
         .event_listener::<EventScreencastFrame>()
         .await
-        .map_err(|e| BrowserError::Browser(e.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("subscribe to screencast frames", error))?;
 
     let (jpeg_tx, jpeg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<EncodedSample>(16);
@@ -813,7 +1012,7 @@ async fn start_encoding_pipeline(
         .spawn(move || {
             encode_loop(jpeg_rx, sample_tx, screencast_quality);
         })
-        .map_err(|e| BrowserError::Encoder(e.to_string()))?;
+        .map_err(|error| BrowserError::encoder_operation("spawn browser encoder thread", error))?;
 
     let sample_writer = tokio::spawn(async move {
         while let Some(encoded) = sample_rx.recv().await {
@@ -982,43 +1181,28 @@ fn setup_data_channel_handler(pc: &RTCPeerConnection, page: Arc<Page>) {
 }
 
 async fn handle_input_message(page: &Page, text: &str) -> Result<(), BrowserError> {
-    let msg: InputMessage =
-        serde_json::from_str(text).map_err(|e| BrowserError::Browser(e.to_string()))?;
+    let msg: InputMessage = serde_json::from_str(text)
+        .map_err(|source| BrowserError::InvalidInputPayload { source })?;
 
     match msg {
         InputMessage::Mouse(input) => dispatch_mouse(page, input).await,
         InputMessage::Keyboard(input) => dispatch_keyboard(page, input).await,
         InputMessage::Navigate { url } => {
-            page.goto(&url)
+            let trimmed_url = url.trim();
+            if trimmed_url.is_empty() {
+                return Err(BrowserInputError::EmptyNavigationUrl.into());
+            }
+            page.goto(trimmed_url)
                 .await
-                .map_err(|e| BrowserError::Browser(e.to_string()))?;
+                .map_err(|error| BrowserError::browser_operation("navigate from data channel", error))?;
             Ok(())
         }
     }
 }
 
 async fn dispatch_mouse(page: &Page, input: MouseInput) -> Result<(), BrowserError> {
-    let event_type = match input.event_type.as_str() {
-        "mousePressed" => DispatchMouseEventType::MousePressed,
-        "mouseReleased" => DispatchMouseEventType::MouseReleased,
-        "mouseMoved" => DispatchMouseEventType::MouseMoved,
-        "mouseWheel" => DispatchMouseEventType::MouseWheel,
-        other => {
-            return Err(BrowserError::Browser(format!(
-                "Unknown mouse event type: {other}"
-            )));
-        }
-    };
-
-    let button = input
-        .button
-        .as_deref()
-        .map_or(MouseButton::None, |b| match b {
-            "left" => MouseButton::Left,
-            "right" => MouseButton::Right,
-            "middle" => MouseButton::Middle,
-            _ => MouseButton::None,
-        });
+    let event_type = DispatchMouseEventType::from(input.event_type);
+    let button = input.button.map_or(MouseButton::None, MouseButton::from);
 
     let mut builder = DispatchMouseEventParams::builder()
         .r#type(event_type)
@@ -1039,27 +1223,20 @@ async fn dispatch_mouse(page: &Page, input: MouseInput) -> Result<(), BrowserErr
         builder = builder.modifiers(i64::from(m));
     }
 
-    let params = builder.build().map_err(BrowserError::Browser)?;
+    let params = builder.build().map_err(|error| {
+        BrowserError::browser_operation(
+            "build mouse dispatch params",
+            std::io::Error::other(error),
+        )
+    })?;
     page.execute(params)
         .await
-        .map_err(|e| BrowserError::Browser(e.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("dispatch mouse event", error))?;
     Ok(())
 }
 
 async fn dispatch_keyboard(page: &Page, input: KeyboardInput) -> Result<(), BrowserError> {
-    let event_type = match input.event_type.as_str() {
-        "keyDown" => DispatchKeyEventType::KeyDown,
-        "keyUp" => DispatchKeyEventType::KeyUp,
-        "char" => DispatchKeyEventType::Char,
-        "rawKeyDown" => DispatchKeyEventType::RawKeyDown,
-        other => {
-            return Err(BrowserError::Browser(format!(
-                "Unknown key event type: {other}"
-            )));
-        }
-    };
-
-    let mut builder = DispatchKeyEventParams::builder().r#type(event_type);
+    let mut builder = DispatchKeyEventParams::builder().r#type(input.event_type);
 
     if let Some(ref key) = input.key {
         builder = builder.key(key);
@@ -1074,10 +1251,15 @@ async fn dispatch_keyboard(page: &Page, input: KeyboardInput) -> Result<(), Brow
         builder = builder.modifiers(i64::from(m));
     }
 
-    let params = builder.build().map_err(BrowserError::Browser)?;
+    let params = builder.build().map_err(|error| {
+        BrowserError::browser_operation(
+            "build keyboard dispatch params",
+            std::io::Error::other(error),
+        )
+    })?;
     page.execute(params)
         .await
-        .map_err(|e| BrowserError::Browser(e.to_string()))?;
+        .map_err(|error| BrowserError::browser_operation("dispatch keyboard event", error))?;
     Ok(())
 }
 

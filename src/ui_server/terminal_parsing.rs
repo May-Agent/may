@@ -1,47 +1,59 @@
 //! Native terminal-command tool event parsing for streaming UI updates.
 
 use aither_core::llm::ToolResult;
+use aither_sandbox::{OutputEntry, TerminalArgs, TerminalExecutionMode};
 
 use super::types::{
     ApiTerminalExecution, TERMINAL_TOOL_NAME, TerminalCommandMode, TerminalExecutionStatus,
     TerminalStateSnapshot, ToolEventRecord,
 };
 
-fn parse_terminal_mode(raw: &str) -> TerminalCommandMode {
-    match raw {
-        "default" => TerminalCommandMode::Default,
-        "sandboxed" => TerminalCommandMode::Sandboxed,
-        "unsafe" => TerminalCommandMode::Unsafe,
-        "ssh" => TerminalCommandMode::Ssh,
-        other => panic!("invalid terminal command mode: {other}"),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TerminalTaskStatus {
+    Running,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) struct ParsedTerminalToolResult {
+    pub(super) stdout: OutputEntry,
+    pub(super) exit_code: i32,
+    #[serde(default)]
+    pub(super) status: Option<TerminalTaskStatus>,
+}
+
+fn parse_terminal_mode(mode: TerminalExecutionMode) -> TerminalCommandMode {
+    match mode {
+        TerminalExecutionMode::Default => TerminalCommandMode::Default,
+        TerminalExecutionMode::Sandboxed => TerminalCommandMode::Sandboxed,
+        TerminalExecutionMode::Unsafe => TerminalCommandMode::Unsafe,
+        TerminalExecutionMode::Ssh => TerminalCommandMode::Ssh,
     }
 }
 
 pub(super) fn parse_terminal_start(arguments: &str) -> (String, Option<TerminalCommandMode>) {
-    let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok();
-    let script = parsed
-        .as_ref()
-        .and_then(|v| v.get("script"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(arguments)
-        .to_string();
-    let mode = parsed
-        .as_ref()
-        .and_then(|v| v.get("mode"))
-        .and_then(|v| v.as_str())
-        .map(parse_terminal_mode);
-    (script, mode)
+    let parsed: TerminalArgs = serde_json::from_str(arguments).unwrap_or_else(|error| {
+        panic!("invalid terminal tool start payload: {error}; payload: {arguments}")
+    });
+    (parsed.script, Some(parse_terminal_mode(parsed.mode)))
+}
+
+pub(super) fn parse_terminal_result_payload(
+    result: &ToolResult,
+) -> Option<ParsedTerminalToolResult> {
+    let ToolResult::Json { value } = result else {
+        return None;
+    };
+    serde_json::from_value(value.clone()).ok()
 }
 
 /// Preserve terminal tool output as structured JSON when possible.
 fn parse_terminal_end_output_from_result(result: &ToolResult) -> Option<String> {
-    let Ok(serialized) = result.render_for_model() else {
-        return None;
-    };
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&serialized) {
-        return Some(parsed.to_string());
+    if let ToolResult::Json { value } = result {
+        return Some(value.to_string());
     }
-    Some(serialized)
+    result.render_for_model().ok()
 }
 
 /// Determine if a terminal execution failed from a typed tool result.
@@ -49,21 +61,7 @@ fn parse_terminal_failed_from_result(result: &ToolResult) -> bool {
     if result.is_error() {
         return true;
     }
-    let Ok(serialized) = result.render_for_model() else {
-        return true;
-    };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&serialized) else {
-        return false;
-    };
-    let nonzero_exit = parsed
-        .get("exit_code")
-        .and_then(serde_json::Value::as_i64)
-        .is_some_and(|code| code != 0);
-    let failed_status = parsed
-        .get("status")
-        .and_then(|v| v.as_str())
-        .is_some_and(|status| status.eq_ignore_ascii_case("failed"));
-    nonzero_exit || failed_status
+    parse_terminal_result_payload(result).is_some_and(|parsed| parsed.exit_code != 0)
 }
 
 pub(super) fn update_terminal_snapshot_from_tool_event(

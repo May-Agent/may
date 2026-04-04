@@ -8,11 +8,50 @@ use serde::Serialize;
 
 use crate::agent::{AgentHandle, AgentWorker, spawn_worker};
 use crate::ask_user::{AskUserBroker, Question, QuestionAnswer};
+use crate::session::AttachmentKind;
 use crate::tool_dispatch::ToolDispatchers;
 use crate::tui::queue::{LARGE_PASTE_THRESHOLD, PASTE_TRUNCATE_LIMIT};
 use crate::tui::{App, Attachment, PendingMessage};
 use crate::workspace_request::WorkspaceRequestBroker;
 use crate::{ChatDb, ChatMessage, MayAgent, MayConfig, SessionId, generate_session_title};
+
+#[derive(Debug, thiserror::Error)]
+enum TuiRuntimeError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("No active session")]
+    NoActiveSession,
+    #[error("invalid pending message timestamp: {0}")]
+    InvalidPendingMessageTimestamp(#[source] jiff::Error),
+    #[error("persisted image attachment is missing content")]
+    PersistedImageMissingContent,
+    #[error("unsupported persisted attachment type in TUI runtime: {0}")]
+    UnsupportedPersistedAttachmentType(AttachmentKind),
+    #[error("failed to convert path into file URL: {path}")]
+    FileUrlConversion { path: std::path::PathBuf },
+    #[error("failed to parse attachment URL {url}: {source}")]
+    AttachmentUrlParse {
+        url: String,
+        #[source]
+        source: url::ParseError,
+    },
+    #[error("attachment URL is not a local file URL: {url}")]
+    NonLocalAttachmentUrl { url: String },
+    #[error("Selected model is empty")]
+    EmptySelectedModel,
+    #[error("No model configured")]
+    NoModelConfigured,
+    #[error("Location fetch failed: {0}")]
+    LocationFetch(#[source] anyhow::Error),
+    #[error("Failed to convert attachment path to URL: {path}")]
+    AttachmentPathToUrl { path: std::path::PathBuf },
+    #[error("Failed to serialize paste XML: {0}")]
+    SerializePasteXml(#[source] quick_xml::SeError),
+    #[error("invalid data URL")]
+    InvalidDataUrl,
+    #[error("failed to decode data URL: {0}")]
+    DecodeDataUrl(#[source] base64::DecodeError),
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalSessionRuntime {
@@ -328,14 +367,14 @@ impl LocalSessionRuntime {
 
 fn pending_message_to_runtime(
     message: &PendingMessage,
-) -> anyhow::Result<crate::session::PendingUserMessage> {
+) -> Result<crate::session::PendingUserMessage, TuiRuntimeError> {
     Ok(crate::session::PendingUserMessage {
         content: message.content.clone(),
         attachments: message
             .attachments
             .iter()
             .map(persisted_attachment_from_tui)
-            .collect::<anyhow::Result<Vec<_>>>()?,
+            .collect::<Result<Vec<_>, _>>()?,
         hidden_context_xml: message.hidden_context_xml.clone(),
         created_at: message.queued_at.to_string(),
         delivery_mode: message.delivery_mode,
@@ -344,7 +383,7 @@ fn pending_message_to_runtime(
 
 async fn pending_message_from_runtime(
     message: crate::session::PendingUserMessage,
-) -> anyhow::Result<PendingMessage> {
+) -> Result<PendingMessage, TuiRuntimeError> {
     let mut attachments = Vec::with_capacity(message.attachments.len());
     for attachment in message.attachments {
         attachments.push(tui_attachment_from_persisted(attachment).await?);
@@ -356,20 +395,20 @@ async fn pending_message_from_runtime(
         queued_at: message
             .created_at
             .parse()
-            .map_err(|error| anyhow::anyhow!("invalid pending message timestamp: {error}"))?,
+            .map_err(TuiRuntimeError::InvalidPendingMessageTimestamp)?,
         delivery_mode: message.delivery_mode,
     })
 }
 
 fn persisted_attachment_from_tui(
     attachment: &Attachment,
-) -> anyhow::Result<crate::session::PersistedAttachment> {
+) -> Result<crate::session::PersistedAttachment, TuiRuntimeError> {
     let id = uuid::Uuid::new_v4().to_string();
     match attachment {
         Attachment::Image { path, data } => Ok(crate::session::PersistedAttachment {
             id,
             name: file_name_or_default(path, "image.png"),
-            attachment_type: "image".to_string(),
+            attachment_type: AttachmentKind::Image,
             url: file_url(path)?,
             upload_data_url: Some(image_data_url(path, data)),
             text_content: None,
@@ -377,7 +416,7 @@ fn persisted_attachment_from_tui(
         Attachment::FileReference { path } => Ok(crate::session::PersistedAttachment {
             id,
             name: file_name_or_default(path, "file"),
-            attachment_type: "file".to_string(),
+            attachment_type: AttachmentKind::File,
             url: file_url(path)?,
             upload_data_url: None,
             text_content: None,
@@ -391,7 +430,7 @@ fn persisted_attachment_from_tui(
                 || "pasted.txt".to_string(),
                 |path| file_name_or_default(path, "pasted.txt"),
             ),
-            attachment_type: "text".to_string(),
+            attachment_type: AttachmentKind::Text,
             url: saved_path
                 .as_ref()
                 .map(|path| file_url(path))
@@ -405,32 +444,30 @@ fn persisted_attachment_from_tui(
 
 async fn tui_attachment_from_persisted(
     attachment: crate::session::PersistedAttachment,
-) -> anyhow::Result<Attachment> {
-    match attachment.attachment_type.as_str() {
-        "image" => {
+) -> Result<Attachment, TuiRuntimeError> {
+    match attachment.attachment_type {
+        AttachmentKind::Image => {
             let path = path_from_attachment_url(&attachment.url)?;
             let data = if async_fs::metadata(&path).await.is_ok() {
-                async_fs::read(&path).await.map_err(anyhow::Error::from)?
+                async_fs::read(&path).await?
             } else if let Some(data_url) = attachment.upload_data_url.as_deref() {
                 decode_data_url(data_url)?
             } else {
-                return Err(anyhow::anyhow!(
-                    "persisted image attachment is missing content"
-                ));
+                return Err(TuiRuntimeError::PersistedImageMissingContent);
             };
             Ok(Attachment::Image { path, data })
         }
-        "file" => Ok(Attachment::FileReference {
+        AttachmentKind::File => Ok(Attachment::FileReference {
             path: path_from_attachment_url(&attachment.url)?,
         }),
-        "text" => Ok(Attachment::PastedText {
+        AttachmentKind::Text => Ok(Attachment::PastedText {
             content: if let Some(content) = attachment.text_content {
                 content
             } else {
                 let path = path_from_attachment_url(&attachment.url)?;
                 async_fs::read_to_string(path)
                     .await
-                    .map_err(anyhow::Error::from)?
+                    ?
             },
             saved_path: if attachment.url.starts_with("file://") {
                 Some(path_from_attachment_url(&attachment.url)?)
@@ -438,23 +475,28 @@ async fn tui_attachment_from_persisted(
                 None
             },
         }),
-        other => Err(anyhow::anyhow!(
-            "unsupported persisted attachment type: {other}"
-        )),
+        other => Err(TuiRuntimeError::UnsupportedPersistedAttachmentType(other)),
     }
 }
 
-fn file_url(path: &std::path::Path) -> anyhow::Result<String> {
+fn file_url(path: &std::path::Path) -> Result<String, TuiRuntimeError> {
     url::Url::from_file_path(path)
-        .map_err(|()| anyhow::anyhow!("failed to convert path into file URL"))
+        .map_err(|()| TuiRuntimeError::FileUrlConversion {
+            path: path.to_path_buf(),
+        })
         .map(|url| url.to_string())
 }
 
-fn path_from_attachment_url(url: &str) -> anyhow::Result<std::path::PathBuf> {
+fn path_from_attachment_url(url: &str) -> Result<std::path::PathBuf, TuiRuntimeError> {
     url::Url::parse(url)
-        .map_err(anyhow::Error::from)?
+        .map_err(|source| TuiRuntimeError::AttachmentUrlParse {
+            url: url.to_string(),
+            source,
+        })?
         .to_file_path()
-        .map_err(|()| anyhow::anyhow!("attachment URL is not a local file URL"))
+        .map_err(|()| TuiRuntimeError::NonLocalAttachmentUrl {
+            url: url.to_string(),
+        })
 }
 
 fn file_name_or_default(path: &std::path::Path, default_name: &str) -> String {
@@ -473,13 +515,13 @@ fn image_data_url(path: &std::path::Path, data: &[u8]) -> String {
     url
 }
 
-fn decode_data_url(data_url: &str) -> anyhow::Result<Vec<u8>> {
+fn decode_data_url(data_url: &str) -> Result<Vec<u8>, TuiRuntimeError> {
     let Some((_, encoded)) = data_url.split_once(',') else {
-        return Err(anyhow::anyhow!("invalid data URL"));
+        return Err(TuiRuntimeError::InvalidDataUrl);
     };
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(anyhow::Error::from)
+        .map_err(TuiRuntimeError::DecodeDataUrl)
 }
 
 /// Runtime dependencies shared by session and agent operations.
@@ -599,7 +641,7 @@ impl RuntimeDeps {
         let session = app
             .session_manager
             .current()
-            .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
 
         let sandbox_dir = session.sandbox_dir.clone();
         let session_id = session.id.clone();
@@ -754,7 +796,7 @@ impl RuntimeDeps {
                 self.location_provider
                     .get()
                     .await
-                    .map_err(|e| anyhow::anyhow!("Location fetch failed: {e}"))?,
+                    .map_err(TuiRuntimeError::LocationFetch)?,
             )
         } else {
             None
@@ -839,7 +881,7 @@ impl RuntimeDeps {
             .session_manager
             .current()
             .map(|session| session.id.clone())
-            .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
         self.local_runtime
             .enqueue_pending_message(app, &session_id, message)
             .await
@@ -866,7 +908,7 @@ impl RuntimeDeps {
             .session_manager
             .current()
             .map(|session| session.id.clone())
-            .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
         self.local_runtime.set_running(&session_id).await
     }
 
@@ -940,7 +982,7 @@ impl RuntimeDeps {
             .session_manager
             .current()
             .map(|session| session.id.clone())
-            .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
         self.local_runtime
             .resolve_permission_response(app, &session_id, request_id, approved)
             .await
@@ -982,15 +1024,15 @@ pub struct TitleGenContext {
 struct SelectedModel(String);
 
 impl SelectedModel {
-    fn new(model: &str) -> anyhow::Result<Self> {
+    fn new(model: &str) -> Result<Self, TuiRuntimeError> {
         let trimmed = model.trim();
         if trimmed.is_empty() {
-            anyhow::bail!("Selected model is empty");
+            return Err(TuiRuntimeError::EmptySelectedModel);
         }
         Ok(Self(trimmed.to_string()))
     }
 
-    fn resolve(config: &MayConfig, preferred: Option<&str>) -> anyhow::Result<Self> {
+    fn resolve(config: &MayConfig, preferred: Option<&str>) -> Result<Self, TuiRuntimeError> {
         if let Some(model) = preferred {
             return Self::new(model);
         }
@@ -1001,7 +1043,7 @@ impl SelectedModel {
 
         let model = config
             .default_model_for_tier(crate::config::ModelTier::Balanced)
-            .ok_or_else(|| anyhow::anyhow!("No model configured"))?;
+            .ok_or(TuiRuntimeError::NoModelConfigured)?;
 
         Self::new(model)
     }
@@ -1011,7 +1053,7 @@ impl SelectedModel {
     }
 }
 
-fn prepare_message_content(msg: &PendingMessage) -> anyhow::Result<(String, Vec<url::Url>)> {
+fn prepare_message_content(msg: &PendingMessage) -> Result<(String, Vec<url::Url>), TuiRuntimeError> {
     let mut parts = vec![msg.content.clone()];
     let mut attachment_urls = Vec::new();
 
@@ -1019,10 +1061,9 @@ fn prepare_message_content(msg: &PendingMessage) -> anyhow::Result<(String, Vec<
         match attachment {
             Attachment::Image { path, .. } => {
                 let url = url::Url::from_file_path(path).map_err(|()| {
-                    anyhow::anyhow!(
-                        "Failed to convert attachment path to URL: {}",
-                        path.display()
-                    )
+                    TuiRuntimeError::AttachmentPathToUrl {
+                        path: path.to_path_buf(),
+                    }
                 })?;
                 attachment_urls.push(url);
             }
@@ -1078,7 +1119,7 @@ fn build_pasted_text_xml(
     content: &str,
     char_count: usize,
     saved_path: Option<&std::path::PathBuf>,
-) -> anyhow::Result<String> {
+) -> Result<String, TuiRuntimeError> {
     let (text_content, is_truncated) = if char_count > LARGE_PASTE_THRESHOLD {
         let truncated: String = content.chars().take(PASTE_TRUNCATE_LIMIT).collect();
         (truncated, true)
@@ -1093,8 +1134,7 @@ fn build_pasted_text_xml(
         content: text_content,
     };
 
-    quick_xml::se::to_string(&xml)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize paste XML: {e}"))
+    quick_xml::se::to_string(&xml).map_err(TuiRuntimeError::SerializePasteXml)
 }
 
 pub async fn send_image_fetch_event(
