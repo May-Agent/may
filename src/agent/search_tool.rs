@@ -82,7 +82,9 @@ pub enum SearchToolError {
         "semantic search requires a global models.embedding_model and at least one enabled provider that supports it"
     )]
     SemanticEmbeddingUnavailable,
-    #[error("semantic index was built for a different embedding configuration; run `search index <path>` again")]
+    #[error(
+        "semantic index was built for a different embedding configuration; run `search index <path>` again"
+    )]
     SemanticEmbeddingMismatch,
     #[error("invalid regex pattern: {0}")]
     InvalidRegexPattern(#[source] regex::Error),
@@ -301,8 +303,7 @@ impl Tool for SearchTool {
             if let Some(path) = args.path.as_deref() {
                 args.path = Some(
                     resolve_search_path(self.sandbox_dir.as_path(), path)
-                        .await
-                        ?
+                        .await?
                         .display()
                         .to_string(),
                 );
@@ -346,8 +347,8 @@ pub fn apply_command_form(args: &mut SearchArgs, command: &str) -> Result<(), Se
         return Err(SearchToolError::MissingActionOrQuery);
     }
 
-    let tokens = split_shell_words(body, "search")
-        .map_err(|_| SearchToolError::MissingActionOrQuery)?;
+    let tokens =
+        split_shell_words(body, "search").map_err(|_| SearchToolError::MissingActionOrQuery)?;
     match tokens.as_slice() {
         [action, path] if action == "index" => {
             args.action = SearchAction::Index;
@@ -517,12 +518,12 @@ async fn index_path(
 
 async fn load_meta(meta_path: &Path) -> Result<SearchIndexMeta, SearchToolError> {
     match async_fs::read_to_string(meta_path).await {
-        Ok(content) => serde_json::from_str(&content).map_err(|source| {
-            SearchToolError::ParseIndexMetadata {
+        Ok(content) => {
+            serde_json::from_str(&content).map_err(|source| SearchToolError::ParseIndexMetadata {
                 path: meta_path.to_path_buf(),
                 source,
-            }
-        }),
+            })
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(SearchIndexMeta::default())
         }
@@ -997,7 +998,9 @@ fn as_i64<'a>(
         })
 }
 
-async fn collect_searchable_files(roots: &[String]) -> Result<Vec<SearchableFile>, SearchToolError> {
+async fn collect_searchable_files(
+    roots: &[String],
+) -> Result<Vec<SearchableFile>, SearchToolError> {
     let mut files_out = Vec::new();
     for root in roots {
         let root_path = PathBuf::from(root);
@@ -1011,24 +1014,25 @@ async fn collect_searchable_files(roots: &[String]) -> Result<Vec<SearchableFile
         }
 
         let root_path_clone = root_path.clone();
-        let files = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>, SearchToolError> {
-            let mut files = Vec::new();
-            let mut walk = WalkBuilder::new(&root_path_clone);
-            walk.standard_filters(true);
-            walk.hidden(false);
-            for entry in walk.build() {
-                let entry = entry.map_err(|source| SearchToolError::WalkFiles {
-                    root: root_path_clone.clone(),
-                    source,
-                })?;
-                if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                    files.push(entry.into_path());
+        let files =
+            tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>, SearchToolError> {
+                let mut files = Vec::new();
+                let mut walk = WalkBuilder::new(&root_path_clone);
+                walk.standard_filters(true);
+                walk.hidden(false);
+                for entry in walk.build() {
+                    let entry = entry.map_err(|source| SearchToolError::WalkFiles {
+                        root: root_path_clone.clone(),
+                        source,
+                    })?;
+                    if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                        files.push(entry.into_path());
+                    }
                 }
-            }
-            Ok(files)
-        })
-        .await
-        .map_err(SearchToolError::JoinFileScan)??;
+                Ok(files)
+            })
+            .await
+            .map_err(SearchToolError::JoinFileScan)??;
 
         for file in files {
             if let Some(searchable) =

@@ -1048,17 +1048,15 @@ impl ImagineTool {
             CloudProvider::OpenAI(provider) => {
                 let mut stream = std::pin::pin!(provider.create(prompt, size));
                 while let Some(chunk) = stream.next().await {
-                    latest = Some(chunk.map_err(|error| {
-                        ImagineToolError::Generate(error.to_string())
-                    })?);
+                    latest =
+                        Some(chunk.map_err(|error| ImagineToolError::Generate(error.to_string()))?);
                 }
             }
             CloudProvider::Gemini(provider) => {
                 let mut stream = std::pin::pin!(provider.create(prompt, size));
                 while let Some(chunk) = stream.next().await {
-                    latest = Some(chunk.map_err(|error| {
-                        ImagineToolError::Generate(error.to_string())
-                    })?);
+                    latest =
+                        Some(chunk.map_err(|error| ImagineToolError::Generate(error.to_string()))?);
                 }
             }
             _ => return Err(ImagineToolError::UnsupportedProvider),

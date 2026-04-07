@@ -465,9 +465,7 @@ async fn tui_attachment_from_persisted(
                 content
             } else {
                 let path = path_from_attachment_url(&attachment.url)?;
-                async_fs::read_to_string(path)
-                    .await
-                    ?
+                async_fs::read_to_string(path).await?
             },
             saved_path: if attachment.url.starts_with("file://") {
                 Some(path_from_attachment_url(&attachment.url)?)
@@ -1053,7 +1051,9 @@ impl SelectedModel {
     }
 }
 
-fn prepare_message_content(msg: &PendingMessage) -> Result<(String, Vec<url::Url>), TuiRuntimeError> {
+fn prepare_message_content(
+    msg: &PendingMessage,
+) -> Result<(String, Vec<url::Url>), TuiRuntimeError> {
     let mut parts = vec![msg.content.clone()];
     let mut attachment_urls = Vec::new();
 

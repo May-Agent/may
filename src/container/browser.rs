@@ -369,10 +369,9 @@ impl BrowserManager {
             .map_err(|error| BrowserError::web_rtc_operation("register default codecs", error))?;
 
         let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut media_engine)
-            .map_err(|error| {
-                BrowserError::web_rtc_operation("register default interceptors", error)
-            })?;
+        registry = register_default_interceptors(registry, &mut media_engine).map_err(|error| {
+            BrowserError::web_rtc_operation("register default interceptors", error)
+        })?;
 
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -476,12 +475,12 @@ impl BrowserManager {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(BrowserCommand::Start { reply: reply_tx })
-            .map_err(|_| BrowserError::ActorClosed { operation: "start browser" })?;
-        reply_rx
-            .await
             .map_err(|_| BrowserError::ActorClosed {
-                operation: "await start reply",
-            })?
+                operation: "start browser",
+            })?;
+        reply_rx.await.map_err(|_| BrowserError::ActorClosed {
+            operation: "await start reply",
+        })?
     }
 
     /// Stop the browser and clean up all resources.
@@ -489,12 +488,12 @@ impl BrowserManager {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(BrowserCommand::Stop { reply: reply_tx })
-            .map_err(|_| BrowserError::ActorClosed { operation: "stop browser" })?;
-        reply_rx
-            .await
             .map_err(|_| BrowserError::ActorClosed {
-                operation: "await stop reply",
-            })?
+                operation: "stop browser",
+            })?;
+        reply_rx.await.map_err(|_| BrowserError::ActorClosed {
+            operation: "await stop reply",
+        })?
     }
 
     /// Handle a WebRTC SDP offer from a client. Returns the SDP answer.
@@ -563,9 +562,9 @@ pub async fn prepare_browser_runtime(
     config: &MayBrowserConfig,
     may_dir: &Path,
 ) -> Result<(), BrowserError> {
-    config
-        .validate()
-        .map_err(|error| BrowserError::browser_operation("validate browser runtime config", error))?;
+    config.validate().map_err(|error| {
+        BrowserError::browser_operation("validate browser runtime config", error)
+    })?;
     if config.requires_managed_runtime() {
         let _ = provision_managed_browser(may_dir).await?;
     }
@@ -603,9 +602,8 @@ impl BrowserRuntime {
                     ManagedBrowserListenerState::Managed => {
                         let endpoint =
                             resolve_local_browser_websocket_endpoint(config.port).await?;
-                        let (browser, handler) = Browser::connect(endpoint)
-                            .await
-                            .map_err(|error| {
+                        let (browser, handler) =
+                            Browser::connect(endpoint).await.map_err(|error| {
                                 BrowserError::browser_operation(
                                     "connect to managed browser endpoint",
                                     error,
@@ -645,10 +643,7 @@ impl BrowserRuntime {
                         tokio::fs::create_dir_all(&profile_dir)
                             .await
                             .map_err(|error| {
-                                BrowserError::browser_operation(
-                                    "create browser profile dir",
-                                    error,
-                                )
+                                BrowserError::browser_operation("create browser profile dir", error)
                             })?;
 
                         let mut builder = BrowserConfig::builder()
@@ -667,29 +662,21 @@ impl BrowserRuntime {
                                 std::io::Error::other(error),
                             )
                         })?;
-                        let (browser, handler) = Browser::launch(browser_config)
-                            .await
-                            .map_err(|error| {
-                                BrowserError::browser_operation(
-                                    "launch managed browser",
-                                    error,
-                                )
+                        let (browser, handler) =
+                            Browser::launch(browser_config).await.map_err(|error| {
+                                BrowserError::browser_operation("launch managed browser", error)
                             })?;
                         (browser, handler, true)
                     }
                 }
             }
             BrowserBackendKind::RemoteCdp => {
-                let endpoint = config
-                    .remote_cdp_endpoint()
-                    .map_err(|error| {
-                        BrowserError::browser_operation("resolve remote cdp endpoint", error)
-                    })?;
-                let (browser, handler) = Browser::connect(endpoint)
-                    .await
-                    .map_err(|error| {
-                        BrowserError::browser_operation("connect to remote cdp endpoint", error)
-                    })?;
+                let endpoint = config.remote_cdp_endpoint().map_err(|error| {
+                    BrowserError::browser_operation("resolve remote cdp endpoint", error)
+                })?;
+                let (browser, handler) = Browser::connect(endpoint).await.map_err(|error| {
+                    BrowserError::browser_operation("connect to remote cdp endpoint", error)
+                })?;
                 (browser, handler, false)
             }
         };
@@ -915,9 +902,9 @@ async fn resolve_local_browser_websocket_endpoint(port: u16) -> Result<String, B
     let mut endpoint = String::from("http://127.0.0.1:");
     endpoint.push_str(&port.to_string());
     endpoint.push_str("/json/version");
-    let response = reqwest::get(endpoint.as_str())
-        .await
-        .map_err(|error| BrowserError::browser_operation("fetch browser version metadata", error))?;
+    let response = reqwest::get(endpoint.as_str()).await.map_err(|error| {
+        BrowserError::browser_operation("fetch browser version metadata", error)
+    })?;
     if !response.status().is_success() {
         return Err(BrowserError::browser_operation(
             "validate browser version metadata response",
@@ -928,10 +915,9 @@ async fn resolve_local_browser_websocket_endpoint(port: u16) -> Result<String, B
             )),
         ));
     }
-    let metadata: BrowserVersionMetadata = response
-        .json()
-        .await
-        .map_err(|error| BrowserError::browser_operation("decode browser version metadata", error))?;
+    let metadata: BrowserVersionMetadata = response.json().await.map_err(|error| {
+        BrowserError::browser_operation("decode browser version metadata", error)
+    })?;
     metadata.web_socket_debugger_url.ok_or_else(|| {
         BrowserError::browser_operation(
             "read browser websocket endpoint",
@@ -949,7 +935,9 @@ async fn read_page_snapshot(
 ) -> Result<BrowserPageSnapshot, BrowserError> {
     let trimmed_url = url.trim();
     if trimmed_url.is_empty() {
-        return Err(BrowserError::InvalidInput(BrowserInputError::EmptyNavigationUrl));
+        return Err(BrowserError::InvalidInput(
+            BrowserInputError::EmptyNavigationUrl,
+        ));
     }
 
     page.goto(trimmed_url)
@@ -975,7 +963,9 @@ async fn start_encoding_pipeline(
     let mut event_stream = page
         .event_listener::<EventScreencastFrame>()
         .await
-        .map_err(|error| BrowserError::browser_operation("subscribe to screencast frames", error))?;
+        .map_err(|error| {
+            BrowserError::browser_operation("subscribe to screencast frames", error)
+        })?;
 
     let (jpeg_tx, jpeg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<EncodedSample>(16);
@@ -1192,9 +1182,9 @@ async fn handle_input_message(page: &Page, text: &str) -> Result<(), BrowserErro
             if trimmed_url.is_empty() {
                 return Err(BrowserInputError::EmptyNavigationUrl.into());
             }
-            page.goto(trimmed_url)
-                .await
-                .map_err(|error| BrowserError::browser_operation("navigate from data channel", error))?;
+            page.goto(trimmed_url).await.map_err(|error| {
+                BrowserError::browser_operation("navigate from data channel", error)
+            })?;
             Ok(())
         }
     }
@@ -1224,10 +1214,7 @@ async fn dispatch_mouse(page: &Page, input: MouseInput) -> Result<(), BrowserErr
     }
 
     let params = builder.build().map_err(|error| {
-        BrowserError::browser_operation(
-            "build mouse dispatch params",
-            std::io::Error::other(error),
-        )
+        BrowserError::browser_operation("build mouse dispatch params", std::io::Error::other(error))
     })?;
     page.execute(params)
         .await
