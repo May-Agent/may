@@ -69,8 +69,7 @@ pub(super) async fn build_prompt_and_attachments(
     let mut offloaded_xml_items = Vec::new();
 
     for attachment in &req.attachments {
-        let required_modality =
-            AttachmentModality::for_attachment_type(attachment.attachment_type);
+        let required_modality = AttachmentModality::for_attachment_type(attachment.attachment_type);
         let supported = required_modality
             .as_ref()
             .is_none_or(|modality| modality_support.supports(modality));
