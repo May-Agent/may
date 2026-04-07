@@ -11,8 +11,8 @@ use aither_agent::{BrowserBackend, StaticCdpBrowser};
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole, ToolResult, Usage};
 use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{
-    BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, ContainerExecHandle, ContainerLaunchSpec,
-    Content, OutputEntry,
+    BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec, Content, OutputEntry,
+    TERMINAL_STDIN_BLOCKED_NOTICE,
 };
 
 use crate::agent::MayAgent;
@@ -356,7 +356,7 @@ fn output_contains_terminal_wait_notice(output: &OutputEntry) -> bool {
             Content::Text { text, .. } => Some(text.as_str()),
             Content::Image { .. } => None,
         })
-        .is_some_and(|text| text.starts_with(CONTAINER_STDIN_BLOCKED_NOTICE))
+        .is_some_and(|text| text.starts_with(TERMINAL_STDIN_BLOCKED_NOTICE))
 }
 
 fn result_waits_for_terminal_input(result: &ToolResult) -> bool {
@@ -1865,10 +1865,13 @@ async fn push_hidden_context_part(
 async fn setup_agent_environment(
     state: &Arc<UiServerState>,
     ctx: &SessionContext,
-) -> Result<(
-    crate::agent::AgentEnvironment,
-    Option<crate::location::LocationInfo>,
-), UiChatPreparationError> {
+) -> Result<
+    (
+        crate::agent::AgentEnvironment,
+        Option<crate::location::LocationInfo>,
+    ),
+    UiChatPreparationError,
+> {
     let environment = match ctx.profile_environment.as_ref() {
         Some(crate::profile::ProfileEnvironment::Container { .. }) => {
             let profile = ctx
@@ -1883,11 +1886,10 @@ async fn setup_agent_environment(
                 )
                 .await
                 .map_err(UiChatPreparationError::ReconcileContainerLayout)?;
-            let container_manager =
-                state
-                    .resolve_container_manager(false)
-                    .await
-                    .map_err(UiChatPreparationError::ResolveContainerRuntime)?;
+            let container_manager = state
+                .resolve_container_manager(false)
+                .await
+                .map_err(UiChatPreparationError::ResolveContainerRuntime)?;
             let default_image_tag =
                 crate::container::profile::default_image_tag(&state.may_dir, profile)
                     .await
