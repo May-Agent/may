@@ -57,9 +57,7 @@ pub(super) fn map_db_messages(
                 if role == MessageRole::Assistant
                     && (!snapshot.executions.is_empty() || !snapshot.running_by_call_id.is_empty())
                 {
-                    let mut executions = snapshot.executions.clone();
-                    executions.extend(snapshot.running_by_call_id.values().cloned());
-                    api_msg.terminal_executions = executions;
+                    api_msg.terminal_executions = snapshot.all_executions();
                 }
 
                 out.push(api_msg);

@@ -1159,7 +1159,7 @@ async fn stream_chat_events(
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event: None,
-                    terminal_executions: result.terminal_snapshot.executions,
+                    terminal_executions: result.terminal_snapshot.all_executions(),
                     stats: Some(RequestStats {
                         provider_id: Some(result.provider_id),
                         prompt_tokens: result.usage.prompt_tokens,
@@ -1237,7 +1237,7 @@ async fn run_chat_collect_with_persistence(
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event: None,
-                    terminal_executions: Vec::new(),
+                    terminal_executions: result.terminal_snapshot.all_executions(),
                     stats: Some(RequestStats {
                         provider_id: Some(result.provider_id),
                         prompt_tokens: result.usage.prompt_tokens,
