@@ -19,7 +19,6 @@ use arc_swap::ArcSwap;
 use askama::Template;
 use base64::Engine;
 use executor_core::DefaultExecutor;
-use sea_orm::DbErr;
 use serde::Serialize;
 use shell_escape::escape as shell_escape;
 
@@ -265,8 +264,8 @@ fn task_notification_callback_payload(
     )
 }
 
-const fn task_db_error(message: String) -> crate::db::ChatDbError {
-    crate::db::ChatDbError::Db(DbErr::Custom(message))
+fn task_db_error(message: String) -> crate::db::ChatDbError {
+    crate::db::ChatDbError::Storage(message)
 }
 
 fn task_field_error(task_id: &str, prefix: &str, field: &str) -> crate::db::ChatDbError {
@@ -613,8 +612,8 @@ impl TaskRuntime {
         profile_id: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<usize, crate::db::ChatDbError> {
-        let event_name = normalize_event_name(event_name)
-            .map_err(|e| crate::db::ChatDbError::Db(DbErr::Custom(e)))?;
+        let event_name =
+            normalize_event_name(event_name).map_err(crate::db::ChatDbError::Storage)?;
         let tasks = self.active_tasks.load();
         let mut dispatched = 0usize;
 

@@ -41,7 +41,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
 use may_agent::browser_service::{
-    BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus,
+    BrowserReadOptions, BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus,
 };
 use may_agent::session::{SessionPaths, initialize_session_persistence};
 use may_agent::tui::runtime::{LocalSessionRuntime, RuntimeDeps, TitleGenContext};
@@ -373,7 +373,6 @@ fn parse_terminal_execution_mode(value: &str) -> TerminalExecutionMode {
 async fn main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
     ensure_rustls_provider();
-    may_agent::configure_heel_binary();
 
     let cli_mode = parse_cli_mode_from_env();
     let is_ui_mode = matches!(cli_mode, CliMode::Ui(_));
@@ -407,6 +406,10 @@ async fn main() -> anyhow::Result<()> {
             .with(fmt::layer().with_writer(file_appender).with_ansi(false))
             .with(env_filter)
             .init();
+    }
+
+    if !matches!(cli_mode, CliMode::Help(_)) {
+        may_agent::configure_heel_binary().await;
     }
 
     match cli_mode {
@@ -718,10 +721,15 @@ async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
             let status = ensure_browser_service_started(may_dir.as_path(), &config.browser)
                 .await
                 .map_err(BrowserCliError::BrowserService)?;
-            let response =
-                send_browser_service_request(&socket_path, BrowserServiceRequest::Read { url })
-                    .await
-                    .map_err(BrowserCliError::BrowserService)?;
+            let response = send_browser_service_request(
+                &socket_path,
+                BrowserServiceRequest::Read {
+                    url,
+                    options: BrowserReadOptions::default(),
+                },
+            )
+            .await
+            .map_err(BrowserCliError::BrowserService)?;
             match response {
                 Some(BrowserServiceResponse::ReadOk { payload }) => {
                     render_json_stdout(&serde_json::json!({
@@ -840,7 +848,7 @@ async fn run_browser_service(
                 Ok(response) => (response, true),
                 Err(message) => (BrowserServiceResponse::Error { message }, false),
             },
-            BrowserServiceRequest::Read { url } => match async {
+            BrowserServiceRequest::Read { url, options } => match async {
                 if !browser_manager.is_running().await {
                     may_agent::container::browser::prepare_browser_runtime(
                         &config.browser,
@@ -854,7 +862,7 @@ async fn run_browser_service(
                         .map_err(|error| error.to_string())?;
                 }
                 let page = browser_manager
-                    .read_page(url)
+                    .read_page(url, options)
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok::<BrowserServiceResponse, String>(BrowserServiceResponse::ReadOk {

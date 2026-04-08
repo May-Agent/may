@@ -17,8 +17,8 @@ use hyper_util::rt::TokioIo;
 use may_agent::MayConfig;
 use may_agent::config::{ProviderInstance, ProviderType};
 use may_agent::session::{SandboxResourceLayout, SessionId, initialize_session_persistence};
-use serial_test::serial;
 use serde_json::Value;
+use serial_test::serial;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
@@ -137,8 +137,8 @@ impl MockScenarioState {
                         done_frame(Duration::from_millis(10)),
                     ]),
                     1 => {
-                        let task_id =
-                            terminal_task_id_from_latest_tool_output(request).ok_or_else(|| {
+                        let task_id = terminal_task_id_from_latest_tool_output(request)
+                            .ok_or_else(|| {
                                 "terminal tool result did not include a task_id".to_string()
                             })?;
                         self.task_id = Some(task_id.clone());
@@ -688,6 +688,35 @@ async fn wait_for_runtime_state_clear(
     }
 }
 
+async fn wait_for_runtime_condition<F>(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+    server: &RunningUiServer,
+    timeout_duration: Duration,
+    description: &str,
+    mut predicate: F,
+) -> Value
+where
+    F: FnMut(&Value) -> bool,
+{
+    let deadline = Instant::now() + timeout_duration;
+    loop {
+        let runtime = get_runtime(client, base_url, session_id).await;
+        if predicate(&runtime) {
+            return runtime;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime condition `{description}` was not satisfied within {:?}; runtime: {}; server logs:\n{}",
+            timeout_duration,
+            runtime,
+            server.logs().await
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn latest_tool_output(request: &Value) -> Option<Value> {
     let messages = request.get("messages")?.as_array()?;
     let content = messages.iter().rev().find_map(|message| {
@@ -794,7 +823,10 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         "pwd command failed: {}",
         String::from_utf8_lossy(&pwd_output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&pwd_output.stdout).trim(), "/workspace");
+    assert_eq!(
+        String::from_utf8_lossy(&pwd_output.stdout).trim(),
+        "/workspace"
+    );
 
     let layout_output = Command::new(&binary)
         .arg("exec")
@@ -816,7 +848,10 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         "layout/help probe failed: {}",
         String::from_utf8_lossy(&layout_output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&layout_output.stdout).trim(), "ready");
+    assert_eq!(
+        String::from_utf8_lossy(&layout_output.stdout).trim(),
+        "ready"
+    );
 }
 
 #[tokio::test]
@@ -1015,11 +1050,18 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         }
     });
 
-    wait_for_condition(Duration::from_secs(10), || {
-        let mock = &mock;
-        async move { mock.request_count().await >= 1 }
-    })
-    .await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if mock.request_count().await >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "LLM request did not reach mock server within 10s; server logs:\n{}",
+            server.logs().await
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
     sleep(Duration::from_millis(450)).await;
 
     let stop_response = client
@@ -1102,23 +1144,23 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
         }
     });
 
-    wait_for_condition(Duration::from_secs(10), || {
-        let client = client.clone();
-        let base_url = server.base_url.clone();
-        let session_id = session_id.clone();
-        async move {
-            let runtime = get_runtime(&client, &base_url, &session_id).await;
-            runtime
+    let runtime_during_background = wait_for_runtime_condition(
+        &client,
+        &server.base_url,
+        &session_id,
+        &server,
+        Duration::from_secs(10),
+        "terminal runtime to expose taskId and outputFile",
+        |runtime| {
+            let terminal = runtime
                 .get("interactions")
                 .and_then(|interactions| interactions.get("terminal"))
-                .and_then(|terminal| terminal.get("taskId"))
-                .and_then(Value::as_str)
-                .is_some()
-        }
-    })
+                .unwrap_or(&Value::Null);
+            terminal.get("taskId").and_then(Value::as_str).is_some()
+                && terminal.get("outputFile").and_then(Value::as_str).is_some()
+        },
+    )
     .await;
-
-    let runtime_during_background = get_runtime(&client, &server.base_url, &session_id).await;
     let task_id = runtime_during_background
         .get("interactions")
         .and_then(|interactions| interactions.get("terminal"))
@@ -1160,26 +1202,29 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
         .expect("chat response should include terminal executions");
     assert!(
         executions.iter().any(|execution| {
-            execution.get("input").and_then(Value::as_str).is_some_and(|input| {
-                input.contains("read name")
-            })
+            execution
+                .get("input")
+                .and_then(Value::as_str)
+                .is_some_and(|input| input.contains("read name"))
         }),
         "chat response should record the terminal execution"
     );
 
-    wait_for_condition(Duration::from_secs(10), || {
-        let client = client.clone();
-        let base_url = server.base_url.clone();
-        let session_id = session_id.clone();
-        async move {
-            let runtime = get_runtime(&client, &base_url, &session_id).await;
+    wait_for_runtime_condition(
+        &client,
+        &server.base_url,
+        &session_id,
+        &server,
+        Duration::from_secs(10),
+        "terminal runtime to clear after background completion",
+        |runtime| {
             runtime.get("state").is_none()
                 && runtime
                     .get("interactions")
                     .and_then(|interactions| interactions.get("terminal"))
                     .is_none()
-        }
-    })
+        },
+    )
     .await;
 
     assert!(

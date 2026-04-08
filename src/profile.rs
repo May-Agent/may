@@ -179,9 +179,7 @@ pub async fn query_profile_sessions(
         db.list_folders(profile_id),
     );
     let profile_model = profile_model?.ok_or_else(|| {
-        crate::db::ChatDbError::Db(sea_orm::DbErr::RecordNotFound(format!(
-            "Profile not found: {profile_id}"
-        )))
+        crate::db::ChatDbError::RowNotFound(format!("Profile not found: {profile_id}"))
     })?;
     let profile = ProfileInfo::from_db_model(profile_model)?;
     let all_summaries = crate::session::summarize_db_sessions(db, db_sessions?).await?;

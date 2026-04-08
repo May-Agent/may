@@ -13,6 +13,7 @@ pub mod db;
 pub mod embedding_provider;
 mod fs_utils;
 mod heel_binary;
+mod heel_release;
 mod live_response;
 pub mod location;
 pub mod mcp;
