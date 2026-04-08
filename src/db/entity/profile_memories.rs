@@ -3,12 +3,8 @@
 //! Stores preference and recency memory extracted from conversations
 //! by a fast LLM, maintained asynchronously.
 
-use sea_orm::entity::prelude::*;
-
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-#[sea_orm(table_name = "profile_memories")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     /// Profile this memory belongs to.
     pub profile_id: String,
@@ -18,8 +14,3 @@ pub struct Model {
     pub content: String,
     pub updated_at: String,
 }
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
-
-impl ActiveModelBehavior for ActiveModel {}

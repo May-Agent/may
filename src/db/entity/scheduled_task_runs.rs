@@ -1,11 +1,7 @@
-//! Scheduled task execution records.
+//! Scheduled task execution row model.
 
-use sea_orm::entity::prelude::*;
-
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-#[sea_orm(table_name = "scheduled_task_runs")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub task_id: String,
     pub profile_id: String,
@@ -17,8 +13,3 @@ pub struct Model {
     pub finished_at: Option<String>,
     pub updated_at: String,
 }
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
-
-impl ActiveModelBehavior for ActiveModel {}

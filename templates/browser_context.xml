@@ -1,9 +1,13 @@
 <browser>
-<enabled>{{ enabled }}</enabled>
+<enabled>{{ state.enabled() }}</enabled>
 {% if let Some(endpoint) = cdp_endpoint %}
 <cdp_endpoint>{{ endpoint }}</cdp_endpoint>
 {% endif %}
 <instructions>
-{{ instructions }}
+{% if state.enabled() %}
+Browser automation is enabled for this session and May owns the runtime lifecycle. The browser may be backed by a local managed runtime or a remote managed runtime, but it is never the user's personal browser. Use the `browser` command itself for browsing, especially `browser read`. `browser read` can return structured text, accessibility-tree-derived page structure, interactive element summaries, and a screenshot saved under the session `artifacts/` directory. By default it captures a viewport screenshot; request `options.screenshot = full-page` when you need a full-page view or `off` when visual context is unnecessary. Prefer answering directly from the structured browser result and the referenced artifact path instead of installing Playwright, launching Chrome yourself, or relying on a visible desktop browser window.
+{% else %}
+Browser automation is disabled for this session. Do not install Playwright or launch browser runtimes yourself. If browser automation is needed, ask the user to enable the browser feature in settings.
+{% endif %}
 </instructions>
 </browser>

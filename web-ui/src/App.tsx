@@ -77,46 +77,52 @@ function AppScaffold({
   isDesktopSidebarOpen,
   children,
   onOpenSettings,
+  hideChrome = false,
 }: {
   isSidebarOpen: boolean;
   setSidebarOpen: (value: boolean) => void;
   isDesktopSidebarOpen: boolean;
   children: ReactNode;
   onOpenSettings: () => void;
+  hideChrome?: boolean;
 }) {
   const navigate = useNavigate();
 
   return (
     <div className="flex h-full min-h-0 bg-background text-foreground overflow-hidden">
-      <div className="md:hidden fixed top-4 left-4 z-50">
-        <Sheet open={isSidebarOpen} onOpenChange={setSidebarOpen}>
-          <SheetTrigger asChild>
-            <Button variant="outline" size="icon">
-              <Menu className="h-4 w-4" />
-            </Button>
-          </SheetTrigger>
-          <SheetContent side="left" className="p-0 w-72">
-            <Sidebar
-              onOpenSettings={onOpenSettings}
-              onSelectSession={(id) =>
-                navigate(`/chat/${encodeURIComponent(id)}`)
-              }
-              onNewChat={() => navigate('/chat/new')}
-            />
-          </SheetContent>
-        </Sheet>
-      </div>
+      {!hideChrome && (
+        <div className="md:hidden fixed top-4 left-4 z-50">
+          <Sheet open={isSidebarOpen} onOpenChange={setSidebarOpen}>
+            <SheetTrigger asChild>
+              <Button variant="outline" size="icon">
+                <Menu className="h-4 w-4" />
+              </Button>
+            </SheetTrigger>
+            <SheetContent side="left" className="p-0 w-72">
+              <Sidebar
+                onOpenSettings={onOpenSettings}
+                onSelectSession={(id) =>
+                  navigate(`/chat/${encodeURIComponent(id)}`)
+                }
+                onNewChat={() => navigate('/chat/new')}
+              />
+            </SheetContent>
+          </Sheet>
+        </div>
+      )}
 
-      <div
-        className={`${isDesktopSidebarOpen ? 'w-64' : 'w-0'} hidden h-full flex-shrink-0 overflow-hidden transition-all duration-300 ease-in-out md:block`}
-      >
-        <Sidebar
-          className="w-64"
-          onOpenSettings={onOpenSettings}
-          onSelectSession={(id) => navigate(`/chat/${encodeURIComponent(id)}`)}
-          onNewChat={() => navigate('/chat/new')}
-        />
-      </div>
+      {!hideChrome && (
+        <div
+          className={`${isDesktopSidebarOpen ? 'w-64' : 'w-0'} hidden h-full flex-shrink-0 overflow-hidden transition-all duration-300 ease-in-out md:block`}
+        >
+          <Sidebar
+            className="w-64"
+            onOpenSettings={onOpenSettings}
+            onSelectSession={(id) => navigate(`/chat/${encodeURIComponent(id)}`)}
+            onNewChat={() => navigate('/chat/new')}
+          />
+        </div>
+      )}
 
       <main className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {children}
@@ -144,10 +150,12 @@ function ChatRouteView({
     loaded,
     currentSessionId,
     currentProfileId,
+    backendUnavailableReason,
     profileSessions,
     profileSessionsLoading,
     setCurrentSession,
   } = useStore();
+  const hideChrome = (backendUnavailableReason ?? "").trim().length > 0;
 
   useEffect(() => {
     if (!sessionId || sessionId === 'new') {
@@ -187,6 +195,7 @@ function ChatRouteView({
       setSidebarOpen={setSidebarOpen}
       isDesktopSidebarOpen={isDesktopSidebarOpen}
       onOpenSettings={onOpenSettings}
+      hideChrome={hideChrome}
     >
       <ChatInterface
         key={`${currentProfileId ?? 'none'}:${sessionId ?? 'new'}`}

@@ -99,6 +99,22 @@ function formatDurationMs(durationMs: number): string {
   return `${minutes}m ${seconds.toString().padStart(2, '0')}s`;
 }
 
+function buildRunningTimelineLabel(
+  item: TimelineDisplayItem,
+  durationText: string,
+): string {
+  if (item.type === 'thinking') {
+    return 'Thinking';
+  }
+  if (item.type === 'command') {
+    return `Running command for ${durationText}`;
+  }
+  if (item.type === 'websearch') {
+    return 'Searching the web';
+  }
+  return 'Fetching page';
+}
+
 interface ParsedCommandImage {
   src: string;
   mediaType: string;
@@ -974,6 +990,9 @@ export function MessageItem({
                             const normalizedStartedAt = Number.isFinite(startedAt) ? startedAt : nowMs;
                             const endedAt = item.endedAt ?? (item.isRunning ? nowMs : normalizedStartedAt);
                             const durationText = formatDurationMs(Math.max(0, endedAt - normalizedStartedAt));
+                            const rowSummaryText = item.isRunning
+                              ? buildRunningTimelineLabel(item, durationText)
+                              : item.summary;
                             const storedPreviewItems =
                               item.type === 'command' && sessionId && item.parsedOutput.storagePaths.length > 0
                                 ? item.parsedOutput.storagePaths.map((storagePath) => {
@@ -992,7 +1011,15 @@ export function MessageItem({
                                 : [];
 
                             return (
-                              <div key={item.id} className="rounded-lg border border-zinc-800 bg-zinc-900/70">
+                              <div
+                                key={item.id}
+                                className={cn(
+                                  'rounded-lg border bg-zinc-900/70',
+                                  item.isRunning
+                                    ? 'border-zinc-700/90 bg-zinc-900/88'
+                                    : 'border-zinc-800',
+                                )}
+                              >
                                 <button
                                   type="button"
                                   className="flex w-full items-center gap-2 px-3 py-2 text-left"
@@ -1008,12 +1035,18 @@ export function MessageItem({
                                   {item.type === 'thinking' && <FileText className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
                                   {item.type === 'websearch' && <Search className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
                                   {item.type === 'webfetch' && <Globe className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
-                                  <span className="min-w-0 flex-1 truncate text-[14px] text-zinc-200">{item.summary}</span>
+                                  <span
+                                    className={cn(
+                                      'min-w-0 flex-1 truncate text-[14px]',
+                                      item.isRunning
+                                        ? 'timeline-running-label font-medium text-zinc-300'
+                                        : 'text-zinc-200',
+                                    )}
+                                  >
+                                    {rowSummaryText}
+                                  </span>
                                   {item.isRunning ? (
-                                    <span className="inline-flex items-center gap-1 text-[11px] text-cyan-300">
-                                      <Loader2 className="h-3 w-3 animate-spin" />
-                                      running
-                                    </span>
+                                    <span className="text-[11px] text-zinc-500">{durationText}</span>
                                   ) : item.isFailed ? (
                                     <span className="text-[11px] text-red-300">failed</span>
                                   ) : (

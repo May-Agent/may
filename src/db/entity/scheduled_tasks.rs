@@ -1,11 +1,7 @@
-//! Scheduled task entity for the chat history database.
+//! Scheduled task row model for the chat history database.
 
-use sea_orm::entity::prelude::*;
-
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-#[sea_orm(table_name = "scheduled_tasks")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     /// Profile this task belongs to.
     pub profile_id: String,
@@ -26,13 +22,10 @@ pub struct Model {
     /// Inline script content to execute.
     pub script_inline: Option<String>,
     /// Whether this task requires network access (heel-only flag).
-    #[sea_orm(default_value = "0")]
     pub needs_network: bool,
     /// Whether the task has been approved for execution.
-    #[sea_orm(default_value = "0")]
     pub approved: bool,
     /// Whether the task is enabled.
-    #[sea_orm(default_value = "1")]
     pub enabled: bool,
     /// Last execution timestamp (ISO 8601 UTC).
     pub last_run_at: Option<String>,
@@ -43,8 +36,3 @@ pub struct Model {
     pub created_at: String,
     pub updated_at: String,
 }
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
-
-impl ActiveModelBehavior for ActiveModel {}

@@ -1,20 +1,14 @@
-//! Chat history database backed by `SQLite` via `SeaORM`.
+//! Chat history database backed by SQLite.
 //!
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
 pub mod entity;
+mod sql;
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use sea_orm::ConnectionTrait;
-use sea_orm::{
-    ActiveModelTrait,
-    ActiveValue::NotSet,
-    ColumnTrait, ConnectOptions, Database, DatabaseConnection, DbErr, EntityTrait, Order,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Set, TransactionTrait,
-    sea_query::{Expr, Query, SqliteQueryBuilder},
-};
+use skyzen_services::{Db as SkyDb, DbError as SkyDbError};
 
 use crate::PermissionHistoryMode;
 use crate::scheduler::TaskRunStatus;
@@ -29,16 +23,25 @@ use crate::xml_fragment::XmlFragment;
 use entity::{
     context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox,
     profile_memories, profile_memory_jobs, profiles, push_subscriptions, request_logs,
-    scheduled_task_runs, scheduled_tasks, session_context_snapshots, session_pending_ask_user,
-    session_pending_messages, session_pending_permissions, session_pending_workspace,
-    session_plans, session_run_leases, session_runtimes, sessions,
+    scheduled_tasks, session_pending_ask_user, session_pending_messages,
+    session_pending_permissions, session_pending_workspace, session_plans, session_run_leases,
+    session_runtimes, sessions,
 };
+use sql as db_sql;
+
+macro_rules! query {
+    ($db:expr, $sql:expr $(, $param:expr)* $(,)?) => {{
+        $db.query($sql)$(.bind($param))*
+    }};
+}
 
 /// Error type for database operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatDbError {
-    #[error("Database error: {0}")]
-    Db(#[from] DbErr),
+    #[error("Database backend error: {0}")]
+    Storage(String),
+    #[error("Database row not found: {0}")]
+    RowNotFound(String),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Invalid context fragment: {0}")]
@@ -53,6 +56,15 @@ pub enum ChatDbError {
         limit: i64,
         current: i64,
     },
+}
+
+impl From<SkyDbError> for ChatDbError {
+    fn from(error: SkyDbError) -> Self {
+        match error {
+            SkyDbError::RowNotFound => Self::RowNotFound("database row not found".to_string()),
+            other => Self::Storage(other.to_string()),
+        }
+    }
 }
 
 /// Parameters for creating a new profile.
@@ -214,17 +226,17 @@ pub struct AssistantCacheUsageSummary {
     pub cache_write_tokens_total: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct PendingPermissionLookup {
     pub(crate) session_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct PendingAskUserLookup {
     pub(crate) session_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct PendingWorkspaceLookup {
     pub(crate) session_id: String,
 }
@@ -297,16 +309,48 @@ fn prefixed_text(prefix: &str, suffix: &str) -> String {
     text
 }
 
-fn db_custom_error(prefix: &str, error: &impl std::fmt::Display) -> DbErr {
+fn db_custom_error(prefix: &str, error: &impl std::fmt::Display) -> String {
     let error_text = error.to_string();
-    DbErr::Custom(prefixed_text(prefix, error_text.as_str()))
+    prefixed_text(prefix, error_text.as_str())
 }
 
 fn session_not_found_db_error(session_id: &str) -> ChatDbError {
-    ChatDbError::Db(DbErr::RecordNotFound(prefixed_text(
-        "Session not found: ",
-        session_id,
-    )))
+    ChatDbError::RowNotFound(prefixed_text("Session not found: ", session_id))
+}
+
+fn row_not_found(message: impl Into<String>) -> ChatDbError {
+    ChatDbError::RowNotFound(message.into())
+}
+
+fn storage_error(message: impl Into<String>) -> ChatDbError {
+    ChatDbError::Storage(message.into())
+}
+
+fn conversion_error(field: &str, error: &impl std::fmt::Display) -> ChatDbError {
+    storage_error(db_custom_error(
+        &prefixed_text(field, " conversion failed: "),
+        error,
+    ))
+}
+
+fn overflow_error(field: &str, error: &impl std::fmt::Display) -> ChatDbError {
+    storage_error(db_custom_error(&prefixed_text(field, " overflow: "), error))
+}
+
+fn to_i32(value: u32, field: &str) -> Result<i32, ChatDbError> {
+    i32::try_from(value).map_err(|error| overflow_error(field, &error))
+}
+
+fn to_i64_from_u64(value: u64, field: &str) -> Result<i64, ChatDbError> {
+    i64::try_from(value).map_err(|error| overflow_error(field, &error))
+}
+
+fn to_usize(value: i64, field: &str) -> Result<usize, ChatDbError> {
+    usize::try_from(value).map_err(|error| conversion_error(field, &error))
+}
+
+fn to_u64(value: i64, field: &str) -> Result<u64, ChatDbError> {
+    u64::try_from(value).map_err(|error| conversion_error(field, &error))
 }
 
 fn message_stats_params_from_chat_stats(stats: &ChatMessageStats) -> MessageStatsParams {
@@ -322,12 +366,31 @@ fn message_stats_params_from_chat_stats(stats: &ChatMessageStats) -> MessageStat
     }
 }
 
+fn parse_pending_user_message_mode(
+    value: &str,
+) -> Result<crate::session::PendingUserMessageMode, ChatDbError> {
+    value
+        .parse()
+        .map_err(|error| storage_error(db_custom_error("invalid pending message mode: ", &error)))
+}
+
+fn parse_session_runtime_state(value: &str) -> Result<SessionRuntimeState, ChatDbError> {
+    value
+        .parse()
+        .map_err(|error| storage_error(db_custom_error("invalid session runtime state: ", &error)))
+}
+
+fn parse_session_plan_state(value: &str) -> Result<SessionPlanState, ChatDbError> {
+    value
+        .parse()
+        .map_err(|error| storage_error(db_custom_error("invalid session plan state: ", &error)))
+}
+
 /// Chat history database.
 ///
-/// Wraps a `SeaORM` `DatabaseConnection` to a `SQLite` file.
 #[derive(Debug, Clone)]
 pub struct ChatDb {
-    conn: DatabaseConnection,
+    db: SkyDb,
 }
 
 impl ChatDb {
@@ -336,239 +399,45 @@ impl ChatDb {
     /// Creates the current schema if the tables don't exist.
     pub async fn open(db_path: &Path) -> Result<Self, ChatDbError> {
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
-        let mut opts = ConnectOptions::new(url);
-        opts.sqlx_logging(false);
-
-        let conn = Database::connect(opts).await?;
-
-        // Create tables if they don't exist
-        let schema = Schema::new(sea_orm::DatabaseBackend::Sqlite);
-
-        let sessions_stmt = schema.create_table_from_entity(sessions::Entity);
-        let create_sql = sessions_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let messages_stmt = schema.create_table_from_entity(messages::Entity);
-        let create_sql = messages_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        // Profiles and folders tables
-        let profiles_stmt = schema.create_table_from_entity(profiles::Entity);
-        let create_sql = profiles_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let folders_stmt = schema.create_table_from_entity(folders::Entity);
-        let create_sql = folders_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        // Scheduled tasks table
-        let tasks_stmt = schema.create_table_from_entity(scheduled_tasks::Entity);
-        let create_sql = tasks_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let task_runs_stmt = schema.create_table_from_entity(scheduled_task_runs::Entity);
-        let create_sql = task_runs_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        // Push subscriptions table
-        let push_stmt = schema.create_table_from_entity(push_subscriptions::Entity);
-        let create_sql = push_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        // Profile memories table
-        let mem_stmt = schema.create_table_from_entity(profile_memories::Entity);
-        let create_sql = mem_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let memory_jobs_stmt = schema.create_table_from_entity(profile_memory_jobs::Entity);
-        let create_sql = memory_jobs_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        // Context debug snapshots table
-        let context_debug_stmt = schema.create_table_from_entity(context_debug_snapshots::Entity);
-        let create_sql = context_debug_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let notification_mailbox_stmt =
-            schema.create_table_from_entity(notification_mailbox::Entity);
-        let create_sql = notification_mailbox_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let request_logs_stmt = schema.create_table_from_entity(request_logs::Entity);
-        let create_sql = request_logs_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let network_access_logs_stmt = schema.create_table_from_entity(network_access_logs::Entity);
-        let create_sql = network_access_logs_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let session_context_stmt =
-            schema.create_table_from_entity(session_context_snapshots::Entity);
-        let create_sql = session_context_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let session_runtime_stmt = schema.create_table_from_entity(session_runtimes::Entity);
-        let create_sql = session_runtime_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let session_plan_stmt = schema.create_table_from_entity(session_plans::Entity);
-        let create_sql = session_plan_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let session_run_lease_stmt = schema.create_table_from_entity(session_run_leases::Entity);
-        let create_sql = session_run_lease_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let pending_messages_stmt =
-            schema.create_table_from_entity(session_pending_messages::Entity);
-        let create_sql = pending_messages_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let pending_permissions_stmt =
-            schema.create_table_from_entity(session_pending_permissions::Entity);
-        let create_sql = pending_permissions_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let pending_ask_user_stmt =
-            schema.create_table_from_entity(session_pending_ask_user::Entity);
-        let create_sql = pending_ask_user_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        let pending_workspace_stmt =
-            schema.create_table_from_entity(session_pending_workspace::Entity);
-        let create_sql = pending_workspace_stmt
-            .to_string(SqliteQueryBuilder)
-            .replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        conn.execute_unprepared(&create_sql).await?;
-
-        // Create indexes
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_messages_session_role ON messages(session_id, role)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_profile_id ON sessions(profile_id)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_archived ON sessions(archived, updated_at)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_folders_profile_id ON folders(profile_id)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_profile ON scheduled_tasks(profile_id)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_profile_memories_profile ON profile_memories(profile_id, memory_type)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_profile_memory_jobs_dirty_updated_at ON profile_memory_jobs(dirty, updated_at)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_context_debug_snapshots_timestamp ON context_debug_snapshots(timestamp)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_notification_mailbox_status_created_at ON notification_mailbox(status, created_at)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_request_logs_timestamp ON request_logs(timestamp)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_request_logs_session_timestamp ON request_logs(session_id, timestamp)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_session_context_snapshots_updated_at ON session_context_snapshots(updated_at)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_session_pending_messages_session_created ON session_pending_messages(session_id, created_at)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_network_access_logs_timestamp ON network_access_logs(timestamp)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_network_access_logs_session ON network_access_logs(session_id, timestamp)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_session_pending_permissions_session ON session_pending_permissions(session_id)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_session_pending_ask_user_session ON session_pending_ask_user(session_id)",
-        )
-        .await?;
-        conn.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_session_pending_workspace_session ON session_pending_workspace(session_id)",
-        )
-        .await?;
-
-        // Enable WAL mode for better concurrent read/write performance
-        conn.execute_unprepared("PRAGMA journal_mode=WAL").await?;
-
-        Ok(Self { conn })
+        let db = SkyDb::connect_sqlite(&url).await?;
+        Self::initialize_schema(&db).await?;
+        Self::ensure_session_context_snapshot_table(&db).await?;
+        Ok(Self { db })
     }
 
-    /// Get the underlying database connection.
-    #[must_use]
-    pub const fn connection(&self) -> &DatabaseConnection {
-        &self.conn
+    async fn initialize_schema(db: &SkyDb) -> Result<(), ChatDbError> {
+        for statement in db_sql::statements(db_sql::CHAT_SCHEMA) {
+            query!(db, statement).execute().await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_session_context_snapshot_table(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, db_sql::SESSION_CONTEXT_SNAPSHOT_COLUMNS)
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        let expected_columns = [
+            "session_id",
+            "checkpoint_blob",
+            "history_message_count",
+            "updated_at",
+        ];
+        let actual_columns = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+
+        if !actual_columns.is_empty() && actual_columns != expected_columns {
+            query!(db, db_sql::SESSION_CONTEXT_SNAPSHOT_DROP)
+                .execute()
+                .await?;
+        }
+
+        for statement in db_sql::statements(db_sql::SESSION_CONTEXT_SNAPSHOT_SCHEMA) {
+            query!(db, statement).execute().await?;
+        }
+
+        Ok(())
     }
 
     // ── Session CRUD ─────────────────────────────────────────────
@@ -592,28 +461,34 @@ impl ChatDb {
         profile_id: Option<&str>,
     ) -> Result<sessions::Model, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let active = sessions::ActiveModel {
-            id: Set(id.to_string()),
-            title: Set(title.map(String::from)),
-            model: Set(model.map(String::from)),
-            preview: Set(None),
-            message_count: Set(0),
-            profile_id: Set(profile_id.map(String::from)),
-            pinned: Set(false),
-            archived: Set(false),
-            folder_id: Set(None),
-            pin_sort_order: Set(None),
-            created_at: Set(now.clone()),
-            updated_at: Set(now),
-        };
-        let model = active.insert(&self.conn).await?;
-        Ok(model)
+        query!(
+            self.db,
+            "INSERT INTO sessions (id, title, model, preview, message_count, profile_id, pinned, archived, folder_id, pin_sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            id,
+            title,
+            model,
+            Option::<String>::None,
+            0_i64,
+            profile_id,
+            false,
+            false,
+            Option::<String>::None,
+            Option::<i32>::None,
+            now.clone(),
+            now
+        )
+        .execute()
+        .await?;
+        self.get_session(id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(id))
     }
 
     /// Get a session by ID.
     pub async fn get_session(&self, id: &str) -> Result<Option<sessions::Model>, ChatDbError> {
-        let session = sessions::Entity::find_by_id(id).one(&self.conn).await?;
-        Ok(session)
+        Ok(query!(self.db, "SELECT * FROM sessions WHERE id = ?", id)
+            .fetch_optional::<sessions::Model>()
+            .await?)
     }
 
     fn pending_user_message_from_row(
@@ -624,24 +499,26 @@ impl ChatDb {
             attachments: serde_json::from_str(&row.attachments_json)?,
             hidden_context_xml: row.hidden_context_xml.map(XmlFragment::parse).transpose()?,
             created_at: row.created_at,
-            delivery_mode: row.delivery_mode.parse().unwrap_or_default(),
+            delivery_mode: parse_pending_user_message_mode(&row.delivery_mode)?,
         })
     }
 
     fn persisted_permission_request_from_row(
         row: session_pending_permissions::Model,
-    ) -> PersistedPermissionRequest {
-        PersistedPermissionRequest {
+    ) -> Result<PersistedPermissionRequest, ChatDbError> {
+        Ok(PersistedPermissionRequest {
             id: row.request_id,
             request: crate::session::PersistedPermissionRequestPayload {
-                mode: row
-                    .mode
-                    .parse()
-                    .expect("persisted permission request mode must be valid"),
+                mode: row.mode.parse().map_err(|error| {
+                    storage_error(db_custom_error(
+                        "invalid persisted permission request mode: ",
+                        &error,
+                    ))
+                })?,
                 script: row.script,
                 session_id: Some(row.session_id),
             },
-        }
+        })
     }
 
     fn persisted_workspace_request_from_row(
@@ -693,18 +570,18 @@ impl ChatDb {
         queued_messages.splice(0..0, steer_messages);
 
         let mut summary = SessionRuntimeSummary {
-            state: runtime_row
-                .as_ref()
-                .map_or(SessionRuntimeState::Idle.as_str(), |row| row.state.as_str())
-                .parse()
-                .unwrap_or(SessionRuntimeState::Idle),
-            plan_state: plan_row
-                .as_ref()
-                .map_or(SessionPlanState::Disabled.as_str(), |row| {
-                    row.plan_state.as_str()
-                })
-                .parse()
-                .unwrap_or(SessionPlanState::Disabled),
+            state: parse_session_runtime_state(
+                runtime_row
+                    .as_ref()
+                    .map_or(SessionRuntimeState::Idle.as_str(), |row| row.state.as_str()),
+            )?,
+            plan_state: parse_session_plan_state(
+                plan_row
+                    .as_ref()
+                    .map_or(SessionPlanState::Disabled.as_str(), |row| {
+                        row.plan_state.as_str()
+                    }),
+            )?,
             interactions: SessionInteractionState {
                 browser: BrowserInteractionState {
                     takeover_active: runtime_row
@@ -731,7 +608,9 @@ impl ChatDb {
             },
             pending_immediate,
             queued_messages,
-            waiting_permission: permission_row.map(Self::persisted_permission_request_from_row),
+            waiting_permission: permission_row
+                .map(Self::persisted_permission_request_from_row)
+                .transpose()?,
             waiting_workspace: workspace_row.map(Self::persisted_workspace_request_from_row),
             waiting_ask_user: ask_user_row
                 .map(Self::persisted_ask_user_request_from_row)
@@ -759,29 +638,48 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let runtime_row = session_runtimes::Entity::find_by_id(session_id)
-            .one(&self.conn)
-            .await?;
-        let message_rows = session_pending_messages::Entity::find()
-            .filter(session_pending_messages::Column::SessionId.eq(session_id))
-            .order_by(session_pending_messages::Column::Id, Order::Asc)
-            .all(&self.conn)
-            .await?;
-        let permission_row = session_pending_permissions::Entity::find()
-            .filter(session_pending_permissions::Column::SessionId.eq(session_id))
-            .one(&self.conn)
-            .await?;
-        let workspace_row = session_pending_workspace::Entity::find()
-            .filter(session_pending_workspace::Column::SessionId.eq(session_id))
-            .one(&self.conn)
-            .await?;
-        let ask_user_row = session_pending_ask_user::Entity::find()
-            .filter(session_pending_ask_user::Column::SessionId.eq(session_id))
-            .one(&self.conn)
-            .await?;
-        let plan_row = session_plans::Entity::find_by_id(session_id)
-            .one(&self.conn)
-            .await?;
+        let runtime_row = query!(
+            self.db,
+            "SELECT * FROM session_runtimes WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<session_runtimes::Model>()
+        .await?;
+        let message_rows = query!(
+            self.db,
+            "SELECT * FROM session_pending_messages WHERE session_id = ? ORDER BY id ASC",
+            session_id
+        )
+        .fetch_all::<session_pending_messages::Model>()
+        .await?;
+        let permission_row = query!(
+            self.db,
+            "SELECT * FROM session_pending_permissions WHERE session_id = ? LIMIT 1",
+            session_id
+        )
+        .fetch_optional::<session_pending_permissions::Model>()
+        .await?;
+        let workspace_row = query!(
+            self.db,
+            "SELECT * FROM session_pending_workspace WHERE session_id = ? LIMIT 1",
+            session_id
+        )
+        .fetch_optional::<session_pending_workspace::Model>()
+        .await?;
+        let ask_user_row = query!(
+            self.db,
+            "SELECT * FROM session_pending_ask_user WHERE session_id = ? LIMIT 1",
+            session_id
+        )
+        .fetch_optional::<session_pending_ask_user::Model>()
+        .await?;
+        let plan_row = query!(
+            self.db,
+            "SELECT * FROM session_plans WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<session_plans::Model>()
+        .await?;
         Self::build_session_runtime_summary(
             runtime_row,
             message_rows,
@@ -799,76 +697,12 @@ impl ChatDb {
         if session_ids.is_empty() {
             return Ok(HashMap::new());
         }
-
-        let runtime_rows = session_runtimes::Entity::find()
-            .filter(session_runtimes::Column::SessionId.is_in(session_ids.iter().cloned()))
-            .all(&self.conn)
-            .await?;
-        let message_rows = session_pending_messages::Entity::find()
-            .filter(session_pending_messages::Column::SessionId.is_in(session_ids.iter().cloned()))
-            .order_by_asc(session_pending_messages::Column::SessionId)
-            .order_by_asc(session_pending_messages::Column::Id)
-            .all(&self.conn)
-            .await?;
-        let permission_rows = session_pending_permissions::Entity::find()
-            .filter(
-                session_pending_permissions::Column::SessionId.is_in(session_ids.iter().cloned()),
-            )
-            .all(&self.conn)
-            .await?;
-        let workspace_rows = session_pending_workspace::Entity::find()
-            .filter(session_pending_workspace::Column::SessionId.is_in(session_ids.iter().cloned()))
-            .all(&self.conn)
-            .await?;
-        let ask_user_rows = session_pending_ask_user::Entity::find()
-            .filter(session_pending_ask_user::Column::SessionId.is_in(session_ids.iter().cloned()))
-            .all(&self.conn)
-            .await?;
-        let plan_rows = session_plans::Entity::find()
-            .filter(session_plans::Column::SessionId.is_in(session_ids.iter().cloned()))
-            .all(&self.conn)
-            .await?;
-
-        let mut runtime_by_session = runtime_rows
-            .into_iter()
-            .map(|row| (row.session_id.clone(), row))
-            .collect::<HashMap<_, _>>();
-        let mut messages_by_session =
-            HashMap::<String, Vec<session_pending_messages::Model>>::new();
-        for row in message_rows {
-            messages_by_session
-                .entry(row.session_id.clone())
-                .or_default()
-                .push(row);
-        }
-        let mut permission_by_session = permission_rows
-            .into_iter()
-            .map(|row| (row.session_id.clone(), row))
-            .collect::<HashMap<_, _>>();
-        let mut workspace_by_session = workspace_rows
-            .into_iter()
-            .map(|row| (row.session_id.clone(), row))
-            .collect::<HashMap<_, _>>();
-        let mut ask_user_by_session = ask_user_rows
-            .into_iter()
-            .map(|row| (row.session_id.clone(), row))
-            .collect::<HashMap<_, _>>();
-        let mut plan_by_session = plan_rows
-            .into_iter()
-            .map(|row| (row.session_id.clone(), row))
-            .collect::<HashMap<_, _>>();
-
         let mut summaries = HashMap::with_capacity(session_ids.len());
         for session_id in session_ids {
-            let summary = Self::build_session_runtime_summary(
-                runtime_by_session.remove(session_id),
-                messages_by_session.remove(session_id).unwrap_or_default(),
-                permission_by_session.remove(session_id),
-                workspace_by_session.remove(session_id),
-                ask_user_by_session.remove(session_id),
-                plan_by_session.remove(session_id),
-            )?;
-            summaries.insert(session_id.clone(), summary);
+            summaries.insert(
+                session_id.clone(),
+                self.load_session_runtime_summary(session_id).await?,
+            );
         }
 
         Ok(summaries)
@@ -880,148 +714,130 @@ impl ChatDb {
         summary: &SessionRuntimeSummary,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let active_runtime = session_runtimes::ActiveModel {
-            session_id: Set(session_id.to_string()),
-            state: Set(summary.state.as_str().to_string()),
-            browser_takeover_active: Set(summary.interactions.browser.takeover_active),
-            browser_takeover_alert_pending: Set(summary
-                .interactions
-                .browser
-                .takeover_alert_pending),
-            terminal_task_id: Set(summary.interactions.terminal.task_id.clone()),
-            terminal_output_file: Set(summary.interactions.terminal.output_file.clone()),
-            terminal_output_preview: Set(summary.interactions.terminal.output_preview.clone()),
-            terminal_input_notice: Set(summary.interactions.terminal.input_notice.clone()),
-            updated_at: Set(now.clone()),
-        };
-        session_runtimes::Entity::insert(active_runtime)
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::column(session_runtimes::Column::SessionId)
-                    .update_columns([
-                        session_runtimes::Column::State,
-                        session_runtimes::Column::BrowserTakeoverActive,
-                        session_runtimes::Column::BrowserTakeoverAlertPending,
-                        session_runtimes::Column::TerminalTaskId,
-                        session_runtimes::Column::TerminalOutputFile,
-                        session_runtimes::Column::TerminalOutputPreview,
-                        session_runtimes::Column::TerminalInputNotice,
-                        session_runtimes::Column::UpdatedAt,
-                    ])
-                    .to_owned(),
-            )
-            .exec(&self.conn)
-            .await?;
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, browser_takeover_active = excluded.browser_takeover_active, browser_takeover_alert_pending = excluded.browser_takeover_alert_pending, terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, updated_at = excluded.updated_at",
+            session_id,
+            summary.state.as_str(),
+            summary.interactions.browser.takeover_active,
+            summary.interactions.browser.takeover_alert_pending,
+            summary.interactions.terminal.task_id.as_deref(),
+            summary.interactions.terminal.output_file.as_deref(),
+            summary.interactions.terminal.output_preview.as_deref(),
+            summary.interactions.terminal.input_notice.as_deref(),
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "INSERT INTO session_plans (session_id, plan_state, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET plan_state = excluded.plan_state, updated_at = excluded.updated_at",
+            session_id,
+            summary.plan_state.as_str(),
+            now.as_str()
+        )
+        .execute()
+        .await?;
 
-        let active_plan = session_plans::ActiveModel {
-            session_id: Set(session_id.to_string()),
-            plan_state: Set(summary.plan_state.as_str().to_string()),
-            updated_at: Set(now),
-        };
-        session_plans::Entity::insert(active_plan)
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::column(session_plans::Column::SessionId)
-                    .update_columns([
-                        session_plans::Column::PlanState,
-                        session_plans::Column::UpdatedAt,
-                    ])
-                    .to_owned(),
-            )
-            .exec(&self.conn)
-            .await?;
-
-        session_pending_messages::Entity::delete_many()
-            .filter(session_pending_messages::Column::SessionId.eq(session_id))
-            .exec(&self.conn)
-            .await?;
-
+        query!(
+            tx,
+            "DELETE FROM session_pending_messages WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
         for message in &summary.queued_messages {
-            session_pending_messages::ActiveModel {
-                id: NotSet,
-                session_id: Set(session_id.to_string()),
-                delivery_mode: Set(message.delivery_mode.as_str().to_string()),
-                content: Set(message.content.clone()),
-                attachments_json: Set(serde_json::to_string(&message.attachments)?),
-                hidden_context_xml: Set(message
-                    .hidden_context_xml
-                    .clone()
-                    .map(XmlFragment::into_inner)),
-                created_at: Set(message.created_at.clone()),
-            }
-            .insert(&self.conn)
+            query!(
+                tx,
+                "INSERT INTO session_pending_messages (session_id, delivery_mode, content, attachments_json, hidden_context_xml, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                session_id,
+                message.delivery_mode.as_str(),
+                message.content.as_str(),
+                serde_json::to_string(&message.attachments)?,
+                message.hidden_context_xml.clone().map(XmlFragment::into_inner),
+                message.created_at.as_str()
+            )
+            .execute()
             .await?;
         }
         if let Some(message) = &summary.pending_immediate {
-            session_pending_messages::ActiveModel {
-                id: NotSet,
-                session_id: Set(session_id.to_string()),
-                delivery_mode: Set(message.delivery_mode.as_str().to_string()),
-                content: Set(message.content.clone()),
-                attachments_json: Set(serde_json::to_string(&message.attachments)?),
-                hidden_context_xml: Set(message
-                    .hidden_context_xml
-                    .clone()
-                    .map(XmlFragment::into_inner)),
-                created_at: Set(message.created_at.clone()),
-            }
-            .insert(&self.conn)
+            query!(
+                tx,
+                "INSERT INTO session_pending_messages (session_id, delivery_mode, content, attachments_json, hidden_context_xml, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                session_id,
+                message.delivery_mode.as_str(),
+                message.content.as_str(),
+                serde_json::to_string(&message.attachments)?,
+                message.hidden_context_xml.clone().map(XmlFragment::into_inner),
+                message.created_at.as_str()
+            )
+            .execute()
             .await?;
         }
 
-        session_pending_permissions::Entity::delete_many()
-            .filter(session_pending_permissions::Column::SessionId.eq(session_id))
-            .exec(&self.conn)
-            .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_permissions WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
         if let Some(request) = &summary.waiting_permission {
-            session_pending_permissions::ActiveModel {
-                request_id: Set(request.id.clone()),
-                session_id: Set(session_id.to_string()),
-                mode: Set(request.request.mode.to_string()),
-                script: Set(request.request.script.clone()),
-                created_at: Set(summary
-                    .updated_at
-                    .clone()
-                    .unwrap_or_else(|| jiff::Timestamp::now().to_string())),
-            }
-            .insert(&self.conn)
+            query!(
+                tx,
+                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at) VALUES (?, ?, ?, ?, ?)",
+                request.id.as_str(),
+                session_id,
+                request.request.mode.as_str(),
+                request.request.script.as_str(),
+                summary.updated_at.as_deref().unwrap_or(now.as_str())
+            )
+            .execute()
             .await?;
         }
 
-        session_pending_workspace::Entity::delete_many()
-            .filter(session_pending_workspace::Column::SessionId.eq(session_id))
-            .exec(&self.conn)
-            .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_workspace WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
         if let Some(request) = &summary.waiting_workspace {
-            session_pending_workspace::ActiveModel {
-                request_id: Set(request.id.clone()),
-                session_id: Set(session_id.to_string()),
-                path: Set(request.request.path.clone()),
-                reason: Set(request.request.reason.clone()),
-                created_at: Set(summary
-                    .updated_at
-                    .clone()
-                    .unwrap_or_else(|| jiff::Timestamp::now().to_string())),
-            }
-            .insert(&self.conn)
+            query!(
+                tx,
+                "INSERT INTO session_pending_workspace (request_id, session_id, path, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+                request.id.as_str(),
+                session_id,
+                request.request.path.as_str(),
+                request.request.reason.as_str(),
+                summary.updated_at.as_deref().unwrap_or(now.as_str())
+            )
+            .execute()
             .await?;
         }
 
-        session_pending_ask_user::Entity::delete_many()
-            .filter(session_pending_ask_user::Column::SessionId.eq(session_id))
-            .exec(&self.conn)
-            .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_ask_user WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
         if let Some(request) = &summary.waiting_ask_user {
-            session_pending_ask_user::ActiveModel {
-                request_id: Set(request.id.clone()),
-                session_id: Set(session_id.to_string()),
-                questions_json: Set(serde_json::to_string(&request.questions)?),
-                created_at: Set(summary
-                    .updated_at
-                    .clone()
-                    .unwrap_or_else(|| jiff::Timestamp::now().to_string())),
-            }
-            .insert(&self.conn)
+            query!(
+                tx,
+                "INSERT INTO session_pending_ask_user (request_id, session_id, questions_json, created_at) VALUES (?, ?, ?, ?)",
+                request.id.as_str(),
+                session_id,
+                serde_json::to_string(&request.questions)?,
+                summary.updated_at.as_deref().unwrap_or(now.as_str())
+            )
+            .execute()
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1031,11 +847,10 @@ impl ChatDb {
         session_id: &str,
         state: SessionRuntimeState,
     ) -> Result<(), ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.state = state;
         summary.normalize_state();
@@ -1047,11 +862,10 @@ impl ChatDb {
         session_id: &str,
         plan_state: SessionPlanState,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.plan_state = plan_state;
         summary.normalize_state();
@@ -1065,11 +879,10 @@ impl ChatDb {
         session_id: &str,
         message: PendingUserMessage,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         if let Some(previous) = summary.pending_immediate.take() {
             summary.push_overflow_steer(previous);
@@ -1086,11 +899,10 @@ impl ChatDb {
         session_id: &str,
         message: PendingUserMessage,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.queued_messages.push(message);
         summary.normalize_state();
@@ -1103,11 +915,10 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         let next = if summary.pending_immediate.is_some() {
             summary.pending_immediate.take()
@@ -1126,11 +937,10 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let summary = self.load_session_runtime_summary(&session.id).await?;
         if !summary.can_dispatch_follow_up() {
             return Ok(None);
@@ -1143,11 +953,10 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.pending_immediate = None;
         summary.normalize_state();
@@ -1161,16 +970,15 @@ impl ChatDb {
         session_id: &str,
         index: usize,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         if index >= summary.queued_messages.len() {
-            return Err(ChatDbError::Db(DbErr::RecordNotFound(format!(
+            return Err(row_not_found(format!(
                 "Queued message index {index} out of range for session {session_id}"
-            ))));
+            )));
         }
         summary.queued_messages.remove(index);
         summary.normalize_state();
@@ -1184,11 +992,10 @@ impl ChatDb {
         session_id: &str,
         request: Option<PersistedPermissionRequest>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.waiting_permission = request;
         if summary.waiting_permission.is_none() {
@@ -1205,11 +1012,10 @@ impl ChatDb {
         session_id: &str,
         request: Option<PersistedWorkspaceRequest>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.waiting_workspace = request;
         if summary.waiting_workspace.is_none() {
@@ -1226,11 +1032,10 @@ impl ChatDb {
         session_id: &str,
         request: Option<PersistedAskUserRequest>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| session_not_found_db_error(session_id))?;
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.waiting_ask_user = request;
         if summary.waiting_ask_user.is_none() {
@@ -1249,13 +1054,12 @@ impl ChatDb {
             .get_session(session_id)
             .await?
             .ok_or_else(|| session_not_found_db_error(session_id))?;
-        session_runtimes::Entity::update_many()
-            .col_expr(
-                session_runtimes::Column::BrowserTakeoverActive,
-                Expr::value(false),
-            )
-            .exec(&self.conn)
-            .await?;
+        query!(
+            self.db,
+            "UPDATE session_runtimes SET browser_takeover_active = 0"
+        )
+        .execute()
+        .await?;
 
         let mut summary = self.load_session_runtime_summary(&session.id).await?;
         summary.interactions.browser.takeover_active = true;
@@ -1314,59 +1118,52 @@ impl ChatDb {
     }
 
     pub async fn find_browser_takeover_session(&self) -> Result<Option<String>, ChatDbError> {
-        let row = session_runtimes::Entity::find()
-            .filter(session_runtimes::Column::BrowserTakeoverActive.eq(true))
-            .one(&self.conn)
-            .await?;
-        Ok(row.map(|model| model.session_id))
+        Ok(query!(
+            self.db,
+            "SELECT session_id FROM session_runtimes WHERE browser_takeover_active = 1 LIMIT 1"
+        )
+        .fetch_optional::<SessionIdRow>()
+        .await?
+        .map(|row| row.session_id))
     }
 
     pub(crate) async fn find_pending_permission_request(
         &self,
         request_id: &str,
     ) -> Result<Option<PendingPermissionLookup>, ChatDbError> {
-        let Some(row) = session_pending_permissions::Entity::find_by_id(request_id)
-            .one(&self.conn)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(PendingPermissionLookup {
-            session_id: row.session_id,
-        }))
+        Ok(query!(
+            self.db,
+            "SELECT session_id FROM session_pending_permissions WHERE request_id = ? LIMIT 1",
+            request_id
+        )
+        .fetch_optional::<PendingPermissionLookup>()
+        .await?)
     }
 
     pub(crate) async fn find_pending_workspace_request(
         &self,
         request_id: &str,
     ) -> Result<Option<PendingWorkspaceLookup>, ChatDbError> {
-        let Some(row) = session_pending_workspace::Entity::find_by_id(request_id)
-            .one(&self.conn)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(PendingWorkspaceLookup {
-            session_id: row.session_id,
-        }))
+        Ok(query!(
+            self.db,
+            "SELECT session_id FROM session_pending_workspace WHERE request_id = ? LIMIT 1",
+            request_id
+        )
+        .fetch_optional::<PendingWorkspaceLookup>()
+        .await?)
     }
 
     pub(crate) async fn find_pending_ask_user_request(
         &self,
         request_id: &str,
     ) -> Result<Option<PendingAskUserLookup>, ChatDbError> {
-        let Some(row) = session_pending_ask_user::Entity::find_by_id(request_id)
-            .one(&self.conn)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(PendingAskUserLookup {
-            session_id: row.session_id,
-        }))
+        Ok(query!(
+            self.db,
+            "SELECT session_id FROM session_pending_ask_user WHERE request_id = ? LIMIT 1",
+            request_id
+        )
+        .fetch_optional::<PendingAskUserLookup>()
+        .await?)
     }
 
     pub async fn session_has_approved_permission_mode(
@@ -1405,10 +1202,14 @@ impl ChatDb {
 
     /// Check if a session exists in the database.
     pub async fn session_exists(&self, id: &str) -> Result<bool, ChatDbError> {
-        Ok(sessions::Entity::find_by_id(id)
-            .one(&self.conn)
-            .await?
-            .is_some())
+        Ok(query!(
+            self.db,
+            "SELECT id AS session_id FROM sessions WHERE id = ? LIMIT 1",
+            id
+        )
+        .fetch_optional::<SessionIdRow>()
+        .await?
+        .is_some())
     }
 
     /// Update session metadata (title and/or model).
@@ -1418,53 +1219,67 @@ impl ChatDb {
         title: Option<&str>,
         model: Option<&str>,
     ) -> Result<(), ChatDbError> {
-        let now = jiff::Timestamp::now().to_string();
-        let mut active = sessions::ActiveModel {
-            id: Set(id.to_string()),
-            updated_at: Set(now),
-            ..Default::default()
-        };
-        if let Some(t) = title {
-            active.title = Set(Some(t.to_string()));
+        let mut existing = self
+            .get_session(id)
+            .await?
+            .ok_or_else(|| row_not_found(format!("Session not found: {id}")))?;
+        if let Some(title) = title {
+            existing.title = Some(title.to_string());
         }
-        if let Some(m) = model {
-            active.model = Set(Some(m.to_string()));
+        if let Some(model) = model {
+            existing.model = Some(model.to_string());
         }
-        active.update(&self.conn).await?;
+        existing.updated_at = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "UPDATE sessions SET title = ?, model = ?, preview = ?, message_count = ?, profile_id = ?, pinned = ?, archived = ?, folder_id = ?, pin_sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
+            existing.title.as_deref(),
+            existing.model.as_deref(),
+            existing.preview.as_deref(),
+            existing.message_count,
+            existing.profile_id.as_deref(),
+            existing.pinned,
+            existing.archived,
+            existing.folder_id.as_deref(),
+            existing.pin_sort_order,
+            existing.created_at.as_str(),
+            existing.updated_at.as_str(),
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
     /// Delete a session and all its messages (CASCADE).
     pub async fn delete_session(&self, id: &str) -> Result<(), ChatDbError> {
-        // Delete messages first (SQLite may not enforce FK CASCADE)
-        messages::Entity::delete_many()
-            .filter(messages::Column::SessionId.eq(id))
-            .exec(&self.conn)
+        query!(self.db, "DELETE FROM messages WHERE session_id = ?", id)
+            .execute()
             .await?;
-        session_context_snapshots::Entity::delete_by_id(id)
-            .exec(&self.conn)
+        self.delete_session_context_snapshot(id).await?;
+        query!(self.db, "DELETE FROM sessions WHERE id = ?", id)
+            .execute()
             .await?;
-        sessions::Entity::delete_by_id(id).exec(&self.conn).await?;
         Ok(())
     }
 
     /// Delete all sessions.
     pub async fn delete_all_sessions(&self) -> Result<u64, ChatDbError> {
-        let result = messages::Entity::delete_many().exec(&self.conn).await?;
-        let snapshot_result = session_context_snapshots::Entity::delete_many()
-            .exec(&self.conn)
+        let result = query!(self.db, "DELETE FROM messages").execute().await?;
+        let snapshot_result = query!(self.db, "DELETE FROM session_context_snapshots")
+            .execute()
             .await?;
-        let session_result = sessions::Entity::delete_many().exec(&self.conn).await?;
-        Ok(result.rows_affected + snapshot_result.rows_affected + session_result.rows_affected)
+        let session_result = query!(self.db, "DELETE FROM sessions").execute().await?;
+        Ok(result.rows_written + snapshot_result.rows_written + session_result.rows_written)
     }
 
     /// List all sessions ordered by `updated_at` descending.
     pub async fn list_sessions(&self) -> Result<Vec<sessions::Model>, ChatDbError> {
-        let sessions = sessions::Entity::find()
-            .order_by(sessions::Column::UpdatedAt, Order::Desc)
-            .all(&self.conn)
-            .await?;
-        Ok(sessions)
+        Ok(
+            query!(self.db, "SELECT * FROM sessions ORDER BY updated_at DESC")
+                .fetch_all::<sessions::Model>()
+                .await?,
+        )
     }
 
     /// Normalize persisted runtime state after a server restart.
@@ -1506,111 +1321,104 @@ impl ChatDb {
     }
 
     pub async fn recover_task_runs_after_restart(&self) -> Result<(), ChatDbError> {
-        let running = scheduled_task_runs::Entity::find()
-            .filter(scheduled_task_runs::Column::Status.eq(TaskRunStatus::Running.as_str()))
-            .all(&self.conn)
-            .await?;
         let finished_at = jiff::Timestamp::now().to_string();
-        for run in running {
-            let mut active: scheduled_task_runs::ActiveModel = run.into();
-            active.status = Set(TaskRunStatus::Interrupted.as_str().to_string());
-            active.output = Set(Some(
-                "May server restarted before the task run completed".to_string(),
-            ));
-            active.finished_at = Set(Some(finished_at.clone()));
-            active.updated_at = Set(finished_at.clone());
-            active.update(&self.conn).await?;
-        }
+        query!(
+            self.db,
+            "UPDATE scheduled_task_runs SET status = ?, output = ?, finished_at = ?, updated_at = ? WHERE status = ?",
+            TaskRunStatus::Interrupted.as_str(),
+            "May server restarted before the task run completed",
+            Some(finished_at.as_str()),
+            finished_at.as_str(),
+            TaskRunStatus::Running.as_str()
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
     pub async fn recover_session_run_leases_after_restart(&self) -> Result<(), ChatDbError> {
-        session_run_leases::Entity::update_many()
-            .col_expr(session_run_leases::Column::Active, Expr::value(false))
-            .col_expr(
-                session_run_leases::Column::CancellationRequested,
-                Expr::value(false),
-            )
-            .col_expr(
-                session_run_leases::Column::UpdatedAt,
-                Expr::value(jiff::Timestamp::now().to_string()),
-            )
-            .filter(session_run_leases::Column::Active.eq(true))
-            .exec(&self.conn)
-            .await?;
+        query!(
+            self.db,
+            "UPDATE session_run_leases SET active = ?, cancellation_requested = ?, updated_at = ? WHERE active = ?",
+            false,
+            false,
+            jiff::Timestamp::now().to_string(),
+            true
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
     pub async fn claim_session_run_lease(&self, session_id: &str) -> Result<bool, ChatDbError> {
-        let session_id_owned = session_id.to_string();
-        self.conn
-            .transaction::<_, bool, DbErr>(|txn| {
-                Box::pin(async move {
-                    let existing =
-                        session_run_leases::Entity::find_by_id(session_id_owned.as_str())
-                            .one(txn)
-                            .await?;
-                    if let Some(existing) = existing {
-                        if existing.active {
-                            return Ok(false);
-                        }
-                        let mut active: session_run_leases::ActiveModel = existing.into();
-                        active.active = Set(true);
-                        active.cancellation_requested = Set(false);
-                        active.updated_at = Set(jiff::Timestamp::now().to_string());
-                        active.update(txn).await?;
-                    } else {
-                        session_run_leases::ActiveModel {
-                            session_id: Set(session_id_owned.clone()),
-                            active: Set(true),
-                            cancellation_requested: Set(false),
-                            updated_at: Set(jiff::Timestamp::now().to_string()),
-                        }
-                        .insert(txn)
-                        .await?;
-                    }
-                    Ok(true)
-                })
-            })
-            .await
-            .map_err(|error| match error {
-                sea_orm::TransactionError::Connection(db_error)
-                | sea_orm::TransactionError::Transaction(db_error) => ChatDbError::Db(db_error),
-            })
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        let existing = query!(
+            tx,
+            "SELECT * FROM session_run_leases WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<session_run_leases::Model>()
+        .await?;
+        let claimed = if let Some(existing) = existing {
+            if existing.active {
+                false
+            } else {
+                query!(
+                    tx,
+                    "UPDATE session_run_leases SET active = ?, cancellation_requested = ?, updated_at = ? WHERE session_id = ?",
+                    true,
+                    false,
+                    now.as_str(),
+                    session_id
+                )
+                .execute()
+                .await?;
+                true
+            }
+        } else {
+            query!(
+                tx,
+                "INSERT INTO session_run_leases (session_id, active, cancellation_requested, updated_at) VALUES (?, ?, ?, ?)",
+                session_id,
+                true,
+                false,
+                now.as_str()
+            )
+            .execute()
+            .await?;
+            true
+        };
+        tx.commit().await?;
+        Ok(claimed)
     }
 
     pub async fn release_session_run_lease(&self, session_id: &str) -> Result<(), ChatDbError> {
-        session_run_leases::Entity::update_many()
-            .col_expr(session_run_leases::Column::Active, Expr::value(false))
-            .col_expr(
-                session_run_leases::Column::CancellationRequested,
-                Expr::value(false),
-            )
-            .col_expr(
-                session_run_leases::Column::UpdatedAt,
-                Expr::value(jiff::Timestamp::now().to_string()),
-            )
-            .filter(session_run_leases::Column::SessionId.eq(session_id))
-            .exec(&self.conn)
-            .await?;
+        query!(
+            self.db,
+            "UPDATE session_run_leases SET active = ?, cancellation_requested = ?, updated_at = ? WHERE session_id = ?",
+            false,
+            false,
+            jiff::Timestamp::now().to_string(),
+            session_id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
     pub async fn request_session_run_cancel(&self, session_id: &str) -> Result<bool, ChatDbError> {
-        let result = session_run_leases::Entity::update_many()
-            .col_expr(
-                session_run_leases::Column::CancellationRequested,
-                Expr::value(true),
-            )
-            .col_expr(
-                session_run_leases::Column::UpdatedAt,
-                Expr::value(jiff::Timestamp::now().to_string()),
-            )
-            .filter(session_run_leases::Column::SessionId.eq(session_id))
-            .filter(session_run_leases::Column::Active.eq(true))
-            .exec(&self.conn)
-            .await?;
-        Ok(result.rows_affected > 0)
+        let result = query!(
+            self.db,
+            "UPDATE session_run_leases SET cancellation_requested = ?, updated_at = ? WHERE session_id = ? AND active = ?",
+            true,
+            jiff::Timestamp::now().to_string(),
+            session_id,
+            true
+        )
+        .execute()
+        .await?;
+        Ok(result.rows_written > 0)
     }
 
     /// Return session ids that have persisted follow-up work ready to resume.
@@ -1634,24 +1442,28 @@ impl ChatDb {
         preview: Option<&str>,
         increment_count: bool,
     ) -> Result<(), ChatDbError> {
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::UpdatedAt, updated_at);
-        if let Some(preview) = preview {
-            update.value(sessions::Column::Preview, preview);
+        let sql = match (preview.is_some(), increment_count) {
+            (true, true) => {
+                "UPDATE sessions SET updated_at = ?, preview = ?, message_count = message_count + 1 WHERE id = ?"
+            }
+            (true, false) => "UPDATE sessions SET updated_at = ?, preview = ? WHERE id = ?",
+            (false, true) => {
+                "UPDATE sessions SET updated_at = ?, message_count = message_count + 1 WHERE id = ?"
+            }
+            (false, false) => "UPDATE sessions SET updated_at = ? WHERE id = ?",
+        };
+        match preview {
+            Some(preview) => {
+                query!(self.db, sql, updated_at, preview, session_id)
+                    .execute()
+                    .await?;
+            }
+            None => {
+                query!(self.db, sql, updated_at, session_id)
+                    .execute()
+                    .await?;
+            }
         }
-
-        if increment_count {
-            update.value(
-                sessions::Column::MessageCount,
-                Expr::col(sessions::Column::MessageCount).add(1),
-            );
-        }
-
-        update.and_where(Expr::col(sessions::Column::Id).eq(session_id));
-        let stmt = update.clone();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
         Ok(())
     }
 
@@ -1670,61 +1482,54 @@ impl ChatDb {
         let now = jiff::Timestamp::now().to_string();
         let prompt_tokens = stats
             .and_then(|s| s.prompt_tokens)
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("prompt_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "prompt_tokens"))
+            .transpose()?;
         let completion_tokens = stats
             .and_then(|s| s.completion_tokens)
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("completion_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "completion_tokens"))
+            .transpose()?;
         let total_tokens = stats
             .and_then(|s| s.total_tokens)
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("total_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "total_tokens"))
+            .transpose()?;
         let cache_read_tokens = stats
             .and_then(|s| s.cache_read_tokens)
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("cache_read_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "cache_read_tokens"))
+            .transpose()?;
         let cache_write_tokens = stats
             .and_then(|s| s.cache_write_tokens)
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("cache_write_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "cache_write_tokens"))
+            .transpose()?;
         let context_window = stats
             .and_then(|s| s.context_window)
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("context_window overflow: {e}")))?;
+            .map(|value| to_i32(value, "context_window"))
+            .transpose()?;
         let elapsed_ms = stats
             .and_then(|s| s.elapsed_ms)
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("elapsed_ms overflow: {e}")))?;
+            .map(|value| to_i64_from_u64(value, "elapsed_ms"))
+            .transpose()?;
         let provider_id = stats.and_then(|s| s.provider_id.clone());
         let session_update = role.session_summary_update();
         let role_str = role.as_str();
-
-        // Insert the message
-        let active = messages::ActiveModel {
-            session_id: Set(session_id.to_string()),
-            role: Set(role_str.to_string()),
-            content: Set(content.to_string()),
-            timestamp: Set(timestamp.map(String::from).or(Some(now.clone()))),
-            tool_call_id: Set(tool_call_id.map(String::from)),
-            provider_id: Set(provider_id),
-            prompt_tokens: Set(prompt_tokens),
-            completion_tokens: Set(completion_tokens),
-            total_tokens: Set(total_tokens),
-            cache_read_tokens: Set(cache_read_tokens),
-            cache_write_tokens: Set(cache_write_tokens),
-            context_window: Set(context_window),
-            elapsed_ms: Set(elapsed_ms),
-            ..Default::default()
-        };
-        let model = active.insert(&self.conn).await?;
+        let model = query!(
+            self.db,
+            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+            session_id,
+            role_str,
+            content,
+            timestamp.map(String::from).or(Some(now.clone())),
+            tool_call_id,
+            provider_id,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            context_window,
+            elapsed_ms
+        )
+        .fetch_one::<messages::Model>()
+        .await?;
 
         if session_update.touch_updated_at {
             let preview = session_update
@@ -1769,64 +1574,63 @@ impl ChatDb {
         session_id: &str,
         stats: &MessageStatsParams,
     ) -> Result<(), ChatDbError> {
-        let Some(row) = messages::Entity::find()
-            .filter(messages::Column::SessionId.eq(session_id))
-            .filter(messages::Column::Role.eq("assistant"))
-            .order_by_desc(messages::Column::Id)
-            .one(&self.conn)
-            .await?
-        else {
-            return Err(ChatDbError::Db(DbErr::RecordNotFound(format!(
+        let row = query!(
+            self.db,
+            "SELECT * FROM messages WHERE session_id = ? AND role = ? ORDER BY id DESC LIMIT 1",
+            session_id,
+            MessageRole::Assistant.as_str()
+        )
+        .fetch_optional::<messages::Model>()
+        .await?
+        .ok_or_else(|| {
+            row_not_found(format!(
                 "no assistant message found in session {session_id}"
-            ))));
-        };
+            ))
+        })?;
 
         let prompt_tokens = stats
             .prompt_tokens
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("prompt_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "prompt_tokens"))
+            .transpose()?;
         let completion_tokens = stats
             .completion_tokens
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("completion_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "completion_tokens"))
+            .transpose()?;
         let total_tokens = stats
             .total_tokens
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("total_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "total_tokens"))
+            .transpose()?;
         let cache_read_tokens = stats
             .cache_read_tokens
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("cache_read_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "cache_read_tokens"))
+            .transpose()?;
         let cache_write_tokens = stats
             .cache_write_tokens
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("cache_write_tokens overflow: {e}")))?;
+            .map(|value| to_i32(value, "cache_write_tokens"))
+            .transpose()?;
         let context_window = stats
             .context_window
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("context_window overflow: {e}")))?;
+            .map(|value| to_i32(value, "context_window"))
+            .transpose()?;
         let elapsed_ms = stats
             .elapsed_ms
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("elapsed_ms overflow: {e}")))?;
-
-        let mut active: messages::ActiveModel = row.into();
-        active.provider_id = Set(stats.provider_id.clone());
-        active.prompt_tokens = Set(prompt_tokens);
-        active.completion_tokens = Set(completion_tokens);
-        active.total_tokens = Set(total_tokens);
-        active.cache_read_tokens = Set(cache_read_tokens);
-        active.cache_write_tokens = Set(cache_write_tokens);
-        active.context_window = Set(context_window);
-        active.elapsed_ms = Set(elapsed_ms);
-        active.update(&self.conn).await?;
+            .map(|value| to_i64_from_u64(value, "elapsed_ms"))
+            .transpose()?;
+        query!(
+            self.db,
+            "UPDATE messages SET provider_id = ?, prompt_tokens = ?, completion_tokens = ?, total_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?, context_window = ?, elapsed_ms = ? WHERE id = ?",
+            stats.provider_id.as_deref(),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            context_window,
+            elapsed_ms,
+            row.id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -1844,28 +1648,31 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<Vec<messages::Model>, ChatDbError> {
-        let msgs = messages::Entity::find()
-            .filter(messages::Column::SessionId.eq(session_id))
-            .order_by_asc(messages::Column::Id)
-            .all(&self.conn)
-            .await?;
-        Ok(msgs)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC",
+            session_id
+        )
+        .fetch_all::<messages::Model>()
+        .await?)
     }
 
     /// Count messages that contribute to the LLM-visible conversation history.
     pub async fn llm_message_count(&self, session_id: &str) -> Result<usize, ChatDbError> {
-        let count = messages::Entity::find()
-            .filter(messages::Column::SessionId.eq(session_id))
-            .filter(messages::Column::Role.is_in([
-                MessageRole::User.as_str(),
-                MessageRole::Assistant.as_str(),
-                MessageRole::System.as_str(),
-                MessageRole::HiddenContext.as_str(),
-                MessageRole::Tool.as_str(),
-            ]))
-            .count(&self.conn)
-            .await?;
-        usize::try_from(count).map_err(|error| ChatDbError::Db(DbErr::Custom(error.to_string())))
+        let count = query!(
+            self.db,
+            "SELECT COUNT(*) AS value FROM messages WHERE session_id = ? AND role IN (?, ?, ?, ?, ?)",
+            session_id,
+            MessageRole::User.as_str(),
+            MessageRole::Assistant.as_str(),
+            MessageRole::System.as_str(),
+            MessageRole::HiddenContext.as_str(),
+            MessageRole::Tool.as_str()
+        )
+        .fetch_one::<I64ValueRow>()
+        .await?
+        .value;
+        to_usize(count, "llm_message_count")
     }
 
     /// Get messages for a session filtered by role.
@@ -1874,45 +1681,45 @@ impl ChatDb {
         session_id: &str,
         role: &str,
     ) -> Result<Vec<messages::Model>, ChatDbError> {
-        let msgs = messages::Entity::find()
-            .filter(messages::Column::SessionId.eq(session_id))
-            .filter(messages::Column::Role.eq(role))
-            .order_by_asc(messages::Column::Id)
-            .all(&self.conn)
-            .await?;
-        Ok(msgs)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM messages WHERE session_id = ? AND role = ? ORDER BY id ASC",
+            session_id,
+            role
+        )
+        .fetch_all::<messages::Model>()
+        .await?)
     }
 
     /// Summarize persisted cache-token usage across assistant messages.
     pub async fn assistant_cache_usage_summary(
         &self,
     ) -> Result<AssistantCacheUsageSummary, ChatDbError> {
-        let row = self
-            .conn
-            .query_one(sea_orm::Statement::from_sql_and_values(
-                self.conn.get_database_backend(),
-                "SELECT \
-                    COUNT(*) AS assistant_message_count, \
-                    COALESCE(SUM(CASE WHEN COALESCE(cache_read_tokens, 0) > 0 THEN 1 ELSE 0 END), 0) AS cache_hit_message_count, \
-                    COALESCE(SUM(COALESCE(prompt_tokens, 0)), 0) AS prompt_tokens_total, \
-                    COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0) AS cache_read_tokens_total, \
-                    COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0) AS cache_write_tokens_total \
-                 FROM messages \
-                 WHERE role = ?",
-                ["assistant".into()],
-            ))
-            .await?;
-
-        let Some(row) = row else {
-            return Ok(AssistantCacheUsageSummary::default());
-        };
-
+        let row = query!(
+            self.db,
+            "SELECT COUNT(*) AS assistant_message_count, COALESCE(SUM(CASE WHEN COALESCE(cache_read_tokens, 0) > 0 THEN 1 ELSE 0 END), 0) AS cache_hit_message_count, COALESCE(SUM(COALESCE(prompt_tokens, 0)), 0) AS prompt_tokens_total, COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0) AS cache_read_tokens_total, COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0) AS cache_write_tokens_total FROM messages WHERE role = ?",
+            MessageRole::Assistant.as_str()
+        )
+        .fetch_one::<AssistantCacheUsageSummaryRow>()
+        .await?;
         Ok(AssistantCacheUsageSummary {
-            assistant_message_count: query_u64(&row, 0)?,
-            cache_hit_message_count: query_u64(&row, 1)?,
-            prompt_tokens_total: query_u64(&row, 2)?,
-            cache_read_tokens_total: query_u64(&row, 3)?,
-            cache_write_tokens_total: query_u64(&row, 4)?,
+            assistant_message_count: to_u64(
+                row.assistant_message_count,
+                "assistant_message_count",
+            )?,
+            cache_hit_message_count: to_u64(
+                row.cache_hit_message_count,
+                "cache_hit_message_count",
+            )?,
+            prompt_tokens_total: to_u64(row.prompt_tokens_total, "prompt_tokens_total")?,
+            cache_read_tokens_total: to_u64(
+                row.cache_read_tokens_total,
+                "cache_read_tokens_total",
+            )?,
+            cache_write_tokens_total: to_u64(
+                row.cache_write_tokens_total,
+                "cache_write_tokens_total",
+            )?,
         })
     }
 
@@ -1929,30 +1736,19 @@ impl ChatDb {
         prompt_attachments_json: &str,
         assembled_messages_json: &str,
     ) -> Result<(), ChatDbError> {
-        if let Some(existing) = context_debug_snapshots::Entity::find_by_id(session_id)
-            .one(&self.conn)
-            .await?
-        {
-            let mut active: context_debug_snapshots::ActiveModel = existing.into();
-            active.timestamp = Set(timestamp.to_string());
-            active.model = Set(model.to_string());
-            active.provider_id = Set(provider_id.to_string());
-            active.prompt = Set(prompt.to_string());
-            active.prompt_attachments_json = Set(prompt_attachments_json.to_string());
-            active.assembled_messages_json = Set(assembled_messages_json.to_string());
-            active.update(&self.conn).await?;
-        } else {
-            let active = context_debug_snapshots::ActiveModel {
-                session_id: Set(session_id.to_string()),
-                timestamp: Set(timestamp.to_string()),
-                model: Set(model.to_string()),
-                provider_id: Set(provider_id.to_string()),
-                prompt: Set(prompt.to_string()),
-                prompt_attachments_json: Set(prompt_attachments_json.to_string()),
-                assembled_messages_json: Set(assembled_messages_json.to_string()),
-            };
-            active.insert(&self.conn).await?;
-        }
+        query!(
+            self.db,
+            "INSERT INTO context_debug_snapshots (session_id, timestamp, model, provider_id, prompt, prompt_attachments_json, assembled_messages_json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET timestamp = excluded.timestamp, model = excluded.model, provider_id = excluded.provider_id, prompt = excluded.prompt, prompt_attachments_json = excluded.prompt_attachments_json, assembled_messages_json = excluded.assembled_messages_json",
+            session_id,
+            timestamp,
+            model,
+            provider_id,
+            prompt,
+            prompt_attachments_json,
+            assembled_messages_json
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -1961,41 +1757,39 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<Option<context_debug_snapshots::Model>, ChatDbError> {
-        let row = context_debug_snapshots::Entity::find_by_id(session_id)
-            .one(&self.conn)
-            .await?;
-        Ok(row)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM context_debug_snapshots WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<context_debug_snapshots::Model>()
+        .await?)
     }
 
     /// Upsert the latest serialized agent context snapshot for a session.
     pub async fn upsert_session_context_snapshot(
         &self,
         session_id: &str,
-        snapshot: SessionContextSnapshotUpsert<'_>,
+        snapshot: SessionContextSnapshotUpsert,
     ) -> Result<(), ChatDbError> {
         let updated_at = jiff::Timestamp::now().to_string();
-        let active = session_context_snapshots::ActiveModel {
-            session_id: Set(session_id.to_string()),
-            context_json: Set(snapshot.context_json.to_string()),
-            assembled_messages_json: Set(snapshot.assembled_messages_json.map(ToOwned::to_owned)),
-            metadata_json: Set(snapshot.metadata_json.map(ToOwned::to_owned)),
-            updated_at: Set(updated_at),
-        };
-        session_context_snapshots::Entity::insert(active)
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::column(
-                    session_context_snapshots::Column::SessionId,
-                )
-                .update_columns([
-                    session_context_snapshots::Column::ContextJson,
-                    session_context_snapshots::Column::AssembledMessagesJson,
-                    session_context_snapshots::Column::MetadataJson,
-                    session_context_snapshots::Column::UpdatedAt,
-                ])
-                .to_owned(),
-            )
-            .exec(&self.conn)
-            .await?;
+        let history_message_count = to_i64_from_u64(
+            u64::try_from(snapshot.history_message_count)
+                .map_err(|error| overflow_error("history_message_count", &error))?,
+            "history_message_count",
+        )?;
+        let checkpoint_blob = rmp_serde::to_vec_named(&snapshot.checkpoint)
+            .map_err(|error| storage_error(format!("failed to encode checkpoint blob: {error}")))?;
+        query!(
+            self.db,
+            "INSERT INTO session_context_snapshots (session_id, checkpoint_blob, history_message_count, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET checkpoint_blob = excluded.checkpoint_blob, history_message_count = excluded.history_message_count, updated_at = excluded.updated_at",
+            session_id,
+            checkpoint_blob,
+            history_message_count,
+            updated_at
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -2003,11 +1797,32 @@ impl ChatDb {
     pub async fn get_session_context_snapshot(
         &self,
         session_id: &str,
-    ) -> Result<Option<session_context_snapshots::Model>, ChatDbError> {
-        session_context_snapshots::Entity::find_by_id(session_id)
-            .one(&self.conn)
-            .await
-            .map_err(Into::into)
+    ) -> Result<Option<StoredSessionContextSnapshot>, ChatDbError> {
+        let Some(row) = query!(
+            self.db,
+            "SELECT checkpoint_blob, history_message_count, updated_at FROM session_context_snapshots WHERE session_id = ?",
+            session_id
+        )
+            .fetch_optional::<StoredSessionContextSnapshotRow>()
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let checkpoint = rmp_serde::from_slice::<aither_agent::AgentCheckpoint>(
+            &row.checkpoint_blob,
+        )
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to decode checkpoint blob for session {session_id}: {error}"
+            ))
+        })?;
+        let history_message_count = to_usize(row.history_message_count, "history_message_count")?;
+        Ok(Some(StoredSessionContextSnapshot {
+            checkpoint,
+            history_message_count,
+            updated_at: row.updated_at,
+        }))
     }
 
     /// Delete a persisted context snapshot for a session.
@@ -2015,9 +1830,13 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<(), ChatDbError> {
-        session_context_snapshots::Entity::delete_by_id(session_id)
-            .exec(&self.conn)
-            .await?;
+        query!(
+            self.db,
+            "DELETE FROM session_context_snapshots WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -2029,26 +1848,27 @@ impl ChatDb {
         status: &str,
     ) -> Result<notification_mailbox::Model, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        notification_mailbox::ActiveModel {
-            id: Set(id.to_string()),
-            title: Set(payload.title.clone()),
-            body: Set(payload.body.clone()),
-            session_id: Set(payload.session_id.clone()),
-            callback_context_xml: Set(payload
+        Ok(query!(
+            self.db,
+            "INSERT INTO notification_mailbox (id, title, body, session_id, callback_context_xml, callback_message, status, sent_count, last_error, delivered_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+            id,
+            payload.title.as_str(),
+            payload.body.as_str(),
+            payload.session_id.as_deref(),
+            payload
                 .callback_context_xml
                 .clone()
-                .map(XmlFragment::into_inner)),
-            callback_message: Set(payload.callback_message.clone()),
-            status: Set(status.to_string()),
-            sent_count: Set(0),
-            last_error: Set(None),
-            delivered_at: Set(None),
-            created_at: Set(now.clone()),
-            updated_at: Set(now),
-        }
-        .insert(&self.conn)
-        .await
-        .map_err(Into::into)
+                .map(XmlFragment::into_inner),
+            payload.callback_message.as_deref(),
+            status,
+            0_i32,
+            Option::<String>::None,
+            Option::<String>::None,
+            now.as_str(),
+            now.as_str()
+        )
+        .fetch_one::<notification_mailbox::Model>()
+        .await?)
     }
 
     /// Update mailbox delivery state after a send attempt.
@@ -2060,19 +1880,19 @@ impl ChatDb {
         last_error: Option<&str>,
         delivered_at: Option<&str>,
     ) -> Result<(), ChatDbError> {
-        let mut active: notification_mailbox::ActiveModel =
-            notification_mailbox::Entity::find_by_id(id)
-                .one(&self.conn)
-                .await?
-                .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?
-                .into();
-        active.status = Set(status.to_string());
-        active.sent_count = Set(i32::try_from(sent_count)
-            .map_err(|error| db_custom_error("notification sent_count overflow: ", &error))?);
-        active.last_error = Set(last_error.map(ToOwned::to_owned));
-        active.delivered_at = Set(delivered_at.map(ToOwned::to_owned));
-        active.updated_at = Set(jiff::Timestamp::now().to_string());
-        active.update(&self.conn).await?;
+        query!(
+            self.db,
+            "UPDATE notification_mailbox SET status = ?, sent_count = ?, last_error = ?, delivered_at = ?, updated_at = ? WHERE id = ?",
+            status,
+            i32::try_from(sent_count)
+                .map_err(|error| overflow_error("notification sent_count", &error))?,
+            last_error,
+            delivered_at,
+            jiff::Timestamp::now().to_string(),
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -2080,46 +1900,51 @@ impl ChatDb {
     pub async fn list_pending_notification_mailbox_entries(
         &self,
     ) -> Result<Vec<notification_mailbox::Model>, ChatDbError> {
-        notification_mailbox::Entity::find()
-            .filter(notification_mailbox::Column::Status.eq("pending"))
-            .order_by_asc(notification_mailbox::Column::CreatedAt)
-            .all(&self.conn)
-            .await
-            .map_err(Into::into)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM notification_mailbox WHERE status = ? ORDER BY created_at ASC",
+            "pending"
+        )
+        .fetch_all::<notification_mailbox::Model>()
+        .await?)
     }
 
     pub async fn list_notification_mailbox_entries(
         &self,
         limit: u64,
     ) -> Result<Vec<notification_mailbox::Model>, ChatDbError> {
-        notification_mailbox::Entity::find()
-            .order_by_desc(notification_mailbox::Column::CreatedAt)
-            .limit(limit)
-            .all(&self.conn)
-            .await
-            .map_err(Into::into)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM notification_mailbox ORDER BY created_at DESC LIMIT ?",
+            to_i64_from_u64(limit, "notification mailbox limit")?
+        )
+        .fetch_all::<notification_mailbox::Model>()
+        .await?)
     }
 
     pub async fn get_notification_mailbox_entry(
         &self,
         id: &str,
     ) -> Result<Option<notification_mailbox::Model>, ChatDbError> {
-        notification_mailbox::Entity::find_by_id(id)
-            .one(&self.conn)
-            .await
-            .map_err(Into::into)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM notification_mailbox WHERE id = ?",
+            id
+        )
+        .fetch_optional::<notification_mailbox::Model>()
+        .await?)
     }
 
     pub async fn mark_notification_mailbox_opened(&self, id: &str) -> Result<(), ChatDbError> {
-        let mut active: notification_mailbox::ActiveModel =
-            notification_mailbox::Entity::find_by_id(id)
-                .one(&self.conn)
-                .await?
-                .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?
-                .into();
-        active.status = Set("opened".to_string());
-        active.updated_at = Set(jiff::Timestamp::now().to_string());
-        active.update(&self.conn).await?;
+        query!(
+            self.db,
+            "UPDATE notification_mailbox SET status = ?, updated_at = ? WHERE id = ?",
+            "opened",
+            jiff::Timestamp::now().to_string(),
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -2130,7 +1955,7 @@ impl ChatDb {
         let entry = self
             .get_notification_mailbox_entry(id)
             .await?
-            .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?;
+            .ok_or_else(|| row_not_found(format!("Notification mailbox entry not found: {id}")))?;
         let has_callback = entry.callback_context_xml.is_some() || entry.callback_message.is_some();
         let callback_consumed = has_callback && entry.status != "opened";
         if entry.status != "opened" {
@@ -2158,96 +1983,115 @@ impl ChatDb {
         &self,
         params: RequestLogParams<'_>,
     ) -> Result<request_logs::Model, ChatDbError> {
-        request_logs::ActiveModel {
-            id: NotSet,
-            session_id: Set(params.session_id.to_string()),
-            timestamp: Set(params.timestamp.to_string()),
-            model: Set(params.model.to_string()),
-            provider_id: Set(params.provider_id.to_string()),
-            prompt_tokens: Set(params
-                .prompt_tokens
-                .map(i32::try_from)
-                .transpose()
-                .map_err(|error| db_custom_error("prompt_tokens overflow: ", &error))?),
-            completion_tokens: Set(params
-                .completion_tokens
-                .map(i32::try_from)
-                .transpose()
-                .map_err(|error| db_custom_error("completion_tokens overflow: ", &error))?),
-            total_tokens: Set(params
-                .total_tokens
-                .map(i32::try_from)
-                .transpose()
-                .map_err(|error| db_custom_error("total_tokens overflow: ", &error))?),
-            cache_read_tokens: Set(params
-                .cache_read_tokens
-                .map(i32::try_from)
-                .transpose()
-                .map_err(|error| db_custom_error("cache_read_tokens overflow: ", &error))?),
-            cache_write_tokens: Set(params
-                .cache_write_tokens
-                .map(i32::try_from)
-                .transpose()
-                .map_err(|error| db_custom_error("cache_write_tokens overflow: ", &error))?),
-            context_window: Set(params
-                .context_window
-                .map(i32::try_from)
-                .transpose()
-                .map_err(|error| db_custom_error("context_window overflow: ", &error))?),
-            elapsed_ms: Set(i64::try_from(params.elapsed_ms)
-                .map_err(|error| db_custom_error("elapsed_ms overflow: ", &error))?),
-            ok: Set(params.ok),
-            error: Set(params.error.map(ToOwned::to_owned)),
-        }
-        .insert(&self.conn)
-        .await
-        .map_err(Into::into)
+        let prompt_tokens = params
+            .prompt_tokens
+            .map(|value| to_i32(value, "prompt_tokens"))
+            .transpose()?;
+        let completion_tokens = params
+            .completion_tokens
+            .map(|value| to_i32(value, "completion_tokens"))
+            .transpose()?;
+        let total_tokens = params
+            .total_tokens
+            .map(|value| to_i32(value, "total_tokens"))
+            .transpose()?;
+        let cache_read_tokens = params
+            .cache_read_tokens
+            .map(|value| to_i32(value, "cache_read_tokens"))
+            .transpose()?;
+        let cache_write_tokens = params
+            .cache_write_tokens
+            .map(|value| to_i32(value, "cache_write_tokens"))
+            .transpose()?;
+        let context_window = params
+            .context_window
+            .map(|value| to_i32(value, "context_window"))
+            .transpose()?;
+        let elapsed_ms = to_i64_from_u64(params.elapsed_ms, "elapsed_ms")?;
+
+        query!(
+            self.db,
+            "INSERT INTO request_logs (session_id, timestamp, model, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, ok, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params.session_id,
+            params.timestamp,
+            params.model,
+            params.provider_id,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            context_window,
+            elapsed_ms,
+            params.ok,
+            params.error
+        )
+        .execute()
+        .await?;
+
+        Ok(query!(
+            self.db,
+            "SELECT * FROM request_logs ORDER BY timestamp DESC LIMIT ?",
+            1_i64
+        )
+        .fetch_one::<request_logs::Model>()
+        .await?)
     }
 
     pub async fn list_request_logs(
         &self,
         limit: u64,
     ) -> Result<Vec<request_logs::Model>, ChatDbError> {
-        request_logs::Entity::find()
-            .order_by_desc(request_logs::Column::Timestamp)
-            .limit(limit)
-            .all(&self.conn)
-            .await
-            .map_err(Into::into)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM request_logs ORDER BY timestamp DESC LIMIT ?",
+            to_i64_from_u64(limit, "request log limit")?
+        )
+        .fetch_all::<request_logs::Model>()
+        .await?)
     }
 
     pub async fn append_network_access_log(
         &self,
         params: NetworkAccessLogParams<'_>,
     ) -> Result<network_access_logs::Model, ChatDbError> {
+        let timestamp = jiff::Timestamp::now().to_string();
         let port = i32::from(params.port);
-        network_access_logs::ActiveModel {
-            id: NotSet,
-            session_id: Set(params.session_id.map(ToOwned::to_owned)),
-            profile_id: Set(params.profile_id.map(ToOwned::to_owned)),
-            source: Set(params.source.as_str().to_string()),
-            mode: Set(params.mode.as_str().to_string()),
-            domain: Set(params.domain.to_string()),
-            port: Set(port),
-            allowed: Set(params.allowed),
-            reason: Set(params.reason.map(ToOwned::to_owned)),
-            timestamp: Set(jiff::Timestamp::now().to_string()),
-        }
-        .insert(&self.conn)
-        .await
-        .map_err(Into::into)
+        query!(
+            self.db,
+            "INSERT INTO network_access_logs (session_id, profile_id, source, mode, domain, port, allowed, reason, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params.session_id,
+            params.profile_id,
+            params.source.as_str(),
+            params.mode.as_str(),
+            params.domain,
+            port,
+            params.allowed,
+            params.reason,
+            timestamp.clone()
+        )
+        .execute()
+        .await?;
+        Ok(query!(
+            self.db,
+            "SELECT * FROM network_access_logs ORDER BY timestamp DESC LIMIT ?",
+            1_i64
+        )
+        .fetch_one::<network_access_logs::Model>()
+        .await?)
     }
 
     pub async fn list_network_access_logs(
         &self,
         limit: u64,
     ) -> Result<Vec<network_access_logs::Model>, ChatDbError> {
-        network_access_logs::Entity::find()
-            .order_by_desc(network_access_logs::Column::Timestamp)
-            .limit(limit)
-            .all(&self.conn)
-            .await
-            .map_err(Into::into)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM network_access_logs ORDER BY timestamp DESC LIMIT ?",
+            to_i64_from_u64(limit, "network access log limit")?
+        )
+        .fetch_all::<network_access_logs::Model>()
+        .await?)
     }
 
     // ── Permission / AskUser Queries ─────────────────────────────
@@ -2349,43 +2193,63 @@ impl ChatDb {
         params: CreateProfileParams<'_>,
     ) -> Result<profiles::Model, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let max_order = self.max_profile_sort_order().await?;
-        let active = profiles::ActiveModel {
-            id: Set(params.id.to_string()),
-            slug: Set(params.slug.map(String::from)),
-            name: Set(params.name.to_string()),
-            icon: Set(params.icon.map(String::from)),
-            environment: Set(params.environment.as_str().to_string()),
-            container_image: Set(match params.environment {
-                ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote => None,
-                ProfileEnvironmentKind::Container => params.container_image.map(String::from),
-            }),
-            container_id: Set(None),
-            persona: Set(params.persona.map(String::from)),
-            preferences_json: Set(params.preferences_json.map(String::from)),
-            location_aware: Set(params.location_aware),
-            pinned_limit: Set(10),
-            sort_order: Set(max_order + 1),
-            created_at: Set(now.clone()),
-            updated_at: Set(now),
+        let sort_order = self.max_profile_sort_order().await? + 1;
+        let container_image = match params.environment {
+            ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote => None,
+            ProfileEnvironmentKind::Container => params.container_image,
         };
-        let model = active.insert(&self.conn).await?;
-        Ok(model)
+        query!(
+            self.db,
+            "INSERT INTO profiles (id, slug, name, icon, environment, container_image, container_id, persona, preferences_json, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params.id,
+            params.slug,
+            params.name,
+            params.icon,
+            params.environment.as_str(),
+            container_image,
+            Option::<String>::None,
+            params.persona,
+            params.preferences_json,
+            params.location_aware,
+            10_i32,
+            sort_order,
+            now.clone(),
+            now.clone()
+        )
+        .execute()
+        .await?;
+        Ok(profiles::Model {
+            id: params.id.to_string(),
+            slug: params.slug.map(ToOwned::to_owned),
+            name: params.name.to_string(),
+            icon: params.icon.map(ToOwned::to_owned),
+            environment: params.environment.as_str().to_string(),
+            container_image: container_image.map(ToOwned::to_owned),
+            container_id: None,
+            persona: params.persona.map(ToOwned::to_owned),
+            preferences_json: params.preferences_json.map(ToOwned::to_owned),
+            location_aware: params.location_aware,
+            pinned_limit: 10,
+            sort_order,
+            created_at: now.clone(),
+            updated_at: now,
+        })
     }
 
     /// List all profiles ordered by `sort_order`.
     pub async fn list_profiles(&self) -> Result<Vec<profiles::Model>, ChatDbError> {
-        let rows = profiles::Entity::find()
-            .order_by_asc(profiles::Column::SortOrder)
-            .all(&self.conn)
-            .await?;
-        Ok(rows)
+        Ok(
+            query!(self.db, "SELECT * FROM profiles ORDER BY sort_order ASC")
+                .fetch_all::<profiles::Model>()
+                .await?,
+        )
     }
 
     /// Get a profile by ID.
     pub async fn get_profile(&self, id: &str) -> Result<Option<profiles::Model>, ChatDbError> {
-        let row = profiles::Entity::find_by_id(id).one(&self.conn).await?;
-        Ok(row)
+        Ok(query!(self.db, "SELECT * FROM profiles WHERE id = ?", id)
+            .fetch_optional::<profiles::Model>()
+            .await?)
     }
 
     /// Update profile fields.
@@ -2394,69 +2258,82 @@ impl ChatDb {
         id: &str,
         params: UpdateProfileParams<'_>,
     ) -> Result<(), ChatDbError> {
-        let next_environment = params.environment;
-        let now = jiff::Timestamp::now().to_string();
-        let mut active = profiles::ActiveModel {
-            id: Set(id.to_string()),
-            updated_at: Set(now),
-            ..Default::default()
-        };
-        if let Some(n) = params.name {
-            active.name = Set(n.to_string());
+        let mut existing = self
+            .get_profile(id)
+            .await?
+            .ok_or_else(|| row_not_found(format!("Profile not found: {id}")))?;
+        if let Some(name) = params.name {
+            existing.name = name.to_string();
         }
-        if let Some(ic) = params.icon {
-            active.icon = Set(ic.map(String::from));
+        if let Some(icon) = params.icon {
+            existing.icon = icon.map(ToOwned::to_owned);
         }
         if let Some(environment) = params.environment {
-            active.environment = Set(environment.as_str().to_string());
+            existing.environment = environment.as_str().to_string();
+            if matches!(
+                environment,
+                ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote
+            ) {
+                existing.container_image = None;
+                existing.container_id = None;
+            }
         }
         if let Some(container_image) = params.container_image {
-            active.container_image = Set(container_image.map(String::from));
+            existing.container_image = container_image.map(ToOwned::to_owned);
         }
-        if matches!(
-            next_environment,
-            Some(ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote)
-        ) {
-            active.container_image = Set(None);
-            active.container_id = Set(None);
-        }
-        if let Some(cid) = params.container_id {
-            active.container_id = Set(cid.map(String::from));
+        if let Some(container_id) = params.container_id {
+            existing.container_id = container_id.map(ToOwned::to_owned);
         }
         if let Some(sort_order) = params.sort_order {
-            active.sort_order = Set(sort_order);
+            existing.sort_order = sort_order;
         }
-        if let Some(p) = params.persona {
-            active.persona = Set(p.map(String::from));
+        if let Some(persona) = params.persona {
+            existing.persona = persona.map(ToOwned::to_owned);
         }
-        if let Some(pj) = params.preferences_json {
-            active.preferences_json = Set(pj.map(String::from));
+        if let Some(preferences_json) = params.preferences_json {
+            existing.preferences_json = preferences_json.map(ToOwned::to_owned);
         }
-        if let Some(la) = params.location_aware {
-            active.location_aware = Set(la);
+        if let Some(location_aware) = params.location_aware {
+            existing.location_aware = location_aware;
         }
-        active.update(&self.conn).await?;
+        existing.updated_at = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "UPDATE profiles SET name = ?, icon = ?, environment = ?, container_image = ?, container_id = ?, persona = ?, preferences_json = ?, location_aware = ?, pinned_limit = ?, sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
+            existing.name.as_str(),
+            existing.icon.as_deref(),
+            existing.environment.as_str(),
+            existing.container_image.as_deref(),
+            existing.container_id.as_deref(),
+            existing.persona.as_deref(),
+            existing.preferences_json.as_deref(),
+            existing.location_aware,
+            existing.pinned_limit,
+            existing.sort_order,
+            existing.created_at.as_str(),
+            existing.updated_at.as_str(),
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
     /// Delete a profile and reassign its sessions to the default profile.
     pub async fn delete_profile(&self, id: &str) -> Result<(), ChatDbError> {
-        // Reassign sessions to no profile (NULL)
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::ProfileId, Option::<String>::None);
-        update.and_where(Expr::col(sessions::Column::ProfileId).eq(id));
-        let stmt = update.clone();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
-
-        // Delete folders belonging to this profile
-        folders::Entity::delete_many()
-            .filter(folders::Column::ProfileId.eq(id))
-            .exec(&self.conn)
+        query!(
+            self.db,
+            "UPDATE sessions SET profile_id = NULL WHERE profile_id = ?",
+            id
+        )
+        .execute()
+        .await?;
+        query!(self.db, "DELETE FROM folders WHERE profile_id = ?", id)
+            .execute()
             .await?;
-
-        profiles::Entity::delete_by_id(id).exec(&self.conn).await?;
+        query!(self.db, "DELETE FROM profiles WHERE id = ?", id)
+            .execute()
+            .await?;
         Ok(())
     }
 
@@ -2465,11 +2342,11 @@ impl ChatDb {
         &self,
         slug: &str,
     ) -> Result<Option<profiles::Model>, ChatDbError> {
-        let row = profiles::Entity::find()
-            .filter(profiles::Column::Slug.eq(slug))
-            .one(&self.conn)
-            .await?;
-        Ok(row)
+        Ok(
+            query!(self.db, "SELECT * FROM profiles WHERE slug = ?", slug)
+                .fetch_optional::<profiles::Model>()
+                .await?,
+        )
     }
 
     /// Ensure the three default profiles (daily, work, local) exist.
@@ -2535,12 +2412,13 @@ impl ChatDb {
     }
 
     async fn max_profile_sort_order(&self) -> Result<i32, ChatDbError> {
-        self.query_optional_i32_scalar(sea_orm::Statement::from_sql_and_values(
-            self.conn.get_database_backend(),
-            "SELECT COALESCE(MAX(sort_order), -1) FROM profiles",
-            [],
-        ))
-        .await
+        Ok(query!(
+            self.db,
+            "SELECT COALESCE(MAX(sort_order), -1) AS value FROM profiles"
+        )
+        .fetch_one::<I32ValueRow>()
+        .await?
+        .value)
     }
 
     // ── Folder CRUD ─────────────────────────────────────────────
@@ -2555,35 +2433,48 @@ impl ChatDb {
         self.ensure_pinned_capacity(profile_id).await?;
         let now = jiff::Timestamp::now().to_string();
         let max_order = self.max_folder_sort_order(profile_id).await?;
-        let active = folders::ActiveModel {
-            id: Set(id.to_string()),
-            profile_id: Set(profile_id.to_string()),
-            name: Set(name.to_string()),
-            sort_order: Set(max_order + 1),
-            created_at: Set(now),
-        };
-        let model = active.insert(&self.conn).await?;
-        Ok(model)
+        let sort_order = max_order + 1;
+        query!(
+            self.db,
+            "INSERT INTO folders (id, profile_id, name, sort_order, created_at) VALUES (?, ?, ?, ?, ?)",
+            id,
+            profile_id,
+            name,
+            sort_order,
+            now.clone()
+        )
+        .execute()
+        .await?;
+        Ok(folders::Model {
+            id: id.to_string(),
+            profile_id: profile_id.to_string(),
+            name: name.to_string(),
+            sort_order,
+            created_at: now,
+        })
     }
 
     /// List folders for a profile.
     pub async fn list_folders(&self, profile_id: &str) -> Result<Vec<folders::Model>, ChatDbError> {
-        let rows = folders::Entity::find()
-            .filter(folders::Column::ProfileId.eq(profile_id))
-            .order_by_asc(folders::Column::SortOrder)
-            .all(&self.conn)
-            .await?;
-        Ok(rows)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM folders WHERE profile_id = ? ORDER BY sort_order ASC",
+            profile_id
+        )
+        .fetch_all::<folders::Model>()
+        .await?)
     }
 
     /// Update a folder's name.
     pub async fn update_folder(&self, id: &str, name: &str) -> Result<(), ChatDbError> {
-        let active = folders::ActiveModel {
-            id: Set(id.to_string()),
-            name: Set(name.to_string()),
-            ..Default::default()
-        };
-        active.update(&self.conn).await?;
+        query!(
+            self.db,
+            "UPDATE folders SET name = ? WHERE id = ?",
+            name,
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -2593,54 +2484,52 @@ impl ChatDb {
         id: &str,
         sort_order: i32,
     ) -> Result<(), ChatDbError> {
-        let active = folders::ActiveModel {
-            id: Set(id.to_string()),
-            sort_order: Set(sort_order),
-            ..Default::default()
-        };
-        active.update(&self.conn).await?;
+        query!(
+            self.db,
+            "UPDATE folders SET sort_order = ? WHERE id = ?",
+            sort_order,
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
     /// Delete a folder and unpin its sessions.
     pub async fn delete_folder(&self, id: &str) -> Result<(), ChatDbError> {
-        // Remove folder_id from sessions in this folder and unpin them
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::FolderId, Option::<String>::None);
-        update.value(sessions::Column::Pinned, false);
-        update.value(sessions::Column::PinSortOrder, Option::<i32>::None);
-        update.and_where(Expr::col(sessions::Column::FolderId).eq(id));
-        let stmt = update.clone();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
-
-        folders::Entity::delete_by_id(id).exec(&self.conn).await?;
+        query!(self.db, "UPDATE sessions SET folder_id = NULL, pinned = FALSE, pin_sort_order = NULL WHERE folder_id = ?", id)
+            .execute()
+            .await?;
+        query!(self.db, "DELETE FROM folders WHERE id = ?", id)
+            .execute()
+            .await?;
         Ok(())
     }
 
     async fn max_folder_sort_order(&self, profile_id: &str) -> Result<i32, ChatDbError> {
-        self.query_optional_i32_scalar(sea_orm::Statement::from_sql_and_values(
-            self.conn.get_database_backend(),
-            "SELECT COALESCE(MAX(sort_order), -1) FROM folders WHERE profile_id = ?",
-            [profile_id.into()],
-        ))
-        .await
+        Ok(query!(
+            self.db,
+            "SELECT COALESCE(MAX(sort_order), -1) AS value FROM folders WHERE profile_id = ?",
+            profile_id
+        )
+        .fetch_one::<I32ValueRow>()
+        .await?
+        .value)
     }
 
     // ── Session Profile Operations ──────────────────────────────
 
     /// Pin a session in its profile.
     pub async fn pin_session(&self, id: &str) -> Result<(), ChatDbError> {
-        let session = self.get_session(id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!("Session not found: {id}")))
-        })?;
+        let session = self
+            .get_session(id)
+            .await?
+            .ok_or_else(|| row_not_found(format!("Session not found: {id}")))?;
 
-        let profile_id = session.profile_id.as_deref().ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session {id} is not attached to a profile"
-            )))
-        })?;
+        let profile_id = session
+            .profile_id
+            .as_deref()
+            .ok_or_else(|| row_not_found(format!("Session {id} is not attached to a profile")))?;
 
         // Adding a new standalone pinned session consumes one pinned slot.
         // Moving a folder-contained pinned session to top-level also consumes one slot.
@@ -2649,30 +2538,22 @@ impl ChatDb {
         }
 
         let max_order = self.max_pin_sort_order(profile_id).await?;
-
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::Pinned, true);
-        update.value(sessions::Column::Archived, false);
-        update.value(sessions::Column::PinSortOrder, max_order + 1);
-        update.and_where(Expr::col(sessions::Column::Id).eq(id));
-        let stmt = update.clone();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
+        query!(
+            self.db,
+            "UPDATE sessions SET pinned = TRUE, archived = FALSE, pin_sort_order = ? WHERE id = ?",
+            max_order + 1,
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
     /// Unpin a session.
     pub async fn unpin_session(&self, id: &str) -> Result<(), ChatDbError> {
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::Pinned, false);
-        update.value(sessions::Column::FolderId, Option::<String>::None);
-        update.value(sessions::Column::PinSortOrder, Option::<i32>::None);
-        update.and_where(Expr::col(sessions::Column::Id).eq(id));
-        let stmt = update.clone();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
+        query!(self.db, "UPDATE sessions SET pinned = FALSE, folder_id = NULL, pin_sort_order = NULL WHERE id = ?", id)
+            .execute()
+            .await?;
         Ok(())
     }
 
@@ -2690,37 +2571,20 @@ impl ChatDb {
             message.push_str(id);
             message.push_str(" while ");
             message.push_str(reason.as_str());
-            return Err(ChatDbError::Db(DbErr::Custom(message)));
+            return Err(storage_error(message));
         }
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::Archived, true);
-        // Archived sessions must always leave pinned structures.
-        update.value(sessions::Column::Pinned, false);
-        update.value(sessions::Column::FolderId, Option::<String>::None);
-        update.value(sessions::Column::PinSortOrder, Option::<i32>::None);
-        update.and_where(Expr::col(sessions::Column::Id).eq(id));
-        let stmt = update.clone();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
+        query!(self.db, "UPDATE sessions SET archived = TRUE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL WHERE id = ?", id)
+            .execute()
+            .await?;
         Ok(())
     }
 
     /// Unarchive (reopen) a session.
     pub async fn unarchive_session(&self, id: &str) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::Archived, false);
-        // Re-opened sessions always return to the regular list.
-        update.value(sessions::Column::Pinned, false);
-        update.value(sessions::Column::FolderId, Option::<String>::None);
-        update.value(sessions::Column::PinSortOrder, Option::<i32>::None);
-        update.value(sessions::Column::UpdatedAt, now.as_str());
-        update.and_where(Expr::col(sessions::Column::Id).eq(id));
-        let stmt = update.clone();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
+        query!(self.db, "UPDATE sessions SET archived = FALSE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL, updated_at = ? WHERE id = ?", now, id)
+            .execute()
+            .await?;
         Ok(())
     }
 
@@ -2730,64 +2594,60 @@ impl ChatDb {
         session_id: &str,
         folder_id: Option<&str>,
     ) -> Result<(), ChatDbError> {
-        let session = self.get_session(session_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Session not found: {session_id}"
-            )))
-        })?;
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| row_not_found(format!("Session not found: {session_id}")))?;
 
         if session.archived {
-            return Err(ChatDbError::Db(DbErr::Custom(format!(
+            return Err(storage_error(format!(
                 "cannot move archived session {session_id} into pinned folders"
-            ))));
+            )));
         }
 
         if folder_id.is_some() && !session.pinned {
-            return Err(ChatDbError::Db(DbErr::Custom(format!(
+            return Err(storage_error(format!(
                 "cannot move unpinned session {session_id} into a pinned folder"
-            ))));
+            )));
         }
 
         // Moving a session out of a folder (while pinned) creates a new standalone
         // pinned item and therefore consumes profile pin capacity.
         if folder_id.is_none() && session.pinned && session.folder_id.is_some() {
             let profile_id = session.profile_id.as_deref().ok_or_else(|| {
-                ChatDbError::Db(DbErr::RecordNotFound(format!(
-                    "Session {session_id} is not attached to a profile"
-                )))
+                row_not_found(format!("Session {session_id} is not attached to a profile"))
             })?;
             self.ensure_pinned_capacity(profile_id).await?;
         }
 
         if let Some(target_folder_id) = folder_id {
-            let folder = folders::Entity::find_by_id(target_folder_id)
-                .one(&self.conn)
-                .await?
-                .ok_or_else(|| {
-                    ChatDbError::Db(DbErr::RecordNotFound(format!(
-                        "Folder not found: {target_folder_id}"
-                    )))
-                })?;
+            let folder = query!(
+                self.db,
+                "SELECT * FROM folders WHERE id = ?",
+                target_folder_id
+            )
+            .fetch_optional::<folders::Model>()
+            .await?
+            .ok_or_else(|| row_not_found(format!("Folder not found: {target_folder_id}")))?;
 
             let session_profile = session.profile_id.as_deref().ok_or_else(|| {
-                ChatDbError::Db(DbErr::RecordNotFound(format!(
-                    "Session {session_id} is not attached to a profile"
-                )))
+                row_not_found(format!("Session {session_id} is not attached to a profile"))
             })?;
             if folder.profile_id != session_profile {
-                return Err(ChatDbError::Db(DbErr::RecordNotFound(format!(
+                return Err(row_not_found(format!(
                     "Folder {target_folder_id} does not belong to session profile {session_profile}"
-                ))));
+                )));
             }
         }
 
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::FolderId, folder_id.map(String::from));
-        update.and_where(Expr::col(sessions::Column::Id).eq(session_id));
-        let stmt = update.clone();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
+        query!(
+            self.db,
+            "UPDATE sessions SET folder_id = ? WHERE id = ?",
+            folder_id,
+            session_id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -2797,13 +2657,14 @@ impl ChatDb {
         session_id: &str,
         profile_id: &str,
     ) -> Result<(), ChatDbError> {
-        let mut update = Query::update();
-        update.table(sessions::Entity);
-        update.value(sessions::Column::ProfileId, profile_id);
-        update.and_where(Expr::col(sessions::Column::Id).eq(session_id));
-        let stmt = update.clone();
-        let builder = self.conn.get_database_backend();
-        self.conn.execute(builder.build(&stmt)).await?;
+        query!(
+            self.db,
+            "UPDATE sessions SET profile_id = ? WHERE id = ?",
+            profile_id,
+            session_id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -2812,12 +2673,13 @@ impl ChatDb {
         &self,
         profile_id: &str,
     ) -> Result<Vec<sessions::Model>, ChatDbError> {
-        let rows = sessions::Entity::find()
-            .filter(sessions::Column::ProfileId.eq(profile_id))
-            .order_by(sessions::Column::UpdatedAt, Order::Desc)
-            .all(&self.conn)
-            .await?;
-        Ok(rows)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM sessions WHERE profile_id = ? ORDER BY updated_at DESC",
+            profile_id
+        )
+        .fetch_all::<sessions::Model>()
+        .await?)
     }
 
     /// Find non-pinned, non-archived sessions with `updated_at` before the cutoff.
@@ -2825,76 +2687,80 @@ impl ChatDb {
         &self,
         cutoff: &str,
     ) -> Result<Vec<sessions::Model>, ChatDbError> {
-        let mut active_session_ids = session_runtimes::Entity::find()
-            .filter(session_runtimes::Column::State.ne(SessionRuntimeState::Idle.as_str()))
-            .all(&self.conn)
+        let mut active_session_ids = query!(
+            self.db,
+            "SELECT session_id FROM session_runtimes WHERE state != ?",
+            SessionRuntimeState::Idle.as_str()
+        )
+        .fetch_all::<SessionIdRow>()
+        .await?
+        .into_iter()
+        .map(|row| row.session_id)
+        .collect::<std::collections::BTreeSet<_>>();
+        active_session_ids.extend(
+            query!(self.db, "SELECT session_id FROM session_pending_messages")
+                .fetch_all::<SessionIdRow>()
+                .await?
+                .into_iter()
+                .map(|row| row.session_id),
+        );
+        active_session_ids.extend(
+            query!(
+                self.db,
+                "SELECT session_id FROM session_pending_permissions"
+            )
+            .fetch_all::<SessionIdRow>()
             .await?
             .into_iter()
-            .map(|row| row.session_id)
-            .collect::<std::collections::BTreeSet<_>>();
+            .map(|row| row.session_id),
+        );
         active_session_ids.extend(
-            session_pending_messages::Entity::find()
-                .all(&self.conn)
+            query!(self.db, "SELECT session_id FROM session_pending_ask_user")
+                .fetch_all::<SessionIdRow>()
                 .await?
                 .into_iter()
                 .map(|row| row.session_id),
         );
         active_session_ids.extend(
-            session_pending_permissions::Entity::find()
-                .all(&self.conn)
-                .await?
-                .into_iter()
-                .map(|row| row.session_id),
-        );
-        active_session_ids.extend(
-            session_pending_ask_user::Entity::find()
-                .all(&self.conn)
-                .await?
-                .into_iter()
-                .map(|row| row.session_id),
-        );
-        active_session_ids.extend(
-            session_pending_workspace::Entity::find()
-                .all(&self.conn)
+            query!(self.db, "SELECT session_id FROM session_pending_workspace")
+                .fetch_all::<SessionIdRow>()
                 .await?
                 .into_iter()
                 .map(|row| row.session_id),
         );
 
-        let mut query = sessions::Entity::find()
-            .filter(sessions::Column::Pinned.eq(false))
-            .filter(sessions::Column::Archived.eq(false))
-            .filter(sessions::Column::UpdatedAt.lt(cutoff));
-        if !active_session_ids.is_empty() {
-            query = query.filter(sessions::Column::Id.is_not_in(active_session_ids));
-        }
-        let rows = query.all(&self.conn).await?;
-        Ok(rows)
+        let sessions = query!(self.db, "SELECT * FROM sessions WHERE pinned = FALSE AND archived = FALSE AND updated_at < ? ORDER BY updated_at ASC", cutoff)
+            .fetch_all::<sessions::Model>()
+            .await?;
+        Ok(sessions
+            .into_iter()
+            .filter(|session| !active_session_ids.contains(&session.id))
+            .collect())
     }
 
     /// Count pinned items (sessions + folders) in a profile.
     pub async fn pinned_count(&self, profile_id: &str) -> Result<i64, ChatDbError> {
-        let session_count: i64 = sessions::Entity::find()
-            .filter(sessions::Column::ProfileId.eq(profile_id))
-            .filter(sessions::Column::Pinned.eq(true))
-            .filter(sessions::Column::FolderId.is_null())
-            .count(&self.conn)
-            .await? as i64;
-
-        let folder_count: i64 = folders::Entity::find()
-            .filter(folders::Column::ProfileId.eq(profile_id))
-            .count(&self.conn)
-            .await? as i64;
+        let session_count = query!(self.db, "SELECT COUNT(*) AS value FROM sessions WHERE profile_id = ? AND pinned = TRUE AND folder_id IS NULL", profile_id)
+            .fetch_one::<I64ValueRow>()
+            .await?
+            .value;
+        let folder_count = query!(
+            self.db,
+            "SELECT COUNT(*) AS value FROM folders WHERE profile_id = ?",
+            profile_id
+        )
+        .fetch_one::<I64ValueRow>()
+        .await?
+        .value;
 
         Ok(session_count + folder_count)
     }
 
     async fn ensure_pinned_capacity(&self, profile_id: &str) -> Result<(), ChatDbError> {
-        let profile = self.get_profile(profile_id).await?.ok_or_else(|| {
-            ChatDbError::Db(DbErr::RecordNotFound(format!(
-                "Profile not found: {profile_id}"
-            )))
-        })?;
+        let profile = self
+            .get_profile(profile_id)
+            .await?
+            .ok_or_else(|| row_not_found(format!("Profile not found: {profile_id}")))?;
         let current = self.pinned_count(profile_id).await?;
         let limit = i64::from(profile.pinned_limit);
         if current >= limit {
@@ -2908,12 +2774,10 @@ impl ChatDb {
     }
 
     async fn max_pin_sort_order(&self, profile_id: &str) -> Result<i32, ChatDbError> {
-        self.query_optional_i32_scalar(sea_orm::Statement::from_sql_and_values(
-            self.conn.get_database_backend(),
-            "SELECT COALESCE(MAX(pin_sort_order), -1) FROM sessions WHERE profile_id = ? AND pinned = 1",
-            [profile_id.into()],
-        ))
-        .await
+        Ok(query!(self.db, "SELECT COALESCE(MAX(pin_sort_order), -1) AS value FROM sessions WHERE profile_id = ? AND pinned = TRUE", profile_id)
+            .fetch_one::<I32ValueRow>()
+            .await?
+            .value)
     }
 
     // ── Scheduled Task CRUD ─────────────────────────────────
@@ -2926,28 +2790,50 @@ impl ChatDb {
         let trigger_kind = params.trigger.kind().as_str();
         let trigger_type = params.trigger.storage_trigger_type();
         let now = jiff::Timestamp::now().to_string();
-        let active = scheduled_tasks::ActiveModel {
-            id: Set(params.id.to_string()),
-            profile_id: Set(params.profile_id.to_string()),
-            session_id: Set(params.session_id.map(String::from)),
-            name: Set(params.name.to_string()),
-            trigger_kind: Set(trigger_kind.to_string()),
-            trigger_type: Set(trigger_type.to_string()),
-            cron_expression: Set(params.cron_expression.map(String::from)),
-            run_at: Set(params.run_at.map(String::from)),
-            script_path: Set(params.script_path.map(String::from)),
-            script_inline: Set(params.script_inline.map(String::from)),
-            needs_network: Set(params.needs_network),
-            approved: Set(false),
-            enabled: Set(true),
-            last_run_at: Set(None),
-            last_run_status: Set(None),
-            last_run_output: Set(None),
-            created_at: Set(now.clone()),
-            updated_at: Set(now),
-        };
-        let model = active.insert(&self.conn).await?;
-        Ok(model)
+        query!(
+            self.db,
+            "INSERT INTO scheduled_tasks (id, profile_id, session_id, name, trigger_kind, trigger_type, cron_expression, run_at, script_path, script_inline, needs_network, approved, enabled, last_run_at, last_run_status, last_run_output, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params.id,
+            params.profile_id,
+            params.session_id,
+            params.name,
+            trigger_kind,
+            trigger_type,
+            params.cron_expression,
+            params.run_at,
+            params.script_path,
+            params.script_inline,
+            params.needs_network,
+            false,
+            true,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            now.clone(),
+            now.clone()
+        )
+        .execute()
+        .await?;
+        Ok(scheduled_tasks::Model {
+            id: params.id.to_string(),
+            profile_id: params.profile_id.to_string(),
+            session_id: params.session_id.map(ToOwned::to_owned),
+            name: params.name.to_string(),
+            trigger_kind: trigger_kind.to_string(),
+            trigger_type: trigger_type.to_string(),
+            cron_expression: params.cron_expression.map(ToOwned::to_owned),
+            run_at: params.run_at.map(ToOwned::to_owned),
+            script_path: params.script_path.map(ToOwned::to_owned),
+            script_inline: params.script_inline.map(ToOwned::to_owned),
+            needs_network: params.needs_network,
+            approved: false,
+            enabled: true,
+            last_run_at: None,
+            last_run_status: None,
+            last_run_output: None,
+            created_at: now.clone(),
+            updated_at: now,
+        })
     }
 
     /// Get a scheduled task by ID.
@@ -2955,10 +2841,11 @@ impl ChatDb {
         &self,
         id: &str,
     ) -> Result<Option<scheduled_tasks::Model>, ChatDbError> {
-        let row = scheduled_tasks::Entity::find_by_id(id)
-            .one(&self.conn)
-            .await?;
-        Ok(row)
+        Ok(
+            query!(self.db, "SELECT * FROM scheduled_tasks WHERE id = ?", id)
+                .fetch_optional::<scheduled_tasks::Model>()
+                .await?,
+        )
     }
 
     /// List all scheduled tasks, optionally filtered by profile.
@@ -2966,12 +2853,23 @@ impl ChatDb {
         &self,
         profile_id: Option<&str>,
     ) -> Result<Vec<scheduled_tasks::Model>, ChatDbError> {
-        let mut query =
-            scheduled_tasks::Entity::find().order_by_desc(scheduled_tasks::Column::CreatedAt);
-        if let Some(pid) = profile_id {
-            query = query.filter(scheduled_tasks::Column::ProfileId.eq(pid));
-        }
-        let rows = query.all(&self.conn).await?;
+        let sql = if profile_id.is_some() {
+            "SELECT * FROM scheduled_tasks WHERE profile_id = ? ORDER BY created_at DESC"
+        } else {
+            "SELECT * FROM scheduled_tasks ORDER BY created_at DESC"
+        };
+        let rows = match profile_id {
+            Some(profile_id) => {
+                query!(self.db, sql, profile_id)
+                    .fetch_all::<scheduled_tasks::Model>()
+                    .await?
+            }
+            None => {
+                query!(self.db, sql)
+                    .fetch_all::<scheduled_tasks::Model>()
+                    .await?
+            }
+        };
         Ok(rows)
     }
 
@@ -2982,40 +2880,42 @@ impl ChatDb {
         params: UpdateScheduledTaskParams<'_>,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let mut active = scheduled_tasks::ActiveModel {
-            id: Set(id.to_string()),
-            updated_at: Set(now),
-            ..Default::default()
-        };
-        if let Some(name) = params.name {
-            active.name = Set(name.to_string());
-        }
-        if let Some(enabled) = params.enabled {
-            active.enabled = Set(enabled);
-        }
-        if let Some(approved) = params.approved {
-            active.approved = Set(approved);
-        }
-        if let Some(cron_expression) = params.cron_expression {
-            active.cron_expression = Set(cron_expression.map(String::from));
-        }
-        if let Some(run_at) = params.run_at {
-            active.run_at = Set(run_at.map(String::from));
-        }
-        if let Some(script_path) = params.script_path {
-            active.script_path = Set(script_path.map(String::from));
-        }
-        if let Some(script_inline) = params.script_inline {
-            active.script_inline = Set(script_inline.map(String::from));
-        }
-        active.update(&self.conn).await?;
+        let name_enabled = params.name.is_some();
+        let enabled_enabled = params.enabled.is_some();
+        let approved_enabled = params.approved.is_some();
+        let cron_enabled = params.cron_expression.is_some();
+        let run_at_enabled = params.run_at.is_some();
+        let script_path_enabled = params.script_path.is_some();
+        let script_inline_enabled = params.script_inline.is_some();
+        query!(
+            self.db,
+            "UPDATE scheduled_tasks SET updated_at = ?, name = CASE WHEN ? THEN ? ELSE name END, enabled = CASE WHEN ? THEN ? ELSE enabled END, approved = CASE WHEN ? THEN ? ELSE approved END, cron_expression = CASE WHEN ? THEN ? ELSE cron_expression END, run_at = CASE WHEN ? THEN ? ELSE run_at END, script_path = CASE WHEN ? THEN ? ELSE script_path END, script_inline = CASE WHEN ? THEN ? ELSE script_inline END WHERE id = ?",
+            now,
+            name_enabled,
+            params.name,
+            enabled_enabled,
+            params.enabled.unwrap_or(false),
+            approved_enabled,
+            params.approved.unwrap_or(false),
+            cron_enabled,
+            params.cron_expression.flatten(),
+            run_at_enabled,
+            params.run_at.flatten(),
+            script_path_enabled,
+            params.script_path.flatten(),
+            script_inline_enabled,
+            params.script_inline.flatten(),
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
     /// Delete a scheduled task.
     pub async fn delete_scheduled_task(&self, id: &str) -> Result<(), ChatDbError> {
-        scheduled_tasks::Entity::delete_by_id(id)
-            .exec(&self.conn)
+        query!(self.db, "DELETE FROM scheduled_tasks WHERE id = ?", id)
+            .execute()
             .await?;
         Ok(())
     }
@@ -3023,13 +2923,14 @@ impl ChatDb {
     /// Approve a task for execution.
     pub async fn approve_scheduled_task(&self, id: &str) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let active = scheduled_tasks::ActiveModel {
-            id: Set(id.to_string()),
-            approved: Set(true),
-            updated_at: Set(now),
-            ..Default::default()
-        };
-        active.update(&self.conn).await?;
+        query!(
+            self.db,
+            "UPDATE scheduled_tasks SET approved = TRUE, updated_at = ? WHERE id = ?",
+            now,
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -3041,15 +2942,17 @@ impl ChatDb {
         output: Option<&str>,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let active = scheduled_tasks::ActiveModel {
-            id: Set(id.to_string()),
-            last_run_at: Set(Some(now.clone())),
-            last_run_status: Set(Some(status.as_str().to_string())),
-            last_run_output: Set(output.map(String::from)),
-            updated_at: Set(now),
-            ..Default::default()
-        };
-        active.update(&self.conn).await?;
+        query!(
+            self.db,
+            "UPDATE scheduled_tasks SET last_run_at = ?, last_run_status = ?, last_run_output = ?, updated_at = ? WHERE id = ?",
+            now.clone(),
+            status.as_str(),
+            output,
+            now,
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -3060,19 +2963,21 @@ impl ChatDb {
         invocation_kind: &str,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        scheduled_task_runs::ActiveModel {
-            id: Set(id.to_string()),
-            task_id: Set(task.id.clone()),
-            profile_id: Set(task.profile_id.clone()),
-            session_id: Set(task.session_id.clone()),
-            invocation_kind: Set(invocation_kind.to_string()),
-            status: Set(TaskRunStatus::Running.as_str().to_string()),
-            output: Set(None),
-            started_at: Set(now.clone()),
-            finished_at: Set(None),
-            updated_at: Set(now),
-        }
-        .insert(&self.conn)
+        query!(
+            self.db,
+            "INSERT INTO scheduled_task_runs (id, task_id, profile_id, session_id, invocation_kind, status, output, started_at, finished_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            id,
+            task.id.as_str(),
+            task.profile_id.as_str(),
+            task.session_id.as_deref(),
+            invocation_kind,
+            TaskRunStatus::Running.as_str(),
+            Option::<String>::None,
+            now.clone(),
+            Option::<String>::None,
+            now
+        )
+        .execute()
         .await?;
         Ok(())
     }
@@ -3084,17 +2989,17 @@ impl ChatDb {
         output: Option<&str>,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let mut active: scheduled_task_runs::ActiveModel =
-            scheduled_task_runs::Entity::find_by_id(id)
-                .one(&self.conn)
-                .await?
-                .ok_or_else(|| DbErr::RecordNotFound(id.to_string()))?
-                .into();
-        active.status = Set(status.as_str().to_string());
-        active.output = Set(output.map(ToOwned::to_owned));
-        active.finished_at = Set(Some(now.clone()));
-        active.updated_at = Set(now);
-        active.update(&self.conn).await?;
+        query!(
+            self.db,
+            "UPDATE scheduled_task_runs SET status = ?, output = ?, finished_at = ?, updated_at = ? WHERE id = ?",
+            status.as_str(),
+            output,
+            Some(now.clone()),
+            now,
+            id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -3103,26 +3008,26 @@ impl ChatDb {
     /// Due-ness is resolved by the scheduler runtime because it depends on
     /// trigger-kind-specific rules.
     pub async fn list_due_tasks(&self) -> Result<Vec<scheduled_tasks::Model>, ChatDbError> {
-        let rows = scheduled_tasks::Entity::find()
-            .filter(scheduled_tasks::Column::Enabled.eq(true))
-            .filter(scheduled_tasks::Column::Approved.eq(true))
-            .all(&self.conn)
-            .await?;
-        Ok(rows)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM scheduled_tasks WHERE enabled = TRUE AND approved = TRUE"
+        )
+        .fetch_all::<scheduled_tasks::Model>()
+        .await?)
     }
 
     pub async fn list_tasks_for_webhook(
         &self,
         token: &str,
     ) -> Result<Vec<scheduled_tasks::Model>, ChatDbError> {
-        scheduled_tasks::Entity::find()
-            .filter(scheduled_tasks::Column::Enabled.eq(true))
-            .filter(scheduled_tasks::Column::Approved.eq(true))
-            .filter(scheduled_tasks::Column::TriggerKind.eq(TRIGGER_KIND_WEBHOOK))
-            .filter(scheduled_tasks::Column::TriggerType.eq(token))
-            .all(&self.conn)
-            .await
-            .map_err(Into::into)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM scheduled_tasks WHERE enabled = TRUE AND approved = TRUE AND trigger_kind = ? AND trigger_type = ?",
+            TRIGGER_KIND_WEBHOOK,
+            token
+        )
+        .fetch_all::<scheduled_tasks::Model>()
+        .await?)
     }
 
     // ── Push subscriptions ────────────────────────────────
@@ -3136,23 +3041,35 @@ impl ChatDb {
         auth: &str,
     ) -> Result<push_subscriptions::Model, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        let model = push_subscriptions::ActiveModel {
-            id: Set(id.to_string()),
-            endpoint: Set(endpoint.to_string()),
-            p256dh: Set(p256dh.to_string()),
-            auth: Set(auth.to_string()),
-            created_at: Set(now),
-        };
-        let result = model.insert(&self.conn).await?;
-        Ok(result)
+        query!(
+            self.db,
+            "INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?)",
+            id,
+            endpoint,
+            p256dh,
+            auth,
+            now.clone()
+        )
+        .execute()
+        .await?;
+        Ok(push_subscriptions::Model {
+            id: id.to_string(),
+            endpoint: endpoint.to_string(),
+            p256dh: p256dh.to_string(),
+            auth: auth.to_string(),
+            created_at: now,
+        })
     }
 
     /// Remove a push subscription by endpoint.
     pub async fn remove_push_subscription(&self, endpoint: &str) -> Result<(), ChatDbError> {
-        push_subscriptions::Entity::delete_many()
-            .filter(push_subscriptions::Column::Endpoint.eq(endpoint))
-            .exec(&self.conn)
-            .await?;
+        query!(
+            self.db,
+            "DELETE FROM push_subscriptions WHERE endpoint = ?",
+            endpoint
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -3160,8 +3077,12 @@ impl ChatDb {
     pub async fn list_push_subscriptions(
         &self,
     ) -> Result<Vec<push_subscriptions::Model>, ChatDbError> {
-        let rows = push_subscriptions::Entity::find().all(&self.conn).await?;
-        Ok(rows)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM push_subscriptions ORDER BY created_at DESC"
+        )
+        .fetch_all::<push_subscriptions::Model>()
+        .await?)
     }
 
     // ── Profile memories ──────────────────────────────────
@@ -3172,12 +3093,14 @@ impl ChatDb {
         profile_id: &str,
         memory_type: &str,
     ) -> Result<Option<profile_memories::Model>, ChatDbError> {
-        let row = profile_memories::Entity::find()
-            .filter(profile_memories::Column::ProfileId.eq(profile_id))
-            .filter(profile_memories::Column::MemoryType.eq(memory_type))
-            .one(&self.conn)
-            .await?;
-        Ok(row)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM profile_memories WHERE profile_id = ? AND memory_type = ? LIMIT 1",
+            profile_id,
+            memory_type
+        )
+        .fetch_optional::<profile_memories::Model>()
+        .await?)
     }
 
     /// Get all memories for a profile.
@@ -3185,11 +3108,13 @@ impl ChatDb {
         &self,
         profile_id: &str,
     ) -> Result<Vec<profile_memories::Model>, ChatDbError> {
-        let rows = profile_memories::Entity::find()
-            .filter(profile_memories::Column::ProfileId.eq(profile_id))
-            .all(&self.conn)
-            .await?;
-        Ok(rows)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM profile_memories WHERE profile_id = ? ORDER BY updated_at DESC",
+            profile_id
+        )
+        .fetch_all::<profile_memories::Model>()
+        .await?)
     }
 
     /// Upsert a profile memory (insert or replace).
@@ -3200,27 +3125,31 @@ impl ChatDb {
         content: &str,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-
-        // Try to find existing
         let existing = self.get_profile_memory(profile_id, memory_type).await?;
 
         if let Some(existing) = existing {
-            // Update
-            let mut active: profile_memories::ActiveModel = existing.into();
-            active.content = Set(content.to_string());
-            active.updated_at = Set(now);
-            active.update(&self.conn).await?;
+            query!(
+                self.db,
+                "UPDATE profile_memories SET content = ?, updated_at = ? WHERE id = ?",
+                content,
+                now,
+                existing.id
+            )
+            .execute()
+            .await?;
         } else {
-            // Insert
             let id = uuid::Uuid::new_v4().to_string();
-            let model = profile_memories::ActiveModel {
-                id: Set(id),
-                profile_id: Set(profile_id.to_string()),
-                memory_type: Set(memory_type.to_string()),
-                content: Set(content.to_string()),
-                updated_at: Set(now),
-            };
-            model.insert(&self.conn).await?;
+            query!(
+                self.db,
+                "INSERT INTO profile_memories (id, profile_id, memory_type, content, updated_at) VALUES (?, ?, ?, ?, ?)",
+                id,
+                profile_id,
+                memory_type,
+                content,
+                now
+            )
+            .execute()
+            .await?;
         }
 
         Ok(())
@@ -3229,23 +3158,16 @@ impl ChatDb {
     /// Mark a profile memory refresh job dirty.
     pub async fn mark_profile_memory_job_dirty(&self, profile_id: &str) -> Result<(), ChatDbError> {
         let updated_at = jiff::Timestamp::now().to_string();
-        let active = profile_memory_jobs::ActiveModel {
-            profile_id: Set(profile_id.to_string()),
-            dirty: Set(true),
-            last_processed_at: Set(None),
-            updated_at: Set(updated_at),
-        };
-        profile_memory_jobs::Entity::insert(active)
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::column(profile_memory_jobs::Column::ProfileId)
-                    .update_columns([
-                        profile_memory_jobs::Column::Dirty,
-                        profile_memory_jobs::Column::UpdatedAt,
-                    ])
-                    .to_owned(),
-            )
-            .exec(&self.conn)
-            .await?;
+        query!(
+            self.db,
+            "INSERT INTO profile_memory_jobs (profile_id, dirty, last_processed_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(profile_id) DO UPDATE SET dirty = excluded.dirty, updated_at = excluded.updated_at",
+            profile_id,
+            true,
+            Option::<String>::None,
+            updated_at
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -3253,12 +3175,13 @@ impl ChatDb {
     pub async fn list_dirty_profile_memory_jobs(
         &self,
     ) -> Result<Vec<profile_memory_jobs::Model>, ChatDbError> {
-        profile_memory_jobs::Entity::find()
-            .filter(profile_memory_jobs::Column::Dirty.eq(true))
-            .order_by_asc(profile_memory_jobs::Column::UpdatedAt)
-            .all(&self.conn)
-            .await
-            .map_err(Into::into)
+        Ok(query!(
+            self.db,
+            "SELECT * FROM profile_memory_jobs WHERE dirty = ? ORDER BY updated_at ASC",
+            true
+        )
+        .fetch_all::<profile_memory_jobs::Model>()
+        .await?)
     }
 
     /// Mark a profile memory refresh job processed.
@@ -3268,45 +3191,69 @@ impl ChatDb {
         expected_updated_at: &str,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
-        profile_memory_jobs::Entity::update_many()
-            .col_expr(profile_memory_jobs::Column::Dirty, Expr::value(false))
-            .col_expr(
-                profile_memory_jobs::Column::LastProcessedAt,
-                Expr::value(Some(now.clone())),
-            )
-            .col_expr(profile_memory_jobs::Column::UpdatedAt, Expr::value(now))
-            .filter(profile_memory_jobs::Column::ProfileId.eq(profile_id))
-            .filter(profile_memory_jobs::Column::UpdatedAt.eq(expected_updated_at))
-            .exec(&self.conn)
-            .await?;
+        query!(
+            self.db,
+            "UPDATE profile_memory_jobs SET dirty = ?, last_processed_at = ?, updated_at = ? WHERE profile_id = ? AND updated_at = ?",
+            false,
+            Some(now.clone()),
+            now,
+            profile_id,
+            expected_updated_at
+        )
+        .execute()
+        .await?;
         Ok(())
     }
-
-    async fn query_optional_i32_scalar(
-        &self,
-        statement: sea_orm::Statement,
-    ) -> Result<i32, ChatDbError> {
-        let row: Option<sea_orm::QueryResult> = self.conn.query_one(statement).await?;
-        Ok(row
-            .and_then(|query_result| query_result.try_get_by_index::<i32>(0).ok())
-            .unwrap_or(-1))
-    }
-}
-
-fn query_u64(row: &sea_orm::QueryResult, index: usize) -> Result<u64, ChatDbError> {
-    let value = row
-        .try_get_by_index::<i64>(index)
-        .map_err(ChatDbError::Db)?;
-    u64::try_from(value).map_err(|error| {
-        ChatDbError::Db(db_custom_error("u64 aggregate conversion failed: ", &error))
-    })
 }
 
 /// Parameters for upserting a persisted session context snapshot.
-pub struct SessionContextSnapshotUpsert<'a> {
-    pub context_json: &'a str,
-    pub assembled_messages_json: Option<&'a str>,
-    pub metadata_json: Option<&'a str>,
+pub struct SessionContextSnapshotUpsert {
+    pub checkpoint: aither_agent::AgentCheckpoint,
+    pub history_message_count: usize,
+}
+
+/// Structured snapshot loaded from SQL-backed session context storage.
+#[derive(Debug, Clone)]
+pub struct StoredSessionContextSnapshot {
+    pub checkpoint: aither_agent::AgentCheckpoint,
+    pub history_message_count: usize,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct StoredSessionContextSnapshotRow {
+    checkpoint_blob: Vec<u8>,
+    history_message_count: i64,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SqliteTableInfoRow {
+    name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct I32ValueRow {
+    value: i32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct I64ValueRow {
+    value: i64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AssistantCacheUsageSummaryRow {
+    assistant_message_count: i64,
+    cache_hit_message_count: i64,
+    prompt_tokens_total: i64,
+    cache_read_tokens_total: i64,
+    cache_write_tokens_total: i64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SessionIdRow {
+    session_id: String,
 }
 
 /// Parameters for creating a scheduled task.
@@ -3379,7 +3326,6 @@ pub struct AskUserResponsePayload {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::EntityTrait;
     use tempfile::tempdir;
 
     use crate::PermissionRequestMode;
@@ -4265,11 +4211,15 @@ mod tests {
             .await
             .expect("task run recovery should succeed");
 
-        let recovered = scheduled_task_runs::Entity::find_by_id("run-1")
-            .one(&db.conn)
-            .await
-            .expect("task run lookup should succeed")
-            .expect("task run should exist");
+        let recovered = query!(
+            db.db,
+            "SELECT * FROM scheduled_task_runs WHERE id = ?",
+            "run-1"
+        )
+        .fetch_optional::<scheduled_task_runs::Model>()
+        .await
+        .expect("task run lookup should succeed")
+        .expect("task run should exist");
         assert_eq!(recovered.status, "interrupted");
         assert!(recovered.finished_at.is_some());
         assert_eq!(
@@ -4343,11 +4293,15 @@ mod tests {
             .await
             .expect("lease recovery should clear stale active state");
 
-        let recovered = session_run_leases::Entity::find_by_id("session-1")
-            .one(&db.conn)
-            .await
-            .expect("lease lookup should succeed")
-            .expect("lease row should exist");
+        let recovered = query!(
+            db.db,
+            "SELECT * FROM session_run_leases WHERE session_id = ?",
+            "session-1"
+        )
+        .fetch_optional::<session_run_leases::Model>()
+        .await
+        .expect("lease lookup should succeed")
+        .expect("lease row should exist");
         assert!(!recovered.active);
         assert!(!recovered.cancellation_requested);
         assert!(

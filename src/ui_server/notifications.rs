@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use sea_orm::DbErr;
 use skyzen::Result as SkyResult;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
@@ -131,7 +130,7 @@ pub(super) async fn consume_notification_callback(
         .consume_notification_callback(&id)
         .await
         .map_err(|error| match error {
-            crate::db::ChatDbError::Db(DbErr::RecordNotFound(_)) => {
+            crate::db::ChatDbError::RowNotFound(_) => {
                 skyzen::Error::msg("notification mailbox entry not found")
                     .set_status(skyzen::StatusCode::NOT_FOUND)
             }

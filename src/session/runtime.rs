@@ -106,6 +106,15 @@ impl TerminalRuntimeState {
             && self.output_preview.is_none()
             && self.input_notice.is_none()
     }
+
+    #[must_use]
+    pub fn with_input_notice(mut self, task_id: Option<String>, notice: String) -> Self {
+        if let Some(task_id) = task_id {
+            self.task_id = Some(task_id);
+        }
+        self.input_notice = Some(notice);
+        self
+    }
 }
 
 /// Persisted browser interaction state owned by the server runtime.

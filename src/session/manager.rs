@@ -29,6 +29,8 @@ pub enum SessionError {
     NoActiveSession,
     #[error("Bundle error: {0}")]
     Bundle(#[from] crate::bundle::BundleError),
+    #[error("Container runtime preparation failed: {0}")]
+    Container(#[from] crate::container::ContainerError),
 }
 
 /// Unique session identifier (four random words joined by `-`).
@@ -390,6 +392,9 @@ impl SessionManager {
 
         if !already_persisted {
             let layout = self.session_layout(profile_id.as_deref()).await?;
+            if layout == SandboxResourceLayout::ContainerMountPoints {
+                crate::container::profile::ensure_container_runtime_assets(&self.may_dir).await?;
+            }
             // Create filesystem directories (for sandbox, images, etc.)
             self.store
                 .create_session_dirs(&session_id, profile_id.as_deref(), layout)

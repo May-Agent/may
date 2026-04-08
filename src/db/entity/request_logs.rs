@@ -1,11 +1,7 @@
-//! Persisted request log entries for UI observability.
+//! Persisted request log row model for UI observability.
 
-use sea_orm::entity::prelude::*;
-
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-#[sea_orm(table_name = "request_logs")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Model {
-    #[sea_orm(primary_key)]
     pub id: i32,
     pub session_id: String,
     pub timestamp: String,
@@ -21,8 +17,3 @@ pub struct Model {
     pub ok: bool,
     pub error: Option<String>,
 }
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
-
-impl ActiveModelBehavior for ActiveModel {}
