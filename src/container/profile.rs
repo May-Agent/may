@@ -112,6 +112,14 @@ fn normalize_path(context_dir: &Path, configured: &str) -> PathBuf {
 ///
 /// Profiles without a custom Dockerfile share the global May workspace image to
 /// avoid duplicate builds across `daily` / `work` style profiles.
+pub async fn ensure_container_runtime_assets(may_dir: &Path) -> Result<(), ContainerError> {
+    super::heel::ensure_container_heel_binary(may_dir).await
+}
+
+/// Resolve the default image tag for a profile when no explicit `container_image` is set.
+///
+/// Profiles without a custom Dockerfile share the global May workspace image to
+/// avoid duplicate builds across `daily` / `work` style profiles.
 pub async fn default_image_tag(
     may_dir: &Path,
     profile: &profiles::Model,
@@ -125,7 +133,7 @@ pub async fn default_image_tag(
         return Ok(image.to_string());
     }
 
-    super::heel::ensure_container_heel_binary(may_dir).await?;
+    ensure_container_runtime_assets(may_dir).await?;
 
     let uses_custom_dockerfile = parse_preferences(profile)?
         .and_then(|preferences| preferences.dockerfile)

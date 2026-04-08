@@ -2248,6 +2248,34 @@ export function ChatInterface({
     };
   }, []);
 
+  if (chatSurfaceState === "backend-down") {
+    return (
+      <div className="flex flex-1 min-h-0 w-full min-w-0 items-center justify-center overflow-hidden bg-[#8f2020] px-6 py-10 text-red-50 md:px-10">
+        <div className="w-full max-w-3xl text-center">
+          <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-full border border-red-50/18">
+            <CircleX className="h-8 w-8 text-red-50/92" />
+          </div>
+          <h2 className="text-3xl font-semibold tracking-[-0.03em] text-red-50">
+            Backend unavailable
+          </h2>
+          <p className="mx-auto mt-4 max-w-xl text-base leading-7 text-red-50/76">
+            The UI cannot reach the May server right now.
+          </p>
+          <div className="mx-auto mt-8 max-w-2xl border-t border-red-50/14 pt-6 text-sm leading-7 text-red-50/78">
+            {backendUnavailableReason}
+          </div>
+          <Button
+            variant="secondary"
+            className="mt-8 h-10 rounded-full border-0 bg-red-50 text-[#8f2020] hover:bg-white"
+            onClick={() => void refreshProfileSessions()}
+          >
+            Retry
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-1 min-h-0 w-full min-w-0">
       <div className="relative flex flex-1 min-h-0 min-w-0 flex-col">
@@ -2340,29 +2368,7 @@ export function ChatInterface({
           </div>
         </div>
 
-        {chatSurfaceState === "backend-down" ? (
-          <div className="flex-1 min-h-0 px-4 pt-12">
-            <div className="mx-auto w-full max-w-3xl rounded-2xl border border-red-500/45 bg-background/80 p-6 text-center">
-              <div className="mx-auto mb-4 flex w-fit items-center justify-center rounded-full bg-red-500/15 p-2.5">
-                <CircleX className="h-6 w-6 text-red-500" />
-              </div>
-              <h2 className="text-lg font-semibold">Backend unavailable</h2>
-              <p className="mt-2 text-sm text-muted-foreground">
-                Unable to load chats because the server is unreachable.
-              </p>
-              <div className="mt-4 rounded-lg bg-muted/50 px-3 py-2 text-left text-xs text-muted-foreground">
-                {backendUnavailableReason}
-              </div>
-              <Button
-                variant="secondary"
-                className="mt-4"
-                onClick={() => void refreshProfileSessions()}
-              >
-                Retry
-              </Button>
-            </div>
-          </div>
-        ) : chatSurfaceState === "container-preparing" ? (
+        {chatSurfaceState === "container-preparing" ? (
           <div className="flex-1 min-h-0 px-4 pt-12">
             <div className="mx-auto w-full max-w-3xl rounded-2xl border border-border/50 bg-background/70 p-6 text-center">
               {isContainerPrepareFailed ? (
@@ -2803,59 +2809,61 @@ export function ChatInterface({
                 )}
 
                 {queuedMessages.length > 0 && (
-                  <div className="px-3 pt-3 pb-2">
-                    <div className="queued-shell rounded-[14px] border">
-                      <div className="queued-header flex items-center justify-between border-b px-4 py-3">
-                        <div className="flex min-w-0 items-center gap-2">
-                          <span className="queued-header-icon inline-flex h-6 w-6 items-center justify-center rounded-md text-cyan-200">
+                  <div className="px-3 pt-2 pb-2">
+                    <div className="queued-shell rounded-[18px] border">
+                      <div className="queued-header flex items-center justify-between border-b px-3.5 py-2.5">
+                        <div className="flex min-w-0 items-center gap-2.5">
+                          <span className="queued-header-icon inline-flex h-7 w-7 items-center justify-center rounded-lg text-zinc-200">
                             <Clock3 className="h-3.5 w-3.5" />
                           </span>
                           <div className="min-w-0">
-                            <div className="queued-header-title text-[10px] uppercase tracking-[0.14em] text-zinc-200/90">
-                              Queued messages
+                            <div className="queued-header-title text-[11px] text-zinc-100">
+                              Queued
                             </div>
-                            <div className="queued-header-subtitle truncate text-[11px] text-zinc-500">
-                              Run after current response
+                            <div className="queued-header-subtitle truncate text-[11px]">
+                              Sent after the current reply finishes
                             </div>
                           </div>
                         </div>
-                        <div className="queued-count-pill text-[10px] tabular-nums text-zinc-300">
+                        <div className="queued-count-pill text-[11px] font-medium tabular-nums text-zinc-300">
                           {queuedMessages.length}
                         </div>
                       </div>
-                      <div className="queued-list space-y-2 p-2.5">
+                      <div className="queued-list p-2">
                         {queuedMessages.map((msg, i) => (
                           <div
                             key={`${currentSessionId ?? "session"}-${i}`}
-                            className="queued-item group grid grid-cols-[auto,1fr,auto] items-start gap-3.5 rounded-xl px-3 py-3"
+                            className="queued-item group grid grid-cols-[auto,1fr,auto] items-start gap-3 rounded-[14px] px-3 py-3"
                           >
-                            <div className="queued-order mt-0.5 inline-flex h-6 min-w-6 items-center justify-center rounded-full text-[10px] font-semibold tabular-nums text-zinc-300">
+                            <div className="queued-order mt-0.5 inline-flex h-7 min-w-7 items-center justify-center rounded-lg text-[10px] font-medium tabular-nums text-zinc-300">
                               {i + 1}
                             </div>
-                            <div className="min-w-0 flex-1 space-y-1">
-                              <div className="queued-message-content line-clamp-2 text-[12px] leading-snug text-zinc-100/95">
+                            <div className="min-w-0 flex-1 space-y-1.5">
+                              <div className="queued-message-content line-clamp-2 text-[12.5px] leading-[1.45] text-zinc-100/95">
                                 {msg.content.trim().length > 0
                                   ? msg.content
                                   : "Attachment-only message"}
                               </div>
-                              <div className="queued-meta flex items-center gap-2 text-[10px]">
-                                <span className="inline-flex items-center gap-1">
-                                  <Paperclip className="h-3 w-3" />
-                                  {msg.attachments.length} attachment
-                                  {msg.attachments.length > 1 ? "s" : ""}
-                                </span>
-                                <span className="queued-state-pill inline-flex items-center gap-1 rounded-full px-1.5 py-[1px] text-zinc-200">
+                              <div className="queued-meta flex flex-wrap items-center gap-2 text-[10px] leading-none">
+                                <span className="queued-state-pill inline-flex items-center rounded-full px-2 py-1 text-zinc-200">
                                   {msg.deliveryMode === "steer"
-                                    ? "steer"
-                                    : "queued"}
+                                    ? "Steer next"
+                                    : "Queued"}
                                 </span>
+                                {msg.attachments.length > 0 && (
+                                  <span className="inline-flex items-center gap-1.5 text-zinc-400">
+                                    <Paperclip className="h-3 w-3" />
+                                    {msg.attachments.length} attachment
+                                    {msg.attachments.length > 1 ? "s" : ""}
+                                  </span>
+                                )}
                               </div>
                             </div>
-                            <div className="flex shrink-0 items-start gap-1.5 opacity-80 transition-opacity group-hover:opacity-100">
+                            <div className="flex shrink-0 items-start gap-1.5">
                               <button
                                 type="button"
                                 onClick={() => steerQueuedMessage(i)}
-                                className="queued-steer h-6 rounded-md border px-2.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-zinc-200 transition-colors"
+                                className="queued-steer h-7 rounded-full border px-3 text-[11px] font-medium text-zinc-200 transition-colors"
                               >
                                 Steer
                               </button>
@@ -2864,7 +2872,7 @@ export function ChatInterface({
                                 <DropdownMenuTrigger asChild>
                                   <button
                                     type="button"
-                                    className="queued-more inline-flex h-6 w-6 items-center justify-center rounded-md border text-zinc-500 transition-colors hover:text-zinc-100"
+                                    className="queued-more inline-flex h-7 w-7 items-center justify-center rounded-full border text-zinc-500 transition-colors hover:text-zinc-100"
                                     aria-label="More actions"
                                   >
                                     <MoreHorizontal className="h-4 w-4" />

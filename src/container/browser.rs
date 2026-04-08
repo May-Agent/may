@@ -19,14 +19,20 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::accessibility::{
+    AxNode, AxProperty, AxValue, EnableParams as AccessibilityEnableParams,
+    GetFullAxTreeParams as GetFullAccessibilityTreeParams,
+};
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
     MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
+    CaptureScreenshotFormat, EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
+    StartScreencastParams,
 };
 use chromiumoxide::page::Page;
+use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide_fetcher::{
     BrowserFetcher, BrowserFetcherOptions, BrowserKind as ManagedBrowserKind,
     BrowserVersion as ManagedBrowserVersion, Channel as ManagedBrowserChannel,
@@ -51,7 +57,11 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-use crate::browser_service::BrowserPageSnapshot;
+use crate::browser_service::{
+    BrowserAccessibilityNode, BrowserAccessibilityProperty, BrowserAccessibilitySnapshot,
+    BrowserCapturedScreenshot, BrowserInteractiveElement, BrowserPageCapture, BrowserPageSummary,
+    BrowserReadDetail, BrowserReadOptions, BrowserScreenshotMode,
+};
 use crate::config::{BrowserBackendKind, BrowserConfig as MayBrowserConfig};
 
 // ── Error ──────────────────────────────────────────────────────────────────────
@@ -286,6 +296,26 @@ struct BrowserVersionMetadata {
     web_socket_debugger_url: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserDomSummary {
+    url: String,
+    title: String,
+    main_heading: Option<String>,
+    headings: Vec<String>,
+    text_excerpt: String,
+    interactive_elements: Vec<BrowserInteractiveElement>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BrowserCaptureLimits {
+    text_excerpt_chars: usize,
+    interactive_elements: usize,
+    accessibility_nodes: usize,
+    accessibility_depth: i64,
+    settle_delay: Duration,
+}
+
 enum BrowserCommand {
     Start {
         reply: oneshot::Sender<Result<(), BrowserError>>,
@@ -299,7 +329,8 @@ enum BrowserCommand {
     },
     ReadPage {
         url: String,
-        reply: oneshot::Sender<Result<BrowserPageSnapshot, BrowserError>>,
+        options: BrowserReadOptions,
+        reply: oneshot::Sender<Result<BrowserPageCapture, BrowserError>>,
     },
     DropPeer {
         peer_id: String,
@@ -429,8 +460,12 @@ impl BrowserManager {
                     BrowserCommand::HandleOffer { offer_sdp, reply } => {
                         let _ = reply.send(runtime.handle_offer(offer_sdp, actor_tx.clone()).await);
                     }
-                    BrowserCommand::ReadPage { url, reply } => {
-                        let _ = reply.send(runtime.read_page(url.as_str()).await);
+                    BrowserCommand::ReadPage {
+                        url,
+                        options,
+                        reply,
+                    } => {
+                        let _ = reply.send(runtime.read_page(url.as_str(), options).await);
                     }
                     BrowserCommand::DropPeer { peer_id } => {
                         runtime.drop_peer(peer_id.as_str());
@@ -517,11 +552,16 @@ impl BrowserManager {
         })?
     }
 
-    pub async fn read_page(&self, url: String) -> Result<BrowserPageSnapshot, BrowserError> {
+    pub async fn read_page(
+        &self,
+        url: String,
+        options: BrowserReadOptions,
+    ) -> Result<BrowserPageCapture, BrowserError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(BrowserCommand::ReadPage {
                 url,
+                options,
                 reply: reply_tx,
             })
             .map_err(|_| BrowserError::ActorClosed {
@@ -839,14 +879,18 @@ impl BrowserRuntime {
         Ok(local_desc.sdp)
     }
 
-    async fn read_page(&self, url: &str) -> Result<BrowserPageSnapshot, BrowserError> {
+    async fn read_page(
+        &self,
+        url: &str,
+        options: BrowserReadOptions,
+    ) -> Result<BrowserPageCapture, BrowserError> {
         let page = self
             .session
             .as_ref()
             .ok_or(BrowserError::NotRunning)?
             .page
             .clone();
-        read_page_snapshot(page, url).await
+        read_page_capture(page, url, options).await
     }
 }
 
@@ -929,10 +973,11 @@ async fn resolve_local_browser_websocket_endpoint(port: u16) -> Result<String, B
     })
 }
 
-async fn read_page_snapshot(
+async fn read_page_capture(
     page: Arc<Page>,
     url: &str,
-) -> Result<BrowserPageSnapshot, BrowserError> {
+    options: BrowserReadOptions,
+) -> Result<BrowserPageCapture, BrowserError> {
     let trimmed_url = url.trim();
     if trimmed_url.is_empty() {
         return Err(BrowserError::InvalidInput(
@@ -940,19 +985,332 @@ async fn read_page_snapshot(
         ));
     }
 
+    let limits = capture_limits(options.detail);
+
     page.goto(trimmed_url)
         .await
         .map_err(|error| BrowserError::browser_operation("navigate page for read", error))?;
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    tokio::time::sleep(limits.settle_delay).await;
 
-    let snapshot: BrowserPageSnapshot = page
-        .evaluate("() => { const norm = (value) => typeof value === 'string' ? value.replace(/\\s+/g, ' ').trim() : ''; const headings = Array.from(document.querySelectorAll('h1, h2, h3')).map((node) => norm(node.innerText)).filter(Boolean).slice(0, 8); const bodyText = norm(document.body ? document.body.innerText : '').slice(0, 4000); return { url: location.href, title: norm(document.title), mainHeading: headings.length > 0 ? headings[0] : null, headings, textExcerpt: bodyText }; }")
+    let page_summary = read_page_summary(page.as_ref(), limits).await?;
+    let accessibility = read_accessibility_snapshot(page.as_ref(), limits).await?;
+    let screenshot = capture_page_screenshot(page.as_ref(), options.screenshot).await?;
+
+    Ok(BrowserPageCapture {
+        page: BrowserPageSummary {
+            url: page_summary.url,
+            title: page_summary.title,
+            main_heading: page_summary.main_heading,
+            headings: page_summary.headings,
+            text_excerpt: page_summary.text_excerpt,
+            interactive_elements: page_summary.interactive_elements,
+            accessibility,
+        },
+        screenshot,
+    })
+}
+
+fn capture_limits(detail: BrowserReadDetail) -> BrowserCaptureLimits {
+    match detail {
+        BrowserReadDetail::Brief => BrowserCaptureLimits {
+            text_excerpt_chars: 1_200,
+            interactive_elements: 8,
+            accessibility_nodes: 16,
+            accessibility_depth: 4,
+            settle_delay: Duration::from_millis(500),
+        },
+        BrowserReadDetail::Standard => BrowserCaptureLimits {
+            text_excerpt_chars: 3_000,
+            interactive_elements: 16,
+            accessibility_nodes: 32,
+            accessibility_depth: 6,
+            settle_delay: Duration::from_millis(900),
+        },
+        BrowserReadDetail::Full => BrowserCaptureLimits {
+            text_excerpt_chars: 6_000,
+            interactive_elements: 32,
+            accessibility_nodes: 64,
+            accessibility_depth: 8,
+            settle_delay: Duration::from_millis(1_500),
+        },
+    }
+}
+
+async fn read_page_summary(
+    page: &Page,
+    limits: BrowserCaptureLimits,
+) -> Result<BrowserDomSummary, BrowserError> {
+    let summary_script = format!(
+        "() => {{ const normalize = (value) => typeof value === 'string' ? value.replace(/\\s+/g, ' ').trim() : ''; const excerptChars = {}; const maxInteractiveElements = {}; const headings = Array.from(document.querySelectorAll('h1, h2, h3')).map((node) => normalize(node.innerText)).filter(Boolean).slice(0, 12); const interactiveElements = Array.from(document.querySelectorAll('a, button, input, select, textarea, summary, [role=\"button\"], [role=\"link\"], [role=\"menuitem\"], [tabindex]')).map((node) => {{ const role = normalize(node.getAttribute('role')) || normalize(node.tagName).toLowerCase(); const text = normalize(node.innerText || node.textContent || ''); const accessibleName = normalize(node.getAttribute('aria-label')) || normalize(node.getAttribute('title')) || text || null; const href = node instanceof HTMLAnchorElement ? (node.href || null) : null; const inputType = node instanceof HTMLInputElement ? (node.type || null) : null; return {{ role, tagName: normalize(node.tagName).toLowerCase(), text: text || null, accessibleName, href, inputType, disabled: Boolean(node.disabled) }}; }}).filter((item) => item.accessibleName || item.href || item.tagName === 'input').slice(0, maxInteractiveElements); const bodyText = normalize(document.body ? document.body.innerText : '').slice(0, excerptChars); return {{ url: location.href, title: normalize(document.title), mainHeading: headings[0] ?? null, headings, textExcerpt: bodyText, interactiveElements }}; }}",
+        limits.text_excerpt_chars, limits.interactive_elements
+    );
+
+    page.evaluate(summary_script.as_str())
         .await
-        .map_err(|error| BrowserError::browser_operation("evaluate page snapshot script", error))?
+        .map_err(|error| BrowserError::browser_operation("evaluate page summary script", error))?
         .into_value()
-        .map_err(|error| BrowserError::browser_operation("decode page snapshot", error))?;
+        .map_err(|error| BrowserError::browser_operation("decode page summary", error))
+}
 
-    Ok(snapshot)
+async fn read_accessibility_snapshot(
+    page: &Page,
+    limits: BrowserCaptureLimits,
+) -> Result<BrowserAccessibilitySnapshot, BrowserError> {
+    page.execute(AccessibilityEnableParams::default())
+        .await
+        .map_err(|error| BrowserError::browser_operation("enable accessibility domain", error))?;
+    let response = page
+        .execute(
+            GetFullAccessibilityTreeParams::builder()
+                .depth(limits.accessibility_depth)
+                .build(),
+        )
+        .await
+        .map_err(|error| BrowserError::browser_operation("read accessibility tree", error))?;
+
+    Ok(summarize_accessibility_tree(
+        response.result.nodes,
+        limits.accessibility_nodes,
+    ))
+}
+
+fn summarize_accessibility_tree(
+    nodes: Vec<AxNode>,
+    max_nodes: usize,
+) -> BrowserAccessibilitySnapshot {
+    let total_nodes = nodes.len();
+    let interactive_nodes = nodes
+        .iter()
+        .filter(|node| {
+            accessibility_role(node)
+                .as_deref()
+                .is_some_and(is_interactive_role)
+        })
+        .count();
+    let heading_nodes = nodes
+        .iter()
+        .filter(|node| {
+            accessibility_role(node)
+                .as_deref()
+                .is_some_and(is_heading_role)
+        })
+        .count();
+    let landmark_nodes = nodes
+        .iter()
+        .filter(|node| {
+            accessibility_role(node)
+                .as_deref()
+                .is_some_and(is_landmark_role)
+        })
+        .count();
+
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.node_id.as_ref().to_string(), node))
+        .collect::<HashMap<_, _>>();
+    let mut roots = nodes
+        .iter()
+        .filter(|node| node.parent_id.is_none())
+        .map(|node| node.node_id.as_ref().to_string())
+        .collect::<Vec<_>>();
+    roots.sort_unstable();
+
+    let mut rendered_nodes = Vec::new();
+    for root in roots {
+        if rendered_nodes.len() >= max_nodes {
+            break;
+        }
+        append_accessibility_nodes(
+            &node_by_id,
+            root.as_str(),
+            0,
+            max_nodes,
+            &mut rendered_nodes,
+        );
+    }
+
+    let interesting_nodes = rendered_nodes.len();
+    BrowserAccessibilitySnapshot {
+        total_nodes,
+        interesting_nodes,
+        interactive_nodes,
+        heading_nodes,
+        landmark_nodes,
+        nodes: rendered_nodes,
+    }
+}
+
+fn append_accessibility_nodes(
+    node_by_id: &HashMap<String, &AxNode>,
+    node_id: &str,
+    depth: usize,
+    max_nodes: usize,
+    rendered_nodes: &mut Vec<BrowserAccessibilityNode>,
+) {
+    if rendered_nodes.len() >= max_nodes {
+        return;
+    }
+
+    let Some(node) = node_by_id.get(node_id).copied() else {
+        return;
+    };
+
+    if is_interesting_accessibility_node(node) {
+        rendered_nodes.push(BrowserAccessibilityNode {
+            role: accessibility_role(node).unwrap_or_else(|| "unknown".to_string()),
+            name: accessibility_value(node.name.as_ref()),
+            description: accessibility_value(node.description.as_ref()),
+            value: accessibility_value(node.value.as_ref()),
+            depth,
+            child_count: node.child_ids.as_ref().map_or(0, Vec::len),
+            ignored: node.ignored,
+            properties: accessibility_properties(node.properties.as_deref()),
+        });
+    }
+
+    if rendered_nodes.len() >= max_nodes {
+        return;
+    }
+
+    if let Some(child_ids) = node.child_ids.as_ref() {
+        for child_id in child_ids {
+            let child_key = child_id.as_ref().to_string();
+            append_accessibility_nodes(
+                node_by_id,
+                child_key.as_str(),
+                depth + 1,
+                max_nodes,
+                rendered_nodes,
+            );
+            if rendered_nodes.len() >= max_nodes {
+                return;
+            }
+        }
+    }
+}
+
+fn is_interesting_accessibility_node(node: &AxNode) -> bool {
+    if node.ignored {
+        return false;
+    }
+
+    let role = accessibility_role(node);
+    role.as_ref().is_some_and(|value| {
+        is_interactive_role(value) || is_heading_role(value) || is_landmark_role(value)
+    }) || accessibility_value(node.name.as_ref()).is_some()
+}
+
+fn accessibility_role(node: &AxNode) -> Option<String> {
+    accessibility_value(node.role.as_ref()).map(|value| value.to_lowercase())
+}
+
+fn accessibility_value(value: Option<&AxValue>) -> Option<String> {
+    value
+        .and_then(|value| value.value.as_ref())
+        .and_then(accessibility_json_value)
+}
+
+fn accessibility_json_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::String(value) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Array(values) => {
+            let joined = values
+                .iter()
+                .filter_map(accessibility_json_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            (!joined.is_empty()).then_some(joined)
+        }
+        serde_json::Value::Object(_) => Some(value.to_string()),
+    }
+}
+
+fn accessibility_properties(
+    properties: Option<&[AxProperty]>,
+) -> Vec<BrowserAccessibilityProperty> {
+    properties
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|property| {
+            accessibility_value(Some(&property.value)).map(|value| BrowserAccessibilityProperty {
+                name: property.name.as_ref().to_string(),
+                value,
+            })
+        })
+        .take(8)
+        .collect()
+}
+
+fn is_interactive_role(role: &str) -> bool {
+    matches!(
+        role,
+        "button"
+            | "checkbox"
+            | "combobox"
+            | "link"
+            | "listbox"
+            | "menuitem"
+            | "option"
+            | "radio"
+            | "searchbox"
+            | "slider"
+            | "spinbutton"
+            | "switch"
+            | "tab"
+            | "textbox"
+    )
+}
+
+fn is_heading_role(role: &str) -> bool {
+    role == "heading"
+}
+
+fn is_landmark_role(role: &str) -> bool {
+    matches!(
+        role,
+        "banner"
+            | "complementary"
+            | "contentinfo"
+            | "form"
+            | "main"
+            | "navigation"
+            | "region"
+            | "search"
+    )
+}
+
+async fn capture_page_screenshot(
+    page: &Page,
+    mode: BrowserScreenshotMode,
+) -> Result<Option<BrowserCapturedScreenshot>, BrowserError> {
+    if matches!(mode, BrowserScreenshotMode::Off) {
+        return Ok(None);
+    }
+
+    let screenshot_bytes = page
+        .screenshot(
+            ScreenshotParams::builder()
+                .format(CaptureScreenshotFormat::Png)
+                .full_page(matches!(mode, BrowserScreenshotMode::FullPage))
+                .build(),
+        )
+        .await
+        .map_err(|error| BrowserError::browser_operation("capture browser screenshot", error))?;
+    let dimensions = image::load_from_memory(screenshot_bytes.as_slice())
+        .map_err(|error| BrowserError::browser_operation("decode browser screenshot", error))?;
+
+    Ok(Some(BrowserCapturedScreenshot {
+        mime_type: "image/png".to_string(),
+        width: dimensions.width(),
+        height: dimensions.height(),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(screenshot_bytes),
+    }))
 }
 
 async fn start_encoding_pipeline(
@@ -1083,7 +1441,7 @@ fn encode_loop(
             }
         };
 
-        let rgb = img.to_rgb8();
+        let rgb = normalize_rgb_frame_for_h264(img.to_rgb8());
         let (w, h) = (rgb.width() as usize, rgb.height() as usize);
 
         // Compute inter-frame duration
@@ -1122,6 +1480,46 @@ fn encode_loop(
     }
 
     tracing::info!("Browser encoder thread stopped");
+}
+
+fn normalize_rgb_frame_for_h264(rgb: image::RgbImage) -> image::RgbImage {
+    let width = rgb.width();
+    let height = rgb.height();
+    let normalized_width = if width % 2 == 0 { width } else { width + 1 };
+    let normalized_height = if height % 2 == 0 { height } else { height + 1 };
+
+    if normalized_width == width && normalized_height == height {
+        return rgb;
+    }
+
+    let mut normalized = image::RgbImage::new(normalized_width, normalized_height);
+
+    for y in 0..height {
+        for x in 0..width {
+            normalized.put_pixel(x, y, *rgb.get_pixel(x, y));
+        }
+    }
+
+    if normalized_width != width {
+        let edge_x = width - 1;
+        for y in 0..height {
+            normalized.put_pixel(normalized_width - 1, y, *rgb.get_pixel(edge_x, y));
+        }
+    }
+
+    if normalized_height != height {
+        let edge_y = height - 1;
+        for x in 0..normalized_width {
+            let source_x = x.min(width - 1);
+            normalized.put_pixel(
+                x,
+                normalized_height - 1,
+                *normalized.get_pixel(source_x, edge_y),
+            );
+        }
+    }
+
+    normalized
 }
 
 // ── DataChannel input handler ──────────────────────────────────────────────────
@@ -1297,6 +1695,45 @@ async fn cleanup_stale_chrome(port: u16) {
         }
     })
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{Rgb, RgbImage};
+
+    use super::normalize_rgb_frame_for_h264;
+
+    #[test]
+    fn normalize_rgb_frame_for_h264_preserves_even_dimensions() {
+        let mut rgb = RgbImage::new(4, 6);
+        rgb.put_pixel(3, 5, Rgb([12, 34, 56]));
+
+        let normalized = normalize_rgb_frame_for_h264(rgb.clone());
+
+        assert_eq!(normalized.width(), 4);
+        assert_eq!(normalized.height(), 6);
+        assert_eq!(normalized, rgb);
+    }
+
+    #[test]
+    fn normalize_rgb_frame_for_h264_pads_odd_dimensions_with_edge_pixels() {
+        let mut rgb = RgbImage::new(3, 5);
+        for y in 0..5 {
+            for x in 0..3 {
+                rgb.put_pixel(x, y, Rgb([(x * 10) as u8, (y * 20) as u8, 99]));
+            }
+        }
+
+        let normalized = normalize_rgb_frame_for_h264(rgb);
+
+        assert_eq!(normalized.width(), 4);
+        assert_eq!(normalized.height(), 6);
+        assert_eq!(*normalized.get_pixel(0, 0), Rgb([0, 0, 99]));
+        assert_eq!(*normalized.get_pixel(2, 4), Rgb([20, 80, 99]));
+        assert_eq!(*normalized.get_pixel(3, 1), Rgb([20, 20, 99]));
+        assert_eq!(*normalized.get_pixel(1, 5), Rgb([10, 80, 99]));
+        assert_eq!(*normalized.get_pixel(3, 5), Rgb([20, 80, 99]));
+    }
 }
 
 async fn cleanup_profile_lock_files(profile_dir: &Path) {

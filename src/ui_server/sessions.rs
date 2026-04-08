@@ -213,25 +213,15 @@ pub(super) async fn save_session_tasks(
 }
 
 fn build_window_snapshot(
-    snapshot: crate::db::entity::session_context_snapshots::Model,
+    snapshot: crate::db::StoredSessionContextSnapshot,
 ) -> Result<SessionContextWindowSnapshotResponse, skyzen::Error> {
-    let metadata_json = snapshot
-        .metadata_json
-        .ok_or_else(|| internal_error("session context snapshot is missing metadata_json"))?;
-    let stored: crate::session::StoredContextWindowMetadata =
-        parse_json_field(&metadata_json, "session context metadata_json")?;
-    let assembled_messages_json = snapshot.assembled_messages_json.ok_or_else(|| {
-        internal_error("session context snapshot is missing assembled_messages_json")
-    })?;
-    let assembled_messages: Vec<LlmMessage> = parse_json_field(
-        &assembled_messages_json,
-        "session context assembled_messages_json",
-    )?;
+    let window = snapshot.checkpoint.context_window;
 
     Ok(SessionContextWindowSnapshotResponse {
-        phase: stored.phase,
-        metrics: SessionContextWindowMetricsResponse::from(stored.metrics),
-        assembled_messages: assembled_messages
+        phase: window.phase,
+        metrics: SessionContextWindowMetricsResponse::from(window.metrics),
+        assembled_messages: window
+            .messages
             .iter()
             .map(map_context_window_message)
             .collect(),
@@ -329,6 +319,9 @@ pub(super) async fn create_session(
             let environment = ProfileEnvironmentKind::from_str(profile.environment.as_str())
                 .map_err(internal_error)?;
             if environment == ProfileEnvironmentKind::Container {
+                crate::container::profile::ensure_container_runtime_assets(&state.may_dir)
+                    .await
+                    .map_err(internal_error)?;
                 SandboxResourceLayout::ContainerMountPoints
             } else {
                 SandboxResourceLayout::Symlinked

@@ -726,15 +726,7 @@ impl Hook for ContextSnapshotHook {
         let Some(db) = &self.db else {
             return None;
         };
-        let record = match crate::session::ContextSnapshotRecord::from_checkpoint(ctx) {
-            Ok(record) => match db.get_session_runtime(&self.session_id).await {
-                Ok(Some(runtime)) => record.with_terminal_runtime(&runtime),
-                Ok(None) => record,
-                Err(error) => return Some(error.to_string()),
-            },
-            Err(error) => return Some(error.to_string()),
-        };
-        match crate::session::persist_context_snapshot_record(db, &self.session_id, record).await {
+        match crate::session::persist_checkpoint_from_hook(db, &self.session_id, ctx).await {
             Ok(()) => None,
             Err(error) => Some(error.to_string()),
         }
@@ -1703,9 +1695,8 @@ impl MayAgent {
 
     pub(crate) async fn export_checkpoint(
         &mut self,
-        history_anchor: Option<usize>,
     ) -> Result<aither_agent::AgentCheckpoint, AgentError> {
-        self.inner.export_checkpoint(history_anchor).await
+        self.inner.export_checkpoint().await
     }
 
     pub(crate) fn push_message(&mut self, message: aither_core::llm::Message) {
@@ -1989,9 +1980,8 @@ const PLAN_MODE_APPROVED_HINT: &str = include_str!("../texts/plan_mode_approved.
 #[derive(Clone, Template)]
 #[template(path = "browser_context.xml", escape = "none")]
 struct BrowserTemplate {
-    enabled: bool,
+    state: BrowserContextState,
     cdp_endpoint: Option<String>,
-    instructions: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -2001,6 +1991,18 @@ struct Browser {
     cdp_endpoint: Option<String>,
     #[serde(rename = "$text")]
     content: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserContextState {
+    Enabled,
+    Disabled,
+}
+
+impl BrowserContextState {
+    const fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
 }
 
 #[derive(Clone, Template)]
@@ -2173,15 +2175,14 @@ struct BaseSystemTemplate {
 }
 
 fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> Browser {
-    let instructions = if enabled {
-        "Browser automation is enabled for this session and May owns the runtime lifecycle. The browser may be backed by a local managed runtime or a remote managed runtime, but it is never the user's personal browser. For web browsing, use the `browser` command itself, especially `browser read <url>`. `browser read` returns a structured page snapshot with fields such as `url`, `title`, `mainHeading`, `headings`, and `textExcerpt`; for straightforward page facts, one read is usually enough. Prefer answering directly from the `browser read` result instead of post-processing it with extra shell commands unless you truly need additional computation. Do not install Playwright, do not launch Chrome yourself, and do not rely on a visible desktop browser window.".to_string()
+    let state = if enabled {
+        BrowserContextState::Enabled
     } else {
-        "Browser automation is disabled for this session. Do not install Playwright or launch browser runtimes yourself. If browser automation is needed, ask the user to enable the browser feature in settings.".to_string()
+        BrowserContextState::Disabled
     };
     let template = BrowserTemplate {
-        enabled,
+        state,
         cdp_endpoint: cdp_endpoint.map(str::to_string),
-        instructions,
     };
     Browser {
         enabled,

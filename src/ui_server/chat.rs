@@ -16,7 +16,9 @@ use aither_sandbox::{
 };
 
 use crate::agent::MayAgent;
+use crate::agent::browser_tool::BrowserToolError;
 use crate::ask_user;
+use crate::browser_service::persist_browser_page_capture;
 use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
 use crate::prompt_mentions;
@@ -987,15 +989,16 @@ async fn run_agent_loop(
                             SessionRuntimeState::WaitingTerminalInput,
                         )
                         .await?;
+                        let current_terminal = state
+                            .runtime_service
+                            .get(session_id.as_str())
+                            .await?
+                            .interactions
+                            .terminal;
                         set_terminal_runtime_state(
                             state,
                             session_id.as_str(),
-                            TerminalRuntimeState {
-                                task_id,
-                                output_file: None,
-                                output_preview: None,
-                                input_notice: Some(notice),
-                            },
+                            current_terminal.with_input_notice(task_id, notice),
                         )
                         .await?;
                     }
@@ -1466,8 +1469,6 @@ enum UiChatPreparationError {
     LoadRuntime(#[source] crate::db::ChatDbError),
     #[error("failed to load session context snapshot: {0}")]
     LoadContextSnapshot(#[source] crate::db::ChatDbError),
-    #[error("failed to parse persisted session context snapshot: {0}")]
-    ParseContextSnapshot(#[source] anyhow::Error),
     #[error("failed to serialize browser takeover alert: {0}")]
     BuildTakeoverAlert(#[source] anyhow::Error),
     #[error("failed to build session mentions: {0}")]
@@ -1543,7 +1544,6 @@ impl UiChatPreparationError {
             | Self::LoadProfileMemories(_)
             | Self::LoadRuntime(_)
             | Self::LoadContextSnapshot(_)
-            | Self::ParseContextSnapshot(_)
             | Self::BuildTakeoverAlert(_)
             | Self::BuildSessionMentions(_)
             | Self::BuildFileMentions(_)
@@ -1583,7 +1583,6 @@ impl UiChatPreparationError {
             | Self::LoadProfileMemories(_)
             | Self::LoadRuntime(_)
             | Self::LoadContextSnapshot(_)
-            | Self::ParseContextSnapshot(_)
             | Self::BuildTakeoverAlert(_)
             | Self::BuildSessionMentions(_)
             | Self::BuildFileMentions(_)
@@ -1697,8 +1696,6 @@ async fn resolve_session_context(
             .await
             .map_err(UiChatPreparationError::LoadContextSnapshot)?
             .map(crate::session::parse_persisted_context_snapshot)
-            .transpose()
-            .map_err(UiChatPreparationError::ParseContextSnapshot)?
     } else {
         None
     };
@@ -2248,10 +2245,10 @@ async fn handle_notify_request(
 async fn handle_browser_request(
     state: &Arc<UiServerState>,
     request: crate::agent::browser_tool::BrowserRequest,
-) -> Result<crate::agent::browser_tool::BrowserResult, String> {
-    let _session_id = request.session_id;
+) -> Result<crate::agent::browser_tool::BrowserResult, BrowserToolError> {
+    let session_id = request.session_id;
     let Some(browser_manager) = state.browser_manager() else {
-        return Err("browser command is unavailable in this runtime".to_string());
+        return Err(BrowserToolError::UnavailableInRuntime);
     };
 
     match request.args {
@@ -2266,7 +2263,7 @@ async fn handle_browser_request(
             browser_manager
                 .start()
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
             state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
             Ok(crate::agent::browser_tool::BrowserResult {
                 running: true,
@@ -2278,7 +2275,7 @@ async fn handle_browser_request(
             browser_manager
                 .stop()
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
             state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
             Ok(crate::agent::browser_tool::BrowserResult {
                 running: false,
@@ -2291,7 +2288,7 @@ async fn handle_browser_request(
                 browser_manager
                     .start()
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
                 state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
             }
             Ok(crate::agent::browser_tool::BrowserResult {
@@ -2300,18 +2297,24 @@ async fn handle_browser_request(
                 page: None,
             })
         }
-        crate::agent::browser_tool::BrowserArgs::Read { url } => {
+        crate::agent::browser_tool::BrowserArgs::Read { url, options } => {
             if !browser_manager.is_running().await {
                 browser_manager
                     .start()
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
                 state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
             }
-            let page = browser_manager
-                .read_page(url)
+            let capture = browser_manager
+                .read_page(url, options)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+            let session_paths = load_session_paths(state, session_id.as_str())
+                .await
+                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+            let page = persist_browser_page_capture(session_id.as_str(), &session_paths, capture)
+                .await
+                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
             Ok(crate::agent::browser_tool::BrowserResult {
                 running: true,
                 cdp_endpoint: browser_manager.cdp_endpoint(),
@@ -2542,43 +2545,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_persisted_context_snapshot_reads_history_anchor() {
-        let checkpoint = serde_json::to_string(&aither_agent::AgentCheckpoint {
-            context_json: "{\"recent\":[]}".to_string(),
-            todo_items: Vec::new(),
-            active_skill_names: Vec::new(),
-            history_anchor: Some(7),
-            tool_surface_hash: "abc123".to_string(),
-            context_window: aither_agent::ContextWindowSnapshot {
-                phase: aither_agent::ContextWindowPhase::Stable,
-                metrics: aither_agent::ContextWindowMetrics {
-                    usage_fraction: 0.0,
-                    selected_model_context_window: None,
-                    fast_model_context_window: None,
-                    effective_context_window: 0,
-                    system_block_count: 0,
-                    reminder_count: 0,
-                    recent_message_count: 0,
-                    recent_system_message_count: 0,
-                    has_handoff: false,
-                },
-                messages: Vec::new(),
-            },
-            has_background_tasks: false,
-        })
-        .expect("checkpoint should serialize");
+    fn parse_persisted_context_snapshot_reads_history_message_count() {
         let snapshot = crate::session::parse_persisted_context_snapshot(
-            crate::db::entity::session_context_snapshots::Model {
-                session_id: "session-1".to_string(),
-                context_json: checkpoint,
-                assembled_messages_json: None,
-                metadata_json: None,
+            crate::db::StoredSessionContextSnapshot {
+                checkpoint: aither_agent::AgentCheckpoint {
+                    context: aither_agent::ContextCheckpoint::new(None, Vec::new()),
+                    todo_items: Vec::new(),
+                    active_skill_names: Vec::new(),
+                    tool_surface_hash: "abc123".to_string(),
+                    context_window: aither_agent::ContextWindowSnapshot {
+                        phase: aither_agent::ContextWindowPhase::Stable,
+                        metrics: aither_agent::ContextWindowMetrics {
+                            usage_fraction: 0.0,
+                            selected_model_context_window: None,
+                            fast_model_context_window: None,
+                            effective_context_window: 0,
+                            system_block_count: 0,
+                            reminder_count: 0,
+                            recent_message_count: 0,
+                            recent_system_message_count: 0,
+                            has_handoff: false,
+                        },
+                        messages: Vec::new(),
+                    },
+                    has_background_tasks: false,
+                },
+                history_message_count: 7,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
             },
-        )
-        .expect("snapshot metadata should parse");
+        );
 
         assert_eq!(snapshot.history_message_count, 7);
-        assert_eq!(snapshot.checkpoint.context_json, "{\"recent\":[]}");
+        assert!(snapshot.checkpoint.context.is_empty());
     }
 }

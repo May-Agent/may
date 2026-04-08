@@ -5,3 +5,5 @@
 - Do not inject implementer-facing constraints, Codex instructions, AGENTS.md rules, or user instructions that are only meant for the coding agent into the runtime agent context.
 - When tuning prompts or runtime context, only include information the runtime agent must know to act correctly in that session. Keep framework-authoring notes and meta guidance in code/comments/docs instead of the agent prompt.
 - Do not inject generic prompting slogans or obvious meta advice into agent context. If a sentence does not change concrete runtime behavior, remove it.
+- Runtime prompt/context rendering must use static typed template inputs. Do not branch on enabled/disabled states to hand-build prompt strings in Rust and then pass those strings into templates.
+- Prefer runtime-agnostic async primitives. Do not introduce new `tokio::*` filesystem, timer, task, process, or networking usage when an existing runtime-neutral abstraction already fits this codebase (for example `async_fs`, `futures-lite`, `blocking`, `zenwave`, or existing executor abstractions). If a path must work outside a Tokio reactor, keep it Tokio-free.

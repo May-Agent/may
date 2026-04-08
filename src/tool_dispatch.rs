@@ -3,12 +3,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ChatDb;
+use crate::agent::browser_tool::BrowserToolError;
 use crate::agent::browser_tool::{BrowserBroker, BrowserRequest, BrowserResult};
 use crate::agent::notify_tool::{NotifyArgs, NotifyBroker, NotifyResult};
 use crate::agent::register_tool::{RegisterBroker, RegisterRequest, RegisterResult};
 use crate::agent::task_tool::TaskBroker;
 use crate::ask_user::{AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload, Question};
-use crate::browser_service::{BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus};
+use crate::browser_service::{
+    BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus,
+    persist_browser_page_capture,
+};
 use crate::config::{BrowserConfig, SshServerConfig};
 use crate::network_policy::NetworkPolicyConfig;
 use crate::notification::NotificationManager;
@@ -51,6 +55,7 @@ pub struct ToolDispatchConfig {
 struct BrowserServiceRuntime {
     browser_config: BrowserConfig,
     may_dir: PathBuf,
+    db: ChatDb,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +100,7 @@ impl ToolDispatchers {
         let registration = RegistrationRuntime {
             may_dir: config.may_dir.clone(),
             cwd: config.cwd.clone(),
-            db: config.db,
+            db: config.db.clone(),
             ask_user_broker: config.ask_user_broker,
         };
 
@@ -122,6 +127,7 @@ impl ToolDispatchers {
             let browser_service = BrowserServiceRuntime {
                 browser_config: config.browser_config,
                 may_dir: config.may_dir,
+                db: config.db.clone(),
             };
             let (broker, queue) = crate::agent::browser_channel();
             tokio::spawn(async move {
@@ -190,13 +196,12 @@ async fn handle_notify_request(
 async fn handle_browser_request(
     browser_service: &BrowserServiceRuntime,
     request: BrowserRequest,
-) -> Result<BrowserResult, String> {
-    let _session_id = request.session_id;
+) -> Result<BrowserResult, BrowserToolError> {
+    let session_id = request.session_id;
     if !browser_service.browser_config.enabled {
-        return Err(
-            "browser command is unavailable because browser automation is disabled in settings"
-                .to_string(),
-        );
+        return Err(BrowserToolError::request_failed(
+            "browser command is unavailable because browser automation is disabled in settings",
+        ));
     }
 
     match request.args {
@@ -209,14 +214,16 @@ async fn handle_browser_request(
                         browser_service.may_dir.as_path(),
                         &browser_service.browser_config,
                     )
-                    .await?,
+                    .await
+                    .map_err(BrowserToolError::request_failed)?,
                 ),
                 Err(_) => Some(
                     ensure_browser_service_started(
                         browser_service.may_dir.as_path(),
                         &browser_service.browser_config,
                     )
-                    .await?,
+                    .await
+                    .map_err(BrowserToolError::request_failed)?,
                 ),
             };
             Ok(BrowserResult {
@@ -236,7 +243,8 @@ async fn handle_browser_request(
                 browser_service.may_dir.as_path(),
                 &browser_service.browser_config,
             )
-            .await?;
+            .await
+            .map_err(BrowserToolError::request_failed)?;
             Ok(BrowserResult {
                 running: true,
                 cdp_endpoint: status.cdp_endpoint,
@@ -248,7 +256,8 @@ async fn handle_browser_request(
                 browser_service.socket_path().as_path(),
                 browser_service.browser_config.port,
             )
-            .await?;
+            .await
+            .map_err(BrowserToolError::request_failed)?;
             Ok(BrowserResult {
                 running: false,
                 cdp_endpoint: None,
@@ -260,38 +269,77 @@ async fn handle_browser_request(
                 browser_service.may_dir.as_path(),
                 &browser_service.browser_config,
             )
-            .await?;
+            .await
+            .map_err(BrowserToolError::request_failed)?;
             Ok(BrowserResult {
                 running: true,
                 cdp_endpoint: status.cdp_endpoint,
                 page: None,
             })
         }
-        crate::agent::BrowserArgs::Read { url } => {
-            let request = BrowserServiceRequest::Read { url };
+        crate::agent::BrowserArgs::Read { url, options } => {
+            let request = BrowserServiceRequest::Read { url, options };
             let status = ensure_browser_service_started(
                 browser_service.may_dir.as_path(),
                 &browser_service.browser_config,
             )
-            .await?;
-            let response =
-                query_browser_service(browser_service.socket_path().as_path(), &request).await?;
+            .await
+            .map_err(BrowserToolError::request_failed)?;
+            let response = query_browser_service(browser_service.socket_path().as_path(), &request)
+                .await
+                .map_err(BrowserToolError::request_failed)?;
             match response {
-                Some(BrowserServiceResponse::ReadOk { payload }) => Ok(BrowserResult {
-                    running: true,
-                    cdp_endpoint: status.cdp_endpoint,
-                    page: Some(payload),
-                }),
-                Some(BrowserServiceResponse::Error { message }) => Err(message),
-                Some(BrowserServiceResponse::Ok { .. }) => {
-                    Err("browser service returned status payload for read request".to_string())
+                Some(BrowserServiceResponse::ReadOk { payload }) => {
+                    let session_paths =
+                        resolve_browser_session_paths(browser_service, session_id.as_str())
+                            .await
+                            .map_err(BrowserToolError::request_failed)?;
+                    let page =
+                        persist_browser_page_capture(session_id.as_str(), &session_paths, payload)
+                            .await
+                            .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                    Ok(BrowserResult {
+                        running: true,
+                        cdp_endpoint: status.cdp_endpoint,
+                        page: Some(page),
+                    })
                 }
-                Some(BrowserServiceResponse::Stopped) | None => {
-                    Err("browser service stopped while reading page".to_string())
+                Some(BrowserServiceResponse::Error { message }) => {
+                    Err(BrowserToolError::request_failed(message))
                 }
+                Some(BrowserServiceResponse::Ok { .. }) => Err(BrowserToolError::request_failed(
+                    "browser service returned status payload for read request",
+                )),
+                Some(BrowserServiceResponse::Stopped) | None => Err(
+                    BrowserToolError::request_failed("browser service stopped while reading page"),
+                ),
             }
         }
     }
+}
+
+async fn resolve_browser_session_paths(
+    runtime: &BrowserServiceRuntime,
+    session_id: &str,
+) -> Result<crate::session::SessionPaths, String> {
+    let session = runtime
+        .db
+        .get_session(session_id)
+        .await
+        .map_err(|error| session_error_text("failed to load session ", session_id, &error))?
+        .ok_or_else(|| session_not_found_text(session_id))?;
+    let store = SessionStore::new(MayHomePaths::new(runtime.may_dir.clone()));
+    let session_paths = store.session_paths(session_id, session.profile_id.as_deref());
+    tokio::fs::create_dir_all(session_paths.root())
+        .await
+        .map_err(|error| {
+            path_error_text(
+                "failed to create session root ",
+                session_paths.root(),
+                &error,
+            )
+        })?;
+    Ok(session_paths)
 }
 
 async fn handle_register_skills_request(
