@@ -1,41 +1,19 @@
 //! Typed parsing for remote profile preferences.
 
+use crate::profile::RemoteProfilePreferences as RemoteProfileConfig;
 use crate::{config::SshServerConfig, db::entity::profiles};
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ProfilePreferences {
-    #[serde(default)]
-    remote: Option<RemoteProfileConfig>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RemoteProfileConfig {
-    pub ssh_server_id: String,
-}
-
-impl RemoteProfileConfig {
-    pub fn normalized_ssh_server_id(&self) -> Result<&str, String> {
-        let ssh_server_id = self.ssh_server_id.trim();
-        if ssh_server_id.is_empty() {
-            return Err("remote profile requires preferences.remote.ssh_server_id".to_string());
-        }
-        Ok(ssh_server_id)
-    }
-}
 
 pub fn parse_remote_profile_config(
     profile: &profiles::Model,
 ) -> Result<Option<RemoteProfileConfig>, String> {
-    let Some(raw) = profile.preferences_json.as_deref() else {
+    let Some(ssh_server_id) = profile.remote_ssh_server_id.as_deref() else {
         return Ok(None);
     };
-    let preferences: ProfilePreferences = serde_json::from_str(raw).map_err(|error| {
-        format!(
-            "invalid profile.preferences_json for remote profile {}: {error}",
-            profile.id
-        )
-    })?;
-    Ok(preferences.remote)
+    let config = RemoteProfileConfig {
+        ssh_server_id: ssh_server_id.to_string(),
+    };
+    config.normalized_ssh_server_id()?;
+    Ok(Some(config))
 }
 
 pub fn resolve_remote_profile_server(

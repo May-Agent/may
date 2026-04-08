@@ -13,7 +13,7 @@ use zenwave::ResponseExt;
 use crate::session::SessionPaths;
 
 /// Image format.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
     Png,
     Jpeg,
@@ -33,21 +33,25 @@ impl ImageFormat {
         }
     }
 
-    /// Detect format from URL or content-type.
+    /// Detect format from URL path suffix.
     #[must_use]
     pub fn from_url(url: &str) -> Option<Self> {
-        let lower = url.to_lowercase();
-        // Check file extension in URL path
-        if lower.contains(".png") {
-            Some(Self::Png)
-        } else if lower.contains(".jpg") || lower.contains(".jpeg") {
-            Some(Self::Jpeg)
-        } else if lower.contains(".gif") {
-            Some(Self::Gif)
-        } else if lower.contains(".webp") {
-            Some(Self::Webp)
-        } else {
-            None
+        let url = Url::parse(url).ok()?;
+        Self::from_url_path(&url)
+    }
+
+    #[must_use]
+    fn from_url_path(url: &Url) -> Option<Self> {
+        let extension = std::path::Path::new(url.path())
+            .extension()
+            .and_then(|value| value.to_str())?
+            .to_ascii_lowercase();
+        match extension.as_str() {
+            "png" => Some(Self::Png),
+            "jpg" | "jpeg" => Some(Self::Jpeg),
+            "gif" => Some(Self::Gif),
+            "webp" => Some(Self::Webp),
+            _ => None,
         }
     }
 
@@ -66,6 +70,24 @@ impl ImageFormat {
         } else {
             None
         }
+    }
+
+    #[must_use]
+    fn from_image_format(format: ImgFormat) -> Option<Self> {
+        match format {
+            ImgFormat::Png => Some(Self::Png),
+            ImgFormat::Jpeg => Some(Self::Jpeg),
+            ImgFormat::Gif => Some(Self::Gif),
+            ImgFormat::WebP => Some(Self::Webp),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    fn from_magic_bytes(data: &[u8]) -> Option<Self> {
+        image::guess_format(data)
+            .ok()
+            .and_then(Self::from_image_format)
     }
 }
 
@@ -182,6 +204,8 @@ pub enum ImageError {
     Encoding(String),
     #[error("Download error: {0}")]
     Download(String),
+    #[error("URL did not resolve to an image: {0}")]
+    NotImage(String),
 }
 
 /// Try to get an image from the clipboard.
@@ -248,52 +272,15 @@ pub fn set_clipboard_text(text: &str) -> Result<(), ImageError> {
         .map_err(|e| ImageError::Clipboard(e.to_string()))
 }
 
-/// Check if text is an image URL.
+/// Parse a remote URL candidate from clipboard text.
 #[must_use]
 pub fn is_image_url(text: &str) -> Option<Url> {
     let trimmed = text.trim();
-
-    // Must be a valid URL
     let url = Url::parse(trimmed).ok()?;
-
-    // Must be http or https
     if url.scheme() != "http" && url.scheme() != "https" {
         return None;
     }
-
-    // Check if the URL looks like an image
-    if ImageFormat::from_url(url.as_str()).is_some() {
-        return Some(url);
-    }
-
-    // Check for common image hosting patterns
-    let host = url.host_str().unwrap_or_default();
-    let path = url.path().to_lowercase();
-
-    // Known image hosting services that may not have file extensions
-    let is_image_host = host.contains("imgur.com")
-        || host.contains("i.redd.it")
-        || host.contains("pbs.twimg.com")
-        || host.contains("cdn.discordapp.com")
-        || host.contains("media.discordapp.net")
-        || host.contains("images.unsplash.com")
-        || host.contains("i.ibb.co")
-        || host.contains("prnt.sc")
-        || host.contains("gyazo.com")
-        || host.contains("snipboard.io");
-
-    // Check path for image indicators
-    let has_image_path = path.contains("/image/")
-        || path.contains("/images/")
-        || path.contains("/photo/")
-        || path.contains("/photos/")
-        || path.contains("/media/");
-
-    if is_image_host || has_image_path {
-        return Some(url);
-    }
-
-    None
+    Some(url)
 }
 
 /// Download an image from a URL.
@@ -311,26 +298,80 @@ pub async fn download_image(url: &Url) -> Result<ClipboardImage, ImageError> {
         )));
     }
 
-    // Try to detect format from Content-Type header
     let content_type = response
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-
-    let format = ImageFormat::from_content_type(content_type)
-        .or_else(|| ImageFormat::from_url(url.as_str()))
-        .unwrap_or(ImageFormat::Png);
+        .unwrap_or_default()
+        .to_string();
 
     let data = response
         .into_bytes()
         .await
         .map_err(|e| ImageError::Download(e.to_string()))?;
 
+    let format_from_header = ImageFormat::from_content_type(&content_type);
+    let format_from_bytes = ImageFormat::from_magic_bytes(data.as_ref());
+    let format = match (format_from_header, format_from_bytes) {
+        (Some(header), Some(bytes)) if header != bytes => {
+            return Err(ImageError::Download(format!(
+                "image response format mismatch for {}: content-type={} bytes={:?}",
+                url, content_type, bytes
+            )));
+        }
+        (Some(header), _) => header,
+        (None, Some(bytes)) => bytes,
+        (None, None) => {
+            let path_hint = ImageFormat::from_url_path(url)
+                .map(|format| format.extension().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            return Err(ImageError::NotImage(format!(
+                "response content-type '{}' and bytes are not a supported image format (path hint: {})",
+                content_type, path_hint
+            )));
+        }
+    };
+
     Ok(ClipboardImage {
         data: data.to_vec(),
         format,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_url_detection_accepts_http_and_https_only() {
+        assert!(is_image_url("https://example.com/view?page=photo.png").is_some());
+        assert!(is_image_url("https://cdn.example.com/signed/blob").is_some());
+        assert!(is_image_url("file:///tmp/test.png").is_none());
+        assert!(is_image_url("not a url").is_none());
+    }
+
+    #[test]
+    fn format_detection_uses_url_path_extension_only() {
+        let page_url =
+            Url::parse("https://example.com/view?page=photo.png").expect("url should parse");
+        assert!(ImageFormat::from_url_path(&page_url).is_none());
+
+        let asset_url =
+            Url::parse("https://example.com/assets/photo.png").expect("url should parse");
+        assert_eq!(
+            ImageFormat::from_url_path(&asset_url),
+            Some(ImageFormat::Png)
+        );
+    }
+
+    #[test]
+    fn format_detection_uses_magic_bytes() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let jpg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F'];
+        assert_eq!(ImageFormat::from_magic_bytes(&png), Some(ImageFormat::Png));
+        assert_eq!(ImageFormat::from_magic_bytes(&jpg), Some(ImageFormat::Jpeg));
+        assert_eq!(ImageFormat::from_magic_bytes(b"not-an-image"), None);
+    }
 }
 
 /// Manager for pasted text content.

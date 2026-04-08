@@ -10,6 +10,8 @@ use executor_core::spawn;
 use crate::profile::{ProfileInfo, ProfileSessions};
 use crate::{SessionSummary, SkillInfo};
 
+use super::error::TuiError;
+
 const ERR_TUI_EVENT_POLL: &str = include_str!("../texts/event_poll_failed.txt");
 
 /// Application events.
@@ -28,29 +30,29 @@ pub enum AppEvent {
 
     // ─── Async operation results ───────────────────────────────────────
     /// Session list loaded from background task
-    SessionsLoaded(Result<Vec<SessionSummary>, anyhow::Error>),
+    SessionsLoaded(Result<Vec<SessionSummary>, TuiError>),
     /// Session deleted from background task (includes refreshed list)
     SessionDeleted {
         was_current: bool,
-        result: Result<Vec<SessionSummary>, anyhow::Error>,
+        result: Result<Vec<SessionSummary>, TuiError>,
     },
 
     // ─── Skill operation results ───────────────────────────────────────
     /// Skills list loaded from background task
-    SkillsLoaded(Result<Vec<SkillInfo>, anyhow::Error>),
+    SkillsLoaded(Result<Vec<SkillInfo>, TuiError>),
     /// Skill installed from GitHub
-    SkillInstalled(Result<Vec<SkillInfo>, anyhow::Error>),
+    SkillInstalled(Result<Vec<SkillInfo>, TuiError>),
     /// Skill deleted
-    SkillDeleted(Result<Vec<SkillInfo>, anyhow::Error>),
+    SkillDeleted(Result<Vec<SkillInfo>, TuiError>),
 
     // ─── Profile operation results ──────────────────────────────────
     /// Profile list loaded (for `ProfileSelect` mode)
-    ProfilesLoaded(Result<Vec<ProfileInfo>, anyhow::Error>),
+    ProfilesLoaded(Result<Vec<ProfileInfo>, TuiError>),
     /// Profile sessions loaded (pinned/regular/archived groups)
-    ProfileSessionsLoaded(Result<ProfileSessions, anyhow::Error>),
+    ProfileSessionsLoaded(Result<ProfileSessions, TuiError>),
 
     /// Background config save completed.
-    ConfigSaved(Result<(), anyhow::Error>),
+    ConfigSaved(Result<(), TuiError>),
 
     // ─── Image loading ────────────────────────────────────────────────
     /// Image fetch finished from URL (data=None means fetch failed)

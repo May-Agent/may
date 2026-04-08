@@ -1,7 +1,8 @@
 import { Dialog, DialogContent, DialogTrigger, DialogTitle } from '@/components/ui/dialog';
 import type { Attachment } from '@/types';
-import { File, FileText, Download } from 'lucide-react';
+import { File, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { AttachmentKindIcon } from './AttachmentCard';
 
 interface AttachmentPreviewProps {
   attachment: Attachment;
@@ -23,13 +24,7 @@ export function AttachmentPreview({ attachment, children }: AttachmentPreviewPro
         <div className="flex flex-col h-full">
           <div className="flex items-center justify-between px-4 py-3 border-b">
             <div className="flex items-center gap-2 min-w-0">
-              {attachment.type === 'pdf' ? (
-                <FileText className="h-4 w-4 text-red-500 flex-shrink-0" />
-              ) : attachment.type === 'document' ? (
-                <FileText className="h-4 w-4 text-blue-500 flex-shrink-0" />
-              ) : attachment.type === 'image' ? null : (
-                <File className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-              )}
+              <AttachmentKindIcon attachment={attachment} />
               <span className="text-sm font-medium truncate">{attachment.name}</span>
             </div>
             {attachment.url && (

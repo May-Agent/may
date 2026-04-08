@@ -16,9 +16,15 @@ use crate::workspace_request::WorkspaceRequestBroker;
 use crate::{ChatDb, ChatMessage, MayAgent, MayConfig, SessionId, generate_session_title};
 
 #[derive(Debug, thiserror::Error)]
-enum TuiRuntimeError {
+pub enum TuiRuntimeError {
+    #[error("database error: {0}")]
+    Database(#[from] crate::db::ChatDbError),
+    #[error("session error: {0}")]
+    Session(#[from] crate::session::SessionError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("agent environment resolution failed: {0}")]
+    ResolveAgentEnvironment(#[from] crate::agent::ResolveAgentEnvironmentError),
     #[error("No active session")]
     NoActiveSession,
     #[error("invalid pending message timestamp: {0}")]
@@ -42,7 +48,13 @@ enum TuiRuntimeError {
     #[error("No model configured")]
     NoModelConfigured,
     #[error("Location fetch failed: {0}")]
-    LocationFetch(#[source] anyhow::Error),
+    LocationFetch(#[source] crate::location::LocationError),
+    #[error("agent initialization failed: {0}")]
+    MayAgent(#[from] crate::agent::MayAgentError),
+    #[error("agent operation failed: {0}")]
+    Agent(#[from] aither_agent::AgentError),
+    #[error("context snapshot history delta failed: {0}")]
+    HistoryDelta(#[from] crate::session::HistoryDeltaError),
     #[error("Failed to convert attachment path to URL: {path}")]
     AttachmentPathToUrl { path: std::path::PathBuf },
     #[error("Failed to serialize paste XML: {0}")]
@@ -95,16 +107,11 @@ impl LocalSessionRuntime {
             .for_session(session_id.as_str().to_string())
     }
 
-    pub async fn sync_app_queue(
+    async fn replace_app_queue(
         &self,
         app: &mut App,
-        session_id: &SessionId,
-    ) -> anyhow::Result<()> {
-        let runtime = self
-            .runtime_service
-            .get(session_id.as_str())
-            .await
-            .map_err(anyhow::Error::from)?;
+        runtime: crate::session::SessionRuntimeSummary,
+    ) -> Result<(), TuiRuntimeError> {
         let pending_immediate = match runtime.pending_immediate {
             Some(message) => Some(pending_message_from_runtime(message).await?),
             None => None,
@@ -115,6 +122,15 @@ impl LocalSessionRuntime {
         }
         app.queue.replace(pending_immediate, queued_messages);
         Ok(())
+    }
+
+    pub async fn sync_app_queue(
+        &self,
+        app: &mut App,
+        session_id: &SessionId,
+    ) -> Result<(), TuiRuntimeError> {
+        let runtime = self.runtime_service.get(session_id.as_str()).await?;
+        self.replace_app_queue(app, runtime).await
     }
 
     pub async fn enqueue_pending_message(
@@ -122,7 +138,7 @@ impl LocalSessionRuntime {
         app: &mut App,
         session_id: &SessionId,
         message: PendingMessage,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         let runtime = self
             .runtime_service
             .enqueue(
@@ -130,30 +146,19 @@ impl LocalSessionRuntime {
                 pending_message_to_runtime(&message)?,
                 message.delivery_mode,
             )
-            .await
-            .map_err(anyhow::Error::from)?;
-        let pending_immediate = match runtime.pending_immediate {
-            Some(message) => Some(pending_message_from_runtime(message).await?),
-            None => None,
-        };
-        let mut queued_messages = Vec::with_capacity(runtime.queued_messages.len());
-        for message in runtime.queued_messages {
-            queued_messages.push(pending_message_from_runtime(message).await?);
-        }
-        app.queue.replace(pending_immediate, queued_messages);
-        Ok(())
+            .await?;
+        self.replace_app_queue(app, runtime).await
     }
 
     pub async fn take_next_dispatchable(
         &self,
         app: &mut App,
         session_id: &SessionId,
-    ) -> anyhow::Result<Option<PendingMessage>> {
+    ) -> Result<Option<PendingMessage>, TuiRuntimeError> {
         let next = self
             .runtime_service
             .take_next_dispatchable(session_id.as_str())
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let next = match next {
             Some(message) => Some(pending_message_from_runtime(message).await?),
             None => None,
@@ -162,21 +167,24 @@ impl LocalSessionRuntime {
         Ok(next)
     }
 
-    pub async fn set_running(&self, session_id: &SessionId) -> anyhow::Result<()> {
+    pub async fn set_running(&self, session_id: &SessionId) -> Result<(), TuiRuntimeError> {
         self.runtime_service
             .set_state(
                 session_id.as_str(),
                 crate::session::SessionRuntimeState::Running,
             )
-            .await
-            .map_err(anyhow::Error::from)
+            .await?;
+        Ok(())
     }
 
-    pub async fn clear_running_if_needed(&self, session_id: &SessionId) -> anyhow::Result<()> {
+    pub async fn clear_running_if_needed(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), TuiRuntimeError> {
         self.runtime_service
             .clear_running_if_needed(session_id.as_str())
-            .await
-            .map_err(anyhow::Error::from)
+            .await?;
+        Ok(())
     }
 
     pub async fn register_ask_user_request(
@@ -184,7 +192,7 @@ impl LocalSessionRuntime {
         app: &mut App,
         session_id: &SessionId,
         questions: &[Question],
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, TuiRuntimeError> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.runtime_service
             .set_waiting_ask_user(
@@ -202,18 +210,16 @@ impl LocalSessionRuntime {
                         .collect(),
                 }),
             )
-            .await
-            .map_err(anyhow::Error::from)?;
-        let questions_json = serde_json::to_value(questions).map_err(anyhow::Error::from)?;
+            .await?;
         app.session_manager
-            .append_message(crate::session::ChatMessage::ask_user_request(
-                &crate::session::history::AskUserRequestData {
-                    id: request_id.clone(),
-                    questions: questions_json,
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
+            .db()
+            .append_ask_user_request_message(
+                session_id.as_str(),
+                request_id.as_str(),
+                questions,
+                None,
+            )
+            .await?;
         Ok(request_id)
     }
 
@@ -223,28 +229,20 @@ impl LocalSessionRuntime {
         session_id: &SessionId,
         request_id: &str,
         answers: &[QuestionAnswer],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         self.runtime_service
             .set_waiting_ask_user(session_id.as_str(), None)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         self.runtime_service
             .set_state(
                 session_id.as_str(),
                 crate::session::SessionRuntimeState::Running,
             )
-            .await
-            .map_err(anyhow::Error::from)?;
-        let answers_json = serde_json::to_value(answers).map_err(anyhow::Error::from)?;
+            .await?;
         app.session_manager
-            .append_message(crate::session::ChatMessage::ask_user_response(
-                &crate::session::history::AskUserResponseData {
-                    id: request_id.to_string(),
-                    answers: answers_json,
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
+            .db()
+            .append_ask_user_response_message(session_id.as_str(), request_id, answers, None)
+            .await?;
         Ok(())
     }
 
@@ -253,7 +251,7 @@ impl LocalSessionRuntime {
         app: &mut App,
         session_id: &SessionId,
         request: &crate::workspace_request::RequestWorkspaceArgs,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, TuiRuntimeError> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.runtime_service
             .set_waiting_workspace(
@@ -267,18 +265,17 @@ impl LocalSessionRuntime {
                     },
                 }),
             )
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         app.session_manager
-            .append_message(crate::session::ChatMessage::workspace_request(
-                &crate::session::history::WorkspaceRequestData {
-                    id: request_id.clone(),
-                    path: request.path.clone(),
-                    reason: request.reason.clone(),
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
+            .db()
+            .append_workspace_request_message(
+                session_id.as_str(),
+                request_id.as_str(),
+                request.path.as_str(),
+                request.reason.as_str(),
+                None,
+            )
+            .await?;
         Ok(request_id)
     }
 
@@ -288,39 +285,32 @@ impl LocalSessionRuntime {
         session_id: &SessionId,
         request_id: &str,
         approved: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         self.runtime_service
             .set_waiting_workspace(session_id.as_str(), None)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         self.runtime_service
             .set_state(
                 session_id.as_str(),
                 crate::session::SessionRuntimeState::Running,
             )
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         app.session_manager
-            .append_message(crate::session::ChatMessage::workspace_response(
-                &crate::session::history::WorkspaceResponseData {
-                    id: request_id.to_string(),
-                    approved,
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
+            .db()
+            .append_workspace_response_message(session_id.as_str(), request_id, approved, None)
+            .await?;
         Ok(())
     }
 
     pub async fn waiting_permission(
         &self,
         session_id: &SessionId,
-    ) -> anyhow::Result<Option<crate::session::PersistedPermissionRequest>> {
-        self.runtime_service
+    ) -> Result<Option<crate::session::PersistedPermissionRequest>, TuiRuntimeError> {
+        Ok(self
+            .runtime_service
             .get(session_id.as_str())
-            .await
-            .map(|runtime| runtime.waiting_permission)
-            .map_err(anyhow::Error::from)
+            .await?
+            .waiting_permission)
     }
 
     pub async fn resolve_permission_response(
@@ -329,12 +319,11 @@ impl LocalSessionRuntime {
         session_id: &SessionId,
         request_id: &str,
         approved: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         let responded = self.permission_approver.respond(request_id, approved);
         self.runtime_service
             .set_waiting_permission(session_id.as_str(), None)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         self.runtime_service
             .set_state(
                 session_id.as_str(),
@@ -344,17 +333,11 @@ impl LocalSessionRuntime {
                     crate::session::SessionRuntimeState::Idle
                 },
             )
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         app.session_manager
-            .append_message(crate::session::ChatMessage::permission_response(
-                &crate::session::history::PermissionResponseData {
-                    id: request_id.to_string(),
-                    approved,
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
+            .db()
+            .append_permission_response_message(session_id.as_str(), request_id, approved, None)
+            .await?;
         if !responded {
             tracing::warn!(
                 request_id,
@@ -568,7 +551,7 @@ impl RuntimeDeps {
         &self,
         app: &mut App,
         worker: &mut Option<AgentWorker>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         let model = self
             .oneshot_model
             .clone()
@@ -609,7 +592,7 @@ impl RuntimeDeps {
         app: &mut App,
         worker: &mut Option<AgentWorker>,
         id: &SessionId,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         let session = app.session_manager.load_session(id).await?;
 
         let sandbox_dir = session.sandbox_dir.clone();
@@ -635,7 +618,7 @@ impl RuntimeDeps {
         app: &mut App,
         worker: &mut Option<AgentWorker>,
         model: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         let session = app
             .session_manager
             .current()
@@ -660,7 +643,7 @@ impl RuntimeDeps {
         worker: &AgentWorker,
         msg: PendingMessage,
         title_gen: &mut Option<TitleGenContext>,
-    ) -> anyhow::Result<AgentHandle> {
+    ) -> Result<AgentHandle, TuiRuntimeError> {
         let needs_title = app
             .session_manager
             .current()
@@ -675,14 +658,12 @@ impl RuntimeDeps {
         if let Some(hidden_context_xml) = msg.hidden_context_xml.as_ref() {
             app.session_manager
                 .append_message(ChatMessage::hidden_context(hidden_context_xml.to_string()))
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
         }
 
         app.session_manager
             .append_message(ChatMessage::user(&msg.content))
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
 
         let (prompt, image_urls) = prepare_message_content(&msg)?;
         app.start_processing(&msg);
@@ -748,7 +729,7 @@ impl RuntimeDeps {
         session_id: SessionId,
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
-    ) -> anyhow::Result<AgentWorker> {
+    ) -> Result<AgentWorker, TuiRuntimeError> {
         let db = app.session_manager.db().clone();
         let session_id_string = session_id.as_str().to_string();
         let history_messages = app
@@ -762,11 +743,7 @@ impl RuntimeDeps {
             .current()
             .and_then(|session| session.profile_id.clone())
         {
-            app.session_manager
-                .db()
-                .get_profile(&profile_id)
-                .await
-                .map_err(anyhow::Error::from)?
+            app.session_manager.db().get_profile(&profile_id).await?
         } else {
             None
         };
@@ -775,9 +752,7 @@ impl RuntimeDeps {
             .and_then(|profile| profile.persona.clone());
         let profile_memories = if let Some(ref profile) = profile_model {
             let memories =
-                crate::memory::ProfileMemories::load(app.session_manager.db(), &profile.id)
-                    .await
-                    .map_err(anyhow::Error::from)?;
+                crate::memory::ProfileMemories::load(app.session_manager.db(), &profile.id).await?;
             if memories.is_empty() {
                 None
             } else {
@@ -799,24 +774,34 @@ impl RuntimeDeps {
         } else {
             None
         };
-        let profile_environment = profile_model
-            .as_ref()
-            .map(|profile| {
-                crate::profile::ProfileInfo::from_db_model(profile.clone())
-                    .map(|info| info.environment.into_kind())
-            })
-            .transpose()
-            .map_err(anyhow::Error::from)?;
+        let profile_preferences = match profile_model.as_ref() {
+            Some(profile) => {
+                app.session_manager
+                    .db()
+                    .load_profile_preferences(profile)
+                    .await?
+            }
+            None => None,
+        };
+        let profile_environment = match (profile_model.clone(), profile_preferences.clone()) {
+            (Some(profile), preferences) => Some(
+                crate::profile::ProfileInfo::from_db_parts(profile, preferences)?
+                    .environment
+                    .into_kind(),
+            ),
+            (None, None) => None,
+            (None, Some(_)) => panic!("profile preferences cannot exist without a profile model"),
+        };
         let runtime = app
             .session_manager
             .db()
             .get_session_runtime(session_id.as_str())
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
             .unwrap_or_default();
         let environment = resolve_agent_environment_for_tui(
             profile_environment,
             profile_model.as_ref(),
+            profile_preferences.and_then(|preferences| preferences.container),
             &may_dir,
             &sandbox_dir,
             &session_id,
@@ -852,9 +837,7 @@ impl RuntimeDeps {
         if let Some(snapshot) =
             crate::session::load_persisted_context_snapshot(&db, &session_id_string).await?
         {
-            agent
-                .restore_checkpoint(snapshot.checkpoint.clone())
-                .map_err(anyhow::Error::from)?;
+            agent.restore_checkpoint(snapshot.checkpoint.clone())?;
             for message in crate::session::history_delta_since_snapshot(
                 &history_messages,
                 snapshot.history_message_count,
@@ -874,7 +857,7 @@ impl RuntimeDeps {
         &self,
         app: &mut App,
         message: PendingMessage,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         let session_id = app
             .session_manager
             .current()
@@ -888,7 +871,7 @@ impl RuntimeDeps {
     pub async fn take_next_dispatchable(
         &self,
         app: &mut App,
-    ) -> anyhow::Result<Option<PendingMessage>> {
+    ) -> Result<Option<PendingMessage>, TuiRuntimeError> {
         let Some(session_id) = app
             .session_manager
             .current()
@@ -901,7 +884,7 @@ impl RuntimeDeps {
             .await
     }
 
-    pub async fn mark_running(&self, app: &App) -> anyhow::Result<()> {
+    pub async fn mark_running(&self, app: &App) -> Result<(), TuiRuntimeError> {
         let session_id = app
             .session_manager
             .current()
@@ -915,7 +898,7 @@ impl RuntimeDeps {
         app: &mut App,
         session_id: &SessionId,
         questions: &[Question],
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, TuiRuntimeError> {
         self.local_runtime
             .register_ask_user_request(app, session_id, questions)
             .await
@@ -927,7 +910,7 @@ impl RuntimeDeps {
         session_id: &SessionId,
         request_id: &str,
         answers: &[QuestionAnswer],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         self.local_runtime
             .resolve_ask_user_response(app, session_id, request_id, answers)
             .await
@@ -938,7 +921,7 @@ impl RuntimeDeps {
         app: &mut App,
         session_id: &SessionId,
         request: &crate::workspace_request::RequestWorkspaceArgs,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, TuiRuntimeError> {
         self.local_runtime
             .register_workspace_request(app, session_id, request)
             .await
@@ -950,7 +933,7 @@ impl RuntimeDeps {
         session_id: &SessionId,
         request_id: &str,
         approved: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         self.local_runtime
             .resolve_workspace_response(app, session_id, request_id, approved)
             .await
@@ -959,7 +942,7 @@ impl RuntimeDeps {
     pub async fn pending_permission(
         &self,
         app: &App,
-    ) -> anyhow::Result<Option<crate::session::PersistedPermissionRequest>> {
+    ) -> Result<Option<crate::session::PersistedPermissionRequest>, TuiRuntimeError> {
         let Some(session_id) = app
             .session_manager
             .current()
@@ -975,7 +958,7 @@ impl RuntimeDeps {
         app: &mut App,
         request_id: &str,
         approved: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TuiRuntimeError> {
         let session_id = app
             .session_manager
             .current()
@@ -1087,19 +1070,21 @@ fn prepare_message_content(
 async fn resolve_agent_environment_for_tui(
     profile_environment: Option<crate::profile::ProfileEnvironment>,
     profile_model: Option<&crate::db::entity::profiles::Model>,
+    container_preferences: Option<crate::profile::ContainerProfilePreferences>,
     may_dir: &std::path::Path,
     sandbox_dir: &std::path::Path,
     session_id: &SessionId,
-) -> anyhow::Result<crate::agent::AgentEnvironment> {
+) -> Result<crate::agent::AgentEnvironment, TuiRuntimeError> {
     crate::agent::resolve_agent_environment_for_session(
         profile_environment,
         profile_model,
+        container_preferences,
         may_dir,
         sandbox_dir,
         session_id,
     )
     .await
-    .map_err(anyhow::Error::from)
+    .map_err(TuiRuntimeError::ResolveAgentEnvironment)
 }
 
 #[derive(Serialize)]

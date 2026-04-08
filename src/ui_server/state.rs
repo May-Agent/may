@@ -19,7 +19,7 @@ use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
 use crate::live_response::LiveResponseRegistry;
 use crate::mcp::{MayMcpServerConfig, McpManager, McpServerInfo};
-use crate::session::{MessageRole, PersistedAskUserQuestion, PersistedAskUserRequest};
+use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use crate::workspace_request::RequestWorkspaceArgs;
 
@@ -452,21 +452,45 @@ impl UiServerState {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum UiAnswerInput {
-    Selected(Vec<String>),
-    Custom(String),
-    Skipped(()),
+    Selected { values: Vec<String> },
+    Custom { text: String },
+    Skipped,
 }
 
-impl From<UiAnswerInput> for AnswerValue {
-    fn from(value: UiAnswerInput) -> Self {
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum UiAnswerInputError {
+    #[error("ask-user selected answer requires at least one option")]
+    EmptySelected,
+    #[error("ask-user selected answers must not contain empty options")]
+    EmptySelectedOption,
+    #[error("ask-user custom answer must not be empty")]
+    EmptyCustom,
+}
+
+impl TryFrom<UiAnswerInput> for AnswerValue {
+    type Error = UiAnswerInputError;
+
+    fn try_from(value: UiAnswerInput) -> Result<Self, Self::Error> {
         match value {
-            UiAnswerInput::Selected(selected) if selected.is_empty() => Self::Skipped,
-            UiAnswerInput::Selected(selected) => Self::Selected(selected),
-            UiAnswerInput::Custom(custom) if custom.trim().is_empty() => Self::Skipped,
-            UiAnswerInput::Custom(custom) => Self::Custom(custom),
-            UiAnswerInput::Skipped(()) => Self::Skipped,
+            UiAnswerInput::Selected { values } => {
+                if values.is_empty() {
+                    return Err(UiAnswerInputError::EmptySelected);
+                }
+                if values.iter().any(|value| value.trim().is_empty()) {
+                    return Err(UiAnswerInputError::EmptySelectedOption);
+                }
+                Ok(Self::Selected(values))
+            }
+            UiAnswerInput::Custom { text } => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return Err(UiAnswerInputError::EmptyCustom);
+                }
+                Ok(Self::Custom(trimmed.to_string()))
+            }
+            UiAnswerInput::Skipped => Ok(Self::Skipped),
         }
     }
 }
@@ -495,6 +519,16 @@ pub struct AskUserApprover {
 pub struct WorkspaceApprover {
     live_responses: Arc<LiveResponseRegistry<bool>>,
     runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WorkspaceApprovalError {
+    #[error("failed to persist waiting workspace request: {0}")]
+    PersistWaiting(#[source] crate::db::ChatDbError),
+    #[error("failed to append workspace request history: {0}")]
+    PersistHistory(#[source] crate::db::ChatDbError),
+    #[error("workspace request interrupted")]
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -586,22 +620,9 @@ impl AskUserApprover {
                 tracing::warn!(session_id = %session_id, error = %error, "failed to persist ask-user runtime state");
             }
 
-            let content = serde_json::to_string(&crate::session::history::AskUserRequestData {
-                id: request_id.clone(),
-                questions: serde_json::to_value(&questions)
-                    .expect("ask_user questions must serialize"),
-            })
-            .expect("ask_user request content must serialize");
             if let Err(error) = runtime_service
                 .db()
-                .append_message(
-                    session_id,
-                    MessageRole::AskUserRequest,
-                    &content,
-                    None,
-                    None,
-                    None,
-                )
+                .append_ask_user_request_message(session_id, request_id.as_str(), &questions, None)
                 .await
             {
                 tracing::warn!(session_id, error = %error, "failed to append ask-user request history");
@@ -656,7 +677,7 @@ impl WorkspaceApprover {
         &self,
         session_id: &str,
         request: RequestWorkspaceArgs,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, WorkspaceApprovalError> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let rx = self.live_responses.open(request_id.clone());
 
@@ -671,31 +692,24 @@ impl WorkspaceApprover {
                     )),
                 )
                 .await
-                .map_err(anyhow::Error::from)?;
+                .map_err(WorkspaceApprovalError::PersistWaiting)?;
 
-            let content = serde_json::to_string(&crate::session::history::WorkspaceRequestData {
-                id: request_id.clone(),
-                path: request.path.clone(),
-                reason: request.reason.clone(),
-            })
-            .expect("workspace request content must serialize");
             runtime_service
                 .db()
-                .append_message(
+                .append_workspace_request_message(
                     session_id,
-                    MessageRole::WorkspaceRequest,
-                    &content,
-                    None,
-                    None,
+                    request_id.as_str(),
+                    request.path.as_str(),
+                    request.reason.as_str(),
                     None,
                 )
                 .await
-                .map_err(anyhow::Error::from)?;
+                .map_err(WorkspaceApprovalError::PersistHistory)?;
         }
 
         rx.recv()
             .await
-            .map_err(|_| anyhow::anyhow!("workspace request interrupted"))
+            .map_err(|_| WorkspaceApprovalError::Interrupted)
     }
 
     pub(crate) fn respond(&self, request_id: &str, approved: bool) -> bool {

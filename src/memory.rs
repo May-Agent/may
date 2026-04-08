@@ -27,6 +27,18 @@ pub struct MemoryProcessor {
     db: ChatDb,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum MemoryProcessingError {
+    #[error("database error: {0}")]
+    Database(#[from] crate::db::ChatDbError),
+    #[error("no memory extraction providers configured")]
+    NoProviders,
+    #[error("all memory extraction providers failed: {details}")]
+    AllProvidersFailed { details: String },
+    #[error("memory extraction LLM error: {0}")]
+    Llm(#[from] aither_cloud::CloudError),
+}
+
 #[derive(Clone)]
 pub struct MemoryExtractionProvider {
     pub provider_id: String,
@@ -106,7 +118,10 @@ impl MemoryProcessor {
         }
     }
 
-    async fn build_profile_conversation(db: &ChatDb, profile_id: &str) -> anyhow::Result<String> {
+    async fn build_profile_conversation(
+        db: &ChatDb,
+        profile_id: &str,
+    ) -> Result<String, MemoryProcessingError> {
         let sessions = db
             .list_sessions_for_profile(profile_id)
             .await?
@@ -152,9 +167,9 @@ impl MemoryProcessor {
         providers: &[MemoryExtractionProvider],
         profile_id: &str,
         conversation: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), MemoryProcessingError> {
         if providers.is_empty() {
-            return Err(anyhow::anyhow!("no memory extraction providers configured"));
+            return Err(MemoryProcessingError::NoProviders);
         }
 
         // Extract preference memory
@@ -203,7 +218,7 @@ impl MemoryProcessor {
         template: &str,
         current: &str,
         conversation: &str,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, MemoryProcessingError> {
         let prompt = template
             .replace("{current}", current)
             .replace("{conversation}", conversation);
@@ -228,13 +243,15 @@ impl MemoryProcessor {
             }
         }
 
-        Err(anyhow::anyhow!(
-            "all memory extraction providers failed: {}",
-            errors.join(" | ")
-        ))
+        Err(MemoryProcessingError::AllProvidersFailed {
+            details: errors.join(" | "),
+        })
     }
 
-    async fn extract_with_provider(llm: &CloudProvider, prompt: &str) -> anyhow::Result<String> {
+    async fn extract_with_provider(
+        llm: &CloudProvider,
+        prompt: &str,
+    ) -> Result<String, MemoryProcessingError> {
         let request = LLMRequest::new(vec![Message::user(prompt)]);
 
         let mut stream = std::pin::pin!(llm.respond(request));

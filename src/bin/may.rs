@@ -1244,6 +1244,7 @@ struct ExecSessionContext {
     sandbox_dir: std::path::PathBuf,
     profile_environment: Option<ProfileEnvironment>,
     profile_model: Option<may_agent::db::entity::profiles::Model>,
+    profile_container_preferences: Option<may_agent::profile::ContainerProfilePreferences>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1278,6 +1279,7 @@ async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
     let environment = resolve_agent_environment_for_session(
         context.profile_environment.clone(),
         context.profile_model.as_ref(),
+        context.profile_container_preferences.clone(),
         &context.may_dir,
         &context.sandbox_dir,
         &context.session_id,
@@ -1292,6 +1294,7 @@ async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
 
     let output = terminal_tool
         .call(TerminalArgs {
+            description: "execute the requested shell command".to_string(),
             script: args.script,
             mode: shell_mode,
             ssh_server_id: args.ssh_server_id,
@@ -1349,9 +1352,20 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
         None => None,
     };
 
-    let profile_environment = match profile_model.clone() {
-        Some(model) => Some(
-            ProfileInfo::from_db_model(model)
+    let profile_preferences = match profile_model.as_ref() {
+        Some(model) => Some(db.load_profile_preferences(model).await.map_err(|source| {
+            ExecError::LoadProfile {
+                profile_id: profile_id
+                    .clone()
+                    .expect("profile id present when model exists"),
+                source,
+            }
+        })?),
+        None => None,
+    };
+    let profile_environment = match (profile_model.clone(), profile_preferences.as_ref()) {
+        (Some(model), Some(preferences)) => Some(
+            ProfileInfo::from_db_parts(model, preferences.clone())
                 .map_err(|source| ExecError::InvalidProfile {
                     profile_id: profile_id
                         .clone()
@@ -1361,7 +1375,8 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
                 .environment
                 .into_kind(),
         ),
-        None => None,
+        (None, None) => None,
+        _ => panic!("profile preferences must exist exactly when profile model exists"),
     };
 
     ensure_exec_session_layout(
@@ -1379,6 +1394,9 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
         sandbox_dir: store.sandbox_dir(session_id, profile_id.as_deref()),
         profile_environment,
         profile_model,
+        profile_container_preferences: profile_preferences
+            .and_then(|preferences| preferences)
+            .and_then(|preferences| preferences.container),
     })
 }
 
@@ -2860,7 +2878,7 @@ where
                             };
                             let _ = tx
                                 .send(AppEvent::SkillInstalled(
-                                    final_result.map_err(anyhow::Error::from),
+                                    final_result.map_err(may_agent::tui::error::TuiError::from),
                                 ))
                                 .await;
                         })
@@ -2888,7 +2906,7 @@ where
                             };
                             let _ = tx
                                 .send(AppEvent::SkillDeleted(
-                                    final_result.map_err(anyhow::Error::from),
+                                    final_result.map_err(may_agent::tui::error::TuiError::from),
                                 ))
                                 .await;
                         })

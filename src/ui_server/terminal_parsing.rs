@@ -32,11 +32,17 @@ fn parse_terminal_mode(mode: TerminalExecutionMode) -> TerminalCommandMode {
     }
 }
 
-pub(super) fn parse_terminal_start(arguments: &str) -> (String, Option<TerminalCommandMode>) {
+pub(super) fn parse_terminal_start(
+    arguments: &str,
+) -> (String, String, Option<TerminalCommandMode>) {
     let parsed: TerminalArgs = serde_json::from_str(arguments).unwrap_or_else(|error| {
         panic!("invalid terminal tool start payload: {error}; payload: {arguments}")
     });
-    (parsed.script, Some(parse_terminal_mode(parsed.mode)))
+    (
+        parsed.description,
+        parsed.script,
+        Some(parse_terminal_mode(parsed.mode)),
+    )
 }
 
 pub(super) fn parse_terminal_result_payload(
@@ -77,12 +83,13 @@ pub(super) fn update_terminal_snapshot_from_tool_event(
             if !name.eq_ignore_ascii_case(TERMINAL_TOOL_NAME) {
                 return;
             }
-            let (script, mode) = parse_terminal_start(arguments);
+            let (description, script, mode) = parse_terminal_start(arguments);
             let mode = mode.unwrap_or(TerminalCommandMode::Default);
             snapshot.running_by_call_id.insert(
                 id.clone(),
                 ApiTerminalExecution {
                     id: id.clone(),
+                    description,
                     input: script,
                     output: None,
                     status: TerminalExecutionStatus::Running,
@@ -94,16 +101,9 @@ pub(super) fn update_terminal_snapshot_from_tool_event(
             if !name.eq_ignore_ascii_case(TERMINAL_TOOL_NAME) {
                 return;
             }
-            let mut exec = snapshot
-                .running_by_call_id
-                .remove(id)
-                .unwrap_or(ApiTerminalExecution {
-                    id: id.clone(),
-                    input: "(terminal)".to_string(),
-                    output: None,
-                    status: TerminalExecutionStatus::Done,
-                    mode: TerminalCommandMode::Default,
-                });
+            let mut exec = snapshot.running_by_call_id.remove(id).unwrap_or_else(|| {
+                panic!("terminal tool end received without matching start: call_id={id}")
+            });
 
             let output = parse_terminal_end_output_from_result(result);
             let failed = parse_terminal_failed_from_result(result);

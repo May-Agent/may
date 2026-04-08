@@ -16,8 +16,10 @@ pub struct Model {
     pub container_id: Option<String>,
     /// Persona overlay text injected into the agent system prompt.
     pub persona: Option<String>,
-    /// JSON blob of per-profile preferences.
-    pub preferences_json: Option<String>,
+    /// Structured SSH server binding for remote profiles.
+    pub remote_ssh_server_id: Option<String>,
+    /// Structured Dockerfile override for container profiles.
+    pub container_dockerfile: Option<String>,
     /// Whether this profile has location awareness enabled.
     pub location_aware: bool,
     /// Maximum number of pinned items in this profile.

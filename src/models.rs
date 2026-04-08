@@ -11,8 +11,8 @@ use crate::config::{MayConfig, ProviderInstance, ProviderType};
 /// Error type for model fetching operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelFetchError {
-    #[error("Provider error: {0}")]
-    Provider(#[from] anyhow::Error),
+    #[error("provider error: {0}")]
+    Provider(String),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Copilot not authenticated")]
@@ -187,7 +187,7 @@ async fn fetch_models_for_provider(
     let profiles = provider
         .list_models()
         .await
-        .map_err(|e| ModelFetchError::Provider(e.into()))?;
+        .map_err(|error| ModelFetchError::Provider(error.to_string()))?;
     Ok(profiles
         .into_iter()
         .map(|p| {

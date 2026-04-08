@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use super::store::SandboxResourceLayout;
 use super::{ChatHistory, ChatMessage, ChatMessageStats, MessageRole, SessionStore};
 use super::{MayHomePaths, SessionRuntimeSummary};
+use super::{PersistedMessage, PersistedMessageError};
 use crate::bundle::Bundle;
 use crate::config::MayConfig;
 use crate::db::{ChatDb, ChatDbError};
@@ -31,6 +32,8 @@ pub enum SessionError {
     Bundle(#[from] crate::bundle::BundleError),
     #[error("Container runtime preparation failed: {0}")]
     Container(#[from] crate::container::ContainerError),
+    #[error("Persisted message error: {0}")]
+    PersistedMessage(#[from] PersistedMessageError),
 }
 
 /// Unique session identifier (four random words joined by `-`).
@@ -124,8 +127,8 @@ impl SessionSummary {
     /// Convert a DB session model to a summary.
     #[must_use]
     pub fn from_db_model(s: crate::db::entity::sessions::Model) -> Self {
-        let created_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &s.created_at).ok();
-        let updated_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &s.updated_at).ok();
+        let created_at = s.created_at.parse::<Timestamp>().ok();
+        let updated_at = s.updated_at.parse::<Timestamp>().ok();
 
         Self {
             id: SessionId::from_string(s.id),
@@ -194,11 +197,10 @@ pub async fn load_history_from_db(
     }
 
     for msg in db_messages {
-        let role = MessageRole::from_str(&msg.role).unwrap_or(MessageRole::User);
-        let timestamp = msg
-            .timestamp
-            .as_deref()
-            .and_then(|value| Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", value).ok());
+        let persisted = PersistedMessage::try_from(&msg)?;
+        let role = persisted.role.clone();
+        let timestamp = persisted.timestamp.clone();
+        drop(persisted);
         let stats = map_db_message_stats(&msg);
 
         history.push(ChatMessage {
@@ -437,9 +439,13 @@ impl SessionManager {
                 .reconcile_container_mount_points(id.as_str(), profile_id.as_deref())
                 .await?;
         }
-        let created_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &db_session.created_at)
+        let created_at = db_session
+            .created_at
+            .parse::<Timestamp>()
             .unwrap_or_else(|_| Timestamp::now());
-        let updated_at = Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", &db_session.updated_at)
+        let updated_at = db_session
+            .updated_at
+            .parse::<Timestamp>()
             .unwrap_or_else(|_| Timestamp::now());
 
         let history = load_history_from_db(&self.db, id.as_str()).await?;

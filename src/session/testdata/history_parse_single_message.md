@@ -1,4 +1,0 @@
----
-role: user
----
-Hello, May!
