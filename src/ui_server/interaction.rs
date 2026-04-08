@@ -4,11 +4,9 @@ use skyzen::Result as SkyResult;
 use skyzen::utils::{Json, State};
 
 use crate::ask_user::QuestionAnswer;
-use crate::session::history::{AskUserResponseData, PermissionResponseData, WorkspaceResponseData};
-use crate::session::{ChatMessage, SessionId};
+use crate::session::SessionId;
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::append_history_message;
 use super::state::{AskUserRespondRequest, UiServerState};
 use super::types::{PermissionRespondRequest, SessionRuntimeResponse, WorkspaceRespondRequest};
 
@@ -35,13 +33,16 @@ pub(super) async fn respond_permission_request(
         tracing::warn!(request_id = %req.id, session_id = %session_id, "permission response arrived without a live waiter");
     }
 
-    let data = PermissionResponseData {
-        id: req.id.clone(),
-        approved: req.approved,
-    };
     let session_id = SessionId::from(session_id);
-    let _ =
-        append_history_message(&state, &session_id, ChatMessage::permission_response(&data)).await;
+    let _ = state
+        .db()
+        .append_permission_response_message(
+            session_id.as_str(),
+            req.id.as_str(),
+            req.approved,
+            None,
+        )
+        .await;
     if !responded {
         state
             .runtime_service
@@ -83,11 +84,13 @@ pub(super) async fn respond_ask_user_request(
     let answers = req
         .answers
         .into_iter()
-        .map(|answer| QuestionAnswer {
-            section: answer.section,
-            answer: answer.answer.into(),
+        .map(|answer| {
+            Ok(QuestionAnswer {
+                section: answer.section,
+                answer: answer.answer.try_into().map_err(bad_request_error)?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<SkyResult<Vec<_>>>()?;
 
     let responded = state.ask_user_approver.respond(&req.id, answers.clone());
 
@@ -100,14 +103,11 @@ pub(super) async fn respond_ask_user_request(
         tracing::warn!(request_id = %req.id, session_id = %session_id, "ask-user response arrived without a live waiter");
     }
 
-    let answers_json = serde_json::to_value(&answers).map_err(internal_error)?;
-    let data = AskUserResponseData {
-        id: req.id.clone(),
-        answers: answers_json,
-    };
     let session_id = SessionId::from(session_id);
-    let _ =
-        append_history_message(&state, &session_id, ChatMessage::ask_user_response(&data)).await;
+    let _ = state
+        .db()
+        .append_ask_user_response_message(session_id.as_str(), req.id.as_str(), &answers, None)
+        .await;
     if !responded {
         state
             .runtime_service
@@ -153,13 +153,11 @@ pub(super) async fn respond_workspace_request(
         tracing::warn!(request_id = %req.id, session_id = %session_id, "workspace response arrived without a live waiter");
     }
 
-    let data = WorkspaceResponseData {
-        id: req.id.clone(),
-        approved: req.approved,
-    };
     let session_id = SessionId::from(session_id);
-    let _ =
-        append_history_message(&state, &session_id, ChatMessage::workspace_response(&data)).await;
+    let _ = state
+        .db()
+        .append_workspace_response_message(session_id.as_str(), req.id.as_str(), req.approved, None)
+        .await;
     if !responded {
         state
             .runtime_service

@@ -5,6 +5,12 @@ use crate::ui_event_bus::UiEventTopics;
 
 use super::state::UiServerState;
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PersistLastModelError {
+    #[error("config save failed: {0}")]
+    Save(#[from] crate::config::ConfigError),
+}
+
 pub(super) fn preferred_advanced_model(config: &MayConfig) -> Option<String> {
     config.models.advanced.first().cloned()
 }
@@ -19,7 +25,10 @@ pub(super) fn resolve_default_model(
         .or_else(|| preferred_advanced_model(config))
 }
 
-pub(super) async fn persist_last_model(state: &UiServerState, model: &str) -> anyhow::Result<()> {
+pub(super) async fn persist_last_model(
+    state: &UiServerState,
+    model: &str,
+) -> Result<(), PersistLastModelError> {
     let snapshot = state.config_snapshot();
     let strict = snapshot.preferences.strict_model_matching;
     let normalized_existing = snapshot.last_model.as_deref().map(|value| {
@@ -46,9 +55,7 @@ pub(super) async fn persist_last_model(state: &UiServerState, model: &str) -> an
         config.last_model = Some(model.to_string());
     });
 
-    updated
-        .save()
-        .await
-        .map_err(anyhow::Error::from)
-        .inspect(|()| state.notify_ui_events(UiEventTopics::CONFIG))
+    updated.save().await?;
+    state.notify_ui_events(UiEventTopics::CONFIG);
+    Ok(())
 }

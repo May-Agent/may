@@ -1,10 +1,10 @@
-use anyhow::Result;
 use crossterm::event::KeyCode;
 
 use crate::tui::app::{App, SendAction};
+use crate::tui::error::{AppResult, TuiError};
 use crate::tui::state::AppMode;
 
-pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     let filtered = app.filtered_sessions();
     let filtered_len = filtered.len();
 
@@ -138,7 +138,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Result<Option<
                                         let _ = tx
                                             .send(crate::tui::event::AppEvent::SessionDeleted {
                                                 was_current,
-                                                result: Err(anyhow::Error::from(error)),
+                                                result: Err(TuiError::from(error)),
                                             })
                                             .await;
                                         return;
@@ -148,7 +148,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Result<Option<
                                     let _ = tx
                                         .send(crate::tui::event::AppEvent::SessionDeleted {
                                             was_current,
-                                            result: Err(anyhow::Error::from(e)),
+                                            result: Err(TuiError::from(e)),
                                         })
                                         .await;
                                     return;
@@ -160,7 +160,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Result<Option<
                                 let _ = tx
                                     .send(crate::tui::event::AppEvent::SessionDeleted {
                                         was_current,
-                                        result: result.map_err(anyhow::Error::from),
+                                        result: result.map_err(TuiError::from),
                                     })
                                     .await;
                             })
@@ -213,7 +213,7 @@ fn toggle_pin(app: &mut App) {
             let result = crate::profile::query_profile_sessions(&db, &pid).await;
             let _ = tx
                 .send(crate::tui::event::AppEvent::ProfileSessionsLoaded(
-                    result.map_err(anyhow::Error::from),
+                    result.map_err(TuiError::from),
                 ))
                 .await;
         }
@@ -257,7 +257,7 @@ fn toggle_archive(app: &mut App) {
             let result = crate::profile::query_profile_sessions(&db, &pid).await;
             let _ = tx
                 .send(crate::tui::event::AppEvent::ProfileSessionsLoaded(
-                    result.map_err(anyhow::Error::from),
+                    result.map_err(TuiError::from),
                 ))
                 .await;
         }
@@ -270,7 +270,7 @@ fn toggle_archive(app: &mut App) {
     });
 }
 
-pub fn handle_profile_select_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_profile_select_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     let profile_count = app.profiles.len();
 
     match code {
@@ -306,7 +306,7 @@ fn set_active_profile(app: &mut App, profile_id: String) {
     app.session_manager.set_current_profile(profile_id);
 }
 
-pub fn handle_help_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_help_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     match code {
         KeyCode::Esc | KeyCode::Char('?' | 'q') => {
             app.mode = AppMode::Chat;
@@ -316,7 +316,7 @@ pub fn handle_help_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction
     Ok(None)
 }
 
-pub fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = AppMode::Chat;
@@ -338,7 +338,7 @@ pub fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> Result<Option<Sen
     Ok(None)
 }
 
-pub fn handle_file_picker_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_file_picker_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     let Some(picker) = app.file_picker.as_mut() else {
         app.mode = AppMode::Chat;
         return Ok(None);

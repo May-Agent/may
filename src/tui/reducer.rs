@@ -4,14 +4,13 @@ pub(super) mod ask_user;
 pub(super) mod manage;
 pub(super) mod navigation;
 
-use anyhow::Result;
-
 use super::app::{App, SendAction};
+use super::error::AppResult;
 use super::event::AppEvent;
 use super::state::AppMode;
 
 /// Reduce a single UI event into state transitions and optional actions.
-pub fn reduce_event(app: &mut App, event: AppEvent) -> Result<Option<SendAction>> {
+pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendAction>> {
     match event {
         AppEvent::Key(code, modifiers) => app.handle_key(code, modifiers),
         AppEvent::Tick => {

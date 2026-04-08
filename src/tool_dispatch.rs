@@ -19,6 +19,7 @@ use crate::notification::NotificationManager;
 use crate::notification_service::NotificationService;
 use crate::scheduler::TaskRuntime;
 use crate::session::{MayHomePaths, SessionStore};
+use crate::text::{join_text, path_error_text, path_message};
 use crate::{SkillManager, SubagentManager};
 
 #[derive(Debug, thiserror::Error)]
@@ -529,26 +530,6 @@ fn build_registration_approval_message(
         target_dir_name,
         ". Approve?",
     ])
-}
-
-fn join_text(parts: &[&str]) -> String {
-    let capacity = parts.iter().map(|part| part.len()).sum();
-    let mut output = String::with_capacity(capacity);
-    for part in parts {
-        output.push_str(part);
-    }
-    output
-}
-
-fn path_message(prefix: &str, path: &Path) -> String {
-    let path_text = path.display().to_string();
-    join_text(&[prefix, path_text.as_str()])
-}
-
-fn path_error_text(prefix: &str, path: &Path, error: &impl std::fmt::Display) -> String {
-    let path_text = path.display().to_string();
-    let error_text = error.to_string();
-    join_text(&[prefix, path_text.as_str(), ": ", error_text.as_str()])
 }
 
 fn session_error_text(prefix: &str, session_id: &str, error: &impl std::fmt::Display) -> String {

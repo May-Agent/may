@@ -153,6 +153,7 @@ function ChatRouteView({
     backendUnavailableReason,
     profileSessions,
     profileSessionsLoading,
+    sessions,
     setCurrentSession,
   } = useStore();
   const hideChrome = (backendUnavailableReason ?? "").trim().length > 0;
@@ -168,7 +169,10 @@ function ChatRouteView({
     if (!loaded || profileSessionsLoading) return;
 
     const existsInProfile = profileHasSession(profileSessions, sessionId);
-    if (!existsInProfile) {
+    const existsLocally =
+      currentSessionId === sessionId ||
+      sessions.some((session) => session.id === sessionId);
+    if (!existsInProfile && !existsLocally) {
       if (currentSessionId !== null) {
         setCurrentSession(null);
       }
@@ -185,6 +189,7 @@ function ChatRouteView({
     currentSessionId,
     profileSessions,
     profileSessionsLoading,
+    sessions,
     setCurrentSession,
     navigate,
   ]);

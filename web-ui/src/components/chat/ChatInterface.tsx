@@ -3,12 +3,12 @@ import { useNavigate } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { useStore } from "@/lib/store";
 import {
-  ApiError,
   fetchArtifactPreview,
   mapContainerLocalArtifactUrl,
   prepareSlidevPreview,
   fetchSessionArtifacts,
   fetchSessionRuntime,
+  isSessionActiveConflictError,
   fetchSessionTasks,
   enqueueChat,
   removePendingSessionMessage,
@@ -27,9 +27,11 @@ import {
 import { MessageItem } from "./MessageItem";
 import { ModelSelector } from "./ModelSelector";
 import { AttachmentPreview } from "./AttachmentPreview";
+import { AttachmentCard } from "./AttachmentCard";
 import { ArtifactsSidebar } from "./ArtifactsSidebar";
 import { BrowserView } from "./BrowserView";
 import { ContextInspector } from "./ContextInspectorDialog";
+import { PendingFollowUpPanel } from "./PendingFollowUpPanel";
 import {
   createDisconnectBanner,
   collectRetryBatch,
@@ -68,9 +70,6 @@ import {
   Share2,
   Square,
   CircleX,
-  MoreHorizontal,
-  Clock3,
-  Paperclip,
 } from "lucide-react";
 import type {
   Artifact,
@@ -95,6 +94,12 @@ interface AskUserState {
 interface ChatInterfaceProps {
   onToggleSidebar: () => void;
   isSidebarOpen: boolean;
+}
+
+interface TerminalToolStartArgs {
+  description: string;
+  script: string;
+  mode?: TerminalExecution["mode"];
 }
 
 function normalizeToolName(rawName: unknown): string {
@@ -127,6 +132,33 @@ function isTerminalExecutionMode(value: unknown): value is TerminalExecution["mo
     value === "unsafe" ||
     value === "ssh"
   );
+}
+
+function parseTerminalToolStartArgs(raw: unknown): TerminalToolStartArgs {
+  const parsed =
+    typeof raw === "string"
+      ? JSON.parse(raw)
+      : raw;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("terminal tool payload must be an object");
+  }
+  const record = parsed as Record<string, unknown>;
+  const description =
+    typeof record.description === "string" ? record.description.trim() : "";
+  if (!description) {
+    throw new Error("terminal tool payload is missing a non-empty description");
+  }
+  const script =
+    typeof record.script === "string"
+      ? record.script
+      : typeof record.command === "string"
+        ? record.command
+        : "";
+  if (!script) {
+    throw new Error("terminal tool payload is missing script");
+  }
+  const mode = isTerminalExecutionMode(record.mode) ? record.mode : undefined;
+  return { description, script, mode };
 }
 
 export function ChatInterface({
@@ -211,6 +243,8 @@ export function ChatInterface({
   const titleInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const streamingSessionIdRef = useRef<string | null>(null);
+  const stopRequestedSessionIdsRef = useRef<Set<string>>(new Set());
+  const stopWaitersRef = useRef<Map<string, Promise<void>>>(new Map());
   const previewSessionRef = useRef<string | null>(null);
   const currentSession = sessions.find((s) => s.id === currentSessionId);
   const currentPlanState: SessionPlanState =
@@ -342,6 +376,13 @@ export function ChatInterface({
     isSending ||
     isStreamControllerActive ||
     hasPendingAssistantMessage;
+  const pendingPanelTitle =
+    queuedMessages.length > 1 ? "Pending follow-ups" : "Pending follow-up";
+  const pendingPanelSubtitle = runtimeSession?.state === "running"
+    ? "Will send after the active run settles"
+    : runtimeSession?.pendingImmediate
+      ? "Waiting to dispatch next"
+      : "Saved for later in this session";
   const markRuntimeRunning = useRuntimeStore((state) => state.markRunning);
   const applyRuntime = useRuntimeStore((state) => state.applyRuntime);
   const markRuntimeFirstToken = useRuntimeStore(
@@ -724,7 +765,7 @@ export function ChatInterface({
         request: pendingAskUserRequest,
         answers: pendingAskUserRequest.questions.map((question) => ({
           section: question.section,
-          answer: null,
+          answer: { kind: "skipped" },
         })),
       };
     });
@@ -1034,6 +1075,15 @@ export function ChatInterface({
     async (sessionId: string) => {
       const runtime = await fetchSessionRuntime(sessionId);
       applyRuntime(sessionId, runtime);
+      return runtime;
+    },
+    [applyRuntime],
+  );
+
+  const waitForStoppedSession = useCallback(
+    async (sessionId: string) => {
+      const runtime = await stopSessionRun(sessionId);
+      applyRuntime(sessionId, runtime);
     },
     [applyRuntime],
   );
@@ -1052,6 +1102,21 @@ export function ChatInterface({
     if (includeComposerInput && !composerHasInput) return;
 
     const requestedSessionId = options?.sessionIdHint ?? currentSessionId;
+    const pendingStop = requestedSessionId
+      ? stopWaitersRef.current.get(requestedSessionId)
+      : undefined;
+    if (pendingStop) {
+      try {
+        await pendingStop;
+      } catch (error) {
+        setUiError(
+          `Failed to stop session: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return;
+      }
+    }
     if (!requestedSessionId) {
       const candidateModelId = newChatModelId.trim();
       if (!candidateModelId) {
@@ -1154,6 +1219,8 @@ export function ChatInterface({
       return;
     }
 
+    stopRequestedSessionIdsRef.current.delete(sessionId);
+
     const resolvedSessionModelId =
       useStore
         .getState()
@@ -1191,12 +1258,6 @@ export function ChatInterface({
     const baseMessages =
       useStore.getState().sessions.find((session) => session.id === sessionId)
         ?.messages ?? [];
-    const fallbackPrompt = pendingBatch
-      .map((message) => message.content)
-      .join("\n\n");
-    const fallbackAttachments = pendingBatch.flatMap(
-      (message) => message.attachments,
-    );
 
     if (!options?.skipAppendUserMessages) {
       for (const queued of pendingBatch) {
@@ -1222,31 +1283,42 @@ export function ChatInterface({
     const toolSegmentByToolId = new Map<string, string>();
     let lastStreamEventKind: "reasoning" | "text" | "tool" | null = null;
     let lastTextFlushAt = 0;
-    let shouldFallbackToSteer = false;
-
-    const isActiveSessionStreamMessage = (message: string): boolean =>
-      message.includes("session is already active") ||
-      message.includes("session is already streaming");
+    const wasStoppedByUser = (): boolean =>
+      controller.signal.aborted ||
+      stopRequestedSessionIdsRef.current.has(sessionId);
 
     const isActiveSessionStreamFailure = (error: unknown): boolean =>
-      error instanceof ApiError
-        ? error.statusCode === 409
-        : error instanceof Error && isActiveSessionStreamMessage(error.message);
+      isSessionActiveConflictError(error);
 
-    const fallbackToSteerQueue = async (): Promise<boolean> => {
-      if (options?.retryAssistantId) {
-        return false;
+    const restoreComposerDraft = () => {
+      if (!includeComposerInput || options?.retryAssistantId || pendingBatch.length !== 1) {
+        return;
       }
-      const runtime = await enqueueChat({
-        sessionId,
-        content: fallbackPrompt,
-        attachments: fallbackAttachments,
-        deliveryMode: "steer",
-      });
+      const [draft] = pendingBatch;
+      if (!draft) {
+        return;
+      }
+      setInputValue(draft.content);
+      setAttachments(draft.attachments);
+    };
+
+    const rollbackOptimisticStreamStart = async (message: string) => {
       replaceSessionMessages(sessionId, baseMessages);
-      applyRuntime(sessionId, runtime);
-      completedNormally = true;
-      return true;
+      restoreComposerDraft();
+      try {
+        const runtime = await fetchSessionRuntime(sessionId);
+        applyRuntime(sessionId, runtime);
+      } catch (runtimeError) {
+        setUiError(
+          `Failed to refresh session state: ${
+            runtimeError instanceof Error
+              ? runtimeError.message
+              : String(runtimeError)
+          }`,
+        );
+        return;
+      }
+      setUiError(message);
     };
 
     const cloneTimelineSegments = (
@@ -1452,30 +1524,17 @@ export function ChatInterface({
             typeof tool.arguments === "string"
               ? tool.arguments
               : JSON.stringify(tool.arguments ?? {});
-          let script = "(terminal)";
-          let mode: TerminalExecution["mode"];
-          try {
-            const args =
-              typeof tool.arguments === "string"
-                ? JSON.parse(tool.arguments)
-                : tool.arguments;
-            script = args?.script ?? args?.command ?? "(terminal)";
-            mode = isTerminalExecutionMode(args?.mode) ? args.mode : undefined;
-          } catch (error) {
-            console.warn("Invalid tool arguments payload", error);
-          }
-          if (typeof script !== "string") {
-            script = String(script);
-          }
 
           if (name === "terminal") {
+            const args = parseTerminalToolStartArgs(tool.arguments);
             closeActiveThinkingSegment();
             const startedAt = Date.now();
             const nextExec: TerminalExecution = {
               id: toolId,
-              input: script,
+              description: args.description,
+              input: args.script,
               status: "running",
-              mode: mode ?? "default",
+              mode: args.mode ?? "default",
               startedAt,
             };
 
@@ -1663,8 +1722,8 @@ export function ChatInterface({
           );
         },
         onError: (message) => {
-          if (isActiveSessionStreamMessage(message)) {
-            shouldFallbackToSteer = true;
+          if (wasStoppedByUser()) {
+            completedNormally = true;
             return;
           }
           closeActiveThinkingSegment();
@@ -1696,23 +1755,19 @@ export function ChatInterface({
           setUiError(`LLM endpoint error: ${message}`);
         },
       });
-      if (shouldFallbackToSteer) {
-        const recovered = await fallbackToSteerQueue();
-        if (!recovered) {
-          setUiError(
-            "session is already active; send this message via steer or queue instead",
-          );
-        }
-      }
     } catch (error) {
+      if (wasStoppedByUser()) {
+        completedNormally = true;
+        return;
+      }
       if (!(error instanceof DOMException && error.name === "AbortError")) {
-        const message = error instanceof Error ? error.message : String(error);
         if (isActiveSessionStreamFailure(error)) {
-          const recovered = await fallbackToSteerQueue();
-          if (recovered) {
-            return;
-          }
+          await rollbackOptimisticStreamStart(
+            "This session is still active. Wait for the current run to settle or stop it before sending another message.",
+          );
+          return;
         }
+        const message = error instanceof Error ? error.message : String(error);
         closeActiveThinkingSegment();
         const errText = `LLM endpoint error: ${message}`;
         const latest = useStore
@@ -1752,7 +1807,7 @@ export function ChatInterface({
         .getState()
         .sessions.find((s) => s.id === sessionId);
       if (latest) {
-        const terminalError = !completedNormally
+        const terminalError = !completedNormally && !wasStoppedByUser()
           ? "LLM endpoint error: stream terminated before a final assistant response"
           : undefined;
         replaceSessionMessages(
@@ -1790,64 +1845,60 @@ export function ChatInterface({
 
   const handleStop = () => {
     const runtimeSessionId = streamingSessionIdRef.current ?? currentSessionId;
+    if (!runtimeSessionId) {
+      return;
+    }
+    stopRequestedSessionIdsRef.current.add(runtimeSessionId);
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
     setIsStreamControllerActive(false);
     setIsSending(false);
     setIsBrowserOpen(false);
-    if (runtimeSessionId) {
-      void stopSessionRun(runtimeSessionId)
-        .then((runtime) => {
-          applyRuntime(runtimeSessionId, runtime);
-        })
-        .catch((error) => {
-          setUiError(
-            `Failed to stop session: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        });
-      const latest = useStore
-        .getState()
-        .sessions.find((s) => s.id === runtimeSessionId);
-      if (latest) {
-        let stopped = false;
-        const endedAt = Date.now();
-        replaceSessionMessages(
-          runtimeSessionId,
-          latest.messages.map((m) => {
-            if (
-              !stopped &&
-              m.role === "assistant" &&
-              (m.isStreaming || m.isThinking)
-            ) {
-              stopped = true;
-              const timelineSegments = settleTimelineSegments(
-                m.timelineSegments,
-                endedAt,
-              );
-              const { thinking, terminalExecutions } =
-                summarizeTimelineSegments(timelineSegments);
-              return {
-                ...m,
-                timelineSegments,
-                thinking,
-                terminalExecutions,
-                isStreaming: false,
-                isThinking: false,
-              };
-            }
-            return m;
-          }),
-        );
-      }
-      void syncSessionRuntime(runtimeSessionId).catch((error) => {
-        setUiError(
-          `Failed to sync runtime state: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      });
+    const waitForStop = waitForStoppedSession(runtimeSessionId).finally(() => {
+      stopWaitersRef.current.delete(runtimeSessionId);
+      stopRequestedSessionIdsRef.current.delete(runtimeSessionId);
+    });
+    stopWaitersRef.current.set(runtimeSessionId, waitForStop);
+    void waitForStop.catch((error) => {
+      setUiError(
+        `Failed to stop session: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+    const latest = useStore
+      .getState()
+      .sessions.find((s) => s.id === runtimeSessionId);
+    if (latest) {
+      let stopped = false;
+      const endedAt = Date.now();
+      replaceSessionMessages(
+        runtimeSessionId,
+        latest.messages.map((m) => {
+          if (
+            !stopped &&
+            m.role === "assistant" &&
+            (m.isStreaming || m.isThinking)
+          ) {
+            stopped = true;
+            const timelineSegments = settleTimelineSegments(
+              m.timelineSegments,
+              endedAt,
+            );
+            const { thinking, terminalExecutions } =
+              summarizeTimelineSegments(timelineSegments);
+            return {
+              ...m,
+              timelineSegments,
+              thinking,
+              terminalExecutions,
+              isStreaming: false,
+              isThinking: false,
+            };
+          }
+          return m;
+        }),
+      );
     }
     streamingSessionIdRef.current = null;
   };
@@ -2261,7 +2312,7 @@ export function ChatInterface({
           <p className="mx-auto mt-4 max-w-xl text-base leading-7 text-red-50/76">
             The UI cannot reach the May server right now.
           </p>
-          <div className="mx-auto mt-8 max-w-2xl border-t border-red-50/14 pt-6 text-sm leading-7 text-red-50/78">
+          <div className="mx-auto mt-8 max-w-2xl rounded-3xl bg-red-950/16 px-6 py-4 text-sm leading-7 text-red-50/78 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] backdrop-blur-sm">
             {backendUnavailableReason}
           </div>
           <Button
@@ -2651,8 +2702,10 @@ export function ChatInterface({
                   <div className="mt-3 max-h-[36vh] overflow-y-auto space-y-3 pr-1">
                     {pendingAskUser.request.questions.map((question, idx) => {
                       const answer = pendingAskUser.answers[idx]?.answer;
-                      const selected = Array.isArray(answer) ? answer : [];
-                      const custom = typeof answer === "string" ? answer : "";
+                      const selected =
+                        answer?.kind === "selected" ? answer.values : [];
+                      const custom =
+                        answer?.kind === "custom" ? answer.text : "";
 
                       return (
                         <div
@@ -2688,12 +2741,18 @@ export function ChatInterface({
                                           : [...selected, option];
                                         handleAskUserAnswerChange(
                                           idx,
-                                          next.length > 0 ? next : null,
+                                          next.length > 0
+                                            ? {
+                                                kind: "selected",
+                                                values: next,
+                                              }
+                                            : { kind: "skipped" },
                                         );
                                       } else {
-                                        handleAskUserAnswerChange(idx, [
-                                          option,
-                                        ]);
+                                        handleAskUserAnswerChange(idx, {
+                                          kind: "selected",
+                                          values: [option],
+                                        });
                                       }
                                     }}
                                   >
@@ -2707,7 +2766,15 @@ export function ChatInterface({
                           <Input
                             value={custom}
                             onChange={(e) =>
-                              handleAskUserAnswerChange(idx, e.target.value)
+                              handleAskUserAnswerChange(
+                                idx,
+                                e.target.value.trim().length > 0
+                                  ? {
+                                      kind: "custom",
+                                      text: e.target.value,
+                                    }
+                                  : { kind: "skipped" },
+                              )
                             }
                             placeholder="Custom answer (optional)"
                             className="mt-2 h-9 bg-background"
@@ -2728,7 +2795,7 @@ export function ChatInterface({
                         const skipped = pendingAskUser.request.questions.map(
                           (q) => ({
                             section: q.section,
-                            answer: null,
+                            answer: { kind: "skipped" as const },
                           }),
                         );
                         void handleAskUserSubmit(skipped);
@@ -2760,37 +2827,7 @@ export function ChatInterface({
                         className="relative group flex-shrink-0"
                       >
                         <AttachmentPreview attachment={att}>
-                          {att.type === "image" ? (
-                            <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted">
-                              <img
-                                src={att.url}
-                                alt={att.name}
-                                className="h-full w-full object-cover"
-                              />
-                            </div>
-                          ) : att.type === "document" || att.type === "pdf" ? (
-                            <div className="h-20 w-44 border rounded-lg overflow-hidden bg-muted/50 p-2.5 flex flex-col gap-1">
-                              <div className="flex items-center gap-1.5">
-                                <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-                                <span className="text-[11px] font-medium truncate">
-                                  {att.name}
-                                </span>
-                              </div>
-                              {att.textPreview ? (
-                                <p className="text-[10px] text-muted-foreground/70 leading-tight line-clamp-3 overflow-hidden">
-                                  {att.textPreview}
-                                </p>
-                              ) : (
-                                <p className="text-[10px] text-muted-foreground/50 uppercase tracking-wide mt-auto">
-                                  {att.type === "pdf" ? "PDF" : "DOCUMENT"}
-                                </p>
-                              )}
-                            </div>
-                          ) : (
-                            <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted flex items-center justify-center">
-                              <File className="h-8 w-8 text-muted-foreground" />
-                            </div>
-                          )}
+                          <AttachmentCard attachment={att} variant="composer" />
                         </AttachmentPreview>
                         <button
                           onClick={(e) => {
@@ -2808,100 +2845,14 @@ export function ChatInterface({
                   </div>
                 )}
 
-                {queuedMessages.length > 0 && (
-                  <div className="px-3 pt-2 pb-2">
-                    <div className="queued-shell rounded-[18px] border">
-                      <div className="queued-header flex items-center justify-between border-b px-3.5 py-2.5">
-                        <div className="flex min-w-0 items-center gap-2.5">
-                          <span className="queued-header-icon inline-flex h-7 w-7 items-center justify-center rounded-lg text-zinc-200">
-                            <Clock3 className="h-3.5 w-3.5" />
-                          </span>
-                          <div className="min-w-0">
-                            <div className="queued-header-title text-[11px] text-zinc-100">
-                              Queued
-                            </div>
-                            <div className="queued-header-subtitle truncate text-[11px]">
-                              Sent after the current reply finishes
-                            </div>
-                          </div>
-                        </div>
-                        <div className="queued-count-pill text-[11px] font-medium tabular-nums text-zinc-300">
-                          {queuedMessages.length}
-                        </div>
-                      </div>
-                      <div className="queued-list p-2">
-                        {queuedMessages.map((msg, i) => (
-                          <div
-                            key={`${currentSessionId ?? "session"}-${i}`}
-                            className="queued-item group grid grid-cols-[auto,1fr,auto] items-start gap-3 rounded-[14px] px-3 py-3"
-                          >
-                            <div className="queued-order mt-0.5 inline-flex h-7 min-w-7 items-center justify-center rounded-lg text-[10px] font-medium tabular-nums text-zinc-300">
-                              {i + 1}
-                            </div>
-                            <div className="min-w-0 flex-1 space-y-1.5">
-                              <div className="queued-message-content line-clamp-2 text-[12.5px] leading-[1.45] text-zinc-100/95">
-                                {msg.content.trim().length > 0
-                                  ? msg.content
-                                  : "Attachment-only message"}
-                              </div>
-                              <div className="queued-meta flex flex-wrap items-center gap-2 text-[10px] leading-none">
-                                <span className="queued-state-pill inline-flex items-center rounded-full px-2 py-1 text-zinc-200">
-                                  {msg.deliveryMode === "steer"
-                                    ? "Steer next"
-                                    : "Queued"}
-                                </span>
-                                {msg.attachments.length > 0 && (
-                                  <span className="inline-flex items-center gap-1.5 text-zinc-400">
-                                    <Paperclip className="h-3 w-3" />
-                                    {msg.attachments.length} attachment
-                                    {msg.attachments.length > 1 ? "s" : ""}
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                            <div className="flex shrink-0 items-start gap-1.5">
-                              <button
-                                type="button"
-                                onClick={() => steerQueuedMessage(i)}
-                                className="queued-steer h-7 rounded-full border px-3 text-[11px] font-medium text-zinc-200 transition-colors"
-                              >
-                                Steer
-                              </button>
-
-                              <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                  <button
-                                    type="button"
-                                    className="queued-more inline-flex h-7 w-7 items-center justify-center rounded-full border text-zinc-500 transition-colors hover:text-zinc-100"
-                                    aria-label="More actions"
-                                  >
-                                    <MoreHorizontal className="h-4 w-4" />
-                                  </button>
-                                </DropdownMenuTrigger>
-                                <DropdownMenuContent
-                                  align="end"
-                                  className="w-44"
-                                >
-                                  <DropdownMenuItem
-                                    onClick={() => steerQueuedMessage(i)}
-                                  >
-                                    Steer to composer
-                                  </DropdownMenuItem>
-                                  <DropdownMenuItem
-                                    className="text-destructive focus:text-destructive"
-                                    onClick={() => removeQueuedMessage(i)}
-                                  >
-                                    Remove
-                                  </DropdownMenuItem>
-                                </DropdownMenuContent>
-                              </DropdownMenu>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                )}
+                <PendingFollowUpPanel
+                  messages={queuedMessages}
+                  title={pendingPanelTitle}
+                  subtitle={pendingPanelSubtitle}
+                  sessionId={currentSessionId}
+                  onSteerMessage={steerQueuedMessage}
+                  onRemoveMessage={removeQueuedMessage}
+                />
 
                 <Textarea
                   ref={composerInputRef}

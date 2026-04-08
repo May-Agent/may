@@ -10,6 +10,7 @@ use crate::db::ProfileEnvironmentKind;
 use crate::session::{
     MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db,
 };
+use crate::text::{join_text, prefixed_text};
 use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
@@ -27,16 +28,16 @@ use super::types::{
 };
 
 fn session_not_found_error(session_id: &str) -> SkyError {
-    let mut message = String::from("Session ");
-    message.push_str(session_id);
-    message.push_str(" not found");
-    SkyError::msg(message).set_status(StatusCode::NOT_FOUND)
+    SkyError::msg(join_text(&["Session ", session_id, " not found"]))
+        .set_status(StatusCode::NOT_FOUND)
 }
 
 fn context_debug_not_found_error(session_id: &str) -> SkyError {
-    let mut message = String::from("No context debug snapshot for session ");
-    message.push_str(session_id);
-    SkyError::msg(message).set_status(StatusCode::NOT_FOUND)
+    SkyError::msg(prefixed_text(
+        "No context debug snapshot for session ",
+        session_id,
+    ))
+    .set_status(StatusCode::NOT_FOUND)
 }
 
 fn resolve_session_model(
@@ -45,24 +46,8 @@ fn resolve_session_model(
     model: Option<String>,
 ) -> Result<String, skyzen::Error> {
     let config = state.config_snapshot();
-    resolve_default_model(&config, model).ok_or_else(|| {
-        let mut message = String::from("no model resolved for session ");
-        message.push_str(session_id);
-        internal_error(message)
-    })
-}
-
-fn parse_json_field<T>(raw: &str, label: &str) -> Result<T, skyzen::Error>
-where
-    T: serde::de::DeserializeOwned,
-{
-    serde_json::from_str(raw).map_err(|error| {
-        let mut message = String::from("invalid ");
-        message.push_str(label);
-        message.push_str(": ");
-        message.push_str(error.to_string().as_str());
-        internal_error(message)
-    })
+    resolve_default_model(&config, model)
+        .ok_or_else(|| internal_error(prefixed_text("no model resolved for session ", session_id)))
 }
 
 pub(super) async fn list_sessions(
@@ -81,9 +66,10 @@ pub(super) async fn list_api_sessions(
     let mut sessions = Vec::with_capacity(summaries.len());
     for s in summaries {
         let model = resolve_default_model(&config, s.model.clone()).ok_or_else(|| {
-            let mut message = String::from("no model resolved for session ");
-            message.push_str(s.id.as_str());
-            internal_error(message)
+            internal_error(prefixed_text(
+                "no model resolved for session ",
+                s.id.as_str(),
+            ))
         })?;
         sessions.push(ApiSession::from_summary(s, model, Vec::new()));
     }
@@ -115,7 +101,7 @@ pub(super) async fn get_session(
     let model = resolve_session_model(&state, &id, summary.model.clone())?;
 
     let db_messages = db.get_messages(&id).await.map_err(internal_error)?;
-    let messages = map_db_messages(&db_messages);
+    let messages = map_db_messages(&db_messages).map_err(internal_error)?;
 
     Ok(Json(ApiSession::from_summary(summary, model, messages)))
 }
@@ -132,11 +118,6 @@ pub(super) async fn get_session_context_debug(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| context_debug_not_found_error(&id))?;
-
-    let prompt_attachments: Vec<String> =
-        parse_json_field(&row.prompt_attachments_json, "prompt_attachments_json")?;
-    let assembled_messages: Vec<ContextDebugMessage> =
-        parse_json_field(&row.assembled_messages_json, "assembled_messages_json")?;
     let window_snapshot = db
         .get_session_context_snapshot(&id)
         .await
@@ -150,8 +131,18 @@ pub(super) async fn get_session_context_debug(
         model: row.model,
         provider_id: row.provider_id,
         prompt: row.prompt,
-        prompt_attachments,
-        assembled_messages,
+        prompt_attachments: row.prompt_attachments,
+        assembled_messages: row
+            .assembled_messages
+            .into_iter()
+            .map(|message| ContextDebugMessage {
+                role: message.role,
+                content: message.content,
+                attachments: message.attachments,
+                tool_call_id: message.tool_call_id,
+                tool_call_names: message.tool_call_names,
+            })
+            .collect(),
         window_snapshot,
     }))
 }

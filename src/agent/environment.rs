@@ -7,6 +7,7 @@ use crate::agent::AgentEnvironment;
 use crate::container::ContainerRuntime;
 use crate::container::lifecycle::ContainerManager;
 use crate::db::entity::profiles;
+use crate::profile::ContainerProfilePreferences;
 use crate::profile::ProfileEnvironment;
 use crate::session::SessionId;
 
@@ -37,6 +38,7 @@ pub enum ResolveAgentEnvironmentError {
 pub async fn resolve_agent_environment_for_session(
     profile_environment: Option<ProfileEnvironment>,
     profile_model: Option<&profiles::Model>,
+    container_preferences: Option<ContainerProfilePreferences>,
     may_dir: &Path,
     sandbox_dir: &Path,
     session_id: &SessionId,
@@ -66,13 +68,21 @@ pub async fn resolve_agent_environment_for_session(
         .map_err(ResolveAgentEnvironmentError::DetectContainerRuntime)?;
     let container_manager = ContainerManager::new(Arc::new(runtime), may_dir.to_path_buf());
 
-    let default_image_tag = crate::container::profile::default_image_tag(may_dir, profile)
-        .await
-        .map_err(ResolveAgentEnvironmentError::ContainerImageTag)?;
-    let image_spec =
-        crate::container::profile::image_spec_for_profile(may_dir, profile, &default_image_tag)
-            .map_err(ResolveAgentEnvironmentError::ContainerProfileConfig)?;
-    let extra_mounts = crate::container::profile::mounts_for_profile(profile)
+    let default_image_tag = crate::container::profile::default_image_tag(
+        may_dir,
+        profile,
+        container_preferences.clone(),
+    )
+    .await
+    .map_err(ResolveAgentEnvironmentError::ContainerImageTag)?;
+    let image_spec = crate::container::profile::image_spec_for_profile(
+        may_dir,
+        profile,
+        &default_image_tag,
+        container_preferences.clone(),
+    )
+    .map_err(ResolveAgentEnvironmentError::ContainerProfileConfig)?;
+    let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences)
         .map_err(ResolveAgentEnvironmentError::ContainerMountConfig)?;
 
     crate::container::image::ensure_image(container_manager.runtime(), &image_spec)

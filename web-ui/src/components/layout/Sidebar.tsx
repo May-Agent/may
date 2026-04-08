@@ -144,7 +144,7 @@ function sessionStatusLabel(state: SessionRuntimeState | undefined, queuedCount:
     case 'waiting_terminal_input':
       return 'Waiting input';
     default:
-      return (queuedCount ?? 0) > 0 ? `Queued ${queuedCount}` : null;
+      return (queuedCount ?? 0) > 0 ? `Pending ${queuedCount}` : null;
   }
 }
 

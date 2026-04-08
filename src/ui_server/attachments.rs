@@ -23,7 +23,7 @@ struct TextXmlBlock<'a> {
     content: &'a str,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct AttachmentXml {
     #[serde(rename = "@name")]
     name: String,
@@ -39,18 +39,53 @@ struct AttachmentXml {
     reason: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct AttachmentsXml {
     #[serde(rename = "attachment")]
     attachments: Vec<AttachmentXml>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct UnsupportedModalityAlertXml {
     #[serde(rename = "@type")]
     alert_type: String,
     message: String,
     offloaded_attachments: AttachmentsXml,
+}
+
+enum PromptSection {
+    PastedText(String),
+    OffloadedText(String),
+    Attachments(Vec<AttachmentXml>),
+    UnsupportedModalityAlert(Vec<AttachmentXml>),
+}
+
+impl PromptSection {
+    fn render(&self) -> SkyResult<String> {
+        match self {
+            Self::PastedText(content) => serialize_xml("pasted_text", &TextXmlBlock { content }),
+            Self::OffloadedText(content) => {
+                serialize_xml("offloaded_text", &TextXmlBlock { content })
+            }
+            Self::Attachments(attachments) => serialize_xml(
+                "attachments",
+                &AttachmentsXml {
+                    attachments: attachments.clone(),
+                },
+            ),
+            Self::UnsupportedModalityAlert(offloaded_attachments) => serialize_xml(
+                "system_alert",
+                &UnsupportedModalityAlertXml {
+                    alert_type: "unsupported_modality_offload".to_string(),
+                    message:
+                        "Some attachments were offloaded because the current model does not support their modality. Inspect the referenced files with tools before answering.".to_string(),
+                    offloaded_attachments: AttachmentsXml {
+                        attachments: offloaded_attachments.clone(),
+                    },
+                },
+            ),
+        }
+    }
 }
 
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> SkyResult<String> {
@@ -63,8 +98,8 @@ pub(super) async fn build_prompt_and_attachments(
     model_id: &str,
 ) -> SkyResult<(String, Vec<url::Url>)> {
     let modality_support = ModelModalitySupport::for_model(model_id);
-    let mut prompt = req.content.clone();
     let mut attachments = Vec::new();
+    let mut prompt_sections = Vec::new();
     let mut xml_items = Vec::new();
     let mut offloaded_xml_items = Vec::new();
 
@@ -103,11 +138,7 @@ pub(super) async fn build_prompt_and_attachments(
                 model_id,
             ));
             if let Some(text) = &attachment.text_content {
-                prompt.push_str("\n\n");
-                prompt.push_str(&serialize_xml(
-                    "offloaded_text",
-                    &TextXmlBlock { content: text },
-                )?);
+                prompt_sections.push(PromptSection::OffloadedText(text.clone()));
             }
             continue;
         }
@@ -134,11 +165,7 @@ pub(super) async fn build_prompt_and_attachments(
 
         if let Some(text) = &attachment.text_content {
             if text.chars().count() <= INLINE_PASTED_TEXT_THRESHOLD {
-                prompt.push_str("\n\n");
-                prompt.push_str(&serialize_xml(
-                    "pasted_text",
-                    &TextXmlBlock { content: text },
-                )?);
+                prompt_sections.push(PromptSection::PastedText(text.clone()));
             } else {
                 let (saved_path, relative_path) =
                     save_large_pasted_text(state, &req.session_id, text).await?;
@@ -173,31 +200,26 @@ pub(super) async fn build_prompt_and_attachments(
     }
 
     if !xml_items.is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(&serialize_xml(
-            "attachments",
-            &AttachmentsXml {
-                attachments: xml_items,
-            },
-        )?);
+        prompt_sections.push(PromptSection::Attachments(xml_items));
     }
 
     if !offloaded_xml_items.is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(&serialize_xml(
-            "system_alert",
-            &UnsupportedModalityAlertXml {
-                alert_type: "unsupported_modality_offload".to_string(),
-                message:
-                    "Some attachments were offloaded because the current model does not support their modality. Inspect the referenced files with tools before answering.".to_string(),
-                offloaded_attachments: AttachmentsXml {
-                    attachments: offloaded_xml_items,
-                },
-            },
-        )?);
+        prompt_sections.push(PromptSection::UnsupportedModalityAlert(offloaded_xml_items));
     }
 
-    Ok((prompt, attachments))
+    Ok((
+        render_prompt(req.content.as_str(), &prompt_sections)?,
+        attachments,
+    ))
+}
+
+fn render_prompt(base: &str, sections: &[PromptSection]) -> SkyResult<String> {
+    let mut blocks = Vec::with_capacity(sections.len() + 1);
+    blocks.push(base.to_string());
+    for section in sections {
+        blocks.push(section.render()?);
+    }
+    Ok(blocks.join("\n\n"))
 }
 
 // ── Modality support ─────────────────────────────────────────

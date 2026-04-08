@@ -186,7 +186,10 @@ type UiEventTopic =
   | 'session_runtime'
   | 'session_runtimes';
 
-export type AskUserAnswerValue = string[] | string | null;
+export type AskUserAnswerValue =
+  | { kind: 'selected'; values: string[] }
+  | { kind: 'custom'; text: string }
+  | { kind: 'skipped' };
 
 export interface AskUserAnswer {
   section: string;
@@ -652,6 +655,12 @@ export class ApiError extends Error {
   }
 }
 
+const ACTIVE_SESSION_CONFLICT_STATUS = 409;
+
+export function isSessionActiveConflictError(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.statusCode === ACTIVE_SESSION_CONFLICT_STATUS;
+}
+
 // ── Enrichment helpers ───────────────────────────────────
 // The backend sends camelCase JSON matching our types directly.
 // These helpers add client-side computed fields.
@@ -886,6 +895,10 @@ function createReconnectingEventSource(
 
 // ── HTTP Helpers ─────────────────────────────────────────
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
 function buildRequestError(url: string, res: Response, text: string): ApiError {
   let decodedMessage: string | null = null;
   let errorCode: string | null = null;
@@ -955,6 +968,9 @@ async function requestResponse(
   try {
     res = await fetch(url, init);
   } catch (fetchError) {
+    if (isAbortError(fetchError)) {
+      throw fetchError;
+    }
     // Network-level error: the request never reached the server (connection refused, DNS, etc.).
     const detail =
       fetchError instanceof Error ? fetchError.message : String(fetchError);

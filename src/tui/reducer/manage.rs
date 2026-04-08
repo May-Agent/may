@@ -1,10 +1,10 @@
-use anyhow::Result;
 use crossterm::event::KeyCode;
 
 use crate::tui::app::{App, SendAction};
+use crate::tui::error::AppResult;
 use crate::tui::state::{CopilotAuthStatus, McpAddMode, SkillAddMode, SshAddMode};
 
-pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     match code {
         KeyCode::Esc => {
             app.copilot_auth_status = None;
@@ -34,7 +34,7 @@ pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> Result<Option<Se
     Ok(None)
 }
 
-pub fn handle_workspace_confirm_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_workspace_confirm_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     match code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
@@ -61,7 +61,10 @@ pub fn handle_workspace_confirm_key(app: &mut App, code: KeyCode) -> Result<Opti
     Ok(None)
 }
 
-pub fn handle_permission_confirm_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_permission_confirm_key(
+    app: &mut App,
+    code: KeyCode,
+) -> AppResult<Option<SendAction>> {
     match code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
@@ -86,7 +89,7 @@ pub fn handle_permission_confirm_key(app: &mut App, code: KeyCode) -> Result<Opt
     Ok(None)
 }
 
-pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     match app.mcp_add_mode {
         McpAddMode::None => match code {
             KeyCode::Esc => {
@@ -182,7 +185,7 @@ pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>
     Ok(None)
 }
 
-pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     match app.ssh_add_mode {
         SshAddMode::None => match code {
             KeyCode::Esc => {
@@ -253,7 +256,7 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>
     Ok(None)
 }
 
-pub fn handle_skill_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_skill_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     match app.skill_add_mode {
         SkillAddMode::None => match code {
             KeyCode::Esc => {

@@ -70,10 +70,10 @@ impl EmbeddingModelResolution {
     pub fn require_ready(
         &self,
         disabled_message: &'static str,
-    ) -> anyhow::Result<MayEmbeddingModel> {
+    ) -> Result<MayEmbeddingModel, EmbeddingModelRequireError> {
         match self {
-            Self::Disabled => Err(anyhow::anyhow!(disabled_message)),
-            Self::Failed(error) => Err(anyhow::anyhow!(error.to_string())),
+            Self::Disabled => Err(EmbeddingModelRequireError::Disabled(disabled_message)),
+            Self::Failed(error) => Err(EmbeddingModelRequireError::Resolution(error.clone())),
             Self::Ready(model) => Ok(model.clone()),
         }
     }
@@ -134,11 +134,11 @@ impl EmbeddingModel for MayEmbeddingModel {
                 }
             }
 
-            Err(anyhow::anyhow!(
-                "embedding request failed for model '{}' across providers: {}",
+            Err(EmbeddingRequestError {
                 model_id,
-                failures.join(" | ")
-            ))
+                details: failures.join(" | "),
+            }
+            .into())
         }
     }
 }
@@ -172,6 +172,21 @@ pub enum EmbeddingProviderError {
     },
     #[error("embedding probe failed for every provider serving '{model_id}': {details}")]
     ProbeFailed { model_id: String, details: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EmbeddingModelRequireError {
+    #[error("{0}")]
+    Disabled(&'static str),
+    #[error("{0}")]
+    Resolution(EmbeddingProviderError),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("embedding request failed for model '{model_id}' across providers: {details}")]
+struct EmbeddingRequestError {
+    model_id: String,
+    details: String,
 }
 
 pub async fn resolve_embedding_model(

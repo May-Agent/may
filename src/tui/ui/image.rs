@@ -5,7 +5,6 @@
 //!
 //! The Picker must be initialized before entering raw mode and is stored in App state.
 
-use anyhow;
 use image::DynamicImage;
 use ratatui::prelude::*;
 
@@ -152,6 +151,14 @@ pub async fn fetch_image(url: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ImageFetchError {
+    #[error("failed to prepare image request: {0}")]
+    Request(String),
+    #[error("failed to download image bytes: {0}")]
+    Download(String),
+}
+
 /// Check if the data starts with valid image format magic bytes.
 fn is_valid_image_format(data: &[u8]) -> bool {
     if data.len() < 8 {
@@ -192,19 +199,23 @@ fn is_valid_image_format(data: &[u8]) -> bool {
 }
 
 /// Fetch image bytes from HTTP URL using zenwave.
-async fn fetch_image_http(url: &str) -> anyhow::Result<Vec<u8>> {
+async fn fetch_image_http(url: &str) -> Result<Vec<u8>, ImageFetchError> {
     use zenwave::{Client, client, header};
 
     let mut backend = client();
     let bytes = backend
-        .get(url)?
+        .get(url)
+        .map_err(|error| ImageFetchError::Request(error.to_string()))?
         .header(
             header::USER_AGENT.as_str(),
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        )?
-        .header(header::ACCEPT.as_str(), "image/*,*/*")?
+        )
+        .map_err(|error| ImageFetchError::Request(error.to_string()))?
+        .header(header::ACCEPT.as_str(), "image/*,*/*")
+        .map_err(|error| ImageFetchError::Request(error.to_string()))?
         .bytes()
-        .await?;
+        .await
+        .map_err(|error| ImageFetchError::Download(error.to_string()))?;
 
     Ok(bytes.to_vec())
 }
