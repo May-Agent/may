@@ -33,33 +33,24 @@ use crate::copilot::clear_copilot_credentials;
 use crate::embedding_provider::{EmbeddingModelResolution, resolve_embedding_model};
 use crate::live_response::LiveResponseRegistry;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
-use crate::session::{MessageRole, SessionId, SessionPaths, SessionPlanState};
+use crate::session::{SessionId, SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
 use crate::subagent::SubagentManager;
 use crate::terminal_commands::{SharedTerminalCommandConfig, register_shared_terminal_commands};
 use crate::terminal_permission_handler::TerminalPermissionHandler;
+use crate::text::{join_text, prefixed_display, quoted_text};
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 use crate::workspace_request::WorkspaceRequestBroker;
 
 // Error message templates
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
 
-fn join_text(parts: &[&str]) -> String {
-    let capacity = parts.iter().map(|part| part.len()).sum();
-    let mut output = String::with_capacity(capacity);
-    for part in parts {
-        output.push_str(part);
-    }
-    output
-}
-
 fn quoted_name_error(prefix: &str, name: &str, suffix: &str) -> String {
-    join_text(&[prefix, "'", name, "'", suffix])
+    quoted_text(prefix, name, suffix)
 }
 
 fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
-    let error_text = error.to_string();
-    join_text(&[prefix, error_text.as_str()])
+    prefixed_display(prefix, error)
 }
 
 fn err_no_provider(model: &str) -> String {
@@ -552,20 +543,11 @@ impl PermissionApprover {
         mode: TerminalMode,
         script: &str,
     ) -> Result<(), PermissionError> {
-        let content = serde_json::to_string(&crate::session::history::PermissionRequestData {
-            id: request_id.to_string(),
-            mode: PermissionHistoryMode::from(mode),
-            script: script.to_string(),
-        })
-        .map_err(anyhow::Error::from)
-        .map_err(PermissionError::Internal)?;
-
-        db.append_message(
+        db.append_permission_request_message(
             session_id,
-            MessageRole::PermissionRequest,
-            &content,
-            None,
-            None,
+            request_id,
+            PermissionHistoryMode::from(mode),
+            script,
             None,
         )
         .await
@@ -2537,26 +2519,57 @@ fn build_macos_host_automation_context() -> Option<Platform> {
 }
 
 fn is_running_in_container() -> bool {
-    if std::env::var_os("container").is_some() {
-        return true;
+    ContainerDetector::default().detect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerSignalKind {
+    EnvVar,
+    DockerEnvFile,
+    ContainerEnvFile,
+    OverlayRootFs,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContainerDetector;
+
+impl ContainerDetector {
+    fn detect(&self) -> bool {
+        self.detect_signal().is_some()
     }
 
-    if std::path::Path::new("/.dockerenv").exists()
-        || std::path::Path::new("/run/.containerenv").exists()
-    {
-        return true;
+    fn detect_signal(&self) -> Option<ContainerSignalKind> {
+        if std::env::var_os("container").is_some() {
+            return Some(ContainerSignalKind::EnvVar);
+        }
+
+        if std::path::Path::new("/.dockerenv").exists() {
+            return Some(ContainerSignalKind::DockerEnvFile);
+        }
+
+        if std::path::Path::new("/run/.containerenv").exists() {
+            return Some(ContainerSignalKind::ContainerEnvFile);
+        }
+
+        self.proc_root_fs_type()
+            .filter(|fs_type| matches!(fs_type.as_str(), "overlay" | "aufs"))
+            .map(|_| ContainerSignalKind::OverlayRootFs)
     }
 
-    std::fs::read_to_string("/proc/1/cgroup")
-        .map(|content| {
-            let lower = content.to_ascii_lowercase();
-            lower.contains("docker")
-                || lower.contains("containerd")
-                || lower.contains("kubepods")
-                || lower.contains("podman")
-                || lower.contains("lxc")
-        })
-        .unwrap_or(false)
+    fn proc_root_fs_type(&self) -> Option<String> {
+        let mountinfo = std::fs::read_to_string("/proc/1/mountinfo").ok()?;
+        for line in mountinfo.lines() {
+            let (left, right) = line.split_once(" - ")?;
+            let mut left_fields = left.split_whitespace();
+            let mount_point = left_fields.nth(4)?;
+            if mount_point != "/" {
+                continue;
+            }
+            let fs_type = right.split_whitespace().next()?;
+            return Some(fs_type.to_string());
+        }
+        None
+    }
 }
 
 fn global_memory_file_path(may_dir: &std::path::Path) -> PathBuf {

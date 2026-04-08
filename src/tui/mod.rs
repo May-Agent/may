@@ -4,6 +4,7 @@ pub mod agent_event_adapter;
 pub mod app;
 pub mod clipboard;
 pub mod completion;
+pub mod error;
 pub mod event;
 pub mod history;
 pub mod queue;

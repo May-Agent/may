@@ -72,6 +72,8 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub enum BrowserInputError {
     #[error("navigate input requires a non-empty url")]
     EmptyNavigationUrl,
+    #[error("mouse input with event type {event_type:?} requires a button")]
+    MissingMouseButton { event_type: MouseEventType },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -174,6 +176,12 @@ enum MouseEventType {
     MouseReleased,
     MouseMoved,
     MouseWheel,
+}
+
+impl MouseEventType {
+    const fn requires_button(&self) -> bool {
+        matches!(self, Self::MousePressed | Self::MouseReleased)
+    }
 }
 
 impl From<MouseEventType> for DispatchMouseEventType {
@@ -1589,11 +1597,17 @@ async fn handle_input_message(page: &Page, text: &str) -> Result<(), BrowserErro
 }
 
 async fn dispatch_mouse(page: &Page, input: MouseInput) -> Result<(), BrowserError> {
-    let event_type = DispatchMouseEventType::from(input.event_type);
-    let button = input.button.map_or(MouseButton::None, MouseButton::from);
+    let event_type = input.event_type;
+    let button = match input.button {
+        Some(button) => MouseButton::from(button),
+        None if event_type.requires_button() => {
+            return Err(BrowserInputError::MissingMouseButton { event_type }.into());
+        }
+        None => MouseButton::None,
+    };
 
     let mut builder = DispatchMouseEventParams::builder()
-        .r#type(event_type)
+        .r#type(DispatchMouseEventType::from(event_type))
         .x(input.x)
         .y(input.y)
         .button(button);

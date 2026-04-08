@@ -36,12 +36,11 @@ pub(super) async fn append_history_message(
     state: &Arc<UiServerState>,
     session_id: &SessionId,
     message: ChatMessage,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::db::ChatDbError> {
     state
         .db()
         .append_chat_message(session_id.as_str(), &message)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     Ok(())
 }
 

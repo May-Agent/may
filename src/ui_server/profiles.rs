@@ -10,7 +10,7 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
 use crate::db::{ChatDbError, CreateProfileParams, ProfileEnvironmentKind, UpdateProfileParams};
-use crate::profile::{ProfileInfo, query_profile_sessions};
+use crate::profile::{ProfileInfo, ProfilePreferences, query_profile_sessions};
 use crate::ui_event_bus::UiEventTopics;
 
 use super::error::{bad_request_error, internal_error, json_ok_response, typed_error_response};
@@ -32,7 +32,7 @@ pub(super) struct CreateProfileRequest {
     #[serde(default)]
     pub persona: Option<String>,
     #[serde(default)]
-    pub preferences: Option<serde_json::Value>,
+    pub preferences: Option<ProfilePreferences>,
     #[serde(default)]
     pub location_aware: bool,
 }
@@ -129,13 +129,22 @@ pub(super) async fn ensure_profile_environment_ready(
         }
     };
 
-    let default_image_tag = crate::container::profile::default_image_tag(&state.may_dir, &profile)
+    let container_preferences = db
+        .load_container_profile_preferences(&profile)
         .await
         .map_err(internal_error)?;
+    let default_image_tag = crate::container::profile::default_image_tag(
+        &state.may_dir,
+        &profile,
+        container_preferences.clone(),
+    )
+    .await
+    .map_err(internal_error)?;
     let image_spec = crate::container::profile::image_spec_for_profile(
         &state.may_dir,
         &profile,
         &default_image_tag,
+        container_preferences,
     )
     .map_err(internal_error)?;
 
@@ -255,7 +264,7 @@ pub(super) struct UpdateProfileRequest {
     #[serde(default)]
     pub persona: Option<String>,
     #[serde(default)]
-    pub preferences: Option<serde_json::Value>,
+    pub preferences: Option<ProfilePreferences>,
     #[serde(default)]
     pub location_aware: Option<bool>,
 }
@@ -301,12 +310,6 @@ pub(super) async fn create_profile(
     let db = state.db();
 
     let id = uuid::Uuid::new_v4().to_string();
-    let preferences_json = req
-        .preferences
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(internal_error)?;
     let model = db
         .create_profile(CreateProfileParams {
             id: &id,
@@ -316,7 +319,7 @@ pub(super) async fn create_profile(
             slug: None,
             icon: req.icon.as_deref(),
             persona: req.persona.as_deref(),
-            preferences_json: preferences_json.as_deref(),
+            preferences: req.preferences.as_ref(),
             location_aware: req.location_aware,
         })
         .await
@@ -326,7 +329,9 @@ pub(super) async fn create_profile(
         .map_err(internal_error)?;
 
     Ok(Json(
-        ProfileInfo::from_db_model(model).map_err(map_profile_error)?,
+        db.profile_info_from_model(model)
+            .await
+            .map_err(map_profile_error)?,
     ))
 }
 
@@ -339,12 +344,6 @@ pub(super) async fn update_profile(
 
     let db = state.db();
 
-    let preferences_json = req
-        .preferences
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(internal_error)?;
     db.update_profile(
         &id,
         UpdateProfileParams {
@@ -355,7 +354,7 @@ pub(super) async fn update_profile(
             container_id: None,
             sort_order: req.sort_order,
             persona: req.persona.as_deref().map(Some),
-            preferences_json: preferences_json.as_deref().map(Some),
+            preferences: req.preferences.as_ref().map(Some),
             location_aware: req.location_aware,
         },
     )
@@ -372,7 +371,9 @@ pub(super) async fn update_profile(
         .map_err(internal_error)?;
 
     Ok(Json(
-        ProfileInfo::from_db_model(model).map_err(map_profile_error)?,
+        db.profile_info_from_model(model)
+            .await
+            .map_err(map_profile_error)?,
     ))
 }
 

@@ -541,6 +541,7 @@ pub enum TerminalCommandMode {
 #[serde(rename_all = "camelCase")]
 pub struct ApiTerminalExecution {
     pub(crate) id: String,
+    pub(crate) description: String,
     pub(crate) input: String,
     #[serde(default)]
     pub(crate) output: Option<String>,

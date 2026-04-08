@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::RemoteAccessConfig;
 use crate::db::ChatDb;
+use crate::text::prefixed_text;
 use crate::ui_event_bus::UiEventBus;
 
 use super::error::{bad_request_error, internal_error};
@@ -29,6 +30,7 @@ struct RemoteAccessLaunchSpec {
 struct RemoteAccessRuntime {
     status: RemoteAccessStatusResponse,
     launch_spec: Option<RemoteAccessLaunchSpec>,
+    last_stderr_line: Option<String>,
 }
 
 impl Default for RemoteAccessRuntime {
@@ -42,6 +44,7 @@ impl Default for RemoteAccessRuntime {
                 recent_logs: Vec::new(),
             },
             launch_spec: None,
+            last_stderr_line: None,
         }
     }
 }
@@ -60,6 +63,7 @@ enum RemoteAccessCommand {
 enum RemoteAccessEvent {
     Stdout(String),
     Stderr(String),
+    ReaderError(String),
 }
 
 #[derive(Clone)]
@@ -220,12 +224,18 @@ async fn run_remote_access_actor(
                 }
             }
             Some(event) = event_rx.recv() => {
-                let line = match event {
-                    RemoteAccessEvent::Stdout(line) | RemoteAccessEvent::Stderr(line) => line,
-                };
-                push_log(&mut runtime.status.recent_logs, line.clone());
-                if line.to_ascii_lowercase().contains("error") {
-                    runtime.status.last_error = Some(line);
+                match event {
+                    RemoteAccessEvent::Stdout(line) => {
+                        push_log(&mut runtime.status.recent_logs, line);
+                    }
+                    RemoteAccessEvent::Stderr(line) => {
+                        runtime.last_stderr_line = Some(line.clone());
+                        push_log(&mut runtime.status.recent_logs, line);
+                    }
+                    RemoteAccessEvent::ReaderError(message) => {
+                        runtime.status.last_error = Some(message.clone());
+                        push_log(&mut runtime.status.recent_logs, message);
+                    }
                 }
                 publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
             }
@@ -245,10 +255,12 @@ async fn run_remote_access_actor(
                             runtime.status.last_error = Some(if success {
                                 "cloudflared exited unexpectedly".to_string()
                             } else {
-                                prefixed_text(
-                                    "cloudflared exited with code ",
-                                    code.to_string().as_str(),
-                                )
+                                runtime.last_stderr_line.clone().unwrap_or_else(|| {
+                                    prefixed_text(
+                                        "cloudflared exited with code ",
+                                        code.to_string().as_str(),
+                                    )
+                                })
                             });
                             publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
                         }
@@ -285,6 +297,7 @@ async fn sync_remote_access_runtime(
         runtime.status.enabled = false;
         runtime.status.state = RemoteAccessState::Disabled;
         runtime.status.last_error = None;
+        runtime.last_stderr_line = None;
         publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
         return Ok(());
     }
@@ -298,6 +311,7 @@ async fn sync_remote_access_runtime(
     {
         runtime.status.state = RemoteAccessState::Running;
         runtime.status.last_error = None;
+        runtime.last_stderr_line = None;
         publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
         return Ok(());
     }
@@ -307,6 +321,7 @@ async fn sync_remote_access_runtime(
     runtime.status.public_url = Some(launch_spec.public_url.clone());
     runtime.status.state = RemoteAccessState::Starting;
     runtime.status.last_error = None;
+    runtime.last_stderr_line = None;
     publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
 
     let mut process = tokio::process::Command::new(launch_spec.cloudflared_binary.as_str())
@@ -357,6 +372,7 @@ async fn stop_remote_access_runtime(
         let _ = process.wait().await;
     }
     runtime.launch_spec = None;
+    runtime.last_stderr_line = None;
     runtime.status.state = if runtime.status.enabled {
         RemoteAccessState::Error
     } else {
@@ -421,7 +437,7 @@ fn spawn_remote_access_log_reader(
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    let _ = event_tx.send(RemoteAccessEvent::Stderr(error.to_string()));
+                    let _ = event_tx.send(RemoteAccessEvent::ReaderError(error.to_string()));
                     break;
                 }
             }
@@ -440,13 +456,6 @@ fn push_log(logs: &mut Vec<String>, line: String) {
         let _ = deque.pop_front();
     }
     *logs = deque.into_iter().collect();
-}
-
-fn prefixed_text(prefix: &str, suffix: &str) -> String {
-    let mut text = String::with_capacity(prefix.len() + suffix.len());
-    text.push_str(prefix);
-    text.push_str(suffix);
-    text
 }
 
 fn publish_remote_access_status(

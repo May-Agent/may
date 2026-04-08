@@ -16,6 +16,36 @@ use tokio::sync::{OnceCell, mpsc, oneshot, watch};
 use zenwave::Client;
 use zenwave::ResponseExt;
 
+#[derive(Debug, thiserror::Error)]
+pub enum LocalUrlProxyError {
+    #[error("failed to bind local url proxy listener: {0}")]
+    BindListener(#[from] std::io::Error),
+    #[error("failed to parse local proxy target URL: {0}")]
+    ParseTargetUrl(#[from] url::ParseError),
+    #[error("local-url map only supports http/https, got {scheme}")]
+    UnsupportedScheme { scheme: String },
+    #[error("local-url map requires a known port")]
+    MissingKnownPort,
+    #[error("local url proxy mapper actor is unavailable")]
+    ActorUnavailable,
+    #[error("local url proxy mapper actor dropped reply")]
+    ActorReplyDropped,
+    #[error("unsupported request method {method}: {source}")]
+    UnsupportedRequestMethod {
+        method: String,
+        #[source]
+        source: hyper::http::method::InvalidMethod,
+    },
+    #[error("failed to read proxy request body: {0}")]
+    ReadRequestBody(#[source] hyper::Error),
+    #[error("failed to build or execute upstream proxy request: {0}")]
+    UpstreamRequest(#[from] zenwave::Error),
+    #[error("failed to read upstream proxy response body: {0}")]
+    ReadUpstreamResponseBody(#[from] zenwave::BodyError),
+    #[error("invalid upstream status code: {0}")]
+    InvalidUpstreamStatus(#[from] hyper::http::status::InvalidStatusCode),
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum ProxyScheme {
     Http,
@@ -105,7 +135,7 @@ impl LocalUrlProxySlot {
         self: &Arc<Self>,
         key: &LocalUrlProxyKey,
         command_tx: &mpsc::UnboundedSender<LocalUrlProxyCommand>,
-    ) -> anyhow::Result<u16> {
+    ) -> Result<u16, LocalUrlProxyError> {
         let entry = self
             .entry
             .get_or_try_init(|| async {
@@ -125,7 +155,7 @@ impl LocalUrlProxySlot {
                     });
                 });
 
-                Ok::<LocalUrlProxyEntry, anyhow::Error>(LocalUrlProxyEntry {
+                Ok::<LocalUrlProxyEntry, LocalUrlProxyError>(LocalUrlProxyEntry {
                     mapped_port,
                     shutdown_tx,
                 })
@@ -139,7 +169,7 @@ enum LocalUrlProxyCommand {
     EnsurePort {
         key: LocalUrlProxyKey,
         upstream: LocalUrlProxyUpstream,
-        reply: oneshot::Sender<anyhow::Result<u16>>,
+        reply: oneshot::Sender<Result<u16, LocalUrlProxyError>>,
     },
     Drop {
         key: LocalUrlProxyKey,
@@ -169,7 +199,7 @@ impl LocalUrlPortMapper {
         self: &Arc<Self>,
         key: LocalUrlProxyKey,
         upstream: LocalUrlProxyUpstream,
-    ) -> anyhow::Result<u16> {
+    ) -> Result<u16, LocalUrlProxyError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(LocalUrlProxyCommand::EnsurePort {
@@ -177,10 +207,10 @@ impl LocalUrlPortMapper {
                 upstream,
                 reply: reply_tx,
             })
-            .map_err(|_| anyhow::anyhow!("local url proxy mapper actor is unavailable"))?;
+            .map_err(|_| LocalUrlProxyError::ActorUnavailable)?;
         reply_rx
             .await
-            .map_err(|_| anyhow::anyhow!("local url proxy mapper actor dropped reply"))?
+            .map_err(|_| LocalUrlProxyError::ActorReplyDropped)?
     }
 }
 
@@ -219,7 +249,7 @@ async fn ensure_local_url_proxy_port(
     key: LocalUrlProxyKey,
     upstream: LocalUrlProxyUpstream,
     command_tx: mpsc::UnboundedSender<LocalUrlProxyCommand>,
-) -> anyhow::Result<u16> {
+) -> Result<u16, LocalUrlProxyError> {
     loop {
         if let Some(existing) = entries.get(&key).cloned() {
             if existing.upstream == upstream {
@@ -297,7 +327,7 @@ async fn proxy_http_request(
 async fn proxy_http_request_impl(
     request: HyperRequest<Incoming>,
     upstream: LocalUrlProxyUpstream,
-) -> anyhow::Result<HyperResponse<Full<Bytes>>> {
+) -> Result<HyperResponse<Full<Bytes>>, LocalUrlProxyError> {
     let path_and_query = request
         .uri()
         .path_and_query()
@@ -312,7 +342,12 @@ async fn proxy_http_request_impl(
 
     let method = to_zenwave_method(request.method())?;
     let (parts, body) = request.into_parts();
-    let body_bytes = body.collect().await?.to_bytes().to_vec();
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(LocalUrlProxyError::ReadRequestBody)?
+        .to_bytes()
+        .to_vec();
 
     let mut client = zenwave::client();
     let mut upstream_request = client.method(method, upstream_url.as_str())?;
@@ -363,11 +398,14 @@ async fn proxy_http_request_impl(
     Ok(response)
 }
 
-fn to_zenwave_method(method: &Method) -> anyhow::Result<zenwave::Method> {
+fn to_zenwave_method(method: &Method) -> Result<zenwave::Method, LocalUrlProxyError> {
     method
         .as_str()
         .parse::<zenwave::Method>()
-        .map_err(|error| anyhow::anyhow!("unsupported request method {}: {error}", method.as_str()))
+        .map_err(|source| LocalUrlProxyError::UnsupportedRequestMethod {
+            method: method.as_str().to_string(),
+            source,
+        })
 }
 
 fn should_skip_request_header(name: &HeaderName) -> bool {
@@ -422,12 +460,17 @@ pub fn target_host_header(target: &url::Url, port: u16) -> String {
     }
 }
 
-pub fn parse_local_proxy_target(url: &str) -> anyhow::Result<(url::Url, ProxyScheme, u16)> {
+pub fn parse_local_proxy_target(
+    url: &str,
+) -> Result<(url::Url, ProxyScheme, u16), LocalUrlProxyError> {
     let parsed = url::Url::parse(url)?;
-    let scheme = ProxyScheme::from_str(parsed.scheme())
-        .ok_or_else(|| anyhow::anyhow!("local-url map only supports http/https"))?;
+    let scheme = ProxyScheme::from_str(parsed.scheme()).ok_or_else(|| {
+        LocalUrlProxyError::UnsupportedScheme {
+            scheme: parsed.scheme().to_string(),
+        }
+    })?;
     let port = parsed
         .port_or_known_default()
-        .ok_or_else(|| anyhow::anyhow!("local-url map requires a known port"))?;
+        .ok_or(LocalUrlProxyError::MissingKnownPort)?;
     Ok((parsed, scheme, port))
 }

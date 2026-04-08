@@ -1,6 +1,6 @@
 //! DB message → API message mapping.
 
-use crate::session::history::MessageRole;
+use crate::session::{MessageRole, PersistedMessage, PersistedMessageError};
 
 use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::types::{
@@ -10,15 +10,13 @@ use super::types::{
 /// Convert DB message rows to API messages, with native terminal execution tracking.
 pub(super) fn map_db_messages(
     db_messages: &[crate::db::entity::messages::Model],
-) -> Vec<ApiMessage> {
+) -> Result<Vec<ApiMessage>, PersistedMessageError> {
     let mut out = Vec::new();
     let mut snapshot = TerminalStateSnapshot::default();
 
     for (idx, msg) in db_messages.iter().enumerate() {
-        let Ok(role) = MessageRole::from_str(&msg.role) else {
-            continue;
-        };
-        match role {
+        let persisted = PersistedMessage::try_from(msg)?;
+        match persisted.role {
             MessageRole::Tool => {
                 if let Ok(record) = serde_json::from_str::<ToolEventRecord>(&msg.content) {
                     update_terminal_snapshot_from_tool_event(&mut snapshot, &record);
@@ -33,16 +31,11 @@ pub(super) fn map_db_messages(
             | MessageRole::AskUserResponse
             | MessageRole::HiddenContext => continue,
             MessageRole::User | MessageRole::Assistant | MessageRole::System => {
-                let timestamp = msg
-                    .timestamp
-                    .as_deref()
-                    .and_then(|t| jiff::Timestamp::strptime("%Y-%m-%dT%H:%M:%S%.fZ", t).ok())
-                    .unwrap_or_else(jiff::Timestamp::now)
-                    .to_string();
+                let timestamp = persisted.require_timestamp()?.to_string();
 
                 let mut api_msg = ApiMessage {
                     id: format!("msg-{idx}"),
-                    role: role.as_str().to_string(),
+                    role: persisted.role.as_str().to_string(),
                     content: msg.content.clone(),
                     timestamp,
                     attachments: Vec::new(),
@@ -54,7 +47,7 @@ pub(super) fn map_db_messages(
                     stats: map_db_message_stats(msg),
                 };
 
-                if role == MessageRole::Assistant
+                if persisted.role == MessageRole::Assistant
                     && (!snapshot.executions.is_empty() || !snapshot.running_by_call_id.is_empty())
                 {
                     api_msg.terminal_executions = snapshot.all_executions();
@@ -65,7 +58,7 @@ pub(super) fn map_db_messages(
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn map_db_message_stats(msg: &crate::db::entity::messages::Model) -> Option<RequestStats> {

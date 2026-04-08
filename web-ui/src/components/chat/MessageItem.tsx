@@ -6,8 +6,9 @@ import { buildSessionOutputPreviewUrl, fetchSessionTasks, saveSessionTasks } fro
 import type { ArtifactPreviewTarget, Message, SessionPlanState } from '@/types';
 import { useStore } from '@/lib/store';
 import { extractArtifactPreviewTargets, stripArtifactPreviewTags } from './chatUtils';
+import { AttachmentCard } from './AttachmentCard';
 import ReactMarkdown from 'react-markdown';
-import { Copy, Check, FileText, File, ChevronRight, RotateCcw, Download, Terminal, Globe, Search, Loader2 } from 'lucide-react';
+import { Copy, Check, FileText, ChevronRight, RotateCcw, Download, Terminal, Globe, Search, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
 
@@ -101,18 +102,30 @@ function formatDurationMs(durationMs: number): string {
 
 function buildRunningTimelineLabel(
   item: TimelineDisplayItem,
-  durationText: string,
 ): string {
   if (item.type === 'thinking') {
     return 'Thinking';
   }
   if (item.type === 'command') {
-    return `Running command for ${durationText}`;
+    return item.description.trim();
   }
   if (item.type === 'websearch') {
     return 'Searching the web';
   }
   return 'Fetching page';
+}
+
+function buildCollapsedTimelineLabel(item: TimelineDisplayItem): string {
+  if (item.type === 'thinking') {
+    return 'Thinking';
+  }
+  if (item.type === 'command') {
+    return item.description.trim();
+  }
+  if (item.type === 'websearch') {
+    return 'Web search';
+  }
+  return 'Web fetch';
 }
 
 interface ParsedCommandImage {
@@ -124,6 +137,9 @@ interface ParsedCommandImage {
 
 interface ParsedCommandOutput {
   text?: string;
+  stdoutText?: string;
+  stderrText?: string;
+  exitCode?: number;
   images: ParsedCommandImage[];
   storagePaths: string[];
 }
@@ -224,12 +240,33 @@ function parseJsonLike(value: string): unknown {
   }
 }
 
+function unwrapStructuredOutputNode(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+  const node = value as Record<string, unknown>;
+  const kind =
+    typeof node.kind === 'string' ? node.kind.trim().toLowerCase() : '';
+  if (kind === 'json' && node.value !== undefined) {
+    return node.value;
+  }
+  if ((kind === 'text' || kind === 'error') && node.value !== undefined) {
+    return node.value;
+  }
+  return value;
+}
+
 function parseOutputEntry(
   entry: unknown,
   parsed: ParsedCommandOutput,
   textChunks: string[],
   sourcePath?: string,
 ) {
+  const unwrappedEntry = unwrapStructuredOutputNode(entry);
+  if (unwrappedEntry !== entry) {
+    parseOutputEntry(unwrappedEntry, parsed, textChunks, sourcePath);
+    return;
+  }
   if (entry === null || entry === undefined) {
     return;
   }
@@ -271,11 +308,23 @@ function parseOutputEntry(
   const content = node.content;
   const payload =
     content && typeof content === 'object' && !Array.isArray(content)
-      ? (content as Record<string, unknown>)
+      ? (unwrapStructuredOutputNode(content) as Record<string, unknown>)
       : node;
-  const kind = typeof payload.type === 'string' ? payload.type.trim().toLowerCase() : '';
+  const kindSource =
+    typeof payload.type === 'string'
+      ? payload.type
+      : typeof payload.kind === 'string'
+        ? payload.kind
+        : '';
+  const kind = kindSource.trim().toLowerCase();
   if (kind === 'text') {
-    const text = typeof payload.text === 'string' ? payload.text : '';
+    const textCandidate =
+      typeof payload.text === 'string'
+        ? payload.text
+        : typeof payload.value === 'string'
+          ? payload.value
+          : '';
+    const text = textCandidate;
     if (text.trim().length > 0) {
       if (isLikelyBinaryTextPayload(text)) {
         return;
@@ -285,7 +334,12 @@ function parseOutputEntry(
     return;
   }
   if (kind === 'image') {
-    const encoded = typeof payload.data === 'string' ? payload.data.trim() : '';
+    const encoded =
+      typeof payload.data === 'string'
+        ? payload.data.trim()
+        : typeof payload.value === 'string'
+          ? payload.value.trim()
+          : '';
     if (!encoded) {
       return;
     }
@@ -354,32 +408,71 @@ function parseOutputEntry(
 }
 
 function parseCommandOutput(output?: string): ParsedCommandOutput {
-  const parsed: ParsedCommandOutput = {
-    images: [],
-    storagePaths: [],
-  };
   if (!output || output.trim().length === 0) {
-    return parsed;
+    return {
+      images: [],
+      storagePaths: [],
+    };
   }
 
-  const interpreted = parseJsonLike(output);
-  const textChunks: string[] = [];
-
-  parseOutputEntry(interpreted, parsed, textChunks);
-
-  if (textChunks.length === 0 && parsed.images.length === 0 && parsed.storagePaths.length === 0) {
-    if (isLikelyBinaryTextPayload(output)) {
+  const buildParsedOutput = (entry: unknown, sourcePath?: string): ParsedCommandOutput => {
+    const parsed: ParsedCommandOutput = {
+      images: [],
+      storagePaths: [],
+    };
+    const textChunks: string[] = [];
+    parseOutputEntry(entry, parsed, textChunks, sourcePath);
+    if (textChunks.length === 0) {
       return parsed;
     }
-    parsed.text = formatCodeText(output, detectCodeLanguage(output));
-  } else if (textChunks.length > 0) {
     const merged = textChunks.join('\n\n').trim();
     if (merged.length > 0) {
       parsed.text = formatCodeText(merged, detectCodeLanguage(merged));
     }
+    parsed.storagePaths = [...new Set(parsed.storagePaths)];
+    return parsed;
+  };
+
+  const interpreted = unwrapStructuredOutputNode(parseJsonLike(output));
+  if (
+    interpreted &&
+    typeof interpreted === 'object' &&
+    !Array.isArray(interpreted)
+  ) {
+    const record = interpreted as Record<string, unknown>;
+    const hasTerminalShape =
+      Object.prototype.hasOwnProperty.call(record, 'stdout') ||
+      Object.prototype.hasOwnProperty.call(record, 'stderr') ||
+      Object.prototype.hasOwnProperty.call(record, 'exit_code');
+    if (hasTerminalShape) {
+      const stdout = buildParsedOutput(record.stdout);
+      const stderr = buildParsedOutput(record.stderr);
+      return {
+        text: stdout.text ?? stderr.text,
+        stdoutText: stdout.text,
+        stderrText: stderr.text,
+        exitCode:
+          typeof record.exit_code === 'number' ? record.exit_code : undefined,
+        images: [...stdout.images, ...stderr.images],
+        storagePaths: [...new Set([...stdout.storagePaths, ...stderr.storagePaths])],
+      };
+    }
   }
 
-  parsed.storagePaths = [...new Set(parsed.storagePaths)];
+  const parsed = buildParsedOutput(interpreted);
+  if (
+    !parsed.text &&
+    parsed.images.length === 0 &&
+    parsed.storagePaths.length === 0
+  ) {
+    if (isLikelyBinaryTextPayload(output)) {
+      return parsed;
+    }
+    return {
+      ...parsed,
+      text: formatCodeText(output, detectCodeLanguage(output)),
+    };
+  }
   return parsed;
 }
 
@@ -405,6 +498,7 @@ interface CommandTimelineDisplayItem {
   id: string;
   type: 'command';
   summary: string;
+  description: string;
   commandInput: string;
   parsedOutput: ParsedCommandOutput;
   outputText: string;
@@ -564,6 +658,35 @@ function StoredOutputImage({ src, alt }: { src: string; alt: string }) {
   );
 }
 
+function CommandCodePanel({
+  label,
+  code,
+  language,
+}: {
+  label: string;
+  code: string;
+  language: 'shell' | 'json' | 'text';
+}) {
+  return (
+    <div className="overflow-hidden rounded-md border border-zinc-800 bg-zinc-950/80">
+      <div className="border-b border-zinc-800 px-2.5 py-1.5 text-[10px] font-medium uppercase tracking-[0.12em] text-zinc-500">
+        {label}
+      </div>
+      <Suspense
+        fallback={
+          <pre className="max-h-[260px] overflow-y-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+            {code}
+          </pre>
+        }
+      >
+        <div className="max-h-[260px] overflow-y-auto scrollbar-none">
+          <LazySyntaxCodeBlock language={language} code={code} />
+        </div>
+      </Suspense>
+    </div>
+  );
+}
+
 function makeComponents(isUser: boolean, isStreaming: boolean) {
   return {
     code({ className, children, ...props }: any) {
@@ -611,9 +734,8 @@ export function MessageItem({
   const isUser = message.role === 'user';
   const isStreaming = !!message.isStreaming;
   const terminalExecutions = message.terminalExecutions || [];
-  const [isTimelineOpen, setIsTimelineOpen] = useState(false);
   const [expandedTimelineItemIds, setExpandedTimelineItemIds] = useState<Record<string, boolean>>({});
-  const hasSeenRunningTimelineRef = useRef(false);
+  const timelineExpansionOverridesRef = useRef<Record<string, boolean>>({});
   const [showTyping, setShowTyping] = useState(false);
   const [tasksContent, setTasksContent] = useState("");
   const [tasksDraft, setTasksDraft] = useState("");
@@ -666,6 +788,7 @@ export function MessageItem({
           id: command.id,
           type: 'command',
           summary: toSingleLineSummary(command.input, 96) || '(empty command)',
+          description: command.description,
           commandInput: command.input,
           parsedOutput,
           outputText: parsedOutput.text
@@ -702,6 +825,7 @@ export function MessageItem({
             id: command.id,
             type: 'command',
             summary: toSingleLineSummary(command.input, 96) || '(empty command)',
+            description: command.description,
             commandInput: command.input,
             parsedOutput,
             outputText: parsedOutput.text
@@ -787,9 +911,8 @@ export function MessageItem({
   const safeDisplayContent = suppressBinaryContent ? '' : displayContent;
 
   useEffect(() => {
-    setIsTimelineOpen(false);
     setExpandedTimelineItemIds({});
-    hasSeenRunningTimelineRef.current = false;
+    timelineExpansionOverridesRef.current = {};
   }, [message.id]);
 
   useEffect(() => {
@@ -862,69 +985,29 @@ export function MessageItem({
     onOpenPreview(previewTargets[previewTargets.length - 1]);
   }, [isUser, onOpenPreview, previewTargets]);
 
-  const runningTimelineItemIds = timelineItems
-    .filter((item) => item.isRunning)
-    .map((item) => item.id);
-  const runningTimelineKey = runningTimelineItemIds.join('|');
-  const hasRunningTimelineItem = runningTimelineItemIds.length > 0;
-
   useEffect(() => {
-    const runningIds = runningTimelineKey.length > 0
-      ? runningTimelineKey.split('|').filter((value) => value.length > 0)
-      : [];
-    if (runningIds.length > 0) {
-      hasSeenRunningTimelineRef.current = true;
-      setIsTimelineOpen(true);
-      setExpandedTimelineItemIds(
-        runningIds.reduce<Record<string, boolean>>((acc, id) => {
-          acc[id] = true;
-          return acc;
-        }, {}),
+    const visibleTimelineItemIds = new Set(timelineItems.map((item) => item.id));
+    setExpandedTimelineItemIds((previous) => {
+      const nextEntries = Object.entries(previous).filter(([itemId]) =>
+        visibleTimelineItemIds.has(itemId),
       );
-      return;
+      const next = Object.fromEntries(nextEntries);
+      for (const item of timelineItems) {
+        if (timelineExpansionOverridesRef.current[item.id] !== undefined) {
+          continue;
+        }
+        next[item.id] = item.isRunning;
+      }
+      return next;
+    });
+    for (const itemId of Object.keys(timelineExpansionOverridesRef.current)) {
+      if (!visibleTimelineItemIds.has(itemId)) {
+        delete timelineExpansionOverridesRef.current[itemId];
+      }
     }
-    if (hasSeenRunningTimelineRef.current) {
-      setIsTimelineOpen(false);
-      setExpandedTimelineItemIds({});
-      hasSeenRunningTimelineRef.current = false;
-    }
-  }, [runningTimelineKey]);
+  }, [timelineItems]);
 
-  const commandCount = timelineItems.filter((item) => item.type === 'command').length;
-  const thinkingCount = timelineItems.filter((item) => item.type === 'thinking').length;
-  const webSearchCount = timelineItems.filter((item) => item.type === 'websearch').length;
-  const webFetchCount = timelineItems.filter((item) => item.type === 'webfetch').length;
-  const failedTimelineCount = timelineItems.filter((item) => item.isFailed).length;
-  const runningTimelineCount = runningTimelineItemIds.length;
   const nowMs = Date.now();
-  const timelineElapsedMs = timelineItems.reduce((sum, item) => {
-    const startedAt = item.startedAt;
-    if (!startedAt) {
-      return sum;
-    }
-    const endedAt = item.endedAt ?? (item.isRunning ? nowMs : startedAt);
-    const delta = Math.max(0, endedAt - startedAt);
-    return sum + delta;
-  }, 0);
-  const timelineElapsedText = formatDurationMs(timelineElapsedMs);
-  const summaryParts: string[] = [];
-  if (commandCount > 0) {
-    summaryParts.push(`Ran ${commandCount} command${commandCount > 1 ? 's' : ''}`);
-  }
-  if (webSearchCount > 0) {
-    summaryParts.push('searched the web');
-  }
-  if (webFetchCount > 0) {
-    summaryParts.push(`fetched ${webFetchCount} page${webFetchCount > 1 ? 's' : ''}`);
-  }
-  if (thinkingCount > 0 && commandCount === 0 && webSearchCount === 0 && webFetchCount === 0) {
-    summaryParts.push(`Thought ${thinkingCount} time${thinkingCount > 1 ? 's' : ''}`);
-  }
-  const timelineSummaryText =
-    summaryParts.length > 0
-      ? summaryParts.join(', ')
-      : `${timelineItems.length} step${timelineItems.length > 1 ? 's' : ''}`;
-  const effectiveTimelineOpen = hasRunningTimelineItem || isTimelineOpen;
 
   return (
     <motion.div
@@ -940,252 +1023,233 @@ export function MessageItem({
             : 'py-1 text-foreground w-full'
         )}>
           {!isUser && timelineItems.length > 0 && !message.toolEvent && (
-            <div className="mb-2 not-prose">
-              <button
-                type="button"
-                className="inline-flex w-full items-center gap-2 rounded-md px-1 py-1 text-left text-zinc-400 transition-colors hover:text-zinc-200"
-                onClick={() => {
-                  if (hasRunningTimelineItem) {
-                    return;
-                  }
-                  setIsTimelineOpen((prev) => !prev);
-                }}
-                aria-expanded={effectiveTimelineOpen}
-              >
-                <span className="truncate text-[15px] font-medium text-zinc-300">{timelineSummaryText}</span>
-                <span className="ml-auto inline-flex items-center gap-2 text-[12px] text-zinc-500">
-                  {runningTimelineCount > 0 ? (
-                    <span className="text-cyan-300">{runningTimelineCount} running</span>
-                  ) : failedTimelineCount > 0 ? (
-                    <span className="text-red-300">{failedTimelineCount} failed</span>
-                  ) : (
-                    <span>done</span>
-                  )}
-                  <span>{timelineElapsedText}</span>
-                </span>
-                <motion.span
-                  animate={{ rotate: effectiveTimelineOpen ? 90 : 0 }}
-                  transition={{ duration: 0.15, ease: 'easeOut' }}
-                  className="inline-flex h-4 w-4 items-center justify-center text-zinc-500"
-                >
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </motion.span>
-              </button>
+            <div className="mb-3 space-y-2 not-prose">
+              {timelineItems.map((item, index) => {
+                const isExpanded = expandedTimelineItemIds[item.id] === true;
+                const startedAt = item.startedAt ?? Date.parse(message.timestamp);
+                const normalizedStartedAt = Number.isFinite(startedAt) ? startedAt : nowMs;
+                const endedAt = item.endedAt ?? (item.isRunning ? nowMs : normalizedStartedAt);
+                const durationText = formatDurationMs(Math.max(0, endedAt - normalizedStartedAt));
+                const rowSummaryText = item.isRunning
+                  ? buildRunningTimelineLabel(item)
+                  : buildCollapsedTimelineLabel(item);
+                const storedPreviewItems =
+                  item.type === 'command' && sessionId && item.parsedOutput.storagePaths.length > 0
+                    ? item.parsedOutput.storagePaths.map((storagePath) => {
+                        try {
+                          return {
+                            storagePath,
+                            src: buildSessionOutputPreviewUrl(sessionId, storagePath),
+                          };
+                        } catch {
+                          return {
+                            storagePath,
+                            src: '',
+                          };
+                        }
+                      })
+                    : [];
 
-              <AnimatePresence initial={false}>
-                {effectiveTimelineOpen && (
-                  <motion.div
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: 'auto', opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
-                    className="overflow-hidden"
+                return (
+                  <div
+                    key={item.id}
+                    className={cn(
+                      'overflow-hidden rounded-lg border',
+                      item.isRunning
+                        ? 'border-zinc-700/70 bg-zinc-900/72'
+                        : 'border-zinc-800/80 bg-zinc-950/38',
+                    )}
                   >
-                    <div className="mt-1 rounded-xl border border-zinc-700/60 bg-zinc-900/45 px-3 py-2">
-                      <div className="max-h-[420px] overflow-y-auto pr-1 scrollbar-none">
-                        <div className="space-y-2">
-                          {timelineItems.map((item, index) => {
-                            const isExpanded = item.isRunning || expandedTimelineItemIds[item.id] === true;
-                            const startedAt = item.startedAt ?? Date.parse(message.timestamp);
-                            const normalizedStartedAt = Number.isFinite(startedAt) ? startedAt : nowMs;
-                            const endedAt = item.endedAt ?? (item.isRunning ? nowMs : normalizedStartedAt);
-                            const durationText = formatDurationMs(Math.max(0, endedAt - normalizedStartedAt));
-                            const rowSummaryText = item.isRunning
-                              ? buildRunningTimelineLabel(item, durationText)
-                              : item.summary;
-                            const storedPreviewItems =
-                              item.type === 'command' && sessionId && item.parsedOutput.storagePaths.length > 0
-                                ? item.parsedOutput.storagePaths.map((storagePath) => {
-                                    try {
-                                      return {
-                                        storagePath,
-                                        src: buildSessionOutputPreviewUrl(sessionId, storagePath),
-                                      };
-                                    } catch {
-                                      return {
-                                        storagePath,
-                                        src: '',
-                                      };
-                                    }
-                                  })
-                                : [];
-
-                            return (
-                              <div
-                                key={item.id}
-                                className={cn(
-                                  'rounded-lg border bg-zinc-900/70',
-                                  item.isRunning
-                                    ? 'border-zinc-700/90 bg-zinc-900/88'
-                                    : 'border-zinc-800',
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-2 px-2.5 py-2 text-left"
+                      onClick={() =>
+                        setExpandedTimelineItemIds((previous) => {
+                          const nextExpanded = !isExpanded;
+                          timelineExpansionOverridesRef.current[item.id] = nextExpanded;
+                          return {
+                            ...previous,
+                            [item.id]: nextExpanded,
+                          };
+                        })
+                      }
+                    >
+                      <span className="text-[11px] tabular-nums text-zinc-600">{index + 1}</span>
+                      {item.type === 'command' && <Terminal className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
+                      {item.type === 'thinking' && <FileText className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
+                      {item.type === 'websearch' && <Search className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
+                      {item.type === 'webfetch' && <Globe className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
+                      <span
+                        className={cn(
+                          'min-w-0 flex-1 truncate text-[14px]',
+                          'tracking-[0.01em]',
+                          item.isRunning
+                            ? 'timeline-running-label font-medium text-zinc-300'
+                            : 'text-zinc-300',
+                        )}
+                      >
+                        {rowSummaryText}
+                      </span>
+                      {item.isRunning ? (
+                        <span className="text-[11px] text-zinc-500">{durationText}</span>
+                      ) : item.isFailed ? (
+                        <span className="text-[11px] text-red-300">failed</span>
+                      ) : (
+                        <span className="text-[11px] text-zinc-500">{durationText}</span>
+                      )}
+                      <motion.span
+                        animate={{ rotate: isExpanded ? 90 : 0 }}
+                        transition={{ duration: 0.12 }}
+                        className="inline-flex h-4 w-4 items-center justify-center text-zinc-500"
+                      >
+                        <ChevronRight className="h-3.5 w-3.5" />
+                      </motion.span>
+                    </button>
+                    <AnimatePresence initial={false}>
+                      {isExpanded && (
+                        <motion.div
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: 'auto', opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ duration: 0.14 }}
+                          className="overflow-hidden border-t border-zinc-800"
+                        >
+                          <div className="space-y-2 px-3 py-2 text-xs text-zinc-300">
+                            {item.type === 'thinking' && (
+                              <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                {item.detail}
+                              </pre>
+                            )}
+                            {item.type === 'command' && (
+                              <>
+                                <CommandCodePanel
+                                  label="command"
+                                  code={item.commandInput}
+                                  language="shell"
+                                />
+                                {typeof item.parsedOutput.exitCode === 'number' && (
+                                  <div className="rounded-md border border-zinc-800 bg-zinc-950/70 px-2.5 py-1.5 text-[11px] text-zinc-400">
+                                    exit code: {item.parsedOutput.exitCode}
+                                  </div>
                                 )}
-                              >
-                                <button
-                                  type="button"
-                                  className="flex w-full items-center gap-2 px-3 py-2 text-left"
-                                  onClick={() =>
-                                    setExpandedTimelineItemIds((previous) => ({
-                                      ...previous,
-                                      [item.id]: !isExpanded,
-                                    }))
-                                  }
-                                >
-                                  <span className="text-[11px] tabular-nums text-zinc-500">{index + 1}</span>
-                                  {item.type === 'command' && <Terminal className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
-                                  {item.type === 'thinking' && <FileText className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
-                                  {item.type === 'websearch' && <Search className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
-                                  {item.type === 'webfetch' && <Globe className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
-                                  <span
-                                    className={cn(
-                                      'min-w-0 flex-1 truncate text-[14px]',
-                                      item.isRunning
-                                        ? 'timeline-running-label font-medium text-zinc-300'
-                                        : 'text-zinc-200',
-                                    )}
-                                  >
-                                    {rowSummaryText}
-                                  </span>
-                                  {item.isRunning ? (
-                                    <span className="text-[11px] text-zinc-500">{durationText}</span>
-                                  ) : item.isFailed ? (
-                                    <span className="text-[11px] text-red-300">failed</span>
-                                  ) : (
-                                    <span className="text-[11px] text-zinc-500">{durationText}</span>
+                                {item.parsedOutput.stdoutText && (
+                                  <CommandCodePanel
+                                    label="stdout"
+                                    code={item.parsedOutput.stdoutText}
+                                    language={detectCodeLanguage(item.parsedOutput.stdoutText)}
+                                  />
+                                )}
+                                {item.parsedOutput.stderrText && (
+                                  <CommandCodePanel
+                                    label="stderr"
+                                    code={item.parsedOutput.stderrText}
+                                    language={detectCodeLanguage(item.parsedOutput.stderrText)}
+                                  />
+                                )}
+                                {!item.parsedOutput.stdoutText &&
+                                  !item.parsedOutput.stderrText &&
+                                  item.outputText && (
+                                    <CommandCodePanel
+                                      label="output"
+                                      code={item.outputText}
+                                      language={detectCodeLanguage(item.outputText)}
+                                    />
                                   )}
-                                  <motion.span
-                                    animate={{ rotate: isExpanded ? 90 : 0 }}
-                                    transition={{ duration: 0.12 }}
-                                    className="inline-flex h-4 w-4 items-center justify-center text-zinc-500"
-                                  >
-                                    <ChevronRight className="h-3.5 w-3.5" />
-                                  </motion.span>
-                                </button>
-                                <AnimatePresence initial={false}>
-                                  {isExpanded && (
-                                    <motion.div
-                                      initial={{ height: 0, opacity: 0 }}
-                                      animate={{ height: 'auto', opacity: 1 }}
-                                      exit={{ height: 0, opacity: 0 }}
-                                      transition={{ duration: 0.14 }}
-                                      className="overflow-hidden border-t border-zinc-800"
-                                    >
-                                      <div className="space-y-2 px-3 py-2 text-xs text-zinc-300">
-                                        {item.type === 'thinking' && (
-                                          <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
-                                            {item.detail}
-                                          </pre>
-                                        )}
-                                        {item.type === 'command' && (
-                                          <>
-                                            <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
-                                              {item.commandInput}
-                                            </pre>
-                                            {item.outputText && (
-                                              <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
-                                                {item.outputText}
-                                              </pre>
-                                            )}
-                                            {(item.parsedOutput.images.length > 0 || storedPreviewItems.length > 0) && (
-                                              <div className="grid gap-2">
-                                                {item.parsedOutput.images.map((image, imageIndex) => (
-                                                  <figure
-                                                    key={`${item.id}-inline-image-${imageIndex}`}
-                                                    className="space-y-1.5 rounded-md border border-zinc-800 bg-zinc-950/70 p-2"
-                                                  >
-                                                    <img
-                                                      src={image.src}
-                                                      alt={`Command output image (${image.mediaType})`}
-                                                      className="h-auto max-h-[360px] w-full max-w-full rounded object-contain"
-                                                      loading="lazy"
-                                                    />
-                                                    <figcaption className="break-all font-mono text-[10px] text-zinc-500">
-                                                      {image.mediaType}
-                                                    </figcaption>
-                                                  </figure>
-                                                ))}
-                                                {storedPreviewItems.map((previewItem, previewItemIndex) => (
-                                                  <div
-                                                    key={`${item.id}-stored-output-${previewItem.storagePath}-${previewItemIndex}`}
-                                                    className="space-y-1.5 rounded-md border border-zinc-800 bg-zinc-950/70 p-2"
-                                                  >
-                                                    {previewItem.src ? (
-                                                      <StoredOutputImage
-                                                        src={previewItem.src}
-                                                        alt={`Stored command output ${previewItem.storagePath}`}
-                                                      />
-                                                    ) : null}
-                                                    <div className="break-all font-mono text-[10px] text-zinc-500">
-                                                      {previewItem.storagePath}
-                                                    </div>
-                                                  </div>
-                                                ))}
-                                              </div>
-                                            )}
-                                          </>
-                                        )}
-                                        {item.type === 'websearch' && (
-                                          <div className="space-y-2">
-                                            {item.query && (
-                                              <div className="rounded-md border border-zinc-800 bg-zinc-950/80 px-2 py-1.5 font-mono text-[11px] text-zinc-200">
-                                                {item.query}
-                                              </div>
-                                            )}
-                                            {item.results.length > 0 ? (
-                                              <div className="space-y-1.5">
-                                                {item.results.map((result, resultIndex) => (
-                                                  <a
-                                                    key={`${item.id}-result-${resultIndex}`}
-                                                    href={result.url}
-                                                    target="_blank"
-                                                    rel="noreferrer"
-                                                    className="block rounded-md border border-zinc-800 bg-zinc-950/70 px-2 py-1.5 hover:border-zinc-700"
-                                                  >
-                                                    <div className="line-clamp-1 text-[12px] text-zinc-100">{result.title}</div>
-                                                    <div className="text-[11px] text-zinc-500">{result.host}</div>
-                                                    {result.snippet ? (
-                                                      <div className="line-clamp-2 text-[11px] text-zinc-400">{result.snippet}</div>
-                                                    ) : null}
-                                                  </a>
-                                                ))}
-                                              </div>
-                                            ) : item.responseRaw ? (
-                                              <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
-                                                {item.responseRaw}
-                                              </pre>
-                                            ) : (
-                                              <div className="text-[11px] text-zinc-500">No search results</div>
-                                            )}
-                                          </div>
-                                        )}
-                                        {item.type === 'webfetch' && (
-                                          <div className="space-y-2">
-                                            {item.url && (
-                                              <div className="rounded-md border border-zinc-800 bg-zinc-950/80 px-2 py-1.5 font-mono text-[11px] text-zinc-200">
-                                                {item.url}
-                                              </div>
-                                            )}
-                                            {item.responseRaw ? (
-                                              <pre className="max-h-[260px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
-                                                {item.responseRaw}
-                                              </pre>
-                                            ) : (
-                                              <div className="text-[11px] text-zinc-500">No response body</div>
-                                            )}
-                                          </div>
-                                        )}
+                                {(item.parsedOutput.images.length > 0 || storedPreviewItems.length > 0) && (
+                                  <div className="grid gap-2">
+                                    {item.parsedOutput.images.map((image, imageIndex) => (
+                                      <figure
+                                        key={`${item.id}-inline-image-${imageIndex}`}
+                                        className="space-y-1.5 rounded-md border border-zinc-800 bg-zinc-950/70 p-2"
+                                      >
+                                        <img
+                                          src={image.src}
+                                          alt={`Command output image (${image.mediaType})`}
+                                          className="h-auto max-h-[360px] w-full max-w-full rounded object-contain"
+                                          loading="lazy"
+                                        />
+                                        <figcaption className="break-all font-mono text-[10px] text-zinc-500">
+                                          {image.mediaType}
+                                        </figcaption>
+                                      </figure>
+                                    ))}
+                                    {storedPreviewItems.map((previewItem, previewItemIndex) => (
+                                      <div
+                                        key={`${item.id}-stored-output-${previewItem.storagePath}-${previewItemIndex}`}
+                                        className="space-y-1.5 rounded-md border border-zinc-800 bg-zinc-950/70 p-2"
+                                      >
+                                        {previewItem.src ? (
+                                          <StoredOutputImage
+                                            src={previewItem.src}
+                                            alt={`Stored command output ${previewItem.storagePath}`}
+                                          />
+                                        ) : null}
+                                        <div className="break-all font-mono text-[10px] text-zinc-500">
+                                          {previewItem.storagePath}
+                                        </div>
                                       </div>
-                                    </motion.div>
-                                  )}
-                                </AnimatePresence>
+                                    ))}
+                                  </div>
+                                )}
+                              </>
+                            )}
+                            {item.type === 'websearch' && (
+                              <div className="space-y-2">
+                                {item.query && (
+                                  <div className="rounded-md border border-zinc-800 bg-zinc-950/80 px-2 py-1.5 font-mono text-[11px] text-zinc-200">
+                                    {item.query}
+                                  </div>
+                                )}
+                                {item.results.length > 0 ? (
+                                  <div className="space-y-1.5">
+                                    {item.results.map((result, resultIndex) => (
+                                      <a
+                                        key={`${item.id}-result-${resultIndex}`}
+                                        href={result.url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="block rounded-md border border-zinc-800 bg-zinc-950/70 px-2 py-1.5 hover:border-zinc-700"
+                                      >
+                                        <div className="line-clamp-1 text-[12px] text-zinc-100">{result.title}</div>
+                                        <div className="text-[11px] text-zinc-500">{result.host}</div>
+                                        {result.snippet ? (
+                                          <div className="line-clamp-2 text-[11px] text-zinc-400">{result.snippet}</div>
+                                        ) : null}
+                                      </a>
+                                    ))}
+                                  </div>
+                                ) : item.responseRaw ? (
+                                  <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                    {item.responseRaw}
+                                  </pre>
+                                ) : (
+                                  <div className="text-[11px] text-zinc-500">No search results</div>
+                                )}
                               </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
+                            )}
+                            {item.type === 'webfetch' && (
+                              <div className="space-y-2">
+                                {item.url && (
+                                  <div className="rounded-md border border-zinc-800 bg-zinc-950/80 px-2 py-1.5 font-mono text-[11px] text-zinc-200">
+                                    {item.url}
+                                  </div>
+                                )}
+                                {item.responseRaw ? (
+                                  <pre className="max-h-[260px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                    {item.responseRaw}
+                                  </pre>
+                                ) : (
+                                  <div className="text-[11px] text-zinc-500">No response body</div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -1407,28 +1471,7 @@ export function MessageItem({
           <div className={cn('flex flex-wrap gap-2 mt-2', isUser ? 'justify-end' : 'justify-start')}>
             {message.attachments.map(att => (
               <AttachmentPreview key={att.id} attachment={att}>
-                {att.type === 'image' ? (
-                  <div className="border rounded-md overflow-hidden bg-background">
-                    <img src={att.url} alt={att.name} className="h-32 w-32 object-cover transition-transform hover:scale-105" />
-                  </div>
-                ) : (att.type === 'document' || att.type === 'pdf') ? (
-                  <div className="h-20 w-48 border rounded-lg overflow-hidden bg-muted/40 p-2.5 flex flex-col gap-1">
-                    <div className="flex items-center gap-1.5">
-                      <FileText className={cn("h-3.5 w-3.5 flex-shrink-0", att.type === 'pdf' ? 'text-red-400' : 'text-blue-400')} />
-                      <span className="text-[11px] font-medium truncate">{att.name}</span>
-                    </div>
-                    {att.textPreview ? (
-                      <p className="text-[10px] text-muted-foreground/70 leading-tight line-clamp-3">{att.textPreview}</p>
-                    ) : (
-                      <p className="text-[10px] text-muted-foreground/50 uppercase tracking-wide mt-auto">{att.type === 'pdf' ? 'PDF' : 'DOCUMENT'}</p>
-                    )}
-                  </div>
-                ) : (
-                  <div className="h-16 w-16 border rounded-md overflow-hidden bg-muted flex flex-col items-center justify-center p-2 gap-1">
-                    <File className="h-6 w-6 text-muted-foreground" />
-                    <span className="text-[9px] truncate w-full text-center" title={att.name}>{att.name}</span>
-                  </div>
-                )}
+                <AttachmentCard attachment={att} variant="message" />
               </AttachmentPreview>
             ))}
           </div>

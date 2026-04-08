@@ -9,6 +9,79 @@ use crate::db::ChatDb;
 use crate::db::entity::profiles;
 use crate::session::SessionSummary;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilePreferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteProfilePreferences>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerProfilePreferences>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProfilePreferences {
+    pub ssh_server_id: String,
+}
+
+impl RemoteProfilePreferences {
+    pub fn normalized_ssh_server_id(&self) -> Result<&str, String> {
+        let ssh_server_id = self.ssh_server_id.trim();
+        if ssh_server_id.is_empty() {
+            return Err("remote profile requires preferences.remote.ssh_server_id".to_string());
+        }
+        Ok(ssh_server_id)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerProfilePreferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<ContainerMountPreference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerMountPreference {
+    pub host_path: String,
+    pub container_path: String,
+    #[serde(default)]
+    pub access: ContainerMountAccess,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerMountAccess {
+    #[default]
+    ReadOnly,
+    ReadWrite,
+}
+
+impl ContainerMountAccess {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::ReadWrite => "read_write",
+        }
+    }
+}
+
+impl core::str::FromStr for ContainerMountAccess {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "read_only" => Ok(Self::ReadOnly),
+            "read_write" => Ok(Self::ReadWrite),
+            other => Err(format!("invalid container mount access: {other}")),
+        }
+    }
+}
+
 /// A profile with its organized sessions.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProfileSessions {
@@ -27,16 +100,18 @@ pub struct ProfileInfo {
     pub icon: Option<String>,
     pub environment: HomeEnvironment,
     pub persona: Option<String>,
-    pub preferences: Option<serde_json::Value>,
+    pub preferences: Option<ProfilePreferences>,
     pub location_aware: bool,
     pub pinned_limit: i32,
     pub sort_order: i32,
 }
 
 impl ProfileInfo {
-    pub fn from_db_model(m: profiles::Model) -> Result<Self, crate::db::ChatDbError> {
-        let remote_config = crate::remote_profile::parse_remote_profile_config(&m)
-            .map_err(crate::db::ChatDbError::InvalidProfileEnvironment)?;
+    pub fn from_db_parts(
+        m: profiles::Model,
+        preferences: Option<ProfilePreferences>,
+    ) -> Result<Self, crate::db::ChatDbError> {
+        let remote_config = preferences.as_ref().and_then(|prefs| prefs.remote.as_ref());
         let environment = match m.environment.as_str() {
             "container" => ProfileEnvironment::Container {
                 image: m.container_image,
@@ -62,11 +137,6 @@ impl ProfileInfo {
                 ));
             }
         };
-        let preferences = m
-            .preferences_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()?;
         Ok(Self {
             id: m.id,
             slug: m.slug,
@@ -181,7 +251,7 @@ pub async fn query_profile_sessions(
     let profile_model = profile_model?.ok_or_else(|| {
         crate::db::ChatDbError::RowNotFound(format!("Profile not found: {profile_id}"))
     })?;
-    let profile = ProfileInfo::from_db_model(profile_model)?;
+    let profile = db.profile_info_from_model(profile_model).await?;
     let all_summaries = crate::session::summarize_db_sessions(db, db_sessions?).await?;
     let folders = folders?;
 
@@ -248,7 +318,8 @@ mod tests {
             container_image: None,
             container_id: None,
             persona: None,
-            preferences_json: None,
+            remote_ssh_server_id: None,
+            container_dockerfile: None,
             location_aware: false,
             pinned_limit: 10,
             sort_order: 0,
@@ -259,7 +330,7 @@ mod tests {
 
     #[test]
     fn profile_info_wraps_environment_as_home_environment() {
-        let info = ProfileInfo::from_db_model(make_profile_model("local"))
+        let info = ProfileInfo::from_db_parts(make_profile_model("local"), None)
             .expect("local profile should deserialize");
 
         assert!(matches!(info.environment, HomeEnvironment(_)));
@@ -271,8 +342,10 @@ mod tests {
 /// List all profiles as [`ProfileInfo`].
 pub async fn list_profiles(db: &ChatDb) -> Result<Vec<ProfileInfo>, crate::db::ChatDbError> {
     let models = db.list_profiles().await?;
-    models
-        .into_iter()
-        .map(ProfileInfo::from_db_model)
-        .collect::<Result<Vec<_>, _>>()
+    let mut profiles = Vec::with_capacity(models.len());
+    for model in models {
+        let preferences = db.load_profile_preferences(&model).await?;
+        profiles.push(ProfileInfo::from_db_parts(model, preferences)?);
+    }
+    Ok(profiles)
 }

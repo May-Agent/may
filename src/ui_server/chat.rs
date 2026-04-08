@@ -28,6 +28,7 @@ use crate::session::{
     TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
+use crate::text::{join_text, path_error_text, path_message, prefixed_text};
 use crate::ui_event_bus::UiEventTopics;
 
 use super::attachments::build_prompt_and_attachments;
@@ -43,7 +44,7 @@ use super::terminal_parsing::{
 };
 use super::title_generation;
 use super::types::{
-    ApiErrorCode, ApiMessage, ChatRequest, ChatResponse, ContextDebugMessage, PendingMessageKind,
+    ApiErrorCode, ApiMessage, ChatRequest, ChatResponse, PendingMessageKind,
     RemovePendingMessageRequest, RequestLogEntry, RequestStats, SessionRuntimeResponse,
     SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent, SseToolEndEvent,
     SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
@@ -230,31 +231,29 @@ fn active_session_conflict_error() -> skyzen::Error {
         .set_status(skyzen::StatusCode::CONFLICT)
 }
 
-fn join_text(parts: &[&str]) -> String {
-    let capacity = parts.iter().map(|part| part.len()).sum();
-    let mut text = String::with_capacity(capacity);
-    for part in parts {
-        text.push_str(part);
+const STOP_WAIT_POLL_INTERVAL_MS: u64 = 120;
+
+async fn wait_for_session_stop_settlement(
+    state: &UiServerState,
+    session_id: &str,
+) -> Result<crate::session::SessionRuntimeSummary, crate::db::ChatDbError> {
+    loop {
+        let runtime = state.runtime_service.get(session_id).await?;
+        let lease_active = state.db().session_run_lease_active(session_id).await?;
+
+        if !lease_active && !runtime.interactions.is_active() {
+            if runtime.state.is_active() {
+                state
+                    .runtime_service
+                    .clear_running_if_needed(session_id)
+                    .await?;
+                return state.runtime_service.get(session_id).await;
+            }
+            return Ok(runtime);
+        }
+
+        tokio::time::sleep(Duration::from_millis(STOP_WAIT_POLL_INTERVAL_MS)).await;
     }
-    text
-}
-
-fn prefixed_text(prefix: &str, suffix: &str) -> String {
-    let mut text = String::with_capacity(prefix.len() + suffix.len());
-    text.push_str(prefix);
-    text.push_str(suffix);
-    text
-}
-
-fn path_error_text(prefix: &str, path: &std::path::Path, error: &impl std::fmt::Display) -> String {
-    let path_text = path.display().to_string();
-    let error_text = error.to_string();
-    join_text(&[prefix, path_text.as_str(), ": ", error_text.as_str()])
-}
-
-fn path_message(prefix: &str, path: &std::path::Path) -> String {
-    let path_text = path.display().to_string();
-    join_text(&[prefix, path_text.as_str()])
 }
 
 fn persisted_attachments(
@@ -303,48 +302,44 @@ async fn set_session_runtime_state(
     state: &Arc<UiServerState>,
     session_id: &str,
     runtime_state: SessionRuntimeState,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::db::ChatDbError> {
     state
         .runtime_service
         .set_state(session_id, runtime_state)
         .await
-        .map_err(anyhow::Error::from)
 }
 
 async fn clear_running_state_if_needed(
     state: &Arc<UiServerState>,
     session_id: &str,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::db::ChatDbError> {
     state
         .runtime_service
         .clear_running_if_needed(session_id)
         .await
-        .map_err(anyhow::Error::from)
 }
 
 async fn set_terminal_runtime_state(
     state: &Arc<UiServerState>,
     session_id: &str,
     terminal: TerminalRuntimeState,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::db::ChatDbError> {
     state
         .runtime_service
         .set_terminal_runtime(session_id, terminal)
         .await
         .map(|_| ())
-        .map_err(anyhow::Error::from)
 }
 
 async fn clear_terminal_runtime_state(
     state: &Arc<UiServerState>,
     session_id: &str,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::db::ChatDbError> {
     state
         .runtime_service
         .clear_terminal_runtime(session_id)
         .await
         .map(|_| ())
-        .map_err(anyhow::Error::from)
 }
 
 fn output_contains_terminal_wait_notice(output: &OutputEntry) -> bool {
@@ -405,13 +400,8 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
                 delivery_mode: next.delivery_mode,
             };
             if let Err(error) =
-                set_session_runtime_state(&state, &session_id, SessionRuntimeState::Running).await
+                run_chat_collect_with_receiver(state.clone(), request, true, true, run_registration.receiver()).await
             {
-                tracing::warn!(session_id = %session_id, error = %error, "failed to mark follow-up run as running");
-                break;
-            }
-
-            if let Err(error) = run_chat_collect(state.clone(), request).await {
                 tracing::warn!(session_id = %session_id, error = %error, "follow-up run failed");
                 break;
             }
@@ -422,12 +412,10 @@ fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     });
 }
 
-pub(super) async fn resume_pending_follow_up_runs(state: Arc<UiServerState>) -> anyhow::Result<()> {
-    let session_ids = state
-        .db()
-        .sessions_requiring_pending_dispatch()
-        .await
-        .map_err(anyhow::Error::from)?;
+pub(super) async fn resume_pending_follow_up_runs(
+    state: Arc<UiServerState>,
+) -> Result<(), crate::db::ChatDbError> {
+    let session_ids = state.db().sessions_requiring_pending_dispatch().await?;
     for session_id in session_ids {
         spawn_follow_up_runs(state.clone(), session_id);
     }
@@ -467,11 +455,11 @@ pub(super) enum ResumeResolution {
     Answered,
 }
 
-fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> anyhow::Result<String> {
-    crate::xml_fragment::serialize_tagged_xml(tag, value).map_err(anyhow::Error::from)
+fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> Result<String, ChatMarkupError> {
+    crate::xml_fragment::serialize_tagged_xml(tag, value).map_err(ChatMarkupError::Serialize)
 }
 
-fn browser_takeover_alert_xml() -> anyhow::Result<String> {
+fn browser_takeover_alert_xml() -> Result<String, ChatMarkupError> {
     serialize_xml(
         "system_alert",
         &BrowserTakeoverAlertXml {
@@ -487,7 +475,7 @@ fn browser_takeover_alert_xml() -> anyhow::Result<String> {
 fn resume_waiting_turn_xml(
     request_kind: ResumeRequestKind,
     resolution: ResumeResolution,
-) -> anyhow::Result<crate::XmlFragment> {
+) -> Result<crate::XmlFragment, ChatMarkupError> {
     let xml = serialize_xml(
         "system_alert",
         &ResumeWaitingTurnXml {
@@ -497,7 +485,7 @@ fn resume_waiting_turn_xml(
             instruction: "The previous run was interrupted while waiting for this response. Reassess the latest state, use the recorded response, and continue from the most sensible next action.",
         },
     )?;
-    crate::XmlFragment::parse(xml).map_err(anyhow::Error::from)
+    crate::XmlFragment::parse(xml).map_err(ChatMarkupError::Parse)
 }
 
 pub(super) async fn schedule_waiting_turn_resume(
@@ -505,7 +493,7 @@ pub(super) async fn schedule_waiting_turn_resume(
     session_id: &str,
     request_kind: ResumeRequestKind,
     resolution: ResumeResolution,
-) -> anyhow::Result<crate::session::SessionRuntimeSummary> {
+) -> Result<crate::session::SessionRuntimeSummary, ScheduleWaitingTurnError> {
     let pending = PendingUserMessage {
         content: String::new(),
         attachments: Vec::new(),
@@ -521,7 +509,7 @@ pub(super) async fn schedule_waiting_turn_resume(
             crate::session::PendingUserMessageMode::Steer,
         )
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(ScheduleWaitingTurnError::Enqueue)?;
     spawn_follow_up_runs(state.clone(), session_id.to_string());
     Ok(runtime)
 }
@@ -581,6 +569,9 @@ pub(super) async fn enqueue_chat(
         .enqueue(&req.session_id, pending, req.delivery_mode)
         .await
         .map_err(internal_error)?;
+    if runtime.can_dispatch_follow_up() {
+        spawn_follow_up_runs(state.clone(), req.session_id.clone());
+    }
 
     Ok(Json(runtime.into()))
 }
@@ -644,9 +635,7 @@ pub(super) async fn stop_session_run(
     let cancelled = state.run_cancellation_registry.cancel(&session_id) || persisted_cancel;
     tracing::info!(session_id = %session_id, cancelled, "received session stop request");
 
-    let runtime = state
-        .runtime_service
-        .get(&session_id)
+    let runtime = wait_for_session_stop_settlement(&state, &session_id)
         .await
         .map_err(internal_error)?;
     Ok(Json(runtime.into()))
@@ -758,7 +747,7 @@ async fn run_agent_loop(
     cancel_rx: &async_channel::Receiver<()>,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
-) -> anyhow::Result<AgentRunResult> {
+) -> Result<AgentRunResult, AgentLoopError> {
     let mut attempt = 0usize;
     let mut max_retries = 0usize;
     let mut turn_hidden_context_xml: Option<String> = None;
@@ -814,7 +803,7 @@ async fn run_agent_loop(
         let tasks_md_path = agent.sandbox_dir().join("tasks.md");
 
         if !sink.on_start(&req.session_id, &assistant_id).await {
-            return Err(anyhow::anyhow!("client disconnected before stream start"));
+            return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
         }
 
         let mut terminal_error: Option<aither_agent::AgentError> = None;
@@ -1045,7 +1034,7 @@ async fn run_agent_loop(
             )
             .await;
             let _ = sink.on_error(&err_msg).await;
-            return Err(anyhow::anyhow!(err));
+            return Err(err.into());
         }
 
         if let Some(reason) = cancellation_reason {
@@ -1062,7 +1051,7 @@ async fn run_agent_loop(
                 log_base.failure(elapsed_ms_saturating(&started_at), reason),
             )
             .await;
-            return Err(anyhow::anyhow!(reason));
+            return Err(AgentLoopError::Cancelled(reason));
         }
 
         // Flush remaining text segment to history.
@@ -1089,7 +1078,7 @@ async fn run_agent_loop(
             )
             .await;
             let _ = sink.on_error(err).await;
-            return Err(anyhow::anyhow!(err));
+            return Err(AgentLoopError::EmptyAssistantResponse);
         }
         if !has_assistant_text && has_tool_activity {
             append_history_message(state, &session_id, ChatMessage::assistant(String::new()))
@@ -1131,7 +1120,7 @@ async fn stream_chat_events(
     req: ChatRequest,
     sender: skyzen::responder::sse::Sender,
     run_registration: SessionRunRegistration,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::db::ChatDbError> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
     let mut sink = SseSink(sender.clone());
     let result = run_agent_loop(
@@ -1176,9 +1165,9 @@ async fn stream_chat_events(
                 },
             };
             send_event(&sender, "done", &done_event).await;
-            spawn_follow_up_runs(state.clone(), response_session_id.clone());
             run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
+            spawn_follow_up_runs(state.clone(), response_session_id.clone());
             Ok(())
         }
         // Errors are already sent to the sink via on_error in run_agent_loop.
@@ -1201,6 +1190,31 @@ async fn run_chat_collect_with_persistence(
     else {
         return Err(ChatCollectError::Sky(active_session_conflict_error()));
     };
+    let response = run_chat_collect_with_receiver(
+        state.clone(),
+        req.clone(),
+        persist_user_message,
+        use_persisted_context_snapshot,
+        run_registration.receiver(),
+    )
+    .await;
+    run_registration.close().await;
+    match response {
+        Ok(response) => {
+            spawn_follow_up_runs(state.clone(), req.session_id.clone());
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn run_chat_collect_with_receiver(
+    state: Arc<UiServerState>,
+    req: ChatRequest,
+    persist_user_message: bool,
+    use_persisted_context_snapshot: bool,
+    cancel_rx: &async_channel::Receiver<()>,
+) -> Result<ChatResponse, ChatCollectError> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running)
         .await
         .map_err(internal_error)
@@ -1210,15 +1224,13 @@ async fn run_chat_collect_with_persistence(
         &state,
         &req,
         &mut sink,
-        run_registration.receiver(),
+        cancel_rx,
         persist_user_message,
         use_persisted_context_snapshot,
     )
     .await;
     match result {
         Ok(result) => {
-            spawn_follow_up_runs(state.clone(), req.session_id.clone());
-            run_registration.close().await;
             clear_running_state_if_needed(&state, &req.session_id)
                 .await
                 .map_err(internal_error)
@@ -1255,14 +1267,13 @@ async fn run_chat_collect_with_persistence(
             })
         }
         Err(error) => {
-            run_registration.close().await;
             clear_running_state_if_needed(&state, &req.session_id)
                 .await
                 .map_err(internal_error)
                 .map_err(ChatCollectError::from)?;
-            match error.downcast::<UiChatPreparationError>() {
-                Ok(error) => Err(ChatCollectError::Preparation(error)),
-                Err(error) => Err(ChatCollectError::Sky(internal_error(error))),
+            match error {
+                AgentLoopError::Preparation(error) => Err(ChatCollectError::Preparation(error)),
+                other => Err(ChatCollectError::Sky(internal_error(other))),
             }
         }
     }
@@ -1292,7 +1303,7 @@ async fn persist_latest_assistant_stats(
     usage: &Usage,
     model_context_window: Option<u32>,
     elapsed_ms: u64,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::db::ChatDbError> {
     let total_tokens = usage.total_tokens.or_else(|| {
         usage
             .prompt_tokens
@@ -1315,7 +1326,6 @@ async fn persist_latest_assistant_stats(
             },
         )
         .await
-        .map_err(anyhow::Error::from)
 }
 
 const fn map_llm_role(role: LlmRole) -> &'static str {
@@ -1327,8 +1337,8 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
     }
 }
 
-fn map_context_debug_message(message: &LlmMessage) -> ContextDebugMessage {
-    ContextDebugMessage {
+fn map_context_debug_message(message: &LlmMessage) -> crate::db::ContextDebugSnapshotMessage {
+    crate::db::ContextDebugSnapshotMessage {
         role: map_llm_role(message.role()).to_string(),
         content: message.content().to_string(),
         attachments: message
@@ -1353,7 +1363,7 @@ async fn persist_context_debug_snapshot(
     prompt: &str,
     prompt_attachments: &[url::Url],
     assembled_messages: &[LlmMessage],
-) -> anyhow::Result<()> {
+) -> Result<(), crate::db::ChatDbError> {
     let prompt_attachments = prompt_attachments
         .iter()
         .map(url::Url::to_string)
@@ -1362,8 +1372,6 @@ async fn persist_context_debug_snapshot(
         .iter()
         .map(map_context_debug_message)
         .collect::<Vec<_>>();
-    let prompt_attachments_json = serde_json::to_string(&prompt_attachments)?;
-    let assembled_messages_json = serde_json::to_string(&assembled_messages)?;
     let timestamp = jiff::Timestamp::now().to_string();
 
     let db = state.db();
@@ -1373,11 +1381,10 @@ async fn persist_context_debug_snapshot(
         model,
         provider_id,
         prompt,
-        &prompt_attachments_json,
-        &assembled_messages_json,
+        &prompt_attachments,
+        &assembled_messages,
     )
     .await
-    .map_err(anyhow::Error::from)
 }
 
 fn enqueue_event_triggered_tasks(
@@ -1470,7 +1477,7 @@ enum UiChatPreparationError {
     #[error("failed to load session context snapshot: {0}")]
     LoadContextSnapshot(#[source] crate::db::ChatDbError),
     #[error("failed to serialize browser takeover alert: {0}")]
-    BuildTakeoverAlert(#[source] anyhow::Error),
+    BuildTakeoverAlert(#[source] ChatMarkupError),
     #[error("failed to build session mentions: {0}")]
     BuildSessionMentions(#[source] crate::prompt_mentions::PromptMentionError),
     #[error("{0}")]
@@ -1504,17 +1511,17 @@ enum UiChatPreparationError {
     #[error("{0}")]
     ResolveRemoteServer(String),
     #[error("location fetch failed: {0}")]
-    LoadLocation(#[source] anyhow::Error),
+    LoadLocation(#[source] crate::location::LocationError),
     #[error("failed to create agent: {0}")]
     BuildAgent(#[from] crate::agent::MayAgentError),
     #[error("failed to restore agent checkpoint: {0}")]
     RestoreCheckpoint(#[source] aither_agent::AgentError),
     #[error("failed to apply history delta after restored checkpoint: {0}")]
-    ApplyHistoryDelta(#[source] anyhow::Error),
+    ApplyHistoryDelta(#[source] crate::session::HistoryDeltaError),
     #[error("failed to build prompt attachments: {0}")]
     BuildPrompt(skyzen::Error),
     #[error("failed to persist context debug snapshot: {0}")]
-    PersistContextDebugSnapshot(#[source] anyhow::Error),
+    PersistContextDebugSnapshot(#[source] crate::db::ChatDbError),
 }
 
 impl UiChatPreparationError {
@@ -1599,6 +1606,38 @@ impl UiChatPreparationError {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ChatMarkupError {
+    #[error("failed to serialize XML fragment: {0}")]
+    Serialize(#[source] quick_xml::SeError),
+    #[error("failed to parse XML fragment: {0}")]
+    Parse(#[source] crate::XmlFragmentError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ScheduleWaitingTurnError {
+    #[error(transparent)]
+    Markup(#[from] ChatMarkupError),
+    #[error("failed to enqueue waiting-turn resume message: {0}")]
+    Enqueue(#[source] crate::db::ChatDbError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum AgentLoopError {
+    #[error(transparent)]
+    Preparation(#[from] UiChatPreparationError),
+    #[error("failed to persist chat state: {0}")]
+    Storage(#[from] crate::db::ChatDbError),
+    #[error("client disconnected before stream start")]
+    ClientDisconnectedBeforeStreamStart,
+    #[error(transparent)]
+    Agent(#[from] aither_agent::AgentError),
+    #[error("{0}")]
+    Cancelled(&'static str),
+    #[error("Model returned an empty assistant response")]
+    EmptyAssistantResponse,
+}
+
 enum ChatCollectError {
     Preparation(UiChatPreparationError),
     Sky(skyzen::Error),
@@ -1663,14 +1702,16 @@ async fn resolve_session_context(
         None
     };
     let profile_persona = profile_model.as_ref().and_then(|p| p.persona.clone());
-    let profile_environment = profile_model
-        .as_ref()
-        .map(|profile| {
-            crate::profile::ProfileInfo::from_db_model(profile.clone())
-                .map(|info| info.environment.into_kind())
-        })
-        .transpose()
-        .map_err(UiChatPreparationError::ParseProfileEnvironment)?;
+    let profile_environment = match profile_model.clone() {
+        Some(profile) => Some(
+            db.profile_info_from_model(profile)
+                .await
+                .map_err(UiChatPreparationError::ParseProfileEnvironment)?
+                .environment
+                .into_kind(),
+        ),
+        None => None,
+    };
 
     let profile_memories = if let Some(ref profile) = profile_model {
         let memories = crate::memory::ProfileMemories::load(&db, &profile.id)
@@ -1887,18 +1928,27 @@ async fn setup_agent_environment(
                 .resolve_container_manager(false)
                 .await
                 .map_err(UiChatPreparationError::ResolveContainerRuntime)?;
-            let default_image_tag =
-                crate::container::profile::default_image_tag(&state.may_dir, profile)
-                    .await
-                    .map_err(UiChatPreparationError::InvalidContainerImageTag)?;
+            let container_preferences = state
+                .db()
+                .load_container_profile_preferences(profile)
+                .await
+                .map_err(UiChatPreparationError::ParseProfileEnvironment)?;
+            let default_image_tag = crate::container::profile::default_image_tag(
+                &state.may_dir,
+                profile,
+                container_preferences.clone(),
+            )
+            .await
+            .map_err(UiChatPreparationError::InvalidContainerImageTag)?;
 
             let image_spec = crate::container::profile::image_spec_for_profile(
                 &state.may_dir,
                 profile,
                 &default_image_tag,
+                container_preferences.clone(),
             )
             .map_err(UiChatPreparationError::InvalidContainerProfileConfiguration)?;
-            let extra_mounts = crate::container::profile::mounts_for_profile(profile)
+            let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences)
                 .map_err(UiChatPreparationError::InvalidContainerMountConfiguration)?;
 
             crate::container::image::ensure_image(container_manager.runtime(), &image_spec)

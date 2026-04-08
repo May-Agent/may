@@ -1,12 +1,12 @@
-use anyhow::Result;
 use crossterm::event::KeyCode;
 use itertools::Itertools;
 
 use crate::ask_user::{AnswerValue, QuestionAnswer};
 use crate::tui::app::{App, SendAction};
+use crate::tui::error::AppResult;
 use crate::tui::state::AppMode;
 
-pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Result<Option<SendAction>> {
+pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     let state = match &mut app.mode {
         AppMode::AskUser(s) => s,
         _ => return Ok(None),

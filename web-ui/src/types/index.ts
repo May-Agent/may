@@ -14,6 +14,7 @@ export interface Attachment {
 
 export interface TerminalExecution {
   id: string;
+  description: string;
   input: string;
   output?: string;
   status: 'running' | 'done' | 'failed';

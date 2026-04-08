@@ -117,34 +117,34 @@
   }
 }
 
-.queued-shell {
+.pending-follow-up-shell {
   border-color: rgba(63, 63, 70, 0.96);
   background: rgba(24, 24, 27, 0.82);
   box-shadow: none;
 }
 
-.queued-header {
+.pending-follow-up-header {
   border-color: rgba(63, 63, 70, 0.94);
   background: rgba(39, 39, 42, 0.42);
 }
 
-.queued-header-icon {
+.pending-follow-up-header-icon {
   border: 1px solid rgba(82, 82, 91, 0.96);
   background: rgba(39, 39, 42, 0.88);
   box-shadow: none;
 }
 
-.queued-header-title {
+.pending-follow-up-header-title {
   font-weight: 600;
   letter-spacing: 0.01em;
   color: rgba(244, 244, 245, 0.96);
 }
 
-.queued-header-subtitle {
+.pending-follow-up-header-subtitle {
   color: rgba(161, 161, 170, 0.9);
 }
 
-.queued-count-pill {
+.pending-follow-up-count-pill {
   border: 1px solid rgba(82, 82, 91, 0.96);
   border-radius: 999px;
   min-width: 30px;
@@ -154,37 +154,37 @@
   background: rgba(39, 39, 42, 0.88);
 }
 
-.queued-list {
+.pending-follow-up-list {
   padding-top: 0;
 }
 
-.queued-list > .queued-item + .queued-item {
+.pending-follow-up-list > .pending-follow-up-item + .pending-follow-up-item {
   margin-top: 8px;
 }
 
-.queued-item {
+.pending-follow-up-item {
   border: 1px solid rgba(63, 63, 70, 0.92);
   background: rgba(24, 24, 27, 0.72);
   box-shadow: none;
   transition: border-color 160ms ease, background-color 160ms ease;
 }
 
-.queued-item:hover {
+.pending-follow-up-item:hover {
   border-color: rgba(82, 82, 91, 0.98);
   background: rgba(39, 39, 42, 0.72);
 }
 
-.queued-message-content {
+.pending-follow-up-message-content {
   text-wrap: pretty;
   color: rgba(244, 244, 245, 0.94);
   line-height: 1.45;
 }
 
-.queued-meta {
+.pending-follow-up-meta {
   color: rgba(161, 161, 170, 0.9);
 }
 
-.queued-state-pill {
+.pending-follow-up-state-pill {
   border: 1px solid rgba(82, 82, 91, 0.94);
   background: rgba(39, 39, 42, 0.86);
   letter-spacing: 0.01em;
@@ -193,30 +193,30 @@
   font-weight: 500;
 }
 
-.queued-order {
+.pending-follow-up-order {
   border: 1px solid rgba(82, 82, 91, 0.94);
   background: rgba(39, 39, 42, 0.82);
   box-shadow: none;
   color: rgba(212, 212, 216, 0.9);
 }
 
-.queued-steer {
+.pending-follow-up-steer {
   border-color: rgba(82, 82, 91, 0.94);
   background: rgba(39, 39, 42, 0.86);
   box-shadow: none;
 }
 
-.queued-steer:hover {
+.pending-follow-up-steer:hover {
   border-color: rgba(113, 113, 122, 0.98);
   background: rgba(63, 63, 70, 0.8);
 }
 
-.queued-more {
+.pending-follow-up-more {
   border-color: rgba(82, 82, 91, 0.94);
   background: rgba(39, 39, 42, 0.82);
 }
 
-.queued-more:hover {
+.pending-follow-up-more:hover {
   border-color: rgba(113, 113, 122, 0.98);
   background: rgba(63, 63, 70, 0.78);
 }

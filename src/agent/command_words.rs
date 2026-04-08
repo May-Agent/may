@@ -1,8 +1,14 @@
-pub fn split_shell_words(input: &str, label: &str) -> anyhow::Result<Vec<String>> {
-    shell_words::split(input).map_err(|error| {
-        let mut message = String::from(label);
-        message.push_str(" command contains invalid shell quoting: ");
-        message.push_str(error.to_string().as_str());
-        anyhow::anyhow!(message)
+#[derive(Debug, thiserror::Error)]
+#[error("{label} command contains invalid shell quoting: {source}")]
+pub struct SplitShellWordsError {
+    label: String,
+    #[source]
+    source: shell_words::ParseError,
+}
+
+pub fn split_shell_words(input: &str, label: &str) -> Result<Vec<String>, SplitShellWordsError> {
+    shell_words::split(input).map_err(|source| SplitShellWordsError {
+        label: label.to_string(),
+        source,
     })
 }

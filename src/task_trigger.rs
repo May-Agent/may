@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use crate::text::{join_text, prefixed_display};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -14,18 +15,8 @@ pub const TRIGGER_TYPE_CRON: &str = "cron";
 pub const EVENT_CHAT_TURN_COMPLETED: &str = "chat.turn.completed";
 const WEBHOOK_ROUTE_PREFIX: &str = "/api/tasks/webhook/";
 
-fn join_text(parts: &[&str]) -> String {
-    let capacity = parts.iter().map(|part| part.len()).sum();
-    let mut output = String::with_capacity(capacity);
-    for part in parts {
-        output.push_str(part);
-    }
-    output
-}
-
 fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
-    let error_text = error.to_string();
-    join_text(&[prefix, error_text.as_str()])
+    prefixed_display(prefix, error)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

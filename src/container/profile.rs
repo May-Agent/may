@@ -10,50 +10,19 @@ use futures_lite::{StreamExt, io::AsyncReadExt};
 
 use super::{ContainerError, image::MAY_IMAGE_TAG};
 use crate::db::entity::profiles;
+use crate::profile::{ContainerMountAccess, ContainerProfilePreferences};
 use crate::session::SessionId;
-
-#[derive(Debug, serde::Deserialize)]
-struct ProfilePreferences {
-    #[serde(default)]
-    container: Option<ContainerPreferences>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ContainerPreferences {
-    #[serde(default)]
-    dockerfile: Option<String>,
-    #[serde(default)]
-    mounts: Vec<ContainerMountPreference>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ContainerMountPreference {
-    host_path: String,
-    container_path: String,
-    #[serde(default = "default_mount_access")]
-    access: ContainerMountAccess,
-}
-
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ContainerMountAccess {
-    ReadOnly,
-    ReadWrite,
-}
-
-const fn default_mount_access() -> ContainerMountAccess {
-    ContainerMountAccess::ReadOnly
-}
 
 /// Build a container image spec from profile preferences.
 pub fn image_spec_for_profile(
     may_dir: &Path,
-    profile: &profiles::Model,
+    _profile: &profiles::Model,
     default_tag: &str,
+    preferences: Option<ContainerProfilePreferences>,
 ) -> Result<ContainerImageSpec, ContainerError> {
     let context_dir = may_dir.join("container");
     let mut spec = ContainerImageSpec::new(default_tag.to_string(), context_dir.clone());
-    let Some(preferences) = parse_preferences(profile)? else {
+    let Some(preferences) = preferences else {
         return Ok(spec);
     };
     let Some(dockerfile) = preferences.dockerfile else {
@@ -66,8 +35,10 @@ pub fn image_spec_for_profile(
 }
 
 /// Build typed mount specs from profile preferences.
-pub fn mounts_for_profile(profile: &profiles::Model) -> Result<Vec<MountSpec>, ContainerError> {
-    let Some(preferences) = parse_preferences(profile)? else {
+pub fn mounts_for_profile(
+    preferences: Option<ContainerProfilePreferences>,
+) -> Result<Vec<MountSpec>, ContainerError> {
+    let Some(preferences) = preferences else {
         return Ok(Vec::new());
     };
 
@@ -82,22 +53,6 @@ pub fn mounts_for_profile(profile: &profiles::Model) -> Result<Vec<MountSpec>, C
         mounts.push(spec);
     }
     Ok(mounts)
-}
-
-fn parse_preferences(
-    profile: &profiles::Model,
-) -> Result<Option<ContainerPreferences>, ContainerError> {
-    let Some(raw) = profile.preferences_json.as_deref() else {
-        return Ok(None);
-    };
-
-    let preferences: ProfilePreferences = serde_json::from_str(raw).map_err(|e| {
-        ContainerError::Bootstrap(format!(
-            "invalid profile.preferences_json for profile {}: {e}",
-            profile.id
-        ))
-    })?;
-    Ok(preferences.container)
 }
 
 fn normalize_path(context_dir: &Path, configured: &str) -> PathBuf {
@@ -123,6 +78,7 @@ pub async fn ensure_container_runtime_assets(may_dir: &Path) -> Result<(), Conta
 pub async fn default_image_tag(
     may_dir: &Path,
     profile: &profiles::Model,
+    preferences: Option<ContainerProfilePreferences>,
 ) -> Result<String, ContainerError> {
     if let Some(image) = profile
         .container_image
@@ -135,7 +91,7 @@ pub async fn default_image_tag(
 
     ensure_container_runtime_assets(may_dir).await?;
 
-    let uses_custom_dockerfile = parse_preferences(profile)?
+    let uses_custom_dockerfile = preferences
         .and_then(|preferences| preferences.dockerfile)
         .is_some_and(|dockerfile| !dockerfile.trim().is_empty());
     let context_hash = container_context_hash_hex(may_dir).await?;
@@ -249,8 +205,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::profile::ContainerMountPreference;
 
-    fn profile_with_preferences(preferences_json: &str) -> profiles::Model {
+    fn profile_model() -> profiles::Model {
         profiles::Model {
             id: "profile-1".to_string(),
             slug: Some("daily".to_string()),
@@ -260,7 +217,8 @@ mod tests {
             container_image: None,
             container_id: None,
             persona: None,
-            preferences_json: Some(preferences_json.to_string()),
+            remote_ssh_server_id: None,
+            container_dockerfile: None,
             location_aware: false,
             pinned_limit: 10,
             sort_order: 0,
@@ -281,12 +239,17 @@ mod tests {
 
     #[test]
     fn image_spec_uses_profile_dockerfile_relative_to_context() {
-        let profile = profile_with_preferences(
-            r#"{"container":{"dockerfile":"custom/Dockerfile.profile","mounts":[]}}"#,
-        );
         let may_dir = PathBuf::from("/tmp/may");
-        let spec =
-            image_spec_for_profile(&may_dir, &profile, "may-workspace:test").expect("valid spec");
+        let spec = image_spec_for_profile(
+            &may_dir,
+            &profile_model(),
+            "may-workspace:test",
+            Some(ContainerProfilePreferences {
+                dockerfile: Some("custom/Dockerfile.profile".to_string()),
+                mounts: Vec::new(),
+            }),
+        )
+        .expect("valid spec");
 
         assert_eq!(spec.tag, "may-workspace:test");
         assert_eq!(spec.context_dir, PathBuf::from("/tmp/may/container"));
@@ -300,33 +263,27 @@ mod tests {
 
     #[test]
     fn mounts_support_read_only_and_read_write() {
-        let profile = profile_with_preferences(
-            r#"{
-                "container":{
-                    "mounts":[
-                        {"host_path":"/host/ro","container_path":"/mnt/ro","access":"read_only"},
-                        {"host_path":"/host/rw","container_path":"/mnt/rw","access":"read_write"}
-                    ]
-                }
-            }"#,
-        );
-
-        let mounts = mounts_for_profile(&profile).expect("valid mounts");
+        let mounts = mounts_for_profile(Some(ContainerProfilePreferences {
+            dockerfile: None,
+            mounts: vec![
+                ContainerMountPreference {
+                    host_path: "/host/ro".to_string(),
+                    container_path: "/mnt/ro".to_string(),
+                    access: ContainerMountAccess::ReadOnly,
+                },
+                ContainerMountPreference {
+                    host_path: "/host/rw".to_string(),
+                    container_path: "/mnt/rw".to_string(),
+                    access: ContainerMountAccess::ReadWrite,
+                },
+            ],
+        }))
+        .expect("valid mounts");
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].host_path, PathBuf::from("/host/ro"));
         assert_eq!(mounts[0].container_path, PathBuf::from("/mnt/ro"));
         assert_eq!(mounts[0].access, MountAccess::ReadOnly);
         assert_eq!(mounts[1].access, MountAccess::ReadWrite);
-    }
-
-    #[test]
-    fn invalid_profile_preferences_fail_fast() {
-        let profile = profile_with_preferences("{invalid-json");
-        let err = mounts_for_profile(&profile).expect_err("invalid json should fail");
-        assert!(
-            err.to_string().contains("invalid profile.preferences_json"),
-            "unexpected error: {err}"
-        );
     }
 
     #[tokio::test]
@@ -351,7 +308,7 @@ mod tests {
     fn container_name_is_profile_session_scoped_and_sanitized() {
         let profile = profiles::Model {
             slug: Some("daily🔥".to_string()),
-            ..profile_with_preferences("{}")
+            ..profile_model()
         };
         let session_id = SessionId::from_string("chat-123");
         let name = container_name_for_profile_session(&profile, &session_id);

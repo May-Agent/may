@@ -95,6 +95,14 @@ struct TaskToolResponse {
 pub type TaskBroker = ToolRequestBroker<TaskCreateRequest, Result<TaskCreateResult, String>>;
 pub type TaskQueue = ToolRequestQueue<TaskCreateRequest, Result<TaskCreateResult, String>>;
 
+#[derive(Debug, thiserror::Error)]
+enum TaskToolError {
+    #[error("task command is unavailable in this runtime")]
+    Unavailable,
+    #[error("task request was rejected: {0}")]
+    Rejected(String),
+}
+
 #[must_use]
 pub fn channel() -> (TaskBroker, TaskQueue) {
     tool_request_channel()
@@ -184,17 +192,14 @@ impl Tool for TaskTool {
     type Res = ToolResult;
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
-        let broker = self
-            .broker
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("task command is unavailable in this runtime"))?;
+        let broker = self.broker.as_ref().ok_or(TaskToolError::Unavailable)?;
         let request = TaskCreateRequest {
             session_id: self.session_id.clone(),
             runtime: self.runtime,
             args,
         };
         let response = broker.request(request).await?;
-        let model = response.map_err(anyhow::Error::msg)?;
+        let model = response.map_err(TaskToolError::Rejected)?;
 
         ToolResult::json(&TaskToolResponse {
             ok: true,

@@ -11,6 +11,11 @@ use std::path::Path;
 use skyzen_services::{Db as SkyDb, DbError as SkyDbError};
 
 use crate::PermissionHistoryMode;
+use crate::ask_user::AnswerValue;
+use crate::profile::{
+    ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences,
+    RemoteProfilePreferences,
+};
 use crate::scheduler::TaskRunStatus;
 use crate::session::{
     BrowserInteractionState, ChatMessage, ChatMessageStats, MessageRole, PendingUserMessage,
@@ -19,11 +24,11 @@ use crate::session::{
     TerminalRuntimeState,
 };
 use crate::task_trigger::{PersistedTaskTrigger, TRIGGER_KIND_WEBHOOK};
+use crate::text::{prefixed_display, prefixed_text};
 use crate::xml_fragment::XmlFragment;
 use entity::{
-    context_debug_snapshots, folders, messages, network_access_logs, notification_mailbox,
-    profile_memories, profile_memory_jobs, profiles, push_subscriptions, request_logs,
-    scheduled_tasks, session_pending_ask_user, session_pending_messages,
+    folders, messages, network_access_logs, notification_mailbox, profile_memories,
+    profile_memory_jobs, profiles, push_subscriptions, request_logs, scheduled_tasks,
     session_pending_permissions, session_pending_workspace, session_plans, session_run_leases,
     session_runtimes, sessions,
 };
@@ -42,8 +47,6 @@ pub enum ChatDbError {
     Storage(String),
     #[error("Database row not found: {0}")]
     RowNotFound(String),
-    #[error("JSON serialization error: {0}")]
-    Json(#[from] serde_json::Error),
     #[error("Invalid context fragment: {0}")]
     InvalidXml(#[from] crate::xml_fragment::XmlFragmentError),
     #[error("Invalid profile environment: {0}")]
@@ -76,7 +79,7 @@ pub struct CreateProfileParams<'a> {
     pub slug: Option<&'a str>,
     pub icon: Option<&'a str>,
     pub persona: Option<&'a str>,
-    pub preferences_json: Option<&'a str>,
+    pub preferences: Option<&'a crate::profile::ProfilePreferences>,
     pub location_aware: bool,
 }
 
@@ -89,7 +92,7 @@ pub struct UpdateProfileParams<'a> {
     pub container_id: Option<Option<&'a str>>,
     pub sort_order: Option<i32>,
     pub persona: Option<Option<&'a str>>,
-    pub preferences_json: Option<Option<&'a str>>,
+    pub preferences: Option<Option<&'a crate::profile::ProfilePreferences>>,
     pub location_aware: Option<bool>,
 }
 
@@ -241,6 +244,194 @@ pub(crate) struct PendingWorkspaceLookup {
     pub(crate) session_id: String,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PendingMessageEntryRow {
+    id: i64,
+    session_id: String,
+    delivery_mode: String,
+    content: String,
+    hidden_context_xml: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PendingMessageAttachmentRow {
+    message_id: i64,
+    ordinal: i64,
+    attachment_id: String,
+    name: String,
+    attachment_type: String,
+    url: String,
+    upload_data_url: Option<String>,
+    text_content: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PendingAskUserRequestRow {
+    request_id: String,
+    session_id: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PendingAskUserQuestionRow {
+    request_id: String,
+    ordinal: i64,
+    section: String,
+    question: String,
+    multi_select: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PendingAskUserQuestionOptionRow {
+    request_id: String,
+    question_ordinal: i64,
+    option_ordinal: i64,
+    value: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProfileMountRow {
+    profile_id: String,
+    ordinal: i64,
+    host_path: String,
+    container_path: String,
+    access: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PermissionRequestMessageRow {
+    request_id: String,
+    mode: String,
+    script: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PermissionResponseMessageRow {
+    request_id: String,
+    approved: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct WorkspaceRequestMessageRow {
+    request_id: String,
+    path: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct WorkspaceResponseMessageRow {
+    request_id: String,
+    approved: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AskUserRequestMessageRow {
+    message_id: i32,
+    request_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AskUserRequestQuestionRow {
+    message_id: i32,
+    ordinal: i64,
+    section: String,
+    question: String,
+    multi_select: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AskUserRequestQuestionOptionRow {
+    message_id: i32,
+    question_ordinal: i64,
+    option_ordinal: i64,
+    value: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AskUserResponseMessageRow {
+    message_id: i32,
+    request_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AskUserResponseAnswerRow {
+    message_id: i32,
+    ordinal: i64,
+    section: String,
+    answer_kind: String,
+    custom_text: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AskUserResponseSelectedOptionRow {
+    message_id: i32,
+    answer_ordinal: i64,
+    option_ordinal: i64,
+    value: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ContextDebugSnapshotHeaderRow {
+    session_id: String,
+    timestamp: String,
+    model: String,
+    provider_id: String,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ContextDebugPromptAttachmentRow {
+    session_id: String,
+    ordinal: i64,
+    url: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ContextDebugMessageRow {
+    session_id: String,
+    ordinal: i64,
+    role: String,
+    content: String,
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ContextDebugMessageAttachmentRow {
+    session_id: String,
+    message_ordinal: i64,
+    attachment_ordinal: i64,
+    url: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ContextDebugMessageToolCallRow {
+    session_id: String,
+    message_ordinal: i64,
+    tool_call_ordinal: i64,
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextDebugSnapshot {
+    pub session_id: String,
+    pub timestamp: String,
+    pub model: String,
+    pub provider_id: String,
+    pub prompt: String,
+    pub prompt_attachments: Vec<String>,
+    pub assembled_messages: Vec<ContextDebugSnapshotMessage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextDebugSnapshotMessage {
+    pub role: String,
+    pub content: String,
+    pub attachments: Vec<String>,
+    pub tool_call_id: Option<String>,
+    pub tool_call_names: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NotificationCallbackConsumeResult {
     pub id: String,
@@ -302,16 +493,8 @@ fn parse_profile_environment(value: &str) -> Result<ProfileEnvironmentKind, Chat
     }
 }
 
-fn prefixed_text(prefix: &str, suffix: &str) -> String {
-    let mut text = String::with_capacity(prefix.len() + suffix.len());
-    text.push_str(prefix);
-    text.push_str(suffix);
-    text
-}
-
 fn db_custom_error(prefix: &str, error: &impl std::fmt::Display) -> String {
-    let error_text = error.to_string();
-    prefixed_text(prefix, error_text.as_str())
+    prefixed_display(prefix, error)
 }
 
 fn session_not_found_db_error(session_id: &str) -> ChatDbError {
@@ -386,6 +569,85 @@ fn parse_session_plan_state(value: &str) -> Result<SessionPlanState, ChatDbError
         .map_err(|error| storage_error(db_custom_error("invalid session plan state: ", &error)))
 }
 
+fn parse_attachment_kind(value: &str) -> Result<crate::session::AttachmentKind, ChatDbError> {
+    match value {
+        "image" => Ok(crate::session::AttachmentKind::Image),
+        "file" => Ok(crate::session::AttachmentKind::File),
+        "text" => Ok(crate::session::AttachmentKind::Text),
+        "document" => Ok(crate::session::AttachmentKind::Document),
+        "pdf" => Ok(crate::session::AttachmentKind::Pdf),
+        "audio" => Ok(crate::session::AttachmentKind::Audio),
+        "video" => Ok(crate::session::AttachmentKind::Video),
+        other => Err(storage_error(format!("invalid attachment kind: {other}"))),
+    }
+}
+
+fn parse_answer_value_kind(
+    kind: &str,
+    selected_values: Vec<String>,
+    custom_text: Option<String>,
+) -> Result<AnswerValue, ChatDbError> {
+    match kind {
+        "selected" => Ok(AnswerValue::Selected(selected_values)),
+        "custom" => Ok(AnswerValue::Custom(custom_text.unwrap_or_default())),
+        "skipped" => Ok(AnswerValue::Skipped),
+        other => Err(storage_error(format!(
+            "invalid ask-user answer kind: {other}"
+        ))),
+    }
+}
+
+fn normalize_profile_preferences(
+    environment: ProfileEnvironmentKind,
+    preferences: Option<&ProfilePreferences>,
+) -> Result<Option<ProfilePreferences>, ChatDbError> {
+    let mut preferences = preferences.cloned().unwrap_or_default();
+    match environment {
+        ProfileEnvironmentKind::Local => {
+            preferences.remote = None;
+            preferences.container = None;
+        }
+        ProfileEnvironmentKind::Remote => {
+            let remote = preferences.remote.ok_or_else(|| {
+                ChatDbError::InvalidProfileEnvironment(
+                    "remote profile requires preferences.remote.ssh_server_id".to_string(),
+                )
+            })?;
+            remote
+                .normalized_ssh_server_id()
+                .map_err(ChatDbError::InvalidProfileEnvironment)?;
+            preferences.remote = Some(remote);
+            preferences.container = None;
+        }
+        ProfileEnvironmentKind::Container => {
+            preferences.remote = None;
+        }
+    }
+    Ok((preferences.remote.is_some() || preferences.container.is_some()).then_some(preferences))
+}
+
+fn build_profile_preferences(
+    model: &profiles::Model,
+    mounts: Vec<ContainerMountPreference>,
+) -> Option<ProfilePreferences> {
+    let remote =
+        model
+            .remote_ssh_server_id
+            .as_ref()
+            .map(|ssh_server_id| RemoteProfilePreferences {
+                ssh_server_id: ssh_server_id.clone(),
+            });
+    let container = if model.container_dockerfile.is_some() || !mounts.is_empty() {
+        Some(ContainerProfilePreferences {
+            dockerfile: model.container_dockerfile.clone(),
+            mounts,
+        })
+    } else {
+        None
+    };
+    (remote.is_some() || container.is_some()).then_some(ProfilePreferences { remote, container })
+}
+
 /// Chat history database.
 ///
 #[derive(Debug, Clone)]
@@ -401,6 +663,7 @@ impl ChatDb {
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let db = SkyDb::connect_sqlite(&url).await?;
         Self::initialize_schema(&db).await?;
+        Self::ensure_profile_preference_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
         Ok(Self { db })
     }
@@ -408,6 +671,34 @@ impl ChatDb {
     async fn initialize_schema(db: &SkyDb) -> Result<(), ChatDbError> {
         for statement in db_sql::statements(db_sql::CHAT_SCHEMA) {
             query!(db, statement).execute().await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_profile_preference_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "PRAGMA table_info(profiles)")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        let existing = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        if !existing.contains("remote_ssh_server_id") {
+            query!(
+                db,
+                "ALTER TABLE profiles ADD COLUMN remote_ssh_server_id TEXT"
+            )
+            .execute()
+            .await?;
+        }
+        if !existing.contains("container_dockerfile") {
+            query!(
+                db,
+                "ALTER TABLE profiles ADD COLUMN container_dockerfile TEXT"
+            )
+            .execute()
+            .await?;
         }
         Ok(())
     }
@@ -491,12 +782,25 @@ impl ChatDb {
             .await?)
     }
 
-    fn pending_user_message_from_row(
-        row: session_pending_messages::Model,
+    fn pending_user_message_from_parts(
+        row: PendingMessageEntryRow,
+        attachment_rows: Vec<PendingMessageAttachmentRow>,
     ) -> Result<PendingUserMessage, ChatDbError> {
         Ok(PendingUserMessage {
             content: row.content,
-            attachments: serde_json::from_str(&row.attachments_json)?,
+            attachments: attachment_rows
+                .into_iter()
+                .map(|attachment| {
+                    Ok(crate::session::PersistedAttachment {
+                        id: attachment.attachment_id,
+                        name: attachment.name,
+                        attachment_type: parse_attachment_kind(&attachment.attachment_type)?,
+                        url: attachment.url,
+                        upload_data_url: attachment.upload_data_url,
+                        text_content: attachment.text_content,
+                    })
+                })
+                .collect::<Result<Vec<_>, ChatDbError>>()?,
             hidden_context_xml: row.hidden_context_xml.map(XmlFragment::parse).transpose()?,
             created_at: row.created_at,
             delivery_mode: parse_pending_user_message_mode(&row.delivery_mode)?,
@@ -534,27 +838,62 @@ impl ChatDb {
         }
     }
 
-    fn persisted_ask_user_request_from_row(
-        row: session_pending_ask_user::Model,
+    fn persisted_ask_user_request_from_parts(
+        row: PendingAskUserRequestRow,
+        question_rows: Vec<PendingAskUserQuestionRow>,
+        option_rows: Vec<PendingAskUserQuestionOptionRow>,
     ) -> Result<PersistedAskUserRequest, ChatDbError> {
+        let mut option_rows_by_question = option_rows.into_iter().fold(
+            std::collections::BTreeMap::<i64, Vec<PendingAskUserQuestionOptionRow>>::new(),
+            |mut grouped, row| {
+                grouped.entry(row.question_ordinal).or_default().push(row);
+                grouped
+            },
+        );
         Ok(PersistedAskUserRequest {
             id: row.request_id,
-            questions: serde_json::from_str(&row.questions_json)?,
+            questions: question_rows
+                .into_iter()
+                .map(|question| crate::session::PersistedAskUserQuestion {
+                    section: question.section,
+                    question: question.question,
+                    option: option_rows_by_question
+                        .remove(&question.ordinal)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|option| option.value)
+                        .collect(),
+                    multi_select: question.multi_select,
+                })
+                .collect(),
         })
     }
 
     fn build_session_runtime_summary(
         runtime_row: Option<session_runtimes::Model>,
-        message_rows: Vec<session_pending_messages::Model>,
+        message_rows: Vec<PendingMessageEntryRow>,
+        attachment_rows: Vec<PendingMessageAttachmentRow>,
         permission_row: Option<session_pending_permissions::Model>,
         workspace_row: Option<session_pending_workspace::Model>,
-        ask_user_row: Option<session_pending_ask_user::Model>,
+        ask_user_row: Option<PendingAskUserRequestRow>,
+        ask_user_question_rows: Vec<PendingAskUserQuestionRow>,
+        ask_user_option_rows: Vec<PendingAskUserQuestionOptionRow>,
         plan_row: Option<session_plans::Model>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let mut attachments_by_message = attachment_rows.into_iter().fold(
+            std::collections::BTreeMap::<i64, Vec<PendingMessageAttachmentRow>>::new(),
+            |mut grouped, row| {
+                grouped.entry(row.message_id).or_default().push(row);
+                grouped
+            },
+        );
         let mut steer_messages = Vec::new();
         let mut queued_messages = Vec::new();
         for row in message_rows {
-            let message = Self::pending_user_message_from_row(row)?;
+            let message = Self::pending_user_message_from_parts(
+                row.clone(),
+                attachments_by_message.remove(&row.id).unwrap_or_default(),
+            )?;
             if message.delivery_mode == crate::session::PendingUserMessageMode::Steer {
                 steer_messages.push(message);
             } else {
@@ -613,7 +952,13 @@ impl ChatDb {
                 .transpose()?,
             waiting_workspace: workspace_row.map(Self::persisted_workspace_request_from_row),
             waiting_ask_user: ask_user_row
-                .map(Self::persisted_ask_user_request_from_row)
+                .map(|row| {
+                    Self::persisted_ask_user_request_from_parts(
+                        row,
+                        ask_user_question_rows.clone(),
+                        ask_user_option_rows.clone(),
+                    )
+                })
                 .transpose()?,
             updated_at: runtime_row.map(|row| row.updated_at),
             ..Default::default()
@@ -647,10 +992,17 @@ impl ChatDb {
         .await?;
         let message_rows = query!(
             self.db,
-            "SELECT * FROM session_pending_messages WHERE session_id = ? ORDER BY id ASC",
+            "SELECT * FROM session_pending_message_entries WHERE session_id = ? ORDER BY id ASC",
             session_id
         )
-        .fetch_all::<session_pending_messages::Model>()
+        .fetch_all::<PendingMessageEntryRow>()
+        .await?;
+        let attachment_rows = query!(
+            self.db,
+            "SELECT attachments.* FROM session_pending_message_attachments AS attachments INNER JOIN session_pending_message_entries AS entries ON entries.id = attachments.message_id WHERE entries.session_id = ? ORDER BY attachments.message_id ASC, attachments.ordinal ASC",
+            session_id
+        )
+        .fetch_all::<PendingMessageAttachmentRow>()
         .await?;
         let permission_row = query!(
             self.db,
@@ -668,11 +1020,33 @@ impl ChatDb {
         .await?;
         let ask_user_row = query!(
             self.db,
-            "SELECT * FROM session_pending_ask_user WHERE session_id = ? LIMIT 1",
+            "SELECT * FROM session_pending_ask_user_requests_v2 WHERE session_id = ? LIMIT 1",
             session_id
         )
-        .fetch_optional::<session_pending_ask_user::Model>()
+        .fetch_optional::<PendingAskUserRequestRow>()
         .await?;
+        let ask_user_question_rows = if let Some(request) = ask_user_row.as_ref() {
+            query!(
+                self.db,
+                "SELECT * FROM session_pending_ask_user_questions_v2 WHERE request_id = ? ORDER BY ordinal ASC",
+                request.request_id.as_str()
+            )
+            .fetch_all::<PendingAskUserQuestionRow>()
+            .await?
+        } else {
+            Vec::new()
+        };
+        let ask_user_option_rows = if let Some(request) = ask_user_row.as_ref() {
+            query!(
+                self.db,
+                "SELECT * FROM session_pending_ask_user_question_options_v2 WHERE request_id = ? ORDER BY question_ordinal ASC, option_ordinal ASC",
+                request.request_id.as_str()
+            )
+            .fetch_all::<PendingAskUserQuestionOptionRow>()
+            .await?
+        } else {
+            Vec::new()
+        };
         let plan_row = query!(
             self.db,
             "SELECT * FROM session_plans WHERE session_id = ?",
@@ -683,9 +1057,12 @@ impl ChatDb {
         Self::build_session_runtime_summary(
             runtime_row,
             message_rows,
+            attachment_rows,
             permission_row,
             workspace_row,
             ask_user_row,
+            ask_user_question_rows,
+            ask_user_option_rows,
             plan_row,
         )
     }
@@ -742,7 +1119,14 @@ impl ChatDb {
 
         query!(
             tx,
-            "DELETE FROM session_pending_messages WHERE session_id = ?",
+            "DELETE FROM session_pending_message_attachments WHERE message_id IN (SELECT id FROM session_pending_message_entries WHERE session_id = ?)",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_entries WHERE session_id = ?",
             session_id
         )
         .execute()
@@ -750,30 +1134,68 @@ impl ChatDb {
         for message in &summary.queued_messages {
             query!(
                 tx,
-                "INSERT INTO session_pending_messages (session_id, delivery_mode, content, attachments_json, hidden_context_xml, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO session_pending_message_entries (session_id, delivery_mode, content, hidden_context_xml, created_at) VALUES (?, ?, ?, ?, ?)",
                 session_id,
                 message.delivery_mode.as_str(),
                 message.content.as_str(),
-                serde_json::to_string(&message.attachments)?,
                 message.hidden_context_xml.clone().map(XmlFragment::into_inner),
                 message.created_at.as_str()
             )
             .execute()
             .await?;
+            let message_id = query!(tx, "SELECT last_insert_rowid() AS value")
+                .fetch_one::<I64ValueRow>()
+                .await?
+                .value;
+            for (ordinal, attachment) in message.attachments.iter().enumerate() {
+                query!(
+                    tx,
+                    "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    message_id,
+                    i64::try_from(ordinal).map_err(|error| overflow_error("pending attachment ordinal", &error))?,
+                    attachment.id.as_str(),
+                    attachment.name.as_str(),
+                    attachment.attachment_type.as_str(),
+                    attachment.url.as_str(),
+                    attachment.upload_data_url.as_deref(),
+                    attachment.text_content.as_deref()
+                )
+                .execute()
+                .await?;
+            }
         }
         if let Some(message) = &summary.pending_immediate {
             query!(
                 tx,
-                "INSERT INTO session_pending_messages (session_id, delivery_mode, content, attachments_json, hidden_context_xml, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO session_pending_message_entries (session_id, delivery_mode, content, hidden_context_xml, created_at) VALUES (?, ?, ?, ?, ?)",
                 session_id,
                 message.delivery_mode.as_str(),
                 message.content.as_str(),
-                serde_json::to_string(&message.attachments)?,
                 message.hidden_context_xml.clone().map(XmlFragment::into_inner),
                 message.created_at.as_str()
             )
             .execute()
             .await?;
+            let message_id = query!(tx, "SELECT last_insert_rowid() AS value")
+                .fetch_one::<I64ValueRow>()
+                .await?
+                .value;
+            for (ordinal, attachment) in message.attachments.iter().enumerate() {
+                query!(
+                    tx,
+                    "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    message_id,
+                    i64::try_from(ordinal).map_err(|error| overflow_error("pending attachment ordinal", &error))?,
+                    attachment.id.as_str(),
+                    attachment.name.as_str(),
+                    attachment.attachment_type.as_str(),
+                    attachment.url.as_str(),
+                    attachment.upload_data_url.as_deref(),
+                    attachment.text_content.as_deref()
+                )
+                .execute()
+                .await?;
+            }
         }
 
         query!(
@@ -820,7 +1242,21 @@ impl ChatDb {
 
         query!(
             tx,
-            "DELETE FROM session_pending_ask_user WHERE session_id = ?",
+            "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_ask_user_requests_v2 WHERE session_id = ?",
             session_id
         )
         .execute()
@@ -828,14 +1264,40 @@ impl ChatDb {
         if let Some(request) = &summary.waiting_ask_user {
             query!(
                 tx,
-                "INSERT INTO session_pending_ask_user (request_id, session_id, questions_json, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO session_pending_ask_user_requests_v2 (request_id, session_id, created_at) VALUES (?, ?, ?)",
                 request.id.as_str(),
                 session_id,
-                serde_json::to_string(&request.questions)?,
                 summary.updated_at.as_deref().unwrap_or(now.as_str())
             )
             .execute()
             .await?;
+            for (question_ordinal, question) in request.questions.iter().enumerate() {
+                let question_ordinal = i64::try_from(question_ordinal)
+                    .map_err(|error| overflow_error("ask-user question ordinal", &error))?;
+                query!(
+                    tx,
+                    "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select) VALUES (?, ?, ?, ?, ?)",
+                    request.id.as_str(),
+                    question_ordinal,
+                    question.section.as_str(),
+                    question.question.as_str(),
+                    question.multi_select
+                )
+                .execute()
+                .await?;
+                for (option_ordinal, option) in question.option.iter().enumerate() {
+                    query!(
+                        tx,
+                        "INSERT INTO session_pending_ask_user_question_options_v2 (request_id, question_ordinal, option_ordinal, value) VALUES (?, ?, ?, ?)",
+                        request.id.as_str(),
+                        question_ordinal,
+                        i64::try_from(option_ordinal).map_err(|error| overflow_error("ask-user option ordinal", &error))?,
+                        option.as_str()
+                    )
+                    .execute()
+                    .await?;
+                }
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -1159,7 +1621,7 @@ impl ChatDb {
     ) -> Result<Option<PendingAskUserLookup>, ChatDbError> {
         Ok(query!(
             self.db,
-            "SELECT session_id FROM session_pending_ask_user WHERE request_id = ? LIMIT 1",
+            "SELECT session_id FROM session_pending_ask_user_requests_v2 WHERE request_id = ? LIMIT 1",
             request_id
         )
         .fetch_optional::<PendingAskUserLookup>()
@@ -1171,33 +1633,17 @@ impl ChatDb {
         session_id: &str,
         mode: PermissionHistoryMode,
     ) -> Result<bool, ChatDbError> {
-        let responded_ids = self
-            .get_messages_by_role(session_id, MessageRole::PermissionResponse.as_str())
+        Ok(
+            query!(
+                self.db,
+                "SELECT EXISTS(SELECT 1 FROM messages AS request_message INNER JOIN message_permission_requests AS request ON request.message_id = request_message.id INNER JOIN message_permission_responses AS response ON response.request_id = request.request_id INNER JOIN messages AS response_message ON response_message.id = response.message_id WHERE request_message.session_id = ? AND response_message.session_id = request_message.session_id AND request.mode = ? AND response.approved = TRUE) AS value",
+                session_id,
+                mode.as_str()
+            )
+            .fetch_one::<self::BoolValueRow>()
             .await?
-            .into_iter()
-            .map(|row| {
-                serde_json::from_str::<crate::session::history::PermissionResponseData>(
-                    &row.content,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|response| response.approved)
-            .map(|response| response.id)
-            .collect::<std::collections::HashSet<_>>();
-
-        let approved = self
-            .get_messages_by_role(session_id, MessageRole::PermissionRequest.as_str())
-            .await?
-            .into_iter()
-            .map(|row| {
-                serde_json::from_str::<crate::session::history::PermissionRequestData>(&row.content)
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .any(|request| request.mode == mode && responded_ids.contains(&request.id));
-
-        Ok(approved)
+            .value,
+        )
     }
 
     /// Check if a session exists in the database.
@@ -1407,6 +1853,17 @@ impl ChatDb {
         Ok(())
     }
 
+    pub async fn session_run_lease_active(&self, session_id: &str) -> Result<bool, ChatDbError> {
+        let lease = query!(
+            self.db,
+            "SELECT * FROM session_run_leases WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<session_run_leases::Model>()
+        .await?;
+        Ok(lease.is_some_and(|lease| lease.active))
+    }
+
     pub async fn request_session_run_cancel(&self, session_id: &str) -> Result<bool, ChatDbError> {
         let result = query!(
             self.db,
@@ -1545,6 +2002,213 @@ impl ChatDb {
         }
 
         Ok(model)
+    }
+
+    async fn append_structured_message(
+        &self,
+        session_id: &str,
+        role: MessageRole,
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        self.append_message(session_id, role, "", timestamp, None, None)
+            .await
+    }
+
+    pub async fn append_permission_request_message(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        mode: PermissionHistoryMode,
+        script: &str,
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
+            .append_structured_message(session_id, MessageRole::PermissionRequest, timestamp)
+            .await?;
+        query!(
+            self.db,
+            "INSERT INTO message_permission_requests (message_id, request_id, mode, script) VALUES (?, ?, ?, ?)",
+            message.id,
+            request_id,
+            mode.as_str(),
+            script
+        )
+        .execute()
+        .await?;
+        Ok(message)
+    }
+
+    pub async fn append_permission_response_message(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        approved: bool,
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
+            .append_structured_message(session_id, MessageRole::PermissionResponse, timestamp)
+            .await?;
+        query!(
+            self.db,
+            "INSERT INTO message_permission_responses (message_id, request_id, approved) VALUES (?, ?, ?)",
+            message.id,
+            request_id,
+            approved
+        )
+        .execute()
+        .await?;
+        Ok(message)
+    }
+
+    pub async fn append_workspace_request_message(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        path: &str,
+        reason: &str,
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
+            .append_structured_message(session_id, MessageRole::WorkspaceRequest, timestamp)
+            .await?;
+        query!(
+            self.db,
+            "INSERT INTO message_workspace_requests (message_id, request_id, path, reason) VALUES (?, ?, ?, ?)",
+            message.id,
+            request_id,
+            path,
+            reason
+        )
+        .execute()
+        .await?;
+        Ok(message)
+    }
+
+    pub async fn append_workspace_response_message(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        approved: bool,
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
+            .append_structured_message(session_id, MessageRole::WorkspaceResponse, timestamp)
+            .await?;
+        query!(
+            self.db,
+            "INSERT INTO message_workspace_responses (message_id, request_id, approved) VALUES (?, ?, ?)",
+            message.id,
+            request_id,
+            approved
+        )
+        .execute()
+        .await?;
+        Ok(message)
+    }
+
+    pub async fn append_ask_user_request_message(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        questions: &[crate::ask_user::Question],
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
+            .append_structured_message(session_id, MessageRole::AskUserRequest, timestamp)
+            .await?;
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "INSERT INTO message_ask_user_requests (message_id, request_id) VALUES (?, ?)",
+            message.id,
+            request_id
+        )
+        .execute()
+        .await?;
+        for (question_ordinal, question) in questions.iter().enumerate() {
+            let question_ordinal = i64::try_from(question_ordinal)
+                .map_err(|error| overflow_error("ask-user history question ordinal", &error))?;
+            query!(
+                tx,
+                "INSERT INTO message_ask_user_request_questions (message_id, ordinal, section, question, multi_select) VALUES (?, ?, ?, ?, ?)",
+                message.id,
+                question_ordinal,
+                question.section.as_str(),
+                question.question.as_str(),
+                question.multi_select
+            )
+            .execute()
+            .await?;
+            for (option_ordinal, option) in question.option.iter().enumerate() {
+                query!(
+                    tx,
+                    "INSERT INTO message_ask_user_request_options (message_id, question_ordinal, option_ordinal, value) VALUES (?, ?, ?, ?)",
+                    message.id,
+                    question_ordinal,
+                    i64::try_from(option_ordinal).map_err(|error| overflow_error("ask-user history option ordinal", &error))?,
+                    option.as_str()
+                )
+                .execute()
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(message)
+    }
+
+    pub async fn append_ask_user_response_message(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        answers: &[crate::ask_user::QuestionAnswer],
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
+            .append_structured_message(session_id, MessageRole::AskUserResponse, timestamp)
+            .await?;
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "INSERT INTO message_ask_user_responses (message_id, request_id) VALUES (?, ?)",
+            message.id,
+            request_id
+        )
+        .execute()
+        .await?;
+        for (answer_ordinal, answer) in answers.iter().enumerate() {
+            let answer_ordinal = i64::try_from(answer_ordinal)
+                .map_err(|error| overflow_error("ask-user history answer ordinal", &error))?;
+            let (answer_kind, custom_text, selected_values) = match &answer.answer {
+                AnswerValue::Selected(values) => ("selected", None, values.as_slice()),
+                AnswerValue::Custom(value) => ("custom", Some(value.as_str()), &[][..]),
+                AnswerValue::Skipped => ("skipped", None, &[][..]),
+            };
+            query!(
+                tx,
+                "INSERT INTO message_ask_user_response_answers (message_id, ordinal, section, answer_kind, custom_text) VALUES (?, ?, ?, ?, ?)",
+                message.id,
+                answer_ordinal,
+                answer.section.as_str(),
+                answer_kind,
+                custom_text
+            )
+            .execute()
+            .await?;
+            for (option_ordinal, value) in selected_values.iter().enumerate() {
+                query!(
+                    tx,
+                    "INSERT INTO message_ask_user_response_selected_options (message_id, answer_ordinal, option_ordinal, value) VALUES (?, ?, ?, ?)",
+                    message.id,
+                    answer_ordinal,
+                    i64::try_from(option_ordinal).map_err(|error| overflow_error("ask-user history selected option ordinal", &error))?,
+                    value.as_str()
+                )
+                .execute()
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(message)
     }
 
     pub async fn append_chat_message(
@@ -1733,22 +2397,100 @@ impl ChatDb {
         model: &str,
         provider_id: &str,
         prompt: &str,
-        prompt_attachments_json: &str,
-        assembled_messages_json: &str,
+        prompt_attachments: &[String],
+        assembled_messages: &[ContextDebugSnapshotMessage],
     ) -> Result<(), ChatDbError> {
+        let mut tx = self.db.begin().await?;
         query!(
-            self.db,
-            "INSERT INTO context_debug_snapshots (session_id, timestamp, model, provider_id, prompt, prompt_attachments_json, assembled_messages_json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET timestamp = excluded.timestamp, model = excluded.model, provider_id = excluded.provider_id, prompt = excluded.prompt, prompt_attachments_json = excluded.prompt_attachments_json, assembled_messages_json = excluded.assembled_messages_json",
+            tx,
+            "INSERT INTO context_debug_snapshot_headers (session_id, timestamp, model, provider_id, prompt) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET timestamp = excluded.timestamp, model = excluded.model, provider_id = excluded.provider_id, prompt = excluded.prompt",
             session_id,
             timestamp,
             model,
             provider_id,
-            prompt,
-            prompt_attachments_json,
-            assembled_messages_json
+            prompt
         )
         .execute()
         .await?;
+        query!(
+            tx,
+            "DELETE FROM context_debug_snapshot_prompt_attachments WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM context_debug_snapshot_message_attachments WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM context_debug_snapshot_message_tool_calls WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM context_debug_snapshot_messages WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        for (ordinal, attachment_url) in prompt_attachments.iter().enumerate() {
+            query!(
+                tx,
+                "INSERT INTO context_debug_snapshot_prompt_attachments (session_id, ordinal, url) VALUES (?, ?, ?)",
+                session_id,
+                i64::try_from(ordinal).map_err(|error| overflow_error("context debug prompt attachment ordinal", &error))?,
+                attachment_url.as_str()
+            )
+            .execute()
+            .await?;
+        }
+        for (message_ordinal, message) in assembled_messages.iter().enumerate() {
+            let message_ordinal = i64::try_from(message_ordinal)
+                .map_err(|error| overflow_error("context debug message ordinal", &error))?;
+            query!(
+                tx,
+                "INSERT INTO context_debug_snapshot_messages (session_id, ordinal, role, content, tool_call_id) VALUES (?, ?, ?, ?, ?)",
+                session_id,
+                message_ordinal,
+                message.role.as_str(),
+                message.content.as_str(),
+                message.tool_call_id.as_deref()
+            )
+            .execute()
+            .await?;
+            for (attachment_ordinal, attachment_url) in message.attachments.iter().enumerate() {
+                query!(
+                    tx,
+                    "INSERT INTO context_debug_snapshot_message_attachments (session_id, message_ordinal, attachment_ordinal, url) VALUES (?, ?, ?, ?)",
+                    session_id,
+                    message_ordinal,
+                    i64::try_from(attachment_ordinal).map_err(|error| overflow_error("context debug message attachment ordinal", &error))?,
+                    attachment_url.as_str()
+                )
+                .execute()
+                .await?;
+            }
+            for (tool_call_ordinal, tool_call_name) in message.tool_call_names.iter().enumerate() {
+                query!(
+                    tx,
+                    "INSERT INTO context_debug_snapshot_message_tool_calls (session_id, message_ordinal, tool_call_ordinal, name) VALUES (?, ?, ?, ?)",
+                    session_id,
+                    message_ordinal,
+                    i64::try_from(tool_call_ordinal).map_err(|error| overflow_error("context debug tool call ordinal", &error))?,
+                    tool_call_name.as_str()
+                )
+                .execute()
+                .await?;
+            }
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1756,14 +2498,90 @@ impl ChatDb {
     pub async fn get_context_debug_snapshot(
         &self,
         session_id: &str,
-    ) -> Result<Option<context_debug_snapshots::Model>, ChatDbError> {
-        Ok(query!(
+    ) -> Result<Option<ContextDebugSnapshot>, ChatDbError> {
+        let Some(header) = query!(
             self.db,
-            "SELECT * FROM context_debug_snapshots WHERE session_id = ?",
+            "SELECT * FROM context_debug_snapshot_headers WHERE session_id = ?",
             session_id
         )
-        .fetch_optional::<context_debug_snapshots::Model>()
-        .await?)
+        .fetch_optional::<ContextDebugSnapshotHeaderRow>()
+        .await?
+        else {
+            return Ok(None);
+        };
+        let prompt_attachment_rows = query!(
+            self.db,
+            "SELECT * FROM context_debug_snapshot_prompt_attachments WHERE session_id = ? ORDER BY ordinal ASC",
+            session_id
+        )
+        .fetch_all::<ContextDebugPromptAttachmentRow>()
+        .await?;
+        let message_rows = query!(
+            self.db,
+            "SELECT * FROM context_debug_snapshot_messages WHERE session_id = ? ORDER BY ordinal ASC",
+            session_id
+        )
+        .fetch_all::<ContextDebugMessageRow>()
+        .await?;
+        let message_attachment_rows = query!(
+            self.db,
+            "SELECT * FROM context_debug_snapshot_message_attachments WHERE session_id = ? ORDER BY message_ordinal ASC, attachment_ordinal ASC",
+            session_id
+        )
+        .fetch_all::<ContextDebugMessageAttachmentRow>()
+        .await?;
+        let message_tool_call_rows = query!(
+            self.db,
+            "SELECT * FROM context_debug_snapshot_message_tool_calls WHERE session_id = ? ORDER BY message_ordinal ASC, tool_call_ordinal ASC",
+            session_id
+        )
+        .fetch_all::<ContextDebugMessageToolCallRow>()
+        .await?;
+        let mut attachments_by_message = message_attachment_rows.into_iter().fold(
+            std::collections::BTreeMap::<i64, Vec<ContextDebugMessageAttachmentRow>>::new(),
+            |mut grouped, row| {
+                grouped.entry(row.message_ordinal).or_default().push(row);
+                grouped
+            },
+        );
+        let mut tool_calls_by_message = message_tool_call_rows.into_iter().fold(
+            std::collections::BTreeMap::<i64, Vec<ContextDebugMessageToolCallRow>>::new(),
+            |mut grouped, row| {
+                grouped.entry(row.message_ordinal).or_default().push(row);
+                grouped
+            },
+        );
+        Ok(Some(ContextDebugSnapshot {
+            session_id: header.session_id,
+            timestamp: header.timestamp,
+            model: header.model,
+            provider_id: header.provider_id,
+            prompt: header.prompt,
+            prompt_attachments: prompt_attachment_rows
+                .into_iter()
+                .map(|row| row.url)
+                .collect(),
+            assembled_messages: message_rows
+                .into_iter()
+                .map(|row| ContextDebugSnapshotMessage {
+                    role: row.role,
+                    content: row.content,
+                    attachments: attachments_by_message
+                        .remove(&row.ordinal)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|attachment| attachment.url)
+                        .collect(),
+                    tool_call_id: row.tool_call_id,
+                    tool_call_names: tool_calls_by_message
+                        .remove(&row.ordinal)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|tool_call| tool_call.name)
+                        .collect(),
+                })
+                .collect(),
+        }))
     }
 
     /// Upsert the latest serialized agent context snapshot for a session.
@@ -2098,31 +2916,8 @@ impl ChatDb {
 
     /// Check if network permission was ever approved in a session.
     pub async fn has_network_approval(&self, session_id: &str) -> Result<bool, ChatDbError> {
-        let responses = self
-            .get_messages_by_role(session_id, "permission_response")
-            .await?;
-
-        let requests = self
-            .get_messages_by_role(session_id, "permission_request")
-            .await?;
-
-        for resp in &responses {
-            if let Ok(data) = serde_json::from_str::<PermissionResponsePayload>(&resp.content) {
-                if !data.approved {
-                    continue;
-                }
-                for req in &requests {
-                    if let Ok(req_data) =
-                        serde_json::from_str::<PermissionRequestPayload>(&req.content)
-                        && req_data.id == data.id
-                        && req_data.mode == PermissionHistoryMode::Network
-                    {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
+        self.session_has_approved_permission_mode(session_id, PermissionHistoryMode::Network)
+            .await
     }
 
     /// Find unanswered permission requests in a session.
@@ -2130,29 +2925,24 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<Vec<PermissionRequestPayload>, ChatDbError> {
-        let requests = self
-            .get_messages_by_role(session_id, "permission_request")
-            .await?;
-        let responses = self
-            .get_messages_by_role(session_id, "permission_response")
-            .await?;
-
-        let responded_ids: std::collections::HashSet<String> = responses
-            .iter()
-            .filter_map(|m| {
-                serde_json::from_str::<PermissionResponsePayload>(&m.content)
-                    .ok()
-                    .map(|d| d.id)
+        query!(
+            self.db,
+            "SELECT request.request_id AS request_id, request.mode AS mode, request.script AS script FROM messages AS message INNER JOIN message_permission_requests AS request ON request.message_id = message.id WHERE message.session_id = ? AND NOT EXISTS (SELECT 1 FROM message_permission_responses AS response INNER JOIN messages AS response_message ON response_message.id = response.message_id WHERE response.request_id = request.request_id AND response_message.session_id = message.session_id) ORDER BY message.id ASC",
+            session_id
+        )
+        .fetch_all::<PermissionRequestMessageRow>()
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(PermissionRequestPayload {
+                id: row.request_id,
+                mode: row.mode.parse().map_err(|error| {
+                    storage_error(db_custom_error("invalid permission history mode: ", &error))
+                })?,
+                script: row.script,
             })
-            .collect();
-
-        let pending = requests
-            .iter()
-            .filter_map(|m| serde_json::from_str::<PermissionRequestPayload>(&m.content).ok())
-            .filter(|d| !responded_ids.contains(&d.id))
-            .collect();
-
-        Ok(pending)
+        })
+        .collect()
     }
 
     /// Find unanswered ask-user requests in a session.
@@ -2160,29 +2950,120 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<Vec<AskUserRequestPayload>, ChatDbError> {
-        let requests = self
-            .get_messages_by_role(session_id, "ask_user_request")
-            .await?;
-        let responses = self
-            .get_messages_by_role(session_id, "ask_user_response")
-            .await?;
-
-        let responded_ids: std::collections::HashSet<String> = responses
-            .iter()
-            .filter_map(|m| {
-                serde_json::from_str::<AskUserResponsePayload>(&m.content)
-                    .ok()
-                    .map(|d| d.id)
+        let request_rows = query!(
+            self.db,
+            "SELECT request.message_id AS message_id, request.request_id AS request_id FROM messages AS message INNER JOIN message_ask_user_requests AS request ON request.message_id = message.id WHERE message.session_id = ? AND NOT EXISTS (SELECT 1 FROM message_ask_user_responses AS response INNER JOIN messages AS response_message ON response_message.id = response.message_id WHERE response.request_id = request.request_id AND response_message.session_id = message.session_id) ORDER BY message.id ASC",
+            session_id
+        )
+        .fetch_all::<AskUserRequestMessageRow>()
+        .await?;
+        let question_rows = query!(
+            self.db,
+            "SELECT request.message_id AS message_id, question.ordinal AS ordinal, question.section AS section, question.question AS question, question.multi_select AS multi_select FROM messages AS message INNER JOIN message_ask_user_requests AS request ON request.message_id = message.id INNER JOIN message_ask_user_request_questions AS question ON question.message_id = request.message_id WHERE message.session_id = ? ORDER BY request.message_id ASC, question.ordinal ASC",
+            session_id
+        )
+        .fetch_all::<AskUserRequestQuestionRow>()
+        .await?;
+        let option_rows = query!(
+            self.db,
+            "SELECT request.message_id AS message_id, option.question_ordinal AS question_ordinal, option.option_ordinal AS option_ordinal, option.value AS value FROM messages AS message INNER JOIN message_ask_user_requests AS request ON request.message_id = message.id INNER JOIN message_ask_user_request_options AS option ON option.message_id = request.message_id WHERE message.session_id = ? ORDER BY request.message_id ASC, option.question_ordinal ASC, option.option_ordinal ASC",
+            session_id
+        )
+        .fetch_all::<AskUserRequestQuestionOptionRow>()
+        .await?;
+        let mut questions_by_message = question_rows.into_iter().fold(
+            std::collections::BTreeMap::<i32, Vec<AskUserRequestQuestionRow>>::new(),
+            |mut grouped, row| {
+                grouped.entry(row.message_id).or_default().push(row);
+                grouped
+            },
+        );
+        let mut options_by_message = option_rows.into_iter().fold(
+            std::collections::BTreeMap::<i32, Vec<AskUserRequestQuestionOptionRow>>::new(),
+            |mut grouped, row| {
+                grouped.entry(row.message_id).or_default().push(row);
+                grouped
+            },
+        );
+        request_rows
+            .into_iter()
+            .map(|request| {
+                let question_rows = questions_by_message
+                    .remove(&request.message_id)
+                    .unwrap_or_default();
+                let option_rows = options_by_message
+                    .remove(&request.message_id)
+                    .unwrap_or_default();
+                let mut options_by_question = option_rows.into_iter().fold(
+                    std::collections::BTreeMap::<i64, Vec<AskUserRequestQuestionOptionRow>>::new(),
+                    |mut grouped, row| {
+                        grouped.entry(row.question_ordinal).or_default().push(row);
+                        grouped
+                    },
+                );
+                Ok(AskUserRequestPayload {
+                    id: request.request_id,
+                    questions: question_rows
+                        .into_iter()
+                        .map(|question| crate::ask_user::Question {
+                            section: question.section,
+                            question: question.question,
+                            option: options_by_question
+                                .remove(&question.ordinal)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|option| option.value)
+                                .collect(),
+                            multi_select: question.multi_select,
+                        })
+                        .collect(),
+                })
             })
-            .collect();
+            .collect()
+    }
 
-        let pending = requests
-            .iter()
-            .filter_map(|m| serde_json::from_str::<AskUserRequestPayload>(&m.content).ok())
-            .filter(|d| !responded_ids.contains(&d.id))
-            .collect();
+    pub async fn load_profile_preferences(
+        &self,
+        profile: &profiles::Model,
+    ) -> Result<Option<ProfilePreferences>, ChatDbError> {
+        let mounts = query!(
+            self.db,
+            "SELECT * FROM profile_container_mounts WHERE profile_id = ? ORDER BY ordinal ASC",
+            profile.id.as_str()
+        )
+        .fetch_all::<ProfileMountRow>()
+        .await?
+        .into_iter()
+        .map(|row| {
+            let access = row.access.parse().map_err(|error| {
+                storage_error(db_custom_error("invalid profile mount access: ", &error))
+            })?;
+            Ok(ContainerMountPreference {
+                host_path: row.host_path,
+                container_path: row.container_path,
+                access,
+            })
+        })
+        .collect::<Result<Vec<_>, ChatDbError>>()?;
+        Ok(build_profile_preferences(profile, mounts))
+    }
 
-        Ok(pending)
+    pub async fn profile_info_from_model(
+        &self,
+        profile: profiles::Model,
+    ) -> Result<crate::profile::ProfileInfo, ChatDbError> {
+        let preferences = self.load_profile_preferences(&profile).await?;
+        crate::profile::ProfileInfo::from_db_parts(profile, preferences)
+    }
+
+    pub async fn load_container_profile_preferences(
+        &self,
+        profile: &profiles::Model,
+    ) -> Result<Option<ContainerProfilePreferences>, ChatDbError> {
+        Ok(self
+            .load_profile_preferences(profile)
+            .await?
+            .and_then(|preferences| preferences.container))
     }
 
     // ── Profile CRUD ────────────────────────────────────────────
@@ -2194,13 +3075,28 @@ impl ChatDb {
     ) -> Result<profiles::Model, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         let sort_order = self.max_profile_sort_order().await? + 1;
+        let preferences = normalize_profile_preferences(params.environment, params.preferences)?;
         let container_image = match params.environment {
             ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote => None,
             ProfileEnvironmentKind::Container => params.container_image,
         };
+        let remote_ssh_server_id = preferences
+            .as_ref()
+            .and_then(|value| value.remote.as_ref())
+            .map(|value| value.ssh_server_id.as_str());
+        let container_dockerfile = preferences
+            .as_ref()
+            .and_then(|value| value.container.as_ref())
+            .and_then(|value| value.dockerfile.as_deref());
+        let container_mounts = preferences
+            .as_ref()
+            .and_then(|value| value.container.as_ref())
+            .map(|value| value.mounts.as_slice())
+            .unwrap_or(&[]);
+        let mut tx = self.db.begin().await?;
         query!(
-            self.db,
-            "INSERT INTO profiles (id, slug, name, icon, environment, container_image, container_id, persona, preferences_json, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            tx,
+            "INSERT INTO profiles (id, slug, name, icon, environment, container_image, container_id, persona, remote_ssh_server_id, container_dockerfile, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params.id,
             params.slug,
             params.name,
@@ -2209,31 +3105,33 @@ impl ChatDb {
             container_image,
             Option::<String>::None,
             params.persona,
-            params.preferences_json,
+            remote_ssh_server_id,
+            container_dockerfile,
             params.location_aware,
             10_i32,
             sort_order,
-            now.clone(),
-            now.clone()
+            now.as_str(),
+            now.as_str()
         )
         .execute()
         .await?;
-        Ok(profiles::Model {
-            id: params.id.to_string(),
-            slug: params.slug.map(ToOwned::to_owned),
-            name: params.name.to_string(),
-            icon: params.icon.map(ToOwned::to_owned),
-            environment: params.environment.as_str().to_string(),
-            container_image: container_image.map(ToOwned::to_owned),
-            container_id: None,
-            persona: params.persona.map(ToOwned::to_owned),
-            preferences_json: params.preferences_json.map(ToOwned::to_owned),
-            location_aware: params.location_aware,
-            pinned_limit: 10,
-            sort_order,
-            created_at: now.clone(),
-            updated_at: now,
-        })
+        for (ordinal, mount) in container_mounts.iter().enumerate() {
+            query!(
+                tx,
+                "INSERT INTO profile_container_mounts (profile_id, ordinal, host_path, container_path, access) VALUES (?, ?, ?, ?, ?)",
+                params.id,
+                i64::try_from(ordinal).map_err(|error| overflow_error("profile mount ordinal", &error))?,
+                mount.host_path.as_str(),
+                mount.container_path.as_str(),
+                mount.access.as_str()
+            )
+            .execute()
+            .await?;
+        }
+        tx.commit().await?;
+        self.get_profile(params.id)
+            .await?
+            .ok_or_else(|| row_not_found(format!("Profile not found after insert: {}", params.id)))
     }
 
     /// List all profiles ordered by `sort_order`.
@@ -2290,23 +3188,41 @@ impl ChatDb {
         if let Some(persona) = params.persona {
             existing.persona = persona.map(ToOwned::to_owned);
         }
-        if let Some(preferences_json) = params.preferences_json {
-            existing.preferences_json = preferences_json.map(ToOwned::to_owned);
-        }
         if let Some(location_aware) = params.location_aware {
             existing.location_aware = location_aware;
         }
+        let environment = parse_profile_environment(existing.environment.as_str())?;
+        let current_preferences = self.load_profile_preferences(&existing).await?;
+        let merged_preferences = match params.preferences {
+            Some(preferences) => normalize_profile_preferences(environment, preferences)?,
+            None => current_preferences,
+        };
+        existing.remote_ssh_server_id = merged_preferences
+            .as_ref()
+            .and_then(|value| value.remote.as_ref())
+            .map(|value| value.ssh_server_id.clone());
+        existing.container_dockerfile = merged_preferences
+            .as_ref()
+            .and_then(|value| value.container.as_ref())
+            .and_then(|value| value.dockerfile.clone());
+        let container_mounts = merged_preferences
+            .as_ref()
+            .and_then(|value| value.container.as_ref())
+            .map(|value| value.mounts.as_slice())
+            .unwrap_or(&[]);
         existing.updated_at = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
         query!(
-            self.db,
-            "UPDATE profiles SET name = ?, icon = ?, environment = ?, container_image = ?, container_id = ?, persona = ?, preferences_json = ?, location_aware = ?, pinned_limit = ?, sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
+            tx,
+            "UPDATE profiles SET name = ?, icon = ?, environment = ?, container_image = ?, container_id = ?, persona = ?, remote_ssh_server_id = ?, container_dockerfile = ?, location_aware = ?, pinned_limit = ?, sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
             existing.name.as_str(),
             existing.icon.as_deref(),
             existing.environment.as_str(),
             existing.container_image.as_deref(),
             existing.container_id.as_deref(),
             existing.persona.as_deref(),
-            existing.preferences_json.as_deref(),
+            existing.remote_ssh_server_id.as_deref(),
+            existing.container_dockerfile.as_deref(),
             existing.location_aware,
             existing.pinned_limit,
             existing.sort_order,
@@ -2316,6 +3232,27 @@ impl ChatDb {
         )
         .execute()
         .await?;
+        query!(
+            tx,
+            "DELETE FROM profile_container_mounts WHERE profile_id = ?",
+            id
+        )
+        .execute()
+        .await?;
+        for (ordinal, mount) in container_mounts.iter().enumerate() {
+            query!(
+                tx,
+                "INSERT INTO profile_container_mounts (profile_id, ordinal, host_path, container_path, access) VALUES (?, ?, ?, ?, ?)",
+                id,
+                i64::try_from(ordinal).map_err(|error| overflow_error("profile mount ordinal", &error))?,
+                mount.host_path.as_str(),
+                mount.container_path.as_str(),
+                mount.access.as_str()
+            )
+            .execute()
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2396,7 +3333,7 @@ impl ChatDb {
                     slug: Some(def.slug),
                     icon: Some(def.icon),
                     persona: None,
-                    preferences_json: None,
+                    preferences: None,
                     location_aware: def.location_aware,
                 })
                 .await?
@@ -2698,11 +3635,14 @@ impl ChatDb {
         .map(|row| row.session_id)
         .collect::<std::collections::BTreeSet<_>>();
         active_session_ids.extend(
-            query!(self.db, "SELECT session_id FROM session_pending_messages")
-                .fetch_all::<SessionIdRow>()
-                .await?
-                .into_iter()
-                .map(|row| row.session_id),
+            query!(
+                self.db,
+                "SELECT DISTINCT session_id FROM session_pending_message_entries"
+            )
+            .fetch_all::<SessionIdRow>()
+            .await?
+            .into_iter()
+            .map(|row| row.session_id),
         );
         active_session_ids.extend(
             query!(
@@ -2715,11 +3655,14 @@ impl ChatDb {
             .map(|row| row.session_id),
         );
         active_session_ids.extend(
-            query!(self.db, "SELECT session_id FROM session_pending_ask_user")
-                .fetch_all::<SessionIdRow>()
-                .await?
-                .into_iter()
-                .map(|row| row.session_id),
+            query!(
+                self.db,
+                "SELECT DISTINCT session_id FROM session_pending_ask_user_requests_v2"
+            )
+            .fetch_all::<SessionIdRow>()
+            .await?
+            .into_iter()
+            .map(|row| row.session_id),
         );
         active_session_ids.extend(
             query!(self.db, "SELECT session_id FROM session_pending_workspace")
@@ -3243,6 +4186,11 @@ struct I64ValueRow {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+struct BoolValueRow {
+    value: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 struct AssistantCacheUsageSummaryRow {
     assistant_message_count: i64,
     cache_hit_message_count: i64,
@@ -3295,7 +4243,7 @@ fn truncate_preview(content: &str) -> String {
     }
 }
 
-/// Permission request data stored as JSON in message content.
+/// Persisted permission request from structured history rows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PermissionRequestPayload {
     pub id: String,
@@ -3303,25 +4251,25 @@ pub struct PermissionRequestPayload {
     pub script: String,
 }
 
-/// Permission response data stored as JSON in message content.
+/// Persisted permission response from structured history rows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PermissionResponsePayload {
     pub id: String,
     pub approved: bool,
 }
 
-/// Ask-user request data stored as JSON in message content.
+/// Persisted ask-user request from structured history rows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AskUserRequestPayload {
     pub id: String,
-    pub questions: serde_json::Value,
+    pub questions: Vec<crate::ask_user::Question>,
 }
 
-/// Ask-user response data stored as JSON in message content.
+/// Persisted ask-user response from structured history rows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AskUserResponsePayload {
     pub id: String,
-    pub answers: serde_json::Value,
+    pub answers: Vec<crate::ask_user::QuestionAnswer>,
 }
 
 #[cfg(test)]
@@ -3331,7 +4279,7 @@ mod tests {
     use crate::PermissionRequestMode;
     use crate::db::ProfileEnvironmentKind;
     use crate::db::entity::{scheduled_task_runs, session_run_leases};
-    use crate::profile::ProfileEnvironment;
+    use crate::profile::{ProfileEnvironment, ProfilePreferences, RemoteProfilePreferences};
     use crate::session::{
         PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
         PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
@@ -3369,7 +4317,7 @@ mod tests {
             slug: None,
             icon: None,
             persona: None,
-            preferences_json: None,
+            preferences: None,
             location_aware: false,
         })
         .await
@@ -3472,7 +4420,7 @@ mod tests {
             slug: None,
             icon: None,
             persona: None,
-            preferences_json: None,
+            preferences: None,
             location_aware: false,
         })
         .await
@@ -3539,7 +4487,7 @@ mod tests {
             slug: Some("daily"),
             icon: Some("D"),
             persona: None,
-            preferences_json: None,
+            preferences: None,
             location_aware: false,
         })
         .await
@@ -3552,7 +4500,7 @@ mod tests {
             slug: Some("work"),
             icon: Some("W"),
             persona: None,
-            preferences_json: None,
+            preferences: None,
             location_aware: true,
         })
         .await
@@ -3565,7 +4513,7 @@ mod tests {
             slug: Some("local"),
             icon: Some("L"),
             persona: None,
-            preferences_json: None,
+            preferences: None,
             location_aware: true,
         })
         .await
@@ -3905,13 +4853,20 @@ mod tests {
                 slug: None,
                 icon: None,
                 persona: None,
-                preferences_json: Some(r#"{"remote":{"ssh_server_id":"prod"}}"#),
+                preferences: Some(&ProfilePreferences {
+                    remote: Some(RemoteProfilePreferences {
+                        ssh_server_id: "prod".to_string(),
+                    }),
+                    container: None,
+                }),
                 location_aware: false,
             })
             .await
             .expect("remote profile should be created");
 
-        let info = crate::profile::ProfileInfo::from_db_model(model)
+        let info = db
+            .profile_info_from_model(model)
+            .await
             .expect("remote profile should deserialize");
         match info.environment.kind() {
             ProfileEnvironment::Remote { ssh_server_id } => assert_eq!(ssh_server_id, "prod"),
@@ -3936,13 +4891,20 @@ mod tests {
                 slug: None,
                 icon: None,
                 persona: None,
-                preferences_json: Some(r#"{"remote":{"ssh_server_id":"  "}}"#),
+                preferences: Some(&ProfilePreferences {
+                    remote: Some(RemoteProfilePreferences {
+                        ssh_server_id: "  ".to_string(),
+                    }),
+                    container: None,
+                }),
                 location_aware: false,
             })
             .await
             .expect("remote profile row should be stored");
 
-        let error = crate::profile::ProfileInfo::from_db_model(model)
+        let error = db
+            .profile_info_from_model(model)
+            .await
             .expect_err("invalid remote preferences must fail fast");
         assert!(
             error

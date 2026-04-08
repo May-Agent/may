@@ -3,7 +3,6 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 
-use anyhow::Context;
 use async_channel::Receiver;
 use blocking::unblock;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -21,6 +20,7 @@ use super::clipboard::{
     set_clipboard_html, set_clipboard_text,
 };
 use super::completion::{Completion, CompletionMode};
+use super::error::{AppResult, TuiError};
 use super::event::{AppEvent, EventSender};
 use super::history::InputHistory;
 use super::queue::{Attachment, LARGE_PASTE_THRESHOLD, MessageQueue, PendingMessage};
@@ -131,10 +131,9 @@ pub struct App {
     /// Receiver for fetched models (oneshot)
     pub model_fetch_rx: Option<Receiver<Vec<FetchedModel>>>,
     /// Receiver for clipboard paste resolution (oneshot)
-    pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, anyhow::Error>>>,
+    pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, TuiError>>>,
     /// Pending paste results waiting to be handled
-    pub pending_paste_results:
-        std::collections::VecDeque<Result<ClipboardPasteResult, anyhow::Error>>,
+    pub pending_paste_results: std::collections::VecDeque<Result<ClipboardPasteResult, TuiError>>,
     /// Pending attachment jobs (clipboard read / download)
     pub pending_attachment_jobs: usize,
     /// Cumulative token usage for current session
@@ -208,8 +207,8 @@ impl App {
     pub async fn new(
         event_tx: EventSender,
         image_support: Option<super::ui::image::TerminalImageSupport>,
-    ) -> anyhow::Result<Self> {
-        let mut config = MayConfig::load().await.context("Failed to load config")?;
+    ) -> AppResult<Self> {
+        let mut config = MayConfig::load().await.map_err(TuiError::LoadConfig)?;
         let mut session_manager = SessionManager::new().await?;
 
         // Auto-detect API keys from environment variables
@@ -366,7 +365,7 @@ impl App {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
         spawn(async move {
-            let result = config.save().await.map_err(anyhow::Error::from);
+            let result = config.save().await.map_err(TuiError::from);
             let _ = tx.send(AppEvent::ConfigSaved(result)).await;
         })
         .detach();
@@ -569,7 +568,7 @@ impl App {
     }
 
     /// Handle an event. Returns Some(message) if user wants to send a message.
-    pub fn handle_event(&mut self, event: AppEvent) -> anyhow::Result<Option<SendAction>> {
+    pub fn handle_event(&mut self, event: AppEvent) -> AppResult<Option<SendAction>> {
         super::reducer::reduce_event(self, event)
     }
 
@@ -676,10 +675,7 @@ impl App {
     }
 
     /// Handle bracketed paste event.
-    pub(super) fn handle_bracketed_paste(
-        &mut self,
-        text: String,
-    ) -> anyhow::Result<Option<SendAction>> {
+    pub(super) fn handle_bracketed_paste(&mut self, text: String) -> AppResult<Option<SendAction>> {
         // Special handling for Chat mode: large pastes become attachments
         if matches!(self.mode, AppMode::Chat)
             && (text.contains('\n') || text.len() > LARGE_PASTE_THRESHOLD)
@@ -736,7 +732,7 @@ impl App {
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
-    ) -> anyhow::Result<Option<SendAction>> {
+    ) -> AppResult<Option<SendAction>> {
         // Global shortcuts
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
@@ -872,15 +868,13 @@ impl App {
                 let result = crate::profile::query_profile_sessions(&db, &pid).await;
                 let _ = tx
                     .send(AppEvent::ProfileSessionsLoaded(
-                        result.map_err(anyhow::Error::from),
+                        result.map_err(TuiError::from),
                     ))
                     .await;
             } else {
                 let result = crate::session::list_summaries_from_db(&db).await;
                 let _ = tx
-                    .send(AppEvent::SessionsLoaded(
-                        result.map_err(anyhow::Error::from),
-                    ))
+                    .send(AppEvent::SessionsLoaded(result.map_err(TuiError::from)))
                     .await;
             }
         })
@@ -940,7 +934,7 @@ impl App {
             let result = crate::profile::query_profile_sessions(&db, &pid).await;
             let _ = tx
                 .send(AppEvent::ProfileSessionsLoaded(
-                    result.map_err(anyhow::Error::from),
+                    result.map_err(TuiError::from),
                 ))
                 .await;
         })
@@ -979,7 +973,7 @@ impl App {
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
-    ) -> anyhow::Result<Option<SendAction>> {
+    ) -> AppResult<Option<SendAction>> {
         // Handle Ctrl+V for paste
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('v') {
             self.handle_paste()?;
@@ -1114,7 +1108,7 @@ impl App {
         Ok(None)
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> anyhow::Result<Option<SendAction>> {
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
         if !matches!(self.mode, AppMode::Chat) {
             return Ok(None);
         }
@@ -1234,7 +1228,7 @@ impl App {
         if out.is_empty() { None } else { Some(out) }
     }
 
-    fn copy_selection_to_clipboard(&mut self) -> anyhow::Result<bool> {
+    fn copy_selection_to_clipboard(&mut self) -> AppResult<bool> {
         let Some(text) = self.selected_text() else {
             return Ok(false);
         };
@@ -1249,14 +1243,14 @@ impl App {
             .is_ok();
 
         if !osc52_ok && !arboard_ok {
-            return Err(anyhow::anyhow!("failed to copy selection to clipboard"));
+            return Err(TuiError::ClipboardCopyFailed);
         }
 
         Ok(true)
     }
 
     /// Execute a slash command directly (from menu selection only).
-    fn execute_slash_command(&mut self, cmd: &str) -> anyhow::Result<Option<SendAction>> {
+    fn execute_slash_command(&mut self, cmd: &str) -> AppResult<Option<SendAction>> {
         match cmd {
             "/session" => {
                 self.load_session_list();
@@ -1343,7 +1337,7 @@ impl App {
                     );
                     let result = manager.list_skills().await;
                     let _ = tx
-                        .send(AppEvent::SkillsLoaded(result.map_err(anyhow::Error::from)))
+                        .send(AppEvent::SkillsLoaded(result.map_err(TuiError::from)))
                         .await;
                 })
                 .detach();
@@ -1355,10 +1349,7 @@ impl App {
     }
 
     /// Handle key in tier model picker mode.
-    fn handle_tier_model_picker_key(
-        &mut self,
-        code: KeyCode,
-    ) -> anyhow::Result<Option<SendAction>> {
+    fn handle_tier_model_picker_key(&mut self, code: KeyCode) -> AppResult<Option<SendAction>> {
         match code {
             KeyCode::Esc => {
                 // Cancel and go back to config
@@ -1446,12 +1437,12 @@ impl App {
     }
 
     /// Queue a paste result to be handled by the main loop.
-    pub fn enqueue_paste_result(&mut self, result: Result<ClipboardPasteResult, anyhow::Error>) {
+    pub fn enqueue_paste_result(&mut self, result: Result<ClipboardPasteResult, TuiError>) {
         self.pending_paste_results.push_back(result);
     }
 
     /// Dequeue the next pending paste result.
-    pub fn dequeue_paste_result(&mut self) -> Option<Result<ClipboardPasteResult, anyhow::Error>> {
+    pub fn dequeue_paste_result(&mut self) -> Option<Result<ClipboardPasteResult, TuiError>> {
         self.pending_paste_results.pop_front()
     }
 
@@ -1463,8 +1454,8 @@ impl App {
     /// Handle a completed paste result (clipboard or bracketed paste).
     pub async fn handle_paste_result(
         &mut self,
-        result: Result<ClipboardPasteResult, anyhow::Error>,
-    ) -> anyhow::Result<()> {
+        result: Result<ClipboardPasteResult, TuiError>,
+    ) -> AppResult<()> {
         let result = match result {
             Ok(result) => result,
             Err(e) => {
@@ -1483,7 +1474,7 @@ impl App {
             let manager = self
                 .image_manager
                 .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("Image manager not initialized"))?;
+                .ok_or(TuiError::MissingImageManager)?;
             let path = manager.save(&image).await?;
             self.attachments.push(Attachment::Image {
                 path,
@@ -1498,7 +1489,7 @@ impl App {
                 let manager = self
                     .text_manager
                     .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("Text manager not initialized"))?;
+                    .ok_or(TuiError::MissingTextManager)?;
                 Some(manager.save(&text).await?)
             } else {
                 None
@@ -1512,9 +1503,7 @@ impl App {
             return Ok(());
         }
 
-        Err(anyhow::anyhow!(
-            "Clipboard paste result contained no image or text"
-        ))
+        Err(TuiError::EmptyPasteResult)
     }
 
     /// Handle fetched models from async task.
@@ -1563,7 +1552,7 @@ impl App {
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
-    ) -> anyhow::Result<Option<SendAction>> {
+    ) -> AppResult<Option<SendAction>> {
         let state = &mut self.config_state;
 
         // If in edit mode, handle text input
@@ -1626,7 +1615,7 @@ impl App {
     }
 
     /// Handle Enter in config screen - edit/toggle the selected item.
-    fn handle_config_enter(&mut self) -> anyhow::Result<Option<SendAction>> {
+    fn handle_config_enter(&mut self) -> AppResult<Option<SendAction>> {
         let state = &mut self.config_state;
 
         match state.section {
@@ -1720,7 +1709,7 @@ impl App {
     }
 
     /// Handle key input when editing in config screen.
-    fn handle_config_edit_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
+    fn handle_config_edit_key(&mut self, code: KeyCode) -> AppResult<Option<SendAction>> {
         let state = &mut self.config_state;
 
         // Handle list selection mode
@@ -1964,7 +1953,7 @@ impl App {
     }
 
     /// Save the current edit in config screen.
-    fn save_config_edit(&mut self) -> anyhow::Result<Option<SendAction>> {
+    fn save_config_edit(&mut self) -> AppResult<Option<SendAction>> {
         // Extract needed values from state first to avoid borrow issues
         let (value, section, selected) = {
             let state = &self.config_state;
@@ -2064,7 +2053,7 @@ impl App {
     }
 
     /// Handle key in model select popup.
-    fn handle_model_select_key(&mut self, code: KeyCode) -> anyhow::Result<Option<SendAction>> {
+    fn handle_model_select_key(&mut self, code: KeyCode) -> AppResult<Option<SendAction>> {
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.model_select_index = self.model_select_index.saturating_sub(1);
@@ -2110,7 +2099,7 @@ impl App {
     }
 
     /// Handle paste (Ctrl+V) - check for image or text in clipboard.
-    fn handle_paste(&mut self) -> anyhow::Result<()> {
+    fn handle_paste(&mut self) -> AppResult<()> {
         if self.clipboard_rx.is_some() {
             self.status = Some("Clipboard paste already in progress".to_string());
             return Ok(());
@@ -2129,10 +2118,13 @@ impl App {
                         Ok(ClipboardPasteResult::image(image))
                     } else if let Some(text) = text {
                         if let Some(url) = is_image_url(&text) {
-                            download_image(&url)
-                                .await
-                                .map(ClipboardPasteResult::image)
-                                .map_err(anyhow::Error::from)
+                            match download_image(&url).await {
+                                Ok(image) => Ok(ClipboardPasteResult::image(image)),
+                                Err(crate::tui::clipboard::ImageError::NotImage(_)) => {
+                                    Ok(ClipboardPasteResult::text(text))
+                                }
+                                Err(error) => Err(TuiError::from(error)),
+                            }
                         } else {
                             Ok(ClipboardPasteResult::text(text))
                         }
@@ -2140,7 +2132,7 @@ impl App {
                         Ok(ClipboardPasteResult::empty())
                     }
                 }
-                Err(e) => Err(anyhow::Error::from(e)),
+                Err(e) => Err(TuiError::from(e)),
             };
 
             let _ = tx.send(result).await;

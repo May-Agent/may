@@ -26,7 +26,9 @@ use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
 use crate::agent::command_words::split_shell_words;
 use crate::agent::search_match::{extend_unique, push_unique};
 use crate::db::ChatDb;
-use crate::embedding_provider::{EmbeddingModelResolution, MayEmbeddingModel};
+use crate::embedding_provider::{
+    EmbeddingModelRequireError, EmbeddingModelResolution, MayEmbeddingModel,
+};
 
 const TABLE_NAME: &str = "session_messages";
 const INDEX_META_FILE: &str = "session_index.meta.json";
@@ -175,6 +177,60 @@ pub struct SessionTool {
     embedder: EmbeddingModelResolution,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum SessionToolError {
+    #[error("database error: {0}")]
+    Database(#[from] crate::db::ChatDbError),
+    #[error("session command parsing failed: {0}")]
+    CommandWords(#[from] crate::agent::command_words::SplitShellWordsError),
+    #[error("{0}")]
+    EmbeddingModel(#[from] EmbeddingModelRequireError),
+    #[error("LanceDB error: {0}")]
+    LanceDb(#[from] lancedb::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("tool result serialization error: {0}")]
+    ToolResult(#[from] aither_core::Error),
+    #[error("RAG error: {0}")]
+    Rag(#[from] aither_rag::RagError),
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] arrow_schema::ArrowError),
+    #[error("invalid regex pattern: {0}")]
+    InvalidRegex(#[source] regex::Error),
+    #[error("failed to parse semantic metadata integer: {0}")]
+    ParseInt(#[from] std::num::ParseIntError),
+    #[error("{command_name} command must not be empty")]
+    EmptyCommand { command_name: String },
+    #[error("{command_name} command must include a search prompt")]
+    MissingCommandPrompt { command_name: String },
+    #[error("invalid session command: missing prompt after 'search'")]
+    MissingSearchPrompt,
+    #[error("failed to remove stale session semantic index {path}: {source}")]
+    RemoveStaleSemanticIndex {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("session semantic index entry is missing '{key}' metadata")]
+    MissingSemanticMetadata { key: String },
+    #[error("session semantic search does not support wildcard queries")]
+    SemanticWildcardUnsupported,
+    #[error("session semantic index is missing; rerun the query after indexing data")]
+    MissingSemanticIndex,
+    #[error("failed to inspect session semantic index {path}: {source}")]
+    InspectSemanticIndex {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("missing or invalid '{name}' column")]
+    MissingOrInvalidColumn { name: String },
+    #[error("invalid full-text search column selection: {0}")]
+    InvalidFullTextColumns(String),
+}
+
 #[derive(Debug, Clone)]
 struct SearchDefaults {
     current_session_id: String,
@@ -243,6 +299,7 @@ impl Tool for SessionTool {
             args,
         )
         .await
+        .map_err(Into::into)
     }
 }
 
@@ -288,7 +345,7 @@ async fn execute_search(
     semantic_index_path: PathBuf,
     embedder: EmbeddingModelResolution,
     args: SessionArgs,
-) -> aither_core::Result<ToolResult> {
+) -> Result<ToolResult, SessionToolError> {
     let query_enabled = args.query.trim() != "*" && !args.query.trim().is_empty();
 
     let db = ChatDb::open(&db_path).await?;
@@ -351,7 +408,7 @@ async fn execute_search(
             RegexBuilder::new(&pattern)
                 .case_insensitive(!args.case_sensitive)
                 .build()
-                .map_err(|e| anyhow::anyhow!("invalid regex pattern: {e}"))?,
+                .map_err(SessionToolError::InvalidRegex)?,
         )
     } else {
         None
@@ -440,10 +497,12 @@ fn apply_command_form(
     args: &mut SessionArgs,
     command: &str,
     command_name: &str,
-) -> aither_core::Result<()> {
+) -> Result<(), SessionToolError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
-        return Err(anyhow::anyhow!("{command_name} command must not be empty"));
+        return Err(SessionToolError::EmptyCommand {
+            command_name: command_name.to_string(),
+        });
     }
 
     let mut prefix = String::with_capacity(command_name.len() + 1);
@@ -454,9 +513,9 @@ fn apply_command_form(
         .unwrap_or(trimmed)
         .trim();
     if body.is_empty() {
-        return Err(anyhow::anyhow!(
-            "{command_name} command must include a search prompt"
-        ));
+        return Err(SessionToolError::MissingCommandPrompt {
+            command_name: command_name.to_string(),
+        });
     }
 
     let tokens = split_shell_words(body, command_name)?;
@@ -465,9 +524,7 @@ fn apply_command_form(
     {
         let prompt = prompt_tokens.join(" ");
         if prompt.is_empty() {
-            return Err(anyhow::anyhow!(
-                "invalid session command: missing prompt after 'search'"
-            ));
+            return Err(SessionToolError::MissingSearchPrompt);
         }
         args.session_id = Some(session_id.clone());
         args.query = prompt;
@@ -572,7 +629,7 @@ struct SessionResult {
     highlights: Vec<MessageResult>,
 }
 
-async fn compute_fingerprint(db: &ChatDb) -> anyhow::Result<SessionIndexMeta> {
+async fn compute_fingerprint(db: &ChatDb) -> Result<SessionIndexMeta, SessionToolError> {
     let sessions = db.list_sessions().await?;
     let session_count = sessions.len();
     let total_messages: usize = sessions
@@ -603,7 +660,7 @@ async fn ensure_index(
     db: &ChatDb,
     fingerprint: &SessionIndexMeta,
     embedder: EmbeddingModelResolution,
-) -> anyhow::Result<Table> {
+) -> Result<Table, SessionToolError> {
     let conn = connect(index_path.to_string_lossy().as_ref())
         .execute()
         .await?;
@@ -699,15 +756,15 @@ async fn rebuild_semantic_index(
     semantic_index_path: &Path,
     embedder: MayEmbeddingModel,
     rows: &[SessionIndexRow],
-) -> anyhow::Result<()> {
+) -> Result<(), SessionToolError> {
     match async_fs::remove_file(semantic_index_path).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(anyhow::anyhow!(
-                "failed to remove stale session semantic index {}: {error}",
-                semantic_index_path.display()
-            ));
+            return Err(SessionToolError::RemoveStaleSemanticIndex {
+                path: semantic_index_path.to_path_buf(),
+                source: error,
+            });
         }
     }
 
@@ -745,7 +802,7 @@ async fn rebuild_semantic_index(
     Ok(())
 }
 
-async fn build_index_rows(db: &ChatDb) -> anyhow::Result<Vec<SessionIndexRow>> {
+async fn build_index_rows(db: &ChatDb) -> Result<Vec<SessionIndexRow>, SessionToolError> {
     let sessions = db.list_sessions().await?;
     let mut rows = Vec::new();
 
@@ -793,7 +850,7 @@ async fn build_index_rows(db: &ChatDb) -> anyhow::Result<Vec<SessionIndexRow>> {
 
 fn rows_to_record_reader(
     rows: &[SessionIndexRow],
-) -> anyhow::Result<Box<dyn RecordBatchReader + Send>> {
+) -> Result<Box<dyn RecordBatchReader + Send>, SessionToolError> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("session_id", DataType::Utf8, false),
         Field::new("profile_id", DataType::Utf8, false),
@@ -953,7 +1010,7 @@ fn binary_sql_expr(column: &str, op: BinaryOperator, value: &str) -> SqlExpr {
 async fn run_plain_query(
     table: &Table,
     args: &SessionArgs,
-) -> anyhow::Result<Vec<SessionMatchRow>> {
+) -> Result<Vec<SessionMatchRow>, SessionToolError> {
     let mut query = table
         .query()
         .select(Select::columns(&[
@@ -984,7 +1041,7 @@ async fn run_full_text_query(
     table: &Table,
     args: &SessionArgs,
     fuzzy: bool,
-) -> anyhow::Result<Vec<SessionMatchRow>> {
+) -> Result<Vec<SessionMatchRow>, SessionToolError> {
     if args.query.trim() == "*" || args.query.trim().is_empty() {
         return run_plain_query(table, args).await;
     }
@@ -1002,7 +1059,9 @@ async fn run_full_text_query(
         .cloned()
         .collect();
     if !fts_columns.is_empty() {
-        fts = fts.with_columns(&fts_columns)?;
+        fts = fts
+            .with_columns(&fts_columns)
+            .map_err(|error| SessionToolError::InvalidFullTextColumns(error.to_string()))?;
     }
 
     let mut query = table
@@ -1047,11 +1106,13 @@ async fn run_full_text_query(
 fn require_semantic_metadata<'a>(
     metadata: &'a aither_rag::Metadata,
     key: &str,
-) -> anyhow::Result<&'a str> {
+) -> Result<&'a str, SessionToolError> {
     metadata
         .get(key)
         .map(String::as_str)
-        .ok_or_else(|| anyhow::anyhow!("session semantic index entry is missing '{key}' metadata"))
+        .ok_or_else(|| SessionToolError::MissingSemanticMetadata {
+            key: key.to_string(),
+        })
 }
 
 fn row_matches_session_filters(row: &SessionMatchRow, args: &SessionArgs) -> bool {
@@ -1112,25 +1173,21 @@ async fn run_semantic_query(
     semantic_index_path: PathBuf,
     embedder: MayEmbeddingModel,
     args: SessionArgs,
-) -> anyhow::Result<ToolResult> {
+) -> Result<ToolResult, SessionToolError> {
     if args.query.trim() == "*" {
-        return Err(anyhow::anyhow!(
-            "session semantic search does not support wildcard queries"
-        ));
+        return Err(SessionToolError::SemanticWildcardUnsupported);
     }
 
     match async_fs::metadata(&semantic_index_path).await {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow::anyhow!(
-                "session semantic index is missing; rerun the query after indexing data"
-            ));
+            return Err(SessionToolError::MissingSemanticIndex);
         }
         Err(error) => {
-            return Err(anyhow::anyhow!(
-                "failed to inspect session semantic index {}: {error}",
-                semantic_index_path.display()
-            ));
+            return Err(SessionToolError::InspectSemanticIndex {
+                path: semantic_index_path,
+                source: error,
+            });
         }
     }
 
@@ -1147,7 +1204,7 @@ async fn run_semantic_query(
         .search_with_k(args.query.as_str(), args.scan_limit)
         .await?
         .into_iter()
-        .map(|result| -> anyhow::Result<SessionMatchRow> {
+        .map(|result| -> Result<SessionMatchRow, SessionToolError> {
             let metadata = &result.chunk.metadata;
             Ok(SessionMatchRow {
                 session_id: require_semantic_metadata(metadata, "session_id")?.to_string(),
@@ -1167,7 +1224,7 @@ async fn run_semantic_query(
                 matched_by: vec![SessionSearchMode::Semantic],
             })
         })
-        .collect::<anyhow::Result<Vec<_>>>()?
+        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter(|row| row_matches_session_filters(row, &args))
         .collect::<Vec<_>>();
@@ -1178,7 +1235,7 @@ async fn run_semantic_query(
 
 async fn read_rows_from_stream(
     stream: &mut lancedb::arrow::SendableRecordBatchStream,
-) -> anyhow::Result<Vec<SessionMatchRow>> {
+) -> Result<Vec<SessionMatchRow>, SessionToolError> {
     let mut rows = Vec::new();
 
     while let Some(batch_res) = stream.next().await {
@@ -1236,22 +1293,37 @@ async fn read_rows_from_stream(
     Ok(rows)
 }
 
-fn as_string<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a StringArray> {
+fn as_string<'a>(
+    column: Option<&'a ArrayRef>,
+    name: &str,
+) -> Result<&'a StringArray, SessionToolError> {
     column
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
+        .ok_or_else(|| SessionToolError::MissingOrInvalidColumn {
+            name: name.to_string(),
+        })
 }
 
-fn as_i64<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a Int64Array> {
+fn as_i64<'a>(
+    column: Option<&'a ArrayRef>,
+    name: &str,
+) -> Result<&'a Int64Array, SessionToolError> {
     column
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
+        .ok_or_else(|| SessionToolError::MissingOrInvalidColumn {
+            name: name.to_string(),
+        })
 }
 
-fn as_i32<'a>(column: Option<&'a ArrayRef>, name: &str) -> anyhow::Result<&'a Int32Array> {
+fn as_i32<'a>(
+    column: Option<&'a ArrayRef>,
+    name: &str,
+) -> Result<&'a Int32Array, SessionToolError> {
     column
         .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-        .ok_or_else(|| anyhow::anyhow!("missing or invalid '{name}' column"))
+        .ok_or_else(|| SessionToolError::MissingOrInvalidColumn {
+            name: name.to_string(),
+        })
 }
 
 fn searchable_text(row: &SessionMatchRow, fields: &[String]) -> String {
@@ -1286,7 +1358,7 @@ fn finalize_rows_with_total(
     rows: Vec<SessionMatchRow>,
     total_matches: usize,
     args: &SessionArgs,
-) -> anyhow::Result<ToolResult> {
+) -> Result<ToolResult, SessionToolError> {
     let start = args.offset.min(rows.len());
     let end = (start + args.limit).min(rows.len());
     let rows = rows[start..end].to_vec();
@@ -1348,7 +1420,7 @@ fn finalize_rows_with_total(
         })
     };
 
-    ToolResult::json(&value)
+    ToolResult::json(&value).map_err(SessionToolError::ToolResult)
 }
 
 #[cfg(test)]

@@ -30,11 +30,12 @@ use crate::db::{ChatDb, NetworkAccessLogParams, NetworkAccessMode, NetworkAccess
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
 use crate::notification::NotificationPayload;
 use crate::notification_service::NotificationService;
-use crate::profile::{ProfileEnvironment, ProfileInfo};
+use crate::profile::ProfileEnvironment;
 use crate::task_trigger::{
     PersistedTaskTrigger, TaskInvocation, TaskTriggerResponse, TaskWebhookRequest, TimeTriggerType,
     normalize_event_name,
 };
+use crate::text::{join_text, path_error_text, prefixed_display};
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 
 /// Shared task execution facility used by the scheduler, REST API, and agent tools.
@@ -111,18 +112,8 @@ impl TaskCatalog {
     }
 }
 
-fn join_text(parts: &[&str]) -> String {
-    let capacity = parts.iter().map(|part| part.len()).sum();
-    let mut output = String::with_capacity(capacity);
-    for part in parts {
-        output.push_str(part);
-    }
-    output
-}
-
 fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
-    let error_text = error.to_string();
-    join_text(&[prefix, error_text.as_str()])
+    prefixed_display(prefix, error)
 }
 
 fn profile_load_error(profile_id: &str, error: &impl std::fmt::Display) -> String {
@@ -207,12 +198,6 @@ fn task_script_failure(exit_code: i32, output: &str) -> String {
 
 fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String {
     join_text(&[prefix, execution_id, suffix])
-}
-
-fn path_error_text(prefix: &str, path: &std::path::Path, error: &impl std::fmt::Display) -> String {
-    let path_text = path.display().to_string();
-    let error_text = error.to_string();
-    join_text(&[prefix, path_text.as_str(), ": ", error_text.as_str()])
 }
 
 fn profile_workspace_key(profile: &profiles::Model) -> &str {
@@ -515,7 +500,10 @@ impl TaskRuntime {
             .await
             .map_err(|error| profile_load_error(profile_id.as_str(), &error))?
             .ok_or_else(|| profile_not_found_error(profile_id.as_str()))?;
-        let profile_info = ProfileInfo::from_db_model(profile.clone())
+        let profile_info = self
+            .db
+            .profile_info_from_model(profile.clone())
+            .await
             .map_err(|error| invalid_profile_error(profile_id.as_str(), &error))?;
         let actual_runtime = match profile_info.environment.kind() {
             ProfileEnvironment::Local => TaskRuntimeKind::Local,
@@ -787,7 +775,10 @@ impl TaskRuntime {
         script_path: Option<&str>,
         script_inline: Option<&str>,
     ) -> Result<(), String> {
-        let profile_info = ProfileInfo::from_db_model(profile.clone())
+        let profile_info = self
+            .db
+            .profile_info_from_model(profile.clone())
+            .await
             .map_err(|error| invalid_profile_error(profile.id.as_str(), &error))?;
         let script = self
             .resolve_script_source(script_path, script_inline)
@@ -918,7 +909,10 @@ impl TaskRuntime {
             .await
             .map_err(|error| profile_load_error(task.profile_id.as_str(), &error))?
             .ok_or_else(|| profile_not_found_error(task.profile_id.as_str()))?;
-        let profile_info = ProfileInfo::from_db_model(profile.clone())
+        let profile_info = self
+            .db
+            .profile_info_from_model(profile.clone())
+            .await
             .map_err(|error| invalid_profile_error(task.profile_id.as_str(), &error))?;
 
         let script = self.resolve_script(task).await?;
@@ -1232,17 +1226,28 @@ impl TaskRuntime {
         let container_manager = self.container_manager.as_ref().ok_or_else(|| {
             "container profile task cannot run: container runtime unavailable".to_string()
         })?;
+        let container_preferences = self
+            .db
+            .load_container_profile_preferences(profile)
+            .await
+            .map_err(|error| {
+                invalid_profile_component_error("invalid container profile preferences: ", &error)
+            })?;
 
-        let default_image_tag =
-            crate::container::profile::default_image_tag(&self.may_dir, profile)
-                .await
-                .map_err(|error| {
-                    invalid_profile_component_error("invalid container profile image tag: ", &error)
-                })?;
+        let default_image_tag = crate::container::profile::default_image_tag(
+            &self.may_dir,
+            profile,
+            container_preferences.clone(),
+        )
+        .await
+        .map_err(|error| {
+            invalid_profile_component_error("invalid container profile image tag: ", &error)
+        })?;
         let image_spec = crate::container::profile::image_spec_for_profile(
             &self.may_dir,
             profile,
             &default_image_tag,
+            container_preferences.clone(),
         )
         .map_err(|error| {
             invalid_profile_component_error(
@@ -1250,8 +1255,8 @@ impl TaskRuntime {
                 &error,
             )
         })?;
-        let extra_mounts =
-            crate::container::profile::mounts_for_profile(profile).map_err(|error| {
+        let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences)
+            .map_err(|error| {
                 invalid_profile_component_error(
                     "invalid container profile mount configuration: ",
                     &error,
@@ -1355,17 +1360,28 @@ impl TaskRuntime {
         let container_manager = self.container_manager.as_ref().ok_or_else(|| {
             "container profile task cannot run: container runtime unavailable".to_string()
         })?;
+        let container_preferences = self
+            .db
+            .load_container_profile_preferences(profile)
+            .await
+            .map_err(|error| {
+                invalid_profile_component_error("invalid container profile preferences: ", &error)
+            })?;
 
-        let default_image_tag =
-            crate::container::profile::default_image_tag(&self.may_dir, profile)
-                .await
-                .map_err(|error| {
-                    invalid_profile_component_error("invalid container profile image tag: ", &error)
-                })?;
+        let default_image_tag = crate::container::profile::default_image_tag(
+            &self.may_dir,
+            profile,
+            container_preferences.clone(),
+        )
+        .await
+        .map_err(|error| {
+            invalid_profile_component_error("invalid container profile image tag: ", &error)
+        })?;
         let image_spec = crate::container::profile::image_spec_for_profile(
             &self.may_dir,
             profile,
             &default_image_tag,
+            container_preferences.clone(),
         )
         .map_err(|error| {
             invalid_profile_component_error(
@@ -1373,8 +1389,8 @@ impl TaskRuntime {
                 &error,
             )
         })?;
-        let extra_mounts =
-            crate::container::profile::mounts_for_profile(profile).map_err(|error| {
+        let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences)
+            .map_err(|error| {
                 invalid_profile_component_error(
                     "invalid container profile mount configuration: ",
                     &error,
@@ -1496,6 +1512,7 @@ async fn run_terminal_command(
 ) -> Result<String, String> {
     let output = terminal_tool
         .call(TerminalArgs {
+            description: "run the scheduled task script".to_string(),
             script,
             mode,
             ssh_server_id,

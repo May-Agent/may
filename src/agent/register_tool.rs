@@ -31,6 +31,16 @@ pub type RegisterQueue = ToolRequestQueue<RegisterRequest, Result<RegisterResult
 
 const SUBAGENT_QUEUE_CAPACITY: usize = 64;
 
+#[derive(Debug, thiserror::Error)]
+enum RegisterToolError {
+    #[error("path must not be empty")]
+    EmptyPath,
+    #[error("{tool_name} command is unavailable in this runtime")]
+    Unavailable { tool_name: &'static str },
+    #[error("register request was rejected: {0}")]
+    Rejected(String),
+}
+
 #[must_use]
 pub fn skills_channel() -> (RegisterBroker, RegisterQueue) {
     tool_request_channel()
@@ -84,7 +94,7 @@ impl<K: RegisterKind> RegisterTool<K> {
 fn normalize_path(args: RegisterPathArgs) -> aither_core::Result<String> {
     let path = args.path.trim();
     if path.is_empty() {
-        return Err(anyhow::anyhow!("path must not be empty"));
+        return Err(RegisterToolError::EmptyPath.into());
     }
     Ok(path.to_string())
 }
@@ -98,17 +108,16 @@ impl<K: RegisterKind> Tool for RegisterTool<K> {
     type Res = ToolResult;
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
-        let broker = self
-            .broker
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("{} command is unavailable", K::TOOL_NAME))?;
+        let broker = self.broker.as_ref().ok_or(RegisterToolError::Unavailable {
+            tool_name: K::TOOL_NAME,
+        })?;
         let path = normalize_path(args)?;
         let request = RegisterRequest {
             session_id: self.session_id.clone(),
             path,
         };
         let response = broker.request(request).await?;
-        let result = response.map_err(anyhow::Error::msg)?;
+        let result = response.map_err(RegisterToolError::Rejected)?;
 
         ToolResult::json(&serde_json::json!({
             "ok": true,
