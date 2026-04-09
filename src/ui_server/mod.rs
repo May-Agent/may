@@ -209,6 +209,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         container_prepare,
         container_manager,
         browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
+        browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
         remote_access_manager,
         notification_service: notification_service.clone(),
         memory_processor,

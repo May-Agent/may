@@ -31,6 +31,8 @@ use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
     StartScreencastParams,
 };
+use chromiumoxide::cdp::browser_protocol::target::{TargetId, TargetInfo};
+use chromiumoxide::error::CdpError;
 use chromiumoxide::page::Page;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide_fetcher::{
@@ -115,6 +117,10 @@ pub enum BrowserError {
     },
     #[error(transparent)]
     InvalidInput(#[from] BrowserInputError),
+    #[error(transparent)]
+    ManagedBrowserStartup(#[from] ManagedBrowserStartupError),
+    #[error(transparent)]
+    BrowserPageReady(#[from] BrowserPageReadyError),
 }
 
 impl BrowserError {
@@ -157,6 +163,28 @@ impl BrowserError {
             source: Box::new(source),
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedBrowserStartupError {
+    #[error("managed browser debugger metadata at {url} did not include webSocketDebuggerUrl")]
+    MissingWebSocketDebuggerUrl { url: reqwest::Url },
+    #[error("failed to decode managed browser debugger metadata from {url}")]
+    DecodeDebuggerMetadata {
+        url: reqwest::Url,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error(
+        "managed browser did not expose a websocket endpoint on port {port} within {timeout:?}"
+    )]
+    Timeout { port: u16, timeout: Duration },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BrowserPageReadyError {
+    #[error("browser did not expose an initial page within {timeout:?}")]
+    Timeout { timeout: Duration },
 }
 
 // ── DataChannel input messages ─────────────────────────────────────────────────
@@ -277,11 +305,16 @@ struct EncodedSample {
 struct BrowserSession {
     browser: Browser,
     page: Arc<Page>,
-    owns_browser_process: bool,
+    backing: BrowserSessionBacking,
     _handler: tokio::task::JoinHandle<()>,
     _cdp_reader: tokio::task::JoinHandle<()>,
     _sample_writer: tokio::task::JoinHandle<()>,
     _audio_writer: tokio::task::JoinHandle<()>,
+}
+
+enum BrowserSessionBacking {
+    Managed { owns_process: bool },
+    RemoteCdp,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -296,6 +329,28 @@ enum ManagedBrowserListenerState {
     NotListening,
     Managed,
     ExternalProcess,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedBrowserPaths {
+    executable: PathBuf,
+    profile_dir: PathBuf,
+}
+
+impl ManagedBrowserPaths {
+    fn discover(may_dir: &Path) -> Option<Self> {
+        let profile_dir =
+            crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_profile_dir();
+        managed_browser_executable(may_dir).map(|executable| Self {
+            executable,
+            profile_dir,
+        })
+    }
+
+    fn owns_process_command(&self, command_line: &str) -> bool {
+        let profile_arg = format!("--user-data-dir={}", self.profile_dir.display());
+        command_line.contains(profile_arg.as_str())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -621,11 +676,12 @@ pub async fn prepare_browser_runtime(
 
 #[must_use]
 pub fn provisioned_browser_executable(may_dir: &Path) -> Option<PathBuf> {
-    managed_browser_executable(may_dir).map(PathBuf::from)
+    managed_browser_executable(may_dir)
 }
 
 pub async fn stop_managed_browser(port: u16, may_dir: &Path) {
-    cleanup_stale_chrome(port).await;
+    let paths = ManagedBrowserPaths::discover(may_dir);
+    cleanup_stale_chrome(port, paths.as_ref()).await;
     cleanup_profile_lock_files(
         crate::session::MayHomePaths::new(may_dir.to_path_buf())
             .browser_profile_dir()
@@ -644,12 +700,21 @@ impl BrowserRuntime {
             return Ok(());
         }
 
-        let (browser, mut handler, owns_browser_process) = match config.backend {
+        let (mut browser, mut handler, backing) = match config.backend {
             BrowserBackendKind::Managed => {
-                match inspect_managed_browser_listener_state(config.port).await? {
+                let paths =
+                    ManagedBrowserPaths::discover(may_dir).ok_or(BrowserError::NotProvisioned)?;
+                match inspect_managed_browser_listener_state(config.port, &paths).await? {
                     ManagedBrowserListenerState::Managed => {
-                        let endpoint =
-                            resolve_local_browser_websocket_endpoint(config.port).await?;
+                        tracing::info!(
+                            port = config.port,
+                            "Connecting to existing managed browser"
+                        );
+                        let endpoint = wait_for_local_browser_websocket_endpoint(
+                            config.port,
+                            managed_browser_launch_timeout(),
+                        )
+                        .await?;
                         let (browser, handler) =
                             Browser::connect(endpoint).await.map_err(|error| {
                                 BrowserError::browser_operation(
@@ -657,7 +722,13 @@ impl BrowserRuntime {
                                     error,
                                 )
                             })?;
-                        (browser, handler, false)
+                        (
+                            browser,
+                            handler,
+                            BrowserSessionBacking::Managed {
+                                owns_process: false,
+                            },
+                        )
                     }
                     ManagedBrowserListenerState::ExternalProcess => {
                         return Err(BrowserError::browser_operation(
@@ -669,52 +740,31 @@ impl BrowserRuntime {
                         ));
                     }
                     ManagedBrowserListenerState::NotListening => {
-                        cleanup_stale_chrome(config.port).await;
-
-                        let may_dir = may_dir.to_path_buf();
-                        let browser_paths = tokio::task::spawn_blocking(move || {
-                            let home = crate::session::MayHomePaths::new(may_dir);
-                            (
-                                managed_browser_executable(home.root()),
-                                home.browser_profile_dir(),
-                            )
-                        })
-                        .await
-                        .map_err(|error| {
-                            BrowserError::browser_operation(
-                                "resolve managed browser paths",
-                                std::io::Error::other(error.to_string()),
-                            )
-                        })?;
-                        let (binary_path, profile_dir) = browser_paths;
-                        cleanup_profile_lock_files(profile_dir.as_path()).await;
-                        tokio::fs::create_dir_all(&profile_dir)
+                        cleanup_stale_chrome(config.port, Some(&paths)).await;
+                        cleanup_profile_lock_files(paths.profile_dir.as_path()).await;
+                        tokio::fs::create_dir_all(&paths.profile_dir)
                             .await
                             .map_err(|error| {
                                 BrowserError::browser_operation("create browser profile dir", error)
                             })?;
 
-                        let mut builder = BrowserConfig::builder()
-                            .new_headless_mode()
-                            .port(config.port)
-                            .arg("--remote-allow-origins=*")
-                            .arg("--remote-debugging-address=0.0.0.0")
-                            .user_data_dir(profile_dir);
-
-                        let path = binary_path.ok_or(BrowserError::NotProvisioned)?;
-                        builder = builder.chrome_executable(path);
-
-                        let browser_config = builder.build().map_err(|error| {
-                            BrowserError::browser_operation(
-                                "build browser launch config",
-                                std::io::Error::other(error),
-                            )
-                        })?;
+                        tracing::info!(
+                            port = config.port,
+                            executable = %paths.executable.display(),
+                            profile_dir = %paths.profile_dir.display(),
+                            "Launching managed browser"
+                        );
+                        let browser_config =
+                            build_managed_browser_launch_config(config.port, &paths)?;
                         let (browser, handler) =
                             Browser::launch(browser_config).await.map_err(|error| {
                                 BrowserError::browser_operation("launch managed browser", error)
                             })?;
-                        (browser, handler, true)
+                        (
+                            browser,
+                            handler,
+                            BrowserSessionBacking::Managed { owns_process: true },
+                        )
                     }
                 }
             }
@@ -725,22 +775,39 @@ impl BrowserRuntime {
                 let (browser, handler) = Browser::connect(endpoint).await.map_err(|error| {
                     BrowserError::browser_operation("connect to remote cdp endpoint", error)
                 })?;
-                (browser, handler, false)
+                (browser, handler, BrowserSessionBacking::RemoteCdp)
             }
         };
 
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-        let page = Arc::new(
-            browser
-                .new_page("about:blank")
-                .await
-                .map_err(|error| BrowserError::browser_operation("open blank page", error))?,
-        );
+        let page = Arc::new(match &backing {
+            BrowserSessionBacking::Managed { owns_process } => {
+                let timeout = managed_browser_start_operation_timeout();
+                let page = tokio::time::timeout(timeout, browser.new_page("about:blank"))
+                    .await
+                    .map_err(|_| {
+                        managed_browser_start_timeout_error(
+                            &mut browser,
+                            *owns_process,
+                            "create managed browser page",
+                            timeout,
+                        )
+                    })?
+                    .map_err(|error| {
+                        BrowserError::browser_operation("create managed browser page", error)
+                    })?;
+                page
+            }
+            BrowserSessionBacking::RemoteCdp => {
+                let page = acquire_browser_page(&mut browser).await?;
+                page
+            }
+        });
 
         let max_width = i64::from(config.screencast_max_width);
         let max_height = max_width * 5 / 8;
-        page.execute(
+        let start_screencast = page.execute(
             StartScreencastParams::builder()
                 .format(StartScreencastFormat::Jpeg)
                 .quality(i64::from(config.screencast_quality))
@@ -748,9 +815,28 @@ impl BrowserRuntime {
                 .max_height(max_height)
                 .every_nth_frame(1)
                 .build(),
-        )
-        .await
-        .map_err(|error| BrowserError::browser_operation("start screencast", error))?;
+        );
+        match &backing {
+            BrowserSessionBacking::Managed { owns_process } => {
+                let timeout = managed_browser_start_operation_timeout();
+                tokio::time::timeout(timeout, start_screencast)
+                    .await
+                    .map_err(|_| {
+                        managed_browser_start_timeout_error(
+                            &mut browser,
+                            *owns_process,
+                            "start screencast",
+                            timeout,
+                        )
+                    })?
+                    .map_err(|error| BrowserError::browser_operation("start screencast", error))?;
+            }
+            BrowserSessionBacking::RemoteCdp => {
+                start_screencast
+                    .await
+                    .map_err(|error| BrowserError::browser_operation("start screencast", error))?;
+            }
+        }
 
         let (cdp_reader, sample_writer) = start_encoding_pipeline(
             page.clone(),
@@ -763,7 +849,7 @@ impl BrowserRuntime {
         self.session = Some(BrowserSession {
             browser,
             page,
-            owns_browser_process,
+            backing,
             _handler: handler_task,
             _cdp_reader: cdp_reader,
             _sample_writer: sample_writer,
@@ -785,10 +871,14 @@ impl BrowserRuntime {
             session._sample_writer.abort();
             session._audio_writer.abort();
             session._handler.abort();
-            if session.owns_browser_process {
-                let _ = session.browser.close().await;
-            } else {
-                let _ = session.page.as_ref().clone().close().await;
+            match session.backing {
+                BrowserSessionBacking::Managed { owns_process } => {
+                    let _ =
+                        shutdown_managed_browser_session(&mut session.browser, owns_process).await;
+                }
+                BrowserSessionBacking::RemoteCdp => {
+                    let _ = session.page.as_ref().clone().close().await;
+                }
             }
             tracing::info!("Browser stopped");
         }
@@ -904,19 +994,24 @@ impl BrowserRuntime {
 
 async fn inspect_managed_browser_listener_state(
     port: u16,
+    paths: &ManagedBrowserPaths,
 ) -> Result<ManagedBrowserListenerState, BrowserError> {
-    tokio::task::spawn_blocking(move || inspect_managed_browser_listener_state_blocking(port))
-        .await
-        .map_err(|error| {
-            BrowserError::browser_operation(
-                "inspect managed browser listener state",
-                std::io::Error::other(error.to_string()),
-            )
-        })?
+    let paths = paths.clone();
+    tokio::task::spawn_blocking(move || {
+        inspect_managed_browser_listener_state_blocking(port, &paths)
+    })
+    .await
+    .map_err(|error| {
+        BrowserError::browser_operation(
+            "inspect managed browser listener state",
+            std::io::Error::other(error.to_string()),
+        )
+    })?
 }
 
 fn inspect_managed_browser_listener_state_blocking(
     port: u16,
+    paths: &ManagedBrowserPaths,
 ) -> Result<ManagedBrowserListenerState, BrowserError> {
     let output = std::process::Command::new("lsof")
         .args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"])
@@ -942,7 +1037,7 @@ fn inspect_managed_browser_listener_state_blocking(
                 std::io::Error::other(format!("ps failed for pid {pid}")),
             ));
         }
-        if String::from_utf8_lossy(&command.stdout).contains("chromiumoxide-runner") {
+        if paths.owns_process_command(String::from_utf8_lossy(&command.stdout).as_ref()) {
             return Ok(ManagedBrowserListenerState::Managed);
         }
     }
@@ -950,35 +1045,219 @@ fn inspect_managed_browser_listener_state_blocking(
     Ok(ManagedBrowserListenerState::ExternalProcess)
 }
 
-async fn resolve_local_browser_websocket_endpoint(port: u16) -> Result<String, BrowserError> {
-    let mut endpoint = String::from("http://127.0.0.1:");
-    endpoint.push_str(&port.to_string());
-    endpoint.push_str("/json/version");
-    let response = reqwest::get(endpoint.as_str()).await.map_err(|error| {
-        BrowserError::browser_operation("fetch browser version metadata", error)
-    })?;
-    if !response.status().is_success() {
-        return Err(BrowserError::browser_operation(
-            "validate browser version metadata response",
-            std::io::Error::other(format!(
-                "browser debugger metadata request to {} returned HTTP {}",
-                endpoint,
-                response.status()
-            )),
-        ));
+fn managed_browser_launch_timeout() -> Duration {
+    Duration::from_millis(chromiumoxide::browser::LAUNCH_TIMEOUT)
+}
+
+fn managed_browser_start_operation_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn browser_initial_page_timeout() -> Duration {
+    Duration::from_secs(3)
+}
+
+fn managed_browser_start_timeout_error(
+    browser: &mut Browser,
+    owns_process: bool,
+    operation: &'static str,
+    timeout: Duration,
+) -> BrowserError {
+    if owns_process {
+        match browser.try_wait() {
+            Ok(Some(status)) => {
+                return BrowserError::browser_operation(
+                    operation,
+                    std::io::Error::other(format!(
+                        "managed browser exited with status {status} during startup"
+                    )),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return BrowserError::browser_operation(
+                    "inspect managed browser process state",
+                    error,
+                );
+            }
+        }
     }
-    let metadata: BrowserVersionMetadata = response.json().await.map_err(|error| {
-        BrowserError::browser_operation("decode browser version metadata", error)
-    })?;
-    metadata.web_socket_debugger_url.ok_or_else(|| {
-        BrowserError::browser_operation(
-            "read browser websocket endpoint",
-            std::io::Error::other(format!(
-                "browser debugger metadata at {} did not include webSocketDebuggerUrl",
-                endpoint
+
+    BrowserError::browser_operation(
+        operation,
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("browser startup operation exceeded {timeout:?}"),
+        ),
+    )
+}
+
+fn managed_browser_debugger_metadata_url(port: u16) -> reqwest::Url {
+    let mut url =
+        reqwest::Url::parse("http://127.0.0.1").expect("static managed browser URL must parse");
+    url.set_port(Some(port))
+        .expect("managed browser port must be valid");
+    url.set_path("/json/version");
+    url
+}
+
+fn build_managed_browser_launch_config(
+    port: u16,
+    paths: &ManagedBrowserPaths,
+) -> Result<BrowserConfig, BrowserError> {
+    BrowserConfig::builder()
+        .new_headless_mode()
+        .port(port)
+        .arg("--remote-allow-origins=*")
+        .arg("--remote-debugging-address=0.0.0.0")
+        .user_data_dir(paths.profile_dir.clone())
+        .chrome_executable(paths.executable.clone())
+        .build()
+        .map_err(|error| {
+            BrowserError::browser_operation(
+                "build browser launch config",
+                std::io::Error::other(error),
+            )
+        })
+}
+
+async fn wait_for_local_browser_websocket_endpoint(
+    port: u16,
+    timeout: Duration,
+) -> Result<String, BrowserError> {
+    let metadata_url = managed_browser_debugger_metadata_url(port);
+    let client = reqwest::Client::new();
+    let start = Instant::now();
+
+    loop {
+        match client.get(metadata_url.clone()).send().await {
+            Ok(response) if response.status().is_success() => {
+                let metadata: BrowserVersionMetadata = response.json().await.map_err(|source| {
+                    ManagedBrowserStartupError::DecodeDebuggerMetadata {
+                        url: metadata_url.clone(),
+                        source,
+                    }
+                })?;
+                return metadata.web_socket_debugger_url.ok_or_else(|| {
+                    ManagedBrowserStartupError::MissingWebSocketDebuggerUrl {
+                        url: metadata_url.clone(),
+                    }
+                    .into()
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.is_connect() || error.is_timeout() => {}
+            Err(error) => {
+                return Err(BrowserError::browser_operation(
+                    "fetch managed browser debugger metadata",
+                    error,
+                ));
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(ManagedBrowserStartupError::Timeout { port, timeout }.into());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn shutdown_managed_browser_session(
+    browser: &mut Browser,
+    owns_process: bool,
+) -> Result<(), BrowserError> {
+    let _ = browser.close().await;
+
+    if !owns_process {
+        return Ok(());
+    }
+
+    if browser
+        .try_wait()
+        .map_err(|error| {
+            BrowserError::browser_operation("inspect managed browser shutdown", error)
+        })?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    match tokio::time::timeout(Duration::from_secs(3), browser.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(BrowserError::browser_operation(
+            "wait for managed browser shutdown",
+            error,
+        )),
+        Err(_) => match browser.kill().await {
+            Some(Ok(())) | None => Ok(()),
+            Some(Err(error)) => Err(BrowserError::browser_operation(
+                "kill managed browser after shutdown timeout",
+                error,
             )),
-        )
-    })
+        },
+    }
+}
+
+async fn acquire_browser_page(browser: &mut Browser) -> Result<Page, BrowserError> {
+    let timeout = browser_initial_page_timeout();
+    let start = Instant::now();
+    let mut page_target_id: Option<TargetId> = None;
+
+    loop {
+        let target_id = if let Some(target_id) = page_target_id.clone() {
+            target_id
+        } else {
+            let targets = browser
+                .fetch_targets()
+                .await
+                .map_err(|error| BrowserError::browser_operation("fetch browser targets", error))?;
+            let discovered_target_id = first_page_target_id(targets.as_slice()).ok_or_else(|| {
+                BrowserError::browser_operation(
+                    "discover initial browser page target",
+                    std::io::Error::other("no page target exposed by browser"),
+                )
+            });
+            match discovered_target_id {
+                Ok(target_id) => {
+                    tracing::debug!(target_id = ?target_id, "discovered initial browser page target");
+                    page_target_id = Some(target_id.clone());
+                    target_id
+                }
+                Err(error) if start.elapsed() < timeout => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        match browser.get_page(target_id.clone()).await {
+            Ok(page) => return Ok(page),
+            Err(CdpError::NotFound) => {
+                tracing::debug!(target_id = ?target_id, "browser page target not ready yet");
+            }
+            Err(error) => {
+                return Err(BrowserError::browser_operation(
+                    "acquire browser page from target",
+                    error,
+                ));
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(BrowserPageReadyError::Timeout { timeout }.into());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn first_page_target_id(targets: &[TargetInfo]) -> Option<TargetId> {
+    targets
+        .iter()
+        .find(|target| target.r#type == "page")
+        .map(|target| target.target_id.clone())
 }
 
 async fn read_page_capture(
@@ -1669,19 +1948,11 @@ async fn dispatch_keyboard(page: &Page, input: KeyboardInput) -> Result<(), Brow
 /// When the server exits without cleanly shutting down `BrowserManager`,
 /// Chrome processes survive and hold the CDP port. This function detects
 /// and kills any chromiumoxide-launched Chrome on the target port.
-async fn cleanup_stale_chrome(port: u16) {
+async fn cleanup_stale_chrome(port: u16, paths: Option<&ManagedBrowserPaths>) {
+    let Some(paths) = paths.cloned() else {
+        return;
+    };
     let _ = tokio::task::spawn_blocking(move || {
-        // Clean up singleton lock files
-        let dir = std::env::temp_dir().join("chromiumoxide-runner");
-        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-            let path = dir.join(name);
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-
-        // Kill any Chrome processes using our port that have chromiumoxide-runner user-data-dir.
-        // This avoids killing the user's regular Chrome.
         let Ok(output) = std::process::Command::new("lsof")
             .args(["-ti", &format!(":{port}")])
             .output()
@@ -1700,7 +1971,7 @@ async fn cleanup_stale_chrome(port: u16) {
                 continue;
             };
             let args = String::from_utf8_lossy(&cmdline.stdout);
-            if args.contains("chromiumoxide-runner") {
+            if paths.owns_process_command(args.as_ref()) {
                 tracing::info!(pid, "Killing stale Chrome process on port {port}");
                 let _ = std::process::Command::new("kill")
                     .arg(pid.to_string())
@@ -1764,7 +2035,7 @@ async fn cleanup_profile_lock_files(profile_dir: &Path) {
 }
 
 /// Resolve the provisioned browser binary path. Runs in `spawn_blocking` since it does filesystem I/O.
-fn managed_browser_executable(may_dir: &Path) -> Option<String> {
+fn managed_browser_executable(may_dir: &Path) -> Option<PathBuf> {
     let cache_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_cache_dir();
     if !cache_dir.exists() {
         return None;
@@ -1782,5 +2053,5 @@ fn managed_browser_executable(may_dir: &Path) -> Option<String> {
         .into_iter()
         .filter_map(Result::ok)
         .find(|entry| entry.file_type().is_file() && entry.file_name() == binary_name)
-        .map(|entry| entry.path().to_string_lossy().to_string())
+        .map(|entry| entry.into_path())
 }

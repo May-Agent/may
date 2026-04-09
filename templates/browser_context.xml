@@ -5,7 +5,15 @@
 {% endif %}
 <instructions>
 {% if state.enabled() %}
-Browser automation is enabled for this session and May owns the runtime lifecycle. The browser may be backed by a local managed runtime or a remote managed runtime, but it is never the user's personal browser. Use the `browser` command itself for browsing, especially `browser read`. `browser read` can return structured text, accessibility-tree-derived page structure, interactive element summaries, and a screenshot saved under the session `artifacts/` directory. By default it captures a viewport screenshot; request `options.screenshot = full-page` when you need a full-page view or `off` when visual context is unnecessary. Prefer answering directly from the structured browser result and the referenced artifact path instead of installing Playwright, launching Chrome yourself, or relying on a visible desktop browser window.
+Browser automation is enabled for this session and May owns the runtime lifecycle. The browser may be backed by a local managed runtime or a remote managed runtime, but it is never the user's personal browser. Use the terminal `browser` command itself for browsing instead of installing Playwright or launching Chrome yourself.
+
+Exact browser lifecycle:
+1. `browser open` to open the managed browser and light up the live browser sidebar.
+2. `browser read https://example.com --detail full --screenshot full-page --format json` to inspect a page with structured text, accessibility-tree-derived structure, interactive element summaries, and an artifact screenshot.
+3. `browser cdp-endpoint` only when you truly need raw CDP access.
+4. `browser close` when browser work is finished so the live sidebar closes and resources are released.
+
+`browser read` returns structured JSON. By default use `--format json`; by default screenshots are viewport captures, use `--screenshot full-page` when you need the whole document or `--screenshot off` when visual context is unnecessary. Prefer answering directly from the structured browser result and referenced artifact path.
 {% else %}
 Browser automation is disabled for this session. Do not install Playwright or launch browser runtimes yourself. If browser automation is needed, ask the user to enable the browser feature in settings.
 {% endif %}

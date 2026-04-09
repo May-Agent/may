@@ -12,7 +12,7 @@ use aither_core::llm::{Message as LlmMessage, Role as LlmRole, ToolResult, Usage
 use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{
     BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec, Content, OutputEntry,
-    TERMINAL_STDIN_BLOCKED_NOTICE,
+    TERMINAL_STDIN_BLOCKED_NOTICE, TerminalResult,
 };
 
 use crate::agent::MayAgent;
@@ -28,10 +28,11 @@ use crate::session::{
     TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
-use crate::text::{join_text, path_error_text, path_message, prefixed_text};
+use crate::text::{error_chain_text, join_text, path_error_text, path_message, prefixed_text};
 use crate::ui_event_bus::UiEventTopics;
 
 use super::attachments::build_prompt_and_attachments;
+use super::browser::ensure_browser_runtime_started;
 use super::error::{internal_error, json_ok_response, typed_error_response};
 use super::helpers::{
     RETRY_BACKOFF_MS, append_history_message, elapsed_ms_saturating, load_session_paths,
@@ -49,6 +50,17 @@ use super::types::{
     SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent, SseToolEndEvent,
     SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
 };
+
+fn stopped_terminal_tool_result() -> ToolResult {
+    ToolResult::json(&TerminalResult {
+        stdout: OutputEntry::Empty,
+        stderr: None,
+        exit_code: 130,
+        task_id: None,
+        status: Some("stopped".to_string()),
+    })
+    .expect("stopped terminal tool result must serialize")
+}
 
 // ── ChatSink trait ──────────────────────────────────────────
 
@@ -164,6 +176,7 @@ impl ChatSink for CollectSink {
 }
 
 /// Successful result from the shared agent loop.
+#[derive(Debug)]
 struct AgentRunResult {
     assistant_id: String,
     full_text: String,
@@ -173,6 +186,35 @@ struct AgentRunResult {
     provider_id: String,
     model_context_window: Option<u32>,
     elapsed_ms: u64,
+}
+
+fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
+    ApiMessage {
+        id: result.assistant_id,
+        role: "assistant".to_string(),
+        content: result.full_text,
+        timestamp: jiff::Timestamp::now().to_string(),
+        attachments: Vec::new(),
+        thinking: if result.reasoning_text.is_empty() {
+            None
+        } else {
+            Some(result.reasoning_text)
+        },
+        is_streaming: Some(false),
+        is_thinking: Some(false),
+        tool_event: None,
+        terminal_executions: result.terminal_snapshot.all_executions(),
+        stats: Some(RequestStats {
+            provider_id: Some(result.provider_id),
+            prompt_tokens: result.usage.prompt_tokens,
+            completion_tokens: result.usage.completion_tokens,
+            total_tokens: result.usage.total_tokens,
+            cache_read_tokens: result.usage.cache_read_tokens,
+            cache_write_tokens: result.usage.cache_write_tokens,
+            context_window: result.model_context_window,
+            elapsed_ms: Some(result.elapsed_ms),
+        }),
+    }
 }
 
 struct SessionRunRegistration {
@@ -252,7 +294,7 @@ async fn wait_for_session_stop_settlement(
             return Ok(runtime);
         }
 
-        tokio::time::sleep(Duration::from_millis(STOP_WAIT_POLL_INTERVAL_MS)).await;
+        async_io::Timer::after(Duration::from_millis(STOP_WAIT_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -280,6 +322,10 @@ fn pending_user_message_from_request(req: ChatRequest) -> PendingUserMessage {
         created_at: jiff::Timestamp::now().to_string(),
         delivery_mode: req.delivery_mode,
     }
+}
+
+fn request_has_visible_user_input(req: &ChatRequest) -> bool {
+    !req.content.trim().is_empty() || !req.attachments.is_empty()
 }
 
 fn api_attachments_from_persisted(
@@ -367,7 +413,7 @@ fn result_waits_for_terminal_input(result: &ToolResult) -> bool {
         && output_contains_terminal_wait_notice(&parsed.stdout)
 }
 
-fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
+pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
         let Some(run_registration) =
@@ -512,6 +558,27 @@ pub(super) async fn schedule_waiting_turn_resume(
         .map_err(ScheduleWaitingTurnError::Enqueue)?;
     spawn_follow_up_runs(state.clone(), session_id.to_string());
     Ok(runtime)
+}
+
+async fn schedule_browser_takeover_resume(
+    state: &Arc<UiServerState>,
+    session_id: &str,
+) -> Result<crate::session::SessionRuntimeSummary, crate::db::ChatDbError> {
+    let pending = PendingUserMessage {
+        content: String::new(),
+        attachments: Vec::new(),
+        hidden_context_xml: None,
+        created_at: jiff::Timestamp::now().to_string(),
+        delivery_mode: crate::session::PendingUserMessageMode::Steer,
+    };
+    state
+        .runtime_service
+        .enqueue(
+            session_id,
+            pending,
+            crate::session::PendingUserMessageMode::Steer,
+        )
+        .await
 }
 
 async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) {
@@ -808,6 +875,7 @@ async fn run_agent_loop(
 
         let mut terminal_error: Option<aither_agent::AgentError> = None;
         let mut cancellation_reason: Option<&'static str> = None;
+        let mut browser_takeover_paused = false;
         {
             agent.sync_runtime_context().await;
             let mut stream = std::pin::pin!(agent.run_with_hidden_context(
@@ -999,10 +1067,7 @@ async fn run_agent_loop(
                 }
 
                 if is_takeover_active_for_session(state, &session_id).await {
-                    terminal_error = Some(aither_agent::AgentError::Config(
-                        "Browser takeover is active for this session; model execution paused"
-                            .to_string(),
-                    ));
+                    browser_takeover_paused = true;
                     break;
                 }
             }
@@ -1015,6 +1080,48 @@ async fn run_agent_loop(
             &usage,
             model_context_window,
         );
+
+        if browser_takeover_paused {
+            const TAKEOVER_PAUSED_MESSAGE: &str =
+                "Browser takeover is active for this session; model execution paused";
+
+            if !segment_text.trim().is_empty() {
+                append_history_message(
+                    state,
+                    &session_id,
+                    ChatMessage::assistant(segment_text.clone()),
+                )
+                .await?;
+            }
+
+            clear_terminal_runtime_state(state, session_id.as_str()).await?;
+
+            let has_assistant_text = !full_text.trim().is_empty();
+            let has_terminal_output = !terminal_snapshot.executions.is_empty();
+            let has_tool_activity = has_terminal_output || saw_tool_activity;
+            if !has_assistant_text && has_tool_activity {
+                append_history_message(state, &session_id, ChatMessage::assistant(String::new()))
+                    .await?;
+            }
+
+            record_request_log(
+                state,
+                log_base.failure(elapsed_ms_saturating(&started_at), TAKEOVER_PAUSED_MESSAGE),
+            )
+            .await;
+            schedule_browser_takeover_resume(state, session_id.as_str()).await?;
+
+            return Err(AgentLoopError::BrowserTakeoverPaused(AgentRunResult {
+                assistant_id,
+                full_text,
+                reasoning_text,
+                terminal_snapshot,
+                usage,
+                provider_id,
+                model_context_window,
+                elapsed_ms: elapsed_ms_saturating(&started_at),
+            }));
+        }
 
         // Handle terminal errors with provider failover.
         if let Some(err) = terminal_error {
@@ -1038,6 +1145,29 @@ async fn run_agent_loop(
         }
 
         if let Some(reason) = cancellation_reason {
+            if reason == "run cancelled by user" {
+                let running_terminal_ids = terminal_snapshot
+                    .running_by_call_id
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for call_id in running_terminal_ids {
+                    let record = ToolEventRecord::End {
+                        id: call_id.clone(),
+                        name: "terminal".to_string(),
+                        result: stopped_terminal_tool_result(),
+                    };
+                    if let Ok(serialized) = serde_json::to_string(&record) {
+                        append_history_message(
+                            state,
+                            &session_id,
+                            ChatMessage::tool(call_id, serialized),
+                        )
+                        .await?;
+                    }
+                    update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
+                }
+            }
             if !segment_text.trim().is_empty() {
                 append_history_message(
                     state,
@@ -1137,37 +1267,22 @@ async fn stream_chat_events(
         Ok(result) => {
             let done_event = SseDoneEvent {
                 session_id: response_session_id.clone(),
-                assistant: ApiMessage {
-                    id: result.assistant_id,
-                    role: "assistant".to_string(),
-                    content: result.full_text,
-                    timestamp: jiff::Timestamp::now().to_string(),
-                    attachments: Vec::new(),
-                    thinking: if result.reasoning_text.is_empty() {
-                        None
-                    } else {
-                        Some(result.reasoning_text)
-                    },
-                    is_streaming: Some(false),
-                    is_thinking: Some(false),
-                    tool_event: None,
-                    terminal_executions: result.terminal_snapshot.all_executions(),
-                    stats: Some(RequestStats {
-                        provider_id: Some(result.provider_id),
-                        prompt_tokens: result.usage.prompt_tokens,
-                        completion_tokens: result.usage.completion_tokens,
-                        total_tokens: result.usage.total_tokens,
-                        cache_read_tokens: result.usage.cache_read_tokens,
-                        cache_write_tokens: result.usage.cache_write_tokens,
-                        context_window: result.model_context_window,
-                        elapsed_ms: Some(result.elapsed_ms),
-                    }),
-                },
+                assistant: api_message_from_run_result(result),
             };
             send_event(&sender, "done", &done_event).await;
             run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
             spawn_follow_up_runs(state.clone(), response_session_id.clone());
+            Ok(())
+        }
+        Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
+            let done_event = SseDoneEvent {
+                session_id: response_session_id.clone(),
+                assistant: api_message_from_run_result(result),
+            };
+            send_event(&sender, "paused", &done_event).await;
+            run_registration.close().await;
+            clear_running_state_if_needed(&state, &response_session_id).await?;
             Ok(())
         }
         // Errors are already sent to the sink via on_error in run_agent_loop.
@@ -1238,32 +1353,17 @@ async fn run_chat_collect_with_receiver(
 
             Ok(ChatResponse {
                 session_id: req.session_id,
-                assistant: ApiMessage {
-                    id: result.assistant_id,
-                    role: "assistant".to_string(),
-                    content: result.full_text,
-                    timestamp: jiff::Timestamp::now().to_string(),
-                    attachments: Vec::new(),
-                    thinking: if result.reasoning_text.is_empty() {
-                        None
-                    } else {
-                        Some(result.reasoning_text)
-                    },
-                    is_streaming: Some(false),
-                    is_thinking: Some(false),
-                    tool_event: None,
-                    terminal_executions: result.terminal_snapshot.all_executions(),
-                    stats: Some(RequestStats {
-                        provider_id: Some(result.provider_id),
-                        prompt_tokens: result.usage.prompt_tokens,
-                        completion_tokens: result.usage.completion_tokens,
-                        total_tokens: result.usage.total_tokens,
-                        cache_read_tokens: result.usage.cache_read_tokens,
-                        cache_write_tokens: result.usage.cache_write_tokens,
-                        context_window: result.model_context_window,
-                        elapsed_ms: Some(result.elapsed_ms),
-                    }),
-                },
+                assistant: api_message_from_run_result(result),
+            })
+        }
+        Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
+            clear_running_state_if_needed(&state, &req.session_id)
+                .await
+                .map_err(internal_error)
+                .map_err(ChatCollectError::from)?;
+            Ok(ChatResponse {
+                session_id: req.session_id,
+                assistant: api_message_from_run_result(result),
             })
         }
         Err(error) => {
@@ -1634,6 +1734,8 @@ enum AgentLoopError {
     Agent(#[from] aither_agent::AgentError),
     #[error("{0}")]
     Cancelled(&'static str),
+    #[error("Browser takeover is active for this session; model execution paused")]
+    BrowserTakeoverPaused(AgentRunResult),
     #[error("Model returned an empty assistant response")]
     EmptyAssistantResponse,
 }
@@ -1817,7 +1919,7 @@ async fn resolve_session_context(
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
 
-    if persist_user_message {
+    if persist_user_message && request_has_visible_user_input(req) {
         let needs_title = session.title.is_none();
         if needs_title {
             let title = truncate_preview(&req.content);
@@ -1965,8 +2067,11 @@ async fn setup_agent_environment(
             let browser_backend: Option<Arc<dyn BrowserBackend>> = if let Some(bm) =
                 state.browser_manager()
             {
-                if let Err(e) = bm.start().await {
-                    tracing::warn!(error = %e, "Failed to auto-start browser for container session");
+                if let Err(error) = ensure_browser_runtime_started(state.as_ref()).await {
+                    tracing::warn!(
+                        error = %error_chain_text(&error),
+                        "Failed to auto-start browser for container session"
+                    );
                     None
                 } else {
                     let config = state.config_snapshot();
@@ -2301,6 +2406,12 @@ async fn handle_browser_request(
         return Err(BrowserToolError::UnavailableInRuntime);
     };
 
+    let browser_not_running_error = || {
+        BrowserToolError::request_failed(
+            "browser is not running; call browser open before browser cdp-endpoint or browser read",
+        )
+    };
+
     match request.args {
         crate::agent::browser_tool::BrowserArgs::Status => {
             Ok(crate::agent::browser_tool::BrowserResult {
@@ -2310,10 +2421,10 @@ async fn handle_browser_request(
             })
         }
         crate::agent::browser_tool::BrowserArgs::Start => {
-            browser_manager
-                .start()
+            let browser_manager = ensure_browser_runtime_started(state.as_ref())
                 .await
-                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                .map_err(|error| BrowserToolError::request_failed(error_chain_text(&error)))?;
+            state.set_browser_owner_session_id(Some(session_id.clone()));
             state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
             Ok(crate::agent::browser_tool::BrowserResult {
                 running: true,
@@ -2326,6 +2437,7 @@ async fn handle_browser_request(
                 .stop()
                 .await
                 .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+            state.set_browser_owner_session_id(None);
             state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
             Ok(crate::agent::browser_tool::BrowserResult {
                 running: false,
@@ -2335,11 +2447,7 @@ async fn handle_browser_request(
         }
         crate::agent::browser_tool::BrowserArgs::CdpEndpoint => {
             if !browser_manager.is_running().await {
-                browser_manager
-                    .start()
-                    .await
-                    .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
-                state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+                return Err(browser_not_running_error());
             }
             Ok(crate::agent::browser_tool::BrowserResult {
                 running: true,
@@ -2347,18 +2455,22 @@ async fn handle_browser_request(
                 page: None,
             })
         }
-        crate::agent::browser_tool::BrowserArgs::Read { url, options } => {
-            if !browser_manager.is_running().await {
-                browser_manager
-                    .start()
-                    .await
-                    .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
-                state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
-            }
+        crate::agent::browser_tool::BrowserArgs::Read {
+            url,
+            detail,
+            screenshot,
+            format: _,
+        } => {
+            let options = crate::agent::browser_tool::BrowserArgs::read_options(detail, screenshot);
+            let browser_manager = ensure_browser_runtime_started(state.as_ref())
+                .await
+                .map_err(|error| BrowserToolError::request_failed(error_chain_text(&error)))?;
+            state.set_browser_owner_session_id(Some(session_id.clone()));
+            state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
             let capture = browser_manager
                 .read_page(url, options)
                 .await
-                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                .map_err(|error| BrowserToolError::request_failed(error_chain_text(&error)))?;
             let session_paths = load_session_paths(state, session_id.as_str())
                 .await
                 .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;

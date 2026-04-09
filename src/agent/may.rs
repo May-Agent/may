@@ -2248,6 +2248,7 @@ fn build_terminal_runtime_context(
             "For large saved outputs, use normal shell tools such as `head`, `tail`, `sed`, `rg`, `jq`, or the `ask` command against files to recall only the relevant slice.".to_string(),
             "Background tasks persist output to files. Use terminal_read for incremental reads, terminal_input for stdin when the process needs user input, and terminal_kill to stop them.".to_string(),
             "For image-producing commands, set expect=image and optionally resolution=auto|low|medium|high|native. If omitted, May picks a preview resolution from the source media.".to_string(),
+            "For browser work, use the terminal `browser` command with this exact lifecycle: `browser open`, `browser read <url> --detail <brief|standard|full> --screenshot <off|viewport|full-page> --format json`, `browser cdp-endpoint` only when CDP is required, and `browser close` when finished so the live browser sidebar closes and resources are released.".to_string(),
             "When you create a user-facing file, write it under artifacts/ so it survives and can be surfaced cleanly to the user.".to_string(),
             "Use tasks.md as the canonical working document for multi-step work; it should stay accurate enough to resume after context loss.".to_string(),
         ],

@@ -8,7 +8,7 @@ import { useStore } from '@/lib/store';
 import { extractArtifactPreviewTargets, stripArtifactPreviewTags } from './chatUtils';
 import { AttachmentCard } from './AttachmentCard';
 import ReactMarkdown from 'react-markdown';
-import { Copy, Check, FileText, ChevronRight, RotateCcw, Download, Terminal, Globe, Search, Loader2 } from 'lucide-react';
+import { Copy, Check, ChevronRight, RotateCcw, Download, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
 
@@ -112,6 +112,9 @@ function buildRunningTimelineLabel(
   if (item.type === 'websearch') {
     return 'Searching the web';
   }
+  if (item.type === 'browser') {
+    return item.runningLabel;
+  }
   return 'Fetching page';
 }
 
@@ -125,7 +128,39 @@ function buildCollapsedTimelineLabel(item: TimelineDisplayItem): string {
   if (item.type === 'websearch') {
     return 'Web search';
   }
+  if (item.type === 'browser') {
+    return item.summary;
+  }
   return 'Web fetch';
+}
+
+function timelineItemStatusLabel(item: TimelineDisplayItem): string | null {
+  if (item.type === 'thinking' || item.isRunning) {
+    return null;
+  }
+  if (item.status === 'failed') {
+    return 'failed';
+  }
+  if (item.status === 'stopped') {
+    return 'stopped';
+  }
+  return null;
+}
+
+function timelineItemStatusClass(item: TimelineDisplayItem): string {
+  if (item.type === 'thinking') {
+    return 'text-muted-foreground';
+  }
+  if (item.isRunning) {
+    return 'timeline-running-label';
+  }
+  if (item.status === 'failed') {
+    return 'text-destructive';
+  }
+  if (item.status === 'stopped') {
+    return 'text-amber-600 dark:text-amber-300';
+  }
+  return 'text-foreground';
 }
 
 interface ParsedCommandImage {
@@ -317,13 +352,17 @@ function parseOutputEntry(
         ? payload.kind
         : '';
   const kind = kindSource.trim().toLowerCase();
-  if (kind === 'text') {
-    const textCandidate =
-      typeof payload.text === 'string'
-        ? payload.text
-        : typeof payload.value === 'string'
-          ? payload.value
-          : '';
+  const textCandidate =
+    typeof payload.text === 'string'
+      ? payload.text
+      : typeof payload.value === 'string'
+        ? payload.value
+        : typeof node.text === 'string'
+          ? node.text
+          : typeof node.value === 'string'
+            ? node.value
+            : '';
+  if (kind === 'text' || (kind.length === 0 && textCandidate.trim().length > 0)) {
     const text = textCandidate;
     if (text.trim().length > 0) {
       if (isLikelyBinaryTextPayload(text)) {
@@ -504,6 +543,7 @@ interface CommandTimelineDisplayItem {
   outputText: string;
   isRunning: boolean;
   isFailed: boolean;
+  status: 'running' | 'done' | 'failed' | 'stopped';
   startedAt?: number;
   endedAt?: number;
 }
@@ -518,6 +558,7 @@ interface WebSearchTimelineDisplayItem {
   results: WebSearchResultEntry[];
   isRunning: boolean;
   isFailed: boolean;
+  status: 'running' | 'done' | 'failed' | 'stopped';
   startedAt?: number;
   endedAt?: number;
 }
@@ -531,6 +572,61 @@ interface WebFetchTimelineDisplayItem {
   responseRaw?: string;
   isRunning: boolean;
   isFailed: boolean;
+  status: 'running' | 'done' | 'failed' | 'stopped';
+  startedAt?: number;
+  endedAt?: number;
+}
+
+interface BrowserPageDisplay {
+  url: string;
+  title: string;
+  mainHeading?: string;
+  textExcerpt: string;
+  headings: string[];
+  interactiveElements: Array<{
+    role: string;
+    tagName: string;
+    text?: string;
+    accessibleName?: string;
+    href?: string;
+    inputType?: string;
+    disabled: boolean;
+  }>;
+  accessibility: {
+    totalNodes: number;
+    interestingNodes: number;
+    interactiveNodes: number;
+    headingNodes: number;
+    landmarkNodes: number;
+  };
+  screenshot?: {
+    apiPath: string;
+    artifactPath: string;
+    mimeType: string;
+    width: number;
+    height: number;
+  };
+}
+
+interface BrowserToolDisplayResult {
+  running: boolean;
+  cdpEndpoint?: string;
+  page?: BrowserPageDisplay;
+}
+
+interface BrowserTimelineDisplayItem {
+  id: string;
+  type: 'browser';
+  summary: string;
+  runningLabel: string;
+  action: 'status' | 'start' | 'stop' | 'cdp-endpoint' | 'read' | 'unknown';
+  url?: string;
+  requestRaw?: string;
+  responseRaw?: string;
+  result?: BrowserToolDisplayResult;
+  isRunning: boolean;
+  isFailed: boolean;
+  status: 'running' | 'done' | 'failed' | 'stopped';
   startedAt?: number;
   endedAt?: number;
 }
@@ -539,7 +635,8 @@ type TimelineDisplayItem =
   | ThinkingTimelineDisplayItem
   | CommandTimelineDisplayItem
   | WebSearchTimelineDisplayItem
-  | WebFetchTimelineDisplayItem;
+  | WebFetchTimelineDisplayItem
+  | BrowserTimelineDisplayItem;
 
 function toSingleLineSummary(text: string, limit = 92): string {
   const normalized = text.replace(/\s+/g, ' ').trim();
@@ -572,6 +669,14 @@ function isWebFetchToolName(name: string): boolean {
   );
 }
 
+function isBrowserToolName(name: string): boolean {
+  return (
+    name === 'browser' ||
+    name.endsWith('.browser') ||
+    name.endsWith('/browser')
+  );
+}
+
 function parseJsonRecord(raw: string | undefined): Record<string, unknown> | null {
   if (!raw || raw.trim().length === 0) {
     return null;
@@ -599,6 +704,214 @@ function parseWebFetchUrl(rawRequest: string | undefined): string {
   }
   const urlCandidate = parsed.url ?? parsed.uri ?? parsed.link;
   return typeof urlCandidate === 'string' ? urlCandidate.trim() : '';
+}
+
+function parseBrowserAction(
+  rawRequest: string | undefined,
+): BrowserTimelineDisplayItem['action'] {
+  const parsed = parseJsonRecord(rawRequest);
+  if (!parsed) {
+    return 'unknown';
+  }
+  const command = parsed.command;
+  if (typeof command !== 'string') {
+    return 'unknown';
+  }
+  const normalized = command.trim().toLowerCase();
+  if (
+    normalized === 'status' ||
+    normalized === 'start' ||
+    normalized === 'stop' ||
+    normalized === 'cdp-endpoint' ||
+    normalized === 'read'
+  ) {
+    return normalized;
+  }
+  return 'unknown';
+}
+
+function parseBrowserUrl(rawRequest: string | undefined): string {
+  const parsed = parseJsonRecord(rawRequest);
+  if (!parsed) {
+    return '';
+  }
+  const url = parsed.url;
+  return typeof url === 'string' ? url.trim() : '';
+}
+
+function parseBrowserResult(
+  rawResponse: string | undefined,
+): BrowserToolDisplayResult | undefined {
+  const parsed = parseJsonRecord(rawResponse);
+  if (!parsed) {
+    return undefined;
+  }
+  const running = parsed.running;
+  if (typeof running !== 'boolean') {
+    return undefined;
+  }
+  const cdpEndpoint =
+    typeof parsed.cdpEndpoint === 'string' && parsed.cdpEndpoint.trim().length > 0
+      ? parsed.cdpEndpoint.trim()
+      : undefined;
+  const pageNode =
+    parsed.page && typeof parsed.page === 'object' && !Array.isArray(parsed.page)
+      ? (parsed.page as Record<string, unknown>)
+      : undefined;
+  const screenshotNode =
+    pageNode?.screenshot && typeof pageNode.screenshot === 'object' && !Array.isArray(pageNode.screenshot)
+      ? (pageNode.screenshot as Record<string, unknown>)
+      : undefined;
+  const accessibilityNode =
+    pageNode?.accessibility && typeof pageNode.accessibility === 'object' && !Array.isArray(pageNode.accessibility)
+      ? (pageNode.accessibility as Record<string, unknown>)
+      : undefined;
+  const interactiveElements = Array.isArray(pageNode?.interactiveElements)
+    ? pageNode?.interactiveElements.flatMap((entry) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+          return [];
+        }
+        const node = entry as Record<string, unknown>;
+        const role = typeof node.role === 'string' ? node.role.trim() : '';
+        const tagName = typeof node.tagName === 'string' ? node.tagName.trim() : '';
+        if (!role || !tagName) {
+          return [];
+        }
+        return [{
+          role,
+          tagName,
+          text: typeof node.text === 'string' ? node.text.trim() || undefined : undefined,
+          accessibleName:
+            typeof node.accessibleName === 'string'
+              ? node.accessibleName.trim() || undefined
+              : undefined,
+          href: typeof node.href === 'string' ? node.href.trim() || undefined : undefined,
+          inputType:
+            typeof node.inputType === 'string'
+              ? node.inputType.trim() || undefined
+              : undefined,
+          disabled: node.disabled === true,
+        }];
+      })
+    : [];
+
+  const page =
+    pageNode &&
+    typeof pageNode.url === 'string' &&
+    typeof pageNode.title === 'string' &&
+    typeof pageNode.textExcerpt === 'string'
+      ? {
+          url: pageNode.url.trim(),
+          title: pageNode.title.trim(),
+          mainHeading:
+            typeof pageNode.mainHeading === 'string'
+              ? pageNode.mainHeading.trim() || undefined
+              : undefined,
+          textExcerpt: pageNode.textExcerpt.trim(),
+          headings: Array.isArray(pageNode.headings)
+            ? pageNode.headings.flatMap((heading) =>
+                typeof heading === 'string' && heading.trim().length > 0
+                  ? [heading.trim()]
+                  : [],
+              )
+            : [],
+          interactiveElements,
+          accessibility: {
+            totalNodes:
+              typeof accessibilityNode?.totalNodes === 'number'
+                ? accessibilityNode.totalNodes
+                : 0,
+            interestingNodes:
+              typeof accessibilityNode?.interestingNodes === 'number'
+                ? accessibilityNode.interestingNodes
+                : 0,
+            interactiveNodes:
+              typeof accessibilityNode?.interactiveNodes === 'number'
+                ? accessibilityNode.interactiveNodes
+                : 0,
+            headingNodes:
+              typeof accessibilityNode?.headingNodes === 'number'
+                ? accessibilityNode.headingNodes
+                : 0,
+            landmarkNodes:
+              typeof accessibilityNode?.landmarkNodes === 'number'
+                ? accessibilityNode.landmarkNodes
+                : 0,
+          },
+          screenshot:
+            screenshotNode &&
+            typeof screenshotNode.apiPath === 'string' &&
+            typeof screenshotNode.artifactPath === 'string' &&
+            typeof screenshotNode.mimeType === 'string' &&
+            typeof screenshotNode.width === 'number' &&
+            typeof screenshotNode.height === 'number'
+              ? {
+                  apiPath: screenshotNode.apiPath.trim(),
+                  artifactPath: screenshotNode.artifactPath.trim(),
+                  mimeType: screenshotNode.mimeType.trim(),
+                  width: screenshotNode.width,
+                  height: screenshotNode.height,
+                }
+              : undefined,
+        }
+      : undefined;
+
+  return {
+    running,
+    cdpEndpoint,
+    page,
+  };
+}
+
+function buildBrowserSummary(
+  action: BrowserTimelineDisplayItem['action'],
+  url: string,
+  result: BrowserToolDisplayResult | undefined,
+): string {
+  if (action === 'read') {
+    if (result?.page?.title) {
+      return result.page.title;
+    }
+    if (url) {
+      return toSingleLineSummary(url, 96) || 'Browser read';
+    }
+    return 'Browser read';
+  }
+  if (action === 'start') {
+    return 'Opened browser';
+  }
+  if (action === 'stop') {
+    return 'Closed browser';
+  }
+  if (action === 'status') {
+    return result?.running ? 'Browser running' : 'Browser stopped';
+  }
+  if (action === 'cdp-endpoint') {
+    return 'Browser CDP endpoint';
+  }
+  return 'Browser';
+}
+
+function buildBrowserRunningLabel(
+  action: BrowserTimelineDisplayItem['action'],
+  url: string,
+): string {
+  if (action === 'read') {
+    return url ? `Reading ${url}` : 'Reading page in browser';
+  }
+  if (action === 'start') {
+    return 'Opening browser';
+  }
+  if (action === 'stop') {
+    return 'Closing browser';
+  }
+  if (action === 'status') {
+    return 'Checking browser status';
+  }
+  if (action === 'cdp-endpoint') {
+    return 'Reading browser CDP endpoint';
+  }
+  return 'Using browser';
 }
 
 function extractHost(urlValue: string): string {
@@ -651,38 +964,62 @@ function StoredOutputImage({ src, alt }: { src: string; alt: string }) {
     <img
       src={src}
       alt={alt}
-      className="h-auto max-h-[420px] w-full max-w-full rounded-lg border border-zinc-800 bg-zinc-950/80 object-contain"
+      className="h-auto max-h-[420px] w-full max-w-full rounded-lg border border-border/70 bg-muted/20 object-contain"
       loading="lazy"
       onError={() => setFailed(true)}
     />
   );
 }
 
-function CommandCodePanel({
-  label,
-  code,
-  language,
+function CommandTranscriptPanel({
+  command,
+  stdout,
+  stderr,
+  fallbackOutput,
+  exitCode,
 }: {
-  label: string;
-  code: string;
-  language: 'shell' | 'json' | 'text';
+  command: string;
+  stdout?: string;
+  stderr?: string;
+  fallbackOutput?: string;
+  exitCode?: number;
 }) {
+  const body = stdout ?? fallbackOutput;
+
   return (
-    <div className="overflow-hidden rounded-md border border-zinc-800 bg-zinc-950/80">
-      <div className="border-b border-zinc-800 px-2.5 py-1.5 text-[10px] font-medium uppercase tracking-[0.12em] text-zinc-500">
-        {label}
-      </div>
-      <Suspense
-        fallback={
-          <pre className="max-h-[260px] overflow-y-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
-            {code}
-          </pre>
-        }
-      >
-        <div className="max-h-[260px] overflow-y-auto scrollbar-none">
-          <LazySyntaxCodeBlock language={language} code={code} />
+    <div className="group/code relative overflow-hidden rounded-[18px] bg-transparent">
+      <CopyButton
+        text={[
+          `$ ${command}`,
+          body?.trimEnd() ?? '',
+          stderr?.trimEnd() ?? '',
+          typeof exitCode === 'number' && exitCode !== 0 ? `exit ${exitCode}` : '',
+        ]
+          .filter((segment) => segment.length > 0)
+          .join('\n\n')}
+        className="absolute right-1 top-1 z-10 h-7 w-7 text-muted-foreground opacity-0 transition-opacity group-hover/code:opacity-100 hover:bg-muted hover:text-foreground"
+      />
+      <div className="max-h-[320px] overflow-y-auto px-0 py-0 scrollbar-none">
+        <div className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed">
+          <span className="text-muted-foreground">$ </span>
+          <span className="text-foreground">{command}</span>
         </div>
-      </Suspense>
+        {body && (
+          <pre className="mt-2 whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground">
+            {body}
+          </pre>
+        )}
+        {stderr && (
+          <pre className="mt-2 whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-destructive">
+            {stderr}
+          </pre>
+        )}
+        {typeof exitCode === 'number' && exitCode !== 0 && (
+          <div className="mt-2 font-mono text-[11px] font-medium text-destructive">
+            exit {exitCode}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -694,13 +1031,13 @@ function makeComponents(isUser: boolean, isStreaming: boolean) {
       const code = String(children).replace(/\n$/, '');
       return lang ? (
         <div className="relative group/code my-3 rounded-lg overflow-hidden border border-border/30">
-          <div className="flex items-center justify-between px-4 py-1.5 bg-zinc-800 text-zinc-400 text-xs">
+          <div className="flex items-center justify-between px-4 py-1.5 bg-muted text-muted-foreground text-xs">
             <span>{lang}</span>
-            {!isStreaming && <CopyButton text={code} className="h-5 w-5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-700/50" />}
+            {!isStreaming && <CopyButton text={code} className="h-5 w-5 text-muted-foreground hover:text-foreground hover:bg-background/80" />}
           </div>
           <Suspense
             fallback={
-              <pre className="m-0 overflow-x-auto bg-zinc-950 px-4 py-3 text-[0.8125rem] text-zinc-100">
+              <pre className="m-0 overflow-x-auto bg-background px-4 py-3 text-[0.8125rem] text-foreground">
                 <code>{code}</code>
               </pre>
             }
@@ -733,7 +1070,6 @@ export function MessageItem({
 }) {
   const isUser = message.role === 'user';
   const isStreaming = !!message.isStreaming;
-  const terminalExecutions = message.terminalExecutions || [];
   const [expandedTimelineItemIds, setExpandedTimelineItemIds] = useState<Record<string, boolean>>({});
   const timelineExpansionOverridesRef = useRef<Record<string, boolean>>({});
   const [showTyping, setShowTyping] = useState(false);
@@ -781,7 +1117,7 @@ export function MessageItem({
           endedAt: message.isThinking ? undefined : fallbackStartedAt,
         });
       }
-      for (const command of terminalExecutions) {
+      for (const command of message.terminalExecutions ?? []) {
         const parsedOutput = parseCommandOutput(command.output);
         const outputLang = detectCodeLanguage(parsedOutput.text || '');
         items.push({
@@ -796,6 +1132,7 @@ export function MessageItem({
             : '',
           isRunning: command.status === 'running',
           isFailed: command.status === 'failed',
+          status: command.status,
           startedAt: command.startedAt ?? fallbackStartedAt,
           endedAt: command.endedAt,
         });
@@ -833,6 +1170,7 @@ export function MessageItem({
               : '',
             isRunning: command.status === 'running',
             isFailed: command.status === 'failed',
+            status: command.status,
             startedAt: command.startedAt ?? segment.startedAt,
             endedAt: command.endedAt ?? segment.endedAt,
           });
@@ -856,6 +1194,7 @@ export function MessageItem({
           results,
           isRunning: segment.tool.status === 'running',
           isFailed: segment.tool.status === 'failed',
+          status: segment.tool.status,
           startedAt: segment.tool.startedAt,
           endedAt: segment.tool.endedAt,
         });
@@ -873,6 +1212,27 @@ export function MessageItem({
           responseRaw: segment.tool.response,
           isRunning: segment.tool.status === 'running',
           isFailed: segment.tool.status === 'failed',
+          status: segment.tool.status,
+          startedAt: segment.tool.startedAt,
+          endedAt: segment.tool.endedAt,
+        });
+      } else if (isBrowserToolName(toolName)) {
+        const action = parseBrowserAction(segment.tool.request);
+        const url = parseBrowserUrl(segment.tool.request);
+        const result = parseBrowserResult(segment.tool.response);
+        items.push({
+          id: segment.id,
+          type: 'browser',
+          summary: buildBrowserSummary(action, url, result),
+          runningLabel: buildBrowserRunningLabel(action, url),
+          action,
+          url,
+          requestRaw: segment.tool.request,
+          responseRaw: segment.tool.response,
+          result,
+          isRunning: segment.tool.status === 'running',
+          isFailed: segment.tool.status === 'failed',
+          status: segment.tool.status,
           startedAt: segment.tool.startedAt,
           endedAt: segment.tool.endedAt,
         });
@@ -880,13 +1240,12 @@ export function MessageItem({
     }
     return items;
   }, [
-    message.terminalExecutions,
     message.id,
     message.isThinking,
     message.thinking,
     message.timelineSegments,
     message.timestamp,
-    terminalExecutions,
+    message.terminalExecutions,
   ]);
   const hasImageLikeTerminalOutput = useMemo(
     () => timelineItems.some((item) => item.type === 'command' && (item.parsedOutput.images.length > 0 || item.parsedOutput.storagePaths.length > 0)),
@@ -998,6 +1357,20 @@ export function MessageItem({
         }
         next[item.id] = item.isRunning;
       }
+      const previousKeys = Object.keys(previous);
+      const nextKeys = Object.keys(next);
+      if (previousKeys.length === nextKeys.length) {
+        let unchanged = true;
+        for (const key of nextKeys) {
+          if (previous[key] !== next[key]) {
+            unchanged = false;
+            break;
+          }
+        }
+        if (unchanged) {
+          return previous;
+        }
+      }
       return next;
     });
     for (const itemId of Object.keys(timelineExpansionOverridesRef.current)) {
@@ -1014,16 +1387,16 @@ export function MessageItem({
       initial={{ opacity: 0, y: 16, scale: 0.97 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
       transition={{ type: 'spring', stiffness: 500, damping: 30 }}
-      className={cn('flex w-full gap-2 p-2 group/message', isUser ? 'flex-row-reverse' : 'flex-row')}>
+      className={cn('group/message flex w-full gap-1.5 px-2 py-1.5', isUser ? 'flex-row-reverse' : 'flex-row')}>
       <div className={cn('flex flex-col relative', isUser ? 'max-w-[75%] items-end' : 'w-full max-w-[85%] items-start')}>
         <div className={cn(
           'prose prose-sm dark:prose-invert max-w-none break-words relative prose-pre:p-0 prose-pre:m-0 prose-pre:bg-transparent',
           isUser
-            ? 'px-4 py-2.5 rounded-2xl bg-primary text-primary-foreground rounded-br-md'
+            ? 'rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-primary-foreground'
             : 'py-1 text-foreground w-full'
         )}>
           {!isUser && timelineItems.length > 0 && !message.toolEvent && (
-            <div className="mb-3 space-y-2 not-prose">
+            <div className="not-prose mb-1.5 space-y-1">
               {timelineItems.map((item, index) => {
                 const isExpanded = expandedTimelineItemIds[item.id] === true;
                 const startedAt = item.startedAt ?? Date.parse(message.timestamp);
@@ -1054,15 +1427,13 @@ export function MessageItem({
                   <div
                     key={item.id}
                     className={cn(
-                      'overflow-hidden rounded-lg border',
-                      item.isRunning
-                        ? 'border-zinc-700/70 bg-zinc-900/72'
-                        : 'border-zinc-800/80 bg-zinc-950/38',
+                      'overflow-hidden rounded-2xl border border-border/70 bg-muted/25 px-3 py-2 shadow-[0_8px_24px_-24px_rgba(15,23,42,0.45)]',
+                      index > 0 && 'pt-0.5',
                     )}
                   >
                     <button
                       type="button"
-                      className="flex w-full items-center gap-2 px-2.5 py-2 text-left"
+                      className="flex w-full items-center gap-2 px-0 py-0.5 text-left transition-colors"
                       onClick={() =>
                         setExpandedTimelineItemIds((previous) => {
                           const nextExpanded = !isExpanded;
@@ -1074,33 +1445,30 @@ export function MessageItem({
                         })
                       }
                     >
-                      <span className="text-[11px] tabular-nums text-zinc-600">{index + 1}</span>
-                      {item.type === 'command' && <Terminal className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
-                      {item.type === 'thinking' && <FileText className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
-                      {item.type === 'websearch' && <Search className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
-                      {item.type === 'webfetch' && <Globe className="h-3.5 w-3.5 shrink-0 text-zinc-400" />}
                       <span
                         className={cn(
                           'min-w-0 flex-1 truncate text-[14px]',
                           'tracking-[0.01em]',
                           item.isRunning
-                            ? 'timeline-running-label font-medium text-zinc-300'
-                            : 'text-zinc-300',
+                            ? 'timeline-running-label font-medium'
+                            : 'text-foreground',
                         )}
                       >
                         {rowSummaryText}
                       </span>
                       {item.isRunning ? (
-                        <span className="text-[11px] text-zinc-500">{durationText}</span>
-                      ) : item.isFailed ? (
-                        <span className="text-[11px] text-red-300">failed</span>
+                        <span className="text-[11px] text-muted-foreground">{durationText}</span>
+                      ) : timelineItemStatusLabel(item) ? (
+                        <span className={cn('text-[11px]', timelineItemStatusClass(item))}>
+                          {timelineItemStatusLabel(item)}
+                        </span>
                       ) : (
-                        <span className="text-[11px] text-zinc-500">{durationText}</span>
+                        <span className="text-[11px] text-muted-foreground">{durationText}</span>
                       )}
                       <motion.span
                         animate={{ rotate: isExpanded ? 90 : 0 }}
                         transition={{ duration: 0.12 }}
-                        className="inline-flex h-4 w-4 items-center justify-center text-zinc-500"
+                        className="inline-flex h-4 w-4 items-center justify-center text-muted-foreground"
                       >
                         <ChevronRight className="h-3.5 w-3.5" />
                       </motion.span>
@@ -1112,55 +1480,33 @@ export function MessageItem({
                           animate={{ height: 'auto', opacity: 1 }}
                           exit={{ height: 0, opacity: 0 }}
                           transition={{ duration: 0.14 }}
-                          className="overflow-hidden border-t border-zinc-800"
+                          className="overflow-hidden"
                         >
-                          <div className="space-y-2 px-3 py-2 text-xs text-zinc-300">
+                          <div className="space-y-2 pb-0 pl-0 pr-0 pt-2 text-xs text-foreground">
                             {item.type === 'thinking' && (
-                              <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                              <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap rounded-xl border border-border/70 bg-background/70 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-none">
                                 {item.detail}
                               </pre>
                             )}
                             {item.type === 'command' && (
                               <>
-                                <CommandCodePanel
-                                  label="command"
-                                  code={item.commandInput}
-                                  language="shell"
+                                <CommandTranscriptPanel
+                                  command={item.commandInput}
+                                  stdout={item.parsedOutput.stdoutText}
+                                  stderr={item.parsedOutput.stderrText}
+                                  fallbackOutput={
+                                    !item.parsedOutput.stdoutText && !item.parsedOutput.stderrText
+                                      ? item.outputText
+                                      : undefined
+                                  }
+                                  exitCode={item.parsedOutput.exitCode}
                                 />
-                                {typeof item.parsedOutput.exitCode === 'number' && (
-                                  <div className="rounded-md border border-zinc-800 bg-zinc-950/70 px-2.5 py-1.5 text-[11px] text-zinc-400">
-                                    exit code: {item.parsedOutput.exitCode}
-                                  </div>
-                                )}
-                                {item.parsedOutput.stdoutText && (
-                                  <CommandCodePanel
-                                    label="stdout"
-                                    code={item.parsedOutput.stdoutText}
-                                    language={detectCodeLanguage(item.parsedOutput.stdoutText)}
-                                  />
-                                )}
-                                {item.parsedOutput.stderrText && (
-                                  <CommandCodePanel
-                                    label="stderr"
-                                    code={item.parsedOutput.stderrText}
-                                    language={detectCodeLanguage(item.parsedOutput.stderrText)}
-                                  />
-                                )}
-                                {!item.parsedOutput.stdoutText &&
-                                  !item.parsedOutput.stderrText &&
-                                  item.outputText && (
-                                    <CommandCodePanel
-                                      label="output"
-                                      code={item.outputText}
-                                      language={detectCodeLanguage(item.outputText)}
-                                    />
-                                  )}
                                 {(item.parsedOutput.images.length > 0 || storedPreviewItems.length > 0) && (
                                   <div className="grid gap-2">
                                     {item.parsedOutput.images.map((image, imageIndex) => (
                                       <figure
                                         key={`${item.id}-inline-image-${imageIndex}`}
-                                        className="space-y-1.5 rounded-md border border-zinc-800 bg-zinc-950/70 p-2"
+                                        className="space-y-1 rounded-xl border border-border/70 bg-background/70 p-2"
                                       >
                                         <img
                                           src={image.src}
@@ -1168,7 +1514,7 @@ export function MessageItem({
                                           className="h-auto max-h-[360px] w-full max-w-full rounded object-contain"
                                           loading="lazy"
                                         />
-                                        <figcaption className="break-all font-mono text-[10px] text-zinc-500">
+                                        <figcaption className="break-all font-mono text-[10px] text-muted-foreground">
                                           {image.mediaType}
                                         </figcaption>
                                       </figure>
@@ -1176,7 +1522,7 @@ export function MessageItem({
                                     {storedPreviewItems.map((previewItem, previewItemIndex) => (
                                       <div
                                         key={`${item.id}-stored-output-${previewItem.storagePath}-${previewItemIndex}`}
-                                        className="space-y-1.5 rounded-md border border-zinc-800 bg-zinc-950/70 p-2"
+                                        className="space-y-1 rounded-xl border border-border/70 bg-background/70 p-2"
                                       >
                                         {previewItem.src ? (
                                           <StoredOutputImage
@@ -1184,7 +1530,7 @@ export function MessageItem({
                                             alt={`Stored command output ${previewItem.storagePath}`}
                                           />
                                         ) : null}
-                                        <div className="break-all font-mono text-[10px] text-zinc-500">
+                                        <div className="break-all font-mono text-[10px] text-muted-foreground">
                                           {previewItem.storagePath}
                                         </div>
                                       </div>
@@ -1196,7 +1542,7 @@ export function MessageItem({
                             {item.type === 'websearch' && (
                               <div className="space-y-2">
                                 {item.query && (
-                                  <div className="rounded-md border border-zinc-800 bg-zinc-950/80 px-2 py-1.5 font-mono text-[11px] text-zinc-200">
+                                  <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2 font-mono text-[11px] text-foreground">
                                     {item.query}
                                   </div>
                                 )}
@@ -1208,38 +1554,154 @@ export function MessageItem({
                                         href={result.url}
                                         target="_blank"
                                         rel="noreferrer"
-                                        className="block rounded-md border border-zinc-800 bg-zinc-950/70 px-2 py-1.5 hover:border-zinc-700"
+                                        className="block rounded-xl border border-border/70 bg-background/70 px-3 py-2 hover:border-foreground/20"
                                       >
-                                        <div className="line-clamp-1 text-[12px] text-zinc-100">{result.title}</div>
-                                        <div className="text-[11px] text-zinc-500">{result.host}</div>
+                                        <div className="line-clamp-1 text-[12px] text-foreground">{result.title}</div>
+                                        <div className="text-[11px] text-muted-foreground">{result.host}</div>
                                         {result.snippet ? (
-                                          <div className="line-clamp-2 text-[11px] text-zinc-400">{result.snippet}</div>
+                                          <div className="line-clamp-2 text-[11px] text-muted-foreground">{result.snippet}</div>
                                         ) : null}
                                       </a>
                                     ))}
                                   </div>
                                 ) : item.responseRaw ? (
-                                  <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                  <pre className="max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all rounded-xl border border-border/70 bg-background/70 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-none">
                                     {item.responseRaw}
                                   </pre>
                                 ) : (
-                                  <div className="text-[11px] text-zinc-500">No search results</div>
+                                  <div className="text-[11px] text-muted-foreground">No search results</div>
                                 )}
                               </div>
                             )}
                             {item.type === 'webfetch' && (
                               <div className="space-y-2">
                                 {item.url && (
-                                  <div className="rounded-md border border-zinc-800 bg-zinc-950/80 px-2 py-1.5 font-mono text-[11px] text-zinc-200">
+                                  <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2 font-mono text-[11px] text-foreground">
                                     {item.url}
                                   </div>
                                 )}
                                 {item.responseRaw ? (
-                                  <pre className="max-h-[260px] overflow-y-auto whitespace-pre-wrap break-all rounded-md border border-zinc-800 bg-zinc-950/80 p-2 font-mono text-[11px] leading-relaxed text-zinc-200 scrollbar-none">
+                                  <pre className="max-h-[260px] overflow-y-auto whitespace-pre-wrap break-all rounded-xl border border-border/70 bg-background/70 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-none">
                                     {item.responseRaw}
                                   </pre>
                                 ) : (
-                                  <div className="text-[11px] text-zinc-500">No response body</div>
+                                  <div className="text-[11px] text-muted-foreground">No response body</div>
+                                )}
+                              </div>
+                            )}
+                            {item.type === 'browser' && (
+                              <div className="space-y-2">
+                                {item.result?.page ? (
+                                  <>
+                                    {item.result.page.screenshot?.apiPath ? (
+                                      <div className="space-y-1 rounded-xl border border-border/70 bg-background/70 p-2">
+                                        <StoredOutputImage
+                                          src={item.result.page.screenshot.apiPath}
+                                          alt={item.result.page.title || item.result.page.url}
+                                        />
+                                        <div className="break-all font-mono text-[10px] text-muted-foreground">
+                                          {item.result.page.screenshot.artifactPath}
+                                        </div>
+                                      </div>
+                                    ) : null}
+                                    <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2">
+                                      <div className="text-[13px] font-medium text-foreground">
+                                        {item.result.page.title || item.result.page.url}
+                                      </div>
+                                      <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
+                                        {item.result.page.url}
+                                      </div>
+                                      {item.result.page.mainHeading ? (
+                                        <div className="mt-2 text-[12px] text-foreground">
+                                          {item.result.page.mainHeading}
+                                        </div>
+                                      ) : null}
+                                      {item.result.page.textExcerpt ? (
+                                        <div className="mt-2 whitespace-pre-wrap text-[12px] leading-relaxed text-foreground">
+                                          {item.result.page.textExcerpt}
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                    <div className="grid gap-2 md:grid-cols-2">
+                                      <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2">
+                                        <div className="text-[11px] uppercase tracking-[0.08em] text-muted-foreground">
+                                          Accessibility
+                                        </div>
+                                        <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[12px] text-foreground">
+                                          <div>Total {item.result.page.accessibility.totalNodes}</div>
+                                          <div>Interesting {item.result.page.accessibility.interestingNodes}</div>
+                                          <div>Interactive {item.result.page.accessibility.interactiveNodes}</div>
+                                          <div>Headings {item.result.page.accessibility.headingNodes}</div>
+                                          <div>Landmarks {item.result.page.accessibility.landmarkNodes}</div>
+                                        </div>
+                                      </div>
+                                      <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2">
+                                        <div className="text-[11px] uppercase tracking-[0.08em] text-muted-foreground">
+                                          Headings
+                                        </div>
+                                        {item.result.page.headings.length > 0 ? (
+                                          <div className="mt-2 space-y-1 text-[12px] text-foreground">
+                                            {item.result.page.headings.slice(0, 6).map((heading, headingIndex) => (
+                                              <div key={`${item.id}-heading-${headingIndex}`} className="line-clamp-2">
+                                                {heading}
+                                              </div>
+                                            ))}
+                                          </div>
+                                        ) : (
+                                          <div className="mt-2 text-[12px] text-muted-foreground">
+                                            No headings extracted
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2">
+                                      <div className="text-[11px] uppercase tracking-[0.08em] text-muted-foreground">
+                                        Interactive elements
+                                      </div>
+                                      {item.result.page.interactiveElements.length > 0 ? (
+                                        <div className="mt-2 space-y-1.5">
+                                          {item.result.page.interactiveElements.slice(0, 8).map((element, elementIndex) => (
+                                            <div
+                                              key={`${item.id}-interactive-${elementIndex}`}
+                                              className="rounded-lg border border-border/60 px-2 py-1.5 text-[11px] text-foreground"
+                                            >
+                                              <span className="font-medium">{element.role}</span>
+                                              <span className="text-muted-foreground"> · {element.tagName}</span>
+                                              {element.accessibleName ? (
+                                                <div className="mt-1">{element.accessibleName}</div>
+                                              ) : element.text ? (
+                                                <div className="mt-1">{element.text}</div>
+                                              ) : null}
+                                              {element.href ? (
+                                                <div className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
+                                                  {element.href}
+                                                </div>
+                                              ) : null}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      ) : (
+                                        <div className="mt-2 text-[12px] text-muted-foreground">
+                                          No interactive elements extracted
+                                        </div>
+                                      )}
+                                    </div>
+                                  </>
+                                ) : item.result ? (
+                                  <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-[12px] text-foreground">
+                                    <div>Running: {item.result.running ? 'yes' : 'no'}</div>
+                                    {item.result.cdpEndpoint ? (
+                                      <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
+                                        {item.result.cdpEndpoint}
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                ) : item.responseRaw ? (
+                                  <pre className="max-h-[260px] overflow-y-auto whitespace-pre-wrap break-all rounded-xl border border-border/70 bg-background/70 p-3 font-mono text-[11px] leading-relaxed text-foreground scrollbar-none">
+                                    {item.responseRaw}
+                                  </pre>
+                                ) : (
+                                  <div className="text-[11px] text-muted-foreground">No browser result</div>
                                 )}
                               </div>
                             )}

@@ -8,6 +8,7 @@ import {
   prepareSlidevPreview,
   fetchSessionArtifacts,
   fetchSessionRuntime,
+  isBrowserTakeoverActiveError,
   isSessionActiveConflictError,
   fetchSessionTasks,
   enqueueChat,
@@ -26,12 +27,13 @@ import {
 } from "@/lib/api";
 import { MessageItem } from "./MessageItem";
 import { ModelSelector } from "./ModelSelector";
+import { ReasoningEffortSelector } from "./ReasoningEffortSelector";
 import { AttachmentPreview } from "./AttachmentPreview";
 import { AttachmentCard } from "./AttachmentCard";
 import { ArtifactsSidebar } from "./ArtifactsSidebar";
 import { BrowserView } from "./BrowserView";
 import { ContextInspector } from "./ContextInspectorDialog";
-import { PendingFollowUpPanel } from "./PendingFollowUpPanel";
+import { SessionActivityIsland } from "./SessionActivityIsland";
 import {
   createDisconnectBanner,
   collectRetryBatch,
@@ -85,6 +87,7 @@ import {
   isManagedPodmanApprovalCode,
   resolveWorkspaceSurfaceState,
 } from "@/lib/containerPrepare";
+import { getModel } from "@/lib/constants";
 
 interface AskUserState {
   request: AskUserRequest;
@@ -176,6 +179,7 @@ export function ChatInterface({
     backendUnavailableReason,
     containerPrepareStatuses,
     profiles,
+    models,
     sessions,
     createSession,
     refreshProfileSessions,
@@ -188,6 +192,7 @@ export function ChatInterface({
     setLastModel,
     uiConfig,
   } = useStore();
+  const browserStatus = useStore((state) => state.browserStatus);
   const [inputValue, setInputValue] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -371,18 +376,44 @@ export function ChatInterface({
   const pendingAskUserRequest: AskUserRequest | null =
     runtimeSession?.waitingAskUser ?? null;
   const isGenerating = runtimeSession?.state === "running";
+  const runningTerminalCommands = useMemo(() => {
+    const deduped = new Map<string, TerminalExecution>();
+    for (const message of messages) {
+      for (const execution of message.terminalExecutions ?? []) {
+        if (execution.status !== "running") {
+          continue;
+        }
+        deduped.set(execution.id, execution);
+      }
+    }
+    return [...deduped.values()].sort(
+      (left, right) => (left.startedAt ?? 0) - (right.startedAt ?? 0),
+    );
+  }, [messages]);
+  const backgroundTerminalTask = runtimeSession?.interactions?.terminal
+    ? {
+        taskId: runtimeSession.interactions.terminal.taskId ?? null,
+        outputFile: runtimeSession.interactions.terminal.outputFile ?? null,
+        outputPreview: runtimeSession.interactions.terminal.outputPreview ?? null,
+        inputNotice: runtimeSession.interactions.terminal.inputNotice ?? null,
+      }
+    : null;
+  const browserOwnedByCurrentSession =
+    !!currentSessionId &&
+    browserStatus?.ownerSessionId === currentSessionId;
+  const browserTakeoverOwnedByCurrentSession =
+    !!currentSessionId &&
+    browserStatus?.takeoverSessionId === currentSessionId;
+  const shouldAutoOpenBrowserPanel =
+    !!browserStatus?.running &&
+    !!currentSessionId &&
+    (browserOwnedByCurrentSession || browserTakeoverOwnedByCurrentSession);
   const showStopButton =
     isGenerating ||
     isSending ||
     isStreamControllerActive ||
     hasPendingAssistantMessage;
-  const pendingPanelTitle =
-    queuedMessages.length > 1 ? "Pending follow-ups" : "Pending follow-up";
-  const pendingPanelSubtitle = runtimeSession?.state === "running"
-    ? "Will send after the active run settles"
-    : runtimeSession?.pendingImmediate
-      ? "Waiting to dispatch next"
-      : "Saved for later in this session";
+  const showComposerSendButton = !showStopButton || hasInput;
   const markRuntimeRunning = useRuntimeStore((state) => state.markRunning);
   const applyRuntime = useRuntimeStore((state) => state.applyRuntime);
   const markRuntimeFirstToken = useRuntimeStore(
@@ -1172,7 +1203,8 @@ export function ChatInterface({
       (targetRuntime.state !== "idle" ||
         targetRuntime.pendingImmediate != null ||
         (targetRuntime.queuedMessages?.length ?? 0) > 0);
-    const deliveryMode = options?.deliveryMode ?? "steer";
+    const deliveryMode =
+      options?.deliveryMode ?? (targetGenerating ? "queue" : "steer");
 
     if (targetGenerating) {
       if (!includeComposerInput) {
@@ -1358,6 +1390,15 @@ export function ChatInterface({
         .map((segment) => segment.content)
         .join("\n\n")
         .trim();
+
+    const timelineContainsStoppedWork = (segments: TimelineSegment[]): boolean =>
+      segments.some((segment) =>
+        segment.kind === "tool"
+          ? segment.tool.status === "stopped"
+          : segment.kind === "terminal"
+            ? segment.commands.some((command) => command.status === "stopped")
+            : false,
+      );
 
     const isAnyThinkingRunning = (segments: TimelineSegment[]): boolean =>
       segments.some(
@@ -1610,7 +1651,7 @@ export function ChatInterface({
               ? tool.arguments
               : JSON.stringify(tool?.arguments ?? {});
           const endedAt = Date.now();
-          const { output, failed } = parseToolResultPayload(tool.result);
+          const { output, status } = parseToolResultPayload(tool.result);
           const terminalSegmentId = terminalSegmentByToolId.get(toolId);
           if (terminalSegmentId) {
             timelineSegments = timelineSegments.map((segment) => {
@@ -1622,9 +1663,7 @@ export function ChatInterface({
                   ? {
                       ...command,
                       output,
-                      status: (failed
-                        ? "failed"
-                        : "done") as TerminalExecution["status"],
+                      status,
                       endedAt,
                     }
                   : command,
@@ -1655,7 +1694,7 @@ export function ChatInterface({
                     ...segment.tool,
                     request: segment.tool.request ?? serializedArguments,
                     response: output,
-                    status: failed ? "failed" : "done",
+                    status,
                     endedAt,
                   },
                 }
@@ -1721,6 +1760,56 @@ export function ChatInterface({
             ),
           );
         },
+        onPaused: (assistant) => {
+          closeActiveThinkingSegment();
+          if (textFlushTimer != null) {
+            window.clearTimeout(textFlushTimer);
+            textFlushTimer = null;
+          }
+          completedNormally = true;
+          const latest = useStore
+            .getState()
+            .sessions.find((s) => s.id === sessionId);
+          if (!latest) {
+            return;
+          }
+          const finalTimelineSegments = cloneTimelineSegments(timelineSegments);
+          const finalThinking = collectThinkingText(finalTimelineSegments);
+          const finalTerminalExecutions = collectTerminalExecutions(
+            finalTimelineSegments,
+          );
+          const isEmptyPause =
+            assistant.content.trim().length === 0 &&
+            finalThinking.trim().length === 0 &&
+            finalTimelineSegments.length === 0;
+
+          if (isEmptyPause) {
+            replaceSessionMessages(
+              sessionId,
+              latest.messages.filter((m) => m.id !== assistantId),
+            );
+            return;
+          }
+
+          replaceSessionMessages(
+            sessionId,
+            latest.messages.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...assistant,
+                    id: assistantId,
+                    content: assistant.content,
+                    thinking: finalThinking,
+                    timelineSegments: finalTimelineSegments,
+                    isStreaming: false,
+                    isThinking: false,
+                    terminalExecutions: finalTerminalExecutions,
+                    error: undefined,
+                  }
+                : m,
+            ),
+          );
+        },
         onError: (message) => {
           if (wasStoppedByUser()) {
             completedNormally = true;
@@ -1767,6 +1856,12 @@ export function ChatInterface({
           );
           return;
         }
+        if (isBrowserTakeoverActiveError(error)) {
+          await rollbackOptimisticStreamStart(
+            "Browser takeover is active for this session. Return browser control before sending another message.",
+          );
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         closeActiveThinkingSegment();
         const errText = `LLM endpoint error: ${message}`;
@@ -1807,7 +1902,15 @@ export function ChatInterface({
         .getState()
         .sessions.find((s) => s.id === sessionId);
       if (latest) {
-        const terminalError = !completedNormally && !wasStoppedByUser()
+        const stopRequestedByUser =
+          stopRequestedSessionIdsRef.current.has(sessionId);
+        const assistantStopped =
+          latest.messages.some(
+            (message) =>
+              message.id === assistantId &&
+              timelineContainsStoppedWork(message.timelineSegments ?? []),
+          );
+        const terminalError = !completedNormally && !stopRequestedByUser && !assistantStopped
           ? "LLM endpoint error: stream terminated before a final assistant response"
           : undefined;
         replaceSessionMessages(
@@ -1833,13 +1936,17 @@ export function ChatInterface({
       }
       setIsBrowserOpen(false);
 
-      void syncSessionRuntime(sessionId).catch((error) => {
-        setUiError(
-          `Failed to sync runtime state: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      });
+      void syncSessionRuntime(sessionId)
+        .catch((error) => {
+          setUiError(
+            `Failed to sync runtime state: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        })
+        .finally(() => {
+          stopRequestedSessionIdsRef.current.delete(sessionId);
+        });
     }
   };
 
@@ -1848,6 +1955,7 @@ export function ChatInterface({
     if (!runtimeSessionId) {
       return;
     }
+    const ownsLocalStream = streamingSessionIdRef.current === runtimeSessionId;
     stopRequestedSessionIdsRef.current.add(runtimeSessionId);
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
@@ -1856,7 +1964,9 @@ export function ChatInterface({
     setIsBrowserOpen(false);
     const waitForStop = waitForStoppedSession(runtimeSessionId).finally(() => {
       stopWaitersRef.current.delete(runtimeSessionId);
-      stopRequestedSessionIdsRef.current.delete(runtimeSessionId);
+      if (!ownsLocalStream) {
+        stopRequestedSessionIdsRef.current.delete(runtimeSessionId);
+      }
     });
     stopWaitersRef.current.set(runtimeSessionId, waitForStop);
     void waitForStop.catch((error) => {
@@ -1884,6 +1994,7 @@ export function ChatInterface({
             const timelineSegments = settleTimelineSegments(
               m.timelineSegments,
               endedAt,
+              "stopped",
             );
             const { thinking, terminalExecutions } =
               summarizeTimelineSegments(timelineSegments);
@@ -2189,9 +2300,13 @@ export function ChatInterface({
   const currentReasoningEffort = isNewChat
     ? newChatReasoningEffort
     : currentSession.reasoningEffort;
+  const currentModelSupportsReasoning =
+    (currentModelId.trim().length > 0
+      ? getModel(currentModelId, models)?.reasoning
+      : false) ?? false;
 
   const canShowArtifactsPanel = artifacts.length > 0 || !!selectedPreviewPath;
-  const activeRightPanel = isBrowserOpen
+  const activeRightPanel = isBrowserOpen || shouldAutoOpenBrowserPanel
     ? "browser"
     : isArtifactsOpen && canShowArtifactsPanel
       ? "artifacts"
@@ -2818,117 +2933,134 @@ export function ChatInterface({
                   {uiError}
                 </div>
               )}
-              <div className="relative bg-background/60 backdrop-blur-xl rounded-2xl border border-border/50">
-                {attachments.length > 0 && (
-                  <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
-                    {attachments.map((att) => (
-                      <div
-                        key={att.id}
-                        className="relative group flex-shrink-0"
-                      >
-                        <AttachmentPreview attachment={att}>
-                          <AttachmentCard attachment={att} variant="composer" />
-                        </AttachmentPreview>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setAttachments((prev) =>
-                              prev.filter((a) => a.id !== att.id),
-                            );
-                          }}
-                          className="absolute -top-1 -right-1 bg-destructive text-destructive-foreground rounded-full p-0.5 shadow-sm opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
-                      </div>
-                    ))}
+              <div className="relative">
+                <div className="pointer-events-none absolute inset-x-0 top-0 z-10 -translate-y-1/2 px-3">
+                  <div className="ml-auto pointer-events-auto">
+                    <SessionActivityIsland
+                      pendingMessages={queuedMessages}
+                      runningCommands={runningTerminalCommands}
+                      backgroundCommand={backgroundTerminalTask}
+                      sessionId={currentSessionId}
+                      onSteerMessage={steerQueuedMessage}
+                      onRemoveMessage={removeQueuedMessage}
+                    />
                   </div>
-                )}
+                </div>
 
-                <PendingFollowUpPanel
-                  messages={queuedMessages}
-                  title={pendingPanelTitle}
-                  subtitle={pendingPanelSubtitle}
-                  sessionId={currentSessionId}
-                  onSteerMessage={steerQueuedMessage}
-                  onRemoveMessage={removeQueuedMessage}
-                />
+                <div className="relative rounded-2xl border border-border/50 bg-background/60 backdrop-blur-xl">
+                  {attachments.length > 0 && (
+                    <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
+                      {attachments.map((att) => (
+                        <div
+                          key={att.id}
+                          className="relative group flex-shrink-0"
+                        >
+                          <AttachmentPreview attachment={att}>
+                            <AttachmentCard attachment={att} variant="composer" />
+                          </AttachmentPreview>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setAttachments((prev) =>
+                                prev.filter((a) => a.id !== att.id),
+                              );
+                            }}
+                            className="absolute -top-1 -right-1 bg-destructive text-destructive-foreground rounded-full p-0.5 shadow-sm opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
-                <Textarea
-                  ref={composerInputRef}
-                  value={inputValue}
-                  onChange={(e) => setInputValue(e.target.value)}
+                  <Textarea
+                    ref={composerInputRef}
+                    value={inputValue}
+                    onChange={(e) => setInputValue(e.target.value)}
                   onPaste={handlePaste}
                   onKeyDown={(e) => {
-                    if (e.key === "Tab" && isGenerating) {
-                      e.preventDefault();
-                      if (!canSend) return;
-                      void handleSend({ deliveryMode: "queue" });
-                      return;
-                    }
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
                       if (!canSend) return;
-                      void handleSend({ deliveryMode: "steer" });
+                      void handleSend();
                     }
                   }}
-                  placeholder={composerPlaceholder}
-                  className="min-h-[60px] max-h-[200px] w-full resize-none border-0 shadow-none focus-visible:ring-0 bg-transparent py-4 px-3 text-base"
-                  rows={1}
-                  autoFocus={isNewChat}
-                />
+                    placeholder={composerPlaceholder}
+                    className="min-h-[60px] max-h-[200px] w-full resize-none border-0 bg-transparent px-3 py-4 text-base shadow-none focus-visible:ring-0"
+                    rows={1}
+                    autoFocus={isNewChat}
+                  />
 
-                <div className="flex items-center justify-between p-2 pl-3">
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="file"
-                      multiple
-                      className="hidden"
-                      ref={fileInputRef}
-                      onChange={handleFileSelect}
-                    />
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-8 w-8 text-muted-foreground hover:text-foreground rounded-lg"
-                        >
-                          <Plus className="h-5 w-5" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="start" className="w-48">
-                        <DropdownMenuItem
-                          onClick={() => fileInputRef.current?.click()}
-                        >
-                          <File className="mr-2 h-4 w-4" />
-                          Upload File
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={() => fileInputRef.current?.click()}
-                        >
-                          <ImageIcon className="mr-2 h-4 w-4" />
-                          Upload Photo
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={handleScreenshot}>
-                          <Monitor className="mr-2 h-4 w-4" />
-                          Take Screenshot
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <ModelSelector
-                      currentModelId={currentModelId}
-                      currentReasoningEffort={currentReasoningEffort}
-                      onModelChange={(id) => {
-                        if (isNewChat) {
-                          setNewChatModelId(id);
+                  <div className="flex items-center justify-between p-2 pl-3">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="file"
+                        multiple
+                        className="hidden"
+                        ref={fileInputRef}
+                        onChange={handleFileSelect}
+                      />
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground"
+                          >
+                            <Plus className="h-5 w-5" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start" className="w-48">
+                          <DropdownMenuItem
+                            onClick={() => fileInputRef.current?.click()}
+                          >
+                            <File className="mr-2 h-4 w-4" />
+                            Upload File
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => fileInputRef.current?.click()}
+                          >
+                            <ImageIcon className="mr-2 h-4 w-4" />
+                            Upload Photo
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={handleScreenshot}>
+                            <Monitor className="mr-2 h-4 w-4" />
+                            Take Screenshot
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <ModelSelector
+                        currentModelId={currentModelId}
+                        onModelChange={(id) => {
+                          if (isNewChat) {
+                            setNewChatModelId(id);
+                            setIsModelUpdating(true);
+                            void setLastModel(id)
+                              .catch((error) => {
+                                setUiError(
+                                  `Failed to update default model: ${
+                                    error instanceof Error
+                                      ? error.message
+                                      : String(error)
+                                  }`,
+                                );
+                              })
+                              .finally(() => {
+                                setIsModelUpdating(false);
+                              });
+                            return;
+                          }
+                          if (!currentSessionId) {
+                            return;
+                          }
                           setIsModelUpdating(true);
-                          void setLastModel(id)
+                          void updateSessionModel(currentSessionId, id)
                             .catch((error) => {
                               setUiError(
-                                `Failed to update default model: ${
+                                `Failed to update session model: ${
                                   error instanceof Error
                                     ? error.message
                                     : String(error)
@@ -2938,68 +3070,58 @@ export function ChatInterface({
                             .finally(() => {
                               setIsModelUpdating(false);
                             });
-                          return;
-                        }
-                        if (!currentSessionId) {
-                          return;
-                        }
-                        setIsModelUpdating(true);
-                        void updateSessionModel(currentSessionId, id)
-                          .catch((error) => {
-                            setUiError(
-                              `Failed to update session model: ${
-                                error instanceof Error
-                                  ? error.message
-                                  : String(error)
-                              }`,
-                            );
-                          })
-                          .finally(() => {
-                            setIsModelUpdating(false);
-                          });
-                      }}
-                      onReasoningEffortChange={(e) => {
-                        if (isNewChat) {
-                          setNewChatReasoningEffort(e);
-                        } else {
-                          updateSessionReasoningEffort(currentSessionId, e);
-                        }
-                      }}
-                      disabled={isModelUpdating || isSending}
-                      isUpdating={isModelUpdating}
-                    />
-                    {showTokenUsage && (
-                      <ContextInspector
-                        currentSessionId={currentSessionId}
-                        promptTokens={latestStats?.promptTokens}
-                        contextUsedTokens={contextUsedTokens}
-                        contextWindow={contextWindow}
-                        contextUsagePercent={contextUsagePercent}
-                        contextUsageTitle={contextUsageTitle}
+                        }}
+                        disabled={isModelUpdating || isSending}
+                        isUpdating={isModelUpdating}
                       />
-                    )}
-                    {showStopButton ? (
-                      <Button
-                        onClick={handleStop}
-                        size="icon"
-                        className="h-8 w-8 bg-destructive text-destructive-foreground rounded-lg hover:bg-destructive/90"
-                      >
-                        <Square className="h-3.5 w-3.5 fill-current" />
-                      </Button>
-                    ) : (
-                      <Button
-                        onClick={() => void handleSend()}
-                        disabled={!canSend}
-                        size="icon"
-                        className={
-                          canSend
-                            ? "h-8 w-8 bg-primary text-primary-foreground rounded-lg"
-                            : "h-8 w-8 bg-muted text-muted-foreground rounded-lg"
-                        }
-                      >
-                        <Send className="h-4 w-4" />
-                      </Button>
-                    )}
+                      {currentModelSupportsReasoning && (
+                        <ReasoningEffortSelector
+                          value={currentReasoningEffort}
+                          onChange={(effort) => {
+                            if (isNewChat) {
+                              setNewChatReasoningEffort(effort);
+                            } else {
+                              updateSessionReasoningEffort(currentSessionId, effort);
+                            }
+                          }}
+                          disabled={isModelUpdating || isSending}
+                        />
+                      )}
+                      {showTokenUsage && (
+                        <ContextInspector
+                          currentSessionId={currentSessionId}
+                          promptTokens={latestStats?.promptTokens}
+                          contextUsedTokens={contextUsedTokens}
+                          contextWindow={contextWindow}
+                          contextUsagePercent={contextUsagePercent}
+                          contextUsageTitle={contextUsageTitle}
+                        />
+                      )}
+                      {showStopButton && (
+                        <Button
+                          onClick={handleStop}
+                          size="icon"
+                          variant="ghost"
+                          className="h-8 w-8 rounded-lg text-destructive hover:bg-destructive/10 hover:text-destructive"
+                        >
+                          <Square className="h-3.5 w-3.5 fill-current" />
+                        </Button>
+                      )}
+                      {showComposerSendButton && (
+                        <Button
+                          onClick={() => void handleSend()}
+                          disabled={!canSend}
+                          size="icon"
+                          className={
+                            canSend
+                              ? "h-8 w-8 rounded-lg bg-primary text-primary-foreground"
+                              : "h-8 w-8 rounded-lg bg-muted text-muted-foreground"
+                          }
+                        >
+                          <Send className="h-4 w-4" />
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
