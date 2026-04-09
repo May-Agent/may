@@ -62,7 +62,10 @@ pub enum SessionOutputMode {
 pub struct SessionArgs {
     /// Optional command-form input. Supported:
     /// - `session <id> search <prompt>`
-    /// - `session <search>`
+    /// - `session search <prompt>`
+    /// - `session inspect <id>`
+    /// - `session messages <id>`
+    /// - `session list`
     #[serde(default)]
     pub command: Option<String>,
 
@@ -229,11 +232,52 @@ enum SessionToolError {
     MissingOrInvalidColumn { name: String },
     #[error("invalid full-text search column selection: {0}")]
     InvalidFullTextColumns(String),
+    #[error("session action '{action}' requires a session id")]
+    MissingActionSessionId { action: &'static str },
+    #[error("session '{session_id}' was not found")]
+    SessionNotFound { session_id: String },
 }
 
 #[derive(Debug, Clone)]
 struct SearchDefaults {
     current_session_id: String,
+}
+
+#[derive(Debug, Clone)]
+enum SessionExecutionPlan {
+    Search(SessionArgs),
+    Inspect(SessionInspectRequest),
+    Messages(SessionMessagesRequest),
+    List(SessionListRequest),
+}
+
+#[derive(Debug, Clone)]
+struct SessionInspectRequest {
+    session_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct SessionMessagesRequest {
+    session_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct SessionListRequest {
+    limit: usize,
+    offset: usize,
+    include_current: bool,
+    include_archived: bool,
+    current_session_id: String,
+    profile_id: Option<String>,
+    model: Option<String>,
+    title_contains: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+enum SessionCommandInput {
+    RawQuery,
+    Tokens(Vec<String>),
 }
 
 impl SessionTool {
@@ -266,17 +310,22 @@ impl SessionTool {
         self.may_dir.join(SEMANTIC_INDEX_FILE)
     }
 
-    fn normalize_args(&self, mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
+    async fn normalize_args(
+        &self,
+        mut args: SessionArgs,
+    ) -> Result<SessionExecutionPlan, SessionToolError> {
+        let defaults = SearchDefaults {
+            current_session_id: self.current_session_id.clone(),
+        };
+
         if let Some(command) = args.command.take() {
-            apply_command_form(&mut args, &command, "session")?;
+            let tokens = split_command_form_tokens(&command, "session")?;
+            let plan = build_execution_plan(args, SessionCommandInput::Tokens(tokens), &defaults)?;
+            return resolve_implicit_session_lookup(self.db_path(), plan).await;
         }
-        apply_search_defaults(
-            &mut args,
-            &SearchDefaults {
-                current_session_id: self.current_session_id.clone(),
-            },
-        );
-        normalize_common_args(args)
+
+        let plan = build_execution_plan(args, SessionCommandInput::RawQuery, &defaults)?;
+        resolve_implicit_session_lookup(self.db_path(), plan).await
     }
 }
 
@@ -289,14 +338,14 @@ impl Tool for SessionTool {
     type Res = ToolResult;
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
-        let args = self.normalize_args(arguments)?;
-        execute_search(
+        let plan = self.normalize_args(arguments).await?;
+        execute_plan(
             self.db_path(),
             self.index_path(),
             self.index_meta_path(),
             self.semantic_index_path(),
             self.embedder.clone(),
-            args,
+            plan,
         )
         .await
         .map_err(Into::into)
@@ -338,6 +387,32 @@ fn normalize_common_args(mut args: SessionArgs) -> aither_core::Result<SessionAr
     Ok(args)
 }
 
+async fn execute_plan(
+    db_path: PathBuf,
+    index_path: PathBuf,
+    index_meta_path: PathBuf,
+    semantic_index_path: PathBuf,
+    embedder: EmbeddingModelResolution,
+    plan: SessionExecutionPlan,
+) -> Result<ToolResult, SessionToolError> {
+    match plan {
+        SessionExecutionPlan::Search(args) => {
+            execute_search(
+                db_path,
+                index_path,
+                index_meta_path,
+                semantic_index_path,
+                embedder,
+                args,
+            )
+            .await
+        }
+        SessionExecutionPlan::Inspect(request) => execute_inspect(db_path, request).await,
+        SessionExecutionPlan::Messages(request) => execute_messages(db_path, request).await,
+        SessionExecutionPlan::List(request) => execute_list(db_path, request).await,
+    }
+}
+
 async fn execute_search(
     db_path: PathBuf,
     index_path: PathBuf,
@@ -347,6 +422,7 @@ async fn execute_search(
     args: SessionArgs,
 ) -> Result<ToolResult, SessionToolError> {
     let query_enabled = args.query.trim() != "*" && !args.query.trim().is_empty();
+    let semantic_index_required = args.search_mode == SessionSearchMode::Semantic;
 
     let db = ChatDb::open(&db_path).await?;
     let fingerprint = compute_fingerprint(&db).await?;
@@ -358,6 +434,7 @@ async fn execute_search(
         &db,
         &fingerprint,
         embedder.clone(),
+        semantic_index_required,
     )
     .await?;
 
@@ -493,11 +570,193 @@ async fn execute_search(
     finalize_rows_with_total(rows, total_matches, &args)
 }
 
-fn apply_command_form(
-    args: &mut SessionArgs,
+#[derive(Debug, Clone, Serialize)]
+struct SessionSummaryView {
+    session_id: String,
+    title: String,
+    model: String,
+    profile_id: Option<String>,
+    archived: bool,
+    created_at: String,
+    updated_at: String,
+    message_count: i32,
+    preview: String,
+}
+
+impl From<crate::db::entity::sessions::Model> for SessionSummaryView {
+    fn from(value: crate::db::entity::sessions::Model) -> Self {
+        Self {
+            session_id: value.id,
+            title: value.title.unwrap_or_default(),
+            model: value.model.unwrap_or_default(),
+            profile_id: value.profile_id,
+            archived: value.archived,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            message_count: value.message_count,
+            preview: value.preview.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionMessageView {
+    message_id: i32,
+    role: String,
+    timestamp: Option<String>,
+    content: String,
+}
+
+impl From<crate::db::entity::messages::Model> for SessionMessageView {
+    fn from(value: crate::db::entity::messages::Model) -> Self {
+        Self {
+            message_id: value.id,
+            role: value.role,
+            timestamp: value.timestamp,
+            content: value.content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionInspectView {
+    session: SessionSummaryView,
+    final_assistant_message: Option<SessionMessageView>,
+    final_user_message: Option<SessionMessageView>,
+    latest_message: Option<SessionMessageView>,
+}
+
+async fn execute_inspect(
+    db_path: PathBuf,
+    request: SessionInspectRequest,
+) -> Result<ToolResult, SessionToolError> {
+    let db = ChatDb::open(&db_path).await?;
+    let session = db.get_session(&request.session_id).await?.ok_or_else(|| {
+        SessionToolError::SessionNotFound {
+            session_id: request.session_id.clone(),
+        }
+    })?;
+    let messages = db.get_messages(&request.session_id).await?;
+    let latest_message = messages.last().cloned().map(SessionMessageView::from);
+    let final_assistant_message = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .cloned()
+        .map(SessionMessageView::from);
+    let final_user_message = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .cloned()
+        .map(SessionMessageView::from);
+
+    ToolResult::json(&serde_json::json!({
+        "action": "inspect",
+        "result": SessionInspectView {
+            session: SessionSummaryView::from(session),
+            final_assistant_message,
+            final_user_message,
+            latest_message,
+        }
+    }))
+    .map_err(SessionToolError::ToolResult)
+}
+
+async fn execute_messages(
+    db_path: PathBuf,
+    request: SessionMessagesRequest,
+) -> Result<ToolResult, SessionToolError> {
+    let db = ChatDb::open(&db_path).await?;
+    let session = db.get_session(&request.session_id).await?.ok_or_else(|| {
+        SessionToolError::SessionNotFound {
+            session_id: request.session_id.clone(),
+        }
+    })?;
+    let messages = db
+        .get_messages(&request.session_id)
+        .await?
+        .into_iter()
+        .map(SessionMessageView::from)
+        .collect::<Vec<_>>();
+
+    ToolResult::json(&serde_json::json!({
+        "action": "messages",
+        "session": SessionSummaryView::from(session),
+        "returned": messages.len(),
+        "messages": messages,
+    }))
+    .map_err(SessionToolError::ToolResult)
+}
+
+async fn execute_list(
+    db_path: PathBuf,
+    request: SessionListRequest,
+) -> Result<ToolResult, SessionToolError> {
+    let db = ChatDb::open(&db_path).await?;
+    let lowered_title = request.title_contains.as_deref().map(str::to_lowercase);
+    let mut sessions = db
+        .list_sessions()
+        .await?
+        .into_iter()
+        .filter(|session| {
+            if !request.include_current && session.id == request.current_session_id {
+                return false;
+            }
+            if !request.include_archived && session.archived {
+                return false;
+            }
+            if let Some(profile_id) = request.profile_id.as_deref()
+                && session.profile_id.as_deref() != Some(profile_id)
+            {
+                return false;
+            }
+            if let Some(model) = request.model.as_deref()
+                && session.model.as_deref() != Some(model)
+            {
+                return false;
+            }
+            if let Some(title_contains) = lowered_title.as_deref() {
+                let title = session.title.as_deref().unwrap_or_default().to_lowercase();
+                if !title.contains(title_contains) {
+                    return false;
+                }
+            }
+            if let Some(since) = request.since.as_deref()
+                && session.updated_at.as_str() < since
+            {
+                return false;
+            }
+            if let Some(until) = request.until.as_deref()
+                && session.updated_at.as_str() > until
+            {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    let total_matches = sessions.len();
+    let results = sessions
+        .into_iter()
+        .skip(request.offset)
+        .take(request.limit)
+        .map(SessionSummaryView::from)
+        .collect::<Vec<_>>();
+
+    ToolResult::json(&serde_json::json!({
+        "action": "list",
+        "returned": results.len(),
+        "total_matches": total_matches,
+        "results": results,
+    }))
+    .map_err(SessionToolError::ToolResult)
+}
+
+fn split_command_form_tokens(
     command: &str,
     command_name: &str,
-) -> Result<(), SessionToolError> {
+) -> Result<Vec<String>, SessionToolError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return Err(SessionToolError::EmptyCommand {
@@ -518,21 +777,178 @@ fn apply_command_form(
         });
     }
 
-    let tokens = split_shell_words(body, command_name)?;
-    if let [session_id, keyword, prompt_tokens @ ..] = tokens.as_slice()
+    split_shell_words(body, command_name).map_err(Into::into)
+}
+
+fn build_execution_plan(
+    mut args: SessionArgs,
+    input: SessionCommandInput,
+    defaults: &SearchDefaults,
+) -> Result<SessionExecutionPlan, SessionToolError> {
+    match input {
+        SessionCommandInput::Tokens(tokens) => {
+            if let Some(plan) = plan_from_tokens(&tokens, &args, defaults)? {
+                return Ok(plan);
+            }
+            args.query = tokens.join(" ");
+        }
+        SessionCommandInput::RawQuery => {
+            if let Some(plan) = plan_from_raw_query(&args, defaults)? {
+                return Ok(plan);
+            }
+        }
+    }
+
+    apply_search_defaults(&mut args, defaults);
+    Ok(normalize_common_args(args).map(SessionExecutionPlan::Search)?)
+}
+
+async fn resolve_implicit_session_lookup(
+    db_path: PathBuf,
+    plan: SessionExecutionPlan,
+) -> Result<SessionExecutionPlan, SessionToolError> {
+    let SessionExecutionPlan::Search(args) = plan else {
+        return Ok(plan);
+    };
+    let Some(session_id) = implicit_session_lookup_candidate(&args) else {
+        return Ok(SessionExecutionPlan::Search(args));
+    };
+    let db = ChatDb::open(&db_path).await?;
+    if db.get_session(session_id).await?.is_some() {
+        return Ok(SessionExecutionPlan::Inspect(SessionInspectRequest {
+            session_id: session_id.to_string(),
+        }));
+    }
+    Ok(SessionExecutionPlan::Search(args))
+}
+
+fn implicit_session_lookup_candidate(args: &SessionArgs) -> Option<&str> {
+    if args.session_id.is_some() {
+        return None;
+    }
+    let candidate = args.query.trim();
+    if candidate.is_empty() || candidate == "*" || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn plan_from_tokens(
+    tokens: &[String],
+    args: &SessionArgs,
+    defaults: &SearchDefaults,
+) -> Result<Option<SessionExecutionPlan>, SessionToolError> {
+    let Some(first) = tokens.first().map(String::as_str) else {
+        return Ok(None);
+    };
+
+    if let [session_id, keyword, prompt_tokens @ ..] = tokens
         && keyword == "search"
     {
         let prompt = prompt_tokens.join(" ");
         if prompt.is_empty() {
             return Err(SessionToolError::MissingSearchPrompt);
         }
-        args.session_id = Some(session_id.clone());
-        args.query = prompt;
-        return Ok(());
+        let mut next_args = args.clone();
+        next_args.session_id = Some(session_id.clone());
+        next_args.query = prompt;
+        apply_search_defaults(&mut next_args, defaults);
+        return Ok(Some(
+            normalize_common_args(next_args).map(SessionExecutionPlan::Search)?,
+        ));
     }
 
-    args.query = tokens.join(" ");
-    Ok(())
+    match first {
+        "search" => {
+            let prompt = tokens
+                .iter()
+                .skip(1)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if prompt.is_empty() {
+                return Err(SessionToolError::MissingSearchPrompt);
+            }
+            let mut next_args = args.clone();
+            next_args.query = prompt;
+            apply_search_defaults(&mut next_args, defaults);
+            Ok(Some(
+                normalize_common_args(next_args).map(SessionExecutionPlan::Search)?,
+            ))
+        }
+        "inspect" | "show" | "read" | "get" | "view" if tokens.len() == 2 => {
+            let session_id = tokens
+                .get(1)
+                .ok_or(SessionToolError::MissingActionSessionId { action: "inspect" })?;
+            Ok(Some(SessionExecutionPlan::Inspect(SessionInspectRequest {
+                session_id: session_id.clone(),
+            })))
+        }
+        "messages" if tokens.len() == 2 => {
+            let session_id = tokens
+                .get(1)
+                .ok_or(SessionToolError::MissingActionSessionId { action: "messages" })?;
+            Ok(Some(SessionExecutionPlan::Messages(
+                SessionMessagesRequest {
+                    session_id: session_id.clone(),
+                },
+            )))
+        }
+        "list" if tokens.len() == 1 => Ok(Some(SessionExecutionPlan::List(SessionListRequest {
+            limit: args.limit.clamp(1, 200),
+            offset: args.offset,
+            include_current: args.include_current,
+            include_archived: args.include_archived,
+            current_session_id: defaults.current_session_id.clone(),
+            profile_id: args.profile_id.clone(),
+            model: args.model.clone(),
+            title_contains: args.title_contains.clone(),
+            since: args.since.clone(),
+            until: args.until.clone(),
+        }))),
+        _ => Ok(None),
+    }
+}
+
+fn plan_from_raw_query(
+    args: &SessionArgs,
+    defaults: &SearchDefaults,
+) -> Result<Option<SessionExecutionPlan>, SessionToolError> {
+    let trimmed = args.query.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let Some(first) = tokens.first().copied() else {
+        return Ok(None);
+    };
+
+    match first {
+        "inspect" | "show" | "read" | "get" | "view" if tokens.len() == 2 => {
+            Ok(Some(SessionExecutionPlan::Inspect(SessionInspectRequest {
+                session_id: tokens[1].to_string(),
+            })))
+        }
+        "messages" if tokens.len() == 2 => Ok(Some(SessionExecutionPlan::Messages(
+            SessionMessagesRequest {
+                session_id: tokens[1].to_string(),
+            },
+        ))),
+        "list" if tokens.len() == 1 => Ok(Some(SessionExecutionPlan::List(SessionListRequest {
+            limit: args.limit.clamp(1, 200),
+            offset: args.offset,
+            include_current: args.include_current,
+            include_archived: args.include_archived,
+            current_session_id: defaults.current_session_id.clone(),
+            profile_id: args.profile_id.clone(),
+            model: args.model.clone(),
+            title_contains: args.title_contains.clone(),
+            since: args.since.clone(),
+            until: args.until.clone(),
+        }))),
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -660,6 +1076,7 @@ async fn ensure_index(
     db: &ChatDb,
     fingerprint: &SessionIndexMeta,
     embedder: EmbeddingModelResolution,
+    semantic_index_required: bool,
 ) -> Result<Table, SessionToolError> {
     let conn = connect(index_path.to_string_lossy().as_ref())
         .execute()
@@ -715,17 +1132,24 @@ async fn ensure_index(
             session_count: fingerprint.session_count,
             total_messages: fingerprint.total_messages,
             latest_updated_at: fingerprint.latest_updated_at.clone(),
-            semantic_embedding_model: embedder.ready().map(|value| value.selector().to_string()),
-            semantic_embedding_dimensions: embedder.ready().map(aither_core::EmbeddingModel::dim),
+            semantic_embedding_model: None,
+            semantic_embedding_dimensions: None,
         };
-        async_fs::write(meta_path, serde_json::to_vec_pretty(&next_meta)?).await?;
-        if let Some(embedder) = embedder.clone_ready() {
-            rebuild_semantic_index(semantic_index_path, embedder, &rows).await?;
+        if semantic_index_required && let Some(embedder) = embedder.clone_ready() {
+            rebuild_semantic_index(semantic_index_path, embedder.clone(), &rows).await?;
+            let next_meta = SessionIndexMeta {
+                semantic_embedding_model: Some(embedder.selector().to_string()),
+                semantic_embedding_dimensions: Some(embedder.dim()),
+                ..next_meta
+            };
+            async_fs::write(meta_path, serde_json::to_vec_pretty(&next_meta)?).await?;
+        } else {
+            async_fs::write(meta_path, serde_json::to_vec_pretty(&next_meta)?).await?;
         }
 
         Ok(table)
     } else {
-        if let Some(embedder) = embedder.clone_ready() {
+        if semantic_index_required && let Some(embedder) = embedder.clone_ready() {
             let saved_meta = async_fs::read_to_string(meta_path)
                 .await
                 .ok()
@@ -1426,6 +1850,8 @@ fn finalize_rows_with_total(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_lite::future::block_on;
+    use tempfile::tempdir;
 
     fn base_args() -> SessionArgs {
         SessionArgs {
@@ -1456,61 +1882,184 @@ mod tests {
 
     #[test]
     fn parses_scoped_session_command_form() {
-        let mut args = base_args();
-        apply_command_form(
-            &mut args,
-            "session abc123 search investigate failures",
-            "session",
+        let tokens =
+            split_command_form_tokens("session abc123 search investigate failures", "session")
+                .expect("command form should parse");
+        let plan = plan_from_tokens(
+            &tokens,
+            &base_args(),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
         )
-        .expect("command form should parse");
+        .expect("plan should parse")
+        .expect("search plan should be produced");
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
         assert_eq!(args.session_id.as_deref(), Some("abc123"));
         assert_eq!(args.query, "investigate failures");
     }
 
     #[test]
     fn parses_global_session_command_form() {
-        let mut args = base_args();
-        apply_command_form(&mut args, "session recall onboarding decision", "session")
+        let tokens = split_command_form_tokens("session recall onboarding decision", "session")
             .expect("global command form should parse");
+        let plan = build_execution_plan(
+            base_args(),
+            SessionCommandInput::Tokens(tokens),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect("search plan should parse");
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
         assert_eq!(args.session_id, None);
         assert_eq!(args.query, "recall onboarding decision");
     }
 
     #[test]
     fn parses_quoted_scoped_session_command_form() {
-        let mut args = base_args();
-        apply_command_form(
-            &mut args,
+        let tokens = split_command_form_tokens(
             "session abc123 search \"investigate spaced failures\"",
             "session",
         )
         .expect("quoted scoped command form should parse");
+        let plan = plan_from_tokens(
+            &tokens,
+            &base_args(),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect("plan should parse")
+        .expect("search plan should be produced");
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
         assert_eq!(args.session_id.as_deref(), Some("abc123"));
         assert_eq!(args.query, "investigate spaced failures");
     }
 
     #[test]
     fn parses_quoted_global_session_command_form() {
-        let mut args = base_args();
-        apply_command_form(
-            &mut args,
-            "session \"recall onboarding decision\"",
-            "session",
+        let tokens = split_command_form_tokens("session \"recall onboarding decision\"", "session")
+            .expect("quoted global command form should parse");
+        let plan = build_execution_plan(
+            base_args(),
+            SessionCommandInput::Tokens(tokens),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
         )
-        .expect("quoted global command form should parse");
+        .expect("search plan should parse");
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
         assert_eq!(args.session_id, None);
         assert_eq!(args.query, "recall onboarding decision");
     }
 
     #[test]
     fn rejects_missing_prompt_in_scoped_command() {
-        let mut args = base_args();
-        let err = apply_command_form(&mut args, "session abc123 search", "session")
-            .expect_err("missing prompt must fail");
+        let tokens =
+            split_command_form_tokens("session abc123 search", "session").expect("tokens parse");
+        let err = plan_from_tokens(
+            &tokens,
+            &base_args(),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect_err("missing prompt must fail");
         assert!(
             err.to_string().contains("missing prompt"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn parses_inspect_command_form() {
+        let tokens = split_command_form_tokens("session inspect abc123", "session")
+            .expect("inspect command form should parse");
+        let plan = plan_from_tokens(
+            &tokens,
+            &base_args(),
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect("plan should parse")
+        .expect("inspect plan should be produced");
+        let SessionExecutionPlan::Inspect(request) = plan else {
+            panic!("expected inspect plan");
+        };
+        assert_eq!(request.session_id, "abc123");
+    }
+
+    #[test]
+    fn parses_raw_query_inspect_action() {
+        let mut args = base_args();
+        args.query = "inspect abc123".to_string();
+        let plan = plan_from_raw_query(
+            &args,
+            &SearchDefaults {
+                current_session_id: "current".to_string(),
+            },
+        )
+        .expect("raw query plan should parse")
+        .expect("inspect plan should be produced");
+        let SessionExecutionPlan::Inspect(request) = plan else {
+            panic!("expected inspect plan");
+        };
+        assert_eq!(request.session_id, "abc123");
+    }
+
+    #[test]
+    fn single_token_query_becomes_implicit_inspect_when_session_exists() {
+        block_on(async {
+            let temp = tempdir().expect("tempdir");
+            let db_path = temp.path().join("history.db");
+            let db = ChatDb::open(&db_path).await.expect("db should open");
+            db.create_session("abc123", Some("session"), Some("gpt-5"))
+                .await
+                .expect("session should be created");
+
+            let mut args = base_args();
+            args.query = "abc123".to_string();
+
+            let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
+                .await
+                .expect("implicit inspect should resolve");
+
+            let SessionExecutionPlan::Inspect(request) = plan else {
+                panic!("expected inspect plan");
+            };
+            assert_eq!(request.session_id, "abc123");
+        });
+    }
+
+    #[test]
+    fn single_token_query_stays_search_when_session_missing() {
+        block_on(async {
+            let temp = tempdir().expect("tempdir");
+            let db_path = temp.path().join("history.db");
+            let _db = ChatDb::open(&db_path).await.expect("db should open");
+
+            let mut args = base_args();
+            args.query = "abc123".to_string();
+
+            let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
+                .await
+                .expect("search should remain valid");
+
+            let SessionExecutionPlan::Search(args) = plan else {
+                panic!("expected search plan");
+            };
+            assert_eq!(args.query, "abc123");
+        });
     }
 
     #[test]

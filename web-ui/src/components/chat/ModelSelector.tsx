@@ -2,25 +2,20 @@ import { useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Check, Loader2 } from 'lucide-react';
 import { PROVIDER_ICONS, getModel, inferProvider } from '@/lib/constants';
 import { useStore } from '@/lib/store';
 
 interface ModelSelectorProps {
   currentModelId: string;
-  currentReasoningEffort?: string;
   onModelChange: (modelId: string) => void;
-  onReasoningEffortChange: (effort?: string) => void;
   disabled?: boolean;
   isUpdating?: boolean;
 }
 
 export function ModelSelector({
   currentModelId,
-  currentReasoningEffort,
   onModelChange,
-  onReasoningEffortChange,
   disabled = false,
   isUpdating = false,
 }: ModelSelectorProps) {
@@ -106,26 +101,6 @@ export function ModelSelector({
             </CommandGroup>
           </CommandList>
         </Command>
-        {selected?.reasoning && (
-          <div className="border-t p-3 bg-muted/30">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-medium text-muted-foreground">Reasoning Effort</span>
-              <Select
-                value={currentReasoningEffort ?? 'off'}
-                onValueChange={(v) => onReasoningEffortChange(v === 'off' ? undefined : v)}
-                disabled={disabled}
-              >
-                <SelectTrigger className="h-7 w-[120px] text-xs"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="off">Off</SelectItem>
-                  <SelectItem value="low">Low</SelectItem>
-                  <SelectItem value="medium">Medium</SelectItem>
-                  <SelectItem value="high">High</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-        )}
       </PopoverContent>
     </Popover>
   );

@@ -402,7 +402,7 @@ function DraggableSessionRow({
           {session.title || 'New Chat'}
         </span>
         {planLabel && (
-          <span className="shrink-0 rounded-full border border-amber-500/35 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-amber-200">
+          <span className="shrink-0 rounded-full border border-amber-500/35 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-amber-700 dark:text-amber-200">
             {planLabel}
           </span>
         )}
@@ -631,10 +631,9 @@ export function Sidebar({ className, onOpenSettings, onSelectSession, onNewChat 
 
   const handleSelectSession = useCallback(
     (id: string) => {
-      setCurrentSession(id);
       onSelectSession?.(id);
     },
-    [setCurrentSession, onSelectSession],
+    [onSelectSession],
   );
 
   const handleCreateProfile = useCallback(async () => {
@@ -906,7 +905,6 @@ export function Sidebar({ className, onOpenSettings, onSelectSession, onNewChat 
                 {/* ── New Chat button ── */}
                 <button
                   onClick={() => {
-                    setCurrentSession(null);
                     onNewChat?.();
                   }}
                   className="mx-2 flex w-[calc(100%-1rem)] min-w-0 items-center gap-2 rounded-lg px-2.5 py-[7px] text-[13px] text-muted-foreground/60 transition-all duration-150 hover:bg-accent/50 hover:text-foreground"
@@ -1021,7 +1019,7 @@ export function Sidebar({ className, onOpenSettings, onSelectSession, onNewChat 
           <DropdownMenuContent align="end" className="w-40">
             {canCreateSession ? (
               <>
-                <DropdownMenuItem onClick={() => { setCurrentSession(null); onNewChat?.(); }}>
+                <DropdownMenuItem onClick={() => { onNewChat?.(); }}>
                   <Plus className="mr-2 h-4 w-4" />
                   New Chat
                 </DropdownMenuItem>
