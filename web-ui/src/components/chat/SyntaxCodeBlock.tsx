@@ -1,5 +1,6 @@
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { oneLight, vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { useThemeMode } from '@/lib/themeMode';
 
 export default function SyntaxCodeBlock({
   language,
@@ -8,12 +9,19 @@ export default function SyntaxCodeBlock({
   language: string;
   code: string;
 }) {
+  const themeMode = useThemeMode();
+
   return (
     <SyntaxHighlighter
-      style={vscDarkPlus}
+      style={themeMode === 'dark' ? vscDarkPlus : oneLight}
       language={language}
       PreTag="div"
-      customStyle={{ margin: 0, borderRadius: 0, fontSize: '0.8125rem' }}
+      customStyle={{
+        margin: 0,
+        borderRadius: 0,
+        fontSize: '0.8125rem',
+        background: 'transparent',
+      }}
     >
       {code}
     </SyntaxHighlighter>

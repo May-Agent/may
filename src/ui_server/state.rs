@@ -407,6 +407,7 @@ pub struct UiServerState {
     pub(crate) container_prepare: ContainerPrepareTracker,
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
     pub(crate) browser_manager: ArcSwapOption<crate::container::browser::BrowserManager>,
+    pub(crate) browser_owner_session_id: ArcSwapOption<String>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
     pub(crate) notification_service: Arc<crate::notification_service::NotificationService>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
@@ -441,6 +442,17 @@ impl UiServerState {
 
     pub(crate) fn browser_manager(&self) -> Option<Arc<crate::container::browser::BrowserManager>> {
         self.browser_manager.load_full()
+    }
+
+    pub(crate) fn browser_owner_session_id(&self) -> Option<String> {
+        self.browser_owner_session_id
+            .load_full()
+            .map(|session_id| session_id.as_ref().clone())
+    }
+
+    pub(crate) fn set_browser_owner_session_id(&self, session_id: Option<String>) {
+        self.browser_owner_session_id
+            .store(session_id.map(Arc::new));
     }
 
     pub(crate) fn set_browser_manager(

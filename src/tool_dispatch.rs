@@ -205,6 +205,12 @@ async fn handle_browser_request(
         ));
     }
 
+    let browser_not_running_error = || {
+        BrowserToolError::request_failed(
+            "browser is not running; call browser open before browser cdp-endpoint or browser read",
+        )
+    };
+
     match request.args {
         crate::agent::BrowserArgs::Status => {
             let status = match browser_service_status(browser_service.socket_path().as_path()).await
@@ -266,26 +272,38 @@ async fn handle_browser_request(
             })
         }
         crate::agent::BrowserArgs::CdpEndpoint => {
-            let status = ensure_browser_service_started(
-                browser_service.may_dir.as_path(),
-                &browser_service.browser_config,
-            )
-            .await
-            .map_err(BrowserToolError::request_failed)?;
+            let Some(status) = browser_service_status(browser_service.socket_path().as_path())
+                .await
+                .map_err(BrowserToolError::request_failed)?
+            else {
+                return Err(browser_not_running_error());
+            };
+            if !status.running {
+                return Err(browser_not_running_error());
+            }
             Ok(BrowserResult {
                 running: true,
                 cdp_endpoint: status.cdp_endpoint,
                 page: None,
             })
         }
-        crate::agent::BrowserArgs::Read { url, options } => {
+        crate::agent::BrowserArgs::Read {
+            url,
+            detail,
+            screenshot,
+            format: _,
+        } => {
+            let options = crate::agent::BrowserArgs::read_options(detail, screenshot);
             let request = BrowserServiceRequest::Read { url, options };
-            let status = ensure_browser_service_started(
-                browser_service.may_dir.as_path(),
-                &browser_service.browser_config,
-            )
-            .await
-            .map_err(BrowserToolError::request_failed)?;
+            let Some(status) = browser_service_status(browser_service.socket_path().as_path())
+                .await
+                .map_err(BrowserToolError::request_failed)?
+            else {
+                return Err(browser_not_running_error());
+            };
+            if !status.running {
+                return Err(browser_not_running_error());
+            }
             let response = query_browser_service(browser_service.socket_path().as_path(), &request)
                 .await
                 .map_err(BrowserToolError::request_failed)?;

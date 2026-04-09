@@ -41,7 +41,8 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
 use may_agent::browser_service::{
-    BrowserReadOptions, BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus,
+    BrowserReadDetail, BrowserReadFormat, BrowserReadOptions, BrowserScreenshotMode,
+    BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus,
 };
 use may_agent::session::{SessionPaths, initialize_session_persistence};
 use may_agent::tui::runtime::{LocalSessionRuntime, RuntimeDeps, TitleGenContext};
@@ -96,13 +97,22 @@ struct BrowserCliArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BrowserCliCommand {
     Status,
+    Start,
+    Stop,
     Targets,
     Contexts,
     Endpoint,
-    Read { url: String },
+    Read {
+        url: String,
+        detail: BrowserReadDetail,
+        screenshot: BrowserScreenshotMode,
+        format: BrowserReadFormat,
+    },
     Provision,
     Kill,
-    Service { socket_path: std::path::PathBuf },
+    Service {
+        socket_path: std::path::PathBuf,
+    },
 }
 
 impl OneShotArgs {
@@ -127,7 +137,7 @@ impl ExecArgs {
 
 impl BrowserCliArgs {
     fn help_text() -> &'static str {
-        "Usage: may browser <status|targets|contexts|endpoint|read <url>|provision|kill>\n\nInspect or maintain the May-managed browser runtime used for browser automation."
+        "Usage: may browser <status|open|close|targets|contexts|cdp-endpoint|read <url> [--detail <brief|standard|full>] [--screenshot <off|viewport|full-page>] [--format json]|provision|kill>\n\nInspect or maintain the May-managed browser runtime used for browser automation."
     }
 }
 
@@ -155,20 +165,76 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
     let command = match args.first().map(String::as_str).unwrap_or("status") {
         "--help" | "-h" => panic!("{}", BrowserCliArgs::help_text()),
         "status" => BrowserCliCommand::Status,
+        "open" => BrowserCliCommand::Start,
+        "close" => BrowserCliCommand::Stop,
         "targets" => BrowserCliCommand::Targets,
         "contexts" => BrowserCliCommand::Contexts,
-        "endpoint" => BrowserCliCommand::Endpoint,
+        "cdp-endpoint" => BrowserCliCommand::Endpoint,
         "provision" => BrowserCliCommand::Provision,
         "kill" => BrowserCliCommand::Kill,
         "read" => {
-            let url = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| panic!("may browser read requires <url>"));
-            if args.len() > 2 {
-                panic!("may browser read accepts exactly one url");
+            let url = args.get(1).cloned().unwrap_or_else(|| {
+                panic!("may browser read requires <url>");
+            });
+            let mut detail = BrowserReadDetail::default();
+            let mut screenshot = BrowserScreenshotMode::default();
+            let mut format = BrowserReadFormat::Json;
+            let mut index = 2;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--detail" => {
+                        let value = args.get(index + 1).unwrap_or_else(|| {
+                            panic!("may browser read requires --detail <brief|standard|full>")
+                        });
+                        detail = match value.as_str() {
+                            "brief" => BrowserReadDetail::Brief,
+                            "standard" => BrowserReadDetail::Standard,
+                            "full" => BrowserReadDetail::Full,
+                            other => panic!(
+                                "invalid may browser read detail '{}'; expected brief, standard, or full",
+                                other
+                            ),
+                        };
+                        index += 2;
+                    }
+                    "--screenshot" => {
+                        let value = args.get(index + 1).unwrap_or_else(|| {
+                            panic!(
+                                "may browser read requires --screenshot <off|viewport|full-page>"
+                            )
+                        });
+                        screenshot = match value.as_str() {
+                            "off" => BrowserScreenshotMode::Off,
+                            "viewport" => BrowserScreenshotMode::Viewport,
+                            "full-page" => BrowserScreenshotMode::FullPage,
+                            other => panic!(
+                                "invalid may browser read screenshot mode '{}'; expected off, viewport, or full-page",
+                                other
+                            ),
+                        };
+                        index += 2;
+                    }
+                    "--format" => {
+                        let value = args
+                            .get(index + 1)
+                            .unwrap_or_else(|| panic!("may browser read requires --format json"));
+                        format = match value.as_str() {
+                            "json" => BrowserReadFormat::Json,
+                            other => {
+                                panic!("invalid may browser read format '{}'; expected json", other)
+                            }
+                        };
+                        index += 2;
+                    }
+                    other => panic!("unexpected may browser read argument '{other}'"),
+                }
             }
-            BrowserCliCommand::Read { url }
+            BrowserCliCommand::Read {
+                url,
+                detail,
+                screenshot,
+                format,
+            }
         }
         "service" => {
             let mut socket_path = None;
@@ -191,7 +257,7 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
             }
         }
         other => panic!(
-            "invalid browser command '{}'; expected one of: status, targets, contexts, endpoint, read, provision, kill",
+            "invalid browser command '{}'; expected one of: status, open, close, targets, contexts, cdp-endpoint, read, provision, kill",
             other
         ),
     };
@@ -614,6 +680,25 @@ async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
                 .map_err(BrowserCliError::BrowserService)?;
             render_json_stdout(&serde_json::json!({ "cdpEndpoint": status.cdp_endpoint }))?;
         }
+        BrowserCliCommand::Start => {
+            let status = ensure_browser_service_started(may_dir.as_path(), &config.browser)
+                .await
+                .map_err(BrowserCliError::BrowserService)?;
+            render_json_stdout(&serde_json::json!({
+                "running": status.running,
+                "cdpEndpoint": status.cdp_endpoint,
+            }))?;
+        }
+        BrowserCliCommand::Stop => {
+            stop_browser_service(&socket_path, &config.browser, &may_dir)
+                .await
+                .map_err(BrowserCliError::BrowserService)?;
+            render_json_stdout(&serde_json::json!({
+                "ok": true,
+                "running": false,
+                "cdpEndpoint": serde_json::Value::Null,
+            }))?;
+        }
         BrowserCliCommand::Provision => {
             if !config.browser.requires_managed_runtime() {
                 return Err(BrowserCliError::BrowserService(
@@ -717,7 +802,12 @@ async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
                 .collect::<Vec<_>>();
             render_json_stdout(&contexts)?;
         }
-        BrowserCliCommand::Read { url } => {
+        BrowserCliCommand::Read {
+            url,
+            detail,
+            screenshot,
+            format: _,
+        } => {
             let status = ensure_browser_service_started(may_dir.as_path(), &config.browser)
                 .await
                 .map_err(BrowserCliError::BrowserService)?;
@@ -725,7 +815,7 @@ async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
                 &socket_path,
                 BrowserServiceRequest::Read {
                     url,
-                    options: BrowserReadOptions::default(),
+                    options: BrowserReadOptions { detail, screenshot },
                 },
             )
             .await
@@ -1671,6 +1761,7 @@ mod tests {
         parse_cli_mode, parse_oneshot_selection, parse_reasoning_effort,
     };
     use aither_core::llm::model::ReasoningEffort;
+    use may_agent::browser_service::{BrowserReadDetail, BrowserReadFormat, BrowserScreenshotMode};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
@@ -1695,6 +1786,42 @@ mod tests {
             parse_cli_mode(&args(&["may", "browser", "contexts"])),
             CliMode::Browser(BrowserCliArgs {
                 command: BrowserCliCommand::Contexts,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_detects_browser_open_command() {
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "browser", "open"])),
+            CliMode::Browser(BrowserCliArgs {
+                command: BrowserCliCommand::Start,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_detects_browser_read_flags() {
+        assert_eq!(
+            parse_cli_mode(&args(&[
+                "may",
+                "browser",
+                "read",
+                "https://example.com",
+                "--detail",
+                "full",
+                "--screenshot",
+                "full-page",
+                "--format",
+                "json",
+            ])),
+            CliMode::Browser(BrowserCliArgs {
+                command: BrowserCliCommand::Read {
+                    url: "https://example.com".to_string(),
+                    detail: BrowserReadDetail::Full,
+                    screenshot: BrowserScreenshotMode::FullPage,
+                    format: BrowserReadFormat::Json,
+                },
             })
         );
     }

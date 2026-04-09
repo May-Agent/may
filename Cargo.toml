@@ -41,6 +41,7 @@ async-stream = "0.3"
 event-listener = "5"
 executor-core = { version = "0.7", features = ["tokio"] }
 async-fs = "2.1"
+async-io = "2.6"
 async-channel = "2"
 blocking = "1"
 

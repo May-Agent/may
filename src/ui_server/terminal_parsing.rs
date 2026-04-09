@@ -12,6 +12,7 @@ use super::types::{
 #[serde(rename_all = "snake_case")]
 pub(super) enum TerminalTaskStatus {
     Running,
+    Stopped,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -62,12 +63,18 @@ fn parse_terminal_end_output_from_result(result: &ToolResult) -> Option<String> 
     result.render_for_model().ok()
 }
 
-/// Determine if a terminal execution failed from a typed tool result.
-fn parse_terminal_failed_from_result(result: &ToolResult) -> bool {
+fn parse_terminal_status_from_result(result: &ToolResult) -> TerminalExecutionStatus {
     if result.is_error() {
-        return true;
+        return TerminalExecutionStatus::Failed;
     }
-    parse_terminal_result_payload(result).is_some_and(|parsed| parsed.exit_code != 0)
+    match parse_terminal_result_payload(result) {
+        Some(parsed) => match parsed.status {
+            Some(TerminalTaskStatus::Stopped) => TerminalExecutionStatus::Stopped,
+            _ if parsed.exit_code != 0 => TerminalExecutionStatus::Failed,
+            _ => TerminalExecutionStatus::Done,
+        },
+        None => TerminalExecutionStatus::Done,
+    }
 }
 
 pub(super) fn update_terminal_snapshot_from_tool_event(
@@ -106,13 +113,8 @@ pub(super) fn update_terminal_snapshot_from_tool_event(
             });
 
             let output = parse_terminal_end_output_from_result(result);
-            let failed = parse_terminal_failed_from_result(result);
             exec.output = output;
-            exec.status = if failed {
-                TerminalExecutionStatus::Failed
-            } else {
-                TerminalExecutionStatus::Done
-            };
+            exec.status = parse_terminal_status_from_result(result);
 
             snapshot.executions.push(exec);
         }

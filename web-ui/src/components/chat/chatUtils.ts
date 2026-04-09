@@ -23,7 +23,7 @@ export interface PreviewPaneState {
 
 export interface ParsedToolResult {
   output?: string;
-  failed: boolean;
+  status: "done" | "failed" | "stopped";
 }
 
 export interface ContextRoleTokenBucket {
@@ -407,7 +407,10 @@ export function parseToolResultPayload(rawResult: unknown): ParsedToolResult {
       return typeof kind === 'string' && kind.trim().length > 0;
     });
   const exitCode = (parsed as any)?.exit_code;
-  const status = (parsed as any)?.status;
+  const status =
+    typeof (parsed as any)?.status === "string"
+      ? (parsed as any).status.trim().toLowerCase()
+      : "";
 
   const serializedParsed =
     parsed && typeof parsed === 'object'
@@ -420,27 +423,37 @@ export function parseToolResultPayload(rawResult: unknown): ParsedToolResult {
         })()
       : undefined;
 
-  const output =
-    typeof serializedParsed === 'string' && (hasTerminalShape || hasStructuredTerminalOutput)
-      ? serializedParsed
-      : typeof stdoutText === 'string' && stdoutText.trim().length > 0
+  const plainTerminalText =
+    typeof stdoutText === 'string' && stdoutText.trim().length > 0
       ? stdoutText
       : typeof stderrText === 'string' && stderrText.trim().length > 0
         ? stderrText
-        : typeof parsed === 'string' && parsed.trim().length > 0
+        : undefined;
+
+  const output =
+    typeof plainTerminalText === 'string'
+      ? plainTerminalText
+      : typeof serializedParsed === 'string' && (hasTerminalShape || hasStructuredTerminalOutput)
+      ? serializedParsed
+      : typeof parsed === 'string' && parsed.trim().length > 0
           ? parsed
           : typeof serializedParsed === 'string' && serializedParsed.trim().length > 0
             ? serializedParsed
           : undefined;
 
+  const stoppedByStatus = status === "stopped" || status === "cancelled";
   const failedByExitCode =
-    typeof exitCode === 'number' && exitCode !== 0;
-  const failedByStatus =
-    typeof status === 'string' && status.toLowerCase() === 'failed';
+    typeof exitCode === "number" && exitCode !== 0 && !stoppedByStatus;
+  const failedByStatus = status === "failed";
+  const nextStatus: ParsedToolResult["status"] = stoppedByStatus
+    ? "stopped"
+    : wrappedFailure || failedByExitCode || failedByStatus
+      ? "failed"
+      : "done";
 
   return {
     output,
-    failed: wrappedFailure || failedByExitCode || failedByStatus,
+    status: nextStatus,
   };
 }
 
@@ -449,6 +462,7 @@ export function parseToolResultPayload(rawResult: unknown): ParsedToolResult {
 export function settleTimelineSegments(
   segments: TimelineSegment[] | undefined,
   settledAt: number,
+  interruptedStatus: "failed" | "stopped" = "failed",
 ): TimelineSegment[] {
   return (segments ?? []).map((segment) => {
     if (segment.kind === "thinking") {
@@ -466,7 +480,7 @@ export function settleTimelineSegments(
           segment.tool.status === "running"
             ? {
                 ...segment.tool,
-                status: "failed" as const,
+                status: interruptedStatus,
                 endedAt: segment.tool.endedAt ?? settledAt,
               }
             : segment.tool,
@@ -480,7 +494,7 @@ export function settleTimelineSegments(
         command.status === "running"
           ? {
               ...command,
-              status: "failed" as const,
+              status: interruptedStatus,
               endedAt: command.endedAt ?? settledAt,
             }
           : command,

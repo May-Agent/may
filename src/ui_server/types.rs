@@ -159,6 +159,7 @@ pub struct BrowserStatusEventPayload {
     pub(crate) enabled: bool,
     pub(crate) running: bool,
     pub(crate) cdp_endpoint: Option<String>,
+    pub(crate) owner_session_id: Option<String>,
     pub(crate) takeover_session_id: Option<String>,
 }
 
@@ -526,6 +527,7 @@ pub enum TerminalExecutionStatus {
     Running,
     Done,
     Failed,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

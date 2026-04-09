@@ -661,6 +661,10 @@ export function isSessionActiveConflictError(error: unknown): error is ApiError 
   return error instanceof ApiError && error.statusCode === ACTIVE_SESSION_CONFLICT_STATUS;
 }
 
+export function isBrowserTakeoverActiveError(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.code === 'browser_takeover_active';
+}
+
 // ── Enrichment helpers ───────────────────────────────────
 // The backend sends camelCase JSON matching our types directly.
 // These helpers add client-side computed fields.
@@ -1106,6 +1110,7 @@ export async function streamChat(input: {
     total: number;
     completed: number;
   }) => void;
+  onPaused?: (assistant: Message) => void;
   onDone?: (assistant: Message) => void;
   onError?: (message: string) => void;
   signal?: AbortSignal;
@@ -1178,6 +1183,14 @@ export async function streamChat(input: {
           );
         }
         input.onDone?.(enrichMessage(parsed.assistant));
+        break;
+      case 'paused':
+        if (!parsed.assistant || typeof parsed.assistant !== 'object') {
+          throw new Error(
+            "Invalid SSE payload: missing 'assistant' in paused event",
+          );
+        }
+        input.onPaused?.(enrichMessage(parsed.assistant));
         break;
       case 'error':
         input.onError?.(parsed.message || 'Unknown stream error');
@@ -1884,6 +1897,7 @@ export interface BrowserStatus {
   enabled: boolean;
   running: boolean;
   cdpEndpoint: string | null;
+  ownerSessionId: string | null;
   takeoverSessionId: string | null;
 }
 

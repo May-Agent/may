@@ -31,6 +31,75 @@
     --border: 214.3 31.8% 91.4%;
     --input: 214.3 31.8% 91.4%;
     --ring: 222.2 84% 4.9%;
+
+    --activity-bg: 255 255 255 / 0.92;
+    --activity-border: 203 213 225 / 0.88;
+    --activity-divider: 226 232 240 / 0.92;
+    --activity-icon-bg: 15 23 42 / 0.05;
+    --activity-icon-fg: 51 65 85 / 0.88;
+    --activity-meta: 100 116 139 / 0.92;
+    --activity-action: 51 65 85 / 0.88;
+    --activity-action-hover: 15 23 42 / 0.96;
+    --timeline-sweep-muted: 100 116 139 / 0.62;
+    --timeline-sweep-bright: 15 23 42 / 0.96;
+
+    --artifacts-shell-bg:
+      radial-gradient(circle at 100% 0%, rgba(8, 145, 178, 0.12), rgba(8, 145, 178, 0) 44%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.96)),
+      rgba(248, 250, 252, 0.94);
+    --artifacts-shell-overlay: linear-gradient(180deg, rgba(14, 116, 144, 0.05), rgba(14, 116, 144, 0));
+    --artifacts-topbar-bg:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(248, 250, 252, 0.86)),
+      rgba(248, 250, 252, 0.84);
+    --artifacts-action-border: rgba(148, 163, 184, 0.26);
+    --artifacts-action-bg:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(241, 245, 249, 0.72)),
+      rgba(241, 245, 249, 0.68);
+    --artifacts-action-hover:
+      linear-gradient(180deg, rgba(240, 249, 255, 0.96), rgba(224, 242, 254, 0.82)),
+      rgba(224, 242, 254, 0.78);
+    --artifacts-history-bg:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(248, 250, 252, 0.84)),
+      rgba(248, 250, 252, 0.82);
+    --artifacts-preview-bar-bg:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(241, 245, 249, 0.78)),
+      rgba(241, 245, 249, 0.74);
+    --artifacts-preview-path: rgba(71, 85, 105, 0.84);
+    --artifacts-history-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.72),
+      0 8px 18px rgba(148, 163, 184, 0.12);
+
+    --slidev-shell-border: rgba(148, 163, 184, 0.42);
+    --slidev-shell-bg:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(241, 245, 249, 0.9)),
+      rgba(241, 245, 249, 0.88);
+    --slidev-shell-highlight: linear-gradient(180deg, rgba(6, 182, 212, 0.08), rgba(6, 182, 212, 0));
+    --slidev-shell-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.72),
+      0 16px 30px rgba(148, 163, 184, 0.14);
+    --slidev-toolbar-border: rgba(148, 163, 184, 0.3);
+    --slidev-toolbar-bg:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(241, 245, 249, 0.8)),
+      rgba(241, 245, 249, 0.76);
+    --slidev-toolbar-title: rgba(15, 23, 42, 0.9);
+    --slidev-live-color: rgba(8, 145, 178, 0.94);
+    --slidev-live-border: rgba(8, 145, 178, 0.3);
+    --slidev-live-bg: rgba(236, 254, 255, 0.9);
+    --slidev-live-dot: rgba(8, 145, 178, 0.92);
+    --slidev-open-border: rgba(148, 163, 184, 0.4);
+    --slidev-open-bg: rgba(255, 255, 255, 0.78);
+    --slidev-open-hover-border: rgba(8, 145, 178, 0.45);
+    --slidev-open-hover-bg: rgba(236, 254, 255, 0.88);
+    --slidev-viewport-bg:
+      radial-gradient(circle at 50% 0%, rgba(34, 211, 238, 0.12), rgba(34, 211, 238, 0) 45%),
+      linear-gradient(180deg, rgba(226, 232, 240, 0.48), rgba(226, 232, 240, 0.32)),
+      rgba(226, 232, 240, 0.28);
+    --slidev-stage-border: rgba(148, 163, 184, 0.44);
+    --slidev-stage-bg: #f8fafc;
+    --slidev-stage-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.78),
+      0 14px 28px rgba(148, 163, 184, 0.16),
+      0 0 0 1px rgba(34, 211, 238, 0.12);
  
     --radius: 0.5rem;
   }
@@ -63,6 +132,75 @@
     --border: 217.2 32.6% 17.5%;
     --input: 217.2 32.6% 17.5%;
     --ring: 212.7 26.8% 83.9%;
+
+    --activity-bg: 24 24 27 / 0.78;
+    --activity-border: 82 82 91 / 0.42;
+    --activity-divider: 82 82 91 / 0.28;
+    --activity-icon-bg: 255 255 255 / 0.05;
+    --activity-icon-fg: 228 228 231 / 0.82;
+    --activity-meta: 161 161 170 / 0.88;
+    --activity-action: 212 212 216 / 0.88;
+    --activity-action-hover: 250 250 250 / 0.96;
+    --timeline-sweep-muted: 161 161 170 / 0.62;
+    --timeline-sweep-bright: 244 244 245 / 0.96;
+
+    --artifacts-shell-bg:
+      radial-gradient(circle at 100% 0%, rgba(34, 211, 238, 0.08), rgba(34, 211, 238, 0) 46%),
+      linear-gradient(180deg, rgba(9, 15, 28, 0.96), rgba(6, 11, 22, 0.94)),
+      rgba(6, 11, 22, 0.92);
+    --artifacts-shell-overlay: linear-gradient(180deg, rgba(103, 232, 249, 0.05), rgba(103, 232, 249, 0));
+    --artifacts-topbar-bg:
+      linear-gradient(180deg, rgba(33, 45, 64, 0.56), rgba(18, 29, 46, 0.44)),
+      rgba(18, 29, 46, 0.42);
+    --artifacts-action-border: rgba(97, 115, 143, 0.34);
+    --artifacts-action-bg:
+      linear-gradient(180deg, rgba(49, 63, 84, 0.42), rgba(23, 35, 53, 0.3)),
+      rgba(23, 35, 53, 0.28);
+    --artifacts-action-hover:
+      linear-gradient(180deg, rgba(39, 55, 78, 0.76), rgba(20, 32, 49, 0.64)),
+      rgba(23, 35, 53, 0.58);
+    --artifacts-history-bg:
+      linear-gradient(180deg, rgba(17, 26, 40, 0.72), rgba(11, 17, 30, 0.66)),
+      rgba(11, 17, 30, 0.64);
+    --artifacts-preview-bar-bg:
+      linear-gradient(180deg, rgba(34, 46, 65, 0.38), rgba(17, 29, 46, 0.32)),
+      rgba(17, 29, 46, 0.3);
+    --artifacts-preview-path: rgba(175, 192, 216, 0.8);
+    --artifacts-history-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      0 6px 14px rgba(2, 6, 23, 0.15);
+
+    --slidev-shell-border: rgba(85, 102, 128, 0.58);
+    --slidev-shell-bg:
+      linear-gradient(180deg, rgba(11, 19, 33, 0.95), rgba(7, 12, 23, 0.94)),
+      rgba(7, 12, 23, 0.92);
+    --slidev-shell-highlight: linear-gradient(180deg, rgba(103, 232, 249, 0.08), rgba(103, 232, 249, 0));
+    --slidev-shell-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      0 16px 30px rgba(2, 6, 23, 0.34);
+    --slidev-toolbar-border: rgba(85, 102, 128, 0.4);
+    --slidev-toolbar-bg:
+      linear-gradient(180deg, rgba(35, 49, 69, 0.62), rgba(18, 32, 50, 0.5)),
+      rgba(18, 32, 50, 0.48);
+    --slidev-toolbar-title: rgba(241, 245, 249, 0.94);
+    --slidev-live-color: rgba(224, 242, 254, 0.96);
+    --slidev-live-border: rgba(34, 211, 238, 0.48);
+    --slidev-live-bg: rgba(9, 43, 62, 0.4);
+    --slidev-live-dot: rgba(125, 211, 252, 0.95);
+    --slidev-open-border: rgba(97, 115, 143, 0.56);
+    --slidev-open-bg: rgba(35, 49, 71, 0.62);
+    --slidev-open-hover-border: rgba(103, 232, 249, 0.68);
+    --slidev-open-hover-bg: rgba(11, 47, 70, 0.64);
+    --slidev-viewport-bg:
+      radial-gradient(circle at 50% 0%, rgba(34, 211, 238, 0.12), rgba(34, 211, 238, 0) 45%),
+      linear-gradient(180deg, rgba(3, 12, 27, 0.84), rgba(2, 9, 24, 0.8)),
+      rgba(2, 9, 24, 0.78);
+    --slidev-stage-border: rgba(85, 102, 128, 0.64);
+    --slidev-stage-bg: #040b19;
+    --slidev-stage-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      0 14px 28px rgba(2, 6, 23, 0.34),
+      0 0 0 1px rgba(34, 211, 238, 0.14);
   }
 }
  
@@ -117,119 +255,82 @@
   }
 }
 
-.pending-follow-up-shell {
-  border-color: rgba(63, 63, 70, 0.96);
-  background: rgba(24, 24, 27, 0.82);
-  box-shadow: none;
+.session-activity-island {
+  overflow: hidden;
+  border: 1px solid rgb(var(--activity-border));
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgb(var(--activity-bg)), rgb(var(--activity-bg)));
+  backdrop-filter: blur(18px);
+  box-shadow: 0 12px 28px -24px rgba(15, 23, 42, 0.32);
 }
 
-.pending-follow-up-header {
-  border-color: rgba(63, 63, 70, 0.94);
-  background: rgba(39, 39, 42, 0.42);
+.session-activity-item {
+  position: relative;
+  padding: 10px 12px;
 }
 
-.pending-follow-up-header-icon {
-  border: 1px solid rgba(82, 82, 91, 0.96);
-  background: rgba(39, 39, 42, 0.88);
-  box-shadow: none;
+.session-activity-item + .session-activity-item {
+  border-top: 1px solid rgb(var(--activity-divider));
 }
 
-.pending-follow-up-header-title {
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  color: rgba(244, 244, 245, 0.96);
+.session-activity-item--running::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background-image: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgb(var(--timeline-sweep-bright)) 48%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  background-size: 220% 100%;
+  animation: timelineSweep 2.2s linear infinite;
 }
 
-.pending-follow-up-header-subtitle {
-  color: rgba(161, 161, 170, 0.9);
-}
-
-.pending-follow-up-count-pill {
-  border: 1px solid rgba(82, 82, 91, 0.96);
+.session-activity-icon {
+  display: inline-flex;
+  height: 1.5rem;
+  width: 1.5rem;
+  min-width: 1.5rem;
+  align-items: center;
+  justify-content: center;
   border-radius: 999px;
-  min-width: 30px;
-  padding: 3px 10px;
-  color: rgba(228, 228, 231, 0.92);
-  text-align: center;
-  background: rgba(39, 39, 42, 0.88);
+  background: rgb(var(--activity-icon-bg));
+  color: rgb(var(--activity-icon-fg));
 }
 
-.pending-follow-up-list {
-  padding-top: 0;
+.session-activity-meta {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  color: rgb(var(--activity-meta));
 }
 
-.pending-follow-up-list > .pending-follow-up-item + .pending-follow-up-item {
-  margin-top: 8px;
-}
-
-.pending-follow-up-item {
-  border: 1px solid rgba(63, 63, 70, 0.92);
-  background: rgba(24, 24, 27, 0.72);
-  box-shadow: none;
-  transition: border-color 160ms ease, background-color 160ms ease;
-}
-
-.pending-follow-up-item:hover {
-  border-color: rgba(82, 82, 91, 0.98);
-  background: rgba(39, 39, 42, 0.72);
-}
-
-.pending-follow-up-message-content {
-  text-wrap: pretty;
-  color: rgba(244, 244, 245, 0.94);
-  line-height: 1.45;
-}
-
-.pending-follow-up-meta {
-  color: rgba(161, 161, 170, 0.9);
-}
-
-.pending-follow-up-state-pill {
-  border: 1px solid rgba(82, 82, 91, 0.94);
-  background: rgba(39, 39, 42, 0.86);
-  letter-spacing: 0.01em;
-  text-transform: none;
-  color: rgba(212, 212, 216, 0.9);
+.session-activity-action {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font-size: 11px;
   font-weight: 500;
+  color: rgb(var(--activity-action));
 }
 
-.pending-follow-up-order {
-  border: 1px solid rgba(82, 82, 91, 0.94);
-  background: rgba(39, 39, 42, 0.82);
-  box-shadow: none;
-  color: rgba(212, 212, 216, 0.9);
-}
-
-.pending-follow-up-steer {
-  border-color: rgba(82, 82, 91, 0.94);
-  background: rgba(39, 39, 42, 0.86);
-  box-shadow: none;
-}
-
-.pending-follow-up-steer:hover {
-  border-color: rgba(113, 113, 122, 0.98);
-  background: rgba(63, 63, 70, 0.8);
-}
-
-.pending-follow-up-more {
-  border-color: rgba(82, 82, 91, 0.94);
-  background: rgba(39, 39, 42, 0.82);
-}
-
-.pending-follow-up-more:hover {
-  border-color: rgba(113, 113, 122, 0.98);
-  background: rgba(63, 63, 70, 0.78);
+.session-activity-action:hover {
+  color: rgb(var(--activity-action-hover));
 }
 
 .timeline-running-label {
   color: transparent;
   background-image: linear-gradient(
     90deg,
-    rgba(161, 161, 170, 0.62) 0%,
-    rgba(161, 161, 170, 0.62) 34%,
-    rgba(244, 244, 245, 0.96) 48%,
-    rgba(161, 161, 170, 0.72) 60%,
-    rgba(161, 161, 170, 0.62) 100%
+    rgb(var(--timeline-sweep-muted)) 0%,
+    rgb(var(--timeline-sweep-muted)) 34%,
+    rgb(var(--timeline-sweep-bright)) 48%,
+    rgb(var(--timeline-sweep-muted)) 60%,
+    rgb(var(--timeline-sweep-muted)) 100%
   );
   background-size: 220% 100%;
   background-position: -40% 50%;
@@ -240,10 +341,7 @@
 
 .artifacts-shell {
   position: relative;
-  background:
-    radial-gradient(circle at 100% 0%, rgba(34, 211, 238, 0.08), rgba(34, 211, 238, 0) 46%),
-    linear-gradient(180deg, rgba(9, 15, 28, 0.96), rgba(6, 11, 22, 0.94)),
-    rgba(6, 11, 22, 0.92);
+  background: var(--artifacts-shell-bg);
 }
 
 .artifacts-shell::before {
@@ -251,56 +349,46 @@
   position: absolute;
   inset: 0;
   pointer-events: none;
-  background: linear-gradient(180deg, rgba(103, 232, 249, 0.05), rgba(103, 232, 249, 0));
+  background: var(--artifacts-shell-overlay);
   opacity: 0.85;
 }
 
 .artifacts-topbar {
   position: relative;
-  background:
-    linear-gradient(180deg, rgba(33, 45, 64, 0.56), rgba(18, 29, 46, 0.44)),
-    rgba(18, 29, 46, 0.42);
+  background: var(--artifacts-topbar-bg);
 }
 
 .artifacts-topbar-action {
-  border: 1px solid rgba(97, 115, 143, 0.34);
-  background:
-    linear-gradient(180deg, rgba(49, 63, 84, 0.42), rgba(23, 35, 53, 0.3)),
-    rgba(23, 35, 53, 0.28);
+  border: 1px solid var(--artifacts-action-border);
+  background: var(--artifacts-action-bg);
+}
+
+.artifacts-topbar-action:hover {
+  background: var(--artifacts-action-hover);
 }
 
 .artifacts-history-panel {
-  background:
-    linear-gradient(180deg, rgba(17, 26, 40, 0.72), rgba(11, 17, 30, 0.66)),
-    rgba(11, 17, 30, 0.64);
+  background: var(--artifacts-history-bg);
 }
 
 .artifacts-history-item {
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    0 6px 14px rgba(2, 6, 23, 0.15);
+  box-shadow: var(--artifacts-history-shadow);
 }
 
 .artifacts-preview-bar {
-  background:
-    linear-gradient(180deg, rgba(34, 46, 65, 0.38), rgba(17, 29, 46, 0.32)),
-    rgba(17, 29, 46, 0.3);
+  background: var(--artifacts-preview-bar-bg);
 }
 
 .artifacts-preview-path {
-  color: rgba(175, 192, 216, 0.8);
+  color: var(--artifacts-preview-path);
 }
 
 .slidev-shell {
   position: relative;
   overflow: hidden;
-  border: 1px solid rgba(85, 102, 128, 0.58);
-  background:
-    linear-gradient(180deg, rgba(11, 19, 33, 0.95), rgba(7, 12, 23, 0.94)),
-    rgba(7, 12, 23, 0.92);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    0 16px 30px rgba(2, 6, 23, 0.34);
+  border: 1px solid var(--slidev-shell-border);
+  background: var(--slidev-shell-bg);
+  box-shadow: var(--slidev-shell-shadow);
 }
 
 .slidev-shell::before {
@@ -308,14 +396,12 @@
   position: absolute;
   inset: 0;
   pointer-events: none;
-  background: linear-gradient(180deg, rgba(103, 232, 249, 0.08), rgba(103, 232, 249, 0));
+  background: var(--slidev-shell-highlight);
 }
 
 .slidev-toolbar {
-  border-color: rgba(85, 102, 128, 0.4);
-  background:
-    linear-gradient(180deg, rgba(35, 49, 69, 0.62), rgba(18, 32, 50, 0.5)),
-    rgba(18, 32, 50, 0.48);
+  border-color: var(--slidev-toolbar-border);
+  background: var(--slidev-toolbar-bg);
 }
 
 .slidev-toolbar-title {
@@ -323,20 +409,20 @@
   text-transform: uppercase;
   font-size: 10.5px;
   font-weight: 720;
-  color: rgba(241, 245, 249, 0.94);
+  color: var(--slidev-toolbar-title);
 }
 
 .slidev-toolbar-live {
-  color: rgba(224, 242, 254, 0.96);
+  color: var(--slidev-live-color);
   font-weight: 700;
   letter-spacing: 0.12em;
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
-  border: 1px solid rgba(34, 211, 238, 0.48);
+  border: 1px solid var(--slidev-live-border);
   border-radius: 999px;
   padding: 2px 9px;
-  background: rgba(9, 43, 62, 0.4);
+  background: var(--slidev-live-bg);
 }
 
 .slidev-toolbar-live::before {
@@ -344,18 +430,18 @@
   width: 6px;
   height: 6px;
   border-radius: 999px;
-  background: rgba(125, 211, 252, 0.95);
+  background: var(--slidev-live-dot);
   animation: terminalLiveBlink 1.3s ease-in-out infinite;
 }
 
 .slidev-toolbar-open {
-  border-color: rgba(97, 115, 143, 0.56);
-  background: rgba(35, 49, 71, 0.62);
+  border-color: var(--slidev-open-border);
+  background: var(--slidev-open-bg);
 }
 
 .slidev-toolbar-open:hover {
-  border-color: rgba(103, 232, 249, 0.68);
-  background: rgba(11, 47, 70, 0.64);
+  border-color: var(--slidev-open-hover-border);
+  background: var(--slidev-open-hover-bg);
 }
 
 .slidev-viewport {
@@ -365,10 +451,7 @@
   align-items: center;
   min-height: clamp(420px, 56vh, 880px);
   padding: 0.75rem;
-  background:
-    radial-gradient(circle at 50% 0%, rgba(34, 211, 238, 0.12), rgba(34, 211, 238, 0) 45%),
-    linear-gradient(180deg, rgba(3, 12, 27, 0.84), rgba(2, 9, 24, 0.8)),
-    rgba(2, 9, 24, 0.78);
+  background: var(--slidev-viewport-bg);
 }
 
 .slidev-viewport::before {
@@ -386,13 +469,10 @@
   width: 100%;
   max-width: 1360px;
   aspect-ratio: 16 / 9;
-  border: 1px solid rgba(85, 102, 128, 0.64);
+  border: 1px solid var(--slidev-stage-border);
   border-radius: 12px;
-  background: #040b19;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    0 14px 28px rgba(2, 6, 23, 0.34),
-    0 0 0 1px rgba(34, 211, 238, 0.14);
+  background: var(--slidev-stage-bg);
+  box-shadow: var(--slidev-stage-shadow);
   overflow: hidden;
 }
 
@@ -403,7 +483,7 @@
   min-height: 0;
   border: 0;
   border-radius: 0;
-  background: #040b19;
+  background: var(--slidev-stage-bg);
 }
 
 @media (max-width: 1024px) {

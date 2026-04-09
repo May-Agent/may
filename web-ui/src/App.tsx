@@ -19,6 +19,7 @@ import { Sidebar } from '@/components/layout/Sidebar';
 import { ChatInterface } from '@/components/chat/ChatInterface';
 import {
   consumeNotificationCallback,
+  fetchBrowserStatus,
   fetchSession,
   sendChat,
   subscribeUiEvents,
@@ -410,6 +411,13 @@ function AppShell() {
   useEffect(() => {
     const isChatRoute = location.pathname.startsWith('/chat');
     const isSettingsRoute = location.pathname === '/settings';
+    if (isChatRoute) {
+      void fetchBrowserStatus()
+        .then((status) => {
+          useStore.getState().setBrowserStatus(status);
+        })
+        .catch(() => {});
+    }
     const unsubscribeEvents = subscribeUiEvents({
       sessionId: isChatRoute ? currentSessionId ?? undefined : undefined,
       profileId: isChatRoute ? currentProfileId ?? undefined : undefined,

@@ -7,7 +7,10 @@ use aither_core::llm::{IntoToolResult, Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::browser_service::{BrowserPageSnapshot, BrowserReadOptions};
+use crate::browser_service::{
+    BrowserPageSnapshot, BrowserReadDetail, BrowserReadFormat, BrowserReadOptions,
+    BrowserScreenshotMode,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -15,18 +18,35 @@ pub enum BrowserArgs {
     /// Show managed browser runtime status.
     Status,
     /// Start the managed browser runtime.
+    #[serde(rename = "open")]
     Start,
     /// Stop the managed browser runtime.
+    #[serde(rename = "close")]
     Stop,
-    /// Return the managed browser CDP endpoint.
+    /// Return the managed browser CDP endpoint. Requires `open` first.
     CdpEndpoint,
     /// Open a URL in the May-managed browser and inspect it with structured text,
-    /// accessibility output, and an optional screenshot artifact.
+    /// accessibility output, and an optional screenshot artifact. Requires
+    /// `open` first; call `close` when browser work is finished.
     Read {
         url: String,
         #[serde(default)]
-        options: BrowserReadOptions,
+        detail: BrowserReadDetail,
+        #[serde(default)]
+        screenshot: BrowserScreenshotMode,
+        #[serde(default)]
+        format: BrowserReadFormat,
     },
+}
+
+impl BrowserArgs {
+    #[must_use]
+    pub fn read_options(
+        detail: BrowserReadDetail,
+        screenshot: BrowserScreenshotMode,
+    ) -> BrowserReadOptions {
+        BrowserReadOptions { detail, screenshot }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

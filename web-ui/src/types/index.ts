@@ -17,7 +17,7 @@ export interface TerminalExecution {
   description: string;
   input: string;
   output?: string;
-  status: 'running' | 'done' | 'failed';
+  status: 'running' | 'done' | 'failed' | 'stopped';
   mode?: 'default' | 'sandboxed' | 'unsafe' | 'ssh';
   startedAt?: number;
   endedAt?: number;
@@ -28,7 +28,7 @@ export interface ToolExecution {
   name: string;
   request?: string;
   response?: string;
-  status: 'running' | 'done' | 'failed';
+  status: 'running' | 'done' | 'failed' | 'stopped';
   startedAt?: number;
   endedAt?: number;
 }

@@ -306,6 +306,7 @@ async fn emit_browser_status_if_changed(
     };
     let browser_manager = state.browser_manager();
     let enabled = state.config_snapshot().browser.enabled;
+    let owner_session_id = state.browser_owner_session_id();
     let running = if let Some(manager) = browser_manager.as_ref() {
         manager.is_running().await
     } else {
@@ -321,6 +322,7 @@ async fn emit_browser_status_if_changed(
         } else {
             None
         },
+        owner_session_id,
         takeover_session_id,
     };
     if let Ok(sig) = serde_json::to_string(&payload)

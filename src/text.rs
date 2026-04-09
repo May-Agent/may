@@ -32,3 +32,14 @@ pub fn path_error_text(prefix: &str, path: &Path, error: &impl std::fmt::Display
     let error_text = error.to_string();
     join_text(&[prefix, path_text.as_str(), ": ", error_text.as_str()])
 }
+
+pub fn error_chain_text(error: &dyn std::error::Error) -> String {
+    let mut chain = Vec::new();
+    chain.push(error.to_string());
+    let mut source = error.source();
+    while let Some(current) = source {
+        chain.push(current.to_string());
+        source = current.source();
+    }
+    chain.join(": ")
+}

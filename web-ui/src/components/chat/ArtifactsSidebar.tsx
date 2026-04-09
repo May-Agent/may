@@ -38,15 +38,15 @@ export function ArtifactsSidebar({
   if (!open) return null;
 
   return (
-    <div className="artifacts-shell flex h-full w-full min-w-0 flex-col border-l border-zinc-800/80 bg-zinc-950/95">
-      <div className="artifacts-topbar flex items-center justify-between border-b border-zinc-800/75 px-4 py-3">
-        <div className="text-base font-semibold text-zinc-100">Artifacts</div>
+    <div className="artifacts-shell flex h-full w-full min-w-0 flex-col border-l border-border/70 bg-background/95 text-foreground">
+      <div className="artifacts-topbar flex items-center justify-between border-b border-border/70 px-4 py-3">
+        <div className="text-base font-semibold text-foreground">Artifacts</div>
         <div className="flex items-center gap-2">
           {artifacts.length > 1 && (
             <Button
               variant="ghost"
               size="sm"
-              className="artifacts-topbar-action h-8 gap-1.5 rounded-md px-2 text-zinc-300 hover:bg-zinc-800/70 hover:text-zinc-100"
+              className="artifacts-topbar-action h-8 gap-1.5 rounded-md px-2 text-muted-foreground hover:text-foreground"
               onClick={onToggleHistory}
             >
               <History className="h-4 w-4" />
@@ -56,7 +56,7 @@ export function ArtifactsSidebar({
             <Button
               variant="ghost"
               size="icon"
-              className="artifacts-topbar-action h-8 w-8 rounded-md text-zinc-300 hover:bg-zinc-800/70 hover:text-zinc-100"
+              className="artifacts-topbar-action h-8 w-8 rounded-md text-muted-foreground hover:text-foreground"
               onClick={onClose}
             >
               <X className="h-4 w-4" />
@@ -66,7 +66,7 @@ export function ArtifactsSidebar({
 
       <div className="flex min-h-0 flex-1">
         {showHistory && (
-          <div className="artifacts-history-panel flex w-72 min-w-0 flex-col border-r border-zinc-800/75">
+          <div className="artifacts-history-panel flex w-72 min-w-0 flex-col border-r border-border/70">
             <ScrollArea className="flex-1">
               <div className="space-y-1 p-2">
                 {artifacts.map((artifact) => {
@@ -79,20 +79,20 @@ export function ArtifactsSidebar({
                       className={cn(
                         'artifacts-history-item w-full rounded-lg border px-2.5 py-2.5 text-left transition-colors',
                         isSelected
-                          ? 'border-cyan-300/45 bg-cyan-500/10 text-cyan-100'
-                          : 'border-zinc-800/80 bg-zinc-900/40 text-zinc-300 hover:border-zinc-600/80 hover:bg-zinc-800/60 hover:text-zinc-100',
+                          ? 'border-cyan-500/35 bg-cyan-500/10 text-cyan-900 dark:text-cyan-100'
+                          : 'border-border/70 bg-background/45 text-foreground/78 hover:border-foreground/15 hover:bg-muted/55 hover:text-foreground',
                       )}
                       onClick={() => onSelect({ path: artifact.path, viewer })}
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="block truncate text-[13px] font-medium">{artifact.name}</span>
                         {viewer === 'slidev' && (
-                          <span className="shrink-0 rounded-full border border-cyan-300/45 bg-cyan-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.14em] text-cyan-100">
+                          <span className="shrink-0 rounded-full border border-cyan-500/35 bg-cyan-500/12 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.14em] text-cyan-800 dark:text-cyan-100">
                             Slidev
                           </span>
                         )}
                       </div>
-                      <span className="mt-0.5 block truncate text-[11px] text-zinc-500">{artifact.path}</span>
+                      <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{artifact.path}</span>
                     </button>
                   );
                 })}
@@ -102,32 +102,32 @@ export function ArtifactsSidebar({
         )}
 
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="artifacts-preview-bar flex items-center justify-between border-b border-zinc-800/75 px-4 py-3">
-            <div className="artifacts-preview-path truncate text-sm text-zinc-400">
+          <div className="artifacts-preview-bar flex items-center justify-between border-b border-border/70 px-4 py-3">
+            <div className="artifacts-preview-path truncate text-sm">
               {selectedPath ?? 'Preview'}
             </div>
           </div>
           <div className="flex-1 overflow-auto p-3.5">
             {!preview && (
-              <div className="text-sm text-zinc-500">No artifact preview available.</div>
+              <div className="text-sm text-muted-foreground">No artifact preview available.</div>
             )}
 
             {preview?.kind === 'markdown' && (
-              <div className="prose prose-sm dark:prose-invert max-w-none text-zinc-200">
+              <div className="prose prose-sm dark:prose-invert max-w-none text-foreground">
                 <ReactMarkdown>{preview.markdown ?? ''}</ReactMarkdown>
               </div>
             )}
 
             {preview?.kind === 'text' && (
-              <pre className="whitespace-pre-wrap break-words text-xs text-zinc-200">{preview.text}</pre>
+              <pre className="whitespace-pre-wrap break-words text-xs text-foreground">{preview.text}</pre>
             )}
 
             {preview?.kind === 'slidev' && preview.url && (
               <div className="slidev-shell flex h-full min-h-[500px] flex-col overflow-hidden rounded-xl border">
                 <div className="slidev-toolbar flex items-center justify-between border-b px-3 py-2.5">
                   <div className="flex items-center gap-2">
-                    <span className="slidev-toolbar-title text-xs font-medium text-zinc-100">Slidev</span>
-                    <span className="slidev-toolbar-live text-[10px] uppercase tracking-[0.12em] text-cyan-200">
+                    <span className="slidev-toolbar-title text-xs font-medium">Slidev</span>
+                    <span className="slidev-toolbar-live text-[10px] uppercase tracking-[0.12em]">
                       live
                     </span>
                   </div>
@@ -135,7 +135,7 @@ export function ArtifactsSidebar({
                     href={preview.url}
                     target="_blank"
                     rel="noreferrer"
-                    className="slidev-toolbar-open inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:text-zinc-100"
+                    className="slidev-toolbar-open inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
                   >
                     <ExternalLink className="h-3 w-3" />
                     Open
@@ -157,15 +157,15 @@ export function ArtifactsSidebar({
               </div>
             )}
             {preview?.kind === 'slidev' && !preview.url && (
-              <div className="text-sm text-zinc-500">Slidev preview is not available.</div>
+              <div className="text-sm text-muted-foreground">Slidev preview is not available.</div>
             )}
 
             {(preview?.kind === 'iframe' || preview?.kind === 'external') && preview.url && (
-              <div className="h-full min-h-[420px] overflow-hidden rounded-xl border border-white/10 bg-zinc-900/60 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+              <div className="h-full min-h-[420px] overflow-hidden rounded-xl border border-border/70 bg-background/80 shadow-[0_18px_30px_-24px_rgba(15,23,42,0.22)]">
                 <iframe
                   title="artifact-preview"
                   src={preview.url}
-                  className="h-full min-h-[420px] w-full bg-zinc-900"
+                  className="h-full min-h-[420px] w-full bg-background"
                 />
               </div>
             )}
@@ -174,7 +174,7 @@ export function ArtifactsSidebar({
               <img
                 src={preview.url}
                 alt={selectedPath ?? 'artifact'}
-                className="h-auto max-w-full rounded-xl border border-white/10"
+                className="h-auto max-w-full rounded-xl border border-border/70"
               />
             )}
 

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use async_fs;
 use serde::{Deserialize, Serialize};
-use zenwave::{BodyError, Client, ResponseExt};
+use zenwave::Client;
 
 const HEEL_RELEASE_API_URL: &str = "https://api.github.com/repos/lexoliu/heel/releases/latest";
 const HEEL_RELEASE_STATE_FILE: &str = "release-state.json";
@@ -42,8 +42,6 @@ pub(crate) enum ManagedHeelError {
     },
     #[error("failed to build heel release metadata request")]
     MetadataRequest(#[source] zenwave::Error),
-    #[error("heel release metadata request failed")]
-    MetadataStatus(#[source] zenwave::Error),
     #[error("failed to parse heel release metadata")]
     MetadataDecode(#[source] zenwave::Error),
     #[error("heel release asset not found: expected {asset_name} in release {release_tag}")]
@@ -57,18 +55,14 @@ pub(crate) enum ManagedHeelError {
         #[source]
         source: zenwave::Error,
     },
-    #[error("heel asset download failed: {asset_name}")]
-    AssetDownloadStatus {
-        asset_name: String,
-        #[source]
-        source: zenwave::Error,
-    },
     #[error("failed to read heel asset payload: {asset_name}")]
     AssetPayload {
         asset_name: String,
         #[source]
         source: zenwave::Error,
     },
+    #[error("heel asset payload was empty: {asset_name}")]
+    EmptyAssetPayload { asset_name: String },
     #[error("failed to parse managed heel state {path:?}")]
     StateParse {
         path: PathBuf,
@@ -206,22 +200,19 @@ pub(crate) async fn ensure_managed_heel_binary(
 
 async fn fetch_latest_release() -> Result<GithubRelease, ManagedHeelError> {
     let mut backend = zenwave::client();
-    let response = backend
+    backend
         .get(HEEL_RELEASE_API_URL)
         .map_err(ManagedHeelError::MetadataRequest)?
         .header("User-Agent", USER_AGENT)
         .map_err(ManagedHeelError::MetadataRequest)?
+        .json::<GithubRelease>()
         .await
-        .map_err(ManagedHeelError::MetadataStatus)?;
-    response
-        .into_json::<GithubRelease>()
-        .await
-        .map_err(|source: BodyError| ManagedHeelError::MetadataDecode(source.into()))
+        .map_err(ManagedHeelError::MetadataDecode)
 }
 
 async fn download_asset_bytes(asset: &GithubAsset) -> Result<bytes::Bytes, ManagedHeelError> {
     let mut backend = zenwave::client();
-    let response = backend
+    let bytes = backend
         .get(asset.browser_download_url.as_str())
         .map_err(|source| ManagedHeelError::AssetDownload {
             asset_name: asset.name.clone(),
@@ -232,18 +223,18 @@ async fn download_asset_bytes(asset: &GithubAsset) -> Result<bytes::Bytes, Manag
             asset_name: asset.name.clone(),
             source,
         })?
+        .bytes()
         .await
-        .map_err(|source| ManagedHeelError::AssetDownloadStatus {
+        .map_err(|source| ManagedHeelError::AssetPayload {
             asset_name: asset.name.clone(),
             source,
         })?;
-    response
-        .into_bytes()
-        .await
-        .map_err(|source: BodyError| ManagedHeelError::AssetPayload {
+    if bytes.is_empty() {
+        return Err(ManagedHeelError::EmptyAssetPayload {
             asset_name: asset.name.clone(),
-            source: source.into(),
-        })
+        });
+    }
+    Ok(bytes)
 }
 
 async fn binary_is_current(
@@ -253,6 +244,17 @@ async fn binary_is_current(
     asset_name: &str,
 ) -> Result<bool, ManagedHeelError> {
     if !try_exists(binary_path, "check managed heel binary presence").await? {
+        return Ok(false);
+    }
+    let metadata =
+        async_fs::metadata(binary_path)
+            .await
+            .map_err(|source| ManagedHeelError::Io {
+                operation: "read managed heel binary metadata",
+                path: binary_path.to_path_buf(),
+                source,
+            })?;
+    if !metadata.is_file() || metadata.len() == 0 {
         return Ok(false);
     }
     let Some(state) = read_state(state_path).await? else {

@@ -39,6 +39,15 @@ impl Default for BrowserScreenshotMode {
 }
 
 #[derive(
+    Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrowserReadFormat {
+    #[default]
+    Json,
+}
+
+#[derive(
     Debug, Clone, Default, serde::Serialize, serde::Deserialize, JsonSchema, PartialEq, Eq,
 )]
 #[serde(rename_all = "camelCase")]
