@@ -3,10 +3,6 @@ import { useNavigate } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { useStore } from "@/lib/store";
 import {
-  fetchArtifactPreview,
-  mapContainerLocalArtifactUrl,
-  prepareSlidevPreview,
-  fetchSessionArtifacts,
   fetchSessionRuntime,
   isBrowserTakeoverActiveError,
   isSessionActiveConflictError,
@@ -18,7 +14,6 @@ import {
   setSessionPlanState as apiSetSessionPlanState,
   stopSessionRun,
   streamChat,
-  subscribeSessionArtifacts,
   type AskUserAnswer,
   type AskUserRequest,
   type PermissionRequest,
@@ -43,10 +38,9 @@ import {
   buildAttachmentFromPastedFile,
   buildAttachmentFromPastedText,
 } from "@/lib/attachments";
+import { useArtifactPanel } from "@/hooks/useArtifactPanel";
 import {
-  createDisconnectBanner,
   collectRetryBatch,
-  buildArtifactViewerHints,
   parseToolResultPayload,
   settleTimelineSegments,
   summarizeTimelineSegments,
@@ -56,13 +50,11 @@ import {
   ARTIFACT_PANEL_MAX_VIEWPORT_RATIO,
   LONG_TEXT_THRESHOLD,
   type QueuedMessage,
-  type PreviewPaneState,
 } from "./chatUtils";
 
 import { Button } from "@/components/ui/button";
 import { CircleX } from "lucide-react";
 import type {
-  Artifact,
   ArtifactPreviewTarget,
   Attachment,
   TerminalExecution,
@@ -136,25 +128,12 @@ export function ChatInterface({
     null,
   );
   const [isAskUserSubmitting, setIsAskUserSubmitting] = useState(false);
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [isArtifactsOpen, setIsArtifactsOpen] = useState(false);
   const [isBrowserOpen, setIsBrowserOpen] = useState(false);
-  const [showArtifactHistory, setShowArtifactHistory] = useState(false);
-  const [selectedPreviewPath, setSelectedPreviewPath] = useState<string | null>(
-    null,
-  );
-  const [selectedPreviewViewer, setSelectedPreviewViewer] =
-    useState<ArtifactPreviewTarget["viewer"]>(undefined);
-  const [previewPane, setPreviewPane] = useState<PreviewPaneState | null>(null);
   const [artifactPanelWidth, setArtifactPanelWidth] = useState(
     ARTIFACT_PANEL_DEFAULT_WIDTH,
   );
   const [isArtifactPanelResizing, setIsArtifactPanelResizing] = useState(false);
   const [todoProgress, setTodoProgress] = useState<TodoProgressState | null>(null);
-  const previewBlobUrlRef = useRef<string | null>(null);
-  const selectedPreviewPathRef = useRef<string | null>(null);
-  const selectedPreviewViewerRef =
-    useRef<ArtifactPreviewTarget["viewer"]>(undefined);
   const artifactResizeStartRef = useRef<{
     pointerId: number;
     x: number;
@@ -170,7 +149,6 @@ export function ChatInterface({
   const streamingSessionIdRef = useRef<string | null>(null);
   const stopRequestedSessionIdsRef = useRef<Set<string>>(new Set());
   const stopWaitersRef = useRef<Map<string, Promise<void>>>(new Map());
-  const previewSessionRef = useRef<string | null>(null);
   const currentSession = sessions.find((s) => s.id === currentSessionId);
   const currentPlanState: SessionPlanState =
     currentSession?.runtime.planState ?? "disabled";
@@ -203,6 +181,30 @@ export function ChatInterface({
         (message.isStreaming || message.isThinking),
     );
   const isNewChat = !currentSessionId || !currentSession;
+
+  const artifactPanel = useArtifactPanel({
+    currentSessionId,
+    currentProfile,
+    messages,
+    setError: setUiError,
+  });
+  const {
+    artifacts,
+    isOpen: isArtifactsOpen,
+    setIsOpen: setIsArtifactsOpen,
+    showHistory: showArtifactHistory,
+    toggleHistory: toggleArtifactHistory,
+    selectedPreviewPath,
+    previewPane,
+    getViewerForPath: getArtifactViewerHint,
+    openPreview,
+  } = artifactPanel;
+  const handleOpenPreview = useCallback(
+    (target: ArtifactPreviewTarget) => {
+      void openPreview(target);
+    },
+    [openPreview],
+  );
 
   const handlePlanStateChange = useCallback(
     async (nextPlanState: SessionPlanState) => {
@@ -346,320 +348,6 @@ export function ChatInterface({
     (state) => state.markFirstToken,
   );
 
-  const normalizePreviewUrl = useCallback((value: string): string | null => {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    try {
-      const parsed = new URL(trimmed);
-      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-        return parsed.toString();
-      }
-      return null;
-    } catch {
-      const localhostPattern =
-        /^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|::1|host\.docker\.internal|host\.containers\.internal)(:\d+)?(\/.*)?$/i;
-      if (!localhostPattern.test(trimmed)) {
-        return null;
-      }
-      try {
-        return new URL(`http://${trimmed}`).toString();
-      } catch {
-        return null;
-      }
-    }
-  }, []);
-
-  const normalizeArtifactPath = useCallback((value: string): string => {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return "";
-    }
-
-    const slashNormalized = trimmed.replace(/\\/g, "/");
-    const withoutDotPrefix = slashNormalized.replace(/^\.\/+/, "");
-    const lower = withoutDotPrefix.toLowerCase();
-    if (lower === "artifacts") {
-      return "";
-    }
-    if (lower.startsWith("artifacts/")) {
-      return withoutDotPrefix.slice("artifacts/".length);
-    }
-    return withoutDotPrefix;
-  }, []);
-
-  const isPreviewUrl = useCallback(
-    (value: string): boolean => {
-      return normalizePreviewUrl(value) !== null;
-    },
-    [normalizePreviewUrl],
-  );
-
-  const artifactViewerHints = useMemo(
-    () => buildArtifactViewerHints(messages, normalizeArtifactPath),
-    [messages, normalizeArtifactPath],
-  );
-
-  const getArtifactViewerHint = useCallback(
-    (rawPath: string): ArtifactPreviewTarget["viewer"] => {
-      const normalized = normalizeArtifactPath(rawPath);
-      if (!normalized) {
-        return undefined;
-      }
-      return artifactViewerHints.get(normalized);
-    },
-    [artifactViewerHints, normalizeArtifactPath],
-  );
-
-  const pickPreferredArtifactTarget = useCallback(
-    (nextArtifacts: Artifact[]): ArtifactPreviewTarget | null => {
-      if (nextArtifacts.length === 0) {
-        return null;
-      }
-      const artifactPaths = new Set(
-        nextArtifacts.map((artifact) => artifact.path),
-      );
-      const hintedEntries = Array.from(artifactViewerHints.entries());
-      for (let index = hintedEntries.length - 1; index >= 0; index -= 1) {
-        const [path, viewer] = hintedEntries[index];
-        if (artifactPaths.has(path)) {
-          return { path, viewer };
-        }
-      }
-      const fallbackPath = nextArtifacts[0].path;
-      return {
-        path: fallbackPath,
-        viewer: getArtifactViewerHint(fallbackPath),
-      };
-    },
-    [artifactViewerHints, getArtifactViewerHint],
-  );
-
-  const refreshArtifacts = useCallback(async (): Promise<Artifact[]> => {
-    if (!currentSessionId) {
-      setArtifacts([]);
-      return [];
-    }
-    try {
-      const next = await fetchSessionArtifacts(currentSessionId);
-      setArtifacts(next);
-      if (next.length === 0) {
-        // Keep preview pane open to avoid flicker while artifacts index catches up.
-        return next;
-      }
-
-      const currentPreviewPath = selectedPreviewPathRef.current;
-      if (currentPreviewPath && !isPreviewUrl(currentPreviewPath)) {
-        const selectedArtifactPath = normalizeArtifactPath(currentPreviewPath);
-        const exists = next.some((a) => a.path === selectedArtifactPath);
-        if (!exists) {
-          const fallbackTarget = pickPreferredArtifactTarget(next);
-          if (!fallbackTarget) {
-            return next;
-          }
-          setSelectedPreviewPath(fallbackTarget.path);
-          setSelectedPreviewViewer(fallbackTarget.viewer);
-          selectedPreviewPathRef.current = fallbackTarget.path;
-          selectedPreviewViewerRef.current = fallbackTarget.viewer;
-          setIsArtifactsOpen(true);
-        } else {
-          const hintedViewer = getArtifactViewerHint(selectedArtifactPath);
-          if (selectedPreviewViewerRef.current !== hintedViewer) {
-            setSelectedPreviewViewer(hintedViewer);
-            selectedPreviewViewerRef.current = hintedViewer;
-          }
-        }
-      } else if (!currentPreviewPath) {
-        const fallbackTarget = pickPreferredArtifactTarget(next);
-        if (fallbackTarget) {
-          setSelectedPreviewPath(fallbackTarget.path);
-          setSelectedPreviewViewer(fallbackTarget.viewer);
-          selectedPreviewPathRef.current = fallbackTarget.path;
-          selectedPreviewViewerRef.current = fallbackTarget.viewer;
-          setIsArtifactsOpen(true);
-        }
-      }
-      return next;
-    } catch (error) {
-      setUiError(
-        `Failed to load artifacts: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      return [];
-    }
-  }, [
-    currentSessionId,
-    getArtifactViewerHint,
-    isPreviewUrl,
-    normalizeArtifactPath,
-    pickPreferredArtifactTarget,
-  ]);
-
-  const openPreview = useCallback(
-    async (target: ArtifactPreviewTarget | string) => {
-      const request = typeof target === "string" ? { path: target } : target;
-      const rawPath = request.path.trim();
-      if (!rawPath || !currentSessionId) return;
-
-      const normalizedUrl = normalizePreviewUrl(rawPath);
-      const previewPath = normalizedUrl ?? normalizeArtifactPath(rawPath);
-      if (!previewPath) {
-        setUiError("artifact path is required");
-        setPreviewPane({
-          kind: "text",
-          text: "Preview failed: artifact path is required",
-        });
-        return;
-      }
-
-      setSelectedPreviewPath(previewPath);
-      setSelectedPreviewViewer(request.viewer);
-      selectedPreviewPathRef.current = previewPath;
-      selectedPreviewViewerRef.current = request.viewer;
-      setIsArtifactsOpen(true);
-      setShowArtifactHistory(false);
-
-      if (previewBlobUrlRef.current) {
-        URL.revokeObjectURL(previewBlobUrlRef.current);
-        previewBlobUrlRef.current = null;
-      }
-
-      if (normalizedUrl) {
-        // For container profiles, delegate host detection to the backend by
-        // calling the local-url-map endpoint.  The backend is the single source of
-        // truth for what constitutes a mappable local host (eliminating the previous
-        // duplicated `isLocalPreviewHost` check on the frontend).
-        let resolvedUrl = normalizedUrl;
-        const isContainerProfile =
-          currentProfile?.environment.type === "container";
-        if (isContainerProfile && currentSessionId) {
-          try {
-            resolvedUrl = await mapContainerLocalArtifactUrl(
-              currentSessionId,
-              normalizedUrl,
-            );
-          } catch {
-            // Backend rejected the URL (not a local host, or missing port, etc.) —
-            // fall through to show the original URL directly.
-          }
-        }
-
-        if (request.viewer === "slidev") {
-          setPreviewPane({
-            kind: "slidev",
-            url: resolvedUrl,
-          });
-          return;
-        }
-
-        setPreviewPane({
-          kind: "external",
-          url: resolvedUrl,
-        });
-        return;
-      }
-
-      try {
-        if (request.viewer === "slidev") {
-          const previewUrl = await prepareSlidevPreview(
-            currentSessionId,
-            previewPath,
-          );
-          setPreviewPane({ kind: "slidev", url: previewUrl });
-          return;
-        }
-
-        const response = await fetchArtifactPreview(
-          currentSessionId,
-          previewPath,
-        );
-        const contentType = (
-          response.headers.get("content-type") || ""
-        ).toLowerCase();
-        const ext = previewPath.split(".").pop()?.toLowerCase() || "";
-        const arrayBuffer = await response.arrayBuffer();
-        const bytes = new Uint8Array(arrayBuffer);
-
-        const text =
-          contentType.startsWith("text/") ||
-          contentType.includes("json") ||
-          contentType.includes("xml") ||
-          ["md", "markdown", "txt", "log", "csv"].includes(ext)
-            ? new TextDecoder().decode(bytes)
-            : "";
-
-        const isMarkdown =
-          contentType.includes("markdown") || ["md", "markdown"].includes(ext);
-        if (isMarkdown) {
-          setPreviewPane({ kind: "markdown", markdown: text });
-        } else if (
-          contentType.startsWith("text/plain") ||
-          ["txt", "log", "csv", "json", "xml"].includes(ext)
-        ) {
-          setPreviewPane({ kind: "text", text });
-        } else if (
-          ext === "docx" ||
-          contentType.includes("officedocument.wordprocessingml.document")
-        ) {
-          const mammoth = await import("mammoth");
-          const htmlResult = await mammoth.default.convertToHtml({
-            arrayBuffer,
-          });
-          const htmlBlob = new Blob([htmlResult.value], {
-            type: "text/html;charset=utf-8",
-          });
-          const htmlUrl = URL.createObjectURL(htmlBlob);
-          previewBlobUrlRef.current = htmlUrl;
-          setPreviewPane({ kind: "iframe", url: htmlUrl });
-        } else {
-          const blob = new Blob([bytes], {
-            type:
-              response.headers.get("content-type") ||
-              "application/octet-stream",
-          });
-          const objectUrl = URL.createObjectURL(blob);
-          previewBlobUrlRef.current = objectUrl;
-
-          if (contentType.startsWith("image/")) {
-            setPreviewPane({ kind: "image", url: objectUrl });
-          } else if (contentType.startsWith("audio/")) {
-            setPreviewPane({ kind: "audio", url: objectUrl });
-          } else {
-            setPreviewPane({ kind: "iframe", url: objectUrl });
-          }
-        }
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        setUiError(`Artifact preview failed: ${reason}`);
-        setPreviewPane({ kind: "text", text: `Preview failed: ${reason}` });
-      }
-    },
-    [
-      currentProfile?.environment.type,
-      currentSessionId,
-      normalizeArtifactPath,
-      normalizePreviewUrl,
-    ],
-  );
-
-  const handleOpenPreview = useCallback(
-    (target: ArtifactPreviewTarget) => {
-      void openPreview(target);
-    },
-    [openPreview],
-  );
-
-  useEffect(() => {
-    selectedPreviewPathRef.current = selectedPreviewPath;
-  }, [selectedPreviewPath]);
-
-  useEffect(() => {
-    selectedPreviewViewerRef.current = selectedPreviewViewer;
-  }, [selectedPreviewViewer]);
-
   useEffect(() => {
     const persisted = uiConfig.fullConfig?.lastModel;
     if (persisted) {
@@ -727,96 +415,6 @@ export function ChatInterface({
       };
     });
   }, [pendingAskUserRequest]);
-
-  useEffect(() => {
-    const nextPreviewSessionId = currentSessionId ?? null;
-    const isSessionChanged = previewSessionRef.current !== nextPreviewSessionId;
-    if (isSessionChanged) {
-      previewSessionRef.current = nextPreviewSessionId;
-      if (previewBlobUrlRef.current) {
-        URL.revokeObjectURL(previewBlobUrlRef.current);
-        previewBlobUrlRef.current = null;
-      }
-      setArtifacts([]);
-      setShowArtifactHistory(false);
-      setSelectedPreviewPath(null);
-      setSelectedPreviewViewer(undefined);
-      selectedPreviewPathRef.current = null;
-      selectedPreviewViewerRef.current = undefined;
-      setPreviewPane(null);
-      setIsArtifactsOpen(false);
-    }
-
-    if (!currentSessionId) {
-      return;
-    }
-
-    void refreshArtifacts();
-    const banner = createDisconnectBanner(
-      setUiError,
-      "Artifacts stream disconnected; reconnecting...",
-    );
-
-    const unsubscribe = subscribeSessionArtifacts(currentSessionId, {
-      onArtifacts: () => {
-        banner.clear();
-        void (async () => {
-          const nextArtifacts = await refreshArtifacts();
-          const currentPreviewPath = selectedPreviewPathRef.current;
-          if (nextArtifacts.length === 0 || !currentPreviewPath) {
-            return;
-          }
-          if (isPreviewUrl(currentPreviewPath)) {
-            return;
-          }
-          const stillExists = nextArtifacts.some(
-            (artifact) => artifact.path === currentPreviewPath,
-          );
-          if (!stillExists) {
-            return;
-          }
-          await openPreview({
-            path: currentPreviewPath,
-            viewer: selectedPreviewViewerRef.current,
-          });
-        })();
-      },
-      onOpen: () => banner.clear(),
-      onHeartbeat: () => banner.clear(),
-      onError: () => banner.schedule(),
-    });
-
-    return () => {
-      banner.cleanup();
-      unsubscribe();
-    };
-  }, [currentSessionId, isPreviewUrl, openPreview, refreshArtifacts]);
-
-  useEffect(() => {
-    if (!currentSessionId || !selectedPreviewPath || previewPane !== null) {
-      return;
-    }
-    if (!isPreviewUrl(selectedPreviewPath)) {
-      const exists = artifacts.some(
-        (artifact) => artifact.path === selectedPreviewPath,
-      );
-      if (!exists) {
-        return;
-      }
-    }
-    void openPreview({
-      path: selectedPreviewPath,
-      viewer: selectedPreviewViewer,
-    });
-  }, [
-    artifacts,
-    currentSessionId,
-    isPreviewUrl,
-    openPreview,
-    previewPane,
-    selectedPreviewPath,
-    selectedPreviewViewer,
-  ]);
 
   useEffect(() => {
     if (!currentSessionId) {
@@ -2278,15 +1876,6 @@ export function ChatInterface({
     };
   }, [clampArtifactPanelWidth, isArtifactPanelResizing]);
 
-  useEffect(() => {
-    return () => {
-      if (previewBlobUrlRef.current) {
-        URL.revokeObjectURL(previewBlobUrlRef.current);
-        previewBlobUrlRef.current = null;
-      }
-    };
-  }, []);
-
   if (chatSurfaceState === "backend-down") {
     return (
       <div className="flex flex-1 min-h-0 w-full min-w-0 items-center justify-center overflow-hidden bg-[#8f2020] px-6 py-10 text-red-50 md:px-10">
@@ -2568,11 +2157,8 @@ export function ChatInterface({
                 selectedPath={selectedPreviewPath}
                 preview={previewPane}
                 showHistory={showArtifactHistory}
-                onToggleHistory={() => setShowArtifactHistory((prev) => !prev)}
-                onClose={() => {
-                  setIsArtifactsOpen(false);
-                  setShowArtifactHistory(false);
-                }}
+                onToggleHistory={toggleArtifactHistory}
+                onClose={() => setIsArtifactsOpen(false)}
                 getViewerForPath={getArtifactViewerHint}
                 onSelect={(target) => {
                   void openPreview(target);
