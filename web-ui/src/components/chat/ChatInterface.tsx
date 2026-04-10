@@ -2,7 +2,6 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useStore } from "@/lib/store";
 import {
-  removePendingSessionMessage,
   respondAskUserRequest,
   respondPermissionRequest,
   respondWorkspaceRequest,
@@ -34,6 +33,7 @@ import {
 import { useArtifactPanel } from "@/hooks/useArtifactPanel";
 import { useArtifactPanelResize } from "@/hooks/useArtifactPanelResize";
 import { useChatAutoScroll } from "@/hooks/useChatAutoScroll";
+import { useQueuedMessageActions } from "@/hooks/useQueuedMessageActions";
 import { useStreamController } from "@/hooks/useStreamController";
 import {
   settleTimelineSegments,
@@ -447,64 +447,14 @@ export function ChatInterface({
     replaceSessionMessages,
   ]);
 
-  const removeQueuedMessage = useCallback(
-    async (index: number) => {
-      if (!currentSessionId) {
-        return;
-      }
-      try {
-        const hasPendingImmediate = runtimeSession?.pendingImmediate != null;
-        const kind =
-          hasPendingImmediate && index === 0 ? "pending_immediate" : "queued";
-        const queuedIndex = hasPendingImmediate ? index - 1 : index;
-        const runtime = await removePendingSessionMessage({
-          sessionId: currentSessionId,
-          kind,
-          index: kind === "queued" ? queuedIndex : undefined,
-        });
-        applyRuntime(currentSessionId, runtime);
-      } catch (error) {
-        setUiError(
-          `Failed to remove queued message: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    },
-    [applyRuntime, currentSessionId, runtimeSession],
-  );
-
-  const steerQueuedMessage = useCallback(
-    (index: number) => {
-      const queued = queuedMessages[index];
-      if (!queued) {
-        return;
-      }
-
-      setInputValue((prev) =>
-        prev.trim().length > 0
-          ? `${queued.content}\n\n${prev}`
-          : queued.content,
-      );
-
-      if (queued.attachments.length > 0) {
-        const timestamp = Date.now();
-        const restored = queued.attachments.map(
-          (attachment, attachmentIndex) => ({
-            ...attachment,
-            id: `${attachment.id}-queued-${timestamp}-${index}-${attachmentIndex}`,
-          }),
-        );
-        setAttachments((prev) => [...restored, ...prev]);
-      }
-
-      void removeQueuedMessage(index);
-      window.setTimeout(() => {
-        composerInputRef.current?.focus();
-      }, 0);
-    },
-    [queuedMessages, removeQueuedMessage],
-  );
+  const { removeQueuedMessage, steerQueuedMessage } = useQueuedMessageActions({
+    currentSessionId,
+    queuedMessages,
+    setInputValue,
+    setAttachments,
+    setError: setUiError,
+    composerInputRef,
+  });
 
   const handleModelChange = (id: string) => {
     if (isNewChat) {
