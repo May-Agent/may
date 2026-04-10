@@ -25,6 +25,7 @@ aither-rag = { path = "../aither/rag" }
 aither-copilot = { path = "../aither/copilot" }
 aither-models = { path = "../aither/models" }
 aither-mcp = { path = "../aither/mcp" }
+aither-search = { path = "../aither/tools/search" }
 
 # Container runtime (Docker/OrbStack/Podman)
 bollard = "0.20"

@@ -362,6 +362,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aither-search"
+version = "0.1.0"
+dependencies = [
+ "aither-core",
+ "aither-rag",
+ "arrow-array",
+ "arrow-schema",
+ "async-fs",
+ "futures-lite 2.6.1",
+ "ignore",
+ "jiff",
+ "lance-index",
+ "lancedb",
+ "regex",
+ "schemars 1.2.0",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "sqlparser",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "aither-skills"
 version = "0.1.0"
 dependencies = [
@@ -6998,6 +7022,7 @@ dependencies = [
  "aither-models",
  "aither-rag",
  "aither-sandbox",
+ "aither-search",
  "anyhow",
  "arboard",
  "arc-swap",
