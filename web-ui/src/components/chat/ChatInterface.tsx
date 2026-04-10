@@ -24,7 +24,6 @@ import {
   type PermissionRequest,
   type WorkspaceRequest,
 } from "@/lib/api";
-import { MessageItem } from "./MessageItem";
 import { ArtifactsSidebar } from "./ArtifactsSidebar";
 import { BrowserView } from "./BrowserView";
 import { ActivityRail } from "./ActivityRail";
@@ -36,6 +35,9 @@ import {
 } from "./PromptBanners";
 import { ChatHeader } from "./ChatHeader";
 import { Composer } from "./Composer";
+import { ChatMessageList } from "./ChatMessageList";
+import { WelcomeScreen } from "./WelcomeScreen";
+import { TodoProgressBar, type TodoProgressState } from "./TodoProgressBar";
 import {
   buildAttachmentFromFile,
   buildAttachmentFromPastedFile,
@@ -148,11 +150,7 @@ export function ChatInterface({
     ARTIFACT_PANEL_DEFAULT_WIDTH,
   );
   const [isArtifactPanelResizing, setIsArtifactPanelResizing] = useState(false);
-  const [todoProgress, setTodoProgress] = useState<{
-    items: Array<{ text: string; checked: boolean }>;
-    total: number;
-    completed: number;
-  } | null>(null);
+  const [todoProgress, setTodoProgress] = useState<TodoProgressState | null>(null);
   const previewBlobUrlRef = useRef<string | null>(null);
   const selectedPreviewPathRef = useRef<string | null>(null);
   const selectedPreviewViewerRef =
@@ -2434,124 +2432,23 @@ export function ChatInterface({
             </div>
           </div>
         ) : chatSurfaceState === "welcome" ? (
-          <div className="flex-1 min-h-0 flex flex-col items-center justify-center px-4 -mt-20">
-            <div className="text-center mb-8">
-              <h1 className="text-3xl font-semibold tracking-tight mb-2">
-                What shall we think through?
-              </h1>
-              <p className="text-muted-foreground text-sm">
-                Ask anything. I'm here to help you think, create, and explore.
-              </p>
-            </div>
-          </div>
+          <WelcomeScreen />
         ) : (
-          <div
-            ref={scrollContainerRef}
+          <ChatMessageList
+            messages={messages}
+            currentSessionId={currentSessionId}
+            scrollContainerRef={scrollContainerRef}
+            contentRef={contentRef}
             onScroll={handleScroll}
-            className="flex-1 min-h-0 overflow-y-auto"
-          >
-            <div
-              ref={contentRef}
-              className="max-w-3xl mx-auto px-4 space-y-6 pb-6 pt-4"
-            >
-              {messages.map((msg, index) => {
-                const isLast = index === messages.length - 1;
-                const retryFromUser = msg.role === "user" && isLast;
-                const retryFromAssistant =
-                  msg.role === "assistant" && !!msg.error;
-
-                return (
-                  <MessageItem
-                    key={msg.id}
-                    message={msg}
-                    sessionId={currentSessionId ?? undefined}
-                    canRetry={retryFromUser || retryFromAssistant}
-                    onOpenPreview={handleOpenPreview}
-                    onRetry={() => {
-                      const batch = retryFromUser
-                        ? [
-                            {
-                              content: msg.content,
-                              attachments: msg.attachments ?? [],
-                            },
-                          ]
-                        : collectRetryBatch(messages, msg.id);
-
-                      void handleSend({
-                        sessionIdHint: currentSessionId ?? undefined,
-                        includeComposerInput: false,
-                        retryAssistantId: retryFromAssistant
-                          ? msg.id
-                          : undefined,
-                        overrideBatch: batch,
-                        skipAppendUserMessages: true,
-                      });
-                    }}
-                  />
-                );
-              })}
-            </div>
-          </div>
+            onOpenPreview={handleOpenPreview}
+            onRetry={(request) => void handleSend(request)}
+          />
         )}
 
         {todoProgress &&
           todoProgress.items.length > 0 &&
           hasPendingAssistantMessage && (
-            <div className="shrink-0 px-4 pb-2">
-              <div className="max-w-3xl mx-auto">
-                <div className="rounded-lg border border-border/60 bg-card/80 px-3 py-2.5 text-sm">
-                  <div className="flex items-center gap-2 mb-2">
-                    <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-                      <svg
-                        className="h-3.5 w-3.5"
-                        viewBox="0 0 16 16"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.5"
-                      >
-                        <rect x="2" y="2" width="12" height="12" rx="2" />
-                        <path d="M5 8l2 2 4-4" />
-                      </svg>
-                      Progress
-                    </div>
-                    <span className="text-xs text-muted-foreground">
-                      {todoProgress.completed}/{todoProgress.total}
-                    </span>
-                    <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden">
-                      <div
-                        className="h-full rounded-full bg-primary/70 transition-all duration-300"
-                        style={{
-                          width: `${todoProgress.total > 0 ? (todoProgress.completed / todoProgress.total) * 100 : 0}%`,
-                        }}
-                      />
-                    </div>
-                  </div>
-                  <ul className="space-y-0.5">
-                    {todoProgress.items.map((item, i) => (
-                      <li
-                        key={i}
-                        className="flex items-start gap-1.5 text-xs leading-relaxed"
-                      >
-                        <span
-                          className={`mt-0.5 shrink-0 ${item.checked ? "text-primary" : "text-muted-foreground/50"}`}
-                        >
-                          {item.checked ? "✓" : "○"}
-                        </span>
-                        <span
-                          className={
-                            item.checked
-                              ? "text-muted-foreground line-through"
-                              : "text-foreground"
-                          }
-                        >
-                          {item.text}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              </div>
-            </div>
+            <TodoProgressBar progress={todoProgress} />
           )}
 
         {showComposer && (
