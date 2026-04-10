@@ -25,6 +25,9 @@ import { Composer } from "./Composer";
 import { ChatMessageList } from "./ChatMessageList";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { TodoProgressBar, type TodoProgressState } from "./TodoProgressBar";
+import { BackendDownScreen } from "./status/BackendDownScreen";
+import { ContainerPreparingScreen } from "./status/ContainerPreparingScreen";
+import { ProfileLoadingScreen } from "./status/ProfileLoadingScreen";
 import {
   buildAttachmentFromFile,
   buildAttachmentFromPastedFile,
@@ -41,8 +44,6 @@ import {
   LONG_TEXT_THRESHOLD,
 } from "./chatUtils";
 
-import { Button } from "@/components/ui/button";
-import { CircleX } from "lucide-react";
 import type {
   ArtifactPreviewTarget,
   Attachment,
@@ -730,29 +731,10 @@ export function ChatInterface({
 
   if (chatSurfaceState === "backend-down") {
     return (
-      <div className="flex flex-1 min-h-0 w-full min-w-0 items-center justify-center overflow-hidden bg-[#8f2020] px-6 py-10 text-red-50 md:px-10">
-        <div className="w-full max-w-3xl text-center">
-          <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-full border border-red-50/18">
-            <CircleX className="h-8 w-8 text-red-50/92" />
-          </div>
-          <h2 className="text-3xl font-semibold tracking-[-0.03em] text-red-50">
-            Backend unavailable
-          </h2>
-          <p className="mx-auto mt-4 max-w-xl text-base leading-7 text-red-50/76">
-            The UI cannot reach the May server right now.
-          </p>
-          <div className="mx-auto mt-8 max-w-2xl rounded-3xl bg-red-950/16 px-6 py-4 text-sm leading-7 text-red-50/78 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] backdrop-blur-sm">
-            {backendUnavailableReason}
-          </div>
-          <Button
-            variant="secondary"
-            className="mt-8 h-10 rounded-full border-0 bg-red-50 text-[#8f2020] hover:bg-white"
-            onClick={() => void refreshProfileSessions()}
-          >
-            Retry
-          </Button>
-        </div>
-      </div>
+      <BackendDownScreen
+        reason={backendUnavailableReason}
+        onRetry={() => void refreshProfileSessions()}
+      />
     );
   }
 
@@ -790,88 +772,23 @@ export function ChatInterface({
         />
 
         {chatSurfaceState === "container-preparing" ? (
-          <div className="flex-1 min-h-0 px-4 pt-12">
-            <div className="mx-auto w-full max-w-3xl rounded-2xl border border-border/50 bg-background/70 p-6 text-center">
-              {isContainerPrepareFailed ? (
-                <div className="mx-auto mb-4 flex w-fit items-center justify-center rounded-full bg-red-500/15 p-2.5">
-                  <CircleX className="h-6 w-6 text-red-500" />
-                </div>
-              ) : (
-                <div className="mx-auto mb-4 flex w-fit items-center gap-2">
-                  <span className="h-2.5 w-2.5 rounded-full bg-primary/70 animate-bounce [animation-delay:-240ms]" />
-                  <span className="h-2.5 w-2.5 rounded-full bg-primary/60 animate-bounce [animation-delay:-120ms]" />
-                  <span className="h-2.5 w-2.5 rounded-full bg-primary/50 animate-bounce" />
-                </div>
-              )}
-              <h2 className="text-lg font-semibold">
-                {isContainerPrepareFailed
-                  ? "Container workspace unavailable"
-                  : "Preparing container workspace"}
-              </h2>
-              <p className="mt-2 text-sm text-muted-foreground">
-                {isContainerPrepareFailed
-                  ? "Unable to open chat history right now. Fix the reported error and retry."
-                  : "This profile is not ready yet. New chat and chat history are temporarily unavailable."}
-              </p>
-              <div className="mt-4 rounded-lg bg-muted/50 px-3 py-2 text-left text-xs text-muted-foreground">
-                {containerPrepareSummary}
-              </div>
-              {containerPrepareStatus?.recentLogs &&
-                containerPrepareStatus.recentLogs.length > 0 && (
-                  <div className="mt-3 max-h-40 overflow-auto rounded-lg border border-border/50 bg-background/50 px-3 py-2 text-left font-mono text-[11px] text-muted-foreground">
-                    {containerPrepareStatus.recentLogs.map(
-                      (line: string, index: number) => (
-                        <div key={`${index}-${line}`} className="truncate">
-                          {line}
-                        </div>
-                      ),
-                    )}
-                  </div>
-                )}
-              {isContainerPrepareFailed && !profileSessionsLoading && (
-                <div className="mt-4 flex items-center justify-center gap-2">
-                  {requiresManagedPodmanApproval && (
-                    <Button
-                      onClick={() => {
-                        const allowed = window.confirm(
-                          "Allow May to download and install managed Podman for container profiles?",
-                        );
-                        if (!allowed) {
-                          return;
-                        }
-                        void refreshProfileSessions({
-                          allowManagedPodmanDownload: true,
-                        });
-                      }}
-                    >
-                      Allow Podman Download
-                    </Button>
-                  )}
-                  <Button
-                    variant="secondary"
-                    onClick={() => void refreshProfileSessions()}
-                  >
-                    Retry
-                  </Button>
-                </div>
-              )}
-            </div>
-          </div>
+          <ContainerPreparingScreen
+            isPrepareFailed={isContainerPrepareFailed}
+            summary={containerPrepareSummary}
+            recentLogs={containerPrepareStatus?.recentLogs ?? []}
+            profileSessionsLoading={profileSessionsLoading}
+            requiresManagedPodmanApproval={requiresManagedPodmanApproval}
+            onRetry={() => void refreshProfileSessions()}
+            onApproveManagedPodmanDownload={() => {
+              const allowed = window.confirm(
+                "Allow May to download and install managed Podman for container profiles?",
+              );
+              if (!allowed) return;
+              void refreshProfileSessions({ allowManagedPodmanDownload: true });
+            }}
+          />
         ) : chatSurfaceState === "profile-loading" ? (
-          <div className="flex-1 min-h-0 px-4 pt-10">
-            <div className="mx-auto w-full max-w-3xl space-y-4">
-              <div className="h-4 w-40 rounded-full bg-muted/70 animate-pulse" />
-              <div className="space-y-3 rounded-2xl border border-border/50 bg-background/70 p-4">
-                <div className="h-3 w-3/4 rounded-full bg-muted/60 animate-pulse" />
-                <div className="h-3 w-5/6 rounded-full bg-muted/50 animate-pulse [animation-delay:120ms]" />
-                <div className="h-3 w-2/3 rounded-full bg-muted/40 animate-pulse [animation-delay:240ms]" />
-              </div>
-              <div className="space-y-3 rounded-2xl border border-border/40 bg-background/60 p-4">
-                <div className="h-3 w-2/3 rounded-full bg-muted/60 animate-pulse [animation-delay:160ms]" />
-                <div className="h-3 w-3/4 rounded-full bg-muted/50 animate-pulse [animation-delay:280ms]" />
-              </div>
-            </div>
-          </div>
+          <ProfileLoadingScreen />
         ) : chatSurfaceState === "welcome" ? (
           <WelcomeScreen />
         ) : (
