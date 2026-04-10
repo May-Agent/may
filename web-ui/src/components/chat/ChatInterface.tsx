@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import { AnimatePresence, motion } from "framer-motion";
 import { useStore } from "@/lib/store";
 import {
   respondAskUserRequest,
@@ -11,8 +10,7 @@ import {
   type PermissionRequest,
   type WorkspaceRequest,
 } from "@/lib/api";
-import { ArtifactsSidebar } from "./ArtifactsSidebar";
-import { BrowserView } from "./BrowserView";
+import { RightPanel } from "./RightPanel";
 import { ActivityRail } from "./ActivityRail";
 import {
   PermissionPrompt,
@@ -892,68 +890,22 @@ export function ChatInterface({
           </div>
         )}
       </div>
-      <AnimatePresence initial={false} mode="wait">
-        {activeRightPanel === "artifacts" && (
-          <>
-            <div
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="Resize artifacts panel"
-              className={`group relative h-full w-2 flex-shrink-0 touch-none cursor-col-resize ${
-                isArtifactPanelResizing ? "bg-primary/10" : ""
-              }`}
-              onPointerDown={handleArtifactResizerPointerDown}
-            >
-              <div
-                className={`absolute inset-y-0 left-1/2 w-px -translate-x-1/2 ${
-                  isArtifactPanelResizing
-                    ? "bg-primary"
-                    : "bg-border/80 group-hover:bg-primary/70"
-                }`}
-              />
-            </div>
-            <motion.aside
-              key="artifacts-panel"
-              initial={{ width: 0, opacity: 0 }}
-              animate={{ width: artifactPanelWidth, opacity: 1 }}
-              exit={{ width: 0, opacity: 0 }}
-              transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
-              className="h-full flex-shrink-0 overflow-hidden"
-            >
-              <ArtifactsSidebar
-                open
-                artifacts={artifacts}
-                selectedPath={selectedPreviewPath}
-                preview={previewPane}
-                showHistory={showArtifactHistory}
-                onToggleHistory={toggleArtifactHistory}
-                onClose={() => setIsArtifactsOpen(false)}
-                getViewerForPath={getArtifactViewerHint}
-                onSelect={(target) => {
-                  void openPreview(target);
-                }}
-              />
-            </motion.aside>
-          </>
-        )}
-
-        {activeRightPanel === "browser" && (
-          <motion.aside
-            key="browser-panel"
-            initial={{ width: 0, opacity: 0 }}
-            animate={{ width: 720, opacity: 1 }}
-            exit={{ width: 0, opacity: 0 }}
-            transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
-            className="h-full flex-shrink-0 overflow-hidden"
-          >
-            <BrowserView
-              open
-              onClose={() => setIsBrowserOpen(false)}
-              sessionId={currentSessionId}
-            />
-          </motion.aside>
-        )}
-      </AnimatePresence>
+      <RightPanel
+        active={activeRightPanel}
+        artifacts={artifacts}
+        selectedPreviewPath={selectedPreviewPath}
+        previewPane={previewPane}
+        showArtifactHistory={showArtifactHistory}
+        onToggleArtifactHistory={toggleArtifactHistory}
+        onCloseArtifacts={() => setIsArtifactsOpen(false)}
+        getViewerForPath={getArtifactViewerHint}
+        onSelectArtifact={(target) => void openPreview(target)}
+        artifactPanelWidth={artifactPanelWidth}
+        isArtifactPanelResizing={isArtifactPanelResizing}
+        onArtifactResizerPointerDown={handleArtifactResizerPointerDown}
+        currentSessionId={currentSessionId}
+        onCloseBrowser={() => setIsBrowserOpen(false)}
+      />
     </div>
   );
 }
