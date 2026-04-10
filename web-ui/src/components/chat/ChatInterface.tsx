@@ -1,11 +1,7 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useStore } from "@/lib/store";
 import {
-  respondAskUserRequest,
-  respondPermissionRequest,
-  respondWorkspaceRequest,
   setSessionPlanState as apiSetSessionPlanState,
-  type AskUserAnswer,
   type AskUserRequest,
   type PermissionRequest,
   type WorkspaceRequest,
@@ -31,6 +27,7 @@ import {
   buildAttachmentFromPastedFile,
   buildAttachmentFromPastedText,
 } from "@/lib/attachments";
+import { useApprovalHandlers } from "@/hooks/useApprovalHandlers";
 import { useArtifactPanel } from "@/hooks/useArtifactPanel";
 import { useArtifactPanelResize } from "@/hooks/useArtifactPanelResize";
 import { useChatAutoScroll } from "@/hooks/useChatAutoScroll";
@@ -101,12 +98,9 @@ export function ChatInterface({
     useState(false);
   const [isModelUpdating, setIsModelUpdating] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
-  const [isPermissionSubmitting, setIsPermissionSubmitting] = useState(false);
-  const [isWorkspaceSubmitting, setIsWorkspaceSubmitting] = useState(false);
   const [pendingAskUser, setPendingAskUser] = useState<AskUserState | null>(
     null,
   );
-  const [isAskUserSubmitting, setIsAskUserSubmitting] = useState(false);
   const [isBrowserOpen, setIsBrowserOpen] = useState(false);
   const [todoProgress, setTodoProgress] = useState<TodoProgressState | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
@@ -316,7 +310,6 @@ export function ChatInterface({
     isStreamControllerActive ||
     hasPendingAssistantMessage;
   const showComposerSendButton = !showStopButton || hasInput;
-  const applyRuntime = useRuntimeStore((state) => state.applyRuntime);
 
   useEffect(() => {
     const persisted = uiConfig.fullConfig?.lastModel;
@@ -530,81 +523,22 @@ export function ChatInterface({
 
   // legacy handleStop removed — using hook version from useStreamController
 
-  const handlePermissionDecision = async (approved: boolean) => {
-    if (!pendingPermission || !currentSessionId) return;
-    setIsPermissionSubmitting(true);
-    try {
-      const runtime = await respondPermissionRequest(
-        pendingPermission.id,
-        approved,
-      );
-      applyRuntime(currentSessionId, runtime);
-    } catch (error) {
-      setUiError(
-        `permission submit failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    } finally {
-      setIsPermissionSubmitting(false);
-    }
-  };
-
-  const handleWorkspaceDecision = async (approved: boolean) => {
-    if (!pendingWorkspace || !currentSessionId) return;
-    setIsWorkspaceSubmitting(true);
-    try {
-      const runtime = await respondWorkspaceRequest(
-        pendingWorkspace.id,
-        approved,
-      );
-      applyRuntime(currentSessionId, runtime);
-    } catch (error) {
-      setUiError(
-        `workspace submit failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    } finally {
-      setIsWorkspaceSubmitting(false);
-    }
-  };
-
-  const handleAskUserAnswerChange = (
-    questionIndex: number,
-    value: AskUserAnswer["answer"],
-  ) => {
-    setPendingAskUser((prev) => {
-      if (!prev) return prev;
-      const nextAnswers = [...prev.answers];
-      nextAnswers[questionIndex] = {
-        section: prev.request.questions[questionIndex]?.section ?? "",
-        answer: value,
-      };
-      return { ...prev, answers: nextAnswers };
-    });
-  };
-
-  const handleAskUserSubmit = useCallback(
-    async (answersOverride?: AskUserAnswer[]) => {
-      if (!pendingAskUser || !currentSessionId) return;
-      setIsAskUserSubmitting(true);
-      setUiError(null);
-      try {
-        const runtime = await respondAskUserRequest(
-          pendingAskUser.request.id,
-          answersOverride ?? pendingAskUser.answers,
-        );
-        applyRuntime(currentSessionId, runtime);
-        setPendingAskUser(null);
-      } catch (error) {
-        setUiError(`ask_user submit failed: ${(error as Error).message}`);
-      } finally {
-        setIsAskUserSubmitting(false);
-      }
-    },
-    [applyRuntime, currentSessionId, pendingAskUser],
-  );
+  const {
+    isPermissionSubmitting,
+    isWorkspaceSubmitting,
+    isAskUserSubmitting,
+    onPermissionDecision: handlePermissionDecision,
+    onWorkspaceDecision: handleWorkspaceDecision,
+    onAskUserAnswerChange: handleAskUserAnswerChange,
+    onAskUserSubmit: handleAskUserSubmit,
+  } = useApprovalHandlers({
+    currentSessionId,
+    pendingPermission,
+    pendingWorkspace,
+    pendingAskUser,
+    setPendingAskUser,
+    setError: setUiError,
+  });
 
   const handleTitleSubmit = async () => {
     const trimmed = titleInput.trim();
