@@ -1,10 +1,9 @@
-import { Suspense, lazy, memo, useState, useMemo, useEffect, useRef } from 'react';
+import { Suspense, lazy, useState, useMemo, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { cn } from '@/lib/utils';
 import type { ArtifactPreviewTarget, Message } from '@/types';
 import { extractArtifactPreviewTargets, stripArtifactPreviewTags } from './chatUtils';
 import { AttachmentCard } from './AttachmentCard';
-import ReactMarkdown from 'react-markdown';
 import { isLikelyBinaryTextPayload } from '@/lib/parsers/toolOutput';
 import {
   type TimelineDisplayItem,
@@ -14,6 +13,7 @@ import { RotateCcw, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
 import { CopyButton } from './shared/CopyButton';
+import { MemoMarkdown, makeMarkdownComponents } from './shared/MarkdownRenderer';
 import { TimelineItemRow } from './timeline/TimelineItemRow';
 import { CommandTimeline } from './timeline/CommandTimeline';
 import { ThinkingTimeline } from './timeline/ThinkingTimeline';
@@ -23,59 +23,12 @@ import { BrowserTimeline } from './timeline/BrowserTimeline';
 import { TasksPanel } from './TasksPanel';
 
 const TASKS_TAG_PATTERN = /<tasks\s*\/>/i;
-const LazySyntaxCodeBlock = lazy(() => import('./SyntaxCodeBlock'));
 const LazyFlowMarkdown = lazy(() =>
   import('./StreamingText').then((module) => ({ default: module.FlowMarkdown })),
 );
 
 function stripTasksTag(content: string): string {
-  return content.replace(/<tasks\s*\/>/gi, "").trim();
-}
-
-const MemoMarkdown = memo(function MemoMarkdown({
-  content,
-  components,
-}: {
-  content: string;
-  components: any;
-}) {
-  return <ReactMarkdown components={components}>{content}</ReactMarkdown>;
-});
-
-
-
-
-
-
-function makeComponents(isUser: boolean, isStreaming: boolean) {
-  return {
-    code({ className, children, ...props }: any) {
-      const lang = /language-(\w+)/.exec(className || '')?.[1];
-      const code = String(children).replace(/\n$/, '');
-      return lang ? (
-        <div className="relative group/code my-3 rounded-lg overflow-hidden border border-border/30">
-          <div className="flex items-center justify-between px-4 py-1.5 bg-muted text-muted-foreground text-xs">
-            <span>{lang}</span>
-            {!isStreaming && <CopyButton text={code} className="h-5 w-5 text-muted-foreground hover:text-foreground hover:bg-background/80" />}
-          </div>
-          <Suspense
-            fallback={
-              <pre className="m-0 overflow-x-auto bg-background px-4 py-3 text-[0.8125rem] text-foreground">
-                <code>{code}</code>
-              </pre>
-            }
-          >
-            <LazySyntaxCodeBlock language={lang} code={code} />
-          </Suspense>
-        </div>
-      ) : (
-        <code {...props} className={cn('rounded px-1 py-0.5 font-mono text-sm', isUser ? 'bg-black/10 dark:bg-white/10' : 'bg-muted', className)}>{children}</code>
-      );
-    },
-    p: ({ children }: any) => <p className="mb-1 last:mb-0 leading-relaxed">{children}</p>,
-    ul: ({ children }: any) => <ul className="list-disc list-inside mb-2 last:mb-0 pl-1">{children}</ul>,
-    ol: ({ children }: any) => <ol className="list-decimal list-inside mb-2 last:mb-0 pl-1">{children}</ol>,
-  };
+  return content.replace(/<tasks\s*\/>/gi, '').trim();
 }
 
 export function MessageItem({
@@ -97,8 +50,8 @@ export function MessageItem({
   const timelineExpansionOverridesRef = useRef<Record<string, boolean>>({});
   const [showTyping, setShowTyping] = useState(false);
   const components = useMemo(
-    () => makeComponents(isUser, isStreaming),
-    [isUser, isStreaming]
+    () => makeMarkdownComponents(isUser, isStreaming),
+    [isUser, isStreaming],
   );
   const showsTasksTag = useMemo(
     () => TASKS_TAG_PATTERN.test(message.content || ""),
