@@ -32,14 +32,11 @@ import {
   buildAttachmentFromPastedText,
 } from "@/lib/attachments";
 import { useArtifactPanel } from "@/hooks/useArtifactPanel";
+import { useArtifactPanelResize } from "@/hooks/useArtifactPanelResize";
 import { useStreamController } from "@/hooks/useStreamController";
 import {
   settleTimelineSegments,
   summarizeTimelineSegments,
-  ARTIFACT_PANEL_MIN_WIDTH,
-  ARTIFACT_PANEL_DEFAULT_WIDTH,
-  ARTIFACT_PANEL_MIN_CHAT_WIDTH,
-  ARTIFACT_PANEL_MAX_VIEWPORT_RATIO,
   LONG_TEXT_THRESHOLD,
 } from "./chatUtils";
 
@@ -111,16 +108,7 @@ export function ChatInterface({
   );
   const [isAskUserSubmitting, setIsAskUserSubmitting] = useState(false);
   const [isBrowserOpen, setIsBrowserOpen] = useState(false);
-  const [artifactPanelWidth, setArtifactPanelWidth] = useState(
-    ARTIFACT_PANEL_DEFAULT_WIDTH,
-  );
-  const [isArtifactPanelResizing, setIsArtifactPanelResizing] = useState(false);
   const [todoProgress, setTodoProgress] = useState<TodoProgressState | null>(null);
-  const artifactResizeStartRef = useRef<{
-    pointerId: number;
-    x: number;
-    width: number;
-  } | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
   const pendingInitialScrollRef = useRef(false);
@@ -859,98 +847,11 @@ export function ChatInterface({
       ? "artifacts"
       : null;
 
-  const clampArtifactPanelWidth = useCallback(
-    (rawWidth: number): number => {
-      if (typeof window === "undefined") {
-        return rawWidth;
-      }
-      const viewportWidth = window.innerWidth;
-      const desktopSidebarWidth = isSidebarOpen ? 256 : 0;
-      const maxByViewport = Math.floor(
-        viewportWidth * ARTIFACT_PANEL_MAX_VIEWPORT_RATIO,
-      );
-      const maxByChat =
-        viewportWidth - desktopSidebarWidth - ARTIFACT_PANEL_MIN_CHAT_WIDTH;
-      const maxWidth = Math.max(
-        ARTIFACT_PANEL_MIN_WIDTH,
-        Math.min(maxByViewport, maxByChat),
-      );
-      return Math.max(
-        ARTIFACT_PANEL_MIN_WIDTH,
-        Math.min(maxWidth, Math.round(rawWidth)),
-      );
-    },
-    [isSidebarOpen],
-  );
-
-  const handleArtifactResizerPointerDown = useCallback(
-    (event: React.PointerEvent<HTMLDivElement>) => {
-      if (event.button !== 0) return;
-      event.preventDefault();
-      artifactResizeStartRef.current = {
-        pointerId: event.pointerId,
-        x: event.clientX,
-        width: artifactPanelWidth,
-      };
-      setIsArtifactPanelResizing(true);
-    },
-    [artifactPanelWidth],
-  );
-
-  useEffect(() => {
-    const updateWidth = () => {
-      setArtifactPanelWidth((prev) => clampArtifactPanelWidth(prev));
-    };
-    updateWidth();
-    window.addEventListener("resize", updateWidth);
-    return () => {
-      window.removeEventListener("resize", updateWidth);
-    };
-  }, [clampArtifactPanelWidth]);
-
-  useEffect(() => {
-    if (!isArtifactPanelResizing) return;
-
-    const previousUserSelect = document.body.style.userSelect;
-    const previousCursor = document.body.style.cursor;
-    document.body.style.userSelect = "none";
-    document.body.style.cursor = "col-resize";
-
-    const handlePointerMove = (event: PointerEvent) => {
-      const resizeState = artifactResizeStartRef.current;
-      if (!resizeState || event.pointerId !== resizeState.pointerId) {
-        return;
-      }
-      if ((event.buttons & 1) === 0) {
-        artifactResizeStartRef.current = null;
-        setIsArtifactPanelResizing(false);
-        return;
-      }
-      const delta = resizeState.x - event.clientX;
-      setArtifactPanelWidth(clampArtifactPanelWidth(resizeState.width + delta));
-    };
-
-    const stopResizing = (event: PointerEvent) => {
-      const resizeState = artifactResizeStartRef.current;
-      if (!resizeState || event.pointerId !== resizeState.pointerId) {
-        return;
-      }
-      artifactResizeStartRef.current = null;
-      setIsArtifactPanelResizing(false);
-    };
-
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", stopResizing);
-    window.addEventListener("pointercancel", stopResizing);
-
-    return () => {
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", stopResizing);
-      window.removeEventListener("pointercancel", stopResizing);
-      document.body.style.userSelect = previousUserSelect;
-      document.body.style.cursor = previousCursor;
-    };
-  }, [clampArtifactPanelWidth, isArtifactPanelResizing]);
+  const {
+    width: artifactPanelWidth,
+    isResizing: isArtifactPanelResizing,
+    onResizerPointerDown: handleArtifactResizerPointerDown,
+  } = useArtifactPanelResize({ isSidebarOpen });
 
   if (chatSurfaceState === "backend-down") {
     return (
