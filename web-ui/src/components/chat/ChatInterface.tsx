@@ -35,6 +35,12 @@ import { BrowserView } from "./BrowserView";
 import { ContextInspector } from "./ContextInspectorDialog";
 import { ActivityRail } from "./ActivityRail";
 import {
+  PermissionPrompt,
+  WorkspacePrompt,
+  AskUserPrompt,
+  type AskUserState,
+} from "./PromptBanners";
+import {
   createDisconnectBanner,
   collectRetryBatch,
   buildArtifactViewerHints,
@@ -94,11 +100,6 @@ import {
   isWebFetchToolName,
   parseTerminalToolStartArgs,
 } from "@/lib/parsers/toolRequest";
-
-interface AskUserState {
-  request: AskUserRequest;
-  answers: AskUserAnswer[];
-}
 
 interface ChatInterfaceProps {
   onToggleSidebar: () => void;
@@ -2037,15 +2038,6 @@ export function ChatInterface({
     [applyRuntime, currentSessionId, pendingAskUser],
   );
 
-  const permissionToneClass = pendingPermission
-    ? pendingPermission.mode === "unsafe"
-      ? "border-red-300 bg-red-100 text-red-900 dark:border-red-800 dark:bg-red-950/95 dark:text-red-100"
-      : "border-border bg-card text-foreground"
-    : "";
-  const workspaceToneClass = pendingWorkspace
-    ? "border-border bg-card text-foreground"
-    : "";
-
   const handleTitleSubmit = async () => {
     const trimmed = titleInput.trim();
     if (!currentSessionId || !trimmed) {
@@ -2701,191 +2693,35 @@ export function ChatInterface({
           <div className="shrink-0 px-4 pb-2 pt-2 bg-transparent w-full z-20 pointer-events-none">
             <div className="max-w-3xl mx-auto w-full pointer-events-auto">
               {pendingPermission && (
-                <div
-                  className={`mb-3 rounded-lg border px-3 py-2 text-sm ${permissionToneClass}`}
-                >
-                  <div className="font-medium">
-                    Approval required ({pendingPermission.mode})
-                  </div>
-                  <div className="mt-1 break-all">
-                    {pendingPermission.script}
-                  </div>
-                  <div className="mt-2 flex gap-2">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled={isPermissionSubmitting}
-                      onClick={() => void handlePermissionDecision(true)}
-                    >
-                      Approve
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={isPermissionSubmitting}
-                      onClick={() => void handlePermissionDecision(false)}
-                    >
-                      Deny
-                    </Button>
-                  </div>
-                </div>
+                <PermissionPrompt
+                  request={pendingPermission}
+                  isSubmitting={isPermissionSubmitting}
+                  onDecide={(approved) => void handlePermissionDecision(approved)}
+                />
               )}
               {pendingWorkspace && (
-                <div
-                  className={`mb-3 rounded-lg border px-3 py-2 text-sm ${workspaceToneClass}`}
-                >
-                  <div className="font-medium">Workspace access required</div>
-                  <div className="mt-1 break-all font-mono text-xs">
-                    {pendingWorkspace.path}
-                  </div>
-                  <div className="mt-2 text-muted-foreground">
-                    {pendingWorkspace.reason}
-                  </div>
-                  <div className="mt-2 flex gap-2">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled={isWorkspaceSubmitting}
-                      onClick={() => void handleWorkspaceDecision(true)}
-                    >
-                      Approve
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={isWorkspaceSubmitting}
-                      onClick={() => void handleWorkspaceDecision(false)}
-                    >
-                      Deny
-                    </Button>
-                  </div>
-                </div>
+                <WorkspacePrompt
+                  request={pendingWorkspace}
+                  isSubmitting={isWorkspaceSubmitting}
+                  onDecide={(approved) => void handleWorkspaceDecision(approved)}
+                />
               )}
               {pendingAskUser && (
-                <div className="mb-3 rounded-xl border-2 border-primary/40 bg-card px-4 py-3 shadow-xl">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="text-sm font-semibold text-foreground">
-                      Input required
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      {pendingAskUser.request.questions.length} question
-                      {pendingAskUser.request.questions.length > 1 ? "s" : ""}
-                    </div>
-                  </div>
-
-                  <div className="mt-3 max-h-[36vh] overflow-y-auto space-y-3 pr-1">
-                    {pendingAskUser.request.questions.map((question, idx) => {
-                      const answer = pendingAskUser.answers[idx]?.answer;
-                      const selected =
-                        answer?.kind === "selected" ? answer.values : [];
-                      const custom =
-                        answer?.kind === "custom" ? answer.text : "";
-
-                      return (
-                        <div
-                          key={`${question.section}-${idx}`}
-                          className="rounded-lg border border-border bg-background p-3"
-                        >
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="text-sm font-medium text-foreground leading-snug">
-                              {question.question}
-                            </div>
-                            {question.section ? (
-                              <span className="text-[10px] uppercase tracking-wide text-muted-foreground border border-border rounded-full px-2 py-0.5">
-                                {question.section}
-                              </span>
-                            ) : null}
-                          </div>
-
-                          {question.option.length > 0 && (
-                            <div className="mt-2 flex flex-col gap-2">
-                              {question.option.map((option) => {
-                                const active = selected.includes(option);
-                                return (
-                                  <Button
-                                    key={option}
-                                    size="sm"
-                                    variant={active ? "default" : "outline"}
-                                    className="h-8 w-full justify-start"
-                                    disabled={isAskUserSubmitting}
-                                    onClick={() => {
-                                      if (question.multiSelect) {
-                                        const next = active
-                                          ? selected.filter((v) => v !== option)
-                                          : [...selected, option];
-                                        handleAskUserAnswerChange(
-                                          idx,
-                                          next.length > 0
-                                            ? {
-                                                kind: "selected",
-                                                values: next,
-                                              }
-                                            : { kind: "skipped" },
-                                        );
-                                      } else {
-                                        handleAskUserAnswerChange(idx, {
-                                          kind: "selected",
-                                          values: [option],
-                                        });
-                                      }
-                                    }}
-                                  >
-                                    {option}
-                                  </Button>
-                                );
-                              })}
-                            </div>
-                          )}
-
-                          <Input
-                            value={custom}
-                            onChange={(e) =>
-                              handleAskUserAnswerChange(
-                                idx,
-                                e.target.value.trim().length > 0
-                                  ? {
-                                      kind: "custom",
-                                      text: e.target.value,
-                                    }
-                                  : { kind: "skipped" },
-                              )
-                            }
-                            placeholder="Custom answer (optional)"
-                            className="mt-2 h-9 bg-background"
-                            disabled={isAskUserSubmitting}
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  <div className="mt-3 flex items-center justify-end gap-2">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={isAskUserSubmitting}
-                      onClick={() => {
-                        if (!pendingAskUser) return;
-                        const skipped = pendingAskUser.request.questions.map(
-                          (q) => ({
-                            section: q.section,
-                            answer: { kind: "skipped" as const },
-                          }),
-                        );
-                        void handleAskUserSubmit(skipped);
-                      }}
-                    >
-                      Skip all
-                    </Button>
-                    <Button
-                      size="sm"
-                      disabled={isAskUserSubmitting}
-                      onClick={() => void handleAskUserSubmit()}
-                    >
-                      Submit
-                    </Button>
-                  </div>
-                </div>
+                <AskUserPrompt
+                  state={pendingAskUser}
+                  isSubmitting={isAskUserSubmitting}
+                  onAnswerChange={handleAskUserAnswerChange}
+                  onSubmit={() => void handleAskUserSubmit()}
+                  onSkipAll={() => {
+                    const skipped = pendingAskUser.request.questions.map(
+                      (q) => ({
+                        section: q.section,
+                        answer: { kind: "skipped" as const },
+                      }),
+                    );
+                    void handleAskUserSubmit(skipped);
+                  }}
+                />
               )}
               {uiError && (
                 <div className="mb-3 rounded-lg border border-destructive bg-destructive px-3 py-2 text-sm text-destructive-foreground">
