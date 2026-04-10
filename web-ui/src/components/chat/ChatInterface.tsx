@@ -1,19 +1,12 @@
-import { useRef, useEffect, useState, useCallback, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useStore } from "@/lib/store";
 import {
-  fetchSessionRuntime,
-  isBrowserTakeoverActiveError,
-  isSessionActiveConflictError,
-  enqueueChat,
   removePendingSessionMessage,
   respondAskUserRequest,
   respondPermissionRequest,
   respondWorkspaceRequest,
   setSessionPlanState as apiSetSessionPlanState,
-  stopSessionRun,
-  streamChat,
   type AskUserAnswer,
   type AskUserRequest,
   type PermissionRequest,
@@ -39,24 +32,8 @@ import {
   buildAttachmentFromPastedText,
 } from "@/lib/attachments";
 import { useArtifactPanel } from "@/hooks/useArtifactPanel";
+import { useStreamController } from "@/hooks/useStreamController";
 import {
-  cloneTimelineSegments,
-  collectTerminalExecutions,
-  collectThinkingText,
-  isAnyThinkingRunning,
-  timelineContainsStoppedWork,
-} from "@/lib/streamTimeline";
-import {
-  isRuntimeTargetBusy,
-  validateModelConfigured,
-} from "@/lib/streamValidation";
-import {
-  createStreamState,
-  createStreamEventHandlers,
-  type AssistantFinalizeUpdate,
-} from "@/lib/streamEventHandlers";
-import {
-  collectRetryBatch,
   settleTimelineSegments,
   summarizeTimelineSegments,
   ARTIFACT_PANEL_MIN_WIDTH,
@@ -64,7 +41,6 @@ import {
   ARTIFACT_PANEL_MIN_CHAT_WIDTH,
   ARTIFACT_PANEL_MAX_VIEWPORT_RATIO,
   LONG_TEXT_THRESHOLD,
-  type QueuedMessage,
 } from "./chatUtils";
 
 import { Button } from "@/components/ui/button";
@@ -91,7 +67,6 @@ export function ChatInterface({
   onToggleSidebar,
   isSidebarOpen,
 }: ChatInterfaceProps) {
-  const navigate = useNavigate();
   const {
     currentSessionId,
     currentProfileId,
@@ -152,10 +127,6 @@ export function ChatInterface({
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const streamingSessionIdRef = useRef<string | null>(null);
-  const stopRequestedSessionIdsRef = useRef<Set<string>>(new Set());
-  const stopWaitersRef = useRef<Map<string, Promise<void>>>(new Map());
   const currentSession = sessions.find((s) => s.id === currentSessionId);
   const currentPlanState: SessionPlanState =
     currentSession?.runtime.planState ?? "disabled";
@@ -349,11 +320,7 @@ export function ChatInterface({
     isStreamControllerActive ||
     hasPendingAssistantMessage;
   const showComposerSendButton = !showStopButton || hasInput;
-  const markRuntimeRunning = useRuntimeStore((state) => state.markRunning);
   const applyRuntime = useRuntimeStore((state) => state.applyRuntime);
-  const markRuntimeFirstToken = useRuntimeStore(
-    (state) => state.markFirstToken,
-  );
 
   useEffect(() => {
     const persisted = uiConfig.fullConfig?.lastModel;
@@ -679,633 +646,27 @@ export function ChatInterface({
         ? "How can I help you today?"
         : "Type a message...";
 
-  const syncSessionRuntime = useCallback(
-    async (sessionId: string) => {
-      const runtime = await fetchSessionRuntime(sessionId);
-      applyRuntime(sessionId, runtime);
-      return runtime;
-    },
-    [applyRuntime],
-  );
+  const { handleSend, handleStop } = useStreamController({
+    currentSessionId,
+    newChatModelId,
+    configuredModelIds,
+    inputValue,
+    attachments,
+    setInputValue,
+    setAttachments,
+    setUiError,
+    setIsSending,
+    setIsStreamControllerActive,
+    setIsBrowserOpen,
+    setTodoProgress,
+    userScrolledUpRef,
+    createSession,
+    addMessage,
+    replaceSessionMessages,
+  });
 
-  const waitForStoppedSession = useCallback(
-    async (sessionId: string) => {
-      const runtime = await stopSessionRun(sessionId);
-      applyRuntime(sessionId, runtime);
-    },
-    [applyRuntime],
-  );
 
-  const handleSend = async (options?: {
-    sessionIdHint?: string;
-    includeComposerInput?: boolean;
-    retryAssistantId?: string;
-    overrideBatch?: QueuedMessage[];
-    skipAppendUserMessages?: boolean;
-    deliveryMode?: "steer" | "queue";
-  }) => {
-    const includeComposerInput = options?.includeComposerInput ?? true;
-    const composerHasInput =
-      inputValue.trim().length > 0 || attachments.length > 0;
-    if (includeComposerInput && !composerHasInput) return;
-
-    const requestedSessionId = options?.sessionIdHint ?? currentSessionId;
-    const pendingStop = requestedSessionId
-      ? stopWaitersRef.current.get(requestedSessionId)
-      : undefined;
-    if (pendingStop) {
-      try {
-        await pendingStop;
-      } catch (error) {
-        setUiError(
-          `Failed to stop session: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        return;
-      }
-    }
-    if (!requestedSessionId) {
-      const validation = validateModelConfigured(
-        newChatModelId,
-        configuredModelIds,
-        "No model configured. Please select a model before sending.",
-        "Selected model is not available in the current profile.",
-      );
-      if (!validation.ok) {
-        setUiError(validation.error!);
-        return;
-      }
-    } else {
-      const targetSession = useStore
-        .getState()
-        .sessions.find((session) => session.id === requestedSessionId);
-      const validation = validateModelConfigured(
-        targetSession?.model,
-        configuredModelIds,
-        "No model configured for this session. Please select a model.",
-        "Session model is no longer available. Please choose another model.",
-      );
-      if (!validation.ok) {
-        setUiError(validation.error!);
-        return;
-      }
-    }
-
-    setIsSending(true);
-    setUiError(null);
-
-    const content = includeComposerInput ? inputValue : "";
-    const atts = includeComposerInput ? [...attachments] : [];
-    if (includeComposerInput) {
-      setInputValue("");
-      setAttachments([]);
-    }
-
-    const targetRuntime = options?.sessionIdHint
-      ? useRuntimeStore.getState().sessions[options.sessionIdHint]
-      : runtimeSession;
-    const targetGenerating = !!targetRuntime && isRuntimeTargetBusy(targetRuntime);
-    const deliveryMode =
-      options?.deliveryMode ?? (targetGenerating ? "queue" : "steer");
-
-    if (targetGenerating) {
-      if (!includeComposerInput) {
-        setIsSending(false);
-        return;
-      }
-      const runtimeSessionId = options?.sessionIdHint ?? currentSessionId;
-      if (runtimeSessionId) {
-        try {
-          const runtime = await enqueueChat({
-            sessionId: runtimeSessionId,
-            content,
-            attachments: atts,
-            deliveryMode,
-          });
-          applyRuntime(runtimeSessionId, runtime);
-        } catch (error) {
-          const message =
-            error instanceof Error ? error.message : String(error);
-          setUiError(message);
-          // Restore the composer draft so the user can retry.
-          setInputValue(content);
-          setAttachments(atts);
-        }
-      }
-      setIsSending(false);
-      return;
-    }
-
-    let sessionId = options?.sessionIdHint ?? currentSessionId;
-    if (!sessionId) {
-      try {
-        sessionId = await createSession(newChatModelId || undefined);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        setUiError(message);
-        // Restore draft so user can retry after fixing the issue.
-        if (includeComposerInput) {
-          setInputValue(content);
-          setAttachments(atts);
-        }
-        setIsSending(false);
-        return;
-      }
-      if (sessionId) {
-        navigate(`/chat/${encodeURIComponent(sessionId)}`);
-      }
-    }
-
-    if (!sessionId) {
-      setIsSending(false);
-      return;
-    }
-
-    stopRequestedSessionIdsRef.current.delete(sessionId);
-
-    const resolvedSessionModelId =
-      useStore
-        .getState()
-        .sessions.find((session) => session.id === sessionId)
-        ?.model?.trim() ?? "";
-    if (!resolvedSessionModelId) {
-      setIsSending(false);
-      setUiError(
-        "No model configured for this session. Please select a model.",
-      );
-      return;
-    }
-    if (
-      configuredModelIds.size > 0 &&
-      !configuredModelIds.has(resolvedSessionModelId)
-    ) {
-      setIsSending(false);
-      setUiError(
-        "Session model is no longer available. Please choose another model.",
-      );
-      return;
-    }
-
-    const pendingBatch = options?.overrideBatch
-      ? [...options.overrideBatch]
-      : includeComposerInput
-        ? [{ content, attachments: atts }]
-        : [];
-
-    if (pendingBatch.length === 0) {
-      setIsSending(false);
-      return;
-    }
-
-    const baseMessages =
-      useStore.getState().sessions.find((session) => session.id === sessionId)
-        ?.messages ?? [];
-
-    if (!options?.skipAppendUserMessages) {
-      for (const queued of pendingBatch) {
-        addMessage(sessionId, queued.content, "user", queued.attachments);
-      }
-    }
-
-    userScrolledUpRef.current = false;
-    streamingSessionIdRef.current = sessionId;
-    markRuntimeRunning(sessionId);
-
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-    setIsStreamControllerActive(true);
-    const assistantId = options?.retryAssistantId ?? `assistant-${Date.now()}`;
-    let textFlushTimer: number | null = null;
-    let lastTextFlushAt = 0;
-    setTodoProgress(null);
-
-    // Mutable stream state lives in a single object so the factory-built
-    // handlers can share it without closing over a dozen `let` bindings.
-    const streamState = createStreamState();
-
-    const wasStoppedByUser = (): boolean =>
-      controller.signal.aborted ||
-      stopRequestedSessionIdsRef.current.has(sessionId);
-
-    const isActiveSessionStreamFailure = (error: unknown): boolean =>
-      isSessionActiveConflictError(error);
-
-    const restoreComposerDraft = () => {
-      if (!includeComposerInput || options?.retryAssistantId || pendingBatch.length !== 1) {
-        return;
-      }
-      const [draft] = pendingBatch;
-      if (!draft) return;
-      setInputValue(draft.content);
-      setAttachments(draft.attachments);
-    };
-
-    const rollbackOptimisticStreamStart = async (message: string) => {
-      replaceSessionMessages(sessionId, baseMessages);
-      restoreComposerDraft();
-      try {
-        const runtime = await fetchSessionRuntime(sessionId);
-        applyRuntime(sessionId, runtime);
-      } catch (runtimeError) {
-        setUiError(
-          `Failed to refresh session state: ${
-            runtimeError instanceof Error
-              ? runtimeError.message
-              : String(runtimeError)
-          }`,
-        );
-        return;
-      }
-      setUiError(message);
-    };
-
-    try {
-      const current = useStore
-        .getState()
-        .sessions.find((s) => s.id === sessionId);
-      if (!current) return;
-
-      const isRetry = !!options?.retryAssistantId;
-      const retryBatch = isRetry
-        ? collectRetryBatch(current.messages, assistantId)
-        : [];
-      const streamingBatch = isRetry ? retryBatch : pendingBatch;
-
-      if (streamingBatch.length === 0) return;
-
-      const finalPrompt = streamingBatch.map((m) => m.content).join("\n\n");
-      const mergedAttachments = streamingBatch.flatMap((m) => m.attachments);
-
-      if (options?.retryAssistantId) {
-        replaceSessionMessages(
-          sessionId,
-          current.messages.map((m) =>
-            m.id === assistantId
-              ? {
-                  ...m,
-                  content: "",
-                  error: undefined,
-                  isStreaming: true,
-                  isThinking: true,
-                  thinking: "",
-                  timelineSegments: [],
-                  terminalExecutions: [],
-                }
-              : m,
-          ),
-        );
-      } else {
-        replaceSessionMessages(sessionId, [
-          ...current.messages,
-          {
-            id: assistantId,
-            role: "assistant",
-            content: "",
-            timestamp: new Date().toISOString(),
-            attachments: [],
-            isStreaming: true,
-            isThinking: true,
-            thinking: "",
-            timelineSegments: [],
-            terminalExecutions: [],
-          },
-        ]);
-      }
-
-      const flushAssistantText = (force = false) => {
-        const now = Date.now();
-        const minIntervalMs = 50;
-        const elapsed = now - lastTextFlushAt;
-
-        if (!force && elapsed < minIntervalMs) {
-          if (textFlushTimer == null) {
-            textFlushTimer = window.setTimeout(() => {
-              textFlushTimer = null;
-              flushAssistantText(true);
-            }, minIntervalMs - elapsed);
-          }
-          return;
-        }
-
-        const latest = useStore
-          .getState()
-          .sessions.find((s) => s.id === sessionId);
-        if (!latest) return;
-
-        lastTextFlushAt = now;
-        const snapshotTimelineSegments = cloneTimelineSegments(
-          streamState.timelineSegments,
-        );
-        const snapshotTerminalExecutions = collectTerminalExecutions(
-          snapshotTimelineSegments,
-        );
-        const snapshotThinking = collectThinkingText(snapshotTimelineSegments);
-        replaceSessionMessages(
-          sessionId,
-          latest.messages.map((m) =>
-            m.id === assistantId
-              ? {
-                  ...m,
-                  content: streamState.streamedText,
-                  isStreaming: true,
-                  isThinking: isAnyThinkingRunning(snapshotTimelineSegments),
-                  thinking: snapshotThinking,
-                  timelineSegments: snapshotTimelineSegments,
-                  terminalExecutions: snapshotTerminalExecutions,
-                }
-              : m,
-          ),
-        );
-      };
-
-      // Apply a finalize update (from onDone or onPaused) to the session store.
-      const applyAssistantFinalize = (
-        update: AssistantFinalizeUpdate,
-        errorMessage?: string,
-      ) => {
-        const latest = useStore
-          .getState()
-          .sessions.find((s) => s.id === sessionId);
-        if (!latest) return;
-        replaceSessionMessages(
-          sessionId,
-          latest.messages.map((m) =>
-            m.id === assistantId
-              ? {
-                  ...update.assistant,
-                  id: assistantId,
-                  content: update.finalContent,
-                  thinking: update.finalThinking,
-                  timelineSegments: update.finalTimelineSegments,
-                  isStreaming: false,
-                  isThinking: false,
-                  terminalExecutions: update.finalTerminalExecutions,
-                  error: errorMessage,
-                }
-              : m,
-          ),
-        );
-      };
-
-      const clearTextFlushTimer = () => {
-        if (textFlushTimer != null) {
-          window.clearTimeout(textFlushTimer);
-          textFlushTimer = null;
-        }
-      };
-
-      const streamHandlers = createStreamEventHandlers({
-        sessionId,
-        assistantId,
-        state: streamState,
-        flushAssistantText,
-        wasStoppedByUser,
-        markRuntimeFirstToken,
-        onTodoUpdate: (event) => {
-          setTodoProgress(event);
-        },
-        onAssistantFinalized: (update) => {
-          clearTextFlushTimer();
-          applyAssistantFinalize(
-            update,
-            update.isEmpty
-              ? "LLM endpoint error: empty assistant response"
-              : undefined,
-          );
-        },
-        onAssistantPaused: (update) => {
-          clearTextFlushTimer();
-          if (update == null) {
-            // Empty pause — drop the placeholder assistant message entirely.
-            const latest = useStore
-              .getState()
-              .sessions.find((s) => s.id === sessionId);
-            if (latest) {
-              replaceSessionMessages(
-                sessionId,
-                latest.messages.filter((m) => m.id !== assistantId),
-              );
-            }
-            return;
-          }
-          applyAssistantFinalize(update, undefined);
-        },
-        onStreamError: (message) => {
-          const latest = useStore
-            .getState()
-            .sessions.find((s) => s.id === sessionId);
-          if (latest) {
-            const snapshotTimelineSegments = cloneTimelineSegments(
-              streamState.timelineSegments,
-            );
-            replaceSessionMessages(
-              sessionId,
-              latest.messages.map((m) =>
-                m.id === assistantId
-                  ? {
-                      ...m,
-                      timelineSegments: snapshotTimelineSegments,
-                      thinking: collectThinkingText(snapshotTimelineSegments),
-                      terminalExecutions: collectTerminalExecutions(
-                        snapshotTimelineSegments,
-                      ),
-                      isStreaming: false,
-                      isThinking: false,
-                      error: `LLM endpoint error: ${message}`,
-                    }
-                  : m,
-              ),
-            );
-          }
-          setUiError(`LLM endpoint error: ${message}`);
-        },
-      });
-
-      await streamChat({
-        sessionId,
-        content: finalPrompt,
-        attachments: mergedAttachments,
-        signal: controller.signal,
-        onReasoning: streamHandlers.onReasoning,
-        onToolStart: streamHandlers.onToolStart,
-        onToolEnd: streamHandlers.onToolEnd,
-        onTodoUpdate: streamHandlers.onTodoUpdate,
-        onText: streamHandlers.onText,
-        onDone: streamHandlers.onDone,
-        onPaused: streamHandlers.onPaused,
-        onError: streamHandlers.onError,
-      });
-    } catch (error) {
-      if (wasStoppedByUser()) {
-        streamState.completedNormally = true;
-        return;
-      }
-      if (!(error instanceof DOMException && error.name === "AbortError")) {
-        if (isActiveSessionStreamFailure(error)) {
-          await rollbackOptimisticStreamStart(
-            "This session is still active. Wait for the current run to settle or stop it before sending another message.",
-          );
-          return;
-        }
-        if (isBrowserTakeoverActiveError(error)) {
-          await rollbackOptimisticStreamStart(
-            "Browser takeover is active for this session. Return browser control before sending another message.",
-          );
-          return;
-        }
-        const message = error instanceof Error ? error.message : String(error);
-        const errText = `LLM endpoint error: ${message}`;
-        const latest = useStore
-          .getState()
-          .sessions.find((s) => s.id === sessionId);
-        if (latest) {
-          const snapshotTimelineSegments = cloneTimelineSegments(
-            streamState.timelineSegments,
-          );
-          replaceSessionMessages(
-            sessionId,
-            latest.messages.map((m) =>
-              m.id === assistantId
-                ? {
-                    ...m,
-                    timelineSegments: snapshotTimelineSegments,
-                    thinking: collectThinkingText(snapshotTimelineSegments),
-                    terminalExecutions: collectTerminalExecutions(
-                      snapshotTimelineSegments,
-                    ),
-                    isStreaming: false,
-                    isThinking: false,
-                    error: errText,
-                  }
-                : m,
-            ),
-          );
-        }
-        setUiError(errText);
-      }
-    } finally {
-      if (textFlushTimer != null) {
-        window.clearTimeout(textFlushTimer);
-        textFlushTimer = null;
-      }
-
-      const latest = useStore
-        .getState()
-        .sessions.find((s) => s.id === sessionId);
-      if (latest) {
-        const stopRequestedByUser =
-          stopRequestedSessionIdsRef.current.has(sessionId);
-        const assistantStopped =
-          latest.messages.some(
-            (message) =>
-              message.id === assistantId &&
-              timelineContainsStoppedWork(message.timelineSegments ?? []),
-          );
-        const terminalError =
-          !streamState.completedNormally && !stopRequestedByUser && !assistantStopped
-            ? "LLM endpoint error: stream terminated before a final assistant response"
-            : undefined;
-        replaceSessionMessages(
-          sessionId,
-          latest.messages.map((m) =>
-            m.id === assistantId
-              ? {
-                  ...m,
-                  isStreaming: false,
-                  isThinking: false,
-                  error: m.error ?? terminalError,
-                }
-              : m,
-          ),
-        );
-      }
-
-      abortControllerRef.current = null;
-      setIsStreamControllerActive(false);
-      setIsSending(false);
-      if (streamingSessionIdRef.current === sessionId) {
-        streamingSessionIdRef.current = null;
-      }
-      setIsBrowserOpen(false);
-
-      void syncSessionRuntime(sessionId)
-        .catch((error) => {
-          setUiError(
-            `Failed to sync runtime state: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        })
-        .finally(() => {
-          stopRequestedSessionIdsRef.current.delete(sessionId);
-        });
-    }
-  };
-
-  const handleStop = () => {
-    const runtimeSessionId = streamingSessionIdRef.current ?? currentSessionId;
-    if (!runtimeSessionId) {
-      return;
-    }
-    const ownsLocalStream = streamingSessionIdRef.current === runtimeSessionId;
-    stopRequestedSessionIdsRef.current.add(runtimeSessionId);
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = null;
-    setIsStreamControllerActive(false);
-    setIsSending(false);
-    setIsBrowserOpen(false);
-    const waitForStop = waitForStoppedSession(runtimeSessionId).finally(() => {
-      stopWaitersRef.current.delete(runtimeSessionId);
-      if (!ownsLocalStream) {
-        stopRequestedSessionIdsRef.current.delete(runtimeSessionId);
-      }
-    });
-    stopWaitersRef.current.set(runtimeSessionId, waitForStop);
-    void waitForStop.catch((error) => {
-      setUiError(
-        `Failed to stop session: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    });
-    const latest = useStore
-      .getState()
-      .sessions.find((s) => s.id === runtimeSessionId);
-    if (latest) {
-      let stopped = false;
-      const endedAt = Date.now();
-      replaceSessionMessages(
-        runtimeSessionId,
-        latest.messages.map((m) => {
-          if (
-            !stopped &&
-            m.role === "assistant" &&
-            (m.isStreaming || m.isThinking)
-          ) {
-            stopped = true;
-            const timelineSegments = settleTimelineSegments(
-              m.timelineSegments,
-              endedAt,
-              "stopped",
-            );
-            const { thinking, terminalExecutions } =
-              summarizeTimelineSegments(timelineSegments);
-            return {
-              ...m,
-              timelineSegments,
-              thinking,
-              terminalExecutions,
-              isStreaming: false,
-              isThinking: false,
-            };
-          }
-          return m;
-        }),
-      );
-    }
-    streamingSessionIdRef.current = null;
-  };
+  // legacy handleStop removed — using hook version from useStreamController
 
   const handlePermissionDecision = async (approved: boolean) => {
     if (!pendingPermission || !currentSessionId) return;
