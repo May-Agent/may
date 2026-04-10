@@ -22,19 +22,14 @@ import { TodoProgressBar, type TodoProgressState } from "./TodoProgressBar";
 import { BackendDownScreen } from "./status/BackendDownScreen";
 import { ContainerPreparingScreen } from "./status/ContainerPreparingScreen";
 import { ProfileLoadingScreen } from "./status/ProfileLoadingScreen";
-import {
-  buildAttachmentFromFile,
-  buildAttachmentFromPastedFile,
-  buildAttachmentFromPastedText,
-} from "@/lib/attachments";
 import { useApprovalHandlers } from "@/hooks/useApprovalHandlers";
 import { useArtifactPanel } from "@/hooks/useArtifactPanel";
 import { useArtifactPanelResize } from "@/hooks/useArtifactPanelResize";
 import { useChatAutoScroll } from "@/hooks/useChatAutoScroll";
+import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useQueuedMessageActions } from "@/hooks/useQueuedMessageActions";
 import { useSettleOrphanedTimelines } from "@/hooks/useSettleOrphanedTimelines";
 import { useStreamController } from "@/hooks/useStreamController";
-import { LONG_TEXT_THRESHOLD } from "./chatUtils";
 
 import type {
   ArtifactPreviewTarget,
@@ -441,9 +436,17 @@ export function ChatInterface({
     }
   };
 
-  const handleRemoveAttachment = (id: string) => {
-    setAttachments((prev) => prev.filter((a) => a.id !== id));
-  };
+  const {
+    removeAttachment: handleRemoveAttachment,
+    onFileSelect: handleFileSelect,
+    onPaste: handlePaste,
+    takeScreenshot: handleScreenshot,
+  } = useComposerAttachments({
+    attachments,
+    setAttachments,
+    setError: setUiError,
+    fileInputRef,
+  });
 
   const composerPlaceholder =
     queuedMessages.length > 0
@@ -471,8 +474,6 @@ export function ChatInterface({
     replaceSessionMessages,
   });
 
-
-  // legacy handleStop removed — using hook version from useStreamController
 
   const {
     isPermissionSubmitting,
@@ -507,88 +508,6 @@ export function ChatInterface({
     }
   };
 
-  const handleScreenshot = async () => {
-    let stream: MediaStream | null = null;
-    try {
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: "browser" },
-        audio: false,
-        preferCurrentTab: true,
-      } as DisplayMediaStreamOptions);
-      const video = document.createElement("video");
-      video.srcObject = stream;
-      await new Promise((r) => {
-        video.onloadedmetadata = () => video.play().then(r);
-      });
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      canvas.getContext("2d")?.drawImage(video, 0, 0);
-      setAttachments((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          name: `screenshot-${Date.now()}.png`,
-          type: "image",
-          url: canvas.toDataURL("image/png"),
-        },
-      ]);
-    } catch (e) {
-      setUiError(
-        `Screenshot failed: ${e instanceof Error ? e.message : String(e)}`,
-      );
-    } finally {
-      stream?.getTracks().forEach((t) => t.stop());
-    }
-  };
-
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files?.length) return;
-    try {
-      const files = Array.from(e.target.files!);
-      const newAttachments = await Promise.all(files.map(buildAttachmentFromFile));
-      setAttachments((prev) => [...prev, ...newAttachments]);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    } catch (error) {
-      setUiError(
-        `Attachment processing failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-  };
-
-  const handlePaste = async (e: React.ClipboardEvent) => {
-    const items = Array.from(e.clipboardData.items);
-    const text = e.clipboardData.getData("text/plain");
-    const hasFileItem = items.some(
-      (item) => item.kind === "file" && item.getAsFile(),
-    );
-    const shouldAttachLargeText =
-      !hasFileItem && !!text && text.length >= LONG_TEXT_THRESHOLD;
-
-    // Prevent default immediately, before async work, so filename/text is never inserted into composer.
-    if (hasFileItem || shouldAttachLargeText) {
-      e.preventDefault();
-    }
-
-    const fileItems = items
-      .filter((item) => item.kind === "file")
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => file != null);
-
-    const newAttachments = await Promise.all(
-      fileItems.map(buildAttachmentFromPastedFile),
-    );
-
-    if (shouldAttachLargeText) {
-      newAttachments.push(buildAttachmentFromPastedText(text));
-    }
-
-    if (newAttachments.length > 0) {
-      setAttachments((prev) => [...prev, ...newAttachments]);
-    }
-  };
 
   const currentModelId = isNewChat ? newChatModelId : currentSession.model;
   const currentReasoningEffort = isNewChat
