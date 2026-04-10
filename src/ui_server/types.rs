@@ -9,22 +9,6 @@ use crate::session::{
 use crate::xml_fragment::XmlFragment;
 use aither_core::llm::ToolResult;
 
-const fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-const fn is_zero_usize(value: &usize) -> bool {
-    *value == 0
-}
-
-const fn session_plan_state_is_disabled(value: &SessionPlanState) -> bool {
-    matches!(value, SessionPlanState::Disabled)
-}
-
-const fn session_runtime_state_is_idle(value: &SessionRuntimeState) -> bool {
-    matches!(value, SessionRuntimeState::Idle)
-}
-
 // ── Typed API Errors ────────────────────────────────────────
 
 /// Machine-readable error codes sent to the frontend, eliminating string-matching.
@@ -604,7 +588,6 @@ pub struct ApiSession {
     pub(crate) model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<String>,
-    #[serde(default, skip_serializing_if = "SessionRuntimeResponse::is_empty")]
     pub(crate) runtime: SessionRuntimeResponse,
 }
 
@@ -826,54 +809,23 @@ pub struct WorkspacePollItem {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserInteractionResponse {
-    #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) takeover_active: bool,
-}
-
-impl BrowserInteractionResponse {
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        !self.takeover_active
-    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInteractionResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) task_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output_file: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output_preview: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input_notice: Option<String>,
-}
-
-impl TerminalInteractionResponse {
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.task_id.is_none()
-            && self.output_file.is_none()
-            && self.output_preview.is_none()
-            && self.input_notice.is_none()
-    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInteractionResponse {
-    #[serde(default, skip_serializing_if = "BrowserInteractionResponse::is_empty")]
     pub(crate) browser: BrowserInteractionResponse,
-    #[serde(default, skip_serializing_if = "TerminalInteractionResponse::is_empty")]
     pub(crate) terminal: TerminalInteractionResponse,
-}
-
-impl SessionInteractionResponse {
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.browser.is_empty() && self.terminal.is_empty()
-    }
 }
 
 impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
@@ -966,13 +918,9 @@ pub struct UiBootstrapResponse {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeResponse {
-    #[serde(default, skip_serializing_if = "session_runtime_state_is_idle")]
     pub(crate) state: SessionRuntimeState,
-    #[serde(default, skip_serializing_if = "session_plan_state_is_disabled")]
     pub(crate) plan_state: SessionPlanState,
-    #[serde(default, skip_serializing_if = "SessionInteractionResponse::is_empty")]
     pub(crate) interactions: SessionInteractionResponse,
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub(crate) queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_immediate: Option<PendingUserMessage>,
@@ -986,18 +934,19 @@ pub struct SessionRuntimeResponse {
     pub(crate) waiting_ask_user: Option<crate::session::PersistedAskUserRequest>,
 }
 
-impl SessionRuntimeResponse {
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        matches!(self.state, SessionRuntimeState::Idle)
-            && matches!(self.plan_state, SessionPlanState::Disabled)
-            && self.interactions.is_empty()
-            && self.queued_count == 0
-            && self.pending_immediate.is_none()
-            && self.queued_messages.is_empty()
-            && self.waiting_permission.is_none()
-            && self.waiting_workspace.is_none()
-            && self.waiting_ask_user.is_none()
+impl Default for SessionRuntimeResponse {
+    fn default() -> Self {
+        Self {
+            state: SessionRuntimeState::Idle,
+            plan_state: SessionPlanState::Disabled,
+            interactions: SessionInteractionResponse::default(),
+            queued_count: 0,
+            pending_immediate: None,
+            queued_messages: Vec::new(),
+            waiting_permission: None,
+            waiting_workspace: None,
+            waiting_ask_user: None,
+        }
     }
 }
 
@@ -1005,7 +954,6 @@ impl SessionRuntimeResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeEventPayload {
     pub(crate) session_id: String,
-    #[serde(default, skip_serializing_if = "SessionRuntimeResponse::is_empty")]
     pub(crate) runtime: SessionRuntimeResponse,
 }
 
@@ -1013,7 +961,6 @@ pub struct SessionRuntimeEventPayload {
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSnapshotItem {
     pub(crate) session_id: String,
-    #[serde(default, skip_serializing_if = "SessionRuntimeResponse::is_empty")]
     pub(crate) runtime: SessionRuntimeResponse,
 }
 

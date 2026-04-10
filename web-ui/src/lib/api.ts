@@ -36,15 +36,15 @@ export interface WorkspaceRequest {
 export interface SessionRuntimeStatus {
   state: SessionRuntimeState;
   planState: SessionPlanState;
-  interactions?: {
+  interactions: {
     browser: {
       takeoverActive: boolean;
     };
-    terminal?: {
-      taskId?: string | null;
-      outputFile?: string | null;
-      outputPreview?: string | null;
-      inputNotice?: string | null;
+    terminal: {
+      taskId: string | null;
+      outputFile: string | null;
+      outputPreview: string | null;
+      inputNotice: string | null;
     };
   };
   queuedCount: number;
@@ -719,45 +719,27 @@ function enrichMessage(m: Message): Message {
   };
 }
 
+/** Backend now sends all fields unconditionally — just pass through with safe defaults for legacy compat. */
 function normalizeRuntime(
   runtime: SessionRuntimeStatus | null | undefined,
 ): SessionRuntimeStatus {
-  const browserTakeoverActive =
-    runtime?.interactions?.browser?.takeoverActive ?? false;
-  const terminal = runtime?.interactions?.terminal;
-  const normalizedTerminal =
-    terminal &&
-    (terminal.taskId != null
-      || terminal.outputFile != null
-      || terminal.outputPreview != null
-      || terminal.inputNotice != null)
-      ? {
-          taskId: terminal.taskId ?? null,
-          outputFile: terminal.outputFile ?? null,
-          outputPreview: terminal.outputPreview ?? null,
-          inputNotice: terminal.inputNotice ?? null,
-        }
-      : undefined;
-
-  return {
-    state: runtime?.state ?? 'idle',
-    planState: runtime?.planState ?? 'disabled',
-    interactions:
-      browserTakeoverActive || normalizedTerminal
-        ? {
-            browser: {
-              takeoverActive: browserTakeoverActive,
-            },
-            terminal: normalizedTerminal,
-          }
-        : undefined,
-    queuedCount: runtime?.queuedCount ?? 0,
-    pendingImmediate: runtime?.pendingImmediate ?? null,
-    queuedMessages: runtime?.queuedMessages ?? [],
-    waitingPermission: runtime?.waitingPermission ?? null,
-    waitingWorkspace: runtime?.waitingWorkspace ?? null,
-    waitingAskUser: runtime?.waitingAskUser ?? null,
-  };
+  if (!runtime) {
+    return {
+      state: 'idle',
+      planState: 'disabled',
+      interactions: {
+        browser: { takeoverActive: false },
+        terminal: { taskId: null, outputFile: null, outputPreview: null, inputNotice: null },
+      },
+      queuedCount: 0,
+      pendingImmediate: null,
+      queuedMessages: [],
+      waitingPermission: null,
+      waitingWorkspace: null,
+      waitingAskUser: null,
+    };
+  }
+  return runtime;
 }
 
 function normalizeSessionSummary(session: SessionSummary): SessionSummary {
@@ -1143,11 +1125,27 @@ export async function streamChat(input: {
   const decoder = new TextDecoder();
   let buffer = '';
   let eventName = '';
-  let data = '';
+  let dataLines: string[] = [];
 
   const flushEvent = () => {
-    if (!data) return;
-    const parsed = JSON.parse(data);
+    if (dataLines.length === 0) return;
+    const rawData = dataLines.join('\n');
+    const currentEventName = eventName;
+    eventName = '';
+    dataLines = [];
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(rawData);
+    } catch (error) {
+      input.onError?.(
+        `Invalid SSE payload for event '${currentEventName}': ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
+
     const requireString = (value: unknown, field: string): string => {
       if (typeof value !== 'string') {
         throw new Error(
@@ -1157,49 +1155,53 @@ export async function streamChat(input: {
       return value;
     };
 
-    switch (eventName) {
-      case 'start':
-        input.onStart?.(requireString(parsed.assistantId, 'assistantId'));
-        break;
-      case 'reasoning':
-        input.onReasoning?.(requireString(parsed.chunk, 'chunk'));
-        break;
-      case 'text':
-        input.onText?.(requireString(parsed.chunk, 'chunk'));
-        break;
-      case 'tool_start':
-        input.onToolStart?.(parsed);
-        break;
-      case 'tool_end':
-        input.onToolEnd?.(parsed);
-        break;
-      case 'todo_update':
-        input.onTodoUpdate?.(parsed);
-        break;
-      case 'done':
-        if (!parsed.assistant || typeof parsed.assistant !== 'object') {
-          throw new Error(
-            "Invalid SSE payload: missing 'assistant' in done event",
-          );
-        }
-        input.onDone?.(enrichMessage(parsed.assistant));
-        break;
-      case 'paused':
-        if (!parsed.assistant || typeof parsed.assistant !== 'object') {
-          throw new Error(
-            "Invalid SSE payload: missing 'assistant' in paused event",
-          );
-        }
-        input.onPaused?.(enrichMessage(parsed.assistant));
-        break;
-      case 'error':
-        input.onError?.(parsed.message || 'Unknown stream error');
-        break;
-      default:
-        break;
+    try {
+      switch (currentEventName) {
+        case 'start':
+          input.onStart?.(requireString(parsed.assistantId, 'assistantId'));
+          break;
+        case 'reasoning':
+          input.onReasoning?.(requireString(parsed.chunk, 'chunk'));
+          break;
+        case 'text':
+          input.onText?.(requireString(parsed.chunk, 'chunk'));
+          break;
+        case 'tool_start':
+          input.onToolStart?.(parsed);
+          break;
+        case 'tool_end':
+          input.onToolEnd?.(parsed);
+          break;
+        case 'todo_update':
+          input.onTodoUpdate?.(parsed);
+          break;
+        case 'done':
+          if (!parsed.assistant || typeof parsed.assistant !== 'object') {
+            throw new Error(
+              "Invalid SSE payload: missing 'assistant' in done event",
+            );
+          }
+          input.onDone?.(enrichMessage(parsed.assistant));
+          break;
+        case 'paused':
+          if (!parsed.assistant || typeof parsed.assistant !== 'object') {
+            throw new Error(
+              "Invalid SSE payload: missing 'assistant' in paused event",
+            );
+          }
+          input.onPaused?.(enrichMessage(parsed.assistant));
+          break;
+        case 'error':
+          input.onError?.(parsed.message || 'Unknown stream error');
+          break;
+        default:
+          break;
+      }
+    } catch (error) {
+      input.onError?.(
+        error instanceof Error ? error.message : String(error),
+      );
     }
-    eventName = '';
-    data = '';
   };
 
   while (true) {
@@ -1209,7 +1211,7 @@ export async function streamChat(input: {
 
     let idx;
     while ((idx = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, idx).trimEnd();
+      const line = buffer.slice(0, idx).replace(/\r$/, '');
       buffer = buffer.slice(idx + 1);
 
       if (!line) {
@@ -1219,13 +1221,16 @@ export async function streamChat(input: {
       if (line.startsWith('event:')) {
         eventName = line.slice(6).trim();
       } else if (line.startsWith('data:')) {
-        data += line.slice(5).trim();
+        // Per SSE spec: preserve the raw data line (without leading space).
+        // Multiple data: lines are joined with '\n' when forming the payload.
+        const chunk = line.slice(5);
+        dataLines.push(chunk.startsWith(' ') ? chunk.slice(1) : chunk);
       }
     }
   }
 
   // Process a trailing event when stream ends without a final blank line.
-  if (data) {
+  if (dataLines.length > 0) {
     flushEvent();
   }
 }

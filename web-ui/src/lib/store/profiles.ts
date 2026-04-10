@@ -114,8 +114,16 @@ export const createProfilesSlice: StateCreator<AppState, [], [], ProfilesSlice> 
       profileAccessBlockedReason: null,
       profileAccessBlockedCode: null,
     });
-    void get().refreshSkills();
+    // Run skills refresh and session fetch in parallel, but handle
+    // skills failure explicitly instead of letting it become an
+    // unhandled promise rejection.
+    const skillsPromise = get()
+      .refreshSkills()
+      .catch((error) => {
+        console.error('failed to refresh skills on profile switch', error);
+      });
     await fetchAndApplyProfileSessions(profileId, get, set);
+    await skillsPromise;
   },
 
   refreshProfileSessions: async (options) => {

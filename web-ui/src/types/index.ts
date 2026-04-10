@@ -212,15 +212,15 @@ export interface RuntimeAskUserRequest {
 export interface SessionRuntimeSummaryPayload {
   state: SessionRuntimeState;
   planState: SessionPlanState;
-  interactions?: {
+  interactions: {
     browser: {
       takeoverActive: boolean;
     };
-    terminal?: {
-      taskId?: string | null;
-      outputFile?: string | null;
-      outputPreview?: string | null;
-      inputNotice?: string | null;
+    terminal: {
+      taskId: string | null;
+      outputFile: string | null;
+      outputPreview: string | null;
+      inputNotice: string | null;
     };
   };
   queuedCount: number;

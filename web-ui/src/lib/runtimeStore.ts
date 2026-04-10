@@ -12,15 +12,15 @@ import type { SessionPlanState } from '@/types';
 interface SessionRuntime {
   state: SessionRuntimeState;
   planState: SessionPlanState;
-  interactions?: {
+  interactions: {
     browser: {
       takeoverActive: boolean;
     };
-    terminal?: {
-      taskId?: string | null;
-      outputFile?: string | null;
-      outputPreview?: string | null;
-      inputNotice?: string | null;
+    terminal: {
+      taskId: string | null;
+      outputFile: string | null;
+      outputPreview: string | null;
+      inputNotice: string | null;
     };
   };
   queuedCount: number;
@@ -40,11 +40,16 @@ interface RuntimeStoreState {
   applyRuntimes: (sessions: SessionRuntimeSnapshot[]) => void;
   markFirstToken: (sessionId: string) => void;
   clearSessionRuntime: (sessionId: string) => void;
+  removeSession: (sessionId: string) => void;
 }
 
 const defaultRuntime = (): SessionRuntime => ({
   state: 'idle',
   planState: 'disabled',
+  interactions: {
+    browser: { takeoverActive: false },
+    terminal: { taskId: null, outputFile: null, outputPreview: null, inputNotice: null },
+  },
   queuedCount: 0,
   waitingPermission: null,
   waitingWorkspace: null,
@@ -61,8 +66,8 @@ function runtimeFromStatus(
     ...defaultRuntime(),
     firstTokenAt: current?.firstTokenAt,
     state: runtime.state,
-    planState: runtime.planState ?? current?.planState ?? 'disabled',
-    interactions: runtime.interactions ?? current?.interactions,
+    planState: runtime.planState,
+    interactions: runtime.interactions ?? defaultRuntime().interactions,
     queuedCount: Math.max(0, runtime.queuedCount ?? 0),
     waitingPermission: runtime.waitingPermission ?? null,
     waitingWorkspace: runtime.waitingWorkspace ?? null,
@@ -96,6 +101,10 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => ({
           waitingPermission: null,
           waitingWorkspace: null,
           waitingAskUser: null,
+          // Clear stale queued state from previous run
+          queuedCount: 0,
+          pendingImmediate: null,
+          queuedMessages: [],
         },
       },
     }));
@@ -151,5 +160,13 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => ({
         [sessionId]: defaultRuntime(),
       },
     }));
+  },
+
+  removeSession: (sessionId) => {
+    if (!sessionId) return;
+    set((state) => {
+      const { [sessionId]: _, ...rest } = state.sessions;
+      return { sessions: rest };
+    });
   },
 }));
