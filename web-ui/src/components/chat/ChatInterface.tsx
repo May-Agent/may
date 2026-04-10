@@ -37,6 +37,11 @@ import {
 import { ChatHeader } from "./ChatHeader";
 import { Composer } from "./Composer";
 import {
+  buildAttachmentFromFile,
+  buildAttachmentFromPastedFile,
+  buildAttachmentFromPastedText,
+} from "@/lib/attachments";
+import {
   createDisconnectBanner,
   collectRetryBatch,
   buildArtifactViewerHints,
@@ -2118,103 +2123,11 @@ export function ChatInterface({
     }
   };
 
-  const classifyFile = (file: File): Attachment["type"] => {
-    if (file.type.startsWith("image/")) return "image";
-    if (file.type === "application/pdf") return "pdf";
-    if (
-      file.type ===
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-      file.name.endsWith(".docx")
-    )
-      return "document";
-    if (
-      file.type === "text/plain" ||
-      file.name.endsWith(".txt") ||
-      file.name.endsWith(".md")
-    )
-      return "document";
-    return "file";
-  };
-
-  const readTextFile = async (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () =>
-        reject(
-          new Error(
-            `failed to read text file ${file.name}: ${
-              reader.error?.message ?? "unknown error"
-            }`,
-          ),
-        );
-      reader.readAsText(file);
-    });
-  };
-
-  const readFileAsDataUrl = async (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () =>
-        resolve(typeof reader.result === "string" ? reader.result : "");
-      reader.onerror = () =>
-        reject(
-          new Error(
-            `failed to read file ${file.name}: ${
-              reader.error?.message ?? "unknown error"
-            }`,
-          ),
-        );
-      reader.readAsDataURL(file);
-    });
-  };
-
-  const processDocxFile = async (file: File): Promise<string> => {
-    try {
-      const mammoth = await import("mammoth");
-      const arrayBuffer = await file.arrayBuffer();
-      const result = await mammoth.default.extractRawText({ arrayBuffer });
-      return result.value;
-    } catch (error) {
-      throw new Error(
-        `failed to parse DOCX ${file.name}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-  };
-
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files?.length) return;
     try {
       const files = Array.from(e.target.files!);
-      const newAttachments: Attachment[] = [];
-
-      for (const f of files) {
-        const fileType = classifyFile(f);
-        const att: Attachment = {
-          id: crypto.randomUUID(),
-          name: f.name,
-          type: fileType,
-          url: URL.createObjectURL(f),
-          uploadDataUrl: await readFileAsDataUrl(f),
-        };
-
-        if (fileType === "document") {
-          if (f.name.endsWith(".docx")) {
-            const text = await processDocxFile(f);
-            att.textContent = text;
-            att.textPreview = text.slice(0, 200);
-          } else {
-            const text = await readTextFile(f);
-            att.textContent = text;
-            att.textPreview = text.slice(0, 200);
-          }
-        }
-
-        newAttachments.push(att);
-      }
-
+      const newAttachments = await Promise.all(files.map(buildAttachmentFromFile));
       setAttachments((prev) => [...prev, ...newAttachments]);
       if (fileInputRef.current) fileInputRef.current.value = "";
     } catch (error) {
@@ -2240,35 +2153,17 @@ export function ChatInterface({
       e.preventDefault();
     }
 
-    const newAttachments: Attachment[] = [];
+    const fileItems = items
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file != null);
 
-    for (const item of items) {
-      if (item.kind !== "file") continue;
-      const file = item.getAsFile();
-      if (!file) continue;
-
-      const fileType = classifyFile(file);
-      const att: Attachment = {
-        id: crypto.randomUUID(),
-        name:
-          file.name || (fileType === "image" ? "Pasted Image" : "Pasted File"),
-        type: fileType,
-        url: URL.createObjectURL(file),
-        uploadDataUrl: await readFileAsDataUrl(file),
-      };
-      newAttachments.push(att);
-    }
+    const newAttachments = await Promise.all(
+      fileItems.map(buildAttachmentFromPastedFile),
+    );
 
     if (shouldAttachLargeText) {
-      const preview = text.slice(0, 200);
-      newAttachments.push({
-        id: crypto.randomUUID(),
-        name: "Pasted Text",
-        type: "document",
-        url: "",
-        textContent: text,
-        textPreview: preview,
-      });
+      newAttachments.push(buildAttachmentFromPastedText(text));
     }
 
     if (newAttachments.length > 0) {
