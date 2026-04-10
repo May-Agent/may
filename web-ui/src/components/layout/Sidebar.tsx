@@ -232,16 +232,17 @@ async function performDragTransfer(sourceData: SessionDragData, targetId: string
   const sessionId = sourceData.session.id;
   const sourceZone = sourceData.zone;
   const store = useStore.getState();
+  // Always read the latest runtime snapshot from the store at drop time.
+  // The drag-start snapshot may be stale by the time the drop lands,
+  // especially if the backend pushed a new runtime event mid-drag.
   const runtime = useRuntimeStore.getState().sessions[sessionId];
-  const fallbackRuntime = sourceData.session.runtime;
-  const runtimeState = runtime?.state ?? fallbackRuntime.state;
-  const planState = runtime?.planState ?? fallbackRuntime.planState;
-  const queuedCount = runtime?.queuedCount ?? fallbackRuntime.queuedCount;
-  const pendingImmediate = runtime?.pendingImmediate ?? fallbackRuntime.pendingImmediate;
-  const queuedMessages = runtime?.queuedMessages ?? fallbackRuntime.queuedMessages;
+  const runtimeState = runtime?.state ?? 'idle';
+  const planState = runtime?.planState ?? 'disabled';
+  const queuedCount = runtime?.queuedCount ?? 0;
+  const pendingImmediate = runtime?.pendingImmediate ?? null;
+  const queuedMessages = runtime?.queuedMessages ?? [];
   const browserTakeoverActive =
-    runtime?.interactions?.browser.takeoverActive
-    ?? fallbackRuntime.interactions?.browser.takeoverActive;
+    runtime?.interactions.browser.takeoverActive ?? false;
 
   // Dropped on a folder → move into folder (pin if needed)
   if (targetId.startsWith('folder-')) {
