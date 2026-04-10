@@ -32,12 +32,9 @@ import { useArtifactPanel } from "@/hooks/useArtifactPanel";
 import { useArtifactPanelResize } from "@/hooks/useArtifactPanelResize";
 import { useChatAutoScroll } from "@/hooks/useChatAutoScroll";
 import { useQueuedMessageActions } from "@/hooks/useQueuedMessageActions";
+import { useSettleOrphanedTimelines } from "@/hooks/useSettleOrphanedTimelines";
 import { useStreamController } from "@/hooks/useStreamController";
-import {
-  settleTimelineSegments,
-  summarizeTimelineSegments,
-  LONG_TEXT_THRESHOLD,
-} from "./chatUtils";
+import { LONG_TEXT_THRESHOLD } from "./chatUtils";
 
 import type {
   ArtifactPreviewTarget,
@@ -386,58 +383,12 @@ export function ChatInterface({
     }
   }, [currentSessionId]);
 
-  useEffect(() => {
-    if (!currentSessionId || messages.length === 0) {
-      return;
-    }
-    if (isGenerating || isSending || isStreamControllerActive) {
-      return;
-    }
-
-    const settledAt = Date.now();
-    let changed = false;
-    const nextMessages = messages.map((message) => {
-      if (message.role !== "assistant") {
-        return message;
-      }
-
-      const timeline = message.timelineSegments ?? [];
-      const hasRunningTimeline = timeline.some((segment) =>
-        segment.kind === "thinking"
-          ? segment.isRunning
-          : segment.kind === "terminal"
-            ? segment.commands.some((command) => command.status === "running")
-            : segment.tool.status === "running",
-      );
-      if (!message.isStreaming && !message.isThinking && !hasRunningTimeline) {
-        return message;
-      }
-
-      changed = true;
-      const settledTimeline = settleTimelineSegments(timeline, settledAt);
-      const { thinking, terminalExecutions } =
-        summarizeTimelineSegments(settledTimeline);
-      return {
-        ...message,
-        isStreaming: false,
-        isThinking: false,
-        timelineSegments: settledTimeline,
-        thinking,
-        terminalExecutions,
-      };
-    });
-
-    if (changed) {
-      replaceSessionMessages(currentSessionId, nextMessages);
-    }
-  }, [
+  useSettleOrphanedTimelines({
     currentSessionId,
-    isGenerating,
-    isSending,
-    isStreamControllerActive,
     messages,
+    isStreamActive: isGenerating || isSending || isStreamControllerActive,
     replaceSessionMessages,
-  ]);
+  });
 
   const { removeQueuedMessage, steerQueuedMessage } = useQueuedMessageActions({
     currentSessionId,
