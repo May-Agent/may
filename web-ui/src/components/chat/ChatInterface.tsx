@@ -7,15 +7,9 @@ import {
   type WorkspaceRequest,
 } from "@/lib/api";
 import { RightPanel } from "./RightPanel";
-import { ActivityRail } from "./ActivityRail";
-import {
-  PermissionPrompt,
-  WorkspacePrompt,
-  AskUserPrompt,
-  type AskUserState,
-} from "./PromptBanners";
+import { ComposerArea } from "./ComposerArea";
+import { type AskUserState } from "./PromptBanners";
 import { ChatHeader } from "./ChatHeader";
-import { Composer } from "./Composer";
 import { ChatMessageList } from "./ChatMessageList";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { TodoProgressBar, type TodoProgressState } from "./TodoProgressBar";
@@ -612,86 +606,66 @@ export function ChatInterface({
           )}
 
         {showComposer && (
-          <div className="shrink-0 px-4 pb-2 pt-2 bg-transparent w-full z-20 pointer-events-none">
-            <div className="max-w-3xl mx-auto w-full pointer-events-auto">
-              {pendingPermission && (
-                <PermissionPrompt
-                  request={pendingPermission}
-                  isSubmitting={isPermissionSubmitting}
-                  onDecide={(approved) => void handlePermissionDecision(approved)}
-                />
-              )}
-              {pendingWorkspace && (
-                <WorkspacePrompt
-                  request={pendingWorkspace}
-                  isSubmitting={isWorkspaceSubmitting}
-                  onDecide={(approved) => void handleWorkspaceDecision(approved)}
-                />
-              )}
-              {pendingAskUser && (
-                <AskUserPrompt
-                  state={pendingAskUser}
-                  isSubmitting={isAskUserSubmitting}
-                  onAnswerChange={handleAskUserAnswerChange}
-                  onSubmit={() => void handleAskUserSubmit()}
-                  onSkipAll={() => {
-                    const skipped = pendingAskUser.request.questions.map(
-                      (q) => ({
-                        section: q.section,
-                        answer: { kind: "skipped" as const },
-                      }),
-                    );
-                    void handleAskUserSubmit(skipped);
-                  }}
-                />
-              )}
-              {uiError && (
-                <div className="mb-3 rounded-lg border border-destructive bg-destructive px-3 py-2 text-sm text-destructive-foreground">
-                  {uiError}
-                </div>
-              )}
-              <ActivityRail
-                pendingMessages={queuedMessages}
-                runningCommands={runningTerminalCommands}
-                backgroundCommand={backgroundTerminalTask}
-                sessionId={currentSessionId}
-                onSteerMessage={steerQueuedMessage}
-                onRemoveMessage={removeQueuedMessage}
-              />
-              <Composer
-                inputValue={inputValue}
-                onInputChange={setInputValue}
-                placeholder={composerPlaceholder}
-                attachments={attachments}
-                onRemoveAttachment={handleRemoveAttachment}
-                onPaste={handlePaste}
-                onFileSelect={handleFileSelect}
-                fileInputRef={fileInputRef}
-                composerInputRef={composerInputRef}
-                isNewChat={isNewChat}
-                canSend={canSend}
-                onSend={() => void handleSend()}
-                onScreenshot={handleScreenshot}
-                currentModelId={currentModelId}
-                onModelChange={handleModelChange}
-                isModelUpdating={isModelUpdating}
-                isSending={isSending}
-                currentModelSupportsReasoning={currentModelSupportsReasoning}
-                currentReasoningEffort={currentReasoningEffort}
-                onReasoningEffortChange={handleReasoningEffortChange}
-                showTokenUsage={showTokenUsage}
-                currentSessionId={currentSessionId}
-                promptTokens={latestStats?.promptTokens}
-                contextUsedTokens={contextUsedTokens}
-                contextWindow={contextWindow}
-                contextUsagePercent={contextUsagePercent}
-                contextUsageTitle={contextUsageTitle}
-                showStopButton={showStopButton}
-                showSendButton={showComposerSendButton}
-                onStop={handleStop}
-              />
-            </div>
-          </div>
+          <ComposerArea
+            pendingPermission={pendingPermission}
+            pendingWorkspace={pendingWorkspace}
+            pendingAskUser={pendingAskUser}
+            isPermissionSubmitting={isPermissionSubmitting}
+            isWorkspaceSubmitting={isWorkspaceSubmitting}
+            isAskUserSubmitting={isAskUserSubmitting}
+            onPermissionDecision={(approved) =>
+              void handlePermissionDecision(approved)
+            }
+            onWorkspaceDecision={(approved) =>
+              void handleWorkspaceDecision(approved)
+            }
+            onAskUserAnswerChange={handleAskUserAnswerChange}
+            onAskUserSubmit={() => void handleAskUserSubmit()}
+            onAskUserSkipAll={() => {
+              if (!pendingAskUser) return;
+              const skipped = pendingAskUser.request.questions.map((q) => ({
+                section: q.section,
+                answer: { kind: "skipped" as const },
+              }));
+              void handleAskUserSubmit(skipped);
+            }}
+            uiError={uiError}
+            sessionId={currentSessionId}
+            queuedMessages={queuedMessages}
+            runningCommands={runningTerminalCommands}
+            backgroundCommand={backgroundTerminalTask}
+            onSteerMessage={steerQueuedMessage}
+            onRemoveMessage={removeQueuedMessage}
+            inputValue={inputValue}
+            onInputChange={setInputValue}
+            placeholder={composerPlaceholder}
+            attachments={attachments}
+            onRemoveAttachment={handleRemoveAttachment}
+            onPaste={handlePaste}
+            onFileSelect={handleFileSelect}
+            fileInputRef={fileInputRef}
+            composerInputRef={composerInputRef}
+            isNewChat={isNewChat}
+            canSend={canSend}
+            onSend={() => void handleSend()}
+            onScreenshot={() => void handleScreenshot()}
+            currentModelId={currentModelId}
+            onModelChange={handleModelChange}
+            isModelUpdating={isModelUpdating}
+            isSending={isSending}
+            currentModelSupportsReasoning={currentModelSupportsReasoning}
+            currentReasoningEffort={currentReasoningEffort}
+            onReasoningEffortChange={handleReasoningEffortChange}
+            showTokenUsage={showTokenUsage}
+            promptTokens={latestStats?.promptTokens}
+            contextUsedTokens={contextUsedTokens}
+            contextWindow={contextWindow}
+            contextUsagePercent={contextUsagePercent}
+            contextUsageTitle={contextUsageTitle}
+            showStopButton={showStopButton}
+            showSendButton={showComposerSendButton}
+            onStop={handleStop}
+          />
         )}
       </div>
       <RightPanel
