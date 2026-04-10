@@ -43,7 +43,6 @@ import {
   cloneTimelineSegments,
   collectTerminalExecutions,
   collectThinkingText,
-  closeThinkingSegment,
   isAnyThinkingRunning,
   timelineContainsStoppedWork,
 } from "@/lib/streamTimeline";
@@ -52,8 +51,12 @@ import {
   validateModelConfigured,
 } from "@/lib/streamValidation";
 import {
+  createStreamState,
+  createStreamEventHandlers,
+  type AssistantFinalizeUpdate,
+} from "@/lib/streamEventHandlers";
+import {
   collectRetryBatch,
-  parseToolResultPayload,
   settleTimelineSegments,
   summarizeTimelineSegments,
   ARTIFACT_PANEL_MIN_WIDTH,
@@ -70,8 +73,6 @@ import type {
   ArtifactPreviewTarget,
   Attachment,
   TerminalExecution,
-  ToolExecution,
-  TimelineSegment,
   SessionPlanState,
 } from "@/types";
 import { useRuntimeStore } from "@/lib/runtimeStore";
@@ -80,12 +81,6 @@ import {
   resolveWorkspaceSurfaceState,
 } from "@/lib/containerPrepare";
 import { getModel } from "@/lib/constants";
-import {
-  normalizeToolName,
-  isWebSearchToolName,
-  isWebFetchToolName,
-  parseTerminalToolStartArgs,
-} from "@/lib/parsers/toolRequest";
 
 interface ChatInterfaceProps {
   onToggleSidebar: () => void;
@@ -880,17 +875,15 @@ export function ChatInterface({
     const controller = new AbortController();
     abortControllerRef.current = controller;
     setIsStreamControllerActive(true);
-    let completedNormally = false;
     const assistantId = options?.retryAssistantId ?? `assistant-${Date.now()}`;
     let textFlushTimer: number | null = null;
-    let streamedText = "";
-    let timelineSegments: TimelineSegment[] = [];
-    setTodoProgress(null);
-    let activeThinkingSegmentId: string | null = null;
-    const terminalSegmentByToolId = new Map<string, string>();
-    const toolSegmentByToolId = new Map<string, string>();
-    let lastStreamEventKind: "reasoning" | "text" | "tool" | null = null;
     let lastTextFlushAt = 0;
+    setTodoProgress(null);
+
+    // Mutable stream state lives in a single object so the factory-built
+    // handlers can share it without closing over a dozen `let` bindings.
+    const streamState = createStreamState();
+
     const wasStoppedByUser = (): boolean =>
       controller.signal.aborted ||
       stopRequestedSessionIdsRef.current.has(sessionId);
@@ -903,9 +896,7 @@ export function ChatInterface({
         return;
       }
       const [draft] = pendingBatch;
-      if (!draft) {
-        return;
-      }
+      if (!draft) return;
       setInputValue(draft.content);
       setAttachments(draft.attachments);
     };
@@ -927,18 +918,6 @@ export function ChatInterface({
         return;
       }
       setUiError(message);
-    };
-
-    const closeActiveThinkingSegment = () => {
-      if (!activeThinkingSegmentId) {
-        return;
-      }
-      timelineSegments = closeThinkingSegment(
-        timelineSegments,
-        activeThinkingSegmentId,
-        Date.now(),
-      );
-      activeThinkingSegmentId = null;
     };
 
     try {
@@ -1015,8 +994,9 @@ export function ChatInterface({
         if (!latest) return;
 
         lastTextFlushAt = now;
-        const snapshotTimelineSegments =
-          cloneTimelineSegments(timelineSegments);
+        const snapshotTimelineSegments = cloneTimelineSegments(
+          streamState.timelineSegments,
+        );
         const snapshotTerminalExecutions = collectTerminalExecutions(
           snapshotTimelineSegments,
         );
@@ -1027,7 +1007,7 @@ export function ChatInterface({
             m.id === assistantId
               ? {
                   ...m,
-                  content: streamedText,
+                  content: streamState.streamedText,
                   isStreaming: true,
                   isThinking: isAnyThinkingRunning(snapshotTimelineSegments),
                   thinking: snapshotThinking,
@@ -1039,308 +1019,86 @@ export function ChatInterface({
         );
       };
 
-      await streamChat({
-        sessionId,
-        content: finalPrompt,
-        attachments: mergedAttachments,
-        signal: controller.signal,
-        onReasoning: (chunk) => {
-          const now = Date.now();
-          const shouldCreateSegment =
-            !activeThinkingSegmentId || lastStreamEventKind !== "reasoning";
-          if (shouldCreateSegment) {
-            const nextId = `thinking-${now}-${Math.random().toString(36).slice(2, 8)}`;
-            activeThinkingSegmentId = nextId;
-            timelineSegments = [
-              ...timelineSegments,
-              {
-                id: nextId,
-                kind: "thinking",
-                offset: streamedText.length,
-                content: chunk,
-                isRunning: true,
-                startedAt: now,
-              },
-            ];
-          } else {
-            timelineSegments = timelineSegments.map((segment) =>
-              segment.kind === "thinking" &&
-              segment.id === activeThinkingSegmentId
-                ? {
-                    ...segment,
-                    content: `${segment.content}${chunk}`,
-                    isRunning: true,
-                  }
-                : segment,
-            );
-          }
-          lastStreamEventKind = "reasoning";
-          flushAssistantText(true);
-        },
-        onToolStart: (tool: any) => {
-          const name = normalizeToolName(tool.name);
-          const toolId = tool.id ?? `tool-${Date.now()}`;
-          const serializedArguments =
-            typeof tool.arguments === "string"
-              ? tool.arguments
-              : JSON.stringify(tool.arguments ?? {});
-
-          if (name === "terminal") {
-            const args = parseTerminalToolStartArgs(tool.arguments);
-            closeActiveThinkingSegment();
-            const startedAt = Date.now();
-            const nextExec: TerminalExecution = {
-              id: toolId,
-              description: args.description,
-              input: args.script,
-              status: "running",
-              mode: args.mode ?? "default",
-              startedAt,
-            };
-
-            const lastSegment = timelineSegments[timelineSegments.length - 1];
-            const canAppendToBatch =
-              lastStreamEventKind === "tool" &&
-              lastSegment?.kind === "terminal" &&
-              lastSegment.offset === streamedText.length;
-
-            let segmentId: string;
-            if (canAppendToBatch && lastSegment.kind === "terminal") {
-              segmentId = lastSegment.id;
-              timelineSegments = timelineSegments.map((segment) =>
-                segment.kind === "terminal" && segment.id === segmentId
-                  ? {
-                      ...segment,
-                      startedAt: segment.startedAt ?? startedAt,
-                      endedAt: undefined,
-                      commands: [...segment.commands, nextExec],
-                    }
-                  : segment,
-              );
-            } else {
-              segmentId = `terminal-${toolId}`;
-              timelineSegments = [
-                ...timelineSegments,
-                {
-                  id: segmentId,
-                  kind: "terminal",
-                  offset: streamedText.length,
-                  commands: [nextExec],
-                  startedAt,
-                },
-              ];
-            }
-
-            terminalSegmentByToolId.set(toolId, segmentId);
-            lastStreamEventKind = "tool";
-            flushAssistantText(true);
-            return;
-          }
-
-          if (isWebSearchToolName(name) || isWebFetchToolName(name)) {
-            closeActiveThinkingSegment();
-            const startedAt = Date.now();
-            const nextTool: ToolExecution = {
-              id: toolId,
-              name,
-              request: serializedArguments,
-              status: "running",
-              startedAt,
-            };
-            const segmentId = `tool-${toolId}`;
-            timelineSegments = [
-              ...timelineSegments,
-              {
-                id: segmentId,
-                kind: "tool",
-                offset: streamedText.length,
-                tool: nextTool,
-              },
-            ];
-            toolSegmentByToolId.set(toolId, segmentId);
-            lastStreamEventKind = "tool";
-            flushAssistantText(true);
-          }
-        },
-        onToolEnd: (tool: any) => {
-          const toolId = typeof tool?.id === "string" ? tool.id : "";
-          if (!toolId) return;
-          const serializedArguments =
-            typeof tool?.arguments === "string"
-              ? tool.arguments
-              : JSON.stringify(tool?.arguments ?? {});
-          const endedAt = Date.now();
-          const { output, status } = parseToolResultPayload(tool.result);
-          const terminalSegmentId = terminalSegmentByToolId.get(toolId);
-          if (terminalSegmentId) {
-            timelineSegments = timelineSegments.map((segment) => {
-              if (segment.kind !== "terminal" || segment.id !== terminalSegmentId) {
-                return segment;
-              }
-              const nextCommands = segment.commands.map((command) =>
-                command.id === toolId
-                  ? {
-                      ...command,
-                      output,
-                      status,
-                      endedAt,
-                    }
-                  : command,
-              );
-              const runningLeft = nextCommands.some(
-                (command) => command.status === "running",
-              );
-              return {
-                ...segment,
-                commands: nextCommands,
-                endedAt: runningLeft ? undefined : endedAt,
-              };
-            });
-            lastStreamEventKind = "tool";
-            flushAssistantText(true);
-            return;
-          }
-
-          const toolSegmentId = toolSegmentByToolId.get(toolId);
-          if (!toolSegmentId) {
-            return;
-          }
-          timelineSegments = timelineSegments.map((segment) =>
-            segment.kind === "tool" && segment.id === toolSegmentId
+      // Apply a finalize update (from onDone or onPaused) to the session store.
+      const applyAssistantFinalize = (
+        update: AssistantFinalizeUpdate,
+        errorMessage?: string,
+      ) => {
+        const latest = useStore
+          .getState()
+          .sessions.find((s) => s.id === sessionId);
+        if (!latest) return;
+        replaceSessionMessages(
+          sessionId,
+          latest.messages.map((m) =>
+            m.id === assistantId
               ? {
-                  ...segment,
-                  tool: {
-                    ...segment.tool,
-                    request: segment.tool.request ?? serializedArguments,
-                    response: output,
-                    status,
-                    endedAt,
-                  },
+                  ...update.assistant,
+                  id: assistantId,
+                  content: update.finalContent,
+                  thinking: update.finalThinking,
+                  timelineSegments: update.finalTimelineSegments,
+                  isStreaming: false,
+                  isThinking: false,
+                  terminalExecutions: update.finalTerminalExecutions,
+                  error: errorMessage,
                 }
-              : segment,
-          );
-          lastStreamEventKind = "tool";
-          flushAssistantText(true);
-        },
+              : m,
+          ),
+        );
+      };
+
+      const clearTextFlushTimer = () => {
+        if (textFlushTimer != null) {
+          window.clearTimeout(textFlushTimer);
+          textFlushTimer = null;
+        }
+      };
+
+      const streamHandlers = createStreamEventHandlers({
+        sessionId,
+        assistantId,
+        state: streamState,
+        flushAssistantText,
+        wasStoppedByUser,
+        markRuntimeFirstToken,
         onTodoUpdate: (event) => {
           setTodoProgress(event);
         },
-        onText: (chunk) => {
-          closeActiveThinkingSegment();
-          streamedText += chunk;
-          lastStreamEventKind = "text";
-          markRuntimeFirstToken(sessionId);
-          flushAssistantText();
-        },
-        onDone: (assistant) => {
-          closeActiveThinkingSegment();
-          if (textFlushTimer != null) {
-            window.clearTimeout(textFlushTimer);
-            textFlushTimer = null;
-          }
-          const latest = useStore
-            .getState()
-            .sessions.find((s) => s.id === sessionId);
-          if (!latest) return;
-          const finalContent =
-            streamedText.trim().length > 0 ? streamedText : assistant.content;
-          const finalTimelineSegments =
-            timelineSegments.length > 0
-              ? cloneTimelineSegments(timelineSegments)
-              : cloneTimelineSegments(assistant.timelineSegments ?? []);
-          const finalThinking = collectThinkingText(finalTimelineSegments);
-          const finalTerminalExecutions = collectTerminalExecutions(
-            finalTimelineSegments,
-          );
-          const isEmptyResponse =
-            finalContent.trim().length === 0 &&
-            finalThinking.trim().length === 0 &&
-            finalTimelineSegments.length === 0;
-          completedNormally = !isEmptyResponse;
-
-          replaceSessionMessages(
-            sessionId,
-            latest.messages.map((m) =>
-              m.id === assistantId
-                ? {
-                    ...assistant,
-                    id: assistantId,
-                    content: finalContent,
-                    thinking: finalThinking,
-                    timelineSegments: finalTimelineSegments,
-                    isStreaming: false,
-                    isThinking: false,
-                    terminalExecutions: finalTerminalExecutions,
-                    error: isEmptyResponse
-                      ? "LLM endpoint error: empty assistant response"
-                      : undefined,
-                  }
-                : m,
-            ),
+        onAssistantFinalized: (update) => {
+          clearTextFlushTimer();
+          applyAssistantFinalize(
+            update,
+            update.isEmpty
+              ? "LLM endpoint error: empty assistant response"
+              : undefined,
           );
         },
-        onPaused: (assistant) => {
-          closeActiveThinkingSegment();
-          if (textFlushTimer != null) {
-            window.clearTimeout(textFlushTimer);
-            textFlushTimer = null;
-          }
-          completedNormally = true;
-          const latest = useStore
-            .getState()
-            .sessions.find((s) => s.id === sessionId);
-          if (!latest) {
+        onAssistantPaused: (update) => {
+          clearTextFlushTimer();
+          if (update == null) {
+            // Empty pause — drop the placeholder assistant message entirely.
+            const latest = useStore
+              .getState()
+              .sessions.find((s) => s.id === sessionId);
+            if (latest) {
+              replaceSessionMessages(
+                sessionId,
+                latest.messages.filter((m) => m.id !== assistantId),
+              );
+            }
             return;
           }
-          const finalTimelineSegments = cloneTimelineSegments(timelineSegments);
-          const finalThinking = collectThinkingText(finalTimelineSegments);
-          const finalTerminalExecutions = collectTerminalExecutions(
-            finalTimelineSegments,
-          );
-          const isEmptyPause =
-            assistant.content.trim().length === 0 &&
-            finalThinking.trim().length === 0 &&
-            finalTimelineSegments.length === 0;
-
-          if (isEmptyPause) {
-            replaceSessionMessages(
-              sessionId,
-              latest.messages.filter((m) => m.id !== assistantId),
-            );
-            return;
-          }
-
-          replaceSessionMessages(
-            sessionId,
-            latest.messages.map((m) =>
-              m.id === assistantId
-                ? {
-                    ...assistant,
-                    id: assistantId,
-                    content: assistant.content,
-                    thinking: finalThinking,
-                    timelineSegments: finalTimelineSegments,
-                    isStreaming: false,
-                    isThinking: false,
-                    terminalExecutions: finalTerminalExecutions,
-                    error: undefined,
-                  }
-                : m,
-            ),
-          );
+          applyAssistantFinalize(update, undefined);
         },
-        onError: (message) => {
-          if (wasStoppedByUser()) {
-            completedNormally = true;
-            return;
-          }
-          closeActiveThinkingSegment();
+        onStreamError: (message) => {
           const latest = useStore
             .getState()
             .sessions.find((s) => s.id === sessionId);
           if (latest) {
-            const snapshotTimelineSegments =
-              cloneTimelineSegments(timelineSegments);
+            const snapshotTimelineSegments = cloneTimelineSegments(
+              streamState.timelineSegments,
+            );
             replaceSessionMessages(
               sessionId,
               latest.messages.map((m) =>
@@ -1363,9 +1121,24 @@ export function ChatInterface({
           setUiError(`LLM endpoint error: ${message}`);
         },
       });
+
+      await streamChat({
+        sessionId,
+        content: finalPrompt,
+        attachments: mergedAttachments,
+        signal: controller.signal,
+        onReasoning: streamHandlers.onReasoning,
+        onToolStart: streamHandlers.onToolStart,
+        onToolEnd: streamHandlers.onToolEnd,
+        onTodoUpdate: streamHandlers.onTodoUpdate,
+        onText: streamHandlers.onText,
+        onDone: streamHandlers.onDone,
+        onPaused: streamHandlers.onPaused,
+        onError: streamHandlers.onError,
+      });
     } catch (error) {
       if (wasStoppedByUser()) {
-        completedNormally = true;
+        streamState.completedNormally = true;
         return;
       }
       if (!(error instanceof DOMException && error.name === "AbortError")) {
@@ -1382,14 +1155,14 @@ export function ChatInterface({
           return;
         }
         const message = error instanceof Error ? error.message : String(error);
-        closeActiveThinkingSegment();
         const errText = `LLM endpoint error: ${message}`;
         const latest = useStore
           .getState()
           .sessions.find((s) => s.id === sessionId);
         if (latest) {
-          const snapshotTimelineSegments =
-            cloneTimelineSegments(timelineSegments);
+          const snapshotTimelineSegments = cloneTimelineSegments(
+            streamState.timelineSegments,
+          );
           replaceSessionMessages(
             sessionId,
             latest.messages.map((m) =>
@@ -1429,9 +1202,10 @@ export function ChatInterface({
               message.id === assistantId &&
               timelineContainsStoppedWork(message.timelineSegments ?? []),
           );
-        const terminalError = !completedNormally && !stopRequestedByUser && !assistantStopped
-          ? "LLM endpoint error: stream terminated before a final assistant response"
-          : undefined;
+        const terminalError =
+          !streamState.completedNormally && !stopRequestedByUser && !assistantStopped
+            ? "LLM endpoint error: stream terminated before a final assistant response"
+            : undefined;
         replaceSessionMessages(
           sessionId,
           latest.messages.map((m) =>
