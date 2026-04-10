@@ -33,7 +33,7 @@ import { AttachmentCard } from "./AttachmentCard";
 import { ArtifactsSidebar } from "./ArtifactsSidebar";
 import { BrowserView } from "./BrowserView";
 import { ContextInspector } from "./ContextInspectorDialog";
-import { SessionActivityIsland } from "./SessionActivityIsland";
+import { ActivityRail } from "./ActivityRail";
 import {
   createDisconnectBanner,
   collectRetryBatch,
@@ -88,6 +88,12 @@ import {
   resolveWorkspaceSurfaceState,
 } from "@/lib/containerPrepare";
 import { getModel } from "@/lib/constants";
+import {
+  normalizeToolName,
+  isWebSearchToolName,
+  isWebFetchToolName,
+  parseTerminalToolStartArgs,
+} from "@/lib/parsers/toolRequest";
 
 interface AskUserState {
   request: AskUserRequest;
@@ -97,71 +103,6 @@ interface AskUserState {
 interface ChatInterfaceProps {
   onToggleSidebar: () => void;
   isSidebarOpen: boolean;
-}
-
-interface TerminalToolStartArgs {
-  description: string;
-  script: string;
-  mode?: TerminalExecution["mode"];
-}
-
-function normalizeToolName(rawName: unknown): string {
-  if (typeof rawName !== "string") {
-    return "";
-  }
-  return rawName.trim().toLowerCase();
-}
-
-function isWebSearchToolName(normalizedName: string): boolean {
-  return (
-    normalizedName === "websearch" ||
-    normalizedName.endsWith(".websearch") ||
-    normalizedName.endsWith("/websearch")
-  );
-}
-
-function isWebFetchToolName(normalizedName: string): boolean {
-  return (
-    normalizedName === "webfetch" ||
-    normalizedName.endsWith(".webfetch") ||
-    normalizedName.endsWith("/webfetch")
-  );
-}
-
-function isTerminalExecutionMode(value: unknown): value is TerminalExecution["mode"] {
-  return (
-    value === "default" ||
-    value === "sandboxed" ||
-    value === "unsafe" ||
-    value === "ssh"
-  );
-}
-
-function parseTerminalToolStartArgs(raw: unknown): TerminalToolStartArgs {
-  const parsed =
-    typeof raw === "string"
-      ? JSON.parse(raw)
-      : raw;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("terminal tool payload must be an object");
-  }
-  const record = parsed as Record<string, unknown>;
-  const description =
-    typeof record.description === "string" ? record.description.trim() : "";
-  if (!description) {
-    throw new Error("terminal tool payload is missing a non-empty description");
-  }
-  const script =
-    typeof record.script === "string"
-      ? record.script
-      : typeof record.command === "string"
-        ? record.command
-        : "";
-  if (!script) {
-    throw new Error("terminal tool payload is missing script");
-  }
-  const mode = isTerminalExecutionMode(record.mode) ? record.mode : undefined;
-  return { description, script, mode };
 }
 
 export function ChatInterface({
@@ -408,7 +349,13 @@ export function ChatInterface({
     !!browserStatus?.running &&
     !!currentSessionId &&
     (browserOwnedByCurrentSession || browserTakeoverOwnedByCurrentSession);
+  // Backend runtime state is the source of truth for whether the run is interruptible.
+  // Local flags only add transient UI states (sending in flight before runtime snapshot arrives).
+  const runtimeInterruptible =
+    runtimeSession != null &&
+    runtimeSession.state !== 'idle';
   const showStopButton =
+    runtimeInterruptible ||
     isGenerating ||
     isSending ||
     isStreamControllerActive ||
@@ -2099,15 +2046,26 @@ export function ChatInterface({
     ? "border-border bg-card text-foreground"
     : "";
 
-  const handleTitleSubmit = () => {
-    if (currentSessionId && titleInput.trim())
-      updateSessionTitle(currentSessionId, titleInput.trim());
-    setIsEditingTitle(false);
+  const handleTitleSubmit = async () => {
+    const trimmed = titleInput.trim();
+    if (!currentSessionId || !trimmed) {
+      setIsEditingTitle(false);
+      return;
+    }
+    try {
+      await updateSessionTitle(currentSessionId, trimmed);
+      setIsEditingTitle(false);
+    } catch (error) {
+      setUiError(
+        error instanceof Error ? error.message : 'Failed to update title',
+      );
+    }
   };
 
   const handleScreenshot = async () => {
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
+      stream = await navigator.mediaDevices.getDisplayMedia({
         video: { displaySurface: "browser" },
         audio: false,
         preferCurrentTab: true,
@@ -2121,7 +2079,6 @@ export function ChatInterface({
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       canvas.getContext("2d")?.drawImage(video, 0, 0);
-      stream.getTracks().forEach((t) => t.stop());
       setAttachments((prev) => [
         ...prev,
         {
@@ -2135,6 +2092,8 @@ export function ChatInterface({
       setUiError(
         `Screenshot failed: ${e instanceof Error ? e.message : String(e)}`,
       );
+    } finally {
+      stream?.getTracks().forEach((t) => t.stop());
     }
   };
 
@@ -2933,20 +2892,15 @@ export function ChatInterface({
                   {uiError}
                 </div>
               )}
+              <ActivityRail
+                pendingMessages={queuedMessages}
+                runningCommands={runningTerminalCommands}
+                backgroundCommand={backgroundTerminalTask}
+                sessionId={currentSessionId}
+                onSteerMessage={steerQueuedMessage}
+                onRemoveMessage={removeQueuedMessage}
+              />
               <div className="relative">
-                <div className="pointer-events-none absolute inset-x-0 top-0 z-10 -translate-y-1/2 px-3">
-                  <div className="ml-auto pointer-events-auto">
-                    <SessionActivityIsland
-                      pendingMessages={queuedMessages}
-                      runningCommands={runningTerminalCommands}
-                      backgroundCommand={backgroundTerminalTask}
-                      sessionId={currentSessionId}
-                      onSteerMessage={steerQueuedMessage}
-                      onRemoveMessage={removeQueuedMessage}
-                    />
-                  </div>
-                </div>
-
                 <div className="relative rounded-2xl border border-border/50 bg-background/60 backdrop-blur-xl">
                   {attachments.length > 0 && (
                     <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
