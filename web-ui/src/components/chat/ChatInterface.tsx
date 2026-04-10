@@ -26,13 +26,8 @@ import {
   type WorkspaceRequest,
 } from "@/lib/api";
 import { MessageItem } from "./MessageItem";
-import { ModelSelector } from "./ModelSelector";
-import { ReasoningEffortSelector } from "./ReasoningEffortSelector";
-import { AttachmentPreview } from "./AttachmentPreview";
-import { AttachmentCard } from "./AttachmentCard";
 import { ArtifactsSidebar } from "./ArtifactsSidebar";
 import { BrowserView } from "./BrowserView";
-import { ContextInspector } from "./ContextInspectorDialog";
 import { ActivityRail } from "./ActivityRail";
 import {
   PermissionPrompt,
@@ -41,6 +36,7 @@ import {
   type AskUserState,
 } from "./PromptBanners";
 import { ChatHeader } from "./ChatHeader";
+import { Composer } from "./Composer";
 import {
   createDisconnectBanner,
   collectRetryBatch,
@@ -57,24 +53,8 @@ import {
   type PreviewPaneState,
 } from "./chatUtils";
 
-import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  Send,
-  Plus,
-  X,
-  File,
-  Image as ImageIcon,
-  Monitor,
-  Square,
-  CircleX,
-} from "lucide-react";
+import { CircleX } from "lucide-react";
 import type {
   Artifact,
   ArtifactPreviewTarget,
@@ -249,7 +229,7 @@ export function ChatInterface({
       : workspaceSurface.state;
   const showComposer =
     chatSurfaceState === "welcome" || chatSurfaceState === "chat";
-  const hasInput = inputValue.trim() || attachments.length > 0;
+  const hasInput = inputValue.trim().length > 0 || attachments.length > 0;
   const configuredModelIds = (() => {
     const modelConfig = uiConfig.fullConfig?.models;
     if (!modelConfig) {
@@ -1038,6 +1018,52 @@ export function ChatInterface({
     },
     [queuedMessages, removeQueuedMessage],
   );
+
+  const handleModelChange = (id: string) => {
+    if (isNewChat) {
+      setNewChatModelId(id);
+      setIsModelUpdating(true);
+      void setLastModel(id)
+        .catch((error) => {
+          setUiError(
+            `Failed to update default model: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        })
+        .finally(() => {
+          setIsModelUpdating(false);
+        });
+      return;
+    }
+    if (!currentSessionId) {
+      return;
+    }
+    setIsModelUpdating(true);
+    void updateSessionModel(currentSessionId, id)
+      .catch((error) => {
+        setUiError(
+          `Failed to update session model: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      })
+      .finally(() => {
+        setIsModelUpdating(false);
+      });
+  };
+
+  const handleReasoningEffortChange = (effort: string | undefined) => {
+    if (isNewChat) {
+      setNewChatReasoningEffort(effort);
+    } else if (currentSessionId) {
+      updateSessionReasoningEffort(currentSessionId, effort);
+    }
+  };
+
+  const handleRemoveAttachment = (id: string) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  };
 
   const composerPlaceholder =
     queuedMessages.length > 0
@@ -2673,185 +2699,38 @@ export function ChatInterface({
                 onSteerMessage={steerQueuedMessage}
                 onRemoveMessage={removeQueuedMessage}
               />
-              <div className="relative">
-                <div className="relative rounded-2xl border border-border/50 bg-background/60 backdrop-blur-xl">
-                  {attachments.length > 0 && (
-                    <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
-                      {attachments.map((att) => (
-                        <div
-                          key={att.id}
-                          className="relative group flex-shrink-0"
-                        >
-                          <AttachmentPreview attachment={att}>
-                            <AttachmentCard attachment={att} variant="composer" />
-                          </AttachmentPreview>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setAttachments((prev) =>
-                                prev.filter((a) => a.id !== att.id),
-                              );
-                            }}
-                            className="absolute -top-1 -right-1 bg-destructive text-destructive-foreground rounded-full p-0.5 shadow-sm opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                          >
-                            <X className="h-3 w-3" />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  <Textarea
-                    ref={composerInputRef}
-                    value={inputValue}
-                    onChange={(e) => setInputValue(e.target.value)}
-                  onPaste={handlePaste}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      if (!canSend) return;
-                      void handleSend();
-                    }
-                  }}
-                    placeholder={composerPlaceholder}
-                    className="min-h-[60px] max-h-[200px] w-full resize-none border-0 bg-transparent px-3 py-4 text-base shadow-none focus-visible:ring-0"
-                    rows={1}
-                    autoFocus={isNewChat}
-                  />
-
-                  <div className="flex items-center justify-between p-2 pl-3">
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="file"
-                        multiple
-                        className="hidden"
-                        ref={fileInputRef}
-                        onChange={handleFileSelect}
-                      />
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground"
-                          >
-                            <Plus className="h-5 w-5" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="start" className="w-48">
-                          <DropdownMenuItem
-                            onClick={() => fileInputRef.current?.click()}
-                          >
-                            <File className="mr-2 h-4 w-4" />
-                            Upload File
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            onClick={() => fileInputRef.current?.click()}
-                          >
-                            <ImageIcon className="mr-2 h-4 w-4" />
-                            Upload Photo
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={handleScreenshot}>
-                            <Monitor className="mr-2 h-4 w-4" />
-                            Take Screenshot
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <ModelSelector
-                        currentModelId={currentModelId}
-                        onModelChange={(id) => {
-                          if (isNewChat) {
-                            setNewChatModelId(id);
-                            setIsModelUpdating(true);
-                            void setLastModel(id)
-                              .catch((error) => {
-                                setUiError(
-                                  `Failed to update default model: ${
-                                    error instanceof Error
-                                      ? error.message
-                                      : String(error)
-                                  }`,
-                                );
-                              })
-                              .finally(() => {
-                                setIsModelUpdating(false);
-                              });
-                            return;
-                          }
-                          if (!currentSessionId) {
-                            return;
-                          }
-                          setIsModelUpdating(true);
-                          void updateSessionModel(currentSessionId, id)
-                            .catch((error) => {
-                              setUiError(
-                                `Failed to update session model: ${
-                                  error instanceof Error
-                                    ? error.message
-                                    : String(error)
-                                }`,
-                              );
-                            })
-                            .finally(() => {
-                              setIsModelUpdating(false);
-                            });
-                        }}
-                        disabled={isModelUpdating || isSending}
-                        isUpdating={isModelUpdating}
-                      />
-                      {currentModelSupportsReasoning && (
-                        <ReasoningEffortSelector
-                          value={currentReasoningEffort}
-                          onChange={(effort) => {
-                            if (isNewChat) {
-                              setNewChatReasoningEffort(effort);
-                            } else {
-                              updateSessionReasoningEffort(currentSessionId, effort);
-                            }
-                          }}
-                          disabled={isModelUpdating || isSending}
-                        />
-                      )}
-                      {showTokenUsage && (
-                        <ContextInspector
-                          currentSessionId={currentSessionId}
-                          promptTokens={latestStats?.promptTokens}
-                          contextUsedTokens={contextUsedTokens}
-                          contextWindow={contextWindow}
-                          contextUsagePercent={contextUsagePercent}
-                          contextUsageTitle={contextUsageTitle}
-                        />
-                      )}
-                      {showStopButton && (
-                        <Button
-                          onClick={handleStop}
-                          size="icon"
-                          variant="ghost"
-                          className="h-8 w-8 rounded-lg text-destructive hover:bg-destructive/10 hover:text-destructive"
-                        >
-                          <Square className="h-3.5 w-3.5 fill-current" />
-                        </Button>
-                      )}
-                      {showComposerSendButton && (
-                        <Button
-                          onClick={() => void handleSend()}
-                          disabled={!canSend}
-                          size="icon"
-                          className={
-                            canSend
-                              ? "h-8 w-8 rounded-lg bg-primary text-primary-foreground"
-                              : "h-8 w-8 rounded-lg bg-muted text-muted-foreground"
-                          }
-                        >
-                          <Send className="h-4 w-4" />
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </div>
+              <Composer
+                inputValue={inputValue}
+                onInputChange={setInputValue}
+                placeholder={composerPlaceholder}
+                attachments={attachments}
+                onRemoveAttachment={handleRemoveAttachment}
+                onPaste={handlePaste}
+                onFileSelect={handleFileSelect}
+                fileInputRef={fileInputRef}
+                composerInputRef={composerInputRef}
+                isNewChat={isNewChat}
+                canSend={canSend}
+                onSend={() => void handleSend()}
+                onScreenshot={handleScreenshot}
+                currentModelId={currentModelId}
+                onModelChange={handleModelChange}
+                isModelUpdating={isModelUpdating}
+                isSending={isSending}
+                currentModelSupportsReasoning={currentModelSupportsReasoning}
+                currentReasoningEffort={currentReasoningEffort}
+                onReasoningEffortChange={handleReasoningEffortChange}
+                showTokenUsage={showTokenUsage}
+                currentSessionId={currentSessionId}
+                promptTokens={latestStats?.promptTokens}
+                contextUsedTokens={contextUsedTokens}
+                contextWindow={contextWindow}
+                contextUsagePercent={contextUsagePercent}
+                contextUsageTitle={contextUsageTitle}
+                showStopButton={showStopButton}
+                showSendButton={showComposerSendButton}
+                onStop={handleStop}
+              />
             </div>
           </div>
         )}
