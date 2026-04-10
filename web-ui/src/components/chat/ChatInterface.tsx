@@ -40,6 +40,18 @@ import {
 } from "@/lib/attachments";
 import { useArtifactPanel } from "@/hooks/useArtifactPanel";
 import {
+  cloneTimelineSegments,
+  collectTerminalExecutions,
+  collectThinkingText,
+  closeThinkingSegment,
+  isAnyThinkingRunning,
+  timelineContainsStoppedWork,
+} from "@/lib/streamTimeline";
+import {
+  isRuntimeTargetBusy,
+  validateModelConfigured,
+} from "@/lib/streamValidation";
+import {
   collectRetryBatch,
   parseToolResultPayload,
   settleTimelineSegments,
@@ -719,38 +731,28 @@ export function ChatInterface({
       }
     }
     if (!requestedSessionId) {
-      const candidateModelId = newChatModelId.trim();
-      if (!candidateModelId) {
-        setUiError(
-          "No model configured. Please select a model before sending.",
-        );
-        return;
-      }
-      if (
-        configuredModelIds.size > 0 &&
-        !configuredModelIds.has(candidateModelId)
-      ) {
-        setUiError("Selected model is not available in the current profile.");
+      const validation = validateModelConfigured(
+        newChatModelId,
+        configuredModelIds,
+        "No model configured. Please select a model before sending.",
+        "Selected model is not available in the current profile.",
+      );
+      if (!validation.ok) {
+        setUiError(validation.error!);
         return;
       }
     } else {
       const targetSession = useStore
         .getState()
         .sessions.find((session) => session.id === requestedSessionId);
-      const targetModelId = targetSession?.model?.trim() ?? "";
-      if (!targetModelId) {
-        setUiError(
-          "No model configured for this session. Please select a model.",
-        );
-        return;
-      }
-      if (
-        configuredModelIds.size > 0 &&
-        !configuredModelIds.has(targetModelId)
-      ) {
-        setUiError(
-          "Session model is no longer available. Please choose another model.",
-        );
+      const validation = validateModelConfigured(
+        targetSession?.model,
+        configuredModelIds,
+        "No model configured for this session. Please select a model.",
+        "Session model is no longer available. Please choose another model.",
+      );
+      if (!validation.ok) {
+        setUiError(validation.error!);
         return;
       }
     }
@@ -768,11 +770,7 @@ export function ChatInterface({
     const targetRuntime = options?.sessionIdHint
       ? useRuntimeStore.getState().sessions[options.sessionIdHint]
       : runtimeSession;
-    const targetGenerating =
-      !!targetRuntime &&
-      (targetRuntime.state !== "idle" ||
-        targetRuntime.pendingImmediate != null ||
-        (targetRuntime.queuedMessages?.length ?? 0) > 0);
+    const targetGenerating = !!targetRuntime && isRuntimeTargetBusy(targetRuntime);
     const deliveryMode =
       options?.deliveryMode ?? (targetGenerating ? "queue" : "steer");
 
@@ -931,71 +929,14 @@ export function ChatInterface({
       setUiError(message);
     };
 
-    const cloneTimelineSegments = (
-      segments: TimelineSegment[],
-    ): TimelineSegment[] =>
-      segments.map((segment) =>
-        segment.kind === "terminal"
-          ? {
-              ...segment,
-              commands: segment.commands.map((command) => ({ ...command })),
-            }
-          : segment.kind === "tool"
-            ? {
-                ...segment,
-                tool: { ...segment.tool },
-              }
-            : { ...segment },
-      );
-
-    const collectTerminalExecutions = (
-      segments: TimelineSegment[],
-    ): TerminalExecution[] =>
-      segments.flatMap((segment) =>
-        segment.kind === "terminal"
-          ? segment.commands.map((command) => ({ ...command }))
-          : [],
-      );
-
-    const collectThinkingText = (segments: TimelineSegment[]): string =>
-      segments
-        .filter(
-          (
-            segment,
-          ): segment is Extract<TimelineSegment, { kind: "thinking" }> =>
-            segment.kind === "thinking",
-        )
-        .map((segment) => segment.content)
-        .join("\n\n")
-        .trim();
-
-    const timelineContainsStoppedWork = (segments: TimelineSegment[]): boolean =>
-      segments.some((segment) =>
-        segment.kind === "tool"
-          ? segment.tool.status === "stopped"
-          : segment.kind === "terminal"
-            ? segment.commands.some((command) => command.status === "stopped")
-            : false,
-      );
-
-    const isAnyThinkingRunning = (segments: TimelineSegment[]): boolean =>
-      segments.some(
-        (segment) => segment.kind === "thinking" && segment.isRunning,
-      );
-
     const closeActiveThinkingSegment = () => {
       if (!activeThinkingSegmentId) {
         return;
       }
-      const endedAt = Date.now();
-      timelineSegments = timelineSegments.map((segment) =>
-        segment.kind === "thinking" && segment.id === activeThinkingSegmentId
-          ? {
-              ...segment,
-              isRunning: false,
-              endedAt: segment.endedAt ?? endedAt,
-            }
-          : segment,
+      timelineSegments = closeThinkingSegment(
+        timelineSegments,
+        activeThinkingSegmentId,
+        Date.now(),
       );
       activeThinkingSegmentId = null;
     };
