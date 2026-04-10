@@ -240,13 +240,14 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
         ),
       }));
     } catch (error) {
-      if (previousModel) {
-        set((state) => ({
-          sessions: state.sessions.map((s) =>
-            s.id === sessionId ? { ...s, model: previousModel } : s,
-          ),
-        }));
-      }
+      // Always restore the prior value on failure, even if it was empty.
+      // Leaving the optimistic write in place would drift the UI from
+      // backend truth the moment the next session refresh arrives.
+      set((state) => ({
+        sessions: state.sessions.map((s) =>
+          s.id === sessionId ? { ...s, model: previousModel ?? '' } : s,
+        ),
+      }));
       throw error;
     }
   },
