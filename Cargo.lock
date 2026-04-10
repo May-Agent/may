@@ -147,6 +147,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aither-browser"
+version = "0.1.0"
+dependencies = [
+ "aither-agent",
+ "aither-core",
+ "schemars 1.2.0",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "aither-claude"
 version = "0.1.0"
 dependencies = [
@@ -7015,6 +7026,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "aither-agent",
+ "aither-browser",
  "aither-cloud",
  "aither-copilot",
  "aither-core",
