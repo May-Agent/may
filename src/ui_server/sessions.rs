@@ -23,8 +23,8 @@ use super::model_resolution::{
 use super::state::UiServerState;
 use super::types::{
     ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, SessionContextDebugResponse,
-    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse, SessionTasksPayload,
-    UpdateSessionRequest,
+    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse,
+    SessionPlanStateRequest, SessionPlanStateResponse, SessionTasksPayload, UpdateSessionRequest,
 };
 
 fn session_not_found_error(session_id: &str) -> SkyError {
@@ -165,6 +165,26 @@ pub(super) async fn get_session_tasks(
     };
     Ok(Json(SessionTasksPayload {
         content,
+        plan_state: runtime.plan_state,
+    }))
+}
+
+/// Atomically set the plan state for a session without touching task content.
+///
+/// This is what the UI uses to toggle plan mode (enter/approve/reopen); it
+/// avoids the fetch-then-save race of the generic save_session_tasks path.
+pub(super) async fn set_session_plan_state(
+    params: Params,
+    Json(payload): Json<SessionPlanStateRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<SessionPlanStateResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let runtime = state
+        .runtime_service
+        .set_plan_state(&id, payload.plan_state)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(SessionPlanStateResponse {
         plan_state: runtime.plan_state,
     }))
 }
