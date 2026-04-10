@@ -2127,6 +2127,25 @@ export async function saveSessionTasks(
   );
 }
 
+/**
+ * Atomically set plan state without touching task content.
+ * This avoids the fetch-then-save race when only the plan state
+ * changes — the old path would overwrite concurrent content edits.
+ */
+export async function setSessionPlanState(
+  sessionId: string,
+  planState: SessionPlanState,
+): Promise<{ planState: SessionPlanState }> {
+  return request<{ planState: SessionPlanState }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/tasks/plan-state`,
+    {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ planState }),
+    },
+  );
+}
+
 // ── Scheduled Task API ──────────────────────────────────
 
 export async function fetchTasks(): Promise<ScheduledTask[]> {

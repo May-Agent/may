@@ -10,13 +10,12 @@ import {
   fetchSessionRuntime,
   isBrowserTakeoverActiveError,
   isSessionActiveConflictError,
-  fetchSessionTasks,
   enqueueChat,
   removePendingSessionMessage,
   respondAskUserRequest,
   respondPermissionRequest,
   respondWorkspaceRequest,
-  saveSessionTasks,
+  setSessionPlanState as apiSetSessionPlanState,
   stopSessionRun,
   streamChat,
   subscribeSessionArtifacts,
@@ -208,12 +207,12 @@ export function ChatInterface({
         return;
       }
       try {
-        const payload = await fetchSessionTasks(currentSessionId);
-        const saved = await saveSessionTasks(currentSessionId, {
-          content: payload.content,
-          planState: nextPlanState,
-        });
-        setSessionPlanState(currentSessionId, saved.planState);
+        // Atomic plan-state change — no fetch-then-save race.
+        const result = await apiSetSessionPlanState(
+          currentSessionId,
+          nextPlanState,
+        );
+        setSessionPlanState(currentSessionId, result.planState);
       } catch (error) {
         setUiError(error instanceof Error ? error.message : String(error));
       }
@@ -1195,6 +1194,9 @@ export function ChatInterface({
           const message =
             error instanceof Error ? error.message : String(error);
           setUiError(message);
+          // Restore the composer draft so the user can retry.
+          setInputValue(content);
+          setAttachments(atts);
         }
       }
       setIsSending(false);
@@ -1208,6 +1210,11 @@ export function ChatInterface({
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setUiError(message);
+        // Restore draft so user can retry after fixing the issue.
+        if (includeComposerInput) {
+          setInputValue(content);
+          setAttachments(atts);
+        }
         setIsSending(false);
         return;
       }

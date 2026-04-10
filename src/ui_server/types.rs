@@ -320,6 +320,18 @@ pub struct SessionTasksPayload {
     pub(crate) plan_state: SessionPlanState,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPlanStateRequest {
+    pub(crate) plan_state: SessionPlanState,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPlanStateResponse {
+    pub(crate) plan_state: SessionPlanState,
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiHealth {

@@ -288,7 +288,7 @@ fn api_routes() -> Route {
     use sessions::{
         create_session, delete_all_sessions, delete_session, get_session,
         get_session_context_debug, get_session_tasks, list_sessions, save_session_tasks,
-        update_session,
+        set_session_plan_state, update_session,
     };
     use tasks::{
         approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
@@ -316,6 +316,7 @@ fn api_routes() -> Route {
                         "".delete(delete_session),
                         "/tasks".at(get_session_tasks),
                         "/tasks".put(save_session_tasks),
+                        "/tasks/plan-state".put(set_session_plan_state),
                         "/stop".post(stop_session_run),
                         "/runtime".route(Route::new((
                             "".at(get_session_runtime),
