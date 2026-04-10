@@ -309,11 +309,7 @@ pub fn handle_skill_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAc
             }
             KeyCode::Enter => {
                 let filtered = app.filtered_skills();
-                if let Some(skill) = filtered.get(app.skill_selected) {
-                    let prefix = format!("Use {} skill, ", skill.name);
-                    let prefix_len = prefix.chars().count();
-                    app.input.insert_str(0, &prefix);
-                    app.cursor += prefix_len;
+                if filtered.get(app.skill_selected).is_some() {
                     app.mode = crate::tui::state::AppMode::Chat;
                     app.skill_search.clear();
                     app.skill_scroll = 0;

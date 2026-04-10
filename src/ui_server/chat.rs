@@ -2713,7 +2713,6 @@ mod tests {
                 checkpoint: aither_agent::AgentCheckpoint {
                     context: aither_agent::ContextCheckpoint::new(None, Vec::new()),
                     todo_items: Vec::new(),
-                    active_skill_names: Vec::new(),
                     tool_surface_hash: "abc123".to_string(),
                     context_window: aither_agent::ContextWindowSnapshot {
                         phase: aither_agent::ContextWindowPhase::Stable,

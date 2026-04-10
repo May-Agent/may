@@ -24,7 +24,6 @@ pub fn checkpoint_from_hook(ctx: &CheckpointContext<'_>) -> AgentCheckpoint {
     AgentCheckpoint {
         context: ctx.context.clone(),
         todo_items: ctx.todo_items.to_vec(),
-        active_skill_names: ctx.active_skill_names.to_vec(),
         tool_surface_hash: ctx.tool_surface_hash.to_string(),
         context_window: ctx.window.clone(),
         has_background_tasks: ctx.has_background_tasks,
