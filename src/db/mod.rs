@@ -4882,7 +4882,10 @@ mod tests {
             .await
             .expect("db should initialize successfully");
 
-        let model = db
+        // Whitespace-only ssh_server_id should be rejected at creation
+        // time by normalize_profile_preferences — we don't want the
+        // invalid row to persist in the first place.
+        let error = db
             .create_profile(CreateProfileParams {
                 id: "remote-profile",
                 name: "Remote",
@@ -4899,11 +4902,6 @@ mod tests {
                 }),
                 location_aware: false,
             })
-            .await
-            .expect("remote profile row should be stored");
-
-        let error = db
-            .profile_info_from_model(model)
             .await
             .expect_err("invalid remote preferences must fail fast");
         assert!(

@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn parse_tool_start_uses_actual_execution_mode() {
-        let args = r#"{"script":"echo hi","mode":"unsafe","timeout":5}"#;
+        let args = r#"{"description":"say hi","script":"echo hi","mode":"unsafe","timeout":5}"#;
         let start = parse_tool_start("terminal", args);
         match start {
             ToolStartKind::Terminal { command, mode } => {
