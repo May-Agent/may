@@ -5,6 +5,7 @@ use std::sync::{
 
 use aither_cloud::{CloudEmbedder, gemini::Gemini, openai::OpenAI};
 use aither_core::EmbeddingModel;
+use aither_search::SearchEmbeddingModel;
 
 use crate::config::{LoadBalanceStrategy, MayConfig, ProviderInstance, ProviderType};
 use crate::models::{ProviderModelFetchResult, fetch_models_by_provider};
@@ -140,6 +141,12 @@ impl EmbeddingModel for MayEmbeddingModel {
             }
             .into())
         }
+    }
+}
+
+impl SearchEmbeddingModel for MayEmbeddingModel {
+    fn selector(&self) -> &str {
+        self.selector()
     }
 }
 
