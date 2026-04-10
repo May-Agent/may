@@ -40,6 +40,7 @@ import {
   AskUserPrompt,
   type AskUserState,
 } from "./PromptBanners";
+import { ChatHeader } from "./ChatHeader";
 import {
   createDisconnectBanner,
   collectRetryBatch,
@@ -58,7 +59,6 @@ import {
 
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -70,12 +70,8 @@ import {
   Plus,
   X,
   File,
-  FileText,
-  Pencil,
   Image as ImageIcon,
   Monitor,
-  PanelLeft,
-  Share2,
   Square,
   CircleX,
 } from "lucide-react";
@@ -2396,94 +2392,35 @@ export function ChatInterface({
   return (
     <div className="flex flex-1 min-h-0 w-full min-w-0">
       <div className="relative flex flex-1 min-h-0 min-w-0 flex-col">
-        <div className="flex items-center justify-between p-4 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 z-10">
-          <div className="flex-1 flex justify-start">
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={onToggleSidebar}
-              className={
-                isNewChat
-                  ? "text-muted-foreground hover:text-foreground"
-                  : "text-muted-foreground hover:text-foreground hidden md:flex"
-              }
-              title={isSidebarOpen ? "Close sidebar" : "Open sidebar"}
-            >
-              <PanelLeft className="h-5 w-5" />
-            </Button>
-          </div>
-          <div className="flex items-center gap-2 min-w-0">
-            {!shouldShowWelcome &&
-              (isEditingTitle ? (
-                <Input
-                  ref={titleInputRef}
-                  value={titleInput}
-                  onChange={(e) => setTitleInput(e.target.value)}
-                  onBlur={handleTitleSubmit}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") handleTitleSubmit();
-                    if (e.key === "Escape") {
-                      setTitleInput(currentSession.title);
-                      setIsEditingTitle(false);
-                    }
-                  }}
-                  className="h-auto py-0 w-[300px] text-sm font-medium text-foreground text-center bg-transparent border-none focus-visible:ring-0 px-0"
-                />
-              ) : (
-                <div
-                  className="flex items-center gap-2 group cursor-pointer min-w-0"
-                  onClick={() => setIsEditingTitle(true)}
-                >
-                  <span className="text-sm font-medium text-foreground truncate max-w-[300px]">
-                    {currentSession.title}
-                  </span>
-                  <Pencil className="h-3 w-3 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-                </div>
-              ))}
-          </div>
-          <div className="flex-1 flex justify-end gap-1">
-            {!shouldShowWelcome && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
-                onClick={() => {
-                  const nextPlanState =
-                    currentPlanState === "disabled"
-                      ? "draft"
-                      : currentPlanState === "draft"
-                        ? "approved"
-                        : "draft";
-                  void handlePlanStateChange(nextPlanState);
-                }}
-                title={
-                  currentPlanState === "disabled"
-                    ? "Enter plan mode"
-                    : currentPlanState === "draft"
-                      ? "Approve plan"
-                      : "Reopen planning"
-                }
-              >
-                <FileText className="mr-1.5 h-4 w-4" />
-                {currentPlanState === "disabled"
-                  ? "Plan"
-                  : currentPlanState === "draft"
-                    ? "Approve"
-                    : "Reopen"}
-              </Button>
-            )}
-            {!shouldShowWelcome && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="text-muted-foreground hover:text-foreground"
-                title="Share chat"
-              >
-                <Share2 className="h-5 w-5" />
-              </Button>
-            )}
-          </div>
-        </div>
+        <ChatHeader
+          isSidebarOpen={isSidebarOpen}
+          onToggleSidebar={onToggleSidebar}
+          isNewChat={isNewChat}
+          shouldShowWelcome={shouldShowWelcome}
+          sessionTitle={currentSession?.title ?? ''}
+          isEditingTitle={isEditingTitle}
+          titleInput={titleInput}
+          titleInputRef={titleInputRef}
+          onTitleInputChange={setTitleInput}
+          onBeginEdit={() => setIsEditingTitle(true)}
+          onTitleSubmit={() => void handleTitleSubmit()}
+          onTitleCancel={() => {
+            if (currentSession) {
+              setTitleInput(currentSession.title);
+            }
+            setIsEditingTitle(false);
+          }}
+          planState={currentPlanState}
+          onPlanStateToggle={() => {
+            const nextPlanState =
+              currentPlanState === "disabled"
+                ? "draft"
+                : currentPlanState === "draft"
+                  ? "approved"
+                  : "draft";
+            void handlePlanStateChange(nextPlanState);
+          }}
+        />
 
         {chatSurfaceState === "container-preparing" ? (
           <div className="flex-1 min-h-0 px-4 pt-12">
