@@ -7,14 +7,14 @@ use aither_agent::websearch::WebSearchTool;
 use aither_core::LanguageModel;
 use aither_core::llm::{Tool, tool::ToolDefinition};
 use aither_sandbox::{TerminalToolFactory, ToolRegistryBuilder};
+use aither_search::{SearchEmbeddingResolution, SearchTool};
 
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
-use crate::agent::search_tool::SearchTool;
 use crate::agent::session_tool::SessionTool;
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
-use crate::embedding_provider::EmbeddingModelResolution;
+use crate::embedding_provider::{EmbeddingModelResolution, MayEmbeddingModel};
 use crate::mcp::load_active_mcp_connections;
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
@@ -63,7 +63,10 @@ where
     register_tool_with_description(
         builder,
         &mut descriptions,
-        SearchTool::new(config.sandbox_dir.clone(), config.search_embedder.clone()),
+        SearchTool::new(
+            config.sandbox_dir.clone(),
+            to_search_embedding_resolution(config.search_embedder.clone()),
+        ),
     );
 
     if let Some(task_broker) = config.task_broker {
@@ -152,6 +155,18 @@ where
     }
 
     Ok(descriptions)
+}
+
+fn to_search_embedding_resolution(
+    resolution: EmbeddingModelResolution,
+) -> SearchEmbeddingResolution<MayEmbeddingModel> {
+    match resolution {
+        EmbeddingModelResolution::Disabled => SearchEmbeddingResolution::Disabled,
+        EmbeddingModelResolution::Failed(error) => {
+            SearchEmbeddingResolution::Failed(error.to_string())
+        }
+        EmbeddingModelResolution::Ready(model) => SearchEmbeddingResolution::Ready(model),
+    }
 }
 
 fn register_tool_with_description<T>(

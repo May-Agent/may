@@ -8,8 +8,6 @@ pub(crate) mod notify_tool;
 pub(crate) mod register_tool;
 pub mod runner;
 mod search_match;
-pub(crate) mod search_tool;
-mod search_tool_tests;
 pub mod session_tool;
 pub mod ssh_authorizer;
 pub(crate) mod task_tool;
