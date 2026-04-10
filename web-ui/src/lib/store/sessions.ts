@@ -112,11 +112,11 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
         console.error('failed to load models during app bootstrap', error);
       });
     } catch (error) {
+      // Keep loaded: false so a later refresh can retry bootstrap.
       set({
         backendUnavailableReason:
           backendUnavailableReasonFromError(error) ?? errorMessage(error),
         profileSessionsLoading: false,
-        loaded: true,
       });
     }
   },
@@ -200,6 +200,7 @@ export const createSessionsSlice: StateCreator<AppState, [], [], SessionsSlice> 
 
   deleteSession: async (sessionId) => {
     await api.removeSession(sessionId);
+    useRuntimeStore.getState().removeSession(sessionId);
     set((state) => {
       const sessions = state.sessions.filter((s) => s.id !== sessionId);
       const nextId =
