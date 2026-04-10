@@ -1,9 +1,7 @@
 import { Suspense, lazy, memo, useState, useMemo, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { cn } from '@/lib/utils';
-import { fetchSessionTasks, saveSessionTasks } from '@/lib/api';
-import type { ArtifactPreviewTarget, Message, SessionPlanState } from '@/types';
-import { useStore } from '@/lib/store';
+import type { ArtifactPreviewTarget, Message } from '@/types';
 import { extractArtifactPreviewTargets, stripArtifactPreviewTags } from './chatUtils';
 import { AttachmentCard } from './AttachmentCard';
 import ReactMarkdown from 'react-markdown';
@@ -12,7 +10,7 @@ import {
   type TimelineDisplayItem,
   buildTimelineDisplayItems,
 } from '@/lib/timeline';
-import { RotateCcw, Download, Loader2 } from 'lucide-react';
+import { RotateCcw, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
 import { CopyButton } from './shared/CopyButton';
@@ -22,6 +20,7 @@ import { ThinkingTimeline } from './timeline/ThinkingTimeline';
 import { WebSearchTimeline } from './timeline/WebSearchTimeline';
 import { WebFetchTimeline } from './timeline/WebFetchTimeline';
 import { BrowserTimeline } from './timeline/BrowserTimeline';
+import { TasksPanel } from './TasksPanel';
 
 const TASKS_TAG_PATTERN = /<tasks\s*\/>/i;
 const LazySyntaxCodeBlock = lazy(() => import('./SyntaxCodeBlock'));
@@ -97,14 +96,6 @@ export function MessageItem({
   const [expandedTimelineItemIds, setExpandedTimelineItemIds] = useState<Record<string, boolean>>({});
   const timelineExpansionOverridesRef = useRef<Record<string, boolean>>({});
   const [showTyping, setShowTyping] = useState(false);
-  const [tasksContent, setTasksContent] = useState("");
-  const [tasksDraft, setTasksDraft] = useState("");
-  const [tasksLoading, setTasksLoading] = useState(false);
-  const [tasksSaving, setTasksSaving] = useState(false);
-  const [tasksEditing, setTasksEditing] = useState(false);
-  const [tasksError, setTasksError] = useState<string | null>(null);
-  const [tasksPlanState, setTasksPlanState] = useState<SessionPlanState>('disabled');
-  const setSessionPlanState = useStore((state) => state.setSessionPlanState);
   const components = useMemo(
     () => makeComponents(isUser, isStreaming),
     [isUser, isStreaming]
@@ -169,61 +160,6 @@ export function MessageItem({
     const timer = window.setTimeout(() => setShowTyping(true), 1000);
     return () => window.clearTimeout(timer);
   }, [isStreaming, message.content, message.id, message.error]);
-
-  useEffect(() => {
-    if (!showsTasksTag || !sessionId) {
-      return;
-    }
-    let cancelled = false;
-    setTasksLoading(true);
-    setTasksError(null);
-    void fetchSessionTasks(sessionId)
-      .then((payload) => {
-        if (cancelled) return;
-        setTasksContent(payload.content);
-        setTasksDraft(payload.content);
-        setTasksPlanState(payload.planState);
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        setTasksError(error instanceof Error ? error.message : String(error));
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setTasksLoading(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId, showsTasksTag]);
-
-  const persistTasks = async (
-    content: string,
-    planState: SessionPlanState,
-    nextEditing: boolean,
-  ) => {
-    if (!sessionId) {
-      return;
-    }
-    setTasksSaving(true);
-    setTasksError(null);
-    try {
-      const payload = await saveSessionTasks(sessionId, {
-        content,
-        planState,
-      });
-      setTasksContent(payload.content);
-      setTasksDraft(payload.content);
-      setTasksPlanState(payload.planState);
-      setTasksEditing(nextEditing);
-      setSessionPlanState(sessionId, payload.planState);
-    } catch (error) {
-      setTasksError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setTasksSaving(false);
-    }
-  };
 
   useEffect(() => {
     if (isUser || !onOpenPreview || previewTargets.length === 0) return;
@@ -348,107 +284,7 @@ export function MessageItem({
           )}
 
           {!isUser && showsTasksTag && sessionId && (
-            <div className="not-prose mt-3 rounded-xl border border-border/70 bg-card/80 px-3 py-3">
-              <div className="mb-2 flex items-center justify-between gap-3">
-                  <div>
-                  <div className="text-sm font-medium text-foreground">tasks.md</div>
-                  <div className="text-xs text-muted-foreground">Session task plan exposed via `&lt;tasks /&gt;`</div>
-                  <div className="mt-1 text-[11px] uppercase tracking-[0.08em] text-muted-foreground">
-                    plan mode: {tasksPlanState}
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  {tasksPlanState === "disabled" && (
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="h-7 px-2 text-xs"
-                      disabled={tasksLoading || tasksSaving}
-                      onClick={() => {
-                        void persistTasks(tasksDraft, "draft", tasksEditing);
-                      }}
-                    >
-                      Enter Plan
-                    </Button>
-                  )}
-                  {tasksPlanState === "draft" && (
-                    <Button
-                      type="button"
-                      size="sm"
-                      className="h-7 px-2 text-xs"
-                      disabled={tasksLoading || tasksSaving}
-                      onClick={() => {
-                        void persistTasks(tasksDraft, "approved", tasksEditing);
-                      }}
-                    >
-                      Approve
-                    </Button>
-                  )}
-                  {tasksPlanState === "approved" && (
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="h-7 px-2 text-xs"
-                      disabled={tasksLoading || tasksSaving}
-                      onClick={() => {
-                        void persistTasks(tasksDraft, "draft", tasksEditing);
-                      }}
-                    >
-                      Reopen Plan
-                    </Button>
-                  )}
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="h-7 px-2 text-xs"
-                    disabled={tasksLoading || tasksSaving}
-                    onClick={() => {
-                      setTasksEditing((value) => !value);
-                      setTasksDraft(tasksContent);
-                    }}
-                  >
-                    {tasksEditing ? "Preview" : "Edit"}
-                  </Button>
-                  {tasksEditing && (
-                    <Button
-                      type="button"
-                      size="sm"
-                      className="h-7 px-2 text-xs"
-                      disabled={tasksSaving}
-                      onClick={() => {
-                        void persistTasks(tasksDraft, tasksPlanState, false);
-                      }}
-                    >
-                      {tasksSaving ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : null}
-                      Save
-                    </Button>
-                  )}
-                </div>
-              </div>
-              {tasksError && (
-                <div className="mb-2 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-xs text-destructive">
-                  {tasksError}
-                </div>
-              )}
-              {tasksLoading ? (
-                <div className="text-xs text-muted-foreground">Loading tasks.md…</div>
-              ) : tasksEditing ? (
-                <textarea
-                  value={tasksDraft}
-                  onChange={(event) => setTasksDraft(event.target.value)}
-                  className="min-h-[220px] w-full rounded-lg border border-border bg-background px-3 py-2 font-mono text-xs text-foreground outline-none focus:ring-2 focus:ring-ring"
-                />
-              ) : tasksContent.trim() ? (
-                <div className="rounded-lg border border-border/60 bg-background/70 px-3 py-2">
-                  <MemoMarkdown content={tasksContent} components={components} />
-                </div>
-              ) : (
-                <div className="text-xs text-muted-foreground">tasks.md is empty.</div>
-              )}
-            </div>
+            <TasksPanel sessionId={sessionId} markdownComponents={components} />
           )}
 
           {!isUser && previewTargets.length > 0 && (
