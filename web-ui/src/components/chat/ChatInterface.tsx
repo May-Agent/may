@@ -33,6 +33,7 @@ import {
 } from "@/lib/attachments";
 import { useArtifactPanel } from "@/hooks/useArtifactPanel";
 import { useArtifactPanelResize } from "@/hooks/useArtifactPanelResize";
+import { useChatAutoScroll } from "@/hooks/useChatAutoScroll";
 import { useStreamController } from "@/hooks/useStreamController";
 import {
   settleTimelineSegments,
@@ -109,9 +110,6 @@ export function ChatInterface({
   const [isAskUserSubmitting, setIsAskUserSubmitting] = useState(false);
   const [isBrowserOpen, setIsBrowserOpen] = useState(false);
   const [todoProgress, setTodoProgress] = useState<TodoProgressState | null>(null);
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const userScrolledUpRef = useRef(false);
-  const pendingInitialScrollRef = useRef(false);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
@@ -199,6 +197,17 @@ export function ChatInterface({
       : workspaceSurface.state;
   const showComposer =
     chatSurfaceState === "welcome" || chatSurfaceState === "chat";
+
+  const {
+    scrollContainerRef,
+    contentRef,
+    userScrolledUpRef,
+    onScroll: handleScroll,
+  } = useChatAutoScroll({
+    currentSessionId,
+    isChatSurfaceActive: chatSurfaceState === "chat",
+    messages,
+  });
   const hasInput = inputValue.trim().length > 0 || attachments.length > 0;
   const configuredModelIds = (() => {
     const modelConfig = uiConfig.fullConfig?.models;
@@ -386,63 +395,6 @@ export function ChatInterface({
   }, [currentSessionId]);
 
   useEffect(() => {
-    userScrolledUpRef.current = false;
-    pendingInitialScrollRef.current = currentSessionId != null;
-  }, [currentSessionId]);
-
-  // Auto-scroll: follow output unless user intentionally scrolled up.
-  const contentRef = useRef<HTMLDivElement>(null);
-
-  const scrollToBottom = () => {
-    const container = scrollContainerRef.current;
-    if (!container) return;
-    container.scrollTop = container.scrollHeight;
-  };
-
-  useEffect(() => {
-    if (
-      !currentSessionId ||
-      chatSurfaceState !== "chat" ||
-      !pendingInitialScrollRef.current
-    ) {
-      return;
-    }
-
-    let rafA = 0;
-    let rafB = 0;
-    rafA = requestAnimationFrame(() => {
-      scrollToBottom();
-      rafB = requestAnimationFrame(() => {
-        scrollToBottom();
-        userScrolledUpRef.current = false;
-        pendingInitialScrollRef.current = false;
-      });
-    });
-
-    return () => {
-      if (rafA) {
-        cancelAnimationFrame(rafA);
-      }
-      if (rafB) {
-        cancelAnimationFrame(rafB);
-      }
-    };
-  }, [chatSurfaceState, currentSessionId, messages.length]);
-
-  useEffect(() => {
-    const container = scrollContainerRef.current;
-    const content = contentRef.current;
-    if (!container || !content) return;
-
-    const observer = new ResizeObserver(() => {
-      if (userScrolledUpRef.current) return;
-      scrollToBottom();
-    });
-    observer.observe(content);
-    return () => observer.disconnect();
-  }, [currentSessionId]);
-
-  useEffect(() => {
     if (!currentSessionId || messages.length === 0) {
       return;
     }
@@ -494,33 +446,6 @@ export function ChatInterface({
     messages,
     replaceSessionMessages,
   ]);
-
-  const lastMessage = messages[messages.length - 1];
-  useEffect(() => {
-    if (userScrolledUpRef.current) return;
-    requestAnimationFrame(scrollToBottom);
-  }, [
-    currentSessionId,
-    messages.length,
-    lastMessage?.content,
-    lastMessage?.thinking,
-    lastMessage?.isStreaming,
-    lastMessage?.isThinking,
-  ]);
-
-  const handleScroll = () => {
-    if (pendingInitialScrollRef.current) {
-      return;
-    }
-    const el = scrollContainerRef.current;
-    if (!el) return;
-    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (distFromBottom > 150) {
-      userScrolledUpRef.current = true;
-    } else if (distFromBottom < 30) {
-      userScrolledUpRef.current = false;
-    }
-  };
 
   const removeQueuedMessage = useCallback(
     async (index: number) => {
