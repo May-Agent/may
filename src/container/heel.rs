@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use super::ContainerError;
-use crate::heel_release::{ensure_managed_heel_binary, linux_heel_asset_for_current_arch};
+use crate::heel::release::{ensure_managed_heel_binary, linux_heel_asset_for_current_arch};
 
 pub async fn ensure_container_heel_binary(may_dir: &Path) -> Result<(), ContainerError> {
     let asset = linux_heel_asset_for_current_arch()

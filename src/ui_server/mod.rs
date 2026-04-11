@@ -170,7 +170,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
             .map_err(|e| anyhow!("failed to initialize web push notifications: {e}"))?;
     let notification_manager = Arc::new(notification_manager);
     tracing::info!("Web Push notifications enabled");
-    let notification_service = Arc::new(crate::notification_service::NotificationService::new(
+    let notification_service = Arc::new(crate::notification::NotificationService::new(
         db_for_archive.clone(),
         notification_manager.clone(),
         ui_event_bus.clone(),

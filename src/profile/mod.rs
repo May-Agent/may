@@ -4,6 +4,11 @@
 //! - **Pinned section**: Pinned sessions and folders (folders group pinned sessions)
 //! - **Regular section**: Recent sessions grouped by time
 //! - **Archived section**: Auto-archived sessions (48h inactivity)
+//!
+//! The [`remote`] submodule handles typed parsing for profiles that
+//! bind to an SSH remote environment.
+
+pub mod remote;
 
 use crate::db::ChatDb;
 use crate::db::entity::profiles;
