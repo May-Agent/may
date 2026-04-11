@@ -2,8 +2,10 @@
 
 pub(crate) mod browser_tool;
 mod environment;
+mod imagine;
 mod may;
 pub(crate) mod notify_tool;
+mod permission;
 pub(crate) mod register_tool;
 pub mod runner;
 mod search_match;
@@ -16,10 +18,13 @@ pub use browser_tool::{
 };
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use may::{
-    AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, PermissionApprover,
-    PermissionHistoryMode, PermissionRequest, PermissionRequestMode, ResolvedProviderRuntime,
+    AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, ResolvedProviderRuntime,
     build_fast_provider_chain, generate_session_title, provider_candidate_count,
     resolve_provider_runtime,
+};
+pub use permission::{
+    PermissionApprover, PermissionHistoryMode, PermissionHistoryModeParseError, PermissionRequest,
+    PermissionRequestMode, PermissionRequestModeParseError,
 };
 pub use notify_tool::{NotifyArgs, NotifyBroker, NotifyResult, channel as notify_channel};
 pub use runner::{AgentHandle, AgentWorker, TuiEvent, spawn_worker};
