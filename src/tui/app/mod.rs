@@ -1,6 +1,8 @@
 //! Application state and logic.
 
+mod completion;
 mod config;
+mod model_picker;
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -10,7 +12,7 @@ use blocking::unblock;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use executor_core::spawn;
 
-use crate::config::{ModelTier, ProviderType, get_model_tier};
+use crate::config::{ModelTier, ProviderType};
 use crate::models::FetchedModel;
 use crate::profile::{PinnedItem, ProfileInfo, ProfileSessions};
 use crate::session::PendingUserMessageMode;
@@ -1351,94 +1353,6 @@ impl App {
         }
     }
 
-    /// Handle key in tier model picker mode.
-    fn handle_tier_model_picker_key(&mut self, code: KeyCode) -> AppResult<Option<SendAction>> {
-        match code {
-            KeyCode::Esc => {
-                // Cancel and go back to config
-                self.mode = AppMode::Config;
-                self.tier_picker_query.clear();
-            }
-            KeyCode::Enter => {
-                // Select model and add to tier
-                if let Some(&idx) = self.tier_picker_filtered.get(self.tier_picker_selected)
-                    && let Some(model) = self.tier_picker_models.get(idx)
-                    && let Some(tier) = self.tier_picker_tier
-                {
-                    self.config
-                        .models
-                        .add_model(tier, &model.id, &model.provider_id);
-                    self.persist_config_background();
-                }
-                self.mode = AppMode::Config;
-                self.tier_picker_query.clear();
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.tier_picker_selected = self.tier_picker_selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !self.tier_picker_filtered.is_empty() {
-                    self.tier_picker_selected =
-                        (self.tier_picker_selected + 1).min(self.tier_picker_filtered.len() - 1);
-                }
-            }
-            KeyCode::Backspace => {
-                self.tier_picker_query.pop();
-                self.update_tier_picker_filter();
-            }
-            KeyCode::Char(c) => {
-                self.tier_picker_query.push(c);
-                self.update_tier_picker_filter();
-            }
-            _ => {}
-        }
-        Ok(None)
-    }
-
-    /// Update tier picker filtered list based on query.
-    fn update_tier_picker_filter(&mut self) {
-        let query_lower = self.tier_picker_query.to_lowercase();
-        self.tier_picker_filtered = self
-            .tier_picker_models
-            .iter()
-            .enumerate()
-            .filter(|(_, model)| {
-                query_lower.is_empty() || model.id.to_lowercase().contains(&query_lower)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        // Reset selection if out of bounds
-        if self.tier_picker_selected >= self.tier_picker_filtered.len() {
-            self.tier_picker_selected = 0;
-        }
-    }
-
-    /// Open tier model picker for a specific tier.
-    /// Returns a receiver to poll for fetched models if async fetch was started.
-    pub fn open_tier_model_picker(
-        &mut self,
-        tier: ModelTier,
-    ) -> Option<Receiver<Vec<FetchedModel>>> {
-        self.tier_picker_tier = Some(tier);
-        self.tier_picker_query.clear();
-        self.tier_picker_selected = 0;
-        self.tier_picker_models.clear();
-        self.tier_picker_filtered.clear();
-        self.tier_picker_loading = true;
-        self.mode = AppMode::TierModelPicker;
-
-        // Create channel and spawn fetch task
-        let (tx, rx) = async_channel::bounded(1);
-        let config = self.config.clone();
-        spawn(async move {
-            let models = crate::models::fetch_all_models(&config).await;
-            let _ = tx.send(models).await;
-        })
-        .detach();
-
-        Some(rx)
-    }
-
     /// Queue a paste result to be handled by the main loop.
     pub fn enqueue_paste_result(&mut self, result: Result<ClipboardPasteResult, TuiError>) {
         self.pending_paste_results.push_back(result);
@@ -1507,94 +1421,6 @@ impl App {
         }
 
         Err(TuiError::EmptyPasteResult)
-    }
-
-    /// Handle fetched models from async task.
-    pub fn handle_fetched_models(&mut self, mut models: Vec<FetchedModel>) {
-        // Sort by tier relevance:
-        // 1. Models matching the current tier (from aither_models database)
-        // 2. Models in the database but not matching this tier
-        // 3. Unknown models (not in database)
-        let current_tier = self.tier_picker_tier;
-
-        models.sort_by(|a, b| {
-            let a_info = aither_models::lookup(&a.id);
-            let b_info = aither_models::lookup(&b.id);
-
-            // Check tier match
-            let a_tier_match = current_tier
-                .and_then(|tier| a_info.map(|info| get_model_tier(info.id()) == tier))
-                .unwrap_or(false);
-            let b_tier_match = current_tier
-                .and_then(|tier| b_info.map(|info| get_model_tier(info.id()) == tier))
-                .unwrap_or(false);
-
-            // Priority: tier match > in database > unknown
-            match (a_tier_match, b_tier_match) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => match (a_info.is_some(), b_info.is_some()) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.id.cmp(&b.id),
-                },
-            }
-        });
-
-        // Dedupe by model ID (keep first occurrence which has correct provider)
-        let mut seen = std::collections::HashSet::new();
-        models.retain(|m| seen.insert(m.id.clone()));
-
-        self.tier_picker_models = models;
-        self.update_tier_picker_filter();
-        self.tier_picker_loading = false;
-    }
-
-
-    /// Handle key in model select popup.
-    fn handle_model_select_key(&mut self, code: KeyCode) -> AppResult<Option<SendAction>> {
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.model_select_index = self.model_select_index.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.model_select_index + 1 < self.model_select_list.len() {
-                    self.model_select_index += 1;
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(model) = self.model_select_list.get(self.model_select_index).cloned() {
-                    self.mode = AppMode::Chat;
-                    return Ok(Some(SendAction::SwitchModel(model)));
-                }
-            }
-            KeyCode::Esc => {
-                self.mode = AppMode::Chat;
-            }
-            _ => {}
-        }
-        Ok(None)
-    }
-
-    /// Collect all unique models from config for model select.
-    fn collect_all_models(&self) -> Vec<String> {
-        let mut models = Vec::new();
-        for m in &self.config.models.advanced {
-            if !models.contains(m) {
-                models.push(m.clone());
-            }
-        }
-        for m in &self.config.models.balanced {
-            if !models.contains(m) {
-                models.push(m.clone());
-            }
-        }
-        for m in &self.config.models.fast {
-            if !models.contains(m) {
-                models.push(m.clone());
-            }
-        }
-        models
     }
 
     /// Handle paste (Ctrl+V) - check for image or text in clipboard.
@@ -1852,98 +1678,6 @@ impl App {
         Some((prompt_tokens, context_window))
     }
 
-    /// Update completion state based on current input.
-    fn update_completion_state(&mut self) {
-        // Check for slash command at start
-        if self.input.starts_with('/') {
-            let query = &self.input[1..]; // Skip the /
-            if self.completion.mode == CompletionMode::Slash {
-                self.completion.update_query(query);
-            } else {
-                self.completion.start_slash(query);
-            }
-            return;
-        }
-
-        // Check for @ file mention - find the last @ that starts a mention
-        if let Some(at_char_pos) = self.find_active_mention() {
-            // Convert char index to byte index for safe slicing
-            let at_byte_pos = char_to_byte_index(&self.input, at_char_pos);
-            let query = &self.input[at_byte_pos + 1..]; // +1 is safe since @ is ASCII
-            if self.completion.mode == CompletionMode::File {
-                self.completion.update_query(query);
-            } else {
-                // Set up directories for file search
-                let workdir = std::env::current_dir().unwrap_or_default();
-                let sandbox = self
-                    .session_manager
-                    .current()
-                    .map_or_else(|| workdir.clone(), |s| s.sandbox_dir.clone());
-                self.completion.set_directories(workdir, sandbox);
-                self.completion.start_file(query);
-            }
-            return;
-        }
-
-        // No completion trigger found
-        if self.completion.is_active() {
-            self.completion.cancel();
-        }
-    }
-
-    /// Find the position of an active @ mention (one that's being typed).
-    fn find_active_mention(&self) -> Option<usize> {
-        // Look for @ that's not followed by whitespace and is at cursor or before it
-        let input_bytes: Vec<char> = self.input.chars().collect();
-        let mut last_at = None;
-
-        for (i, &c) in input_bytes.iter().enumerate() {
-            if c == '@' {
-                // Check if this @ is the start of a mention (not in middle of word)
-                let prev_is_space = i == 0 || input_bytes[i - 1].is_whitespace();
-                if prev_is_space {
-                    last_at = Some(i);
-                }
-            } else if c.is_whitespace() && last_at.is_some() {
-                // Space ends the current mention
-                last_at = None;
-            }
-        }
-
-        // Only return if cursor is within the mention
-        if let Some(pos) = last_at
-            && self.cursor > pos
-        {
-            return Some(pos);
-        }
-        None
-    }
-
-    /// Accept a completion and insert it into the input.
-    fn accept_completion(&mut self, insert: &str) {
-        match self.completion.mode {
-            CompletionMode::Slash => {
-                // Replace the entire input with the command
-                self.input = insert.to_string();
-                self.input_char_count = self.input.chars().count();
-                self.cursor = self.input_char_count;
-            }
-            CompletionMode::File => {
-                // Replace from @ to cursor with the file path
-                if let Some(at_pos) = self.find_active_mention() {
-                    // Build new input: before @ + @path + space
-                    let before: String = self.input.chars().take(at_pos).collect();
-                    let after: String = self.input.chars().skip(self.cursor).collect();
-                    self.input = format!("{before}@{insert} {after}");
-                    self.input_char_count = self.input.chars().count();
-                    // Position cursor after the inserted path + space
-                    self.cursor = at_pos + 1 + insert.chars().count() + 1;
-                }
-            }
-            CompletionMode::None => {}
-        }
-        self.completion.cancel();
-    }
 }
 
 /// Actions returned by event handling.
