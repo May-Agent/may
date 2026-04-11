@@ -848,22 +848,30 @@ enum ImagineToolError {
     WriteImage(std::io::Error),
 }
 
+/// Stable per-session system prefix managed by [`MayAgent`].
+///
+/// Each slot holds a pre-rendered string that is reconciled into the
+/// underlying [`aither_agent::Context`] as a raw-text persistent system
+/// block (see `insert_system_text`). Keeping the slots as pre-rendered
+/// strings means reconcile is a cheap set/unset operation with no
+/// additional templating cost and no XML wrapping.
 #[derive(Clone)]
 struct RuntimeSystemContext {
     memory_path: PathBuf,
     last_memory_content: String,
-    terminal_runtime: Option<TerminalRuntimeContext>,
-    workspace: Option<Workspace>,
-    remote_environment: Option<RemoteEnvironmentContext>,
-    container_environment: Option<ContainerEnvironmentContext>,
-    browser: Option<Browser>,
-    profile_persona: Option<ProfilePersona>,
-    profile_memories: Option<ProfileMemories>,
-    plan_mode: Option<PlanMode>,
-    network_restrictions: Option<NetworkRestrictions>,
-    location: Option<LocationContext>,
-    native_voice_input: Option<NativeVoiceInput>,
-    platform: Option<Platform>,
+    terminal_runtime: Option<String>,
+    workspace: Option<String>,
+    workspace_workdirs: Option<String>,
+    remote_environment: Option<String>,
+    container_environment: Option<String>,
+    browser: Option<String>,
+    profile_persona: Option<String>,
+    profile_memories: Option<String>,
+    plan_mode: Option<String>,
+    network_restrictions: Option<String>,
+    location: Option<String>,
+    native_voice_input: Option<String>,
+    platform: Option<String>,
 }
 
 impl RuntimeSystemContext {
@@ -873,6 +881,7 @@ impl RuntimeSystemContext {
             last_memory_content: memory_content,
             terminal_runtime: None,
             workspace: None,
+            workspace_workdirs: None,
             remote_environment: None,
             container_environment: None,
             browser: None,
@@ -886,84 +895,118 @@ impl RuntimeSystemContext {
         }
     }
 
-    fn with_terminal_runtime(mut self, terminal_runtime: TerminalRuntimeContext) -> Self {
+    fn with_terminal_runtime(mut self, terminal_runtime: String) -> Self {
         self.terminal_runtime = Some(terminal_runtime);
         self
     }
 
-    fn with_workspace(mut self, workspace: Workspace) -> Self {
+    fn with_workspace(mut self, workspace: String) -> Self {
         self.workspace = Some(workspace);
         self
     }
 
-    fn with_remote_environment(mut self, remote_environment: RemoteEnvironmentContext) -> Self {
+    fn with_workspace_workdirs(mut self, workdirs: String) -> Self {
+        self.workspace_workdirs = Some(workdirs);
+        self
+    }
+
+    fn with_remote_environment(mut self, remote_environment: String) -> Self {
         self.remote_environment = Some(remote_environment);
         self
     }
 
-    fn with_container_environment(
-        mut self,
-        container_environment: ContainerEnvironmentContext,
-    ) -> Self {
+    fn with_container_environment(mut self, container_environment: String) -> Self {
         self.container_environment = Some(container_environment);
         self
     }
 
-    fn with_browser(mut self, browser: Browser) -> Self {
+    fn with_browser(mut self, browser: String) -> Self {
         self.browser = Some(browser);
         self
     }
 
-    fn with_profile_persona(mut self, profile_persona: ProfilePersona) -> Self {
+    fn with_profile_persona(mut self, profile_persona: String) -> Self {
         self.profile_persona = Some(profile_persona);
         self
     }
 
-    fn with_profile_memories(mut self, profile_memories: ProfileMemories) -> Self {
+    fn with_profile_memories(mut self, profile_memories: String) -> Self {
         self.profile_memories = Some(profile_memories);
         self
     }
 
-    fn with_plan_mode(mut self, plan_mode: PlanMode) -> Self {
+    fn with_plan_mode(mut self, plan_mode: String) -> Self {
         self.plan_mode = Some(plan_mode);
         self
     }
 
-    fn with_network_restrictions(mut self, network_restrictions: NetworkRestrictions) -> Self {
+    fn with_network_restrictions(mut self, network_restrictions: String) -> Self {
         self.network_restrictions = Some(network_restrictions);
         self
     }
 
-    fn with_location(mut self, location: LocationContext) -> Self {
+    fn with_location(mut self, location: String) -> Self {
         self.location = Some(location);
         self
     }
 
-    fn with_native_voice_input(mut self, native_voice_input: NativeVoiceInput) -> Self {
+    fn with_native_voice_input(mut self, native_voice_input: String) -> Self {
         self.native_voice_input = Some(native_voice_input);
         self
     }
 
-    fn with_platform(mut self, platform: Platform) -> Self {
+    fn with_platform(mut self, platform: String) -> Self {
         self.platform = Some(platform);
         self
     }
 
     fn reconcile(&mut self, context: &mut aither_agent::Context) {
-        let memory = build_memory_context(&self.last_memory_content);
-        reconcile_system_block(context, Some(&memory));
-        reconcile_system_block(context, self.terminal_runtime.as_ref());
-        reconcile_system_block(context, self.workspace.as_ref());
-        reconcile_system_block(context, self.remote_environment.as_ref());
-        reconcile_system_block(context, self.container_environment.as_ref());
-        reconcile_system_block(context, self.browser.as_ref());
-        reconcile_system_block(context, self.profile_persona.as_ref());
-        reconcile_system_block(context, self.profile_memories.as_ref());
-        reconcile_system_block(context, self.plan_mode.as_ref());
-        reconcile_system_block(context, self.network_restrictions.as_ref());
-        reconcile_system_block(context, self.location.as_ref());
-        reconcile_system_block(context, self.native_voice_input.as_ref());
-        reconcile_system_block(context, self.platform.as_ref());
+        reconcile_text_block(
+            context,
+            tag::MEMORY,
+            Some(build_memory_context_content(&self.last_memory_content)),
+        );
+        reconcile_text_block(
+            context,
+            tag::TERMINAL_RUNTIME_CONTEXT,
+            self.terminal_runtime.clone(),
+        );
+        reconcile_text_block(context, tag::WORKSPACE, self.workspace.clone());
+        reconcile_text_block(
+            context,
+            tag::WORKSPACE_WORKDIRS,
+            self.workspace_workdirs.clone(),
+        );
+        reconcile_text_block(
+            context,
+            tag::REMOTE_ENVIRONMENT_CONTEXT,
+            self.remote_environment.clone(),
+        );
+        reconcile_text_block(
+            context,
+            tag::CONTAINER_ENVIRONMENT_CONTEXT,
+            self.container_environment.clone(),
+        );
+        reconcile_text_block(context, tag::BROWSER, self.browser.clone());
+        reconcile_text_block(context, tag::PROFILE_PERSONA, self.profile_persona.clone());
+        reconcile_text_block(
+            context,
+            tag::PROFILE_MEMORIES,
+            self.profile_memories.clone(),
+        );
+        reconcile_text_block(context, tag::PLAN_MODE, self.plan_mode.clone());
+        reconcile_text_block(
+            context,
+            tag::NETWORK_RESTRICTIONS,
+            self.network_restrictions.clone(),
+        );
+        reconcile_text_block(context, tag::LOCATION_CONTEXT, self.location.clone());
+        reconcile_text_block(
+            context,
+            tag::NATIVE_VOICE_INPUT,
+            self.native_voice_input.clone(),
+        );
+        reconcile_text_block(context, tag::PLATFORM, self.platform.clone());
     }
 
     async fn sync_memory_file(&mut self) {
@@ -979,13 +1022,14 @@ impl RuntimeSystemContext {
     }
 }
 
-fn reconcile_system_block<T: serde::Serialize>(
+fn reconcile_text_block(
     context: &mut aither_agent::Context,
-    value: Option<&T>,
+    tag: &'static str,
+    value: Option<String>,
 ) {
     match value {
-        Some(value) => context.insert_system(value),
-        None => context.remove_system::<T>(),
+        Some(content) => context.insert_system_text(tag, content),
+        None => context.remove_system_named(tag),
     }
 }
 
@@ -1310,39 +1354,34 @@ impl MayAgent {
             ))
             .agent_kind(AgentKind::Chatbot)
             .persona_prompt(include_str!("../../templates/system.md"))
-            .system(build_memory_context(&memory_content))
-            .system(terminal_runtime)
+            .system_text(tag::MEMORY, build_memory_context_content(&memory_content))
+            .system_text(tag::TERMINAL_RUNTIME_CONTEXT, terminal_runtime)
             .max_iterations(effective_max_iterations);
 
         if let Some(voice_hint) = build_native_voice_context(config.native_voice_input) {
             runtime_system_context =
                 runtime_system_context.with_native_voice_input(voice_hint.clone());
-            builder = builder.system(voice_hint);
+            builder = builder.system_text(tag::NATIVE_VOICE_INPUT, voice_hint);
         }
 
-        if let Some(ref persona) = config.profile_persona {
-            let profile_persona = ProfilePersona {
-                content: persona.clone(),
-            };
+        if let Some(persona_content) = config.profile_persona.clone() {
             runtime_system_context =
-                runtime_system_context.with_profile_persona(profile_persona.clone());
-            builder = builder.system(profile_persona);
+                runtime_system_context.with_profile_persona(persona_content.clone());
+            builder = builder.system_text(tag::PROFILE_PERSONA, persona_content);
         }
 
         if let Some(ref memories) = config.profile_memories
             && !memories.is_empty()
         {
-            let profile_memories = ProfileMemories {
-                content: memories.to_context_string(),
-            };
+            let profile_memories = memories.to_context_string();
             runtime_system_context =
                 runtime_system_context.with_profile_memories(profile_memories.clone());
-            builder = builder.system(profile_memories);
+            builder = builder.system_text(tag::PROFILE_MEMORIES, profile_memories);
         }
 
         if let Some(plan_mode) = build_plan_mode_context(config.plan_state) {
             runtime_system_context = runtime_system_context.with_plan_mode(plan_mode.clone());
-            builder = builder.system(plan_mode);
+            builder = builder.system_text(tag::PLAN_MODE, plan_mode);
         }
 
         if let Some(network_restrictions) =
@@ -1350,13 +1389,13 @@ impl MayAgent {
         {
             runtime_system_context =
                 runtime_system_context.with_network_restrictions(network_restrictions.clone());
-            builder = builder.system(network_restrictions);
+            builder = builder.system_text(tag::NETWORK_RESTRICTIONS, network_restrictions);
         }
 
         if let Some(ref location) = config.location {
             let location_context = build_location_context(location);
             runtime_system_context = runtime_system_context.with_location(location_context.clone());
-            builder = builder.system(location_context);
+            builder = builder.system_text(tag::LOCATION_CONTEXT, location_context);
         }
 
         let browser_enabled = config.browser_broker.is_some()
@@ -1380,7 +1419,8 @@ impl MayAgent {
                 let container_context = build_container_environment_context(&config.cwd);
                 runtime_system_context =
                     runtime_system_context.with_container_environment(container_context.clone());
-                builder = builder.system(container_context);
+                builder =
+                    builder.system_text(tag::CONTAINER_ENVIRONMENT_CONTEXT, container_context);
                 builder = builder.container_runtime(ContainerShellRuntime::new(
                     container_id,
                     container_ipc_host,
@@ -1400,25 +1440,30 @@ impl MayAgent {
                 let workspace_context = build_workspace_context(&workspace);
                 runtime_system_context =
                     runtime_system_context.with_workspace(workspace_context.clone());
-                builder = builder.system(workspace_context);
+                builder = builder.system_text(tag::WORKSPACE, workspace_context);
+                if let Some(workdirs_context) = build_workspace_workdirs_context(&workspace) {
+                    runtime_system_context = runtime_system_context
+                        .with_workspace_workdirs(workdirs_context.clone());
+                    builder = builder.system_text(tag::WORKSPACE_WORKDIRS, workdirs_context);
+                }
                 if let Some(macos_hint) = build_macos_host_automation_context() {
                     runtime_system_context =
                         runtime_system_context.with_platform(macos_hint.clone());
-                    builder = builder.system(macos_hint);
+                    builder = builder.system_text(tag::PLATFORM, macos_hint);
                 }
             }
             AgentEnvironment::Remote { ssh_server } => {
                 let remote_context = build_remote_environment_context(&workspace, &ssh_server);
                 runtime_system_context =
                     runtime_system_context.with_remote_environment(remote_context.clone());
-                builder = builder.system(remote_context);
+                builder = builder.system_text(tag::REMOTE_ENVIRONMENT_CONTEXT, remote_context);
             }
         }
 
         let browser_context =
             build_browser_context(browser_enabled, browser_cdp_endpoint.as_deref());
         runtime_system_context = runtime_system_context.with_browser(browser_context.clone());
-        builder = builder.system(browser_context);
+        builder = builder.system_text(tag::BROWSER, browser_context);
 
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
@@ -1959,20 +2004,33 @@ const NATIVE_VOICE_AVAILABLE_HINT: &str = "Native voice input is available in th
 const PLAN_MODE_DRAFT_HINT: &str = include_str!("../texts/plan_mode_draft.txt");
 const PLAN_MODE_APPROVED_HINT: &str = include_str!("../texts/plan_mode_approved.txt");
 
+/// Tag name constants for the stable system blocks managed by
+/// [`RuntimeSystemContext`]. Each tag is inserted with raw text content,
+/// with no XML wrapping, so these strings end up as the `IndexMap` keys
+/// in `aither_agent::Context::system_blocks` and as stable KV-cache
+/// prefix segments.
+mod tag {
+    pub const MEMORY: &str = "memory";
+    pub const TERMINAL_RUNTIME_CONTEXT: &str = "terminal_runtime_context";
+    pub const WORKSPACE: &str = "workspace";
+    pub const WORKSPACE_WORKDIRS: &str = "workspace_workdirs";
+    pub const REMOTE_ENVIRONMENT_CONTEXT: &str = "remote_environment_context";
+    pub const CONTAINER_ENVIRONMENT_CONTEXT: &str = "container_environment_context";
+    pub const BROWSER: &str = "browser";
+    pub const PROFILE_PERSONA: &str = "profile_persona";
+    pub const PROFILE_MEMORIES: &str = "profile_memories";
+    pub const PLAN_MODE: &str = "plan_mode";
+    pub const NETWORK_RESTRICTIONS: &str = "network_restrictions";
+    pub const LOCATION_CONTEXT: &str = "location_context";
+    pub const NATIVE_VOICE_INPUT: &str = "native_voice_input";
+    pub const PLATFORM: &str = "platform";
+}
+
 #[derive(Clone, Template)]
-#[template(path = "browser_context.xml", escape = "none")]
+#[template(path = "browser_context.txt", escape = "none")]
 struct BrowserTemplate {
     state: BrowserContextState,
     cdp_endpoint: Option<String>,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct Browser {
-    enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cdp_endpoint: Option<String>,
-    #[serde(rename = "$text")]
-    content: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1988,7 +2046,7 @@ impl BrowserContextState {
 }
 
 #[derive(Clone, Template)]
-#[template(path = "terminal_runtime_context.xml", escape = "none")]
+#[template(path = "terminal_runtime_context.txt", escape = "none")]
 struct TerminalRuntimeContextTemplate {
     model_id: String,
     home_environment_kind: String,
@@ -2003,29 +2061,21 @@ struct TerminalRuntimeContextTemplate {
     modality_support: Vec<String>,
 }
 
-#[derive(Clone, serde::Serialize)]
-struct TerminalRuntimeContext {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
 #[derive(Clone, Template)]
-#[template(path = "workspace_context.xml", escape = "none")]
+#[template(path = "workspace_context.txt", escape = "none")]
 struct WorkspaceTemplate {
     operating_system: String,
     sandbox: String,
     cwd: String,
-    permission_rules: Vec<String>,
+}
+
+#[derive(Clone, Template)]
+#[template(path = "workspace_workdirs.txt", escape = "none")]
+struct WorkspaceWorkdirsTemplate {
     workdirs: Vec<WorkspaceDirEntry>,
 }
 
-#[derive(Clone, serde::Serialize)]
-struct Workspace {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone)]
 struct WorkspaceDirEntry {
     path: String,
     description: String,
@@ -2043,87 +2093,21 @@ impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
     }
 }
 
-#[derive(Clone, serde::Serialize)]
-struct Memory {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct ProfilePersona {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct ProfileMemories {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct PlanMode {
-    #[serde(rename = "@state")]
-    state: String,
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct NetworkRestrictions {
-    mode: NetworkPolicyMode,
-    hosts: Vec<String>,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct LocationContext {
-    city: String,
-    region: String,
-    country: String,
-    timezone: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct NativeVoiceInput {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct Platform {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
 #[derive(Clone, Template)]
-#[template(path = "remote_environment_context.xml", escape = "none")]
+#[template(path = "remote_environment_context.txt", escape = "none")]
 struct RemoteEnvironmentContextTemplate {
     operating_system: String,
     sandbox: String,
     cwd: String,
     ssh_server_id: String,
     ssh_target: String,
-    permission_rules: Vec<String>,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct RemoteEnvironmentContext {
-    #[serde(rename = "$text")]
-    content: String,
 }
 
 #[derive(Clone, Template)]
-#[template(path = "container_environment_context.xml", escape = "none")]
+#[template(path = "container_environment_context.txt", escape = "none")]
 struct ContainerEnvironmentContextTemplate {
     operating_system: String,
     cwd: String,
-    permission_rules: Vec<String>,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct ContainerEnvironmentContext {
-    #[serde(rename = "$text")]
-    content: String,
 }
 
 #[derive(Clone)]
@@ -2156,7 +2140,7 @@ struct BaseSystemTemplate {
     subagents: Vec<BaseSystemSubagent>,
 }
 
-fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> Browser {
+fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> String {
     let state = if enabled {
         BrowserContextState::Enabled
     } else {
@@ -2166,20 +2150,16 @@ fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> Browser {
         state,
         cdp_endpoint: cdp_endpoint.map(str::to_string),
     };
-    Browser {
-        enabled,
-        cdp_endpoint: cdp_endpoint.map(str::to_string),
-        content: template
-            .render()
-            .unwrap_or_else(|error| panic!("failed to render browser context: {error}")),
-    }
+    template
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render browser context: {error}"))
 }
 
 fn build_terminal_runtime_context(
     config: &MayAgentConfig,
     session_paths: &SessionPaths,
     model_info: Option<&aither_models::ModelEntry>,
-) -> TerminalRuntimeContext {
+) -> String {
     let mut modality_support = Vec::new();
     if let Some(info) = model_info {
         modality_support.push(resolved_model_capability(info.id()));
@@ -2255,11 +2235,9 @@ fn build_terminal_runtime_context(
         environment_rules: environment_runtime_rules(&config.environment),
         modality_support,
     };
-    TerminalRuntimeContext {
-        content: template
-            .render()
-            .unwrap_or_else(|error| panic!("failed to render terminal runtime context: {error}")),
-    }
+    template
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render terminal runtime context: {error}"))
 }
 
 fn resolved_model_capability(model_id: &str) -> String {
@@ -2269,35 +2247,43 @@ fn resolved_model_capability(model_id: &str) -> String {
     text
 }
 
-fn build_workspace_context(workspace: &MayWorkspace) -> Workspace {
+fn build_workspace_context(workspace: &MayWorkspace) -> String {
     let template = WorkspaceTemplate {
         operating_system: operating_system_hint(&AgentEnvironment::Local).to_string(),
         sandbox: workspace.sandbox.display().to_string(),
         cwd: workspace.cwd.display().to_string(),
-        permission_rules: vec![
-            "You are on the user's real local machine inside the profile home environment.".to_string(),
-            "The session sandbox is the default writable workspace. Stay there unless there is a concrete reason to touch another host path.".to_string(),
-            "Within May-approved workspace roots you may read and write normally. Outside them, prefer inspection first and request approval before host-level side effects.".to_string(),
-            "Because this is the user's actual computer, treat destructive or irreversible commands as dangerous and seek approval before running them.".to_string(),
-        ],
-        workdirs: workspace
-            .config
-            .workdirs
-            .iter()
-            .map(WorkspaceDirEntry::from)
-            .collect(),
     };
-    Workspace {
-        content: template
-            .render()
-            .unwrap_or_else(|error| panic!("failed to render workspace context: {error}")),
+    template
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render workspace context: {error}"))
+}
+
+/// Builds the optional workspace_workdirs block from currently approved
+/// workspace grants. Split from [`build_workspace_context`] so that runtime
+/// workdir approvals can invalidate only this block and leave the stable
+/// workspace prefix cached.
+fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<String> {
+    let workdirs: Vec<WorkspaceDirEntry> = workspace
+        .config
+        .workdirs
+        .iter()
+        .map(WorkspaceDirEntry::from)
+        .collect();
+    if workdirs.is_empty() {
+        return None;
     }
+    let template = WorkspaceWorkdirsTemplate { workdirs };
+    Some(
+        template
+            .render()
+            .unwrap_or_else(|error| panic!("failed to render workspace workdirs context: {error}")),
+    )
 }
 
 fn build_remote_environment_context(
     workspace: &MayWorkspace,
     ssh_server: &crate::config::SshServerConfig,
-) -> RemoteEnvironmentContext {
+) -> String {
     let template = RemoteEnvironmentContextTemplate {
         operating_system: operating_system_hint(&AgentEnvironment::Remote {
             ssh_server: ssh_server.clone(),
@@ -2307,35 +2293,20 @@ fn build_remote_environment_context(
         cwd: workspace.cwd.display().to_string(),
         ssh_server_id: ssh_server.name.clone(),
         ssh_target: ssh_server.target.clone(),
-        permission_rules: vec![
-            "This profile's home environment is the bound SSH target, so unqualified terminal commands default to that remote machine.".to_string(),
-            "Treat the remote host as real infrastructure. Inspect before mutating, and ask for approval before privileged or potentially destructive changes.".to_string(),
-            "Remote shell, filesystem layout, and operating system details are not guaranteed. Detect them on-host before using shell-specific or OS-specific commands.".to_string(),
-        ],
     };
-    RemoteEnvironmentContext {
-        content: template
-            .render()
-            .unwrap_or_else(|error| panic!("failed to render remote environment context: {error}")),
-    }
+    template
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render remote environment context: {error}"))
 }
 
-fn build_container_environment_context(cwd: &std::path::Path) -> ContainerEnvironmentContext {
+fn build_container_environment_context(cwd: &std::path::Path) -> String {
     let template = ContainerEnvironmentContextTemplate {
         operating_system: "linux (managed container runtime)".to_string(),
         cwd: cwd.display().to_string(),
-        permission_rules: vec![
-            "This profile's home environment is a managed container rather than the user's host machine.".to_string(),
-            "Use terminal commands aggressively; the container filesystem is the primary writable workspace unless a specific command reports otherwise.".to_string(),
-            "Persist anything important into durable session directories such as data/, outputs/, files/, or artifacts/ because container-global state may disappear.".to_string(),
-            "Do not assume desktop automation or host-specific tools exist inside the container unless you verify them.".to_string(),
-        ],
     };
-    ContainerEnvironmentContext {
-        content: template.render().unwrap_or_else(|error| {
-            panic!("failed to render container environment context: {error}")
-        }),
-    }
+    template
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render container environment context: {error}"))
 }
 
 async fn build_base_system_prompt(
@@ -2454,67 +2425,56 @@ fn environment_runtime_rules(environment: &AgentEnvironment) -> Vec<String> {
     }
 }
 
-fn build_location_context(location: &crate::location::LocationInfo) -> LocationContext {
-    LocationContext {
-        city: location.city.clone(),
-        region: location.region.clone(),
-        country: location.country.clone(),
-        timezone: location.timezone.clone(),
-    }
+fn build_location_context(location: &crate::location::LocationInfo) -> String {
+    format!(
+        "Location hint (inferred):\nCity: {}\nRegion: {}\nCountry: {}\nTimezone: {}",
+        location.city, location.region, location.country, location.timezone,
+    )
 }
 
 fn build_memory_context_content(memory: &str) -> String {
-    join_text(&[MEMORY_CONTEXT_HINT.trim(), "\n\n", memory])
+    let mut out = String::with_capacity(MEMORY_CONTEXT_HINT.len() + memory.len() + 2);
+    out.push_str(MEMORY_CONTEXT_HINT.trim());
+    out.push_str("\n\n");
+    out.push_str(memory);
+    out
 }
 
-fn build_memory_context(memory: &str) -> Memory {
-    Memory {
-        content: build_memory_context_content(memory),
-    }
+fn build_native_voice_context(native_voice_input: bool) -> Option<String> {
+    native_voice_input.then(|| NATIVE_VOICE_AVAILABLE_HINT.to_string())
 }
 
-fn build_native_voice_context(native_voice_input: bool) -> Option<NativeVoiceInput> {
-    if native_voice_input {
-        Some(NativeVoiceInput {
-            content: NATIVE_VOICE_AVAILABLE_HINT.to_string(),
-        })
-    } else {
-        None
-    }
-}
-
-fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<PlanMode> {
+fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<String> {
     match plan_state {
         SessionPlanState::Disabled => None,
-        SessionPlanState::Draft => Some(PlanMode {
-            state: SessionPlanState::Draft.as_str().to_string(),
-            content: PLAN_MODE_DRAFT_HINT.to_string(),
-        }),
-        SessionPlanState::Approved => Some(PlanMode {
-            state: SessionPlanState::Approved.as_str().to_string(),
-            content: PLAN_MODE_APPROVED_HINT.to_string(),
-        }),
+        SessionPlanState::Draft => Some(PLAN_MODE_DRAFT_HINT.to_string()),
+        SessionPlanState::Approved => Some(PLAN_MODE_APPROVED_HINT.to_string()),
     }
 }
 
-fn build_network_restrictions_context(
-    policy: Option<&CompiledNetworkPolicy>,
-) -> Option<NetworkRestrictions> {
+fn build_network_restrictions_context(policy: Option<&CompiledNetworkPolicy>) -> Option<String> {
     let policy = policy?;
     if matches!(policy.mode(), NetworkPolicyMode::Disabled) {
         return None;
     }
-    Some(NetworkRestrictions {
-        mode: policy.mode(),
-        hosts: policy.hosts().to_vec(),
-    })
+    let mut out = format!(
+        "Network restrictions active for this session.\nMode: {}\n",
+        policy.mode().as_str(),
+    );
+    if !policy.hosts().is_empty() {
+        out.push_str("Hosts:\n");
+        for host in policy.hosts() {
+            out.push_str("- ");
+            out.push_str(host);
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
-fn build_macos_host_automation_context() -> Option<Platform> {
+fn build_macos_host_automation_context() -> Option<String> {
     if cfg!(target_os = "macos") && !is_running_in_container() {
-        return Some(Platform {
-            content: MACOS_HOST_AUTOMATION_HINT.to_string(),
-        });
+        return Some(MACOS_HOST_AUTOMATION_HINT.to_string());
     }
     None
 }
@@ -2587,7 +2547,7 @@ fn global_memory_file_path(may_dir: &std::path::Path) -> PathBuf {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{ProfilePersona, RuntimeSystemContext, Workspace, build_memory_context_content};
+    use super::{RuntimeSystemContext, build_memory_context_content, tag};
 
     #[test]
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
@@ -2598,26 +2558,19 @@ mod tests {
         let mut runtime_context =
             RuntimeSystemContext::new(memory_path, "remember this".to_string());
         let mut context = aither_agent::Context::default();
-        context.insert_system(&ProfilePersona {
-            content: "stale persona".to_string(),
-        });
-        context.insert_system(&Workspace {
-            content: "stale workspace".to_string(),
-        });
+        context.insert_system_text(tag::PROFILE_PERSONA, "stale persona");
+        context.insert_system_text(tag::WORKSPACE, "stale workspace");
 
         runtime_context.reconcile(&mut context);
 
-        assert!(context.has_system_block("memory"));
+        assert!(context.has_system_block(tag::MEMORY));
         let memory = context
             .system_blocks()
-            .get("memory")
+            .get(tag::MEMORY)
             .expect("memory block should be present");
-        assert!(
-            memory.contains(&build_memory_context_content("remember this")),
-            "unexpected memory block: {memory}"
-        );
-        assert!(!context.has_system_block("profile_persona"));
-        assert!(!context.has_system_block("workspace"));
+        assert_eq!(memory, &build_memory_context_content("remember this"));
+        assert!(!context.has_system_block(tag::PROFILE_PERSONA));
+        assert!(!context.has_system_block(tag::WORKSPACE));
     }
 
     #[test]
@@ -2637,12 +2590,9 @@ mod tests {
 
         let memory = context
             .system_blocks()
-            .get("memory")
+            .get(tag::MEMORY)
             .expect("memory block should be present");
-        assert!(
-            memory.contains(&build_memory_context_content("after")),
-            "unexpected memory block: {memory}"
-        );
+        assert_eq!(memory, &build_memory_context_content("after"));
     }
 
     #[test]
@@ -2653,20 +2603,48 @@ mod tests {
 
         let mut runtime_context =
             RuntimeSystemContext::new(memory_path, "remember this".to_string())
-                .with_terminal_runtime(super::TerminalRuntimeContext {
-                    content: "<terminal_runtime_context><model_id>demo-model</model_id></terminal_runtime_context>"
-                        .to_string(),
-                });
+                .with_terminal_runtime(
+                    "Model: demo-model\nHome environment kind: local".to_string(),
+                );
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
 
         let terminal_runtime = context
             .system_blocks()
-            .get("terminal_runtime_context")
+            .get(tag::TERMINAL_RUNTIME_CONTEXT)
             .expect("terminal runtime block should be present");
         assert!(
             terminal_runtime.contains("demo-model"),
             "unexpected terminal runtime block: {terminal_runtime}"
+        );
+        assert!(
+            !terminal_runtime.contains('<'),
+            "raw-text block must not contain XML tags: {terminal_runtime}"
+        );
+    }
+
+    #[test]
+    fn workspace_and_workdirs_are_reconciled_independently() {
+        let dir = tempdir().expect("temp dir should be created");
+        let memory_path = dir.path().join("MEMORY.md");
+        std::fs::write(&memory_path, "").expect("memory file should be written");
+
+        let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new())
+            .with_workspace("Workspace: local".to_string());
+        let mut context = aither_agent::Context::default();
+        runtime_context.reconcile(&mut context);
+        let without_workdirs_fingerprint = context.stable_prefix_fingerprint();
+
+        runtime_context = runtime_context
+            .with_workspace_workdirs("Approved workspace directories:\n- /foo".to_string());
+        runtime_context.reconcile(&mut context);
+
+        assert!(context.has_system_block(tag::WORKSPACE));
+        assert!(context.has_system_block(tag::WORKSPACE_WORKDIRS));
+        assert_ne!(
+            without_workdirs_fingerprint,
+            context.stable_prefix_fingerprint(),
+            "adding workdirs block must change the fingerprint",
         );
     }
 }
