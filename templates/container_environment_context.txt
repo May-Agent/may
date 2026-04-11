@@ -1,0 +1,5 @@
+Environment: container (managed runtime, not the user's host machine)
+Operating system: {{ operating_system }}
+Current working directory: {{ cwd }}
+
+This profile's home environment is a managed container rather than the user's host machine. Use terminal commands aggressively; the container filesystem is the primary writable workspace unless a specific command reports otherwise. Persist anything important into durable session directories such as data/, outputs/, files/, or artifacts/, because container-global state may disappear between runs. Do not assume desktop automation or host-specific tools exist inside the container unless you verify them.
