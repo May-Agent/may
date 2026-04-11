@@ -1,0 +1,1218 @@
+//! Main layout for the TUI.
+
+mod config;
+mod pickers;
+mod popups;
+
+use self::config::render_config_screen;
+use self::pickers::{
+    render_file_picker_popup, render_profile_select_popup, render_session_popup,
+};
+use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
+
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+};
+use unicode_width::UnicodeWidthChar;
+
+use ratatui::Frame;
+
+use super::super::app::App;
+use super::super::completion::CompletionMode;
+use super::super::state::{
+    AppMode, AskUserState, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode,
+    SkillAddMode, SshAddMode,
+};
+use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
+use crate::workspace_request::WorkspaceRequest;
+
+/// Convert character index to byte index for safe string slicing.
+pub(super) fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
+}
+
+/// Render the main layout.
+pub fn render(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+
+    // Full-screen modes (don't show chat behind them)
+    match &app.mode {
+        AppMode::Config => {
+            render_config_screen(frame, area, app);
+            return;
+        }
+        AppMode::TierModelPicker => {
+            // Render config screen as background, then tier picker as overlay
+            render_config_screen(frame, area, app);
+            render_tier_model_picker(frame, area, app);
+            return;
+        }
+        AppMode::CopilotAuth => {
+            render_copilot_auth_screen(frame, area, app);
+            return;
+        }
+        AppMode::PermissionConfirm(state) => {
+            render_permission_confirm(frame, area, state);
+            return;
+        }
+        AppMode::WorkspaceConfirm(state) => {
+            render_workspace_confirm(frame, area, &state.request);
+            return;
+        }
+        AppMode::AskUser(state) => {
+            render_ask_user(frame, area, state);
+            return;
+        }
+        _ => {}
+    }
+
+    // Scan chat content for images and request fetches for any not yet cached
+    app.scan_and_fetch_images();
+
+    // Build queue message previews
+    let queue_messages: Vec<String> = app
+        .queue
+        .iter()
+        .map(|message| {
+            let label = match message.delivery_mode {
+                crate::session::PendingUserMessageMode::Steer => "[steer] ",
+                crate::session::PendingUserMessageMode::Queue => "[queue] ",
+            };
+            let mut preview = String::from(label);
+            preview.push_str(message.content.as_str());
+            preview
+        })
+        .collect();
+
+    // Build usage info for status
+    let usage_info = app.usage.as_ref().and_then(|u| {
+        u.prompt_tokens
+            .map(|pt| (u64::from(pt), app.context_window.map(|w| u64::from(w))))
+    });
+
+    let images_supported = app.supports_images();
+    let chat_area = area;
+
+    // Collect image positions during rendering
+    let mut image_positions: Vec<(String, usize)> = Vec::new();
+
+    // Capture scroll value for image position calculations
+    let scroll = app.scroll;
+
+    // Render everything in a single unified scrollable area
+    chat::render_unified(
+        frame,
+        chat_area,
+        &app.chat,
+        scroll,
+        UnifiedRenderContext {
+            selected_tool: app.selected_tool.as_deref(),
+            content_height_out: Some(&app.content_height),
+            view_height_out: Some(&app.view_height),
+            input_ctx: Some(InputContext {
+                input: &app.input,
+                cursor: app.cursor,
+                attachments: &app.attachments,
+            }),
+            queue_ctx: if queue_messages.is_empty() {
+                None
+            } else {
+                Some(QueueContext {
+                    messages: &queue_messages,
+                })
+            },
+            status_ctx: Some(StatusContext {
+                model: &app.model_display(),
+                usage: usage_info,
+                queue_count: app.queue.len(),
+                background_tasks: app.background_tasks,
+                processing: app.processing,
+                status_message: app.status.as_deref(),
+                profile_name: app.current_profile_name(),
+            }),
+            images_supported,
+            image_positions_out: Some(&mut image_positions),
+        },
+    );
+
+    // Keep selection cache aligned with chat content and account for top padding.
+    let plain_all_lines = chat::build_plain_wrapped_lines_unified(
+        &app.chat,
+        chat_area.width,
+        if queue_messages.is_empty() {
+            None
+        } else {
+            Some(QueueContext {
+                messages: &queue_messages,
+            })
+        },
+        Some(InputContext {
+            input: &app.input,
+            cursor: app.cursor,
+            attachments: &app.attachments,
+        }),
+        Some(StatusContext {
+            model: &app.model_display(),
+            usage: usage_info,
+            queue_count: app.queue.len(),
+            background_tasks: app.background_tasks,
+            processing: app.processing,
+            status_message: app.status.as_deref(),
+            profile_name: app.current_profile_name(),
+        }),
+    );
+
+    let view_h = chat_area.height as usize;
+    app.render_top_padding = view_h.saturating_sub(plain_all_lines.len());
+    app.rendered_plain_lines = plain_all_lines;
+
+    if app.selection.is_some() {
+        render_text_selection_overlay(frame, chat_area, app);
+    }
+
+    // Render images as overlays at their scroll-adjusted positions
+    if images_supported && !image_positions.is_empty() {
+        render_inline_images(frame, chat_area, app, &image_positions, scroll);
+    }
+
+    // Render popups if in special modes
+    match app.mode {
+        AppMode::SessionSelect => {
+            render_session_popup(frame, area, app);
+        }
+        AppMode::FilePicker => {
+            render_file_picker_popup(frame, area, app);
+        }
+        AppMode::Help => {
+            render_help_popup(frame, area);
+        }
+        AppMode::ToolDetail => {
+            render_tool_detail_popup(frame, area, app);
+        }
+        AppMode::ModelSelect => {
+            render_model_select_popup(frame, area, app);
+        }
+        AppMode::McpManage => {
+            render_mcp_popup(frame, area, app);
+        }
+        AppMode::SshManage => {
+            render_ssh_popup(frame, area, app);
+        }
+        AppMode::SkillManage => {
+            render_skill_popup(frame, area, app);
+        }
+        AppMode::ProfileSelect => {
+            render_profile_select_popup(frame, area, app);
+        }
+        _ => {}
+    }
+
+    // Render completion overlay if active (always on top)
+    if app.completion.is_active() && !app.completion.is_empty() {
+        render_completion_overlay(frame, area, app);
+    }
+}
+
+fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(sel) = app.selection else {
+        return;
+    };
+    if sel.is_empty() || app.rendered_plain_lines.is_empty() {
+        return;
+    }
+
+    let (start, end) = sel.normalized();
+    let start_line = start
+        .line
+        .min(app.rendered_plain_lines.len().saturating_sub(1));
+    let end_line = end
+        .line
+        .min(app.rendered_plain_lines.len().saturating_sub(1));
+
+    let base_scroll = if app.scroll == usize::MAX {
+        app.content_height
+            .get()
+            .saturating_sub(app.view_height.get())
+    } else {
+        app.scroll
+    };
+
+    for line_idx in start_line..=end_line {
+        let visual_line = app.render_top_padding.saturating_add(line_idx);
+        if visual_line < base_scroll {
+            continue;
+        }
+
+        let y_in_view = visual_line - base_scroll;
+        if y_in_view >= area.height as usize {
+            continue;
+        }
+
+        let line = &app.rendered_plain_lines[line_idx];
+        let char_count = line.chars().count();
+        let from = if line_idx == start_line {
+            start.column.min(char_count)
+        } else {
+            0
+        };
+        let to = if line_idx == end_line {
+            end.column.min(char_count)
+        } else {
+            char_count
+        };
+        if to <= from {
+            continue;
+        }
+
+        let x0 = display_width_prefix(line, from).min(area.width as usize);
+        let x1 = display_width_prefix(line, to).min(area.width as usize);
+        if x1 <= x0 {
+            continue;
+        }
+
+        let rect = Rect::new(
+            area.x + x0 as u16,
+            area.y + y_in_view as u16,
+            (x1 - x0) as u16,
+            1,
+        );
+        frame
+            .buffer_mut()
+            .set_style(rect, Style::default().bg(Color::Rgb(70, 90, 130)));
+    }
+}
+
+pub(super) fn display_width_prefix(text: &str, char_count: usize) -> usize {
+    text.chars()
+        .take(char_count)
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
+        .sum()
+}
+
+/// Help text content.
+const HELP_TEXT: &str = include_str!("../help.txt");
+
+
+/// Render help popup.
+fn render_help_popup(frame: &mut Frame, area: Rect) {
+    let popup_area = centered_rect(70, 80, area);
+
+    // Clear background
+    frame.render_widget(Clear, popup_area);
+
+    let help = Paragraph::new(HELP_TEXT)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title("Help (press ? or Esc to close)"),
+        )
+        .style(Style::default().fg(Color::White))
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(help, popup_area);
+}
+
+/// Render tool detail popup (full screen).
+fn render_tool_detail_popup(frame: &mut Frame, area: Rect, app: &App) {
+    // Full screen popup
+    let popup_area = centered_rect(90, 90, area);
+
+    // Clear background
+    frame.render_widget(Clear, popup_area);
+
+    // Get the selected tool
+    if let Some(ref tool_id) = app.selected_tool
+        && let Some(display) = app.chat.get_tool(tool_id)
+    {
+        chat::render_tool_fullscreen(frame, popup_area, display, app.tool_detail_scroll);
+    }
+}
+
+/// Render tier model picker as a popup menu.
+fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::config::ModelTier;
+
+    let tier_name = match app.tier_picker_tier {
+        Some(ModelTier::Advanced) => "Advanced",
+        Some(ModelTier::Balanced) => "Balanced",
+        Some(ModelTier::Fast) => "Fast",
+        Some(ModelTier::ImageGeneration) => "Image Generation",
+        None => "Model",
+    };
+
+    // Create a popup area (60% width, 50% height, centered)
+    let popup_width = (area.width * 60 / 100).min(80).max(40);
+    let popup_height = (area.height * 50 / 100).min(20).max(10);
+    let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear the popup area
+    frame.render_widget(Clear, popup_area);
+
+    // Layout: Search + List
+    let inner_area = Rect::new(
+        popup_area.x + 1,
+        popup_area.y + 1,
+        popup_area.width.saturating_sub(2),
+        popup_area.height.saturating_sub(2),
+    );
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Search box
+            Constraint::Min(3),    // Model list
+        ])
+        .split(inner_area);
+
+    // Search box
+    let search_display = if app.tier_picker_query.is_empty() {
+        "Type to search...".to_string()
+    } else {
+        app.tier_picker_query.clone()
+    };
+    let search = Paragraph::new(search_display)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" Search "),
+        )
+        .style(if app.tier_picker_query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        });
+    frame.render_widget(search, chunks[0]);
+
+    // Model list or loading indicator
+    if app.tier_picker_loading {
+        let loading = Paragraph::new("Loading models...")
+            .style(Style::default().fg(Color::Yellow))
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(" Models "),
+            );
+        frame.render_widget(loading, chunks[1]);
+    } else {
+        // Show visible window of models (scrolling)
+        let visible_height = chunks[1].height.saturating_sub(2) as usize; // -2 for borders
+        let total = app.tier_picker_filtered.len();
+        let selected = app.tier_picker_selected;
+
+        // Calculate scroll offset to keep selected item visible
+        let scroll_offset = if selected >= visible_height {
+            selected - visible_height + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = app
+            .tier_picker_filtered
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(visible_height)
+            .map(|(display_idx, &model_idx)| {
+                let fetched = app.tier_picker_models.get(model_idx);
+                let model_id = fetched.map_or("", |m| m.id.as_str());
+                // Check if model matches tier (for visual indicator)
+                let info = aither_models::lookup(model_id);
+                let tier_match = app
+                    .tier_picker_tier
+                    .and_then(|tier| info.map(|i| crate::config::get_model_tier(i.id()) == tier))
+                    .unwrap_or(false);
+
+                let style = if display_idx == selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else if tier_match {
+                    Style::default().fg(Color::Green)
+                } else if info.is_some() {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let prefix = if display_idx == selected { "> " } else { "  " };
+                ListItem::new(format!("{prefix}{model_id}")).style(style)
+            })
+            .collect();
+
+        let title = if total > 0 {
+            format!(" {tier_name} ({total}) ")
+        } else {
+            format!(" {tier_name} (no models) ")
+        };
+
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        );
+        frame.render_widget(list, chunks[1]);
+    }
+
+    // Draw popup border
+    let title = format!(" Select {tier_name} Model ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    frame.render_widget(block, popup_area);
+}
+
+/// Render unified configuration screen (full screen) with tabs.
+
+/// Render model select popup (anchored near input area).
+fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
+    // Position popup near bottom of screen, left-aligned
+    let popup_height = (app.model_select_list.len() + 2).min(10) as u16;
+    let popup_width = 40.min(area.width);
+    let popup_x = area.x;
+    // Position near bottom, leaving space for status and input (2 lines from bottom)
+    let popup_y = area.y + area.height.saturating_sub(popup_height + 2);
+
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = app
+        .model_select_list
+        .iter()
+        .enumerate()
+        .map(|(idx, model)| {
+            let prefix = if idx == app.model_select_index {
+                "> "
+            } else {
+                "  "
+            };
+            // Check if this is current model
+            let current = app.current_model.as_deref().is_some_and(|m| m == model);
+            let suffix = if current { " (current)" } else { "" };
+            let text = format!("{prefix}{model}{suffix}");
+            let style = if idx == app.model_select_index {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Select Model"),
+    );
+    frame.render_widget(list, popup_area);
+}
+
+/// Helper to create a centered rect.
+pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+/// Create a centered rectangle with exact pixel dimensions.
+pub(super) fn centered_rect_exact(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
+/// Render Copilot OAuth authentication screen.
+fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
+    // Center the content
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Min(12),
+            Constraint::Percentage(25),
+        ])
+        .split(area);
+
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Min(50),
+            Constraint::Percentage(15),
+        ])
+        .split(chunks[1]);
+
+    let content = match &app.copilot_auth_status {
+        Some(CopilotAuthStatus::RequestingCode) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Requesting authorization code...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+            ]
+        }
+        Some(CopilotAuthStatus::WaitingForUser {
+            user_code,
+            verification_uri,
+        }) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "1. Open your browser and visit:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    format!("   {verification_uri}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "2. Enter the code:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    format!("   {user_code}"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Waiting for authorization...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter: open browser & copy code | Esc: cancel]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(CopilotAuthStatus::Success) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication successful!",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to continue]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(CopilotAuthStatus::Failed(error)) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication failed:",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  {error}"),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to go back]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        None => {
+            vec![Line::from("")]
+        }
+    };
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" GitHub Copilot Authentication ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+/// Render the workspace access confirmation dialog.
+fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRequest) {
+    // Clear background
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
+    // Center the dialog
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Min(10),
+            Constraint::Percentage(30),
+        ])
+        .split(area);
+
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Min(50),
+            Constraint::Percentage(15),
+        ])
+        .split(chunks[1]);
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "The agent is requesting access to:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", request.args.request.path.as_str()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Reason:", Style::default().fg(Color::White))),
+        Line::from(Span::styled(
+            format!("  {}", request.args.request.reason.as_str()),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
+            Span::styled("Approve", Style::default().fg(Color::White)),
+            Span::raw("    "),
+            Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
+            Span::styled("Deny", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Workspace Access Request ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+fn render_permission_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    state: &crate::tui::state::PermissionConfirmState,
+) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Min(12),
+            Constraint::Percentage(25),
+        ])
+        .split(area);
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(12),
+            Constraint::Min(60),
+            Constraint::Percentage(12),
+        ])
+        .split(chunks[1]);
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "The agent is requesting elevated terminal access:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  mode: {}", state.request.mode.as_str()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Script:", Style::default().fg(Color::White))),
+        Line::from(Span::styled(
+            format!("  {}", state.request.script.as_str()),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
+            Span::styled("Approve", Style::default().fg(Color::White)),
+            Span::raw("    "),
+            Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
+            Span::styled("Deny", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::LightRed))
+                .title(" Permission Request ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+/// Render MCP server management popup.
+/// Render the `AskUser` dialog as a bottom overlay.
+fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
+    let Some(question) = state.current() else {
+        return;
+    };
+    let Some(qs) = state.current_state() else {
+        return;
+    };
+
+    // Item count: options + Skip + Custom answer
+    let opt_count = question.option.len();
+    let total_items = opt_count + 2;
+
+    // Calculate overlay height: question(2) + items + custom_input?(1) + help(1) + border(2)
+    let custom_line = u16::from(qs.custom_mode);
+    let max_height = (area.height * 60) / 100;
+    let needed = 2 + total_items as u16 + custom_line + 1 + 2;
+    let height = needed.min(max_height);
+
+    // Bottom-anchored overlay
+    let overlay = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(height),
+        area.width,
+        height,
+    );
+    frame.render_widget(Clear, overlay);
+
+    // Build section tabs line for multi-question
+    let mut title_spans: Vec<Span> = Vec::new();
+    if state.is_multi() {
+        for (i, q) in state.questions.iter().enumerate() {
+            let label = if q.section.is_empty() {
+                format!(" {} ", i + 1)
+            } else {
+                format!(" {} ", q.section)
+            };
+            if i == state.current_question {
+                title_spans.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                title_spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+            }
+            if i + 1 < state.questions.len() {
+                title_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            }
+        }
+    }
+
+    let border_title = if state.is_multi() {
+        Line::from(title_spans)
+    } else if question.multi_select {
+        Line::from(" Multiple Choice ")
+    } else {
+        Line::from(" Single Choice ")
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(border_title)
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    // Layout inner: question + items + optional custom input + help
+    let mut constraints = vec![
+        Constraint::Length(2), // question text
+        Constraint::Min(1),    // items list
+    ];
+    if qs.custom_mode {
+        constraints.push(Constraint::Length(1)); // custom input
+    }
+    constraints.push(Constraint::Length(1)); // help text
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    // Render question text
+    let q_text = Paragraph::new(Line::from(Span::styled(
+        &question.question,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .wrap(ratatui::widgets::Wrap { trim: false });
+    frame.render_widget(q_text, chunks[0]);
+
+    // Render items: options + Skip + Custom answer
+    let visible_height = chunks[1].height as usize;
+    let scroll_offset = if qs.cursor >= visible_height {
+        qs.cursor - visible_height + 1
+    } else {
+        0
+    };
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(total_items);
+    for global_idx in 0..total_items {
+        if global_idx < scroll_offset || global_idx >= scroll_offset + visible_height {
+            continue;
+        }
+        let is_cursor = global_idx == qs.cursor;
+        let prefix = if is_cursor { "> " } else { "  " };
+        let cursor_style = if is_cursor {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        if global_idx < opt_count {
+            // Regular option
+            let is_selected = qs.selections.contains(&global_idx);
+            let checkbox = if question.multi_select {
+                if is_selected { "[x] " } else { "[ ] " }
+            } else if is_selected {
+                "(*) "
+            } else {
+                "( ) "
+            };
+            let sel_style = if is_selected {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(prefix, cursor_style),
+                Span::styled(checkbox, sel_style),
+                Span::styled(&question.option[global_idx], cursor_style),
+            ])));
+        } else if global_idx == opt_count {
+            // Skip
+            let skip_style = if qs.skipped {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let mark = if qs.skipped { ">> " } else { "   " };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(prefix, cursor_style),
+                Span::styled(mark, skip_style),
+                Span::styled("Skip", if is_cursor { cursor_style } else { skip_style }),
+            ])));
+        } else {
+            // Custom answer
+            let has_custom = !qs.custom_text.is_empty();
+            let custom_style = if has_custom {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let mark = if has_custom { ">> " } else { "   " };
+            let label = if has_custom {
+                format!("Custom: {}", qs.custom_text)
+            } else {
+                "Custom answer...".to_string()
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(prefix, cursor_style),
+                Span::styled(mark, custom_style),
+                Span::styled(
+                    label,
+                    if is_cursor {
+                        cursor_style
+                    } else {
+                        custom_style
+                    },
+                ),
+            ])));
+        }
+    }
+    frame.render_widget(List::new(items), chunks[1]);
+
+    // Custom text input line
+    let chunk_idx_help;
+    if qs.custom_mode {
+        let input_line = Paragraph::new(Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::Cyan)),
+            Span::styled(&qs.custom_text, Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(input_line, chunks[2]);
+        chunk_idx_help = 3;
+    } else {
+        chunk_idx_help = 2;
+    }
+
+    // Help text
+    let nav = if state.is_multi() {
+        " | Tab/l: next | Shift-Tab/H: prev"
+    } else {
+        ""
+    };
+    let help_text = if question.multi_select {
+        format!("Space: toggle | Enter: confirm | j/k: navigate{nav} | Esc: skip all")
+    } else {
+        format!("Enter: select | j/k: navigate{nav} | Esc: skip all")
+    };
+    let help = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    if chunk_idx_help < chunks.len() {
+        frame.render_widget(help, chunks[chunk_idx_help]);
+    }
+}
+
+/// Render completion overlay near bottom of screen.
+fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let max_items = 10;
+    let item_count = app.completion.len().min(max_items);
+    let height = (item_count + 2) as u16; // +2 for borders
+
+    // Position overlay near bottom, leaving 2 lines for input/status
+    let overlay_y = area.y + area.height.saturating_sub(height + 2);
+    let overlay_area = Rect {
+        x: area.x,
+        y: overlay_y,
+        width: area.width,
+        height,
+    };
+
+    // Clear background
+    frame.render_widget(Clear, overlay_area);
+
+    // Build list items
+    let selected = app.completion.selected();
+    let items: Vec<ListItem> = app
+        .completion
+        .visible_items(max_items)
+        .map(|(idx, item)| {
+            let is_selected = idx == selected;
+            let style = if is_selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            // Format based on completion mode
+            let text = match app.completion.mode {
+                CompletionMode::Slash => {
+                    format!("{:<15} {}", item.label, item.description)
+                }
+                CompletionMode::File => item.label.clone(),
+                CompletionMode::None => item.label.clone(),
+            };
+
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let title = match app.completion.mode {
+        CompletionMode::Slash => "Commands",
+        CompletionMode::File => "Files",
+        CompletionMode::None => "",
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title),
+    );
+
+    frame.render_widget(list, overlay_area);
+}
+
+/// Render images inline at their scroll-adjusted positions.
+/// Images appear within the content flow and scroll with the text.
+fn render_inline_images(
+    frame: &mut Frame,
+    chat_area: Rect,
+    app: &mut App,
+    image_positions: &[(String, usize)],
+    _scroll: usize,
+) {
+    use super::streaming_markdown::IMAGE_HEIGHT;
+    use ratatui_image::StatefulImage;
+
+    // Early exit if image support was disabled during session
+    if app.image_support.is_none() {
+        return;
+    }
+
+    let view_height = chat_area.height as usize;
+    let content_height = app.content_height.get();
+
+    // Calculate offset the same way as render_impl does:
+    // When content doesn't fill the screen, it renders at the BOTTOM of the
+    // viewport area, so the y-offset equals the unused space above.
+    let (padding, actual_scroll) = if content_height < view_height {
+        (view_height - content_height, 0)
+    } else {
+        let max_scroll = content_height - view_height;
+        let scroll_val = if app.scroll == usize::MAX {
+            max_scroll
+        } else {
+            app.scroll.min(max_scroll)
+        };
+        (0, scroll_val)
+    };
+
+    tracing::debug!(
+        "render_inline_images: {} positions, {} cached, padding={}, actual_scroll={}, content_height={}, view_height={}",
+        image_positions.len(),
+        app.image_cache.len(),
+        padding,
+        actual_scroll,
+        content_height,
+        view_height
+    );
+
+    for (url, line_index) in image_positions {
+        let is_cached = app.image_cache.contains_key(url);
+        tracing::debug!(
+            "Image at line {}: url={}, cached={}",
+            line_index,
+            url,
+            is_cached
+        );
+
+        // Calculate screen position accounting for both padding and scroll
+        // line_index is in the unpadded content coordinate system
+        // Screen position = padding + line_index - actual_scroll
+
+        // Skip if the image is scrolled above the visible area
+        if *line_index < actual_scroll {
+            // Image might be partially visible at top
+            let lines_hidden = actual_scroll - line_index;
+            if lines_hidden >= IMAGE_HEIGHT {
+                // Completely scrolled past
+                continue;
+            }
+            // Partial visibility at top - handled below
+        }
+
+        // Screen line position (accounting for padding and scroll)
+        let screen_line = padding + line_index.saturating_sub(actual_scroll);
+
+        // Skip if completely below visible area
+        if screen_line >= view_height {
+            continue;
+        }
+
+        // Get the cached image state
+        let Some(state) = app.image_cache.get_mut(url) else {
+            // Image not yet fetched
+            continue;
+        };
+
+        // Calculate visible portion of the image
+        // The image starts at line_index + 1 (skip the header line "🖼 Alt [loading...]")
+        // and spans IMAGE_HEIGHT - 1 lines
+        let image_content_line = screen_line + 1; // Skip header line
+
+        // Skip if header line is at or past the bottom
+        if image_content_line >= view_height {
+            continue;
+        }
+
+        let image_start_y = chat_area.y + image_content_line as u16;
+        let available_height = (chat_area.y + chat_area.height).saturating_sub(image_start_y);
+
+        // Skip if no space available
+        if available_height == 0 {
+            continue;
+        }
+
+        // Calculate image area with proper bounds
+        // IMAGE_HEIGHT - 1 because we skip the header line
+        let image_height = ((IMAGE_HEIGHT - 1) as u16).min(available_height);
+        let indent = 2u16; // Indent from left edge
+
+        let image_area = Rect::new(
+            chat_area.x + indent,
+            image_start_y,
+            chat_area.width.saturating_sub(indent * 2),
+            image_height,
+        );
+
+        tracing::debug!(
+            "Rendering image at area: x={}, y={}, w={}, h={} (screen_line={}, padding={}, line_index={})",
+            image_area.x,
+            image_area.y,
+            image_area.width,
+            image_area.height,
+            screen_line,
+            padding,
+            line_index
+        );
+
+        // Skip if area is too small
+        if image_area.width < 4 || image_area.height < 2 {
+            continue;
+        }
+
+        // Render the image
+        let image_widget = StatefulImage::default();
+        frame.render_stateful_widget(image_widget, image_area, &mut state.protocol);
+    }
+}
