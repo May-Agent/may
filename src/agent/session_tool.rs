@@ -23,7 +23,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, Ident, Value as SqlValue};
 
-use crate::agent::command_words::split_shell_words;
 use crate::agent::search_match::{extend_unique, push_unique};
 use crate::db::ChatDb;
 use crate::embedding_provider::{
@@ -184,8 +183,12 @@ pub struct SessionTool {
 enum SessionToolError {
     #[error("database error: {0}")]
     Database(#[from] crate::db::ChatDbError),
-    #[error("session command parsing failed: {0}")]
-    CommandWords(#[from] crate::agent::command_words::SplitShellWordsError),
+    #[error("session command '{command}' contains invalid shell quoting: {source}")]
+    CommandWords {
+        command: String,
+        #[source]
+        source: shell_words::ParseError,
+    },
     #[error("{0}")]
     EmbeddingModel(#[from] EmbeddingModelRequireError),
     #[error("LanceDB error: {0}")]
@@ -777,7 +780,10 @@ fn split_command_form_tokens(
         });
     }
 
-    split_shell_words(body, command_name).map_err(Into::into)
+    shell_words::split(body).map_err(|source| SessionToolError::CommandWords {
+        command: command_name.to_string(),
+        source,
+    })
 }
 
 fn build_execution_plan(
