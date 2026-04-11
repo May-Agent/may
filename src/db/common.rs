@@ -429,6 +429,47 @@ pub(super) struct DefaultProfile<'a> {
     pub(super) location_aware: bool,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct SqliteTableInfoRow {
+    pub(super) name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct I32ValueRow {
+    pub(super) value: i32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct I64ValueRow {
+    pub(super) value: i64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct BoolValueRow {
+    pub(super) value: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct AssistantCacheUsageSummaryRow {
+    pub(super) assistant_message_count: i64,
+    pub(super) cache_hit_message_count: i64,
+    pub(super) prompt_tokens_total: i64,
+    pub(super) cache_read_tokens_total: i64,
+    pub(super) cache_write_tokens_total: i64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct SessionIdRow {
+    pub(super) session_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct StoredSessionContextSnapshotRow {
+    pub(super) checkpoint_blob: Vec<u8>,
+    pub(super) history_message_count: i64,
+    pub(super) updated_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileEnvironmentKind {
