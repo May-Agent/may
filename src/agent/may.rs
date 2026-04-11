@@ -3,8 +3,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use aither_agent::{
-    Agent, AgentError, AgentEvent, AgentKind, BrowserBackend, CheckpointContext, CompactResult,
-    HCons, Hook, TerminalAgentBuilder, TurnBoundaryAction, TurnBoundaryContext,
+    Agent, AgentError, AgentEvent, AgentKind, BrowserBackend, CompactResult, HCons,
+    TerminalAgentBuilder,
 };
 use aither_cloud::CloudProvider;
 use aither_core::llm::{
@@ -17,6 +17,7 @@ use aither_sandbox::{
 use executor_core::DefaultExecutor;
 use futures_lite::{Stream, StreamExt};
 
+use super::hooks::{ContextSnapshotHook, PendingSteerHook};
 use super::imagine::{ImageGeneratorConfig, ImagineTool, resolve_image_generator_config};
 use super::permission::PermissionApprover;
 use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
@@ -66,64 +67,6 @@ pub enum MayAgentError {
 }
 
 
-#[derive(Debug, Clone)]
-pub struct PendingSteerHook {
-    db: Option<crate::db::ChatDb>,
-    session_id: String,
-}
-
-impl PendingSteerHook {
-    fn new(db: Option<crate::db::ChatDb>, session_id: &SessionId) -> Self {
-        Self {
-            db,
-            session_id: session_id.as_str().to_string(),
-        }
-    }
-}
-
-impl Hook for PendingSteerHook {
-    async fn on_turn_boundary(&self, _ctx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
-        let Some(db) = &self.db else {
-            return TurnBoundaryAction::Continue;
-        };
-        let Ok(runtime) = db.get_session_runtime(&self.session_id).await else {
-            tracing::warn!(session_id = %self.session_id, "failed to inspect runtime for steer boundary");
-            return TurnBoundaryAction::Continue;
-        };
-        if runtime.is_some_and(|summary| summary.has_pending_immediate()) {
-            TurnBoundaryAction::EndTurn
-        } else {
-            TurnBoundaryAction::Continue
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ContextSnapshotHook {
-    db: Option<crate::db::ChatDb>,
-    session_id: String,
-}
-
-impl ContextSnapshotHook {
-    fn new(db: Option<crate::db::ChatDb>, session_id: &SessionId) -> Self {
-        Self {
-            db,
-            session_id: session_id.as_str().to_string(),
-        }
-    }
-}
-
-impl Hook for ContextSnapshotHook {
-    async fn on_checkpoint(&self, ctx: &CheckpointContext<'_>) -> Option<String> {
-        let Some(db) = &self.db else {
-            return None;
-        };
-        match crate::session::persist_checkpoint_from_hook(db, &self.session_id, ctx).await {
-            Ok(()) => None,
-            Err(error) => Some(error.to_string()),
-        }
-    }
-}
 
 /// Execution environment for a `MayAgent`.
 pub enum AgentEnvironment {
