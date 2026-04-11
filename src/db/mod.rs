@@ -5108,7 +5108,7 @@ mod tests {
             body: "Completed".to_string(),
             session_id: Some("session-1".to_string()),
             callback_context_xml: Some(
-                crate::XmlFragment::parse("<system_alert><status>ok</status></system_alert>")
+                crate::XmlFragment::parse("<system-reminder><status>ok</status></system-reminder>")
                     .expect("callback XML should parse"),
             ),
             callback_message: Some("Follow up".to_string()),
