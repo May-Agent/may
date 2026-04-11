@@ -8,6 +8,7 @@ pub(crate) mod notify_tool;
 mod permission;
 pub(crate) mod register_tool;
 pub mod runner;
+mod runtime_context;
 mod search_match;
 pub mod session_tool;
 pub mod ssh_authorizer;
