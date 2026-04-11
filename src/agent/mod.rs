@@ -2,6 +2,7 @@
 
 pub(crate) mod browser_tool;
 mod environment;
+mod hooks;
 mod imagine;
 mod may;
 pub(crate) mod notify_tool;
