@@ -7,7 +7,7 @@ use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::xml_fragment::XmlFragment;
+use crate::xml::XmlBlock;
 
 /// Send a push notification to subscribed clients.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -21,7 +21,7 @@ pub struct NotifyArgs {
     pub session_id: Option<String>,
     /// Optional hidden XML context injected on notification click.
     #[serde(default)]
-    pub callback_context_xml: Option<XmlFragment>,
+    pub callback_context_xml: Option<XmlBlock>,
     /// Optional user-visible message sent on notification click.
     #[serde(default)]
     pub callback_message: Option<String>,

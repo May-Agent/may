@@ -2,7 +2,7 @@
 
 use super::SessionPlanState;
 use crate::PermissionRequestMode;
-use crate::xml_fragment::XmlFragment;
+use crate::xml::XmlBlock;
 
 const fn is_false(value: &bool) -> bool {
     !*value
@@ -166,7 +166,7 @@ pub struct PendingUserMessage {
     /// Structured hidden context injected as a system message for the next run.
     /// This is intentionally markup-friendly text, not strict XML.
     #[serde(default)]
-    pub hidden_context_xml: Option<XmlFragment>,
+    pub hidden_context_xml: Option<XmlBlock>,
     pub created_at: String,
     pub delivery_mode: PendingUserMessageMode,
 }
