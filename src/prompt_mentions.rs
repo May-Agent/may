@@ -110,7 +110,7 @@ pub async fn build_session_mentions_xml(
         return Ok(None);
     }
 
-    Ok(Some(crate::xml_fragment::serialize_tagged_xml(
+    Ok(Some(crate::xml::serialize_xml_block(
         "session_mentions",
         &SessionMentionsXml { sessions: entries },
     )?))
@@ -164,7 +164,7 @@ pub async fn build_file_mentions_xml(
         return Ok(None);
     }
 
-    Ok(Some(crate::xml_fragment::serialize_tagged_xml(
+    Ok(Some(crate::xml::serialize_xml_block(
         "file_mentions",
         &FileMentionsXml { files },
     )?))

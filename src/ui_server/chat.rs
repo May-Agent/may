@@ -502,7 +502,7 @@ pub(super) enum ResumeResolution {
 }
 
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> Result<String, ChatMarkupError> {
-    crate::xml_fragment::serialize_tagged_xml(tag, value).map_err(ChatMarkupError::Serialize)
+    crate::xml::serialize_xml_block(tag, value).map_err(ChatMarkupError::Serialize)
 }
 
 fn browser_takeover_alert_xml() -> Result<String, ChatMarkupError> {
@@ -521,7 +521,7 @@ fn browser_takeover_alert_xml() -> Result<String, ChatMarkupError> {
 fn resume_waiting_turn_xml(
     request_kind: ResumeRequestKind,
     resolution: ResumeResolution,
-) -> Result<crate::XmlFragment, ChatMarkupError> {
+) -> Result<crate::XmlBlock, ChatMarkupError> {
     let xml = serialize_xml(
         "system-reminder",
         &ResumeWaitingTurnXml {
@@ -531,7 +531,7 @@ fn resume_waiting_turn_xml(
             instruction: "The previous run was interrupted while waiting for this response. Reassess the latest state, use the recorded response, and continue from the most sensible next action.",
         },
     )?;
-    crate::XmlFragment::parse(xml).map_err(ChatMarkupError::Parse)
+    crate::XmlBlock::parse(xml).map_err(ChatMarkupError::Parse)
 }
 
 pub(super) async fn schedule_waiting_turn_resume(
@@ -1711,7 +1711,7 @@ enum ChatMarkupError {
     #[error("failed to serialize XML fragment: {0}")]
     Serialize(#[source] quick_xml::SeError),
     #[error("failed to parse XML fragment: {0}")]
-    Parse(#[source] crate::XmlFragmentError),
+    Parse(#[source] crate::XmlBlockError),
 }
 
 #[derive(Debug, thiserror::Error)]

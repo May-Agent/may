@@ -89,7 +89,7 @@ impl PromptSection {
 }
 
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> SkyResult<String> {
-    crate::xml_fragment::serialize_tagged_xml(tag, value).map_err(internal_error)
+    crate::xml::serialize_xml_block(tag, value).map_err(internal_error)
 }
 
 pub(super) async fn build_prompt_and_attachments(

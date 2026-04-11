@@ -40,7 +40,7 @@ pub mod tui;
 pub mod ui_event_bus;
 pub mod ui_server;
 pub mod workspace;
-pub mod xml_fragment;
+pub mod xml;
 pub use aither_agent::ask_user;
 pub use aither_agent::workspace_request;
 
@@ -64,4 +64,4 @@ pub use terminal_commands::{SharedTerminalCommandConfig, register_shared_termina
 pub use terminal_permission_handler::TerminalPermissionHandler;
 pub use workspace::{Workspace, WorkspaceConfig};
 pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};
-pub use xml_fragment::{XmlFragment, XmlFragmentError};
+pub use xml::{XmlBlock, XmlBlockError};

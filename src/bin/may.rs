@@ -645,7 +645,7 @@ struct OneShotNonInteractiveAlert<'a> {
 #[derive(Debug, Clone)]
 struct OneShotPromptInput {
     content: String,
-    hidden_context_xml: Option<may_agent::XmlFragment>,
+    hidden_context_xml: Option<may_agent::XmlBlock>,
 }
 
 fn render_json_stdout<T: serde::Serialize>(value: &T) -> Result<(), BrowserCliError> {
@@ -2227,7 +2227,7 @@ async fn build_oneshot_prompt_with_mentions(
     app: &App,
     prompt: &str,
 ) -> anyhow::Result<OneShotPromptInput> {
-    let mut hidden_context_parts = vec![may_agent::xml_fragment::serialize_tagged_xml(
+    let mut hidden_context_parts = vec![may_agent::xml::serialize_xml_block(
         "system-reminder",
         &OneShotNonInteractiveAlert {
             alert_type: "oneshot_noninteractive",
@@ -2237,7 +2237,7 @@ async fn build_oneshot_prompt_with_mentions(
     let Some(session) = app.session_manager.current() else {
         return Ok(OneShotPromptInput {
             content: prompt.to_string(),
-            hidden_context_xml: Some(may_agent::XmlFragment::parse(
+            hidden_context_xml: Some(may_agent::XmlBlock::parse(
                 hidden_context_parts.join("\n\n"),
             )?),
         });
@@ -2260,7 +2260,7 @@ async fn build_oneshot_prompt_with_mentions(
 
     Ok(OneShotPromptInput {
         content: prompt.to_string(),
-        hidden_context_xml: Some(may_agent::XmlFragment::parse(
+        hidden_context_xml: Some(may_agent::XmlBlock::parse(
             hidden_context_parts.join("\n\n"),
         )?),
     })
