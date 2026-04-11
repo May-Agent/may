@@ -307,7 +307,7 @@ mod tests {
     fn hidden_context_replays_as_system_message() {
         let mut history = ChatHistory::new();
         history.messages_mut().push(ChatMessage::hidden_context(
-            "<system_alert>notice</system_alert>",
+            "<system-reminder>notice</system-reminder>",
         ));
         history.messages_mut().push(ChatMessage::user("hello"));
         history.messages_mut().push(ChatMessage::assistant("world"));
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(messages[0].role(), Role::System);
         assert_eq!(messages[1].role(), Role::User);
         assert_eq!(messages[2].role(), Role::Assistant);
-        assert_eq!(messages[0].content(), "<system_alert>notice</system_alert>");
+        assert_eq!(messages[0].content(), "<system-reminder>notice</system-reminder>");
     }
 
     #[test]
