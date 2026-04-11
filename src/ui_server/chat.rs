@@ -28,11 +28,11 @@ use crate::session::{
     TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
-use crate::text::{error_chain_text, join_text, path_error_text, path_message, prefixed_text};
 use crate::ui_event_bus::UiEventTopics;
 
 use super::attachments::build_prompt_and_attachments;
 use super::browser::ensure_browser_runtime_started;
+use super::error_chain::error_chain_text;
 use super::error::{internal_error, json_ok_response, typed_error_response};
 use super::helpers::{
     RETRY_BACKOFF_MS, append_history_message, elapsed_ms_saturating, load_session_paths,
@@ -686,12 +686,8 @@ pub(super) async fn stop_session_run(
         .await
         .map_err(internal_error)?
     {
-        return Err(skyzen::Error::msg(join_text(&[
-            "Session ",
-            session_id.as_str(),
-            " not found",
-        ]))
-        .set_status(skyzen::StatusCode::NOT_FOUND));
+        return Err(skyzen::Error::msg(format!("Session {session_id} not found"))
+            .set_status(skyzen::StatusCode::NOT_FOUND));
     }
 
     let persisted_cancel = state
@@ -856,7 +852,7 @@ async fn run_agent_loop(
         });
 
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_id = prefixed_text("assistant-", assistant_uuid.as_str());
+        let assistant_id = format!("assistant-{assistant_uuid}");
         let started_at = Instant::now();
         let mut usage = Usage::default();
         let mut segment_text = String::new(); // current text segment, flushed on tool calls
@@ -2076,8 +2072,7 @@ async fn setup_agent_environment(
                 } else {
                     let config = state.config_snapshot();
                     let endpoint = if config.browser.requires_managed_runtime() {
-                        let port = config.browser.port.to_string();
-                        join_text(&["http://", host_gateway, ":", port.as_str()])
+                        format!("http://{host_gateway}:{}", config.browser.port)
                     } else {
                         bm.cdp_endpoint().unwrap_or_else(|| {
                             panic!(
@@ -2085,7 +2080,7 @@ async fn setup_agent_environment(
                             )
                         })
                     };
-                    extra_env.push(prefixed_text("BROWSER_CDP_ENDPOINT=", endpoint.as_str()));
+                    extra_env.push(format!("BROWSER_CDP_ENDPOINT={endpoint}"));
                     Some(Arc::new(StaticCdpBrowser::new(endpoint)))
                 }
             } else {
@@ -2389,10 +2384,7 @@ async fn handle_notify_request(
     let sent = notification_service
         .send_payload(payload)
         .await
-        .map_err(|error| {
-            let error_text = error.to_string();
-            join_text(&["failed to send notification payload: ", error_text.as_str()])
-        })?;
+        .map_err(|error| format!("failed to send notification payload: {error}"))?;
 
     Ok(crate::agent::notify_tool::NotifyResult { sent })
 }
@@ -2501,7 +2493,7 @@ async fn handle_register_skills_request(
                 .register_from_local_path(&source)
                 .await
                 .map_err(|error| {
-                    path_error_text("failed to register skill from ", &source, &error)
+                    format!("failed to register skill from {}: {error}", source.display())
                 })?;
             Ok(vec![info.dir_name])
         },
@@ -2524,7 +2516,10 @@ async fn handle_register_subagents_request(
                 .register_from_local_path(&source)
                 .await
                 .map_err(|error| {
-                    path_error_text("failed to register subagents from ", &source, &error)
+                    format!(
+                        "failed to register subagents from {}: {error}",
+                        source.display()
+                    )
                 })?;
             Ok(infos.into_iter().map(|item| item.file_name).collect())
         },
@@ -2564,18 +2559,10 @@ fn build_registration_approval_message(
     source_label: &str,
     target_dir_name: &str,
 ) -> String {
-    let source_display = source.display().to_string();
-    join_text(&[
-        "Session ",
-        session_id,
-        " requests registering ",
-        source_label,
-        " from ",
-        source_display.as_str(),
-        " into this session's ",
-        target_dir_name,
-        ". Approve?",
-    ])
+    format!(
+        "Session {session_id} requests registering {source_label} from {} into this session's {target_dir_name}. Approve?",
+        source.display()
+    )
 }
 
 async fn resolve_session_root(
@@ -2590,11 +2577,16 @@ async fn resolve_session_root(
     tokio::fs::create_dir_all(&session_root)
         .await
         .map_err(|error| {
-            path_error_text("failed to create session root ", &session_root, &error)
+            format!(
+                "failed to create session root {}: {error}",
+                session_root.display()
+            )
         })?;
     let session_root_canonical = tokio::fs::canonicalize(&session_root)
         .await
-        .map_err(|error| path_error_text("failed to resolve session ", &session_root, &error))?;
+        .map_err(|error| {
+            format!("failed to resolve session {}: {error}", session_root.display())
+        })?;
     Ok(session_root_canonical)
 }
 
@@ -2614,16 +2606,22 @@ async fn resolve_registration_source_path(
     };
 
     let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
-        path_error_text("failed to resolve registration path ", &candidate, &error)
+        format!(
+            "failed to resolve registration path {}: {error}",
+            candidate.display()
+        )
     })?;
-    let project_root = tokio::fs::canonicalize(&state.cwd)
-        .await
-        .map_err(|error| path_error_text("failed to resolve project root ", &state.cwd, &error))?;
+    let project_root = tokio::fs::canonicalize(&state.cwd).await.map_err(|error| {
+        format!(
+            "failed to resolve project root {}: {error}",
+            state.cwd.display()
+        )
+    })?;
 
     if !canonical.starts_with(&project_root) {
-        return Err(path_message(
-            "registration path must be inside project root ",
-            &project_root,
+        return Err(format!(
+            "registration path must be inside project root {}",
+            project_root.display()
         ));
     }
 
@@ -2657,10 +2655,10 @@ async fn request_registration_approval(
         .ask_user_approver
         .enqueue(request, Some(session_id.to_string()))
         .await;
-    let answers = rx.recv().await.map_err(|error| {
-        let error_text = error.to_string();
-        join_text(&["failed to receive user approval: ", error_text.as_str()])
-    })?;
+    let answers = rx
+        .recv()
+        .await
+        .map_err(|error| format!("failed to receive user approval: {error}"))?;
 
     let approved = answers.into_iter().any(|answer| match answer.answer {
         ask_user::AnswerValue::Selected(values) => values
