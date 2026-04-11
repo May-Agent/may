@@ -35,7 +35,6 @@ use crate::task_trigger::{
     PersistedTaskTrigger, TaskInvocation, TaskTriggerResponse, TaskWebhookRequest, TimeTriggerType,
     normalize_event_name,
 };
-use crate::text::{join_text, path_error_text, prefixed_display};
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 
 /// Shared task execution facility used by the scheduler, REST API, and agent tools.
@@ -101,7 +100,7 @@ impl TaskRunStatus {
             "success" => Ok(Self::Success),
             "failed" => Ok(Self::Failed),
             "interrupted" => Ok(Self::Interrupted),
-            other => Err(join_text(&["unknown task run status: ", other])),
+            other => Err(format!("unknown task run status: {other}")),
         }
     }
 }
@@ -113,44 +112,31 @@ impl TaskCatalog {
 }
 
 fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
-    prefixed_display(prefix, error)
+    format!("{prefix}{error}")
 }
 
 fn profile_load_error(profile_id: &str, error: &impl std::fmt::Display) -> String {
-    let error_text = error.to_string();
-    join_text(&[
-        "failed to load profile ",
-        profile_id,
-        ": ",
-        error_text.as_str(),
-    ])
+    format!("failed to load profile {profile_id}: {error}")
 }
 
 fn profile_not_found_error(profile_id: &str) -> String {
-    join_text(&["profile ", profile_id, " not found"])
+    format!("profile {profile_id} not found")
 }
 
 fn invalid_profile_error(profile_id: &str, error: &impl std::fmt::Display) -> String {
-    let error_text = error.to_string();
-    join_text(&["invalid profile ", profile_id, ": ", error_text.as_str()])
+    format!("invalid profile {profile_id}: {error}")
 }
 
 fn session_load_error(session_id: &str, error: &impl std::fmt::Display) -> String {
-    let error_text = error.to_string();
-    join_text(&[
-        "failed to load session ",
-        session_id,
-        ": ",
-        error_text.as_str(),
-    ])
+    format!("failed to load session {session_id}: {error}")
 }
 
 fn session_not_found_error(session_id: &str) -> String {
-    join_text(&["session not found: ", session_id])
+    format!("session not found: {session_id}")
 }
 
 fn task_notification_title(task_name: &str) -> String {
-    join_text(&["Task: ", task_name])
+    format!("Task: {task_name}")
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -177,27 +163,18 @@ impl TaskCallbackStatus {
 }
 
 fn task_notification_callback_message(task_name: &str, status: TaskCallbackStatus) -> String {
-    join_text(&[
-        "Continue from scheduled task \"",
-        task_name,
-        "\" (",
-        status.as_str(),
-        "). Review the hidden task result and choose the next action.",
-    ])
+    format!(
+        "Continue from scheduled task \"{task_name}\" ({}). Review the hidden task result and choose the next action.",
+        status.as_str()
+    )
 }
 
 fn task_script_failure(exit_code: i32, output: &str) -> String {
-    let exit_code_text = exit_code.to_string();
-    join_text(&[
-        "task script failed with exit code ",
-        exit_code_text.as_str(),
-        "\n",
-        output,
-    ])
+    format!("task script failed with exit code {exit_code}\n{output}")
 }
 
 fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String {
-    join_text(&[prefix, execution_id, suffix])
+    format!("{prefix}{execution_id}{suffix}")
 }
 
 fn profile_workspace_key(profile: &profiles::Model) -> &str {
@@ -205,7 +182,7 @@ fn profile_workspace_key(profile: &profiles::Model) -> &str {
 }
 
 fn container_profile_name(profile: &profiles::Model) -> String {
-    join_text(&["may-", profile_workspace_key(profile)])
+    format!("may-{}", profile_workspace_key(profile))
 }
 
 fn task_notification_callback_context(
@@ -254,7 +231,7 @@ fn task_db_error(message: String) -> crate::db::ChatDbError {
 }
 
 fn task_field_error(task_id: &str, prefix: &str, field: &str) -> crate::db::ChatDbError {
-    task_db_error(join_text(&[prefix, task_id, " is missing ", field]))
+    task_db_error(format!("{prefix}{task_id} is missing {field}"))
 }
 
 fn task_value_error(
@@ -262,8 +239,7 @@ fn task_value_error(
     prefix: &str,
     error: &impl std::fmt::Display,
 ) -> crate::db::ChatDbError {
-    let error_text = error.to_string();
-    task_db_error(join_text(&[prefix, task_id, ": ", error_text.as_str()]))
+    task_db_error(format!("{prefix}{task_id}: {error}"))
 }
 
 fn stored_task_trigger(
@@ -276,7 +252,7 @@ fn stored_task_trigger(
 }
 
 fn workspace_prepare_error(path: &std::path::Path, error: &impl std::fmt::Display) -> String {
-    path_error_text("failed to prepare workspace ", path, error)
+    format!("failed to prepare workspace {}: {error}", path.display())
 }
 
 fn init_terminal_tool_error(prefix: &str, error: &impl std::fmt::Display) -> String {
@@ -488,11 +464,10 @@ impl TaskRuntime {
             .ok_or_else(|| session_not_found_error(normalized.session_id.as_str()))?;
 
         let profile_id = session.profile_id.ok_or_else(|| {
-            join_text(&[
-                "session ",
-                normalized.session_id.as_str(),
-                " is not attached to a profile",
-            ])
+            format!(
+                "session {} is not attached to a profile",
+                normalized.session_id
+            )
         })?;
         let profile = self
             .db
@@ -511,12 +486,11 @@ impl TaskRuntime {
             ProfileEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
         };
         if runtime_kind != actual_runtime {
-            return Err(join_text(&[
-                "task runtime mismatch: session profile uses ",
+            return Err(format!(
+                "task runtime mismatch: session profile uses {}, request declared {}",
                 actual_runtime.as_str(),
-                ", request declared ",
-                runtime_kind.as_str(),
-            ]));
+                runtime_kind.as_str()
+            ));
         }
 
         self.validate_task_script_for_profile_model(
@@ -967,7 +941,10 @@ impl TaskRuntime {
         tokio::fs::write(&script_path, script.content.as_bytes())
             .await
             .map_err(|error| {
-                path_error_text("failed to write task script ", &script_path, &error)
+                format!(
+                    "failed to write task script {}: {error}",
+                    script_path.display()
+                )
             })?;
         tokio::fs::write(&trigger_path, trigger_payload)
             .await
@@ -976,10 +953,9 @@ impl TaskRuntime {
                 tokio::spawn(async move {
                     let _ = tokio::fs::remove_file(script_path).await;
                 });
-                path_error_text(
-                    "failed to write task trigger payload ",
-                    &trigger_path,
-                    &error,
+                format!(
+                    "failed to write task trigger payload {}: {error}",
+                    trigger_path.display()
                 )
             })?;
 
@@ -1029,17 +1005,15 @@ impl TaskRuntime {
                 let content = tokio::fs::read_to_string(&canonical)
                     .await
                     .map_err(|error| {
-                        path_error_text("failed to read script_path ", &canonical, &error)
+                        format!(
+                            "failed to read script_path {}: {error}",
+                            canonical.display()
+                        )
                     })?;
-                let canonical_display = canonical.display().to_string();
                 let working_dir = canonical
                     .parent()
                     .ok_or_else(|| {
-                        join_text(&[
-                            "script_path ",
-                            canonical_display.as_str(),
-                            " has no parent directory",
-                        ])
+                        format!("script_path {} has no parent directory", canonical.display())
                     })?
                     .to_path_buf();
                 Ok(TaskScript {
@@ -1562,7 +1536,7 @@ fn parse_terminal_result(payload: &str) -> Result<String, String> {
 fn combine_output(stdout: &str, stderr: Option<String>) -> String {
     match stderr {
         Some(stderr_text) if !stderr_text.trim().is_empty() => {
-            join_text(&[stdout, "\n--- stderr ---\n", stderr_text.as_str()])
+            format!("{stdout}\n--- stderr ---\n{stderr_text}")
         }
         _ => stdout.to_string(),
     }
@@ -1570,7 +1544,7 @@ fn combine_output(stdout: &str, stderr: Option<String>) -> String {
 
 fn truncate_output(output: &str) -> String {
     if output.len() > 10240 {
-        join_text(&[&output[..10240], "...(truncated)"])
+        format!("{}...(truncated)", &output[..10240])
     } else {
         output.to_string()
     }

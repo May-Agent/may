@@ -5,6 +5,7 @@ mod browser;
 mod chat;
 mod config;
 mod error;
+mod error_chain;
 mod events;
 mod helpers;
 mod interaction;

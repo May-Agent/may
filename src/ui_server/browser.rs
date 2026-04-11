@@ -11,9 +11,9 @@ use skyzen::utils::{Json, State};
 use skyzen::{Result as SkyResult, StatusCode};
 
 use super::chat::spawn_follow_up_runs;
+use super::error_chain::error_chain_text;
 use super::state::UiServerState;
 use super::types::BrowserTakeoverResponse;
-use crate::text::error_chain_text;
 use crate::ui_event_bus::UiEventTopics;
 
 #[derive(serde::Serialize)]

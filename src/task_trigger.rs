@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use crate::text::{join_text, prefixed_display};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +15,7 @@ pub const EVENT_CHAT_TURN_COMPLETED: &str = "chat.turn.completed";
 const WEBHOOK_ROUTE_PREFIX: &str = "/api/tasks/webhook/";
 
 fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
-    prefixed_display(prefix, error)
+    format!("{prefix}{error}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -63,15 +62,9 @@ impl FromStr for TimeTriggerType {
         match trigger_type.as_str() {
             TRIGGER_TYPE_ONCE => Ok(Self::Once),
             TRIGGER_TYPE_CRON => Ok(Self::Cron),
-            other => Err(join_text(&[
-                "unsupported time trigger_type '",
-                other,
-                "', expected '",
-                TRIGGER_TYPE_ONCE,
-                "' or '",
-                TRIGGER_TYPE_CRON,
-                "'",
-            ])),
+            other => Err(format!(
+                "unsupported time trigger_type '{other}', expected '{TRIGGER_TYPE_ONCE}' or '{TRIGGER_TYPE_CRON}'"
+            )),
         }
     }
 }
@@ -85,17 +78,9 @@ impl FromStr for TaskTriggerKind {
             TRIGGER_KIND_TIME => Ok(Self::Time),
             TRIGGER_KIND_EVENT => Ok(Self::Event),
             TRIGGER_KIND_WEBHOOK => Ok(Self::Webhook),
-            other => Err(join_text(&[
-                "unsupported task trigger_kind '",
-                other,
-                "', expected '",
-                TRIGGER_KIND_TIME,
-                "', '",
-                TRIGGER_KIND_EVENT,
-                "', or '",
-                TRIGGER_KIND_WEBHOOK,
-                "'",
-            ])),
+            other => Err(format!(
+                "unsupported task trigger_kind '{other}', expected '{TRIGGER_KIND_TIME}', '{TRIGGER_KIND_EVENT}', or '{TRIGGER_KIND_WEBHOOK}'"
+            )),
         }
     }
 }
@@ -353,7 +338,7 @@ pub fn new_webhook_token() -> String {
 
 #[must_use]
 pub fn webhook_path(token: &str) -> String {
-    join_text(&[WEBHOOK_ROUTE_PREFIX, token])
+    format!("{WEBHOOK_ROUTE_PREFIX}{token}")
 }
 
 pub fn normalize_trigger(input: TaskTriggerInput<'_>) -> Result<NormalizedTaskTrigger, String> {
@@ -409,11 +394,9 @@ pub fn normalize_event_name(value: &str) -> Result<String, String> {
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'));
     if !valid {
-        return Err(join_text(&[
-            "invalid event name '",
-            raw.as_str(),
-            "': only [a-z0-9._-] are allowed",
-        ]));
+        return Err(format!(
+            "invalid event name '{raw}': only [a-z0-9._-] are allowed"
+        ));
     }
     Ok(raw)
 }
@@ -422,7 +405,7 @@ pub fn normalize_cron_expression(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     let field_count = trimmed.split_whitespace().count();
     let canonical = match field_count {
-        5 => join_text(&["0 ", trimmed]),
+        5 => format!("0 {trimmed}"),
         6 => trimmed.to_string(),
         _ => {
             return Err(
@@ -623,10 +606,7 @@ mod tests {
         let token = normalized.storage_trigger_type();
         assert_eq!(normalized.kind(), TaskTriggerKind::Webhook);
         assert!(!token.is_empty());
-        assert_eq!(
-            webhook_path(&token),
-            super::join_text(&["/api/tasks/webhook/", token.as_str()])
-        );
+        assert_eq!(webhook_path(&token), format!("/api/tasks/webhook/{token}"));
     }
 
     #[test]

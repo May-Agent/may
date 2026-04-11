@@ -38,7 +38,6 @@ use crate::skill::SkillManager;
 use crate::subagent::SubagentManager;
 use crate::terminal_commands::{SharedTerminalCommandConfig, register_shared_terminal_commands};
 use crate::terminal_permission_handler::TerminalPermissionHandler;
-use crate::text::{join_text, prefixed_display, quoted_text};
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 use crate::workspace_request::WorkspaceRequestBroker;
 
@@ -46,11 +45,11 @@ use crate::workspace_request::WorkspaceRequestBroker;
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
 
 fn quoted_name_error(prefix: &str, name: &str, suffix: &str) -> String {
-    quoted_text(prefix, name, suffix)
+    format!("{prefix}'{name}'{suffix}")
 }
 
 fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
-    prefixed_display(prefix, error)
+    format!("{prefix}{error}")
 }
 
 fn err_no_provider(model: &str) -> String {
@@ -282,15 +281,9 @@ async fn validate_generic_provider_model_support(
     let fetched = crate::models::fetch_models_for_provider_instance(provider_id, instance)
         .await
         .map_err(|error| {
-            let error_text = error.to_string();
-            MayAgentError::Llm(join_text(&[
-                "Failed to validate model '",
-                model,
-                "' for provider '",
-                provider_id,
-                "' via /models: ",
-                error_text.as_str(),
-            ]))
+            MayAgentError::Llm(format!(
+                "Failed to validate model '{model}' for provider '{provider_id}' via /models: {error}"
+            ))
         })?;
 
     let mode = MatchMode::from_strict_flag(config.preferences.strict_model_matching);
@@ -299,13 +292,9 @@ async fn validate_generic_provider_model_support(
         .any(|candidate| model_ids_match(candidate.id.as_str(), model, mode));
 
     if !has_match {
-        return Err(MayAgentError::Llm(join_text(&[
-            "Provider '",
-            provider_id,
-            "' does not advertise model '",
-            model,
-            "' in /models",
-        ])));
+        return Err(MayAgentError::Llm(format!(
+            "Provider '{provider_id}' does not advertise model '{model}' in /models"
+        )));
     }
 
     Ok(())
@@ -514,12 +503,10 @@ impl PermissionApprover {
     }
 
     fn unavailable_error(mode: TerminalMode, context: &'static str) -> PermissionError {
-        PermissionError::Denied(join_text(&[
-            "sandbox blocked ",
-            mode.description(),
-            " execution; approval is required to escalate this command, but approval is unavailable in ",
-            context,
-        ]))
+        PermissionError::Denied(format!(
+            "sandbox blocked {} execution; approval is required to escalate this command, but approval is unavailable in {context}",
+            mode.description()
+        ))
     }
 
     fn persisted_request(
@@ -632,10 +619,10 @@ impl PermissionHandler for PermissionApprover {
                 if approved {
                     Ok(true)
                 } else {
-                    Err(PermissionError::Denied(join_text(&[
-                        mode.description(),
-                        " mode denied for script",
-                    ])))
+                    Err(PermissionError::Denied(format!(
+                        "{} mode denied for script",
+                        mode.description()
+                    )))
                 }
             }
         }
@@ -1962,12 +1949,9 @@ pub async fn generate_session_title(
     let user_truncated = truncate_at_char_boundary(user_message, 200);
     let assistant_truncated = truncate_at_char_boundary(assistant_response, 300);
 
-    let prompt = join_text(&[
-        "Generate a short, descriptive title (3-6 words) for this conversation. Output ONLY the title, nothing else.\n\nUser: ",
-        user_truncated,
-        "\n\nAssistant: ",
-        assistant_truncated,
-    ]);
+    let prompt = format!(
+        "Generate a short, descriptive title (3-6 words) for this conversation. Output ONLY the title, nothing else.\n\nUser: {user_truncated}\n\nAssistant: {assistant_truncated}"
+    );
 
     let request = LLMRequest::new(vec![Message::user(&prompt)]);
     let mut stream = std::pin::pin!(llm.respond(request));

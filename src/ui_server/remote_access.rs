@@ -10,7 +10,6 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::RemoteAccessConfig;
 use crate::db::ChatDb;
-use crate::text::prefixed_text;
 use crate::ui_event_bus::UiEventBus;
 
 use super::error::{bad_request_error, internal_error};
@@ -256,10 +255,7 @@ async fn run_remote_access_actor(
                                 "cloudflared exited unexpectedly".to_string()
                             } else {
                                 runtime.last_stderr_line.clone().unwrap_or_else(|| {
-                                    prefixed_text(
-                                        "cloudflared exited with code ",
-                                        code.to_string().as_str(),
-                                    )
+                                    format!("cloudflared exited with code {code}")
                                 })
                             });
                             publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
@@ -333,9 +329,7 @@ async fn sync_remote_access_runtime(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            prefixed_text("failed to launch cloudflared: ", error.to_string().as_str())
-        })?;
+        .map_err(|error| format!("failed to launch cloudflared: {error}"))?;
 
     if let Some(stdout) = process.stdout.take() {
         spawn_remote_access_log_reader(stdout, event_tx.clone(), false);
@@ -346,7 +340,7 @@ async fn sync_remote_access_runtime(
 
     push_log(
         &mut runtime.status.recent_logs,
-        prefixed_text("starting tunnel at ", launch_spec.public_url.as_str()),
+        format!("starting tunnel at {}", launch_spec.public_url),
     );
     runtime.status.state = RemoteAccessState::Running;
     runtime.status.last_error = None;
@@ -364,10 +358,7 @@ async fn stop_remote_access_runtime(
 ) -> Result<(), String> {
     if let Some(mut process) = child.take() {
         if let Err(error) = process.start_kill() {
-            return Err(prefixed_text(
-                "failed to stop cloudflared: ",
-                error.to_string().as_str(),
-            ));
+            return Err(format!("failed to stop cloudflared: {error}"));
         }
         let _ = process.wait().await;
     }

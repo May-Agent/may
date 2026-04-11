@@ -10,7 +10,6 @@ use crate::db::ProfileEnvironmentKind;
 use crate::session::{
     MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db,
 };
-use crate::text::{join_text, prefixed_text};
 use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
@@ -28,16 +27,12 @@ use super::types::{
 };
 
 fn session_not_found_error(session_id: &str) -> SkyError {
-    SkyError::msg(join_text(&["Session ", session_id, " not found"]))
-        .set_status(StatusCode::NOT_FOUND)
+    SkyError::msg(format!("Session {session_id} not found")).set_status(StatusCode::NOT_FOUND)
 }
 
 fn context_debug_not_found_error(session_id: &str) -> SkyError {
-    SkyError::msg(prefixed_text(
-        "No context debug snapshot for session ",
-        session_id,
-    ))
-    .set_status(StatusCode::NOT_FOUND)
+    SkyError::msg(format!("No context debug snapshot for session {session_id}"))
+        .set_status(StatusCode::NOT_FOUND)
 }
 
 fn resolve_session_model(
@@ -47,7 +42,7 @@ fn resolve_session_model(
 ) -> Result<String, skyzen::Error> {
     let config = state.config_snapshot();
     resolve_default_model(&config, model)
-        .ok_or_else(|| internal_error(prefixed_text("no model resolved for session ", session_id)))
+        .ok_or_else(|| internal_error(format!("no model resolved for session {session_id}")))
 }
 
 pub(super) async fn list_sessions(
@@ -66,10 +61,7 @@ pub(super) async fn list_api_sessions(
     let mut sessions = Vec::with_capacity(summaries.len());
     for s in summaries {
         let model = resolve_default_model(&config, s.model.clone()).ok_or_else(|| {
-            internal_error(prefixed_text(
-                "no model resolved for session ",
-                s.id.as_str(),
-            ))
+            internal_error(format!("no model resolved for session {}", s.id.as_str()))
         })?;
         sessions.push(ApiSession::from_summary(s, model, Vec::new()));
     }
