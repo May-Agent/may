@@ -79,8 +79,13 @@ anyhow = "1"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# Markdown parsing (incremental/streaming)
+# Markdown parsing
+# - streamdown-parser: incremental / streaming renderer for assistant output
+# - pulldown-cmark: CommonMark AST parser for structured input (checklists,
+#   prompt @-mentions, tasks.md, etc.) where one-shot correctness matters
+#   more than streaming
 streamdown-parser = "0.1"
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # TUI
 ratatui = { version = "0.30", features = ["scrolling-regions", "unstable-rendered-line-info"] }
