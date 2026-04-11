@@ -484,6 +484,31 @@ pub struct StoredSessionContextSnapshot {
     pub updated_at: String,
 }
 
+/// Parameters for creating a scheduled task.
+pub struct CreateScheduledTaskParams<'a> {
+    pub id: &'a str,
+    pub profile_id: &'a str,
+    pub session_id: Option<&'a str>,
+    pub name: &'a str,
+    pub trigger: &'a crate::task_trigger::PersistedTaskTrigger,
+    pub cron_expression: Option<&'a str>,
+    pub run_at: Option<&'a str>,
+    pub script_path: Option<&'a str>,
+    pub script_inline: Option<&'a str>,
+    pub needs_network: bool,
+}
+
+/// Parameters for updating a scheduled task.
+pub struct UpdateScheduledTaskParams<'a> {
+    pub name: Option<&'a str>,
+    pub enabled: Option<bool>,
+    pub approved: Option<bool>,
+    pub cron_expression: Option<Option<&'a str>>,
+    pub run_at: Option<Option<&'a str>>,
+    pub script_path: Option<Option<&'a str>>,
+    pub script_inline: Option<Option<&'a str>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileEnvironmentKind {
