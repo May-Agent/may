@@ -55,7 +55,7 @@ use may_agent::{
     resolve_agent_environment_for_session, resolve_provider_runtime,
 };
 
-const PANIC_MESSAGE: &str = include_str!("../texts/panic_message.txt");
+const PANIC_MESSAGE: &str = include_str!("../../texts/panic_message.txt");
 
 fn ensure_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
