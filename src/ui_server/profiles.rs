@@ -83,7 +83,7 @@ pub(super) async fn ensure_profile_environment_ready(
 
     if environment == ProfileEnvironmentKind::Remote {
         let config = state.config_snapshot();
-        crate::remote_profile::resolve_remote_profile_server(&profile, &config.ssh_servers)
+        crate::profile::remote::resolve_remote_profile_server(&profile, &config.ssh_servers)
             .map_err(bad_request_error)?;
         state.clear_container_prepare_status(profile_id);
         return Ok(());

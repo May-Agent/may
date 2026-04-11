@@ -409,7 +409,7 @@ pub struct UiServerState {
     pub(crate) browser_manager: ArcSwapOption<crate::container::browser::BrowserManager>,
     pub(crate) browser_owner_session_id: ArcSwapOption<String>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
-    pub(crate) notification_service: Arc<crate::notification_service::NotificationService>,
+    pub(crate) notification_service: Arc<crate::notification::NotificationService>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
     pub(crate) local_url_port_mapper: Arc<LocalUrlPortMapper>,
     pub(crate) title_generation_queue: TitleGenerationQueue,

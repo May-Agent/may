@@ -15,8 +15,7 @@ use crate::browser_service::{
 };
 use crate::config::{BrowserConfig, SshServerConfig};
 use crate::network_policy::NetworkPolicyConfig;
-use crate::notification::NotificationManager;
-use crate::notification_service::NotificationService;
+use crate::notification::{NotificationManager, NotificationService};
 use crate::scheduler::TaskRuntime;
 use crate::session::{MayHomePaths, SessionStore};
 use crate::{SkillManager, SubagentManager};
