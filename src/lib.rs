@@ -33,7 +33,6 @@ pub mod task_trigger;
 pub mod tasks;
 pub mod terminal_commands;
 pub mod terminal_permission_handler;
-mod text;
 pub mod todo_parser;
 pub mod tool_dispatch;
 pub mod tui;

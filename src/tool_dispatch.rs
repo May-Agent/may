@@ -19,7 +19,6 @@ use crate::notification::NotificationManager;
 use crate::notification_service::NotificationService;
 use crate::scheduler::TaskRuntime;
 use crate::session::{MayHomePaths, SessionStore};
-use crate::text::{join_text, path_error_text, path_message};
 use crate::{SkillManager, SubagentManager};
 
 #[derive(Debug, thiserror::Error)]
@@ -352,10 +351,9 @@ async fn resolve_browser_session_paths(
     tokio::fs::create_dir_all(session_paths.root())
         .await
         .map_err(|error| {
-            path_error_text(
-                "failed to create session root ",
-                session_paths.root(),
-                &error,
+            format!(
+                "failed to create session root {}: {error}",
+                session_paths.root().display()
             )
         })?;
     Ok(session_paths)
@@ -376,7 +374,7 @@ async fn handle_register_skills_request(
                 .register_from_local_path(&source)
                 .await
                 .map_err(|error| {
-                    path_error_text("failed to register skill from ", &source, &error)
+                    format!("failed to register skill from {}: {error}", source.display())
                 })?;
             Ok(vec![info.dir_name])
         },
@@ -399,7 +397,10 @@ async fn handle_register_subagents_request(
                 .register_from_local_path(&source)
                 .await
                 .map_err(|error| {
-                    path_error_text("failed to register subagents from ", &source, &error)
+                    format!(
+                        "failed to register subagents from {}: {error}",
+                        source.display()
+                    )
                 })?;
             Ok(infos.into_iter().map(|item| item.file_name).collect())
         },
@@ -451,10 +452,9 @@ async fn resolve_registration_target_dir(
     tokio::fs::create_dir_all(session_paths.root())
         .await
         .map_err(|error| {
-            path_error_text(
-                "failed to create session root ",
-                session_paths.root(),
-                &error,
+            format!(
+                "failed to create session root {}: {error}",
+                session_paths.root().display()
             )
         })?;
     Ok(session_paths.home_root().join(target_dir_name))
@@ -472,16 +472,19 @@ async fn resolve_registration_source_path(cwd: &Path, raw_path: &str) -> Result<
         cwd.join(path)
     };
     let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
-        path_error_text("failed to resolve registration path ", &candidate, &error)
+        format!(
+            "failed to resolve registration path {}: {error}",
+            candidate.display()
+        )
     })?;
-    let project_root = tokio::fs::canonicalize(cwd)
-        .await
-        .map_err(|error| path_error_text("failed to resolve project root ", cwd, &error))?;
+    let project_root = tokio::fs::canonicalize(cwd).await.map_err(|error| {
+        format!("failed to resolve project root {}: {error}", cwd.display())
+    })?;
 
     if !canonical.starts_with(&project_root) {
-        return Err(path_message(
-            "registration path must be inside project root ",
-            &project_root,
+        return Err(format!(
+            "registration path must be inside project root {}",
+            project_root.display()
         ));
     }
 
@@ -536,27 +539,18 @@ fn build_registration_approval_message(
     source_label: &str,
     target_dir_name: &str,
 ) -> String {
-    let source_display = source.display().to_string();
-    join_text(&[
-        "Session ",
-        session_id,
-        " requests registering ",
-        source_label,
-        " from ",
-        source_display.as_str(),
-        " into this session's ",
-        target_dir_name,
-        ". Approve?",
-    ])
+    format!(
+        "Session {session_id} requests registering {source_label} from {} into this session's {target_dir_name}. Approve?",
+        source.display()
+    )
 }
 
 fn session_error_text(prefix: &str, session_id: &str, error: &impl std::fmt::Display) -> String {
-    let error_text = error.to_string();
-    join_text(&[prefix, session_id, ": ", error_text.as_str()])
+    format!("{prefix}{session_id}: {error}")
 }
 
 fn session_not_found_text(session_id: &str) -> String {
-    join_text(&["session not found: ", session_id])
+    format!("session not found: {session_id}")
 }
 
 async fn browser_service_status(

@@ -1,7 +1,5 @@
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
-use crate::text::join_text;
-
 /// Global network restriction mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -109,15 +107,8 @@ impl CompiledNetworkPolicy {
 fn build_matcher(hosts: &[String]) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for host in hosts {
-        let glob = Glob::new(host).map_err(|error| {
-            let error_text = error.to_string();
-            join_text(&[
-                "invalid network host pattern '",
-                host.as_str(),
-                "': ",
-                error_text.as_str(),
-            ])
-        })?;
+        let glob = Glob::new(host)
+            .map_err(|error| format!("invalid network host pattern '{host}': {error}"))?;
         builder.add(glob);
     }
     builder.build().map_err(|error| error.to_string())

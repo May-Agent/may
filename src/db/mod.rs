@@ -24,7 +24,6 @@ use crate::session::{
     TerminalRuntimeState,
 };
 use crate::task_trigger::{PersistedTaskTrigger, TRIGGER_KIND_WEBHOOK};
-use crate::text::{prefixed_display, prefixed_text};
 use crate::xml::XmlBlock;
 use entity::{
     folders, messages, network_access_logs, notification_mailbox, profile_memories,
@@ -494,11 +493,11 @@ fn parse_profile_environment(value: &str) -> Result<ProfileEnvironmentKind, Chat
 }
 
 fn db_custom_error(prefix: &str, error: &impl std::fmt::Display) -> String {
-    prefixed_display(prefix, error)
+    format!("{prefix}{error}")
 }
 
 fn session_not_found_db_error(session_id: &str) -> ChatDbError {
-    ChatDbError::RowNotFound(prefixed_text("Session not found: ", session_id))
+    ChatDbError::RowNotFound(format!("Session not found: {session_id}"))
 }
 
 fn row_not_found(message: impl Into<String>) -> ChatDbError {
@@ -510,14 +509,11 @@ fn storage_error(message: impl Into<String>) -> ChatDbError {
 }
 
 fn conversion_error(field: &str, error: &impl std::fmt::Display) -> ChatDbError {
-    storage_error(db_custom_error(
-        &prefixed_text(field, " conversion failed: "),
-        error,
-    ))
+    storage_error(format!("{field} conversion failed: {error}"))
 }
 
 fn overflow_error(field: &str, error: &impl std::fmt::Display) -> ChatDbError {
-    storage_error(db_custom_error(&prefixed_text(field, " overflow: "), error))
+    storage_error(format!("{field} overflow: {error}"))
 }
 
 fn to_i32(value: u32, field: &str) -> Result<i32, ChatDbError> {
@@ -3499,16 +3495,13 @@ impl ChatDb {
         let runtime = self.load_session_runtime_summary(id).await?;
         if runtime.is_active() {
             let reason = if runtime.state.is_active() {
-                prefixed_text("runtime state is ", runtime.state.as_str())
+                format!("runtime state is {}", runtime.state.as_str())
             } else {
                 "pending follow-up work exists".to_string()
             };
-            let mut message = String::with_capacity(35 + id.len() + reason.len());
-            message.push_str("cannot archive active session ");
-            message.push_str(id);
-            message.push_str(" while ");
-            message.push_str(reason.as_str());
-            return Err(storage_error(message));
+            return Err(storage_error(format!(
+                "cannot archive active session {id} while {reason}"
+            )));
         }
         query!(self.db, "UPDATE sessions SET archived = TRUE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL WHERE id = ?", id)
             .execute()
