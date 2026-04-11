@@ -6,6 +6,7 @@ mod imagine;
 mod may;
 pub(crate) mod notify_tool;
 mod permission;
+mod provider;
 pub(crate) mod register_tool;
 pub mod runner;
 mod runtime_context;
@@ -19,8 +20,11 @@ pub use browser_tool::{
 };
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use may::{
-    AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, ResolvedProviderRuntime,
-    build_fast_provider_chain, generate_session_title, provider_candidate_count,
+    AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, generate_session_title,
+};
+pub use provider::{
+    ProviderCandidate, ResolvedProviderRuntime, build_fast_provider_chain,
+    provider_candidate_count, provider_candidates_for_model, provider_candidates_for_tiers,
     resolve_provider_runtime,
 };
 pub use permission::{
