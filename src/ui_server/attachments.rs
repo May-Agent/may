@@ -74,7 +74,7 @@ impl PromptSection {
                 },
             ),
             Self::UnsupportedModalityAlert(offloaded_attachments) => serialize_xml(
-                "system_alert",
+                "system-reminder",
                 &UnsupportedModalityAlertXml {
                     alert_type: "unsupported_modality_offload".to_string(),
                     message:

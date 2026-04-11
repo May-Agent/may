@@ -2228,7 +2228,7 @@ async fn build_oneshot_prompt_with_mentions(
     prompt: &str,
 ) -> anyhow::Result<OneShotPromptInput> {
     let mut hidden_context_parts = vec![may_agent::xml_fragment::serialize_tagged_xml(
-        "system_alert",
+        "system-reminder",
         &OneShotNonInteractiveAlert {
             alert_type: "oneshot_noninteractive",
             message: "Non-interactive oneshot run. Do not use ask_user or wait for stdin. Make a reasonable assumption when possible; if interaction is truly required, explain the blocker and stop.",

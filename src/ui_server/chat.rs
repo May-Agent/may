@@ -507,7 +507,7 @@ fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> Result<String, ChatMarku
 
 fn browser_takeover_alert_xml() -> Result<String, ChatMarkupError> {
     serialize_xml(
-        "system_alert",
+        "system-reminder",
         &BrowserTakeoverAlertXml {
             alert_type: "browser_takeover".to_string(),
             event: "browser_control_returned".to_string(),
@@ -523,7 +523,7 @@ fn resume_waiting_turn_xml(
     resolution: ResumeResolution,
 ) -> Result<crate::XmlFragment, ChatMarkupError> {
     let xml = serialize_xml(
-        "system_alert",
+        "system-reminder",
         &ResumeWaitingTurnXml {
             alert_type: "resume_waiting_turn",
             request_kind,

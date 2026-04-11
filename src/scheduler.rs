@@ -215,7 +215,7 @@ fn task_notification_callback_context(
 ) -> Option<crate::XmlFragment> {
     task.session_id.as_ref()?;
     let xml = crate::xml_fragment::serialize_tagged_xml(
-        "system_alert",
+        "system-reminder",
         &TaskNotificationCallbackXml {
             alert_type: "task_callback",
             task_id: task.id.as_str(),
