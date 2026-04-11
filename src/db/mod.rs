@@ -25,7 +25,7 @@ use crate::session::{
 };
 use crate::task_trigger::{PersistedTaskTrigger, TRIGGER_KIND_WEBHOOK};
 use crate::text::{prefixed_display, prefixed_text};
-use crate::xml_fragment::XmlFragment;
+use crate::xml::XmlBlock;
 use entity::{
     folders, messages, network_access_logs, notification_mailbox, profile_memories,
     profile_memory_jobs, profiles, push_subscriptions, request_logs, scheduled_tasks,
@@ -48,7 +48,7 @@ pub enum ChatDbError {
     #[error("Database row not found: {0}")]
     RowNotFound(String),
     #[error("Invalid context fragment: {0}")]
-    InvalidXml(#[from] crate::xml_fragment::XmlFragmentError),
+    InvalidXml(#[from] crate::xml::XmlBlockError),
     #[error("Invalid profile environment: {0}")]
     InvalidProfileEnvironment(String),
     #[error(
@@ -801,7 +801,7 @@ impl ChatDb {
                     })
                 })
                 .collect::<Result<Vec<_>, ChatDbError>>()?,
-            hidden_context_xml: row.hidden_context_xml.map(XmlFragment::parse).transpose()?,
+            hidden_context_xml: row.hidden_context_xml.map(XmlBlock::parse).transpose()?,
             created_at: row.created_at,
             delivery_mode: parse_pending_user_message_mode(&row.delivery_mode)?,
         })
@@ -1138,7 +1138,7 @@ impl ChatDb {
                 session_id,
                 message.delivery_mode.as_str(),
                 message.content.as_str(),
-                message.hidden_context_xml.clone().map(XmlFragment::into_inner),
+                message.hidden_context_xml.clone().map(XmlBlock::into_inner),
                 message.created_at.as_str()
             )
             .execute()
@@ -1171,7 +1171,7 @@ impl ChatDb {
                 session_id,
                 message.delivery_mode.as_str(),
                 message.content.as_str(),
-                message.hidden_context_xml.clone().map(XmlFragment::into_inner),
+                message.hidden_context_xml.clone().map(XmlBlock::into_inner),
                 message.created_at.as_str()
             )
             .execute()
@@ -2676,7 +2676,7 @@ impl ChatDb {
             payload
                 .callback_context_xml
                 .clone()
-                .map(XmlFragment::into_inner),
+                .map(XmlBlock::into_inner),
             payload.callback_message.as_deref(),
             status,
             0_i32,
@@ -5108,7 +5108,7 @@ mod tests {
             body: "Completed".to_string(),
             session_id: Some("session-1".to_string()),
             callback_context_xml: Some(
-                crate::XmlFragment::parse("<system-reminder><status>ok</status></system-reminder>")
+                crate::XmlBlock::parse("<system-reminder><status>ok</status></system-reminder>")
                     .expect("callback XML should parse"),
             ),
             callback_message: Some("Follow up".to_string()),

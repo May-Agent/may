@@ -212,9 +212,9 @@ fn task_notification_callback_context(
     task: &scheduled_tasks::Model,
     status: TaskCallbackStatus,
     summary: &str,
-) -> Option<crate::XmlFragment> {
+) -> Option<crate::XmlBlock> {
     task.session_id.as_ref()?;
-    let xml = crate::xml_fragment::serialize_tagged_xml(
+    let xml = crate::xml::serialize_xml_block(
         "system-reminder",
         &TaskNotificationCallbackXml {
             alert_type: "task_callback",
@@ -228,14 +228,14 @@ fn task_notification_callback_context(
         },
     )
     .ok()?;
-    crate::XmlFragment::parse(xml).ok()
+    crate::XmlBlock::parse(xml).ok()
 }
 
 fn task_notification_callback_payload(
     task: &scheduled_tasks::Model,
     status: TaskCallbackStatus,
     summary: &str,
-) -> (Option<crate::XmlFragment>, Option<String>) {
+) -> (Option<crate::XmlBlock>, Option<String>) {
     if task.session_id.is_none() {
         return (None, None);
     }

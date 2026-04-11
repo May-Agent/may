@@ -6,7 +6,7 @@ use crate::session::{
     AttachmentKind, PendingUserMessage, PendingUserMessageMode, SessionPlanState,
     SessionRuntimeState,
 };
-use crate::xml_fragment::XmlFragment;
+use crate::xml::XmlBlock;
 use aither_core::llm::ToolResult;
 
 // ── Typed API Errors ────────────────────────────────────────
@@ -675,7 +675,7 @@ pub struct ChatRequest {
     /// Structured hidden context fragment for the next turn.
     /// XML-like tags are allowed, but strict XML validity is not required.
     #[serde(default)]
-    pub(crate) hidden_context_xml: Option<XmlFragment>,
+    pub(crate) hidden_context_xml: Option<XmlBlock>,
     #[serde(default)]
     pub(crate) delivery_mode: PendingUserMessageMode,
 }
