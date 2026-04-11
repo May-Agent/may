@@ -1,30 +1,86 @@
 //! Markdown checklist parser for `tasks.md`.
 //!
-//! Extracts structured checklist items from standard Markdown checkbox syntax
-//! (`- [ ]`, `- [x]`, `* [ ]`, `* [x]`).
+//! Extracts structured checklist items from CommonMark task lists using
+//! `pulldown-cmark`. This correctly handles nesting, task markers inside
+//! code spans vs real items, and edge cases that a regex approach would
+//! miss (for example, `- [ ]` lines inside fenced code blocks must not
+//! be treated as checklist items).
+
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// A parsed checklist document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TodoChecklist {
+    /// Ordered checklist items discovered in the document.
     pub items: Vec<TodoChecklistItem>,
 }
 
 /// A single checklist item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TodoChecklistItem {
+    /// The text of the checklist item with surrounding whitespace trimmed.
     pub text: String,
+    /// Whether the item is marked as complete (`- [x]`).
     pub checked: bool,
 }
 
 impl TodoChecklist {
-    /// Parse a markdown string into a structured checklist.
+    /// Parse a CommonMark string into a structured checklist.
     ///
-    /// Extracts lines matching `- [ ]`/`- [x]`/`* [ ]`/`* [x]` patterns
-    /// (case-insensitive `x`, leading whitespace allowed). Non-checklist
-    /// lines are ignored.
+    /// Nested task-list items are flattened into document order: a
+    /// top-level checklist item containing a nested sub-checklist
+    /// produces one entry per task marker, with the outer item listed
+    /// before its children. Only list items that begin with a
+    /// task-list marker (`[ ]` / `[x]`) are collected; regular bullets
+    /// and prose are ignored.
     #[must_use]
     pub fn parse(content: &str) -> Self {
-        let items = content.lines().filter_map(parse_checklist_line).collect();
+        let parser = Parser::new_ext(content, Options::ENABLE_TASKLISTS);
+        // `pending` holds every open list item in document order, with
+        // a `is_task` flag that flips to true only when a task-list
+        // marker is observed inside it. Non-task list items are
+        // dropped at the end.
+        let mut pending: Vec<PendingItem> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+
+        for event in parser {
+            match event {
+                Event::Start(Tag::Item) => {
+                    stack.push(pending.len());
+                    pending.push(PendingItem::default());
+                }
+                Event::End(TagEnd::Item) => {
+                    stack.pop();
+                }
+                Event::TaskListMarker(checked) => {
+                    if let Some(&index) = stack.last() {
+                        pending[index].is_task = true;
+                        pending[index].checked = checked;
+                    }
+                }
+                Event::Text(text) | Event::Code(text) => {
+                    if let Some(&index) = stack.last() {
+                        pending[index].text.push_str(text.as_ref());
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if let Some(&index) = stack.last() {
+                        pending[index].text.push(' ');
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let items = pending
+            .into_iter()
+            .filter(|entry| entry.is_task)
+            .map(|entry| TodoChecklistItem {
+                text: entry.text.trim().to_string(),
+                checked: entry.checked,
+            })
+            .collect();
+
         Self { items }
     }
 
@@ -47,33 +103,11 @@ impl TodoChecklist {
     }
 }
 
-/// Attempt to parse a single line as a checklist item.
-fn parse_checklist_line(line: &str) -> Option<TodoChecklistItem> {
-    let trimmed = line.trim_start();
-
-    // Must start with `- ` or `* `
-    let rest = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))?;
-
-    // Must continue with `[ ]` or `[x]`/`[X]`
-    let (checked, after_bracket) = if let Some(tail) = rest.strip_prefix("[ ] ") {
-        (false, tail)
-    } else if let Some(tail) = rest
-        .strip_prefix("[x] ")
-        .or_else(|| rest.strip_prefix("[X] "))
-    {
-        (true, tail)
-    } else if rest == "[ ]" {
-        (false, "")
-    } else if rest == "[x]" || rest == "[X]" {
-        (true, "")
-    } else {
-        return None;
-    };
-
-    let text = after_bracket.trim().to_string();
-    Some(TodoChecklistItem { text, checked })
+#[derive(Default)]
+struct PendingItem {
+    is_task: bool,
+    checked: bool,
+    text: String,
 }
 
 #[cfg(test)]
@@ -172,11 +206,50 @@ Some text here.
     }
 
     #[test]
-    fn parse_empty_text_items() {
-        let content = "- [ ]";
+    fn parse_ignores_code_block_checklist_markup() {
+        let content = "\
+- [x] Real item
+
+```
+- [ ] Not a real item inside a code block
+- [x] Also not a real item
+```
+
+- [ ] Another real item";
+
+        let checklist = TodoChecklist::parse(content);
+        assert_eq!(checklist.total(), 2);
+        assert!(checklist.items[0].checked);
+        assert_eq!(checklist.items[0].text, "Real item");
+        assert!(!checklist.items[1].checked);
+        assert_eq!(checklist.items[1].text, "Another real item");
+    }
+
+    #[test]
+    fn parse_item_with_inline_code_preserves_code_text() {
+        let content = "- [ ] Run `cargo test` and verify all pass";
         let checklist = TodoChecklist::parse(content);
         assert_eq!(checklist.total(), 1);
-        assert_eq!(checklist.items[0].text, "");
         assert!(!checklist.items[0].checked);
+        assert_eq!(
+            checklist.items[0].text,
+            "Run cargo test and verify all pass"
+        );
+    }
+
+    #[test]
+    fn parse_multiline_item_joins_soft_breaks() {
+        let content = "\
+- [ ] First line
+  continuation of the same item
+- [x] Second task";
+
+        let checklist = TodoChecklist::parse(content);
+        assert_eq!(checklist.total(), 2);
+        assert_eq!(
+            checklist.items[0].text,
+            "First line continuation of the same item"
+        );
+        assert!(checklist.items[1].checked);
     }
 }
