@@ -53,7 +53,7 @@ pub async fn resolve_agent_environment_for_session(
                 .await
                 .map_err(ResolveAgentEnvironmentError::LoadRemoteConfig)?;
             let ssh_server =
-                crate::remote_profile::resolve_remote_profile_server(profile, &config.ssh_servers)
+                crate::profile::remote::resolve_remote_profile_server(profile, &config.ssh_servers)
                     .map_err(ResolveAgentEnvironmentError::ResolveRemoteServer)?;
             return Ok(AgentEnvironment::Remote { ssh_server });
         }

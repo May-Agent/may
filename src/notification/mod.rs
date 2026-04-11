@@ -1,7 +1,14 @@
-//! Web Push notification manager.
+//! Push notification subsystem.
 //!
-//! Handles VAPID keypair generation/loading, push subscription management,
-//! and sending notifications to all subscribed browsers.
+//! - [`NotificationManager`](self::NotificationManager) handles VAPID
+//!   keypair generation/loading, push subscription management, and
+//!   sending notifications to all subscribed browsers.
+//! - [`service::NotificationService`] wraps the manager with a durable
+//!   mailbox so pending callbacks survive may restarts.
+
+pub mod service;
+
+pub use service::{NotificationService, NotificationServiceError};
 
 use std::path::Path;
 use std::sync::Arc;

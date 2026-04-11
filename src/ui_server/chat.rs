@@ -19,8 +19,7 @@ use crate::agent::MayAgent;
 use crate::agent::browser_tool::BrowserToolError;
 use crate::ask_user;
 use crate::browser_service::persist_browser_page_capture;
-use crate::notification::NotificationPayload;
-use crate::notification_service::NotificationService;
+use crate::notification::{NotificationPayload, NotificationService};
 use crate::prompt_mentions;
 use crate::session::{
     ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths, MessageRole, PendingUserMessage,
@@ -2124,7 +2123,7 @@ async fn setup_agent_environment(
                 .ok_or(UiChatPreparationError::MissingRemoteProfileModel)?;
             let config = state.config_snapshot();
             let ssh_server =
-                crate::remote_profile::resolve_remote_profile_server(profile, &config.ssh_servers)
+                crate::profile::remote::resolve_remote_profile_server(profile, &config.ssh_servers)
                     .map_err(UiChatPreparationError::ResolveRemoteServer)?;
             crate::agent::AgentEnvironment::Remote { ssh_server }
         }

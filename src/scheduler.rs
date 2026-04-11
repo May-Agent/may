@@ -28,8 +28,7 @@ use crate::container::lifecycle::ContainerManager;
 use crate::db::entity::{profiles, scheduled_tasks};
 use crate::db::{ChatDb, NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
-use crate::notification::NotificationPayload;
-use crate::notification_service::NotificationService;
+use crate::notification::{NotificationPayload, NotificationService};
 use crate::profile::ProfileEnvironment;
 use crate::task_trigger::{
     PersistedTaskTrigger, TaskInvocation, TaskTriggerResponse, TaskWebhookRequest, TimeTriggerType,
@@ -1115,7 +1114,7 @@ impl TaskRuntime {
 
     fn resolve_remote_server(&self, profile: &profiles::Model) -> Result<SshServerConfig, String> {
         let configured_servers = self.ssh_servers.load();
-        crate::remote_profile::resolve_remote_profile_server(profile, configured_servers.as_slice())
+        crate::profile::remote::resolve_remote_profile_server(profile, configured_servers.as_slice())
     }
 
     async fn remote_terminal_tool(
