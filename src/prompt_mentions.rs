@@ -200,26 +200,80 @@ pub fn truncate_preview_with_limit(content: &str, max_chars: usize) -> String {
 }
 
 fn extract_mention_candidates(content: &str) -> Vec<MentionCandidate> {
-    static MENTION_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(^|[\s(\[{<])@([^\s)\]}>"'`,!?;]+)"#)
-            .expect("generic mention regex must be valid")
-    });
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
+    // Walk the CommonMark event stream so we only see prose text. This
+    // makes `@mention`s inside fenced code blocks, inline code spans,
+    // and inline HTML invisible to extraction, which matches the user's
+    // mental model: copying a snippet into the prompt should not
+    // accidentally materialize a mention just because the snippet
+    // contains an `@`.
+    let parser = Parser::new(content);
+    let mut in_code_block = false;
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for captures in MENTION_RE.captures_iter(content) {
-        let Some(matched) = captures.get(2) else {
-            continue;
-        };
-        let Some(candidate) = normalize_mention_candidate(matched.as_str()) else {
-            continue;
-        };
-        let dedupe_key = (candidate.kind.clone(), candidate.value.clone());
-        if seen.insert(dedupe_key) {
-            out.push(candidate);
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+            Event::End(TagEnd::CodeBlock) => in_code_block = false,
+            Event::Text(text) if !in_code_block => {
+                scan_text_for_mentions(text.as_ref(), &mut seen, &mut out);
+            }
+            _ => {}
         }
     }
+
     out
+}
+
+/// Scan a single prose-only text fragment for `@`-prefixed mentions and
+/// push deduplicated candidates into `out`.
+fn scan_text_for_mentions(
+    text: &str,
+    seen: &mut std::collections::HashSet<(MentionKind, String)>,
+    out: &mut Vec<MentionCandidate>,
+) {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        // Only treat `@` as a mention start if it either sits at the
+        // beginning of the fragment or follows an ASCII whitespace or
+        // common opening-bracket delimiter. This mirrors the old regex
+        // boundary `(^|[\s(\[{<])` so email addresses like
+        // `alice@example.com` do not get picked up.
+        let ch = bytes[index];
+        if ch != b'@' || !is_mention_boundary(bytes, index) {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let end = text[start..]
+            .find(is_mention_terminator)
+            .map_or(text.len(), |offset| start + offset);
+        let raw = &text[start..end];
+        if !raw.is_empty()
+            && let Some(candidate) = normalize_mention_candidate(raw)
+        {
+            let dedupe_key = (candidate.kind.clone(), candidate.value.clone());
+            if seen.insert(dedupe_key) {
+                out.push(candidate);
+            }
+        }
+        index = end.max(index + 1);
+    }
+}
+
+fn is_mention_boundary(bytes: &[u8], at_index: usize) -> bool {
+    if at_index == 0 {
+        return true;
+    }
+    let prev = bytes[at_index - 1];
+    matches!(prev, b' ' | b'\t' | b'\n' | b'\r' | b'(' | b'[' | b'{' | b'<')
+}
+
+fn is_mention_terminator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, ')' | ']' | '}' | '>' | '"' | '\'' | '`' | ',' | '!' | '?' | ';')
 }
 
 fn normalize_mention_candidate(raw: &str) -> Option<MentionCandidate> {
@@ -337,5 +391,39 @@ mod tests {
         let path = parse_relative_file_mention("docs/guide.md")
             .expect("nested relative file mention must be accepted");
         assert_eq!(path, PathBuf::from("docs/guide.md"));
+    }
+
+    #[test]
+    fn ignores_mentions_inside_fenced_code_blocks() {
+        let content = "\
+Please look at @real-session for context.
+
+```
+# command reference
+send to @alice@example.com
+or @ignored-session
+```
+
+After the block, @another-session also matters.";
+
+        let ids = extract_session_mention_ids(content);
+        assert_eq!(
+            ids,
+            vec!["real-session".to_string(), "another-session".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignores_mentions_inside_inline_code_spans() {
+        let content = "Use `@stale-session` as a literal example, but pay attention to @active-session.";
+        let ids = extract_session_mention_ids(content);
+        assert_eq!(ids, vec!["active-session".to_string()]);
+    }
+
+    #[test]
+    fn ignores_mentions_after_non_boundary_characters() {
+        let content = "Reach me at bob@example.org and ping @new-session.";
+        let ids = extract_session_mention_ids(content);
+        assert_eq!(ids, vec!["new-session".to_string()]);
     }
 }
