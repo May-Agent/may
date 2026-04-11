@@ -470,6 +470,20 @@ pub(super) struct StoredSessionContextSnapshotRow {
     pub(super) updated_at: String,
 }
 
+/// Parameters for upserting a persisted session context snapshot.
+pub struct SessionContextSnapshotUpsert {
+    pub checkpoint: aither_agent::AgentCheckpoint,
+    pub history_message_count: usize,
+}
+
+/// Structured snapshot loaded from SQL-backed session context storage.
+#[derive(Debug, Clone)]
+pub struct StoredSessionContextSnapshot {
+    pub checkpoint: aither_agent::AgentCheckpoint,
+    pub history_message_count: usize,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileEnvironmentKind {
