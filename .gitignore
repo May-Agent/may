@@ -1,5 +1,8 @@
 /target
 .DS_Store
 *.png
+*.log
 .leash/
 .heel/
+.codex-*
+.playwright-cli/
