@@ -171,14 +171,14 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Atomically transition Running → Idle only if currently Running.
     pub async fn clear_running_if_needed(
         &self,
         session_id: &str,
     ) -> Result<(), crate::db::ChatDbError> {
-        let runtime = self.get(session_id).await?;
-        if runtime.state == SessionRuntimeState::Running {
-            self.set_state(session_id, SessionRuntimeState::Idle)
-                .await?;
+        let transitioned = self.db.clear_running_if_idle(session_id).await?;
+        if transitioned {
+            self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         }
         Ok(())
     }
@@ -241,10 +241,10 @@ impl SessionRuntimeService {
         session_id: &str,
         terminal: TerminalRuntimeState,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
-        let mut summary = self.get(session_id).await?;
-        summary.interactions.terminal = terminal;
-        summary.normalize_state();
-        self.db.write_session_runtime(session_id, &summary).await?;
+        self.db
+            .set_terminal_interaction(session_id, &terminal)
+            .await?;
+        let summary = self.get(session_id).await?;
         self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
     }
