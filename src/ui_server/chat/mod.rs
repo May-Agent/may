@@ -38,8 +38,8 @@ use crate::ui_event_bus::UiEventTopics;
 
 use super::attachments::build_prompt_and_attachments;
 use super::browser::ensure_browser_runtime_started;
-use super::error_chain::error_chain_text;
 use super::error::{internal_error, json_ok_response, typed_error_response};
+use super::error_chain::error_chain_text;
 use super::helpers::{
     RETRY_BACKOFF_MS, append_history_message, elapsed_ms_saturating, load_session_paths,
     send_event, truncate_preview,
@@ -692,8 +692,10 @@ pub(super) async fn stop_session_run(
         .await
         .map_err(internal_error)?
     {
-        return Err(skyzen::Error::msg(format!("Session {session_id} not found"))
-            .set_status(skyzen::StatusCode::NOT_FOUND));
+        return Err(
+            skyzen::Error::msg(format!("Session {session_id} not found"))
+                .set_status(skyzen::StatusCode::NOT_FOUND),
+        );
     }
 
     let persisted_cancel = state
@@ -1578,6 +1580,8 @@ enum UiChatPreparationError {
     LoadRuntime(#[source] crate::db::ChatDbError),
     #[error("failed to load session context snapshot: {0}")]
     LoadContextSnapshot(#[source] crate::db::ChatDbError),
+    #[error("failed to replay session history: {0}")]
+    HistoryReplay(#[source] crate::session::HistoryReplayError),
     #[error("failed to serialize browser takeover alert: {0}")]
     BuildTakeoverAlert(#[source] ChatMarkupError),
     #[error("failed to build session mentions: {0}")]
@@ -1664,7 +1668,8 @@ impl UiChatPreparationError {
             | Self::RestoreCheckpoint(_)
             | Self::ApplyHistoryDelta(_)
             | Self::BuildPrompt(_)
-            | Self::PersistContextDebugSnapshot(_) => ApiErrorCode::InternalError,
+            | Self::PersistContextDebugSnapshot(_)
+            | Self::HistoryReplay(_) => ApiErrorCode::InternalError,
         }
     }
 
@@ -1703,7 +1708,8 @@ impl UiChatPreparationError {
             | Self::RestoreCheckpoint(_)
             | Self::ApplyHistoryDelta(_)
             | Self::BuildPrompt(_)
-            | Self::PersistContextDebugSnapshot(_) => skyzen::StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::PersistContextDebugSnapshot(_)
+            | Self::HistoryReplay(_) => skyzen::StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -1835,7 +1841,9 @@ async fn resolve_session_context(
         .map_err(UiChatPreparationError::LoadRuntime)?
         .unwrap_or_default();
 
-    let history_messages = history.to_aither_messages();
+    let history_messages = history
+        .to_aither_messages()
+        .map_err(UiChatPreparationError::HistoryReplay)?;
     let context_snapshot = if use_persisted_context_snapshot {
         db.get_session_context_snapshot(session_id.as_str())
             .await
@@ -2363,7 +2371,6 @@ async fn take_over_alert_pending(state: &UiServerState, session_id: &SessionId) 
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
