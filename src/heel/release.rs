@@ -100,7 +100,12 @@ struct GithubAsset {
 struct ManagedHeelState {
     release_tag: String,
     asset_name: String,
+    #[serde(default)]
+    last_checked_at: Option<String>,
 }
+
+/// How often to re-check the GitHub API for a new heel release (24 hours).
+const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 pub(crate) fn current_host_heel_asset() -> Result<ManagedHeelAsset, ManagedHeelError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -156,6 +161,26 @@ pub(crate) async fn ensure_managed_heel_binary(
 
     let binary_path = binary_dir.join(asset.local_binary_name());
     let state_path = install_root.join(HEEL_RELEASE_STATE_FILE);
+
+    // Fast path: if binary exists and was checked recently, skip the network call.
+    if binary_path.exists() {
+        if let Ok(Some(state)) = read_state(&state_path).await {
+            if let Some(ref checked_at) = state.last_checked_at {
+                if let Ok(ts) = checked_at.parse::<jiff::Timestamp>() {
+                    let elapsed = jiff::Timestamp::now().duration_since(ts);
+                    if elapsed < CHECK_INTERVAL.try_into().unwrap_or(jiff::SignedDuration::ZERO)
+                    {
+                        tracing::debug!(
+                            binary = %binary_path.display(),
+                            "skipping heel update check (checked recently)"
+                        );
+                        return Ok(binary_path);
+                    }
+                }
+            }
+        }
+    }
+
     let release = fetch_latest_release().await?;
     let release_asset = release
         .assets
@@ -175,6 +200,16 @@ pub(crate) async fn ensure_managed_heel_binary(
     )
     .await?
     {
+        // Binary is up-to-date — just refresh the check timestamp
+        let _ = write_state(
+            &state_path,
+            &ManagedHeelState {
+                release_tag: release.tag_name,
+                asset_name: asset.release_asset_name().to_string(),
+                last_checked_at: Some(jiff::Timestamp::now().to_string()),
+            },
+        )
+        .await;
         return Ok(binary_path);
     }
 
@@ -191,6 +226,7 @@ pub(crate) async fn ensure_managed_heel_binary(
         &ManagedHeelState {
             release_tag: release.tag_name,
             asset_name: release_asset.name,
+            last_checked_at: Some(jiff::Timestamp::now().to_string()),
         },
     )
     .await?;
