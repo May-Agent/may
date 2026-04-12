@@ -90,6 +90,45 @@ impl ChatDb {
             .await?)
     }
 
+    /// Atomically claim a pending notification for delivery (CAS: pending → delivering).
+    /// Returns true if the claim succeeded, false if another process already claimed it.
+    pub async fn claim_pending_notification(
+        &self,
+        id: &str,
+    ) -> Result<bool, ChatDbError> {
+        let result = self
+            .db
+            .query(
+                "UPDATE notification_mailbox SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+            )
+            .bind("delivering")
+            .bind(jiff::Timestamp::now().to_string())
+            .bind(id)
+            .bind("pending")
+            .execute()
+            .await?;
+        Ok(result.rows_written > 0)
+    }
+
+    /// Release a claimed notification back to pending (on send failure).
+    pub async fn release_notification_claim(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<(), ChatDbError> {
+        self.db
+            .query(
+                "UPDATE notification_mailbox SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind("pending")
+            .bind(error)
+            .bind(jiff::Timestamp::now().to_string())
+            .bind(id)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
     pub async fn list_notification_mailbox_entries(
         &self,
         limit: u64,
@@ -133,8 +172,7 @@ impl ChatDb {
             .get_notification_mailbox_entry(id)
             .await?
             .ok_or_else(|| row_not_found(format!("Notification mailbox entry not found: {id}")))?;
-        let has_callback =
-            entry.callback_context_xml.is_some() || entry.callback_message.is_some();
+        let has_callback = entry.callback_context_xml.is_some() || entry.callback_message.is_some();
         let callback_consumed = has_callback && entry.status != "opened";
         if entry.status != "opened" {
             self.mark_notification_mailbox_opened(id).await?;
