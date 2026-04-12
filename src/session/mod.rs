@@ -17,7 +17,9 @@ pub use context_snapshot::{
     history_delta_since_snapshot, load_persisted_context_snapshot,
     parse_persisted_context_snapshot, persist_agent_context_snapshot, persist_checkpoint_from_hook,
 };
-pub use history::{ChatHistory, ChatMessage, ChatMessageStats, MessageRole, SessionMetadata};
+pub use history::{
+    ChatHistory, ChatMessage, ChatMessageStats, HistoryReplayError, MessageRole, SessionMetadata,
+};
 pub use layout::{MayHomePaths, ProfileHomePaths, SessionPaths};
 pub use manager::{
     Session, SessionError, SessionId, SessionManager, SessionSummary,

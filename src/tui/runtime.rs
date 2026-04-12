@@ -27,6 +27,8 @@ pub enum TuiRuntimeError {
     ResolveAgentEnvironment(#[from] crate::agent::ResolveAgentEnvironmentError),
     #[error("No active session")]
     NoActiveSession,
+    #[error("history replay failed: {0}")]
+    HistoryReplay(#[from] crate::session::HistoryReplayError),
     #[error("invalid pending message timestamp: {0}")]
     InvalidPendingMessageTimestamp(#[source] jiff::Error),
     #[error("persisted image attachment is missing content")]
@@ -736,6 +738,8 @@ impl RuntimeDeps {
             .session_manager
             .current()
             .map(|session| session.history.to_aither_messages())
+            .transpose()
+            .map_err(|e| TuiRuntimeError::HistoryReplay(e))?
             .unwrap_or_default();
         let may_dir = app.session_manager.may_dir().to_path_buf();
         let profile_model = if let Some(profile_id) = app
