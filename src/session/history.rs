@@ -2,6 +2,14 @@
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Errors that can occur when replaying chat history into LLM messages.
+#[derive(Debug, Error)]
+pub enum HistoryReplayError {
+    #[error("tool history entry is missing tool_call_id (content preview: {preview})")]
+    MissingToolCallId { preview: String },
+}
 
 /// Session metadata stored in the chat history header.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -268,22 +276,27 @@ impl ChatHistory {
     ///
     /// Interaction metadata stays filtered, while hidden context is restored as
     /// system context and tool messages keep their original tool-call IDs.
-    #[must_use]
-    pub fn to_aither_messages(&self) -> Vec<aither_core::llm::Message> {
+    pub fn to_aither_messages(&self) -> Result<Vec<aither_core::llm::Message>, HistoryReplayError> {
         self.messages
             .iter()
             .filter_map(|m| {
                 use aither_core::llm::Message;
                 match m.role {
-                    MessageRole::User => Some(Message::user(&m.content)),
-                    MessageRole::Assistant => Some(Message::assistant(&m.content)),
-                    MessageRole::System => Some(Message::system(&m.content)),
-                    MessageRole::HiddenContext => Some(Message::system(&m.content)),
+                    MessageRole::User => Some(Ok(Message::user(&m.content))),
+                    MessageRole::Assistant => Some(Ok(Message::assistant(&m.content))),
+                    MessageRole::System => Some(Ok(Message::system(&m.content))),
+                    MessageRole::HiddenContext => Some(Ok(Message::system(&m.content))),
                     MessageRole::Tool => {
-                        let tool_call_id = m.tool_call_id.as_deref().unwrap_or_else(|| {
-                            panic!("tool history entry is missing tool_call_id: {}", m.content)
-                        });
-                        Some(Message::tool(tool_call_id, &m.content))
+                        let tool_call_id = match m.tool_call_id.as_deref() {
+                            Some(id) => id,
+                            None => {
+                                let preview: String = m.content.chars().take(100).collect();
+                                return Some(Err(HistoryReplayError::MissingToolCallId {
+                                    preview,
+                                }));
+                            }
+                        };
+                        Some(Ok(Message::tool(tool_call_id, &m.content)))
                     }
                     // Interaction messages are metadata, not LLM context
                     MessageRole::PermissionRequest
@@ -312,12 +325,15 @@ mod tests {
         history.messages_mut().push(ChatMessage::user("hello"));
         history.messages_mut().push(ChatMessage::assistant("world"));
 
-        let messages = history.to_aither_messages();
+        let messages = history.to_aither_messages().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role(), Role::System);
         assert_eq!(messages[1].role(), Role::User);
         assert_eq!(messages[2].role(), Role::Assistant);
-        assert_eq!(messages[0].content(), "<system-reminder>notice</system-reminder>");
+        assert_eq!(
+            messages[0].content(),
+            "<system-reminder>notice</system-reminder>"
+        );
     }
 
     #[test]
@@ -327,7 +343,7 @@ mod tests {
             .messages_mut()
             .push(ChatMessage::tool("call_123", "{\"ok\":true}"));
 
-        let messages = history.to_aither_messages();
+        let messages = history.to_aither_messages().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role(), Role::Tool);
         assert_eq!(messages[0].tool_call_id(), Some("call_123"));
