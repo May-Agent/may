@@ -31,8 +31,10 @@ fn session_not_found_error(session_id: &str) -> SkyError {
 }
 
 fn context_debug_not_found_error(session_id: &str) -> SkyError {
-    SkyError::msg(format!("No context debug snapshot for session {session_id}"))
-        .set_status(StatusCode::NOT_FOUND)
+    SkyError::msg(format!(
+        "No context debug snapshot for session {session_id}"
+    ))
+    .set_status(StatusCode::NOT_FOUND)
 }
 
 fn resolve_session_model(
@@ -84,15 +86,15 @@ pub(super) async fn get_session(
         .ok_or_else(|| session_not_found_error(&id))?;
 
     let mut summary = crate::session::SessionSummary::from_db_model(db_session);
-    summary.runtime = db
-        .get_session_runtime(&id)
-        .await
-        .map_err(internal_error)?
-        .unwrap_or_default();
 
+    // Fetch runtime and messages in parallel — they are independent queries
+    let (runtime_result, messages_result) = tokio::join!(
+        db.get_session_runtime(&id),
+        db.get_messages(&id),
+    );
+    summary.runtime = runtime_result.map_err(internal_error)?.unwrap_or_default();
     let model = resolve_session_model(&state, &id, summary.model.clone())?;
-
-    let db_messages = db.get_messages(&id).await.map_err(internal_error)?;
+    let db_messages = messages_result.map_err(internal_error)?;
     let messages = map_db_messages(&db_messages).map_err(internal_error)?;
 
     Ok(Json(ApiSession::from_summary(summary, model, messages)))
