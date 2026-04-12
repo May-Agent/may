@@ -53,7 +53,39 @@ use types::{
 static WEB_UI_DIST: include_dir::Dir<'static> =
     skyzen::embed_dir!("$CARGO_MANIFEST_DIR/web-ui/dist");
 
-pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
+/// HTTP server mode selected by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiServerMode {
+    /// Serve the REST API plus the embedded web UI.
+    Ui,
+    /// Serve the REST API only.
+    Rest,
+}
+
+impl UiServerMode {
+    fn ensure_supported(self) -> anyhow::Result<()> {
+        match self {
+            Self::Rest => Ok(()),
+            Self::Ui => {
+                #[cfg(feature = "ui")]
+                {
+                    Ok(())
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    Err(anyhow!(
+                        "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Run the May HTTP server in either embedded-UI or REST-only mode.
+pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<()> {
+    mode.ensure_supported()?;
+
     let host = helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
     let port = helpers::parse_arg_value(args, "--port")
         .and_then(|v| v.parse::<u16>().ok())
@@ -75,9 +107,8 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let mut mcp_manager = McpManager::load()
         .await
         .context("failed to load MCP config")?;
-    if mcp_manager.has_servers() {
-        let _ = mcp_manager.connect_all().await;
-    }
+    // Note: MCP connection is deferred until the service is spawned.
+    // The McpService handles connection internally, avoiding startup blocking.
 
     let (tool_dispatchers, tool_queues) = tool_dispatch_channels();
 
@@ -245,11 +276,11 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         native::init_logging();
         native::launch(move || {
             let state = state_for_server;
-            async move { build_router(state) }
+            async move { build_router(state, mode) }
         });
     })
     .await
-    .context("UI server task failed")?;
+    .context("HTTP server task failed")?;
 
     Ok(())
 }
@@ -430,19 +461,58 @@ fn api_routes() -> Route {
     ))
 }
 
-fn build_router(state: Arc<UiServerState>) -> Router {
+fn build_router(state: Arc<UiServerState>, mode: UiServerMode) -> Router {
     let api = "/api".route(api_routes());
 
-    #[cfg(feature = "ui")]
-    {
-        return Route::new((api, EmbeddedStaticDir::new("/", &WEB_UI_DIST)))
-            .middleware(State(state))
-            .build();
+    match mode {
+        UiServerMode::Rest => Route::new((api,)).middleware(State(state)).build(),
+        UiServerMode::Ui => {
+            #[cfg(feature = "ui")]
+            {
+                Route::new((api, EmbeddedStaticDir::new("/", &WEB_UI_DIST)))
+                    .middleware(State(state))
+                    .build()
+            }
+
+            #[cfg(not(feature = "ui"))]
+            {
+                panic!(
+                    "`may ui` should fail before router construction when the `ui` feature is disabled"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UiServerMode;
+
+    #[test]
+    fn rest_mode_is_always_supported() {
+        UiServerMode::Rest
+            .ensure_supported()
+            .expect("rest mode should always be available");
     }
 
     #[cfg(not(feature = "ui"))]
-    {
-        Route::new((api,)).middleware(State(state)).build()
+    #[test]
+    fn ui_mode_requires_ui_feature() {
+        let error = UiServerMode::Ui
+            .ensure_supported()
+            .expect_err("ui mode should fail without the ui feature");
+        assert_eq!(
+            error.to_string(),
+            "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn ui_mode_is_supported_with_ui_feature() {
+        UiServerMode::Ui
+            .ensure_supported()
+            .expect("ui mode should work when the ui feature is enabled");
     }
 }
 

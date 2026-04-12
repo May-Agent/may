@@ -311,7 +311,18 @@ impl std::fmt::Debug for McpService {
 impl McpService {
     pub(crate) fn spawn(mut manager: McpManager) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let has_servers = manager.has_servers();
         tokio::spawn(async move {
+            // Eagerly start connection but don't block the command loop.
+            // The first few commands may see unconnected servers.
+            if has_servers {
+                let results = manager.connect_all().await;
+                for (name, result) in results {
+                    if let Err(e) = result {
+                        tracing::warn!(server = %name, error = %e, "background MCP server connection failed");
+                    }
+                }
+            }
             while let Some(command) = rx.recv().await {
                 match command {
                     McpCommand::ServerInfo { reply } => {
