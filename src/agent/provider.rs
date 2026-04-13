@@ -430,7 +430,9 @@ pub(super) async fn build_cloud_provider_from_instance(
         }
         ProviderType::Custom => {
             let url = base_url.ok_or_else(|| {
-                MayAgentError::MissingApiKey(format!("Base URL required for custom provider '{id}'"))
+                MayAgentError::MissingApiKey(format!(
+                    "Base URL required for custom provider '{id}'"
+                ))
             })?;
             OpenAI::new(api_key)
                 .with_base_url(url)

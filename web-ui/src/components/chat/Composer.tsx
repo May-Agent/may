@@ -27,7 +27,7 @@ interface ComposerProps {
   composerInputRef: RefObject<HTMLTextAreaElement | null>;
   isNewChat: boolean;
   canSend: boolean;
-  onSend: () => void;
+  onSend: (options?: { deliveryMode?: 'steer' | 'queue' }) => void;
   onScreenshot: () => void;
 
   currentModelId: string;
@@ -112,10 +112,19 @@ export function Composer({
         onChange={(e) => onInputChange(e.target.value)}
         onPaste={onPaste}
         onKeyDown={(e) => {
+          if (e.key === 'Tab' && !e.shiftKey) {
+            // Track Tab press for Tab+Enter chord detection
+            (composerInputRef.current as any)?.__lastTabAt = Date.now();
+          }
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             if (!canSend) return;
-            onSend();
+            const lastTab =
+              (composerInputRef.current as any)?.__lastTabAt ?? 0;
+            const isTabChord = Date.now() - lastTab < 400;
+            onSend({
+              deliveryMode: isTabChord ? 'queue' : 'steer',
+            });
           }
         }}
         placeholder={placeholder}

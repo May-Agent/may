@@ -16,15 +16,16 @@ cargo clippy                   # Run lints
 
 ## Fast Web UI + Rust API Iteration Workflow
 
-Use this workflow when iterating on `may ui` + web UI together:
+Use this workflow when iterating on `may rest` + web UI together:
 
 1. Run Rust server in API-only mode (default, fastest):
 
 ```bash
-cargo run --bin may -- ui --port 8787
+cargo run --bin may -- rest --port 8787
 ```
 
 - The `ui` Cargo feature is **off by default**, so `build.rs` skips `web-ui` production build/embed.
+- `may ui` fails fast without that feature; use `may rest` for API-only iteration.
 - This keeps Rust incremental compiles fast.
 - After completing any Rust code change, restart the Rust API server before validation.
 

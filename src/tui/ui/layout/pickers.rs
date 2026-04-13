@@ -352,7 +352,11 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render search match preview snippet below a selected session.
-pub(super) fn render_search_preview(lines: &mut Vec<Line<'_>>, summary: &crate::SessionSummary, search: &str) {
+pub(super) fn render_search_preview(
+    lines: &mut Vec<Line<'_>>,
+    summary: &crate::SessionSummary,
+    search: &str,
+) {
     let query = search.to_lowercase();
     let query_char_count = query.chars().count();
     let content_lower = summary.content_preview.to_lowercase();

@@ -31,8 +31,7 @@ use super::queue::{Attachment, LARGE_PASTE_THRESHOLD, MessageQueue, PendingMessa
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
 
-pub const ERR_TOOL_RESPONSE_SEND: &str =
-    include_str!("../../texts/tool_response_send_failed.txt");
+pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../../texts/tool_response_send_failed.txt");
 
 /// Convert a character index to a byte index in a string.
 pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
@@ -1677,7 +1676,6 @@ impl App {
         let context_window = self.context_window?;
         Some((prompt_tokens, context_window))
     }
-
 }
 
 /// Actions returned by event handling.

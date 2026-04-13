@@ -373,7 +373,10 @@ async fn handle_register_skills_request(
                 .register_from_local_path(&source)
                 .await
                 .map_err(|error| {
-                    format!("failed to register skill from {}: {error}", source.display())
+                    format!(
+                        "failed to register skill from {}: {error}",
+                        source.display()
+                    )
                 })?;
             Ok(vec![info.dir_name])
         },
@@ -476,9 +479,9 @@ async fn resolve_registration_source_path(cwd: &Path, raw_path: &str) -> Result<
             candidate.display()
         )
     })?;
-    let project_root = tokio::fs::canonicalize(cwd).await.map_err(|error| {
-        format!("failed to resolve project root {}: {error}", cwd.display())
-    })?;
+    let project_root = tokio::fs::canonicalize(cwd)
+        .await
+        .map_err(|error| format!("failed to resolve project root {}: {error}", cwd.display()))?;
 
     if !canonical.starts_with(&project_root) {
         return Err(format!(

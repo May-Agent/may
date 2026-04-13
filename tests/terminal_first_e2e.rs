@@ -454,7 +454,7 @@ impl RunningUiServer {
             .expect("ui server log file clone should open");
         let mut command = Command::new(binary);
         command
-            .arg("ui")
+            .arg("rest")
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
@@ -470,7 +470,7 @@ impl RunningUiServer {
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        let child = command.spawn().expect("may ui should spawn");
+        let child = command.spawn().expect("may rest should spawn");
         let base_url = format!("http://127.0.0.1:{port}");
         wait_for_http_ok(&format!("{base_url}/api/health"), Duration::from_secs(15)).await;
         Self {
