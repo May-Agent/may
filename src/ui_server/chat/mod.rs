@@ -898,7 +898,8 @@ async fn run_agent_loop(
         let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut last_todo_hash: Option<u64> = None;
-        let tasks_md_path = agent.sandbox_dir().join("tasks.md");
+        let tasks_db = state.db();
+        let tasks_session_id = req.session_id.clone();
 
         if !sink.on_start(&req.session_id, &assistant_id).await {
             return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
@@ -1041,7 +1042,7 @@ async fn run_agent_loop(
 
                         // Check if tasks.md changed after tool execution.
                         if let Some(event) =
-                            check_tasks_update(&tasks_md_path, &mut last_todo_hash).await
+                            check_tasks_update(&tasks_db, &tasks_session_id, &mut last_todo_hash).await
                             && !sink.on_todo_update(&event).await
                         {
                             cancellation_reason = Some("client disconnected during todo update");
@@ -2379,12 +2380,13 @@ async fn prepare_agent_for_request(
 
 /// Read tasks.md and return an SSE event if its content changed since the last check.
 async fn check_tasks_update(
-    path: &std::path::Path,
+    db: &crate::db::ChatDb,
+    session_id: &str,
     last_hash: &mut Option<u64>,
 ) -> Option<SseTodoUpdateEvent> {
     use std::hash::{Hash, Hasher};
 
-    let content = async_fs::read_to_string(path).await.ok()?;
+    let content = db.get_session_tasks(session_id).await.ok()??;
     let mut hasher = std::hash::DefaultHasher::new();
     content.hash(&mut hasher);
     let hash = hasher.finish();

@@ -146,17 +146,17 @@ pub(super) async fn get_session_tasks(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let path = load_session_paths(&state, &id).await?.tasks_path();
+    let db = state.db();
     let runtime = state
         .runtime_service
         .get(&id)
         .await
         .map_err(internal_error)?;
-    let content = match async_fs::read_to_string(&path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(internal_error(error)),
-    };
+    let content = db
+        .get_session_tasks(&id)
+        .await
+        .map_err(internal_error)?
+        .unwrap_or_default();
     Ok(Json(SessionTasksPayload {
         content,
         plan_state: runtime.plan_state,
@@ -189,19 +189,8 @@ pub(super) async fn save_session_tasks(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let paths = load_session_paths(&state, &id).await?;
-    async_fs::create_dir_all(paths.root())
-        .await
-        .map_err(internal_error)?;
-    let previous_content = match async_fs::read_to_string(paths.tasks_path()).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(internal_error(error)),
-    };
-    archive_existing_tasks_if_replaced(&paths, &previous_content, &payload.content)
-        .await
-        .map_err(internal_error)?;
-    async_fs::write(paths.tasks_path(), payload.content)
+    let db = state.db();
+    db.set_session_tasks(&id, &payload.content)
         .await
         .map_err(internal_error)?;
     let runtime = state
@@ -209,10 +198,13 @@ pub(super) async fn save_session_tasks(
         .set_plan_state(&id, payload.plan_state)
         .await
         .map_err(internal_error)?;
+    let content = db
+        .get_session_tasks(&id)
+        .await
+        .map_err(internal_error)?
+        .unwrap_or_default();
     Ok(Json(SessionTasksPayload {
-        content: async_fs::read_to_string(paths.tasks_path())
-            .await
-            .map_err(internal_error)?,
+        content,
         plan_state: runtime.plan_state,
     }))
 }

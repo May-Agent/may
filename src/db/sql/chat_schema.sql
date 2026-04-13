@@ -62,4 +62,6 @@ CREATE INDEX IF NOT EXISTS idx_network_access_logs_timestamp ON network_access_l
 CREATE INDEX IF NOT EXISTS idx_network_access_logs_session ON network_access_logs(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_session_pending_permissions_session ON session_pending_permissions(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_pending_workspace_session ON session_pending_workspace(session_id);
+CREATE TABLE IF NOT EXISTS session_tasks (session_id TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS global_memory (id INTEGER PRIMARY KEY CHECK (id = 1), content TEXT NOT NULL, updated_at TEXT NOT NULL);
 PRAGMA journal_mode=WAL;
