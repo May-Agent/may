@@ -27,7 +27,7 @@ use super::runtime_context::{
     build_macos_host_automation_context, build_memory_context_content, build_native_voice_context,
     build_network_restrictions_context, build_plan_mode_context, build_remote_environment_context,
     build_terminal_runtime_context, build_workspace_context, build_workspace_workdirs_context,
-    global_memory_file_path, tag,
+    tag,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
@@ -149,6 +149,8 @@ pub struct MayAgentConfig {
     pub model_context_window: Option<u32>,
     /// Request-level parameters applied to each LLM call for this agent.
     pub request_parameters: Parameters,
+    /// Database handle for runtime memory/state lookups.
+    pub db: crate::db::ChatDb,
 }
 
 /// The May agent.
@@ -212,11 +214,18 @@ impl MayAgent {
         };
         let ssh_enabled = !ssh_servers.is_empty();
 
-        // Read global memory from ~/.may/MEMORY.md.
-        let memory_path = global_memory_file_path(&config.may_dir);
-        let memory_content = async_fs::read_to_string(&memory_path).await?;
+        // Read global memory from the database.
+        let memory_content = config
+            .db
+            .get_global_memory()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(error = %error, "failed to load global memory from DB");
+                None
+            })
+            .unwrap_or_default();
         let mut runtime_system_context =
-            RuntimeSystemContext::new(memory_path.clone(), memory_content.clone());
+            RuntimeSystemContext::new(config.db.clone(), memory_content.clone());
         let terminal_runtime = build_terminal_runtime_context(
             &config,
             &session_paths,
@@ -457,78 +466,6 @@ impl MayAgent {
         })
     }
 
-    /// Create a `MayAgent` from config file and session.
-    pub async fn from_config(
-        may_config: &MayConfig,
-        sandbox_dir: PathBuf,
-        may_dir: PathBuf,
-        cwd: PathBuf,
-        session_id: SessionId,
-        workspace_request_broker: WorkspaceRequestBroker,
-        ask_user_broker: AskUserBroker,
-    ) -> Result<Self, MayAgentError> {
-        // Get model: persisted default first, otherwise first Advanced model
-        let model = may_config
-            .last_model
-            .as_deref()
-            .or_else(|| may_config.models.advanced.first().map(String::as_str))
-            .ok_or_else(|| MayAgentError::MissingApiKey(ERR_NO_MODELS.trim().to_string()))?;
-
-        Self::from_config_with_model(
-            may_config,
-            sandbox_dir,
-            may_dir,
-            cwd,
-            session_id,
-            workspace_request_broker,
-            ask_user_broker,
-            model,
-        )
-        .await
-    }
-
-    /// Create a `MayAgent` from config file with a specific model.
-    ///
-    /// Provider selection uses an ordered candidate list:
-    /// model-mapped provider first (if configured), then explicit providers,
-    /// then generic proxy providers as fallback.
-    pub async fn from_config_with_model(
-        may_config: &MayConfig,
-        sandbox_dir: PathBuf,
-        may_dir: PathBuf,
-        cwd: PathBuf,
-        session_id: SessionId,
-        workspace_request_broker: WorkspaceRequestBroker,
-        ask_user_broker: AskUserBroker,
-        model: &str,
-    ) -> Result<Self, MayAgentError> {
-        Self::from_config_with_model_and_permissions(
-            may_config,
-            sandbox_dir,
-            may_dir,
-            cwd,
-            session_id,
-            workspace_request_broker,
-            ask_user_broker,
-            model,
-            None,
-            None,
-            None,
-            None,
-            None,
-            SessionPlanState::Disabled,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            AgentEnvironment::Local,
-            0,
-        )
-        .await
-    }
-
     pub async fn from_config_with_model_and_permissions(
         may_config: &MayConfig,
         sandbox_dir: PathBuf,
@@ -537,6 +474,7 @@ impl MayAgent {
         session_id: SessionId,
         workspace_request_broker: WorkspaceRequestBroker,
         ask_user_broker: AskUserBroker,
+        db: crate::db::ChatDb,
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         profile_id: Option<String>,
@@ -599,6 +537,7 @@ impl MayAgent {
                 .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::Audio)),
             model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),
             request_parameters,
+            db,
         };
 
         Self::new(config).await
@@ -730,7 +669,7 @@ impl MayAgent {
     }
 
     pub(crate) async fn sync_runtime_context(&mut self) {
-        self.runtime_system_context.sync_memory_file().await;
+        self.runtime_system_context.sync_memory_content().await;
         self.runtime_system_context
             .reconcile(self.inner.context_mut());
     }

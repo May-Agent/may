@@ -63,7 +63,7 @@ pub(crate) mod tag {
 /// additional templating cost and no XML wrapping.
 #[derive(Clone)]
 pub(crate) struct RuntimeSystemContext {
-    memory_path: PathBuf,
+    memory_db: crate::db::ChatDb,
     last_memory_content: String,
     terminal_runtime: Option<String>,
     workspace: Option<String>,
@@ -81,9 +81,9 @@ pub(crate) struct RuntimeSystemContext {
 }
 
 impl RuntimeSystemContext {
-    pub(crate) const fn new(memory_path: PathBuf, memory_content: String) -> Self {
+    pub(crate) fn new(memory_db: crate::db::ChatDb, memory_content: String) -> Self {
         Self {
-            memory_path,
+            memory_db,
             last_memory_content: memory_content,
             terminal_runtime: None,
             workspace: None,
@@ -215,16 +215,14 @@ impl RuntimeSystemContext {
         reconcile_text_block(context, tag::PLATFORM, self.platform.clone());
     }
 
-    pub(crate) async fn sync_memory_file(&mut self) {
-        let memory_content = async_fs::read_to_string(&self.memory_path)
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to read memory file at {}: {error}",
-                    self.memory_path.display()
-                )
-            });
-        self.last_memory_content = memory_content;
+    pub(crate) async fn sync_memory_content(&mut self) {
+        match self.memory_db.get_global_memory().await {
+            Ok(Some(content)) => self.last_memory_content = content,
+            Ok(None) => self.last_memory_content = String::new(),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to read global memory from DB");
+            }
+        }
     }
 }
 
@@ -764,14 +762,20 @@ mod tests {
 
     use super::{RuntimeSystemContext, build_memory_context_content, tag};
 
+    fn test_db() -> crate::db::ChatDb {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("test.db");
+        // Leak the tempdir so the DB file persists for the test duration
+        let dir = Box::leak(Box::new(dir));
+        let _ = dir;
+        tokio_test::block_on(crate::db::ChatDb::open(&db_path)).expect("test db should open")
+    }
+
     #[test]
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
-        let dir = tempdir().expect("temp dir should be created");
-        let memory_path = dir.path().join("MEMORY.md");
-        std::fs::write(&memory_path, "remember this").expect("memory file should be written");
-
+        let db = test_db();
         let mut runtime_context =
-            RuntimeSystemContext::new(memory_path, "remember this".to_string());
+            RuntimeSystemContext::new(db, "remember this".to_string());
         let mut context = aither_agent::Context::default();
         context.insert_system_text(tag::PROFILE_PERSONA, "stale persona");
         context.insert_system_text(tag::WORKSPACE, "stale workspace");
@@ -789,18 +793,17 @@ mod tests {
     }
 
     #[test]
-    fn runtime_system_context_refreshes_memory_from_disk() {
-        let dir = tempdir().expect("temp dir should be created");
-        let memory_path = dir.path().join("MEMORY.md");
-        std::fs::write(&memory_path, "before").expect("memory file should be written");
+    fn runtime_system_context_refreshes_memory_from_db() {
+        let db = test_db();
+        tokio_test::block_on(db.set_global_memory("before")).expect("write initial memory");
 
         let mut runtime_context =
-            RuntimeSystemContext::new(memory_path.clone(), "before".to_string());
+            RuntimeSystemContext::new(db.clone(), "before".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
 
-        std::fs::write(&memory_path, "after").expect("memory file should be updated");
-        tokio_test::block_on(runtime_context.sync_memory_file());
+        tokio_test::block_on(db.set_global_memory("after")).expect("update memory");
+        tokio_test::block_on(runtime_context.sync_memory_content());
         runtime_context.reconcile(&mut context);
 
         let memory = context
@@ -812,12 +815,9 @@ mod tests {
 
     #[test]
     fn terminal_runtime_context_is_reconciled_as_system_block() {
-        let dir = tempdir().expect("temp dir should be created");
-        let memory_path = dir.path().join("MEMORY.md");
-        std::fs::write(&memory_path, "remember this").expect("memory file should be written");
-
+        let db = test_db();
         let mut runtime_context =
-            RuntimeSystemContext::new(memory_path, "remember this".to_string())
+            RuntimeSystemContext::new(db, "remember this".to_string())
                 .with_terminal_runtime(
                     "Model: demo-model\nHome environment kind: local".to_string(),
                 );
@@ -840,11 +840,8 @@ mod tests {
 
     #[test]
     fn workspace_and_workdirs_are_reconciled_independently() {
-        let dir = tempdir().expect("temp dir should be created");
-        let memory_path = dir.path().join("MEMORY.md");
-        std::fs::write(&memory_path, "").expect("memory file should be written");
-
-        let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new())
+        let db = test_db();
+        let mut runtime_context = RuntimeSystemContext::new(db, String::new())
             .with_workspace("Workspace: local".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
