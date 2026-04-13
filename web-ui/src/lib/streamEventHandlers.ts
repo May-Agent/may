@@ -83,6 +83,7 @@ export interface AssistantFinalizeUpdate {
 
 export interface StreamEventHandlers {
   onReasoning: (chunk: string) => void;
+  onToolDelta: (delta: { id: string; name: string; argumentsFragment: string }) => void;
   onToolStart: (tool: any) => void;
   onToolEnd: (tool: any) => void;
   onTodoUpdate: (event: {
@@ -154,6 +155,83 @@ export function createStreamEventHandlers(
     }
     state.lastStreamEventKind = 'reasoning';
     flushAssistantText(true);
+  };
+
+  const onToolDelta = (delta: {
+    id: string;
+    name: string;
+    argumentsFragment: string;
+  }): void => {
+    const name = normalizeToolName(delta.name);
+    const toolId = delta.id;
+
+    // Only create a provisional segment if one doesn't already exist for this tool
+    if (name === 'terminal') {
+      const existingSegId = state.terminalSegmentByToolId.get(toolId);
+      if (!existingSegId) {
+        // Parse partial arguments to try extracting a description
+        let description = '';
+        try {
+          if (delta.argumentsFragment) {
+            const partial = JSON.parse(delta.argumentsFragment + '}');
+            description = partial.description || '';
+          }
+        } catch {
+          // partial JSON — try regex fallback
+          const match = delta.argumentsFragment.match(
+            /"description"\s*:\s*"([^"]*)"/,
+          );
+          if (match) description = match[1];
+        }
+
+        closeActiveThinkingSegment();
+        const segmentId = `terminal-delta-${toolId}`;
+        const cmd: TerminalExecution = {
+          id: toolId,
+          description: description || 'Running command...',
+          input: '',
+          output: '',
+          mode: 'foreground',
+          status: 'running',
+          startedAt: Date.now(),
+        };
+        state.timelineSegments = [
+          ...state.timelineSegments,
+          {
+            id: segmentId,
+            kind: 'terminal',
+            offset: state.streamedText.length,
+            commands: [cmd],
+          },
+        ];
+        state.terminalSegmentByToolId.set(toolId, segmentId);
+        state.lastStreamEventKind = 'tool';
+        flushAssistantText(true);
+      } else {
+        // Update description in existing segment if we got more args
+        try {
+          if (delta.argumentsFragment) {
+            const partial = JSON.parse(delta.argumentsFragment + '}');
+            const desc = partial.description;
+            if (desc) {
+              state.timelineSegments = state.timelineSegments.map((seg) => {
+                if (seg.id !== existingSegId || seg.kind !== 'terminal')
+                  return seg;
+                return {
+                  ...seg,
+                  commands: seg.commands.map((c) =>
+                    c.id === toolId ? { ...c, description: desc } : c,
+                  ),
+                };
+              });
+              flushAssistantText(true);
+            }
+          }
+        } catch {
+          // ignore partial parse failures
+        }
+      }
+    }
   };
 
   const onToolStart = (tool: any): void => {
@@ -383,6 +461,7 @@ export function createStreamEventHandlers(
 
   return {
     onReasoning,
+    onToolDelta,
     onToolStart,
     onToolEnd,
     onTodoUpdate,
