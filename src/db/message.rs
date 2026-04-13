@@ -19,7 +19,6 @@ use super::entity::messages;
 use super::{ChatDb, ChatDbError, query, truncate_preview};
 
 impl ChatDb {
-
     /// Append a message to a session. Updates session preview and message count.
     pub async fn append_message(
         &self,
@@ -108,6 +107,48 @@ impl ChatDb {
             .await
     }
 
+    /// Insert a structured message row within an existing transaction.
+    async fn append_structured_message_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
+        session_id: &str,
+        role: MessageRole,
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        let role_str = role.as_str();
+        let model = query!(
+            tx,
+            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+            session_id,
+            role_str,
+            "",
+            timestamp.map(String::from).or(Some(now.clone())),
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<i32>::None,
+            Option::<i32>::None,
+            Option::<i32>::None,
+            Option::<i32>::None,
+            Option::<i32>::None,
+            Option::<i32>::None,
+            Option::<i64>::None
+        )
+        .fetch_one::<messages::Model>()
+        .await?;
+        let session_update = role.session_summary_update();
+        if session_update.touch_updated_at {
+            self.update_session_stats(
+                session_id,
+                &now,
+                None,
+                session_update.increment_message_count,
+            )
+            .await?;
+        }
+        Ok(model)
+    }
+
     pub async fn append_permission_request_message(
         &self,
         session_id: &str,
@@ -116,11 +157,12 @@ impl ChatDb {
         script: &str,
         timestamp: Option<&str>,
     ) -> Result<messages::Model, ChatDbError> {
+        let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message(session_id, MessageRole::PermissionRequest, timestamp)
+            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::PermissionRequest, timestamp)
             .await?;
         query!(
-            self.db,
+            tx,
             "INSERT INTO message_permission_requests (message_id, request_id, mode, script) VALUES (?, ?, ?, ?)",
             message.id,
             request_id,
@@ -129,6 +171,7 @@ impl ChatDb {
         )
         .execute()
         .await?;
+        tx.commit().await?;
         Ok(message)
     }
 
@@ -139,11 +182,12 @@ impl ChatDb {
         approved: bool,
         timestamp: Option<&str>,
     ) -> Result<messages::Model, ChatDbError> {
+        let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message(session_id, MessageRole::PermissionResponse, timestamp)
+            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::PermissionResponse, timestamp)
             .await?;
         query!(
-            self.db,
+            tx,
             "INSERT INTO message_permission_responses (message_id, request_id, approved) VALUES (?, ?, ?)",
             message.id,
             request_id,
@@ -151,6 +195,7 @@ impl ChatDb {
         )
         .execute()
         .await?;
+        tx.commit().await?;
         Ok(message)
     }
 
@@ -162,11 +207,12 @@ impl ChatDb {
         reason: &str,
         timestamp: Option<&str>,
     ) -> Result<messages::Model, ChatDbError> {
+        let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message(session_id, MessageRole::WorkspaceRequest, timestamp)
+            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::WorkspaceRequest, timestamp)
             .await?;
         query!(
-            self.db,
+            tx,
             "INSERT INTO message_workspace_requests (message_id, request_id, path, reason) VALUES (?, ?, ?, ?)",
             message.id,
             request_id,
@@ -175,6 +221,7 @@ impl ChatDb {
         )
         .execute()
         .await?;
+        tx.commit().await?;
         Ok(message)
     }
 
@@ -185,11 +232,12 @@ impl ChatDb {
         approved: bool,
         timestamp: Option<&str>,
     ) -> Result<messages::Model, ChatDbError> {
+        let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message(session_id, MessageRole::WorkspaceResponse, timestamp)
+            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::WorkspaceResponse, timestamp)
             .await?;
         query!(
-            self.db,
+            tx,
             "INSERT INTO message_workspace_responses (message_id, request_id, approved) VALUES (?, ?, ?)",
             message.id,
             request_id,
@@ -197,6 +245,7 @@ impl ChatDb {
         )
         .execute()
         .await?;
+        tx.commit().await?;
         Ok(message)
     }
 
@@ -207,10 +256,10 @@ impl ChatDb {
         questions: &[crate::ask_user::Question],
         timestamp: Option<&str>,
     ) -> Result<messages::Model, ChatDbError> {
-        let message = self
-            .append_structured_message(session_id, MessageRole::AskUserRequest, timestamp)
-            .await?;
         let mut tx = self.db.begin().await?;
+        let message = self
+            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::AskUserRequest, timestamp)
+            .await?;
         query!(
             tx,
             "INSERT INTO message_ask_user_requests (message_id, request_id) VALUES (?, ?)",
@@ -257,10 +306,10 @@ impl ChatDb {
         answers: &[crate::ask_user::QuestionAnswer],
         timestamp: Option<&str>,
     ) -> Result<messages::Model, ChatDbError> {
-        let message = self
-            .append_structured_message(session_id, MessageRole::AskUserResponse, timestamp)
-            .await?;
         let mut tx = self.db.begin().await?;
+        let message = self
+            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::AskUserResponse, timestamp)
+            .await?;
         query!(
             tx,
             "INSERT INTO message_ask_user_responses (message_id, request_id) VALUES (?, ?)",
