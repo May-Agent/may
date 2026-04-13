@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import type { ChangeEvent, ClipboardEvent, RefObject } from 'react';
 import { File, Image as ImageIcon, Monitor, Plus, Send, Square, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -83,6 +84,7 @@ export function Composer({
   showSendButton,
   onStop,
 }: ComposerProps) {
+  const lastTabAtRef = useRef(0);
   return (
     <div className="relative rounded-2xl border border-border/50 bg-background/60 backdrop-blur-xl">
       {attachments.length > 0 && (
@@ -113,15 +115,12 @@ export function Composer({
         onPaste={onPaste}
         onKeyDown={(e) => {
           if (e.key === 'Tab' && !e.shiftKey) {
-            // Track Tab press for Tab+Enter chord detection
-            (composerInputRef.current as any)?.__lastTabAt = Date.now();
+            lastTabAtRef.current = Date.now();
           }
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             if (!canSend) return;
-            const lastTab =
-              (composerInputRef.current as any)?.__lastTabAt ?? 0;
-            const isTabChord = Date.now() - lastTab < 400;
+            const isTabChord = Date.now() - lastTabAtRef.current < 400;
             onSend({
               deliveryMode: isTabChord ? 'queue' : 'steer',
             });
@@ -204,7 +203,7 @@ export function Composer({
           )}
           {showSendButton && (
             <Button
-              onClick={onSend}
+              onClick={() => onSend()}
               disabled={!canSend}
               size="icon"
               className={

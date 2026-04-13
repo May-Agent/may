@@ -191,7 +191,7 @@ export function createStreamEventHandlers(
           description: description || 'Running command...',
           input: '',
           output: '',
-          mode: 'foreground',
+          mode: 'default',
           status: 'running',
           startedAt: Date.now(),
         };
