@@ -201,12 +201,14 @@ impl ChatDb {
                 queued_messages.push(message);
             }
         }
-        steer_messages.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        // The newest steer message (last by id) becomes pending_immediate.
+        // Older steers overflow into the front of the queue.
         let pending_immediate = if steer_messages.is_empty() {
             None
         } else {
-            Some(steer_messages.remove(0))
+            Some(steer_messages.pop().expect("non-empty"))
         };
+        // Insert remaining steers at the front of the queue, preserving their order
         queued_messages.splice(0..0, steer_messages);
 
         let mut summary = SessionRuntimeSummary {
@@ -679,24 +681,17 @@ impl ChatDb {
         self.load_session_runtime_summary(session_id).await
     }
 
-    /// Enqueue a pending-immediate (steer) message. Any existing steer messages
-    /// are demoted to queue position (overflow) — all done via direct SQL inserts
-    /// without loading the full runtime summary.
+    /// Enqueue a pending-immediate (steer) message. Existing steer messages
+    /// remain in the DB with their original delivery_mode — the
+    /// `build_session_runtime_summary` method sorts steer messages by recency
+    /// and only promotes the newest one to `pending_immediate`, keeping older
+    /// steers as overflow in the queue.
     pub async fn set_pending_immediate_message(
         &self,
         session_id: &str,
         message: PendingUserMessage,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let mut tx = self.db.begin().await?;
-        // Demote any existing steer messages to queue
-        query!(
-            tx,
-            "UPDATE session_pending_message_entries SET delivery_mode = 'queue' WHERE session_id = ? AND delivery_mode = 'steer'",
-            session_id
-        )
-        .execute()
-        .await?;
-        // Insert the new steer message
         self.insert_pending_message_in_tx(&mut tx, session_id, &message)
             .await?;
         tx.commit().await?;
@@ -757,16 +752,18 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Atomically dequeue the next pending message (steer first, then oldest queue).
+    /// Atomically dequeue the next pending message.
+    /// Priority: newest steer first, then oldest queued.
     pub async fn take_next_pending_message(
         &self,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, ChatDbError> {
         let mut tx = self.db.begin().await?;
-        // Steer messages first (highest priority), then regular queue, ordered by creation
+        // Steer messages first (newest steer = highest priority), then queue (oldest first).
+        // Two-level sort: steer before queue, then newest steer or oldest queue.
         let row = query!(
             tx,
-            "SELECT * FROM session_pending_message_entries WHERE session_id = ? ORDER BY CASE delivery_mode WHEN 'steer' THEN 0 ELSE 1 END, created_at ASC LIMIT 1",
+            "SELECT * FROM session_pending_message_entries WHERE session_id = ? ORDER BY CASE delivery_mode WHEN 'steer' THEN 0 ELSE 1 END, CASE delivery_mode WHEN 'steer' THEN -id ELSE id END LIMIT 1",
             session_id
         )
         .fetch_optional::<PendingMessageEntryRow>()
