@@ -50,10 +50,10 @@ pub use common::{
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
     AssistantCacheUsageSummaryRow, ContextDebugMessageAttachmentRow, ContextDebugMessageRow,
-    ContextDebugMessageToolCallRow, ContextDebugPromptAttachmentRow,
-    ContextDebugSnapshotHeaderRow, DefaultProfile, I32ValueRow, I64ValueRow, PendingAskUserLookup,
-    PendingPermissionLookup, PendingWorkspaceLookup, PermissionRequestMessageRow, ProfileMountRow,
-    SessionIdRow, SqliteTableInfoRow, StoredSessionContextSnapshotRow, build_profile_preferences,
+    ContextDebugMessageToolCallRow, ContextDebugPromptAttachmentRow, ContextDebugSnapshotHeaderRow,
+    DefaultProfile, I32ValueRow, I64ValueRow, PendingAskUserLookup, PendingPermissionLookup,
+    PendingWorkspaceLookup, PermissionRequestMessageRow, ProfileMountRow, SessionIdRow,
+    SqliteTableInfoRow, StoredSessionContextSnapshotRow, build_profile_preferences,
     db_custom_error, message_stats_params_from_chat_stats, normalize_profile_preferences,
     overflow_error, parse_attachment_kind, parse_profile_environment, row_not_found, storage_error,
     to_i32, to_i64_from_u64, to_u64, to_usize,
@@ -128,7 +128,7 @@ impl ChatDb {
         let expected_columns = [
             "session_id",
             "checkpoint_blob",
-            "history_message_count",
+            "last_message_db_id",
             "updated_at",
         ];
         let actual_columns = columns
@@ -148,8 +148,6 @@ impl ChatDb {
 
         Ok(())
     }
-
-
 
     // ── Permission / AskUser Queries ─────────────────────────────
 
@@ -260,9 +258,6 @@ impl ChatDb {
             })
             .collect()
     }
-
-
-
 }
 
 const PREVIEW_MAX_CHARS: usize = 100;

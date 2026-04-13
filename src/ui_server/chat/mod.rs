@@ -1622,8 +1622,6 @@ enum UiChatPreparationError {
     BuildAgent(#[from] crate::agent::MayAgentError),
     #[error("failed to restore agent checkpoint: {0}")]
     RestoreCheckpoint(#[source] aither_agent::AgentError),
-    #[error("failed to apply history delta after restored checkpoint: {0}")]
-    ApplyHistoryDelta(#[source] crate::session::HistoryDeltaError),
     #[error("failed to build prompt attachments: {0}")]
     BuildPrompt(skyzen::Error),
     #[error("failed to persist context debug snapshot: {0}")]
@@ -1666,7 +1664,7 @@ impl UiChatPreparationError {
             | Self::ReconcileContainerLayout(_)
             | Self::BuildAgent(_)
             | Self::RestoreCheckpoint(_)
-            | Self::ApplyHistoryDelta(_)
+
             | Self::BuildPrompt(_)
             | Self::PersistContextDebugSnapshot(_)
             | Self::HistoryReplay(_) => ApiErrorCode::InternalError,
@@ -1706,7 +1704,7 @@ impl UiChatPreparationError {
             | Self::ReconcileContainerLayout(_)
             | Self::BuildAgent(_)
             | Self::RestoreCheckpoint(_)
-            | Self::ApplyHistoryDelta(_)
+
             | Self::BuildPrompt(_)
             | Self::PersistContextDebugSnapshot(_)
             | Self::HistoryReplay(_) => skyzen::StatusCode::INTERNAL_SERVER_ERROR,
@@ -2266,16 +2264,41 @@ async fn prepare_agent_for_request(
     .map_err(UiChatPreparationError::BuildAgent)?;
 
     if let Some(snapshot) = ctx.context_snapshot.as_ref() {
-        agent
-            .restore_checkpoint(snapshot.checkpoint.clone())
-            .map_err(UiChatPreparationError::RestoreCheckpoint)?;
-        for message in crate::session::history_delta_since_snapshot(
+        // Try to restore from checkpoint with ID-based delta.
+        // If the snapshot anchor is stale, fall back to full history replay.
+        let db_messages = state
+            .db()
+            .get_messages(ctx.session_id.as_str())
+            .await
+            .map_err(UiChatPreparationError::LoadSession)?;
+        let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
+        match crate::session::history_delta_since_snapshot(
             &ctx.history_messages,
-            snapshot.history_message_count,
-        )
-        .map_err(UiChatPreparationError::ApplyHistoryDelta)?
-        {
-            agent.push_message(message);
+            &db_ids,
+            snapshot.last_message_db_id,
+        ) {
+            Some(delta) => {
+                agent
+                    .restore_checkpoint(snapshot.checkpoint.clone())
+                    .map_err(UiChatPreparationError::RestoreCheckpoint)?;
+                for message in delta {
+                    agent.push_message(message);
+                }
+            }
+            None => {
+                tracing::warn!(
+                    session_id = %ctx.session_id.as_str(),
+                    "context snapshot anchor is stale, falling back to full history replay"
+                );
+                // Delete the stale snapshot so future requests don't hit this path
+                let _ = state
+                    .db()
+                    .delete_session_context_snapshot(ctx.session_id.as_str())
+                    .await;
+                for message in &ctx.history_messages {
+                    agent.push_message(message.clone());
+                }
+            }
         }
     } else {
         for message in ctx.history_messages {
@@ -2377,32 +2400,42 @@ mod tests {
     use aither_core::llm::Message as LlmMessage;
 
     #[test]
-    fn history_delta_since_snapshot_returns_suffix_after_anchor() {
+    fn history_delta_since_snapshot_returns_suffix_after_anchor_id() {
         let history = vec![
             LlmMessage::system("memory"),
             LlmMessage::user("first"),
             LlmMessage::assistant("second"),
         ];
+        let db_ids = vec![10, 20, 30];
 
-        let delta = crate::session::history_delta_since_snapshot(&history, 2)
-            .expect("anchor must be valid");
+        let delta =
+            crate::session::history_delta_since_snapshot(&history, &db_ids, Some(20))
+                .expect("anchor should be valid");
         assert_eq!(delta, vec![LlmMessage::assistant("second")]);
     }
 
     #[test]
-    fn history_delta_since_snapshot_rejects_out_of_bounds_anchor() {
+    fn history_delta_since_snapshot_returns_none_for_stale_anchor() {
         let history = vec![LlmMessage::user("only")];
-        let error = crate::session::history_delta_since_snapshot(&history, 2)
-            .expect_err("invalid anchor must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("persisted context snapshot anchor exceeds available history")
-        );
+        let db_ids = vec![10];
+        // Anchor 999 does not exist among message IDs
+        let result =
+            crate::session::history_delta_since_snapshot(&history, &db_ids, Some(999));
+        assert!(result.is_none(), "stale anchor should return None");
     }
 
     #[test]
-    fn parse_persisted_context_snapshot_reads_history_message_count() {
+    fn history_delta_since_snapshot_empty_anchor_replays_all() {
+        let history = vec![LlmMessage::user("a"), LlmMessage::assistant("b")];
+        let db_ids = vec![1, 2];
+        let delta =
+            crate::session::history_delta_since_snapshot(&history, &db_ids, None)
+                .expect("None anchor replays all");
+        assert_eq!(delta.len(), 2);
+    }
+
+    #[test]
+    fn parse_persisted_context_snapshot_reads_last_message_db_id() {
         let snapshot = crate::session::parse_persisted_context_snapshot(
             crate::db::StoredSessionContextSnapshot {
                 checkpoint: aither_agent::AgentCheckpoint {
@@ -2426,12 +2459,12 @@ mod tests {
                     },
                     has_background_tasks: false,
                 },
-                history_message_count: 7,
+                last_message_db_id: Some(42),
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
             },
         );
 
-        assert_eq!(snapshot.history_message_count, 7);
+        assert_eq!(snapshot.last_message_db_id, Some(42));
         assert!(snapshot.checkpoint.context.is_empty());
     }
 }
