@@ -818,6 +818,7 @@ impl RuntimeDeps {
             session_id,
             self.workspace_broker.clone(),
             self.ask_user_broker.clone(),
+            db.clone(),
             model,
             reasoning_effort,
             profile_model.as_ref().map(|profile| profile.id.clone()),
