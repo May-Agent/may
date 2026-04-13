@@ -54,7 +54,7 @@ use super::types::{
     ApiErrorCode, ApiMessage, ChatRequest, ChatResponse, PendingMessageKind,
     RemovePendingMessageRequest, RequestLogEntry, RequestStats, SessionRuntimeResponse,
     SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent, SseToolEndEvent,
-    SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
+    SseToolDeltaEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
 };
 
 fn stopped_terminal_tool_result() -> ToolResult {
@@ -77,6 +77,12 @@ trait ChatSink {
     async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool;
     async fn on_text(&mut self, chunk: &str) -> bool;
     async fn on_reasoning(&mut self, chunk: &str) -> bool;
+    async fn on_tool_delta(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments_fragment: &str,
+    ) -> bool;
     async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool;
     async fn on_tool_end(
         &mut self,
@@ -110,6 +116,24 @@ impl ChatSink for SseSink {
 
     async fn on_reasoning(&mut self, chunk: &str) -> bool {
         send_event(&self.0, "reasoning", &SseChunkEvent { chunk }).await
+    }
+
+    async fn on_tool_delta(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments_fragment: &str,
+    ) -> bool {
+        send_event(
+            &self.0,
+            "tool_delta",
+            &SseToolDeltaEvent {
+                id,
+                name,
+                arguments_fragment,
+            },
+        )
+        .await
     }
 
     async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool {
@@ -165,6 +189,9 @@ impl ChatSink for CollectSink {
         true
     }
     async fn on_reasoning(&mut self, _: &str) -> bool {
+        true
+    }
+    async fn on_tool_delta(&mut self, _: &str, _: &str, _: &str) -> bool {
         true
     }
     async fn on_tool_start(&mut self, _: &str, _: &str, _: &str) -> bool {
@@ -923,6 +950,13 @@ async fn run_agent_loop(
                     }
                     Ok(aither_agent::AgentEvent::Usage(u)) => {
                         usage = u;
+                    }
+                    Ok(aither_agent::AgentEvent::ToolCallDelta {
+                        id,
+                        name,
+                        arguments_fragment,
+                    }) => {
+                        sink.on_tool_delta(&id, &name, &arguments_fragment).await;
                     }
                     Ok(aither_agent::AgentEvent::ToolCallStart {
                         id,

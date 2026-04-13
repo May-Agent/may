@@ -60,6 +60,14 @@ pub struct SseToolStartEvent<'a> {
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SseToolDeltaEvent<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) arguments_fragment: &'a str,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct SseToolEndEvent<'a> {
     pub(crate) id: &'a str,
     pub(crate) name: &'a str,
