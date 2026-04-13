@@ -213,19 +213,14 @@ impl ChatDb {
         snapshot: SessionContextSnapshotUpsert,
     ) -> Result<(), ChatDbError> {
         let updated_at = jiff::Timestamp::now().to_string();
-        let history_message_count = to_i64_from_u64(
-            u64::try_from(snapshot.history_message_count)
-                .map_err(|error| overflow_error("history_message_count", &error))?,
-            "history_message_count",
-        )?;
         let checkpoint_blob = rmp_serde::to_vec_named(&snapshot.checkpoint)
             .map_err(|error| storage_error(format!("failed to encode checkpoint blob: {error}")))?;
         query!(
             self.db,
-            "INSERT INTO session_context_snapshots (session_id, checkpoint_blob, history_message_count, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET checkpoint_blob = excluded.checkpoint_blob, history_message_count = excluded.history_message_count, updated_at = excluded.updated_at",
+            "INSERT INTO session_context_snapshots (session_id, checkpoint_blob, last_message_db_id, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET checkpoint_blob = excluded.checkpoint_blob, last_message_db_id = excluded.last_message_db_id, updated_at = excluded.updated_at",
             session_id,
             checkpoint_blob,
-            history_message_count,
+            snapshot.last_message_db_id,
             updated_at
         )
         .execute()
@@ -240,7 +235,7 @@ impl ChatDb {
     ) -> Result<Option<StoredSessionContextSnapshot>, ChatDbError> {
         let Some(row) = query!(
             self.db,
-            "SELECT checkpoint_blob, history_message_count, updated_at FROM session_context_snapshots WHERE session_id = ?",
+            "SELECT checkpoint_blob, last_message_db_id, updated_at FROM session_context_snapshots WHERE session_id = ?",
             session_id
         )
             .fetch_optional::<StoredSessionContextSnapshotRow>()
@@ -257,10 +252,9 @@ impl ChatDb {
                 "failed to decode checkpoint blob for session {session_id}: {error}"
             ))
         })?;
-        let history_message_count = to_usize(row.history_message_count, "history_message_count")?;
         Ok(Some(StoredSessionContextSnapshot {
             checkpoint,
-            history_message_count,
+            last_message_db_id: row.last_message_db_id,
             updated_at: row.updated_at,
         }))
     }
@@ -278,6 +272,5 @@ impl ChatDb {
         .execute()
         .await?;
         Ok(())
-}
-
+    }
 }

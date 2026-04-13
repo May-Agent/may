@@ -445,6 +445,11 @@ pub(super) struct I64ValueRow {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct OptionalI64ValueRow {
+    pub value: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(super) struct BoolValueRow {
     pub(super) value: bool,
 }
@@ -466,21 +471,24 @@ pub(super) struct SessionIdRow {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(super) struct StoredSessionContextSnapshotRow {
     pub(super) checkpoint_blob: Vec<u8>,
-    pub(super) history_message_count: i64,
+    pub(super) last_message_db_id: Option<i64>,
     pub(super) updated_at: String,
 }
 
 /// Parameters for upserting a persisted session context snapshot.
 pub struct SessionContextSnapshotUpsert {
     pub checkpoint: aither_agent::AgentCheckpoint,
-    pub history_message_count: usize,
+    /// The DB `messages.id` of the last message at snapshot time.
+    /// `None` means the snapshot was taken with an empty history.
+    pub last_message_db_id: Option<i64>,
 }
 
 /// Structured snapshot loaded from SQL-backed session context storage.
 #[derive(Debug, Clone)]
 pub struct StoredSessionContextSnapshot {
     pub checkpoint: aither_agent::AgentCheckpoint,
-    pub history_message_count: usize,
+    /// The DB `messages.id` of the last message at snapshot time.
+    pub last_message_db_id: Option<i64>,
     pub updated_at: String,
 }
 
@@ -593,9 +601,7 @@ pub(super) fn to_u64(value: i64, field: &str) -> Result<u64, ChatDbError> {
     u64::try_from(value).map_err(|error| conversion_error(field, &error))
 }
 
-pub(super) fn message_stats_params_from_chat_stats(
-    stats: &ChatMessageStats,
-) -> MessageStatsParams {
+pub(super) fn message_stats_params_from_chat_stats(stats: &ChatMessageStats) -> MessageStatsParams {
     MessageStatsParams {
         provider_id: stats.provider_id.clone(),
         prompt_tokens: stats.prompt_tokens,

@@ -433,6 +433,7 @@ mod tests {
         let state = ManagedHeelState {
             release_tag: "v1.2.3".to_string(),
             asset_name: "heel-x86_64-unknown-linux-gnu".to_string(),
+            last_checked_at: Some("2026-04-13T00:00:00Z".to_string()),
         };
 
         futures_lite::future::block_on(async {

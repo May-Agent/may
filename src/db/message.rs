@@ -464,6 +464,18 @@ impl ChatDb {
         .await?)
     }
 
+    /// Return the highest `messages.id` for a session, or `None` if empty.
+    pub async fn max_message_id(&self, session_id: &str) -> Result<Option<i64>, ChatDbError> {
+        let row = query!(
+            self.db,
+            "SELECT MAX(id) AS value FROM messages WHERE session_id = ?",
+            session_id
+        )
+        .fetch_one::<crate::db::common::OptionalI64ValueRow>()
+        .await?;
+        Ok(row.value)
+    }
+
     /// Count messages that contribute to the LLM-visible conversation history.
     pub async fn llm_message_count(&self, session_id: &str) -> Result<usize, ChatDbError> {
         let count = query!(

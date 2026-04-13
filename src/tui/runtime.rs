@@ -55,8 +55,6 @@ pub enum TuiRuntimeError {
     MayAgent(#[from] crate::agent::MayAgentError),
     #[error("agent operation failed: {0}")]
     Agent(#[from] aither_agent::AgentError),
-    #[error("context snapshot history delta failed: {0}")]
-    HistoryDelta(#[from] crate::session::HistoryDeltaError),
     #[error("Failed to convert attachment path to URL: {path}")]
     AttachmentPathToUrl { path: std::path::PathBuf },
     #[error("Failed to serialize paste XML: {0}")]
@@ -841,12 +839,31 @@ impl RuntimeDeps {
         if let Some(snapshot) =
             crate::session::load_persisted_context_snapshot(&db, &session_id_string).await?
         {
-            agent.restore_checkpoint(snapshot.checkpoint.clone())?;
-            for message in crate::session::history_delta_since_snapshot(
+            let db_messages = db.get_messages(&session_id_string).await?;
+            let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
+            match crate::session::history_delta_since_snapshot(
                 &history_messages,
-                snapshot.history_message_count,
-            )? {
-                agent.push_message(message);
+                &db_ids,
+                snapshot.last_message_db_id,
+            ) {
+                Some(delta) => {
+                    agent.restore_checkpoint(snapshot.checkpoint.clone())?;
+                    for message in delta {
+                        agent.push_message(message);
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        session_id = %session_id_string,
+                        "context snapshot anchor is stale, falling back to full history replay"
+                    );
+                    let _ = db
+                        .delete_session_context_snapshot(&session_id_string)
+                        .await;
+                    for message in history_messages {
+                        agent.push_message(message);
+                    }
+                }
             }
         } else {
             for message in history_messages {

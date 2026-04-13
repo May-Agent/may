@@ -13,7 +13,7 @@ mod runtime_service;
 mod store;
 
 pub use context_snapshot::{
-    HistoryDeltaError, PersistContextSnapshotError, PersistedContextSnapshot, checkpoint_from_hook,
+    PersistContextSnapshotError, PersistedContextSnapshot, checkpoint_from_hook,
     history_delta_since_snapshot, load_persisted_context_snapshot,
     parse_persisted_context_snapshot, persist_agent_context_snapshot, persist_checkpoint_from_hook,
 };
