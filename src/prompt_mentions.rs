@@ -269,11 +269,18 @@ fn is_mention_boundary(bytes: &[u8], at_index: usize) -> bool {
         return true;
     }
     let prev = bytes[at_index - 1];
-    matches!(prev, b' ' | b'\t' | b'\n' | b'\r' | b'(' | b'[' | b'{' | b'<')
+    matches!(
+        prev,
+        b' ' | b'\t' | b'\n' | b'\r' | b'(' | b'[' | b'{' | b'<'
+    )
 }
 
 fn is_mention_terminator(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, ')' | ']' | '}' | '>' | '"' | '\'' | '`' | ',' | '!' | '?' | ';')
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            ')' | ']' | '}' | '>' | '"' | '\'' | '`' | ',' | '!' | '?' | ';'
+        )
 }
 
 fn normalize_mention_candidate(raw: &str) -> Option<MentionCandidate> {
@@ -415,7 +422,8 @@ After the block, @another-session also matters.";
 
     #[test]
     fn ignores_mentions_inside_inline_code_spans() {
-        let content = "Use `@stale-session` as a literal example, but pay attention to @active-session.";
+        let content =
+            "Use `@stale-session` as a literal example, but pay attention to @active-session.";
         let ids = extract_session_mention_ids(content);
         assert_eq!(ids, vec!["active-session".to_string()]);
     }

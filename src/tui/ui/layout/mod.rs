@@ -5,9 +5,7 @@ mod pickers;
 mod popups;
 
 use self::config::render_config_screen;
-use self::pickers::{
-    render_file_picker_popup, render_profile_select_popup, render_session_popup,
-};
+use self::pickers::{render_file_picker_popup, render_profile_select_popup, render_session_popup};
 use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
 
 use ratatui::{
@@ -292,7 +290,6 @@ pub(super) fn display_width_prefix(text: &str, char_count: usize) -> usize {
 
 /// Help text content.
 const HELP_TEXT: &str = include_str!("../help.txt");
-
 
 /// Render help popup.
 fn render_help_popup(frame: &mut Frame, area: Rect) {

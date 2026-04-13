@@ -499,4 +499,3 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 }
-

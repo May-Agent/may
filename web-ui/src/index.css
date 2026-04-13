@@ -277,21 +277,45 @@
 }
 
 .scanning-label {
+  position: relative;
   color: transparent;
   background-image: linear-gradient(
     90deg,
     rgb(var(--timeline-sweep-muted)) 0%,
-    rgb(var(--timeline-sweep-muted)) 34%,
+    rgb(var(--timeline-sweep-muted)) 40%,
     rgb(var(--timeline-sweep-bright)) 50%,
-    rgb(var(--timeline-sweep-muted)) 66%,
+    rgb(var(--timeline-sweep-muted)) 60%,
     rgb(var(--timeline-sweep-muted)) 100%
   );
-  background-size: 260% 100%;
+  background-size: 280% 100%;
   background-position: -60% 50%;
   -webkit-background-clip: text;
   background-clip: text;
-  animation: scanLine 2.4s ease-in-out infinite;
+  animation: scanLine 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
   font-feature-settings: "ss01";
+}
+
+/* Subtle glow layer behind scanning text */
+.scanning-label-glow {
+  position: absolute;
+  inset: 0;
+  color: transparent;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    transparent 40%,
+    rgb(var(--timeline-sweep-bright)) 50%,
+    transparent 60%,
+    transparent 100%
+  );
+  background-size: 280% 100%;
+  background-position: -60% 50%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: scanLine 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  filter: blur(6px);
+  opacity: 0.25;
+  pointer-events: none;
 }
 
 .terminal-panel {

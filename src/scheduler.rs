@@ -1012,7 +1012,10 @@ impl TaskRuntime {
                 let working_dir = canonical
                     .parent()
                     .ok_or_else(|| {
-                        format!("script_path {} has no parent directory", canonical.display())
+                        format!(
+                            "script_path {} has no parent directory",
+                            canonical.display()
+                        )
                     })?
                     .to_path_buf();
                 Ok(TaskScript {
@@ -1114,7 +1117,10 @@ impl TaskRuntime {
 
     fn resolve_remote_server(&self, profile: &profiles::Model) -> Result<SshServerConfig, String> {
         let configured_servers = self.ssh_servers.load();
-        crate::profile::remote::resolve_remote_profile_server(profile, configured_servers.as_slice())
+        crate::profile::remote::resolve_remote_profile_server(
+            profile,
+            configured_servers.as_slice(),
+        )
     }
 
     async fn remote_terminal_tool(

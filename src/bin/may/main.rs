@@ -19,7 +19,6 @@ mod exec;
 mod oneshot;
 
 use std::io;
-use std::io::Write as _;
 use std::panic;
 
 use aither_agent::AgentEvent;
@@ -60,16 +59,15 @@ fn ensure_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
     ensure_rustls_provider();
 
     let cli_mode = parse_cli_mode_from_env();
-    let is_ui_mode = matches!(cli_mode, CliMode::Ui(_));
+    let is_server_mode = matches!(cli_mode, CliMode::Ui(_) | CliMode::Rest(_));
 
-    // Initialize logging to file (shared by both UI server and TUI modes)
+    // Initialize logging to file (shared by both server and TUI modes)
     let log_dir = dirs::home_dir()
         .context("Failed to determine home directory")?
         .join(".may")
@@ -85,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
         .add_directive("aither_claude=info".parse()?)
         .add_directive("aither_openai=info".parse()?);
 
-    if is_ui_mode {
+    if is_server_mode {
         let file_appender = tracing_appender::rolling::daily(log_dir, "may.log");
         tracing_subscriber::registry()
             .with(fmt::layer().with_writer(file_appender).with_ansi(false))
@@ -114,7 +112,20 @@ async fn main() -> anyhow::Result<()> {
             )?;
             return Ok(());
         }
-        CliMode::Ui(ui_args) => return may_agent::ui_server::run_ui_server(&ui_args).await,
+        CliMode::Ui(ui_args) => {
+            return may_agent::ui_server::run_server(
+                may_agent::ui_server::UiServerMode::Ui,
+                &ui_args,
+            )
+            .await;
+        }
+        CliMode::Rest(rest_args) => {
+            return may_agent::ui_server::run_server(
+                may_agent::ui_server::UiServerMode::Rest,
+                &rest_args,
+            )
+            .await;
+        }
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
         CliMode::Exec(args) => std::process::exit(run_exec(args).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,
@@ -171,9 +182,6 @@ async fn main() -> anyhow::Result<()> {
 
     result
 }
-
-
-
 
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,

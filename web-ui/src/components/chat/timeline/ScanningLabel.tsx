@@ -1,8 +1,8 @@
 import { cn } from '@/lib/utils';
 
 /**
- * A label with a left-to-right scanning gradient, used for running command descriptions.
- * Gives a terminal-style "working" feel without being distracting.
+ * A label with a left-to-right scanning gradient and subtle glow,
+ * used for running command descriptions and thinking indicators.
  */
 export function ScanningLabel({
   children,
@@ -12,8 +12,11 @@ export function ScanningLabel({
   className?: string;
 }) {
   return (
-    <span className={cn('scanning-label', className)}>
-      {children}
+    <span className={cn('relative inline-block', className)}>
+      <span className="scanning-label-glow" aria-hidden>
+        {children}
+      </span>
+      <span className="scanning-label">{children}</span>
     </span>
   );
 }

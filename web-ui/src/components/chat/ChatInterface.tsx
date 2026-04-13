@@ -647,7 +647,7 @@ export function ChatInterface({
             composerInputRef={composerInputRef}
             isNewChat={isNewChat}
             canSend={canSend}
-            onSend={() => void handleSend()}
+            onSend={(opts) => void handleSend(opts)}
             onScreenshot={() => void handleScreenshot()}
             currentModelId={currentModelId}
             onModelChange={handleModelChange}

@@ -59,7 +59,7 @@ export interface ComposerAreaProps {
   composerInputRef: RefObject<HTMLTextAreaElement | null>;
   isNewChat: boolean;
   canSend: boolean;
-  onSend: () => void;
+  onSend: (options?: { deliveryMode?: 'steer' | 'queue' }) => void;
   onScreenshot: () => void;
   currentModelId: string;
   onModelChange: (id: string) => void;
@@ -117,14 +117,21 @@ export function ComposerArea(props: ComposerAreaProps) {
             {props.uiError}
           </div>
         )}
-        <ActivityRail
-          pendingMessages={props.queuedMessages}
-          runningCommands={props.runningCommands}
-          backgroundCommand={props.backgroundCommand}
-          sessionId={props.sessionId}
-          onSteerMessage={props.onSteerMessage}
-          onRemoveMessage={props.onRemoveMessage}
-        />
+        {/* Unified card: shelf (queued/running activity) + composer */}
+        {(props.queuedMessages.length > 0 ||
+          props.runningCommands.length > 0 ||
+          props.backgroundCommand) && (
+          <div className="rounded-t-2xl border border-b-0 border-border/40 bg-muted/30 backdrop-blur-lg shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+            <ActivityRail
+              pendingMessages={props.queuedMessages}
+              runningCommands={props.runningCommands}
+              backgroundCommand={props.backgroundCommand}
+              sessionId={props.sessionId}
+              onSteerMessage={props.onSteerMessage}
+              onRemoveMessage={props.onRemoveMessage}
+            />
+          </div>
+        )}
         <Composer
           inputValue={props.inputValue}
           onInputChange={props.onInputChange}
