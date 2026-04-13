@@ -1,4 +1,5 @@
 mod tool_dispatch;
+mod turn_persister;
 
 use self::tool_dispatch::{
     handle_browser_request, handle_notify_request, handle_register_skills_request,
@@ -900,6 +901,7 @@ async fn run_agent_loop(
         let mut last_todo_hash: Option<u64> = None;
         let tasks_db = state.db();
         let tasks_session_id = req.session_id.clone();
+        let mut turn_persister = turn_persister::TurnPersister::new(session_id.as_str());
 
         if !sink.on_start(&req.session_id, &assistant_id).await {
             return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
@@ -976,14 +978,9 @@ async fn run_agent_loop(
                             )
                             .await?;
                         }
-                        // Flush accumulated text as a history message before the tool call.
+                        // Buffer accumulated text segment before the tool call.
                         if !segment_text.trim().is_empty() {
-                            append_history_message(
-                                state,
-                                &session_id,
-                                ChatMessage::assistant(segment_text.clone()),
-                            )
-                            .await?;
+                            turn_persister.push_assistant(segment_text.clone());
                             segment_text.clear();
                         }
 
@@ -992,14 +989,9 @@ async fn run_agent_loop(
                             name: name.clone(),
                             arguments: arguments.clone(),
                         };
-                        if let Ok(serialized) = serde_json::to_string(&record) {
-                            append_history_message(
-                                state,
-                                &session_id,
-                                ChatMessage::tool(id.clone(), serialized),
-                            )
-                            .await?;
-                        }
+                        let serialized = serde_json::to_string(&record)
+                            .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
+                        turn_persister.push_tool_event(id.clone(), serialized);
                         update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                         tool_arguments_by_id.insert(id.clone(), arguments.clone());
                         if !sink.on_tool_start(&id, &name, &arguments).await {
@@ -1022,14 +1014,9 @@ async fn run_agent_loop(
                             name: name.clone(),
                             result: result.clone(),
                         };
-                        if let Ok(serialized) = serde_json::to_string(&record) {
-                            append_history_message(
-                                state,
-                                &session_id,
-                                ChatMessage::tool(id.clone(), serialized),
-                            )
-                            .await?;
-                        }
+                        let serialized = serde_json::to_string(&record)
+                            .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
+                        turn_persister.push_tool_event(id.clone(), serialized);
                         update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                         let arguments = tool_arguments_by_id.remove(&id);
                         if !sink
@@ -1125,23 +1112,19 @@ async fn run_agent_loop(
                 "Browser takeover is active for this session; model execution paused";
 
             if !segment_text.trim().is_empty() {
-                append_history_message(
-                    state,
-                    &session_id,
-                    ChatMessage::assistant(segment_text.clone()),
-                )
-                .await?;
+                turn_persister.push_assistant(segment_text.clone());
             }
-
-            clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
             let has_assistant_text = !full_text.trim().is_empty();
-            let has_terminal_output = !terminal_snapshot.executions.is_empty();
-            let has_tool_activity = has_terminal_output || saw_tool_activity;
+            let has_tool_activity =
+                !terminal_snapshot.executions.is_empty() || saw_tool_activity;
             if !has_assistant_text && has_tool_activity {
-                append_history_message(state, &session_id, ChatMessage::assistant(String::new()))
-                    .await?;
+                turn_persister.push_assistant(String::new());
             }
+
+            // Flush the entire turn atomically
+            turn_persister.flush(&state.db()).await?;
+            clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
             record_request_log(
                 state,
@@ -1185,6 +1168,7 @@ async fn run_agent_loop(
 
         if let Some(reason) = cancellation_reason {
             if reason == "run cancelled by user" {
+                // Synthesize stopped-end records for all running tool calls
                 let running_terminal_ids = terminal_snapshot
                     .running_by_call_id
                     .keys()
@@ -1196,25 +1180,17 @@ async fn run_agent_loop(
                         name: "terminal".to_string(),
                         result: stopped_terminal_tool_result(),
                     };
-                    if let Ok(serialized) = serde_json::to_string(&record) {
-                        append_history_message(
-                            state,
-                            &session_id,
-                            ChatMessage::tool(call_id, serialized),
-                        )
-                        .await?;
-                    }
+                    let serialized = serde_json::to_string(&record)
+                        .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
+                    turn_persister.push_tool_event(call_id, serialized);
                     update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                 }
             }
             if !segment_text.trim().is_empty() {
-                append_history_message(
-                    state,
-                    &session_id,
-                    ChatMessage::assistant(segment_text.clone()),
-                )
-                .await?;
+                turn_persister.push_assistant(segment_text.clone());
             }
+            // Flush the entire turn atomically before returning
+            turn_persister.flush(&state.db()).await?;
             record_request_log(
                 state,
                 log_base.failure(elapsed_ms_saturating(&started_at), reason),
@@ -1223,20 +1199,12 @@ async fn run_agent_loop(
             return Err(AgentLoopError::Cancelled(reason));
         }
 
-        // Flush remaining text segment to history.
+        // Buffer remaining text segment.
         if !segment_text.trim().is_empty() {
-            append_history_message(
-                state,
-                &session_id,
-                ChatMessage::assistant(segment_text.clone()),
-            )
-            .await?;
+            turn_persister.push_assistant(segment_text.clone());
         }
 
-        clear_terminal_runtime_state(state, session_id.as_str()).await?;
-
         let has_assistant_text = !full_text.trim().is_empty();
-
         let has_terminal_output = !terminal_snapshot.executions.is_empty();
         let has_tool_activity = has_terminal_output || saw_tool_activity;
         if !has_assistant_text && !has_tool_activity {
@@ -1250,9 +1218,12 @@ async fn run_agent_loop(
             return Err(AgentLoopError::EmptyAssistantResponse);
         }
         if !has_assistant_text && has_tool_activity {
-            append_history_message(state, &session_id, ChatMessage::assistant(String::new()))
-                .await?;
+            turn_persister.push_assistant(String::new());
         }
+
+        // Flush the entire turn atomically
+        turn_persister.flush(&state.db()).await?;
+        clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
         let elapsed_ms = elapsed_ms_saturating(&started_at);
         persist_latest_assistant_stats(
@@ -2275,6 +2246,7 @@ async fn prepare_agent_for_request(
         ctx.session_id.clone(),
         brokers.workspace,
         brokers.ask_user,
+        state.db(),
         &ctx.current_model,
         None,
         ctx.profile_id.clone(),
