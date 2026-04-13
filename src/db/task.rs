@@ -8,7 +8,6 @@ use super::entity::scheduled_tasks;
 use super::{ChatDb, ChatDbError, query};
 
 impl ChatDb {
-
     /// Create a scheduled task.
     pub async fn create_scheduled_task(
         &self,

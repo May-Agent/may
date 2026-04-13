@@ -23,10 +23,11 @@ use super::permission::PermissionApprover;
 use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
 use super::runtime_context::{
     RuntimeSystemContext, build_base_system_prompt, build_browser_context,
-    build_container_environment_context, build_location_context, build_macos_host_automation_context,
-    build_memory_context_content, build_native_voice_context, build_network_restrictions_context,
-    build_plan_mode_context, build_remote_environment_context, build_terminal_runtime_context,
-    build_workspace_context, build_workspace_workdirs_context, global_memory_file_path, tag,
+    build_container_environment_context, build_location_context,
+    build_macos_host_automation_context, build_memory_context_content, build_native_voice_context,
+    build_network_restrictions_context, build_plan_mode_context, build_remote_environment_context,
+    build_terminal_runtime_context, build_workspace_context, build_workspace_workdirs_context,
+    global_memory_file_path, tag,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
@@ -65,8 +66,6 @@ pub enum MayAgentError {
     #[error("MCP error: {0}")]
     Mcp(#[from] crate::mcp::McpConnectionLoadError),
 }
-
-
 
 /// Execution environment for a `MayAgent`.
 pub enum AgentEnvironment {
@@ -151,9 +150,6 @@ pub struct MayAgentConfig {
     /// Request-level parameters applied to each LLM call for this agent.
     pub request_parameters: Parameters,
 }
-
-
-
 
 /// The May agent.
 pub struct MayAgent {
@@ -423,8 +419,8 @@ impl MayAgent {
                     runtime_system_context.with_workspace(workspace_context.clone());
                 builder = builder.system_text(tag::WORKSPACE, workspace_context);
                 if let Some(workdirs_context) = build_workspace_workdirs_context(&workspace) {
-                    runtime_system_context = runtime_system_context
-                        .with_workspace_workdirs(workdirs_context.clone());
+                    runtime_system_context =
+                        runtime_system_context.with_workspace_workdirs(workdirs_context.clone());
                     builder = builder.system_text(tag::WORKSPACE_WORKDIRS, workdirs_context);
                 }
                 if let Some(macos_hint) = build_macos_host_automation_context() {
@@ -760,13 +756,10 @@ pub async fn generate_session_title(
     let selected = resolver.select_provider(model)?;
 
     // Build the cloud provider
-    let llm = super::provider::build_cloud_provider_from_instance(
-        selected.id,
-        selected.instance,
-        model,
-    )
-    .await
-    .ok()?;
+    let llm =
+        super::provider::build_cloud_provider_from_instance(selected.id, selected.instance, model)
+            .await
+            .ok()?;
 
     // Truncate messages for prompt
     let user_truncated = truncate_at_char_boundary(user_message, 200);
@@ -804,4 +797,3 @@ fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
         .nth(max_chars)
         .map_or(input, |(idx, _)| &input[..idx])
 }
-

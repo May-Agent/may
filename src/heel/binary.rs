@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use crate::config::MayConfig;
 use super::release::{ManagedHeelError, current_host_heel_asset, ensure_managed_heel_binary};
+use crate::config::MayConfig;
 
 #[derive(Debug, thiserror::Error)]
 enum HeelBinaryConfigurationError {

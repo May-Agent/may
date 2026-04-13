@@ -157,7 +157,10 @@ pub(super) async fn handle_register_skills_request(
                 .register_from_local_path(&source)
                 .await
                 .map_err(|error| {
-                    format!("failed to register skill from {}: {error}", source.display())
+                    format!(
+                        "failed to register skill from {}: {error}",
+                        source.display()
+                    )
                 })?;
             Ok(vec![info.dir_name])
         },
@@ -249,7 +252,10 @@ async fn resolve_session_root(
     let session_root_canonical = tokio::fs::canonicalize(&session_root)
         .await
         .map_err(|error| {
-            format!("failed to resolve session {}: {error}", session_root.display())
+            format!(
+                "failed to resolve session {}: {error}",
+                session_root.display()
+            )
         })?;
     Ok(session_root_canonical)
 }
