@@ -1085,6 +1085,7 @@ export async function streamChat(input: {
   onStart?: (assistantId: string) => void;
   onReasoning?: (chunk: string) => void;
   onText?: (chunk: string) => void;
+  onToolDelta?: (delta: { id: string; name: string; argumentsFragment: string }) => void;
   onToolStart?: (tool: unknown) => void;
   onToolEnd?: (tool: unknown) => void;
   onTodoUpdate?: (event: {
@@ -1165,6 +1166,9 @@ export async function streamChat(input: {
           break;
         case 'text':
           input.onText?.(requireString(parsed.chunk, 'chunk'));
+          break;
+        case 'tool_delta':
+          input.onToolDelta?.(parsed);
           break;
         case 'tool_start':
           input.onToolStart?.(parsed);

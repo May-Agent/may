@@ -564,6 +564,7 @@ export function useStreamController(
           attachments: mergedAttachments,
           signal: controller.signal,
           onReasoning: streamHandlers.onReasoning,
+          onToolDelta: streamHandlers.onToolDelta,
           onToolStart: streamHandlers.onToolStart,
           onToolEnd: streamHandlers.onToolEnd,
           onTodoUpdate: streamHandlers.onTodoUpdate,

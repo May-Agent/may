@@ -454,6 +454,9 @@ fn render_oneshot_event(
                 writeln!(stderr, "Thinking: {text}")?;
             }
         }
+        Ok(AgentEvent::ToolCallDelta { .. }) => {
+            // UI progress — oneshot mode ignores deltas
+        }
         Ok(AgentEvent::ToolCallStart { name, .. }) => {
             writeln!(stderr, "Tool: {name}")?;
         }
