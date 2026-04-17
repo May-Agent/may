@@ -183,6 +183,11 @@ export interface PendingUserMessage {
 
 export type PendingUserMessageMode = 'steer' | 'queue';
 
+export type BackgroundReason =
+  | { kind: 'timeout'; configured_seconds: number }
+  | { kind: 'stdin_blocked'; notice: string }
+  | { kind: 'explicit' };
+
 export interface RuntimePermissionRequest {
   id: string;
   mode: 'default' | 'unsafe' | 'ssh';
@@ -221,6 +226,7 @@ export interface SessionRuntimeSummaryPayload {
       outputFile: string | null;
       outputPreview: string | null;
       inputNotice: string | null;
+      backgroundReason?: BackgroundReason | null;
     };
   };
   queuedCount: number;

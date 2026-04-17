@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ChevronDown, Command, Paperclip, SendToBack, Terminal } from 'lucide-react';
-import type { PendingUserMessage, TerminalExecution } from '@/types';
+import type { BackgroundReason, PendingUserMessage, TerminalExecution } from '@/types';
 import { ScanningLabel } from './timeline/ScanningLabel';
 import { cn } from '@/lib/utils';
 
@@ -10,6 +10,23 @@ interface BackgroundCommandActivity {
   outputFile?: string | null;
   outputPreview?: string | null;
   inputNotice?: string | null;
+  backgroundReason?: BackgroundReason | null;
+}
+
+function backgroundReasonCaption(reason: BackgroundReason | null | undefined): string | null {
+  if (!reason) {
+    return null;
+  }
+  switch (reason.kind) {
+    case 'timeout':
+      return `Promoted after ${reason.configured_seconds}s timeout`;
+    case 'stdin_blocked':
+      return 'Waiting for input — moved to background';
+    case 'explicit':
+      return 'Started in background';
+    default:
+      return null;
+  }
 }
 
 interface ActivityRailProps {
@@ -114,6 +131,7 @@ function RunningCommandRow({ command }: { command: TerminalExecution }) {
 
 function BackgroundCommandRow({ command }: { command: BackgroundCommandActivity }) {
   const isWaitingInput = command.inputNotice != null;
+  const reasonCaption = backgroundReasonCaption(command.backgroundReason);
   return (
     <div
       className={cn(
@@ -135,6 +153,9 @@ function BackgroundCommandRow({ command }: { command: BackgroundCommandActivity 
             <span className="rounded-full border border-border/60 px-1.5 py-0.5 text-[10px] uppercase tracking-[0.08em]">
               Background
             </span>
+            {reasonCaption && !isWaitingInput && (
+              <span className="truncate">{reasonCaption}</span>
+            )}
             {command.taskId && (
               <span className="font-mono text-[10px]">
                 task {command.taskId}

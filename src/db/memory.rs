@@ -180,10 +180,7 @@ impl ChatDb {
     // ── Session Tasks (DB-backed plan/todo) ──────────────────
 
     /// Get the tasks content for a session.
-    pub async fn get_session_tasks(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<String>, ChatDbError> {
+    pub async fn get_session_tasks(&self, session_id: &str) -> Result<Option<String>, ChatDbError> {
         #[derive(serde::Deserialize)]
         struct Row {
             content: String,
@@ -225,13 +222,12 @@ impl ChatDb {
         struct Row {
             content: String,
         }
-        Ok(query!(
-            self.db,
-            "SELECT content FROM global_memory WHERE id = 1"
+        Ok(
+            query!(self.db, "SELECT content FROM global_memory WHERE id = 1")
+                .fetch_optional::<Row>()
+                .await?
+                .map(|r| r.content),
         )
-        .fetch_optional::<Row>()
-        .await?
-        .map(|r| r.content))
     }
 
     /// Upsert the global memory content.

@@ -88,10 +88,8 @@ pub(super) async fn get_session(
     let mut summary = crate::session::SessionSummary::from_db_model(db_session);
 
     // Fetch runtime and messages in parallel — they are independent queries
-    let (runtime_result, messages_result) = tokio::join!(
-        db.get_session_runtime(&id),
-        db.get_messages(&id),
-    );
+    let (runtime_result, messages_result) =
+        tokio::join!(db.get_session_runtime(&id), db.get_messages(&id),);
     summary.runtime = runtime_result.map_err(internal_error)?.unwrap_or_default();
     let model = resolve_session_model(&state, &id, summary.model.clone())?;
     let db_messages = messages_result.map_err(internal_error)?;

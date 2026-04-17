@@ -26,8 +26,7 @@ use super::runtime_context::{
     build_container_environment_context, build_location_context,
     build_macos_host_automation_context, build_memory_context_content, build_native_voice_context,
     build_network_restrictions_context, build_plan_mode_context, build_remote_environment_context,
-    build_terminal_runtime_context, build_workspace_context, build_workspace_workdirs_context,
-    tag,
+    build_terminal_runtime_context, build_workspace_context, build_workspace_workdirs_context, tag,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;

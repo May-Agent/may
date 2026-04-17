@@ -19,6 +19,10 @@ interface ChatMessageListProps {
   onScroll: UIEventHandler<HTMLDivElement>;
   onOpenPreview: (target: ArtifactPreviewTarget) => void;
   onRetry: (request: RetryRequest) => void;
+  /** Backend task_id of the terminal task currently running in background. */
+  activeBackgroundTaskId?: string | null;
+  /** Task IDs whose runtime state has cleared but whose tool_end hasn't landed yet. */
+  recentlyBackgroundedTaskIds?: ReadonlySet<string> | null;
 }
 
 export function ChatMessageList({
@@ -29,6 +33,8 @@ export function ChatMessageList({
   onScroll,
   onOpenPreview,
   onRetry,
+  activeBackgroundTaskId,
+  recentlyBackgroundedTaskIds,
 }: ChatMessageListProps) {
   return (
     <div
@@ -52,6 +58,8 @@ export function ChatMessageList({
               sessionId={currentSessionId ?? undefined}
               canRetry={retryFromUser || retryFromAssistant}
               onOpenPreview={onOpenPreview}
+              activeBackgroundTaskId={activeBackgroundTaskId ?? null}
+              recentlyBackgroundedTaskIds={recentlyBackgroundedTaskIds ?? null}
               onRetry={() => {
                 const batch = retryFromUser
                   ? [

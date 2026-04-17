@@ -1,5 +1,5 @@
 import { Suspense, lazy, memo } from 'react';
-import ReactMarkdown from 'react-markdown';
+import { Streamdown } from 'streamdown';
 import { cn } from '@/lib/utils';
 import { CopyButton } from './CopyButton';
 
@@ -12,7 +12,17 @@ export const MemoMarkdown = memo(function MemoMarkdown({
   content: string;
   components: any;
 }) {
-  return <ReactMarkdown components={components}>{content}</ReactMarkdown>;
+  return (
+    <Streamdown
+      mode="static"
+      parseIncompleteMarkdown={false}
+      linkSafety={{ enabled: false }}
+      controls={{ code: false, table: false }}
+      components={components}
+    >
+      {content}
+    </Streamdown>
+  );
 });
 
 export function makeMarkdownComponents(isUser: boolean, isStreaming: boolean) {

@@ -6,7 +6,7 @@ import type {
   SessionRuntimeStatus,
   WorkspaceRequest,
 } from '@/lib/api';
-import type { PendingUserMessage, SessionRuntimeState } from '@/types';
+import type { BackgroundReason, PendingUserMessage, SessionRuntimeState } from '@/types';
 import type { SessionPlanState } from '@/types';
 
 interface SessionRuntime {
@@ -21,6 +21,7 @@ interface SessionRuntime {
       outputFile: string | null;
       outputPreview: string | null;
       inputNotice: string | null;
+      backgroundReason?: BackgroundReason | null;
     };
   };
   queuedCount: number;
@@ -30,6 +31,13 @@ interface SessionRuntime {
   pendingImmediate: PendingUserMessage | null;
   queuedMessages: PendingUserMessage[];
   firstTokenAt?: number;
+  /**
+   * Task IDs that were promoted to background and whose terminal runtime state
+   * has since been cleared, but whose final tool_end has not yet arrived.
+   * Bridges the non-atomic transition so the main-area placeholder persists
+   * until the real tool result lands.
+   */
+  recentlyBackgroundedTaskIds: Set<string>;
 }
 
 interface RuntimeStoreState {
@@ -41,6 +49,7 @@ interface RuntimeStoreState {
   markFirstToken: (sessionId: string) => void;
   clearSessionRuntime: (sessionId: string) => void;
   removeSession: (sessionId: string) => void;
+  clearRecentlyBackgroundedTaskId: (sessionId: string, taskId: string) => void;
 }
 
 const defaultRuntime = (): SessionRuntime => ({
@@ -56,15 +65,24 @@ const defaultRuntime = (): SessionRuntime => ({
   waitingAskUser: null,
   pendingImmediate: null,
   queuedMessages: [],
+  recentlyBackgroundedTaskIds: new Set(),
 });
 
 function runtimeFromStatus(
   runtime: SessionRuntimeStatus,
   current?: SessionRuntime,
 ): SessionRuntime {
+  const previousTerminalTaskId = current?.interactions?.terminal?.taskId ?? null;
+  const nextTerminalTaskId = runtime.interactions?.terminal?.taskId ?? null;
+  let recentSet = current?.recentlyBackgroundedTaskIds ?? new Set<string>();
+  if (previousTerminalTaskId && previousTerminalTaskId !== nextTerminalTaskId) {
+    recentSet = new Set(recentSet);
+    recentSet.add(previousTerminalTaskId);
+  }
   return {
     ...defaultRuntime(),
     firstTokenAt: current?.firstTokenAt,
+    recentlyBackgroundedTaskIds: recentSet,
     state: runtime.state,
     planState: runtime.planState,
     interactions: runtime.interactions ?? defaultRuntime().interactions,
@@ -167,6 +185,27 @@ export const useRuntimeStore = create<RuntimeStoreState>((set, get) => ({
     set((state) => {
       const { [sessionId]: _, ...rest } = state.sessions;
       return { sessions: rest };
+    });
+  },
+
+  clearRecentlyBackgroundedTaskId: (sessionId, taskId) => {
+    if (!sessionId || !taskId) return;
+    set((state) => {
+      const current = state.sessions[sessionId];
+      if (!current || !current.recentlyBackgroundedTaskIds.has(taskId)) {
+        return state;
+      }
+      const nextSet = new Set(current.recentlyBackgroundedTaskIds);
+      nextSet.delete(taskId);
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...current,
+            recentlyBackgroundedTaskIds: nextSet,
+          },
+        },
+      };
     });
   },
 }));

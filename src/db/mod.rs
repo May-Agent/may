@@ -82,8 +82,29 @@ impl ChatDb {
         let db = SkyDb::connect_sqlite(&url).await?;
         Self::initialize_schema(&db).await?;
         Self::ensure_profile_preference_columns(&db).await?;
+        Self::ensure_session_runtime_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
         Ok(Self { db })
+    }
+
+    async fn ensure_session_runtime_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "PRAGMA table_info(session_runtimes)")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        let existing = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        if !existing.contains("terminal_background_reason") {
+            query!(
+                db,
+                "ALTER TABLE session_runtimes ADD COLUMN terminal_background_reason TEXT"
+            )
+            .execute()
+            .await?;
+        }
+        Ok(())
     }
 
     async fn initialize_schema(db: &SkyDb) -> Result<(), ChatDbError> {

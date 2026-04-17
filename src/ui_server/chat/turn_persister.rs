@@ -70,9 +70,7 @@ impl TurnPersister {
                 tool_call_id: msg.tool_call_id.clone(),
                 stats: None,
             };
-            let row = db
-                .append_chat_message(&self.session_id, &chat_msg)
-                .await?;
+            let row = db.append_chat_message(&self.session_id, &chat_msg).await?;
             last_id = Some(i64::from(row.id));
         }
 

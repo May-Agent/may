@@ -10,5 +10,6 @@ pub struct Model {
     pub terminal_output_file: Option<String>,
     pub terminal_output_preview: Option<String>,
     pub terminal_input_notice: Option<String>,
+    pub terminal_background_reason: Option<String>,
     pub updated_at: String,
 }

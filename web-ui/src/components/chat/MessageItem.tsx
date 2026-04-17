@@ -9,7 +9,7 @@ import {
   type TimelineDisplayItem,
   buildTimelineDisplayItems,
 } from '@/lib/timeline';
-import { RotateCcw, Download } from 'lucide-react';
+import { RotateCcw, Download, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
 import { CopyButton } from './shared/CopyButton';
@@ -37,12 +37,16 @@ export function MessageItem({
   onRetry,
   canRetry,
   onOpenPreview,
+  activeBackgroundTaskId,
+  recentlyBackgroundedTaskIds,
 }: {
   message: Message;
   sessionId?: string;
   onRetry?: () => void;
   canRetry?: boolean;
   onOpenPreview?: (target: ArtifactPreviewTarget) => void;
+  activeBackgroundTaskId?: string | null;
+  recentlyBackgroundedTaskIds?: ReadonlySet<string> | null;
 }) {
   const isUser = message.role === 'user';
   const isStreaming = !!message.isStreaming;
@@ -171,7 +175,7 @@ export function MessageItem({
             : 'py-1 text-foreground w-full'
         )}>
           {!isUser && timelineItems.length > 0 && (
-            <div className="not-prose mb-1.5 space-y-1">
+            <div className="not-prose mb-1.5 space-y-0.5">
               {timelineItems.map((item, index) => {
                 const isExpanded = expandedTimelineItemIds[item.id] === true;
                 const onToggle = () =>
@@ -181,6 +185,33 @@ export function MessageItem({
                     return { ...previous, [item.id]: nextExpanded };
                   });
                 const fallbackStartedAt = Date.parse(message.timestamp);
+                const isBackgroundedPlaceholder =
+                  item.type === 'command' &&
+                  !!item.taskId &&
+                  (
+                    (!!activeBackgroundTaskId && item.taskId === activeBackgroundTaskId) ||
+                    (item.status === 'running' &&
+                      !!recentlyBackgroundedTaskIds &&
+                      recentlyBackgroundedTaskIds.has(item.taskId))
+                  );
+                if (isBackgroundedPlaceholder && item.type === 'command') {
+                  return (
+                    <div
+                      key={item.id}
+                      className="rounded-md px-1 py-0.5 border-l-2 border-l-foreground/50"
+                    >
+                      <div className="flex items-center gap-2 text-[13px] italic text-muted-foreground">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        <span className="shrink-0">Running in background</span>
+                        {item.description.trim().length > 0 && (
+                          <span className="min-w-0 flex-1 truncate opacity-70">
+                            · {item.description}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                }
                 return (
                   <TimelineItemRow
                     key={item.id}

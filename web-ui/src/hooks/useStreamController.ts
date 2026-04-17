@@ -115,6 +115,9 @@ export function useStreamController(
   const markRuntimeFirstToken = useRuntimeStore(
     (state) => state.markFirstToken,
   );
+  const clearRecentlyBackgroundedTaskId = useRuntimeStore(
+    (state) => state.clearRecentlyBackgroundedTaskId,
+  );
 
   const syncSessionRuntime = useCallback(async (sessionId: string) => {
     const runtime = await fetchSessionRuntime(sessionId);
@@ -520,6 +523,7 @@ export function useStreamController(
           flushAssistantText,
           wasStoppedByUser,
           markRuntimeFirstToken,
+          clearRecentlyBackgroundedTaskId,
           onTodoUpdate: (event) => input.setTodoProgress(event),
           onAssistantFinalized: (update) => {
             clearTextFlushTimer();
@@ -641,6 +645,7 @@ export function useStreamController(
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       applyRuntime,
+      clearRecentlyBackgroundedTaskId,
       input.replaceSessionMessages,
       input.setAttachments,
       input.setInputValue,

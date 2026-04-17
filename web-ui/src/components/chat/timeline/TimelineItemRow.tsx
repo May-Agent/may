@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useId, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -29,8 +29,8 @@ export function TimelineItemRow({
   nowMs,
   fallbackStartedAt,
   children,
-  index,
 }: TimelineItemRowProps) {
+  const contentId = useId();
   const startedAt = item.startedAt ?? fallbackStartedAt;
   const normalizedStartedAt = Number.isFinite(startedAt) ? startedAt : nowMs;
   const endedAt = item.endedAt ?? (item.isRunning ? nowMs : normalizedStartedAt);
@@ -40,18 +40,24 @@ export function TimelineItemRow({
     : buildCollapsedTimelineLabel(item);
   const statusLabel = timelineItemStatusLabel(item);
 
+  const containerClass = isExpanded
+    ? 'rounded-2xl border border-border/60 bg-muted/20 px-3 py-2'
+    : 'rounded-md px-1 py-0.5 hover:bg-muted/30';
+
   return (
     <div
       className={cn(
-        'group/row overflow-hidden rounded-2xl border border-border/60 bg-muted/20 px-3 py-2 transition-colors hover:bg-muted/30',
-        index > 0 && 'pt-0.5',
+        'group/row overflow-hidden transition-colors',
+        containerClass,
         item.isRunning && 'border-l-2 border-l-foreground/50',
       )}
     >
       <button
         type="button"
-        className="flex w-full items-center gap-2 px-0 py-0.5 text-left"
+        className="flex w-full items-center gap-2 px-0 py-0.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-sm"
         onClick={onToggle}
+        aria-expanded={isExpanded}
+        aria-controls={contentId}
       >
         <span
           className={cn(
@@ -85,6 +91,7 @@ export function TimelineItemRow({
       <AnimatePresence initial={false}>
         {isExpanded && (
           <motion.div
+            id={contentId}
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: 'auto', opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}

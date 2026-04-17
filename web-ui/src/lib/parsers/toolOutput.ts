@@ -13,8 +13,34 @@ export interface ParsedCommandOutput {
   stdoutText?: string;
   stderrText?: string;
   exitCode?: number;
+  errorMessage?: string;
+  taskId?: string;
+  isError?: boolean;
   images: ParsedCommandImage[];
   storagePaths: string[];
+}
+
+const LEGACY_ERROR_PREFIX = 'Error: terminal command failed: ';
+
+/**
+ * Extract an embedded terminal-shaped JSON object from a legacy
+ * `ToolResult::Error { message: "Error: terminal command failed: {json}" }`
+ * payload. Returns undefined when the prefix is absent or the tail does not
+ * parse as JSON.
+ */
+function extractLegacyTerminalErrorJson(message: string): unknown | undefined {
+  if (!message.startsWith(LEGACY_ERROR_PREFIX)) {
+    return undefined;
+  }
+  const tail = message.slice(LEGACY_ERROR_PREFIX.length).trim();
+  if (!tail.startsWith('{')) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(tail);
+  } catch {
+    return undefined;
+  }
 }
 
 export function detectCodeLanguage(text: string): 'shell' | 'json' | 'text' {
@@ -334,7 +360,29 @@ export function parseCommandOutput(output?: string): ParsedCommandOutput {
     return parsed;
   };
 
-  const interpreted = unwrapStructuredOutputNode(parseJsonLike(output));
+  const rawInterpreted = parseJsonLike(output);
+  let interpreted: unknown = unwrapStructuredOutputNode(rawInterpreted);
+  let legacyErrorMessage: string | undefined;
+
+  if (
+    rawInterpreted &&
+    typeof rawInterpreted === 'object' &&
+    !Array.isArray(rawInterpreted)
+  ) {
+    const wrapper = rawInterpreted as Record<string, unknown>;
+    if (
+      typeof wrapper.kind === 'string' &&
+      wrapper.kind.trim().toLowerCase() === 'error' &&
+      typeof wrapper.message === 'string'
+    ) {
+      legacyErrorMessage = wrapper.message;
+      const embedded = extractLegacyTerminalErrorJson(wrapper.message);
+      if (embedded !== undefined) {
+        interpreted = unwrapStructuredOutputNode(embedded);
+      }
+    }
+  }
+
   if (
     interpreted &&
     typeof interpreted === 'object' &&
@@ -348,16 +396,41 @@ export function parseCommandOutput(output?: string): ParsedCommandOutput {
     if (hasTerminalShape) {
       const stdout = buildParsedOutput(record.stdout);
       const stderr = buildParsedOutput(record.stderr);
+      const exitCode =
+        typeof record.exit_code === 'number' ? record.exit_code : undefined;
+      const taskId =
+        typeof record.task_id === 'string' && record.task_id.length > 0
+          ? record.task_id
+          : undefined;
+      const statusField =
+        typeof record.status === 'string' ? record.status : undefined;
+      const failedByStatus =
+        statusField === 'failed' ||
+        statusField === 'stopped' ||
+        statusField === 'cancelled';
+      const failedByExit = typeof exitCode === 'number' && exitCode !== 0;
       return {
         text: stdout.text ?? stderr.text,
         stdoutText: stdout.text,
         stderrText: stderr.text,
-        exitCode:
-          typeof record.exit_code === 'number' ? record.exit_code : undefined,
+        exitCode,
+        errorMessage: legacyErrorMessage,
+        taskId,
+        isError: legacyErrorMessage !== undefined || failedByStatus || failedByExit,
         images: [...stdout.images, ...stderr.images],
         storagePaths: [...new Set([...stdout.storagePaths, ...stderr.storagePaths])],
       };
     }
+  }
+
+  if (legacyErrorMessage !== undefined) {
+    return {
+      text: legacyErrorMessage,
+      errorMessage: legacyErrorMessage,
+      isError: true,
+      images: [],
+      storagePaths: [],
+    };
   }
 
   const parsed = buildParsedOutput(interpreted);
