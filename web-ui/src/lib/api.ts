@@ -3,6 +3,7 @@ import type {
   Message,
   Attachment,
   Artifact,
+  BackgroundReason,
   PinnedItem,
   SessionSummary,
   TimelineSegment,
@@ -45,6 +46,7 @@ export interface SessionRuntimeStatus {
       outputFile: string | null;
       outputPreview: string | null;
       inputNotice: string | null;
+      backgroundReason?: BackgroundReason | null;
     };
   };
   queuedCount: number;

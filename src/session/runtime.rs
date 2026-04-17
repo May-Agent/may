@@ -96,6 +96,10 @@ pub struct TerminalRuntimeState {
     pub output_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_notice: Option<String>,
+    /// Why the command was promoted to the background (populated when the
+    /// runtime state reflects a live terminal task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_reason: Option<aither_sandbox::BackgroundReason>,
 }
 
 impl TerminalRuntimeState {
@@ -105,6 +109,7 @@ impl TerminalRuntimeState {
             && self.output_file.is_none()
             && self.output_preview.is_none()
             && self.input_notice.is_none()
+            && self.background_reason.is_none()
     }
 
     #[must_use]

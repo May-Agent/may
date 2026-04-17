@@ -16,6 +16,7 @@ import {
   isWebFetchToolName,
   parseTerminalToolStartArgs,
 } from '@/lib/parsers/toolRequest';
+import { extractStringField } from './partialJson';
 import {
   cloneTimelineSegments,
   closeThinkingSegment,
@@ -33,6 +34,10 @@ export interface StreamState {
   lastStreamEventKind: StreamEventKind;
   terminalSegmentByToolId: Map<string, string>;
   toolSegmentByToolId: Map<string, string>;
+  /** Per-tool-call accumulated arguments buffer for streaming delta decoding. */
+  toolArgumentsBufferById: Map<string, string>;
+  /** Last extracted lengths per (toolId, field) to short-circuit no-op updates. */
+  toolDeltaLastLengthById: Map<string, { description: number; script: number }>;
   completedNormally: boolean;
 }
 
@@ -44,6 +49,8 @@ export function createStreamState(): StreamState {
     lastStreamEventKind: null,
     terminalSegmentByToolId: new Map(),
     toolSegmentByToolId: new Map(),
+    toolArgumentsBufferById: new Map(),
+    toolDeltaLastLengthById: new Map(),
     completedNormally: false,
   };
 }
@@ -58,6 +65,8 @@ export interface StreamEventHandlerDeps {
   wasStoppedByUser: () => boolean;
   /** Used to capture TTFT metrics. */
   markRuntimeFirstToken: (sessionId: string) => void;
+  /** Release a recently-backgrounded task's placeholder when its final tool_end lands. */
+  clearRecentlyBackgroundedTaskId: (sessionId: string, taskId: string) => void;
   /** Called with the final assistant message on a successful stream completion. */
   onAssistantFinalized: (update: AssistantFinalizeUpdate) => void;
   /** Called when the stream pauses (e.g. browser takeover). */
@@ -106,6 +115,7 @@ export function createStreamEventHandlers(
     flushAssistantText,
     wasStoppedByUser,
     markRuntimeFirstToken,
+    clearRecentlyBackgroundedTaskId,
     onAssistantFinalized,
     onAssistantPaused,
     onStreamError,
@@ -163,75 +173,75 @@ export function createStreamEventHandlers(
     argumentsFragment: string;
   }): void => {
     const name = normalizeToolName(delta.name);
+    if (name !== 'terminal') {
+      return;
+    }
     const toolId = delta.id;
 
-    // Only create a provisional segment if one doesn't already exist for this tool
-    if (name === 'terminal') {
-      const existingSegId = state.terminalSegmentByToolId.get(toolId);
-      if (!existingSegId) {
-        // Parse partial arguments to try extracting a description
-        let description = '';
-        try {
-          if (delta.argumentsFragment) {
-            const partial = JSON.parse(delta.argumentsFragment + '}');
-            description = partial.description || '';
-          }
-        } catch {
-          // partial JSON — try regex fallback
-          const match = delta.argumentsFragment.match(
-            /"description"\s*:\s*"([^"]*)"/,
-          );
-          if (match) description = match[1];
-        }
+    const previousBuffer = state.toolArgumentsBufferById.get(toolId) ?? '';
+    const buffer = previousBuffer + (delta.argumentsFragment ?? '');
+    state.toolArgumentsBufferById.set(toolId, buffer);
 
-        closeActiveThinkingSegment();
-        const segmentId = `terminal-delta-${toolId}`;
-        const cmd: TerminalExecution = {
-          id: toolId,
-          description: description || 'Running command...',
-          input: '',
-          output: '',
-          mode: 'default',
-          status: 'running',
-          startedAt: Date.now(),
-        };
-        state.timelineSegments = [
-          ...state.timelineSegments,
-          {
-            id: segmentId,
-            kind: 'terminal',
-            offset: state.streamedText.length,
-            commands: [cmd],
-          },
-        ];
-        state.terminalSegmentByToolId.set(toolId, segmentId);
-        state.lastStreamEventKind = 'tool';
-        flushAssistantText(true);
-      } else {
-        // Update description in existing segment if we got more args
-        try {
-          if (delta.argumentsFragment) {
-            const partial = JSON.parse(delta.argumentsFragment + '}');
-            const desc = partial.description;
-            if (desc) {
-              state.timelineSegments = state.timelineSegments.map((seg) => {
-                if (seg.id !== existingSegId || seg.kind !== 'terminal')
-                  return seg;
-                return {
-                  ...seg,
-                  commands: seg.commands.map((c) =>
-                    c.id === toolId ? { ...c, description: desc } : c,
-                  ),
-                };
-              });
-              flushAssistantText(true);
-            }
-          }
-        } catch {
-          // ignore partial parse failures
-        }
-      }
+    const description = extractStringField(buffer, 'description') ?? '';
+    const script = extractStringField(buffer, 'script') ?? '';
+
+    const lastLengths =
+      state.toolDeltaLastLengthById.get(toolId) ?? { description: -1, script: -1 };
+    const descriptionChanged = description.length !== lastLengths.description;
+    const scriptChanged = script.length !== lastLengths.script;
+    if (!descriptionChanged && !scriptChanged) {
+      return;
     }
+    state.toolDeltaLastLengthById.set(toolId, {
+      description: description.length,
+      script: script.length,
+    });
+
+    const existingSegId = state.terminalSegmentByToolId.get(toolId);
+    if (!existingSegId) {
+      closeActiveThinkingSegment();
+      const segmentId = `terminal-delta-${toolId}`;
+      const cmd: TerminalExecution = {
+        id: toolId,
+        description: description || 'Running command...',
+        input: script,
+        output: '',
+        mode: 'default',
+        status: 'running',
+        startedAt: Date.now(),
+      };
+      state.timelineSegments = [
+        ...state.timelineSegments,
+        {
+          id: segmentId,
+          kind: 'terminal',
+          offset: state.streamedText.length,
+          commands: [cmd],
+        },
+      ];
+      state.terminalSegmentByToolId.set(toolId, segmentId);
+      state.lastStreamEventKind = 'tool';
+      flushAssistantText(true);
+      return;
+    }
+
+    state.timelineSegments = state.timelineSegments.map((seg) => {
+      if (seg.id !== existingSegId || seg.kind !== 'terminal') {
+        return seg;
+      }
+      return {
+        ...seg,
+        commands: seg.commands.map((c) => {
+          if (c.id !== toolId) return c;
+          return {
+            ...c,
+            description: description.length > 0 ? description : c.description,
+            input: script.length > 0 ? script : c.input,
+          };
+        }),
+      };
+    });
+    flushAssistantText(true);
   };
 
   const onToolStart = (tool: any): void => {
@@ -339,7 +349,14 @@ export function createStreamEventHandlers(
         ? tool.arguments
         : JSON.stringify(tool?.arguments ?? {});
     const endedAt = Date.now();
-    const { output, status } = parseToolResultPayload(tool.result);
+    const parsedResult = parseToolResultPayload(tool.result);
+    const { output, status } = parsedResult;
+    // Release the recently-backgrounded placeholder, if any, as soon as the
+    // real tool_end is in hand — this is the signal that the full terminal
+    // card can reclaim the spot in the main transcript.
+    if (parsedResult.taskId) {
+      clearRecentlyBackgroundedTaskId(sessionId, parsedResult.taskId);
+    }
 
     const terminalSegmentId = state.terminalSegmentByToolId.get(toolId);
     if (terminalSegmentId) {

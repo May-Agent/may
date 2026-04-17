@@ -24,6 +24,8 @@ export interface PreviewPaneState {
 export interface ParsedToolResult {
   output?: string;
   status: "done" | "failed" | "stopped";
+  /** Backend terminal task_id, only present for backgrounded terminal tools. */
+  taskId?: string;
 }
 
 export interface ContextRoleTokenBucket {
@@ -349,18 +351,90 @@ export function buildContextRoleTokenBreakdown(
 
 // ── Tool result parsing ──────────────────────────────────
 
+const LEGACY_TERMINAL_ERROR_PREFIX = 'Error: terminal command failed: ';
+
+interface NormalizedToolResult {
+  /** The unwrapped value: the inner terminal JSON, or raw text, or undefined. */
+  value: unknown;
+  /** True if this came from a `ToolResult::Error` (transport-level tool failure). */
+  isToolError: boolean;
+  /** Raw error message when `isToolError`, or undefined. */
+  errorMessage?: string;
+}
+
+/**
+ * Unwrap the `ToolResult` envelope (`{ kind: 'json'|'text'|..., ... }`) one
+ * level, including legacy `ToolResult::Error` payloads whose message embeds
+ * a stringified terminal JSON (pre-P1 rows in the history DB). The returned
+ * `value` is the inner payload the rest of the pipeline should reason about.
+ */
+function normalizeToolResultEnvelope(rawResult: unknown): NormalizedToolResult {
+  if (!rawResult || typeof rawResult !== 'object' || Array.isArray(rawResult)) {
+    return { value: rawResult, isToolError: false };
+  }
+  const record = rawResult as Record<string, unknown>;
+
+  if ('Ok' in record || 'ok' in record || 'Err' in record || 'err' in record) {
+    const okValue = record.Ok ?? record.ok;
+    const errValue = record.Err ?? record.err;
+    if (okValue !== undefined) {
+      return normalizeToolResultEnvelope(okValue);
+    }
+    if (errValue !== undefined) {
+      const inner = normalizeToolResultEnvelope(errValue);
+      return {
+        value: inner.value,
+        isToolError: true,
+        errorMessage: inner.errorMessage,
+      };
+    }
+  }
+
+  const kind =
+    typeof record.kind === 'string' ? record.kind.trim().toLowerCase() : '';
+
+  if (kind === 'json' && record.value !== undefined) {
+    return { value: record.value, isToolError: false };
+  }
+  if (kind === 'text' && typeof record.text === 'string') {
+    return { value: record.text, isToolError: false };
+  }
+  if (kind === 'tsv' && typeof record.text === 'string') {
+    return { value: record.text, isToolError: false };
+  }
+  if (kind === 'error' && typeof record.message === 'string') {
+    const message = record.message;
+    if (message.startsWith(LEGACY_TERMINAL_ERROR_PREFIX)) {
+      const tail = message.slice(LEGACY_TERMINAL_ERROR_PREFIX.length).trim();
+      if (tail.startsWith('{')) {
+        try {
+          return {
+            value: JSON.parse(tail),
+            isToolError: true,
+            errorMessage: message,
+          };
+        } catch {
+          // fall through to raw message
+        }
+      }
+    }
+    return { value: message, isToolError: true, errorMessage: message };
+  }
+  if (kind === 'done') {
+    return { value: undefined, isToolError: false };
+  }
+
+  return { value: rawResult, isToolError: false };
+}
+
 export function parseToolResultPayload(rawResult: unknown): ParsedToolResult {
-  const result = (rawResult ?? {}) as Record<string, unknown>;
-  const okValue = result.Ok ?? result.ok;
-  const errValue = result.Err ?? result.err;
-  const wrappedFailure = errValue !== undefined && okValue === undefined;
-  const candidate = okValue ?? errValue ?? rawResult;
+  const { value, isToolError, errorMessage } = normalizeToolResultEnvelope(rawResult);
 
   const parsed = (() => {
-    if (typeof candidate !== 'string') {
-      return candidate;
+    if (typeof value !== 'string') {
+      return value;
     }
-    const trimmed = candidate.trim();
+    const trimmed = value.trim();
     if (!trimmed) {
       return '';
     }
@@ -377,8 +451,6 @@ export function parseToolResultPayload(rawResult: unknown): ParsedToolResult {
     }
   })();
 
-  const stdoutText = (parsed as any)?.stdout?.content?.text;
-  const stderrText = (parsed as any)?.stderr?.content?.text;
   const parsedObject =
     parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
@@ -388,29 +460,14 @@ export function parseToolResultPayload(rawResult: unknown): ParsedToolResult {
     (Object.prototype.hasOwnProperty.call(parsedObject, 'stdout') ||
       Object.prototype.hasOwnProperty.call(parsedObject, 'stderr') ||
       Object.prototype.hasOwnProperty.call(parsedObject, 'exit_code'));
-  const hasStructuredTerminalOutput =
-    !!parsedObject &&
-    ['stdout', 'stderr'].some((key) => {
-      const entry = parsedObject[key];
-      if (!entry || typeof entry !== 'object') {
-        return false;
-      }
-      const node = entry as Record<string, unknown>;
-      if (typeof node.url === 'string' && node.url.trim().length > 0) {
-        return true;
-      }
-      const content = node.content;
-      if (!content || typeof content !== 'object') {
-        return false;
-      }
-      const kind = (content as Record<string, unknown>).type;
-      return typeof kind === 'string' && kind.trim().length > 0;
-    });
-  const exitCode = (parsed as any)?.exit_code;
+  const exitCode =
+    parsedObject && typeof parsedObject.exit_code === 'number'
+      ? (parsedObject.exit_code as number)
+      : undefined;
   const status =
-    typeof (parsed as any)?.status === "string"
-      ? (parsed as any).status.trim().toLowerCase()
-      : "";
+    parsedObject && typeof parsedObject.status === 'string'
+      ? (parsedObject.status as string).trim().toLowerCase()
+      : '';
 
   const serializedParsed =
     parsed && typeof parsed === 'object'
@@ -423,37 +480,35 @@ export function parseToolResultPayload(rawResult: unknown): ParsedToolResult {
         })()
       : undefined;
 
-  const plainTerminalText =
-    typeof stdoutText === 'string' && stdoutText.trim().length > 0
-      ? stdoutText
-      : typeof stderrText === 'string' && stderrText.trim().length > 0
-        ? stderrText
-        : undefined;
+  // For terminal-shaped JSON: always serialize back so downstream
+  // `parseCommandOutput` can extract stdout/stderr/exit_code/task_id.
+  const output = hasTerminalShape
+    ? serializedParsed
+    : typeof parsed === 'string' && parsed.trim().length > 0
+      ? parsed
+      : typeof serializedParsed === 'string' && serializedParsed.trim().length > 0
+        ? serializedParsed
+        : errorMessage;
 
-  const output =
-    typeof plainTerminalText === 'string'
-      ? plainTerminalText
-      : typeof serializedParsed === 'string' && (hasTerminalShape || hasStructuredTerminalOutput)
-      ? serializedParsed
-      : typeof parsed === 'string' && parsed.trim().length > 0
-          ? parsed
-          : typeof serializedParsed === 'string' && serializedParsed.trim().length > 0
-            ? serializedParsed
-          : undefined;
-
-  const stoppedByStatus = status === "stopped" || status === "cancelled";
+  const stoppedByStatus = status === 'stopped' || status === 'cancelled';
   const failedByExitCode =
-    typeof exitCode === "number" && exitCode !== 0 && !stoppedByStatus;
-  const failedByStatus = status === "failed";
-  const nextStatus: ParsedToolResult["status"] = stoppedByStatus
-    ? "stopped"
-    : wrappedFailure || failedByExitCode || failedByStatus
-      ? "failed"
-      : "done";
+    typeof exitCode === 'number' && exitCode !== 0 && !stoppedByStatus;
+  const failedByStatus = status === 'failed';
+  const nextStatus: ParsedToolResult['status'] = stoppedByStatus
+    ? 'stopped'
+    : isToolError || failedByExitCode || failedByStatus
+      ? 'failed'
+      : 'done';
+
+  const taskId =
+    parsedObject && typeof parsedObject.task_id === 'string' && parsedObject.task_id.length > 0
+      ? (parsedObject.task_id as string)
+      : undefined;
 
   return {
     output,
     status: nextStatus,
+    taskId,
   };
 }
 

@@ -159,7 +159,12 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::PermissionRequest, timestamp)
+            .append_structured_message_in_tx(
+                &mut tx,
+                session_id,
+                MessageRole::PermissionRequest,
+                timestamp,
+            )
             .await?;
         query!(
             tx,
@@ -184,7 +189,12 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::PermissionResponse, timestamp)
+            .append_structured_message_in_tx(
+                &mut tx,
+                session_id,
+                MessageRole::PermissionResponse,
+                timestamp,
+            )
             .await?;
         query!(
             tx,
@@ -209,7 +219,12 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::WorkspaceRequest, timestamp)
+            .append_structured_message_in_tx(
+                &mut tx,
+                session_id,
+                MessageRole::WorkspaceRequest,
+                timestamp,
+            )
             .await?;
         query!(
             tx,
@@ -234,7 +249,12 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::WorkspaceResponse, timestamp)
+            .append_structured_message_in_tx(
+                &mut tx,
+                session_id,
+                MessageRole::WorkspaceResponse,
+                timestamp,
+            )
             .await?;
         query!(
             tx,
@@ -258,7 +278,12 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::AskUserRequest, timestamp)
+            .append_structured_message_in_tx(
+                &mut tx,
+                session_id,
+                MessageRole::AskUserRequest,
+                timestamp,
+            )
             .await?;
         query!(
             tx,
@@ -308,7 +333,12 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message_in_tx(&mut tx, session_id, MessageRole::AskUserResponse, timestamp)
+            .append_structured_message_in_tx(
+                &mut tx,
+                session_id,
+                MessageRole::AskUserResponse,
+                timestamp,
+            )
             .await?;
         query!(
             tx,

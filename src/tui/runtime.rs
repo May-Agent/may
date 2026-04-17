@@ -858,9 +858,7 @@ impl RuntimeDeps {
                         session_id = %session_id_string,
                         "context snapshot anchor is stale, falling back to full history replay"
                     );
-                    let _ = db
-                        .delete_session_context_snapshot(&session_id_string)
-                        .await;
+                    let _ = db.delete_session_context_snapshot(&session_id_string).await;
                     for message in history_messages {
                         agent.push_message(message);
                     }
