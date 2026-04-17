@@ -168,7 +168,10 @@ pub(crate) async fn ensure_managed_heel_binary(
             if let Some(ref checked_at) = state.last_checked_at {
                 if let Ok(ts) = checked_at.parse::<jiff::Timestamp>() {
                     let elapsed = jiff::Timestamp::now().duration_since(ts);
-                    if elapsed < CHECK_INTERVAL.try_into().unwrap_or(jiff::SignedDuration::ZERO)
+                    if elapsed
+                        < CHECK_INTERVAL
+                            .try_into()
+                            .unwrap_or(jiff::SignedDuration::ZERO)
                     {
                         tracing::debug!(
                             binary = %binary_path.display(),

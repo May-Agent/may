@@ -774,8 +774,7 @@ mod tests {
     #[test]
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
         let db = test_db();
-        let mut runtime_context =
-            RuntimeSystemContext::new(db, "remember this".to_string());
+        let mut runtime_context = RuntimeSystemContext::new(db, "remember this".to_string());
         let mut context = aither_agent::Context::default();
         context.insert_system_text(tag::PROFILE_PERSONA, "stale persona");
         context.insert_system_text(tag::WORKSPACE, "stale workspace");
@@ -797,8 +796,7 @@ mod tests {
         let db = test_db();
         tokio_test::block_on(db.set_global_memory("before")).expect("write initial memory");
 
-        let mut runtime_context =
-            RuntimeSystemContext::new(db.clone(), "before".to_string());
+        let mut runtime_context = RuntimeSystemContext::new(db.clone(), "before".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
 
@@ -816,11 +814,8 @@ mod tests {
     #[test]
     fn terminal_runtime_context_is_reconciled_as_system_block() {
         let db = test_db();
-        let mut runtime_context =
-            RuntimeSystemContext::new(db, "remember this".to_string())
-                .with_terminal_runtime(
-                    "Model: demo-model\nHome environment kind: local".to_string(),
-                );
+        let mut runtime_context = RuntimeSystemContext::new(db, "remember this".to_string())
+            .with_terminal_runtime("Model: demo-model\nHome environment kind: local".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
 

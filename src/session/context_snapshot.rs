@@ -52,9 +52,7 @@ pub fn history_delta_since_snapshot(
         return Some(history_messages.to_vec());
     };
     // Find the position of the first message *after* the anchor
-    let start_idx = db_message_ids
-        .iter()
-        .position(|&id| id > anchor_id);
+    let start_idx = db_message_ids.iter().position(|&id| id > anchor_id);
     match start_idx {
         Some(idx) => Some(history_messages[idx..].to_vec()),
         None => {

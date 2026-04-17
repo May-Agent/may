@@ -51,6 +51,8 @@ export interface CommandTimelineDisplayItem {
   isRunning: boolean;
   isFailed: boolean;
   status: TerminalExecution['status'];
+  taskId?: string;
+  errorMessage?: string;
   startedAt?: number;
   endedAt?: number;
 }
@@ -110,15 +112,43 @@ export type TimelineDisplayItem =
 
 // ── Timeline label helpers ─────────────────────────────────
 
+function truncate(value: string, max: number): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= max) return trimmed;
+  return `${trimmed.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function extractHostname(raw: string | undefined): string {
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return '';
+  try {
+    const url = new URL(trimmed);
+    return url.hostname || trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
 export function buildRunningTimelineLabel(item: TimelineDisplayItem): string {
   if (item.type === 'thinking') {
     return 'Thinking';
   }
   if (item.type === 'command') {
-    return item.description.trim();
+    const description = item.description.trim();
+    return description.length > 0
+      ? description
+      : item.commandInput.trim().length > 0
+        ? `$ ${truncate(item.commandInput, 60)}`
+        : 'Running command';
   }
   if (item.type === 'websearch') {
-    return 'Searching the web';
+    const query = item.query.trim();
+    return query.length > 0 ? `Searching "${truncate(query, 40)}"` : 'Searching the web';
+  }
+  if (item.type === 'webfetch') {
+    const host = extractHostname(item.url);
+    return host ? `Fetching ${host}` : 'Fetching page';
   }
   if (item.type === 'browser') {
     return item.runningLabel;
@@ -128,15 +158,38 @@ export function buildRunningTimelineLabel(item: TimelineDisplayItem): string {
 
 export function buildCollapsedTimelineLabel(item: TimelineDisplayItem): string {
   if (item.type === 'thinking') {
-    return 'Thinking';
+    const detail = truncate(item.detail, 60);
+    return detail.length > 0 ? `Thinking · ${detail}` : 'Thinking';
   }
   if (item.type === 'command') {
-    return item.description.trim();
+    const description = item.description.trim();
+    if (description.length > 0) return description;
+    const script = item.commandInput.trim();
+    return script.length > 0 ? `$ ${truncate(script, 60)}` : 'Command';
   }
   if (item.type === 'websearch') {
-    return 'Web search';
+    if (item.status === 'failed') {
+      const query = item.query.trim();
+      return query.length > 0 ? `Search failed: "${truncate(query, 36)}"` : 'Search failed';
+    }
+    const count = item.results.length;
+    if (count > 0) {
+      return `Searched the web · ${count} result${count === 1 ? '' : 's'}`;
+    }
+    const query = item.query.trim();
+    return query.length > 0 ? `Searched "${truncate(query, 40)}"` : 'Web search';
+  }
+  if (item.type === 'webfetch') {
+    const host = extractHostname(item.url);
+    if (item.status === 'failed') {
+      return host ? `Fetch failed: ${host}` : 'Fetch failed';
+    }
+    return host ? `Fetched ${host}` : 'Web fetch';
   }
   if (item.type === 'browser') {
+    if (item.status === 'failed') {
+      return `${item.summary} failed`;
+    }
     return item.summary;
   }
   return 'Web fetch';
@@ -145,6 +198,13 @@ export function buildCollapsedTimelineLabel(item: TimelineDisplayItem): string {
 export function timelineItemStatusLabel(item: TimelineDisplayItem): string | null {
   if (item.type === 'thinking' || item.isRunning) {
     return null;
+  }
+  if (
+    item.type === 'command' &&
+    item.status === 'failed' &&
+    typeof item.parsedOutput.exitCode === 'number'
+  ) {
+    return `exit ${item.parsedOutput.exitCode}`;
   }
   if (item.status === 'failed') {
     return 'failed';
@@ -207,6 +267,8 @@ function buildCommandItem(
     isRunning: command.status === 'running',
     isFailed: command.status === 'failed',
     status: command.status,
+    taskId: parsedOutput.taskId,
+    errorMessage: parsedOutput.errorMessage,
     startedAt: command.startedAt ?? segmentStartedAt ?? fallbackStartedAt,
     endedAt: command.endedAt ?? segmentEndedAt,
   };

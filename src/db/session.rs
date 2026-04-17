@@ -246,6 +246,10 @@ impl ChatDb {
                     input_notice: runtime_row
                         .as_ref()
                         .and_then(|row| row.terminal_input_notice.clone()),
+                    background_reason: runtime_row
+                        .as_ref()
+                        .and_then(|row| row.terminal_background_reason.as_deref())
+                        .and_then(|raw| serde_json::from_str(raw).ok()),
                 },
             },
             pending_immediate,
@@ -395,9 +399,17 @@ impl ChatDb {
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         let mut tx = self.db.begin().await?;
+        let background_reason_json = summary
+            .interactions
+            .terminal
+            .background_reason
+            .as_ref()
+            .map(|reason| {
+                serde_json::to_string(reason).expect("BackgroundReason must serialize to JSON")
+            });
         query!(
             tx,
-            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, browser_takeover_active = excluded.browser_takeover_active, browser_takeover_alert_pending = excluded.browser_takeover_alert_pending, terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, updated_at = excluded.updated_at",
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, terminal_background_reason, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, browser_takeover_active = excluded.browser_takeover_active, browser_takeover_alert_pending = excluded.browser_takeover_alert_pending, terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, terminal_background_reason = excluded.terminal_background_reason, updated_at = excluded.updated_at",
             session_id,
             summary.state.as_str(),
             summary.interactions.browser.takeover_active,
@@ -406,6 +418,7 @@ impl ChatDb {
             summary.interactions.terminal.output_file.as_deref(),
             summary.interactions.terminal.output_preview.as_deref(),
             summary.interactions.terminal.input_notice.as_deref(),
+            background_reason_json.as_deref(),
             now.as_str()
         )
         .execute()
@@ -626,10 +639,7 @@ impl ChatDb {
     }
 
     /// Atomically transition Running → Idle only if currently Running.
-    pub async fn clear_running_if_idle(
-        &self,
-        session_id: &str,
-    ) -> Result<bool, ChatDbError> {
+    pub async fn clear_running_if_idle(&self, session_id: &str) -> Result<bool, ChatDbError> {
         let result = query!(
             self.db,
             "UPDATE session_runtimes SET state = 'idle', updated_at = ? WHERE session_id = ? AND state = 'running'",
@@ -648,14 +658,18 @@ impl ChatDb {
         terminal: &TerminalRuntimeState,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
+        let background_reason_json = terminal.background_reason.as_ref().map(|reason| {
+            serde_json::to_string(reason).expect("BackgroundReason must serialize to JSON")
+        });
         query!(
             self.db,
-            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, updated_at) VALUES (?, 'idle', 0, 0, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, updated_at = excluded.updated_at",
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, terminal_background_reason, updated_at) VALUES (?, 'idle', 0, 0, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, terminal_background_reason = excluded.terminal_background_reason, updated_at = excluded.updated_at",
             session_id,
             terminal.task_id.as_deref(),
             terminal.output_file.as_deref(),
             terminal.output_preview.as_deref(),
             terminal.input_notice.as_deref(),
+            background_reason_json.as_deref(),
             now.as_str()
         )
         .execute()

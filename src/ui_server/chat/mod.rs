@@ -54,8 +54,8 @@ use super::title_generation;
 use super::types::{
     ApiErrorCode, ApiMessage, ChatRequest, ChatResponse, PendingMessageKind,
     RemovePendingMessageRequest, RequestLogEntry, RequestStats, SessionRuntimeResponse,
-    SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent, SseToolEndEvent,
-    SseToolDeltaEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
+    SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent,
+    SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
 };
 
 fn stopped_terminal_tool_result() -> ToolResult {
@@ -65,6 +65,7 @@ fn stopped_terminal_tool_result() -> ToolResult {
         exit_code: 130,
         task_id: None,
         status: Some("stopped".to_string()),
+        background_reason: None,
     })
     .expect("stopped terminal tool result must serialize")
 }
@@ -78,12 +79,7 @@ trait ChatSink {
     async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool;
     async fn on_text(&mut self, chunk: &str) -> bool;
     async fn on_reasoning(&mut self, chunk: &str) -> bool;
-    async fn on_tool_delta(
-        &mut self,
-        id: &str,
-        name: &str,
-        arguments_fragment: &str,
-    ) -> bool;
+    async fn on_tool_delta(&mut self, id: &str, name: &str, arguments_fragment: &str) -> bool;
     async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool;
     async fn on_tool_end(
         &mut self,
@@ -119,12 +115,7 @@ impl ChatSink for SseSink {
         send_event(&self.0, "reasoning", &SseChunkEvent { chunk }).await
     }
 
-    async fn on_tool_delta(
-        &mut self,
-        id: &str,
-        name: &str,
-        arguments_fragment: &str,
-    ) -> bool {
+    async fn on_tool_delta(&mut self, id: &str, name: &str, arguments_fragment: &str) -> bool {
         send_event(
             &self.0,
             "tool_delta",
@@ -1029,7 +1020,8 @@ async fn run_agent_loop(
 
                         // Check if tasks.md changed after tool execution.
                         if let Some(event) =
-                            check_tasks_update(&tasks_db, &tasks_session_id, &mut last_todo_hash).await
+                            check_tasks_update(&tasks_db, &tasks_session_id, &mut last_todo_hash)
+                                .await
                             && !sink.on_todo_update(&event).await
                         {
                             cancellation_reason = Some("client disconnected during todo update");
@@ -1040,6 +1032,7 @@ async fn run_agent_loop(
                         task_id,
                         output_preview,
                         output_file,
+                        reason,
                     }) => {
                         saw_tool_activity = true;
                         set_terminal_runtime_state(
@@ -1050,6 +1043,7 @@ async fn run_agent_loop(
                                 output_file: Some(output_file),
                                 output_preview: Some(output_preview),
                                 input_notice: None,
+                                background_reason: Some(reason),
                             },
                         )
                         .await?;
@@ -1116,8 +1110,7 @@ async fn run_agent_loop(
             }
 
             let has_assistant_text = !full_text.trim().is_empty();
-            let has_tool_activity =
-                !terminal_snapshot.executions.is_empty() || saw_tool_activity;
+            let has_tool_activity = !terminal_snapshot.executions.is_empty() || saw_tool_activity;
             if !has_assistant_text && has_tool_activity {
                 turn_persister.push_assistant(String::new());
             }
@@ -1670,7 +1663,6 @@ impl UiChatPreparationError {
             | Self::ReconcileContainerLayout(_)
             | Self::BuildAgent(_)
             | Self::RestoreCheckpoint(_)
-
             | Self::BuildPrompt(_)
             | Self::PersistContextDebugSnapshot(_)
             | Self::HistoryReplay(_) => ApiErrorCode::InternalError,
@@ -1710,7 +1702,6 @@ impl UiChatPreparationError {
             | Self::ReconcileContainerLayout(_)
             | Self::BuildAgent(_)
             | Self::RestoreCheckpoint(_)
-
             | Self::BuildPrompt(_)
             | Self::PersistContextDebugSnapshot(_)
             | Self::HistoryReplay(_) => skyzen::StatusCode::INTERNAL_SERVER_ERROR,
@@ -2416,9 +2407,8 @@ mod tests {
         ];
         let db_ids = vec![10, 20, 30];
 
-        let delta =
-            crate::session::history_delta_since_snapshot(&history, &db_ids, Some(20))
-                .expect("anchor should be valid");
+        let delta = crate::session::history_delta_since_snapshot(&history, &db_ids, Some(20))
+            .expect("anchor should be valid");
         assert_eq!(delta, vec![LlmMessage::assistant("second")]);
     }
 
@@ -2427,8 +2417,7 @@ mod tests {
         let history = vec![LlmMessage::user("only")];
         let db_ids = vec![10];
         // Anchor 999 does not exist among message IDs
-        let result =
-            crate::session::history_delta_since_snapshot(&history, &db_ids, Some(999));
+        let result = crate::session::history_delta_since_snapshot(&history, &db_ids, Some(999));
         assert!(result.is_none(), "stale anchor should return None");
     }
 
@@ -2436,9 +2425,8 @@ mod tests {
     fn history_delta_since_snapshot_empty_anchor_replays_all() {
         let history = vec![LlmMessage::user("a"), LlmMessage::assistant("b")];
         let db_ids = vec![1, 2];
-        let delta =
-            crate::session::history_delta_since_snapshot(&history, &db_ids, None)
-                .expect("None anchor replays all");
+        let delta = crate::session::history_delta_since_snapshot(&history, &db_ids, None)
+            .expect("None anchor replays all");
         assert_eq!(delta.len(), 2);
     }
 

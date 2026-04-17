@@ -272,8 +272,12 @@ export function ChatInterface({
         outputFile: runtimeSession.interactions.terminal.outputFile ?? null,
         outputPreview: runtimeSession.interactions.terminal.outputPreview ?? null,
         inputNotice: runtimeSession.interactions.terminal.inputNotice ?? null,
+        backgroundReason:
+          runtimeSession.interactions.terminal.backgroundReason ?? null,
       }
     : null;
+  const recentlyBackgroundedTaskIds =
+    runtimeSession?.recentlyBackgroundedTaskIds ?? null;
   const browserOwnedByCurrentSession =
     !!currentSessionId &&
     browserStatus?.ownerSessionId === currentSessionId;
@@ -596,6 +600,8 @@ export function ChatInterface({
             onScroll={handleScroll}
             onOpenPreview={handleOpenPreview}
             onRetry={(request) => void handleSend(request)}
+            activeBackgroundTaskId={backgroundTerminalTask?.taskId ?? null}
+            recentlyBackgroundedTaskIds={recentlyBackgroundedTaskIds}
           />
         )}
 

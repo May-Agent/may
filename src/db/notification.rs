@@ -92,10 +92,7 @@ impl ChatDb {
 
     /// Atomically claim a pending notification for delivery (CAS: pending → delivering).
     /// Returns true if the claim succeeded, false if another process already claimed it.
-    pub async fn claim_pending_notification(
-        &self,
-        id: &str,
-    ) -> Result<bool, ChatDbError> {
+    pub async fn claim_pending_notification(&self, id: &str) -> Result<bool, ChatDbError> {
         let result = self
             .db
             .query(
