@@ -296,7 +296,7 @@ fn api_routes() -> Route {
         browser_offer, browser_start, browser_status, browser_stop, browser_takeover_start,
         browser_takeover_stop,
     };
-    use chat::{chat, chat_stream, enqueue_chat, remove_pending_message, stop_session_run};
+    use chat::{chat_stream, enqueue_chat, remove_pending_message, stop_session_run};
     use config::{
         add_mcp_server, add_ssh_server, copilot_logout, copilot_start, copilot_status,
         copilot_stream, delete_skill, get_memory, get_ui_config, install_skill, list_mcp_servers,
@@ -387,7 +387,6 @@ fn api_routes() -> Route {
                 "/{id}".delete(delete_folder),
             ))),
             "/chat".route(Route::new((
-                "".post(chat),
                 "/stream".post(chat_stream),
                 "/enqueue".post(enqueue_chat),
             ))),
