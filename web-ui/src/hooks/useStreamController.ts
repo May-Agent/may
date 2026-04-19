@@ -550,15 +550,21 @@ export function useStreamController(
             }
             applyAssistantFinalize(update, undefined);
           },
-          onStreamError: (message) => {
+          onStreamError: (event) => {
             applyStreamErrorToAssistant(
               sessionId,
               assistantId,
               streamState.timelineSegments,
-              message,
+              event.message,
               input.replaceSessionMessages,
             );
-            input.setUiError(`LLM endpoint error: ${message}`);
+            // Prefix with the structured code so retryable vs. terminal
+            // failures are distinguishable in the surfaced banner. The
+            // banner copy stays human-readable; the code is appended in
+            // brackets for triage.
+            const codeTag = event.code !== 'INTERNAL_ERROR' ? ` [${event.code}]` : '';
+            const retryHint = event.retryable ? ' (retryable)' : '';
+            input.setUiError(`LLM endpoint error${codeTag}${retryHint}: ${event.message}`);
           },
         });
 
@@ -576,6 +582,17 @@ export function useStreamController(
           onDone: streamHandlers.onDone,
           onPaused: streamHandlers.onPaused,
           onError: streamHandlers.onError,
+          onStreamGap: (info) => {
+            // Seq gaps point at proxy reordering or a mid-stream server
+            // restart. We log but don't tear down: the server is the
+            // source of truth, and duplicate events are idempotent in
+            // our reducers (tool_end with unknown id, todo_update with
+            // unchanged hash, etc.).
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[chat-stream] seq ${info.event}: expected >${info.lastSeq}, got ${info.nextSeq}`,
+            );
+          },
         });
       } catch (error) {
         if (wasStoppedByUser()) {
