@@ -1,8 +1,7 @@
 import type { RefObject } from 'react';
-import { FileText, PanelLeft, Pencil, Share2 } from 'lucide-react';
+import { PanelLeft, Pencil, Share2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import type { SessionPlanState } from '@/types';
 
 interface ChatHeaderProps {
   isSidebarOpen: boolean;
@@ -17,20 +16,6 @@ interface ChatHeaderProps {
   onBeginEdit: () => void;
   onTitleSubmit: () => void;
   onTitleCancel: () => void;
-  planState: SessionPlanState;
-  onPlanStateToggle: () => void;
-}
-
-function planButtonLabel(state: SessionPlanState): string {
-  if (state === 'disabled') return 'Plan';
-  if (state === 'draft') return 'Approve';
-  return 'Reopen';
-}
-
-function planButtonTitle(state: SessionPlanState): string {
-  if (state === 'disabled') return 'Enter plan mode';
-  if (state === 'draft') return 'Approve plan';
-  return 'Reopen planning';
 }
 
 export function ChatHeader({
@@ -46,8 +31,6 @@ export function ChatHeader({
   onBeginEdit,
   onTitleSubmit,
   onTitleCancel,
-  planState,
-  onPlanStateToggle,
 }: ChatHeaderProps) {
   return (
     <div className="flex items-center justify-between p-4 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 z-10">
@@ -93,18 +76,6 @@ export function ChatHeader({
           ))}
       </div>
       <div className="flex-1 flex justify-end gap-1">
-        {!shouldShowWelcome && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
-            onClick={onPlanStateToggle}
-            title={planButtonTitle(planState)}
-          >
-            <FileText className="mr-1.5 h-4 w-4" />
-            {planButtonLabel(planState)}
-          </Button>
-        )}
         {!shouldShowWelcome && (
           <Button
             variant="ghost"

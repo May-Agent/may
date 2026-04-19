@@ -1,5 +1,11 @@
 import type { RefObject, UIEventHandler } from 'react';
-import type { ArtifactPreviewTarget, Attachment, Message } from '@/types';
+import type {
+  ArtifactPreviewTarget,
+  Attachment,
+  BackgroundReason,
+  Message,
+  SessionPlanState,
+} from '@/types';
 import { MessageItem } from './MessageItem';
 import { collectRetryBatch } from './chatUtils';
 
@@ -23,6 +29,13 @@ interface ChatMessageListProps {
   activeBackgroundTaskId?: string | null;
   /** Task IDs whose runtime state has cleared but whose tool_end hasn't landed yet. */
   recentlyBackgroundedTaskIds?: ReadonlySet<string> | null;
+  /** Why the currently-active background task was promoted (if known). */
+  activeBackgroundReason?: BackgroundReason | null;
+  sessionPlanState?: SessionPlanState;
+  onApprovePlan?: () => void;
+  onReopenPlan?: () => void;
+  isPlanStateUpdating?: boolean;
+  onFocusComposer?: () => void;
 }
 
 export function ChatMessageList({
@@ -35,6 +48,12 @@ export function ChatMessageList({
   onRetry,
   activeBackgroundTaskId,
   recentlyBackgroundedTaskIds,
+  activeBackgroundReason,
+  sessionPlanState,
+  onApprovePlan,
+  onReopenPlan,
+  isPlanStateUpdating,
+  onFocusComposer,
 }: ChatMessageListProps) {
   return (
     <div
@@ -60,6 +79,12 @@ export function ChatMessageList({
               onOpenPreview={onOpenPreview}
               activeBackgroundTaskId={activeBackgroundTaskId ?? null}
               recentlyBackgroundedTaskIds={recentlyBackgroundedTaskIds ?? null}
+              activeBackgroundReason={activeBackgroundReason ?? null}
+              sessionPlanState={sessionPlanState}
+              onApprovePlan={onApprovePlan}
+              onReopenPlan={onReopenPlan}
+              isPlanStateUpdating={isPlanStateUpdating}
+              onFocusComposer={onFocusComposer}
               onRetry={() => {
                 const batch = retryFromUser
                   ? [

@@ -1,6 +1,7 @@
 import type { ChangeEvent, ClipboardEvent, RefObject } from 'react';
 import { ActivityRail } from './ActivityRail';
 import { Composer } from './Composer';
+import { PlanModeBanner } from './PlanModeBanner';
 import {
   AskUserPrompt,
   PermissionPrompt,
@@ -12,7 +13,12 @@ import type {
   PermissionRequest,
   WorkspaceRequest,
 } from '@/lib/api';
-import type { Attachment, PendingUserMessage, TerminalExecution } from '@/types';
+import type {
+  Attachment,
+  PendingUserMessage,
+  SessionPlanState,
+  TerminalExecution,
+} from '@/types';
 
 export interface ComposerAreaProps {
   // Approval prompts
@@ -74,9 +80,16 @@ export interface ComposerAreaProps {
   contextWindow?: number;
   contextUsagePercent: number | null;
   contextUsageTitle: string;
+  onOpenContextPanel: () => void;
   showStopButton: boolean;
   showSendButton: boolean;
   onStop: () => void;
+
+  planState: SessionPlanState;
+  isPlanStateUpdating: boolean;
+  onApprovePlan: () => void;
+  onReopenPlan: () => void;
+  onExitPlan: () => void;
 }
 
 /**
@@ -117,6 +130,13 @@ export function ComposerArea(props: ComposerAreaProps) {
             {props.uiError}
           </div>
         )}
+        <PlanModeBanner
+          planState={props.planState}
+          isUpdating={props.isPlanStateUpdating}
+          onApprove={props.onApprovePlan}
+          onReopen={props.onReopenPlan}
+          onExit={props.onExitPlan}
+        />
         {/* Unified card: shelf (queued/running activity) + composer */}
         {(props.queuedMessages.length > 0 ||
           props.runningCommands.length > 0 ||
@@ -160,6 +180,7 @@ export function ComposerArea(props: ComposerAreaProps) {
           contextWindow={props.contextWindow}
           contextUsagePercent={props.contextUsagePercent}
           contextUsageTitle={props.contextUsageTitle}
+          onOpenContextPanel={props.onOpenContextPanel}
           showStopButton={props.showStopButton}
           showSendButton={props.showSendButton}
           onStop={props.onStop}

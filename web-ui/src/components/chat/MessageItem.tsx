@@ -10,6 +10,7 @@ import {
   buildTimelineDisplayItems,
 } from '@/lib/timeline';
 import { RotateCcw, Download, Loader2 } from 'lucide-react';
+import type { BackgroundReason } from '@/types';
 import { Button } from '@/components/ui/button';
 import { AttachmentPreview } from './AttachmentPreview';
 import { CopyButton } from './shared/CopyButton';
@@ -21,8 +22,29 @@ import { WebSearchTimeline } from './timeline/WebSearchTimeline';
 import { WebFetchTimeline } from './timeline/WebFetchTimeline';
 import { BrowserTimeline } from './timeline/BrowserTimeline';
 import { TasksPanel } from './TasksPanel';
+import { MayPlanCard } from './MayPlanCard';
+import { extractMayPlanBlocks } from '@/lib/parsers/mayPlanBlocks';
+import type { SessionPlanState } from '@/types';
 
 const TASKS_TAG_PATTERN = /<tasks\s*\/>/i;
+
+/** Map a structured BackgroundReason to a short human-facing explanation.
+ * Null when we have no reason info (older sessions / legacy state). */
+function describeBackgroundReason(
+  reason: BackgroundReason | null | undefined,
+): string | null {
+  if (!reason) return null;
+  switch (reason.kind) {
+    case 'timeout':
+      return `Running in background (timeout ${reason.configured_seconds}s)`;
+    case 'stdin_blocked':
+      return 'Running in background — waiting for input';
+    case 'explicit':
+      return 'Running in background (explicit)';
+    default:
+      return null;
+  }
+}
 const LazyFlowMarkdown = lazy(() =>
   import('./StreamingText').then((module) => ({ default: module.FlowMarkdown })),
 );
@@ -39,6 +61,12 @@ export function MessageItem({
   onOpenPreview,
   activeBackgroundTaskId,
   recentlyBackgroundedTaskIds,
+  activeBackgroundReason,
+  sessionPlanState,
+  onApprovePlan,
+  onReopenPlan,
+  isPlanStateUpdating,
+  onFocusComposer,
 }: {
   message: Message;
   sessionId?: string;
@@ -47,6 +75,12 @@ export function MessageItem({
   onOpenPreview?: (target: ArtifactPreviewTarget) => void;
   activeBackgroundTaskId?: string | null;
   recentlyBackgroundedTaskIds?: ReadonlySet<string> | null;
+  activeBackgroundReason?: BackgroundReason | null;
+  sessionPlanState?: SessionPlanState;
+  onApprovePlan?: () => void;
+  onReopenPlan?: () => void;
+  isPlanStateUpdating?: boolean;
+  onFocusComposer?: () => void;
 }) {
   const isUser = message.role === 'user';
   const isStreaming = !!message.isStreaming;
@@ -102,6 +136,12 @@ export function MessageItem({
     return normalized.length >= 256;
   }, [displayContent, hasImageLikeTerminalOutput, isUser, timelineItems.length]);
   const safeDisplayContent = suppressBinaryContent ? '' : displayContent;
+  const renderSegments = useMemo(() => {
+    if (isUser) return [];
+    if (!safeDisplayContent) return [];
+    return extractMayPlanBlocks(safeDisplayContent);
+  }, [isUser, safeDisplayContent]);
+  const resolvedPlanState: SessionPlanState = sessionPlanState ?? 'disabled';
 
   useEffect(() => {
     setExpandedTimelineItemIds({});
@@ -125,6 +165,13 @@ export function MessageItem({
 
   useEffect(() => {
     const visibleTimelineItemIds = new Set(timelineItems.map((item) => item.id));
+    // Only one item may auto-expand: the *last* currently-running one.
+    // All completed items stay collapsed by default (Cursor-like restraint).
+    // Users can manually override via click, which persists in the override map.
+    let lastRunningId: string | null = null;
+    for (const item of timelineItems) {
+      if (item.isRunning) lastRunningId = item.id;
+    }
     setExpandedTimelineItemIds((previous) => {
       const nextEntries = Object.entries(previous).filter(([itemId]) =>
         visibleTimelineItemIds.has(itemId),
@@ -134,7 +181,7 @@ export function MessageItem({
         if (timelineExpansionOverridesRef.current[item.id] !== undefined) {
           continue;
         }
-        next[item.id] = item.isRunning;
+        next[item.id] = item.id === lastRunningId;
       }
       const previousKeys = Object.keys(previous);
       const nextKeys = Object.keys(next);
@@ -195,14 +242,14 @@ export function MessageItem({
                       recentlyBackgroundedTaskIds.has(item.taskId))
                   );
                 if (isBackgroundedPlaceholder && item.type === 'command') {
+                  const reasonText = describeBackgroundReason(activeBackgroundReason);
                   return (
-                    <div
-                      key={item.id}
-                      className="rounded-md px-1 py-0.5 border-l-2 border-l-foreground/50"
-                    >
-                      <div className="flex items-center gap-2 text-[13px] italic text-muted-foreground">
-                        <Loader2 className="h-3 w-3 animate-spin" />
-                        <span className="shrink-0">Running in background</span>
+                    <div key={item.id} className="px-1 py-0.5">
+                      <div className="flex items-center gap-2 text-[13px] text-muted-foreground">
+                        <Loader2 className="h-3 w-3 animate-spin opacity-70" />
+                        <span className="shrink-0 italic">
+                          {reasonText ?? 'Running in background'}
+                        </span>
                         {item.description.trim().length > 0 && (
                           <span className="min-w-0 flex-1 truncate opacity-70">
                             · {item.description}
@@ -257,15 +304,35 @@ export function MessageItem({
             </div>
           )}
 
-          {safeDisplayContent && (
-            isUser ? (
-              <MemoMarkdown content={safeDisplayContent} components={components} />
-            ) : (
-              <Suspense fallback={<MemoMarkdown content={safeDisplayContent} components={components} />}>
-                <LazyFlowMarkdown content={safeDisplayContent} isStreaming={isStreaming} />
-              </Suspense>
-            )
+          {safeDisplayContent && isUser && (
+            <MemoMarkdown content={safeDisplayContent} components={components} />
           )}
+
+          {safeDisplayContent && !isUser && renderSegments.map((segment, index) => {
+            if (segment.kind === 'plan') {
+              return (
+                <MayPlanCard
+                  key={`plan-${index}-${segment.start}`}
+                  content={segment.content}
+                  status={segment.status}
+                  open={segment.open}
+                  sessionPlanState={resolvedPlanState}
+                  onApprove={onApprovePlan}
+                  onReopen={onReopenPlan}
+                  isUpdatingPlanState={isPlanStateUpdating}
+                  onFocusComposer={onFocusComposer}
+                />
+              );
+            }
+            return (
+              <Suspense
+                key={`text-${index}-${segment.start}`}
+                fallback={<MemoMarkdown content={segment.content} components={components} />}
+              >
+                <LazyFlowMarkdown content={segment.content} isStreaming={isStreaming} />
+              </Suspense>
+            );
+          })}
 
           {!isUser && showsTasksTag && sessionId && (
             <TasksPanel sessionId={sessionId} markdownComponents={components} />

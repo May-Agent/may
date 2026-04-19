@@ -2,13 +2,15 @@ import { AnimatePresence, motion } from 'framer-motion';
 import type { Artifact, ArtifactPreviewTarget } from '@/types';
 import { ArtifactsSidebar } from './ArtifactsSidebar';
 import { BrowserView } from './BrowserView';
+import { ContextInspectorPanel } from './ContextInspectorPanel';
 import type { PreviewPaneState } from './chatUtils';
 
 const BROWSER_PANEL_WIDTH_PX = 720;
+const CONTEXT_PANEL_WIDTH_PX = 480;
 const PANEL_ANIMATION_EASE = [0.22, 1, 0.36, 1] as const;
 const PANEL_ANIMATION_DURATION = 0.24;
 
-export type RightPanelKind = 'artifacts' | 'browser' | null;
+export type RightPanelKind = 'artifacts' | 'browser' | 'context' | null;
 
 interface RightPanelProps {
   active: RightPanelKind;
@@ -35,6 +37,13 @@ interface RightPanelProps {
   // Browser panel props
   currentSessionId: string | null;
   onCloseBrowser: () => void;
+
+  // Context panel props
+  contextPromptTokens?: number;
+  contextUsedTokens?: number;
+  contextWindow?: number;
+  contextUsagePercent: number | null;
+  onCloseContext: () => void;
 }
 
 /**
@@ -58,6 +67,11 @@ export function RightPanel({
   onArtifactResizerPointerDown,
   currentSessionId,
   onCloseBrowser,
+  contextPromptTokens,
+  contextUsedTokens,
+  contextWindow,
+  contextUsagePercent,
+  onCloseContext,
 }: RightPanelProps) {
   return (
     <AnimatePresence initial={false} mode="wait">
@@ -122,6 +136,29 @@ export function RightPanel({
             open
             onClose={onCloseBrowser}
             sessionId={currentSessionId}
+          />
+        </motion.aside>
+      )}
+
+      {active === 'context' && (
+        <motion.aside
+          key="context-panel"
+          initial={{ width: 0, opacity: 0 }}
+          animate={{ width: CONTEXT_PANEL_WIDTH_PX, opacity: 1 }}
+          exit={{ width: 0, opacity: 0 }}
+          transition={{
+            duration: PANEL_ANIMATION_DURATION,
+            ease: PANEL_ANIMATION_EASE,
+          }}
+          className="h-full flex-shrink-0 overflow-hidden"
+        >
+          <ContextInspectorPanel
+            currentSessionId={currentSessionId}
+            promptTokens={contextPromptTokens}
+            contextUsedTokens={contextUsedTokens}
+            contextWindow={contextWindow}
+            contextUsagePercent={contextUsagePercent}
+            onClose={onCloseContext}
           />
         </motion.aside>
       )}
