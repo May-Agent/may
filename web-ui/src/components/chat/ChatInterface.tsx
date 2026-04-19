@@ -88,6 +88,8 @@ export function ChatInterface({
     null,
   );
   const [isBrowserOpen, setIsBrowserOpen] = useState(false);
+  const [isContextPanelOpen, setIsContextPanelOpen] = useState(false);
+  const [isPlanStateUpdating, setIsPlanStateUpdating] = useState(false);
   const [todoProgress, setTodoProgress] = useState<TodoProgressState | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -154,6 +156,7 @@ export function ChatInterface({
       if (!currentSessionId) {
         return;
       }
+      setIsPlanStateUpdating(true);
       try {
         // Atomic plan-state change — no fetch-then-save race.
         const result = await apiSetSessionPlanState(
@@ -163,10 +166,15 @@ export function ChatInterface({
         setSessionPlanState(currentSessionId, result.planState);
       } catch (error) {
         setUiError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setIsPlanStateUpdating(false);
       }
     },
     [currentSessionId, setSessionPlanState],
   );
+  const handleFocusComposer = useCallback(() => {
+    composerInputRef.current?.focus();
+  }, []);
   const shouldShowWelcome = isNewChat || messages.length === 0;
   const chatSurfaceState =
     workspaceSurface.state === "ready"
@@ -289,10 +297,16 @@ export function ChatInterface({
     !!currentSessionId &&
     (browserOwnedByCurrentSession || browserTakeoverOwnedByCurrentSession);
   // Backend runtime state is the source of truth for whether the run is interruptible.
-  // Local flags only add transient UI states (sending in flight before runtime snapshot arrives).
+  // Mirrors the backend `SessionRuntimeSummary::is_active()` — a session is active
+  // when the agent is running, there are queued/pending messages, or the browser
+  // takeover is held. Without this, the UI shows a send button while the backend
+  // 409s the request, leaving the user with no way to stop.
   const runtimeInterruptible =
     runtimeSession != null &&
-    runtimeSession.state !== 'idle';
+    (runtimeSession.state !== 'idle' ||
+      runtimeSession.interactions?.browser?.takeoverActive === true ||
+      runtimeSession.pendingImmediate != null ||
+      (runtimeSession.queuedMessages?.length ?? 0) > 0);
   const showStopButton =
     runtimeInterruptible ||
     isGenerating ||
@@ -517,11 +531,16 @@ export function ChatInterface({
       : false) ?? false;
 
   const canShowArtifactsPanel = artifacts.length > 0 || !!selectedPreviewPath;
+  // Priority: explicit browser open / auto-open (agent-driven), then
+  // context panel (user-driven focus), then artifacts. Mutually exclusive
+  // so the right side never splits.
   const activeRightPanel = isBrowserOpen || shouldAutoOpenBrowserPanel
     ? "browser"
-    : isArtifactsOpen && canShowArtifactsPanel
-      ? "artifacts"
-      : null;
+    : isContextPanelOpen
+      ? "context"
+      : isArtifactsOpen && canShowArtifactsPanel
+        ? "artifacts"
+        : null;
 
   const {
     width: artifactPanelWidth,
@@ -559,16 +578,6 @@ export function ChatInterface({
             }
             setIsEditingTitle(false);
           }}
-          planState={currentPlanState}
-          onPlanStateToggle={() => {
-            const nextPlanState =
-              currentPlanState === "disabled"
-                ? "draft"
-                : currentPlanState === "draft"
-                  ? "approved"
-                  : "draft";
-            void handlePlanStateChange(nextPlanState);
-          }}
         />
 
         {chatSurfaceState === "container-preparing" ? (
@@ -602,6 +611,12 @@ export function ChatInterface({
             onRetry={(request) => void handleSend(request)}
             activeBackgroundTaskId={backgroundTerminalTask?.taskId ?? null}
             recentlyBackgroundedTaskIds={recentlyBackgroundedTaskIds}
+            activeBackgroundReason={backgroundTerminalTask?.backgroundReason ?? null}
+            sessionPlanState={currentPlanState}
+            onApprovePlan={() => void handlePlanStateChange("approved")}
+            onReopenPlan={() => void handlePlanStateChange("draft")}
+            isPlanStateUpdating={isPlanStateUpdating}
+            onFocusComposer={handleFocusComposer}
           />
         )}
 
@@ -668,9 +683,15 @@ export function ChatInterface({
             contextWindow={contextWindow}
             contextUsagePercent={contextUsagePercent}
             contextUsageTitle={contextUsageTitle}
+            onOpenContextPanel={() => setIsContextPanelOpen(true)}
             showStopButton={showStopButton}
             showSendButton={showComposerSendButton}
             onStop={handleStop}
+            planState={currentPlanState}
+            isPlanStateUpdating={isPlanStateUpdating}
+            onApprovePlan={() => void handlePlanStateChange("approved")}
+            onReopenPlan={() => void handlePlanStateChange("draft")}
+            onExitPlan={() => void handlePlanStateChange("disabled")}
           />
         )}
       </div>
@@ -689,6 +710,11 @@ export function ChatInterface({
         onArtifactResizerPointerDown={handleArtifactResizerPointerDown}
         currentSessionId={currentSessionId}
         onCloseBrowser={() => setIsBrowserOpen(false)}
+        contextPromptTokens={latestStats?.promptTokens}
+        contextUsedTokens={contextUsedTokens}
+        contextWindow={contextWindow}
+        contextUsagePercent={contextUsagePercent}
+        onCloseContext={() => setIsContextPanelOpen(false)}
       />
     </div>
   );

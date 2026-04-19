@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { cn } from '@/lib/utils';
 import {
   startBrowser,
   browserOffer,
@@ -8,10 +9,10 @@ import {
   browserTakeoverStop,
 } from '@/lib/api';
 import { useStore } from '@/lib/store';
-import { Globe, Loader2, ArrowRight, X } from 'lucide-react';
+import { Globe, Loader2, ArrowRight, X, MousePointerClick } from 'lucide-react';
 
-/** Minimum interval between mouse-move dispatches (ms). */
-const MOUSE_MOVE_THROTTLE_MS = 50;
+/** Minimum interval between mouse-move dispatches (ms). 60 Hz matches typical displays. */
+const MOUSE_MOVE_THROTTLE_MS = 16;
 
 interface BrowserViewProps {
   open: boolean;
@@ -30,6 +31,10 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
   const [urlInput, setUrlInput] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  // takeoverActive mirrors takeoverSessionRef for re-renders. Flipped to true
+  // when the user clicks the "Click to take control" overlay, flipped back
+  // to false on release (tab hidden, panel close, Esc, component unmount).
+  const [takeoverActive, setTakeoverActive] = useState(false);
   const browserStatus = useStore((state) => state.browserStatus);
   const browserEnabled = browserStatus?.enabled ?? false;
   const running = browserStatus?.running ?? false;
@@ -78,6 +83,7 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
 
   const releaseTakeover = useCallback(async () => {
     const activeSessionId = takeoverSessionRef.current;
+    setTakeoverActive(false);
     if (!activeSessionId) {
       return;
     }
@@ -98,36 +104,69 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
     [releaseTakeover],
   );
 
-  const ensureTakeover = useCallback(async () => {
+  // Auto-release takeover when the tab becomes hidden so a backgrounded tab
+  // doesn't silently hold the browser away from the agent.
+  useEffect(() => {
+    if (!takeoverActive) return;
+    const onVisibility = () => {
+      if (document.hidden) {
+        void releaseTakeover();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [takeoverActive, releaseTakeover]);
+
+  // Esc releases takeover too — user shouldn't have to hunt for an exit.
+  useEffect(() => {
+    if (!takeoverActive) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        void releaseTakeover();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [takeoverActive, releaseTakeover]);
+
+  const acquireTakeover = useCallback(async () => {
     if (!sessionId) {
-      throw new Error('Browser takeover requires an active session');
+      setError('Browser takeover requires an active session');
+      return;
     }
     if (takeoverSessionRef.current === sessionId) {
+      setTakeoverActive(true);
       return;
     }
 
-    const previousSessionId = takeoverSessionRef.current;
-    if (previousSessionId) {
-      await browserTakeoverStop(previousSessionId);
+    try {
+      const previousSessionId = takeoverSessionRef.current;
+      if (previousSessionId) {
+        await browserTakeoverStop(previousSessionId);
+      }
+      await browserTakeoverStart(sessionId);
+      takeoverSessionRef.current = sessionId;
+      setTakeoverActive(true);
+      setError(null);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
     }
-    await browserTakeoverStart(sessionId);
-    takeoverSessionRef.current = sessionId;
   }, [sessionId]);
 
-  // Send a message over the DataChannel. First user input triggers takeover.
-  const sendInput = useCallback(async (msg: InputMessage) => {
+  // Send a message over the DataChannel. Gated on explicit takeover — without
+  // it, hovering or typing over the video is a no-op.
+  const sendInput = useCallback((msg: InputMessage) => {
+    if (!takeoverActive) return;
     const dc = dataChannelRef.current;
     if (!dc || dc.readyState !== 'open') {
       return;
     }
     try {
-      await ensureTakeover();
       dc.send(JSON.stringify(msg));
-      setError(null);
     } catch (error) {
       setError(error instanceof Error ? error.message : String(error));
     }
-  }, [ensureTakeover]);
+  }, [takeoverActive]);
 
   // Establish WebRTC connection when running and sheet is open
   const connectWebRTC = useCallback(async function connectWebRTCImpl() {
@@ -237,13 +276,18 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
     };
   }, [open, running, connectWebRTC]);
 
-  const handleNavigate = () => {
+  const handleNavigate = async () => {
     if (!urlInput.trim()) return;
     let url = urlInput.trim();
     if (!/^https?:\/\//i.test(url)) {
       url = `https://${url}`;
     }
-    void sendInput({ type: 'navigate', url });
+    // Typing a URL is explicit intent to direct the browser — acquire takeover
+    // if not already active, then dispatch.
+    if (!takeoverActive) {
+      await acquireTakeover();
+    }
+    sendInput({ type: 'navigate', url });
   };
 
   // ── Input forwarding via DataChannel ──────────────────────
@@ -367,9 +411,25 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
             <span>
-              {!browserEnabled ? 'Disabled' : running ? 'Managed by May' : 'Stopped'}
+              {!browserEnabled
+                ? 'Disabled'
+                : !running
+                  ? 'Stopped'
+                  : takeoverActive
+                    ? 'You are in control'
+                    : 'Managed by May'}
             </span>
           </div>
+          {takeoverActive && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 border-amber-500/50 text-amber-600 hover:bg-amber-500/10"
+              onClick={() => void releaseTakeover()}
+            >
+              Return control
+            </Button>
+          )}
           <Button variant="ghost" size="icon" className="h-8 w-8" onClick={onClose}>
             <X className="h-4 w-4" />
           </Button>
@@ -426,21 +486,46 @@ export function BrowserView({ open, onClose, sessionId }: BrowserViewProps) {
             )}
           </div>
         ) : (
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted={false}
-            tabIndex={0}
-            className="max-h-full max-w-full cursor-default outline-none"
-            onMouseDown={handleMouseDown}
-            onMouseUp={handleMouseUp}
-            onMouseMove={handleMouseMove}
-            onWheel={handleWheel}
-            onKeyDown={handleKeyDown}
-            onKeyUp={handleKeyUp}
-            onContextMenu={handleContextMenu}
-          />
+          <div className="relative flex h-full w-full items-center justify-center">
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted={false}
+              tabIndex={0}
+              className={cn(
+                'max-h-full max-w-full outline-none transition-shadow duration-200',
+                takeoverActive
+                  ? 'cursor-crosshair ring-2 ring-amber-500/60'
+                  : 'cursor-default',
+              )}
+              onMouseDown={handleMouseDown}
+              onMouseUp={handleMouseUp}
+              onMouseMove={handleMouseMove}
+              onWheel={handleWheel}
+              onKeyDown={handleKeyDown}
+              onKeyUp={handleKeyUp}
+              onContextMenu={handleContextMenu}
+            />
+            {connected && !takeoverActive && (
+              <button
+                type="button"
+                onClick={() => void acquireTakeover()}
+                className="absolute inset-0 flex items-center justify-center bg-background/40 backdrop-blur-[1px] transition-colors hover:bg-background/50"
+                aria-label="Take control of the browser"
+              >
+                <div className="flex items-center gap-2 rounded-full bg-background/80 px-4 py-2 text-sm font-medium shadow-lg ring-1 ring-border/60">
+                  <MousePointerClick className="h-4 w-4" />
+                  May is driving — click to take control
+                </div>
+              </button>
+            )}
+            {takeoverActive && (
+              <div className="pointer-events-none absolute left-3 top-3 rounded-full bg-amber-500/90 px-2.5 py-1 text-[11px] font-medium text-amber-950 shadow">
+                You are in control · Esc to release
+              </div>
+            )}
+          </div>
         )}
       </div>
     </div>

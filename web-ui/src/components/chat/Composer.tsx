@@ -46,6 +46,7 @@ interface ComposerProps {
   contextWindow?: number;
   contextUsagePercent: number | null;
   contextUsageTitle: string;
+  onOpenContextPanel: () => void;
 
   showStopButton: boolean;
   showSendButton: boolean;
@@ -80,6 +81,7 @@ export function Composer({
   contextWindow,
   contextUsagePercent,
   contextUsageTitle,
+  onOpenContextPanel,
   showStopButton,
   showSendButton,
   onStop,
@@ -189,6 +191,7 @@ export function Composer({
               contextWindow={contextWindow}
               contextUsagePercent={contextUsagePercent}
               contextUsageTitle={contextUsageTitle}
+              onOpenPanel={onOpenContextPanel}
             />
           )}
           {showStopButton && (
