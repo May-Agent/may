@@ -52,10 +52,10 @@ use super::terminal_parsing::{
 };
 use super::title_generation;
 use super::types::{
-    ApiErrorCode, ApiMessage, ChatRequest, ChatResponse, PendingMessageKind,
-    RemovePendingMessageRequest, RequestLogEntry, RequestStats, SessionRuntimeResponse,
-    SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent,
-    SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
+    ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
+    RequestLogEntry, RequestStats, SessionRuntimeResponse, SseChunkEvent, SseDoneEvent,
+    SseErrorEvent, SsePingEvent, SseStartEvent, SseTodoUpdateEvent, SseToolDeltaEvent,
+    SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord, ToolVariant,
 };
 
 fn stopped_terminal_tool_result() -> ToolResult {
@@ -73,8 +73,14 @@ fn stopped_terminal_tool_result() -> ToolResult {
 // ── ChatSink trait ──────────────────────────────────────────
 
 /// Abstraction over how chat events are delivered to the caller.
-/// `SseSink` streams events to the browser; `CollectSink` is a no-op
-/// (data is accumulated in the shared loop and returned as a result).
+///
+/// The stream protocol carries ordering metadata — `seq` (monotonic per
+/// turn, shared with pings) and `turn_id` (UUID-per-retry) — so the
+/// frontend can detect gaps and reconcile with history.
+///
+/// `SseSink` streams events to the browser with a running seq counter
+/// and a heartbeat task. `CollectSink` is a no-op used by internal
+/// follow-up dispatch when no client is attached.
 trait ChatSink {
     async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool;
     async fn on_text(&mut self, chunk: &str) -> bool;
@@ -88,40 +94,126 @@ trait ChatSink {
         arguments: Option<&str>,
         result: &ToolResult,
     ) -> bool;
-    async fn on_todo_update(&mut self, event: &SseTodoUpdateEvent) -> bool;
-    async fn on_error(&mut self, message: &str) -> bool;
+    async fn on_todo_update(&mut self, checklist: &crate::todo_parser::TodoChecklist) -> bool;
+    async fn on_error(&mut self, code: ApiErrorCode, message: &str, retryable: bool) -> bool;
 }
 
-struct SseSink(skyzen::responder::sse::Sender);
+/// Shared seq counter — `AtomicU64` so the background heartbeat task
+/// can allocate its own `seq` values without racing the main loop.
+type SeqCounter = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+struct SseSink {
+    sender: skyzen::responder::sse::Sender,
+    seq: SeqCounter,
+    turn_id: String,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SseSink {
+    fn new(sender: skyzen::responder::sse::Sender) -> Self {
+        Self {
+            sender,
+            seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            turn_id: String::new(),
+            heartbeat: None,
+        }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn spawn_heartbeat(&mut self) {
+        if self.heartbeat.is_some() {
+            return;
+        }
+        let sender = self.sender.clone();
+        let seq = self.seq.clone();
+        let turn_id = self.turn_id.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the immediate first tick — we just sent the `start` event.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let event = SsePingEvent {
+                    seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    turn_id: turn_id.as_str(),
+                };
+                if !send_event(&sender, "ping", &event).await {
+                    break;
+                }
+            }
+        });
+        self.heartbeat = Some(handle);
+    }
+}
+
+impl Drop for SseSink {
+    fn drop(&mut self) {
+        if let Some(handle) = self.heartbeat.take() {
+            handle.abort();
+        }
+    }
+}
 
 impl ChatSink for SseSink {
     async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool {
+        self.turn_id.clear();
+        self.turn_id.push_str(assistant_id);
+        let event = SseStartEvent {
+            seq: self.next_seq(),
+            turn_id: &self.turn_id,
+            session_id,
+            assistant_id,
+        };
+        let ok = send_event(&self.sender, "start", &event).await;
+        if ok {
+            self.spawn_heartbeat();
+        }
+        ok
+    }
+
+    async fn on_text(&mut self, chunk: &str) -> bool {
+        let seq = self.next_seq();
         send_event(
-            &self.0,
-            "start",
-            &SseStartEvent {
-                session_id,
-                assistant_id,
+            &self.sender,
+            "text",
+            &SseChunkEvent {
+                seq,
+                turn_id: &self.turn_id,
+                chunk,
             },
         )
         .await
     }
 
-    async fn on_text(&mut self, chunk: &str) -> bool {
-        send_event(&self.0, "text", &SseChunkEvent { chunk }).await
-    }
-
     async fn on_reasoning(&mut self, chunk: &str) -> bool {
-        send_event(&self.0, "reasoning", &SseChunkEvent { chunk }).await
+        let seq = self.next_seq();
+        send_event(
+            &self.sender,
+            "reasoning",
+            &SseChunkEvent {
+                seq,
+                turn_id: &self.turn_id,
+                chunk,
+            },
+        )
+        .await
     }
 
     async fn on_tool_delta(&mut self, id: &str, name: &str, arguments_fragment: &str) -> bool {
+        let seq = self.next_seq();
         send_event(
-            &self.0,
+            &self.sender,
             "tool_delta",
             &SseToolDeltaEvent {
+                seq,
+                turn_id: &self.turn_id,
                 id,
                 name,
+                variant: ToolVariant::infer(name),
                 arguments_fragment,
             },
         )
@@ -129,12 +221,16 @@ impl ChatSink for SseSink {
     }
 
     async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool {
+        let seq = self.next_seq();
         send_event(
-            &self.0,
+            &self.sender,
             "tool_start",
             &SseToolStartEvent {
+                seq,
+                turn_id: &self.turn_id,
                 id,
                 name,
+                variant: ToolVariant::infer(name),
                 arguments,
             },
         )
@@ -148,12 +244,16 @@ impl ChatSink for SseSink {
         arguments: Option<&str>,
         result: &ToolResult,
     ) -> bool {
+        let seq = self.next_seq();
         send_event(
-            &self.0,
+            &self.sender,
             "tool_end",
             &SseToolEndEvent {
+                seq,
+                turn_id: &self.turn_id,
                 id,
                 name,
+                variant: ToolVariant::infer(name),
                 arguments,
                 result,
             },
@@ -161,16 +261,32 @@ impl ChatSink for SseSink {
         .await
     }
 
-    async fn on_todo_update(&mut self, event: &SseTodoUpdateEvent) -> bool {
-        send_event(&self.0, "todo_update", event).await
+    async fn on_todo_update(&mut self, checklist: &crate::todo_parser::TodoChecklist) -> bool {
+        let seq = self.next_seq();
+        let event = SseTodoUpdateEvent::from_checklist(checklist, seq, self.turn_id.clone());
+        send_event(&self.sender, "todo_update", &event).await
     }
 
-    async fn on_error(&mut self, message: &str) -> bool {
-        send_event(&self.0, "error", &SseErrorEvent { message }).await
+    async fn on_error(&mut self, code: ApiErrorCode, message: &str, retryable: bool) -> bool {
+        let seq = self.next_seq();
+        send_event(
+            &self.sender,
+            "error",
+            &SseErrorEvent {
+                seq,
+                turn_id: &self.turn_id,
+                code,
+                message,
+                retryable,
+            },
+        )
+        .await
     }
 }
 
-/// No-op sink for non-streaming collect mode.
+/// No-op sink for internal follow-up runs where no client is attached.
+/// Events are still persisted via the main loop; the sink only suppresses
+/// network emission.
 struct CollectSink;
 
 impl ChatSink for CollectSink {
@@ -192,10 +308,10 @@ impl ChatSink for CollectSink {
     async fn on_tool_end(&mut self, _: &str, _: &str, _: Option<&str>, _: &ToolResult) -> bool {
         true
     }
-    async fn on_todo_update(&mut self, _: &SseTodoUpdateEvent) -> bool {
+    async fn on_todo_update(&mut self, _: &crate::todo_parser::TodoChecklist) -> bool {
         true
     }
-    async fn on_error(&mut self, _: &str) -> bool {
+    async fn on_error(&mut self, _: ApiErrorCode, _: &str, _: bool) -> bool {
         true
     }
 }
@@ -631,25 +747,10 @@ async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) 
     state.notify_ui_events(UiEventTopics::REQUEST_LOGS);
 }
 
-pub(super) async fn chat(
-    Json(req): Json<ChatRequest>,
-    State(state): State<Arc<UiServerState>>,
-) -> SkyResult<skyzen::Response> {
-    let tokio_handle = state.tokio_handle.clone();
-    let result = tokio_handle
-        .spawn(async move { run_chat_collect(state, req).await })
-        .await
-        .map_err(|_| internal_error("chat task panicked before producing a response"))?;
-    match result {
-        Ok(response) => json_ok_response(&response),
-        Err(ChatCollectError::Preparation(error)) => Ok(typed_error_response(
-            error.status(),
-            error.api_code(),
-            error,
-        )),
-        Err(ChatCollectError::Sky(error)) => Err(error),
-    }
-}
+// NOTE: the public `POST /api/chat` non-streaming handler has been removed.
+// All client-facing chat interaction now flows through `POST /api/chat/stream`
+// so there is a single protocol path. `run_chat_collect_with_receiver` below is
+// kept for internal follow-up queue dispatch where no SSE client is attached.
 
 pub(super) async fn enqueue_chat(
     Json(req): Json<ChatRequest>,
@@ -756,11 +857,18 @@ pub(super) async fn chat_stream(
         if let Err(err) =
             stream_chat_events(state.clone(), req, sender.clone(), run_registration).await
         {
+            // Envelope-shaped error for an outer-level failure that bypassed
+            // the sink's own error pathway. `seq = 0` is reserved for events
+            // with no turn context (heartbeat analogue).
             send_event(
                 &sender,
                 "error",
                 &SseErrorEvent {
+                    seq: 0,
+                    turn_id: "",
+                    code: ApiErrorCode::InternalError,
                     message: &err.to_string(),
+                    retryable: false,
                 },
             )
             .await;
@@ -864,7 +972,9 @@ async fn run_agent_loop(
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _ = sink.on_error(&error.to_string()).await;
+                let _ = sink
+                    .on_error(error.api_code(), &error.to_string(), false)
+                    .await;
                 return Err(error.into());
             }
         };
@@ -1019,10 +1129,10 @@ async fn run_agent_loop(
                         }
 
                         // Check if tasks.md changed after tool execution.
-                        if let Some(event) =
+                        if let Some(checklist) =
                             check_tasks_update(&tasks_db, &tasks_session_id, &mut last_todo_hash)
                                 .await
-                            && !sink.on_todo_update(&event).await
+                            && !sink.on_todo_update(&checklist).await
                         {
                             cancellation_reason = Some("client disconnected during todo update");
                             break;
@@ -1155,7 +1265,9 @@ async fn run_agent_loop(
                 log_base.failure(elapsed_ms_saturating(&started_at), &err_msg),
             )
             .await;
-            let _ = sink.on_error(&err_msg).await;
+            let _ = sink
+                .on_error(ApiErrorCode::InternalError, &err_msg, false)
+                .await;
             return Err(err.into());
         }
 
@@ -1207,7 +1319,9 @@ async fn run_agent_loop(
                 log_base.failure(elapsed_ms_saturating(&started_at), err),
             )
             .await;
-            let _ = sink.on_error(err).await;
+            let _ = sink
+                .on_error(ApiErrorCode::InternalError, err, false)
+                .await;
             return Err(AgentLoopError::EmptyAssistantResponse);
         }
         if !has_assistant_text && has_tool_activity {
@@ -1255,7 +1369,7 @@ async fn stream_chat_events(
     run_registration: SessionRunRegistration,
 ) -> Result<(), crate::db::ChatDbError> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
-    let mut sink = SseSink(sender.clone());
+    let mut sink = SseSink::new(sender.clone());
     let result = run_agent_loop(
         &state,
         &req,
@@ -1269,6 +1383,8 @@ async fn stream_chat_events(
     match result {
         Ok(result) => {
             let done_event = SseDoneEvent {
+                seq: sink.next_seq(),
+                turn_id: sink.turn_id.clone(),
                 session_id: response_session_id.clone(),
                 assistant: api_message_from_run_result(result),
             };
@@ -1280,6 +1396,8 @@ async fn stream_chat_events(
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
             let done_event = SseDoneEvent {
+                seq: sink.next_seq(),
+                turn_id: sink.turn_id.clone(),
                 session_id: response_session_id.clone(),
                 assistant: api_message_from_run_result(result),
             };
@@ -1297,42 +1415,17 @@ async fn stream_chat_events(
     }
 }
 
-async fn run_chat_collect_with_persistence(
-    state: Arc<UiServerState>,
-    req: ChatRequest,
-    persist_user_message: bool,
-    use_persisted_context_snapshot: bool,
-) -> Result<ChatResponse, ChatCollectError> {
-    let Some(run_registration) =
-        SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await
-    else {
-        return Err(ChatCollectError::Sky(active_session_conflict_error()));
-    };
-    let response = run_chat_collect_with_receiver(
-        state.clone(),
-        req.clone(),
-        persist_user_message,
-        use_persisted_context_snapshot,
-        run_registration.receiver(),
-    )
-    .await;
-    run_registration.close().await;
-    match response {
-        Ok(response) => {
-            spawn_follow_up_runs(state.clone(), req.session_id.clone());
-            Ok(response)
-        }
-        Err(error) => Err(error),
-    }
-}
-
+/// Drive a chat turn without an attached SSE client — used by the follow-up
+/// queue to dispatch server-side enqueued messages. All assistant text and
+/// tool events are still persisted by the main loop; the sink only
+/// suppresses network emission.
 async fn run_chat_collect_with_receiver(
     state: Arc<UiServerState>,
     req: ChatRequest,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
     cancel_rx: &async_channel::Receiver<()>,
-) -> Result<ChatResponse, ChatCollectError> {
+) -> Result<(), ChatCollectError> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running)
         .await
         .map_err(internal_error)
@@ -1347,46 +1440,15 @@ async fn run_chat_collect_with_receiver(
         use_persisted_context_snapshot,
     )
     .await;
+    clear_running_state_if_needed(&state, &req.session_id)
+        .await
+        .map_err(internal_error)
+        .map_err(ChatCollectError::from)?;
     match result {
-        Ok(result) => {
-            clear_running_state_if_needed(&state, &req.session_id)
-                .await
-                .map_err(internal_error)
-                .map_err(ChatCollectError::from)?;
-
-            Ok(ChatResponse {
-                session_id: req.session_id,
-                assistant: api_message_from_run_result(result),
-            })
-        }
-        Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
-            clear_running_state_if_needed(&state, &req.session_id)
-                .await
-                .map_err(internal_error)
-                .map_err(ChatCollectError::from)?;
-            Ok(ChatResponse {
-                session_id: req.session_id,
-                assistant: api_message_from_run_result(result),
-            })
-        }
-        Err(error) => {
-            clear_running_state_if_needed(&state, &req.session_id)
-                .await
-                .map_err(internal_error)
-                .map_err(ChatCollectError::from)?;
-            match error {
-                AgentLoopError::Preparation(error) => Err(ChatCollectError::Preparation(error)),
-                other => Err(ChatCollectError::Sky(internal_error(other))),
-            }
-        }
+        Ok(_) | Err(AgentLoopError::BrowserTakeoverPaused(_)) => Ok(()),
+        Err(AgentLoopError::Preparation(error)) => Err(ChatCollectError::Preparation(error)),
+        Err(other) => Err(ChatCollectError::Sky(internal_error(other))),
     }
-}
-
-async fn run_chat_collect(
-    state: Arc<UiServerState>,
-    req: ChatRequest,
-) -> Result<ChatResponse, ChatCollectError> {
-    run_chat_collect_with_persistence(state, req, true, true).await
 }
 
 async fn schedule_profile_memory_processing(state: &Arc<UiServerState>, profile_id: Option<&str>) {
@@ -2341,12 +2403,13 @@ async fn prepare_agent_for_request(
     })
 }
 
-/// Read tasks.md and return an SSE event if its content changed since the last check.
+/// Read tasks.md and return the parsed checklist if its content changed since the last check.
+/// The sink is responsible for wrapping it in the SSE envelope with seq/turn_id.
 async fn check_tasks_update(
     db: &crate::db::ChatDb,
     session_id: &str,
     last_hash: &mut Option<u64>,
-) -> Option<SseTodoUpdateEvent> {
+) -> Option<crate::todo_parser::TodoChecklist> {
     use std::hash::{Hash, Hasher};
 
     let content = db.get_session_tasks(session_id).await.ok()??;
@@ -2363,7 +2426,7 @@ async fn check_tasks_update(
     if checklist.is_empty() {
         return None;
     }
-    Some(SseTodoUpdateEvent::from(&checklist))
+    Some(checklist)
 }
 
 async fn is_takeover_active_for_session(state: &UiServerState, session_id: &SessionId) -> bool {
