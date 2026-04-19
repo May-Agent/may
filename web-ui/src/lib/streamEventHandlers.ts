@@ -10,6 +10,12 @@ import type {
   TimelineSegment,
   ToolExecution,
 } from '@/types';
+import type {
+  StreamErrorEvent,
+  StreamToolDelta,
+  StreamToolEnd,
+  StreamToolStart,
+} from '@/lib/api';
 import {
   normalizeToolName,
   isWebSearchToolName,
@@ -84,8 +90,11 @@ export interface StreamEventHandlerDeps {
   onAssistantFinalized: (update: AssistantFinalizeUpdate) => void;
   /** Called when the stream pauses (e.g. browser takeover). */
   onAssistantPaused: (update: AssistantFinalizeUpdate | null) => void;
-  /** Called with any stream-level error message (network, protocol, etc). */
-  onStreamError: (errorMessage: string) => void;
+  /** Called with a stream-level error (network, protocol, provider). The
+   * handler receives the structured envelope so callers can decide
+   * whether to auto-retry (e.g. on retryable provider failures) or
+   * surface the error to the user. */
+  onStreamError: (event: StreamErrorEvent) => void;
   /** Todo progress updates are forwarded directly. */
   onTodoUpdate: (event: {
     items: Array<{ text: string; checked: boolean }>;
@@ -105,9 +114,9 @@ export interface AssistantFinalizeUpdate {
 
 export interface StreamEventHandlers {
   onReasoning: (chunk: string) => void;
-  onToolDelta: (delta: { id: string; name: string; argumentsFragment: string }) => void;
-  onToolStart: (tool: any) => void;
-  onToolEnd: (tool: any) => void;
+  onToolDelta: (delta: StreamToolDelta) => void;
+  onToolStart: (tool: StreamToolStart) => void;
+  onToolEnd: (tool: StreamToolEnd) => void;
   onTodoUpdate: (event: {
     items: Array<{ text: string; checked: boolean }>;
     total: number;
@@ -116,7 +125,7 @@ export interface StreamEventHandlers {
   onText: (chunk: string) => void;
   onDone: (assistant: Message) => void;
   onPaused: (assistant: Message) => void;
-  onError: (message: string) => void;
+  onError: (event: StreamErrorEvent) => void;
   closeActiveThinkingSegment: () => void;
 }
 
@@ -180,13 +189,13 @@ export function createStreamEventHandlers(
     flushAssistantText(true);
   };
 
-  const onToolDelta = (delta: {
-    id: string;
-    name: string;
-    argumentsFragment: string;
-  }): void => {
-    const name = normalizeToolName(delta.name);
-    if (name !== 'terminal') {
+  const onToolDelta = (delta: StreamToolDelta): void => {
+    // The backend stamps every delta with a variant so the client does
+    // not re-infer from tool names. Today we surface live argument
+    // projection only for the terminal tool (script + description
+    // typewriter effect); other variants fall through silently and
+    // light up on tool_start.
+    if (delta.variant !== 'terminal') {
       return;
     }
     const toolId = delta.id;
@@ -260,7 +269,7 @@ export function createStreamEventHandlers(
     flushAssistantText(true);
   };
 
-  const onToolStart = (tool: any): void => {
+  const onToolStart = (tool: StreamToolStart): void => {
     const name = normalizeToolName(tool.name);
     const toolId = tool.id ?? `tool-${Date.now()}`;
     const serializedArguments =
@@ -268,13 +277,20 @@ export function createStreamEventHandlers(
         ? tool.arguments
         : JSON.stringify(tool.arguments ?? {});
 
-    if (name === 'terminal') {
+    if (tool.variant === 'terminal') {
       appendTerminalToolStart(state, tool, toolId);
       flushAssistantText(true);
       return;
     }
 
-    if (isWebSearchToolName(name) || isWebFetchToolName(name)) {
+    if (
+      tool.variant === 'webSearch' ||
+      tool.variant === 'webFetch' ||
+      // Fall back to the name-based sniffing for legacy/unknown variants
+      // (e.g. MCP tools that haven't been categorized server-side yet).
+      isWebSearchToolName(name) ||
+      isWebFetchToolName(name)
+    ) {
       closeActiveThinkingSegment();
       const startedAt = Date.now();
       const nextTool: ToolExecution = {
@@ -308,7 +324,7 @@ export function createStreamEventHandlers(
    * stuck "running" row forever — exactly the double-display bug we had. */
   function appendTerminalToolStart(
     streamState: StreamState,
-    tool: any,
+    tool: StreamToolStart,
     toolId: string,
   ): void {
     const args = parseTerminalToolStartArgs(tool.arguments);
@@ -398,13 +414,13 @@ export function createStreamEventHandlers(
     streamState.lastStreamEventKind = 'tool';
   }
 
-  const onToolEnd = (tool: any): void => {
-    const toolId = typeof tool?.id === 'string' ? tool.id : '';
+  const onToolEnd = (tool: StreamToolEnd): void => {
+    const toolId = tool.id;
     if (!toolId) return;
     const serializedArguments =
-      typeof tool?.arguments === 'string'
+      typeof tool.arguments === 'string'
         ? tool.arguments
-        : JSON.stringify(tool?.arguments ?? {});
+        : JSON.stringify(tool.arguments ?? {});
     const endedAt = Date.now();
     const parsedResult = parseToolResultPayload(tool.result);
     const { output, status } = parsedResult;
@@ -524,13 +540,13 @@ export function createStreamEventHandlers(
     });
   };
 
-  const onError = (message: string): void => {
+  const onError = (event: StreamErrorEvent): void => {
     if (wasStoppedByUser()) {
       state.completedNormally = true;
       return;
     }
     closeActiveThinkingSegment();
-    onStreamError(message);
+    onStreamError(event);
   };
 
   return {

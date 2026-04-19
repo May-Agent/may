@@ -1079,6 +1079,61 @@ export async function sendChat(input: {
   return enrichMessage(data.assistant);
 }
 
+export type ApiErrorCode =
+  | 'BAD_REQUEST'
+  | 'SESSION_NOT_FOUND'
+  | 'BROWSER_TAKEOVER_ACTIVE'
+  | 'MODEL_NOT_CONFIGURED'
+  | 'PROVIDER_UNAVAILABLE'
+  | 'PROFILE_CONFIGURATION_INVALID'
+  | 'CONTAINER_RUNTIME_UNAVAILABLE'
+  | 'CONTAINER_BUILD_FAILED'
+  | 'CONTAINER_START_FAILED'
+  | 'LOCATION_UNAVAILABLE'
+  | 'INTERNAL_ERROR';
+
+export type ToolVariant =
+  | 'terminal'
+  | 'terminalInput'
+  | 'terminalKill'
+  | 'terminalRead'
+  | 'browser'
+  | 'webSearch'
+  | 'webFetch'
+  | 'ask'
+  | 'session'
+  | 'notify'
+  | 'task'
+  | 'generic';
+
+export interface StreamToolDelta {
+  id: string;
+  name: string;
+  variant: ToolVariant;
+  argumentsFragment: string;
+}
+
+export interface StreamToolStart {
+  id: string;
+  name: string;
+  variant: ToolVariant;
+  arguments: unknown;
+}
+
+export interface StreamToolEnd {
+  id: string;
+  name: string;
+  variant: ToolVariant;
+  arguments?: unknown;
+  result: unknown;
+}
+
+export interface StreamErrorEvent {
+  code: ApiErrorCode;
+  message: string;
+  retryable: boolean;
+}
+
 export async function streamChat(input: {
   sessionId: string;
   content: string;
@@ -1087,9 +1142,9 @@ export async function streamChat(input: {
   onStart?: (assistantId: string) => void;
   onReasoning?: (chunk: string) => void;
   onText?: (chunk: string) => void;
-  onToolDelta?: (delta: { id: string; name: string; argumentsFragment: string }) => void;
-  onToolStart?: (tool: unknown) => void;
-  onToolEnd?: (tool: unknown) => void;
+  onToolDelta?: (delta: StreamToolDelta) => void;
+  onToolStart?: (tool: StreamToolStart) => void;
+  onToolEnd?: (tool: StreamToolEnd) => void;
   onTodoUpdate?: (event: {
     items: Array<{ text: string; checked: boolean }>;
     total: number;
@@ -1097,7 +1152,10 @@ export async function streamChat(input: {
   }) => void;
   onPaused?: (assistant: Message) => void;
   onDone?: (assistant: Message) => void;
-  onError?: (message: string) => void;
+  onError?: (event: StreamErrorEvent) => void;
+  /** Optional: invoked when a seq gap is detected (emitted_seq <= last_seq or
+   * jump > 1). The stream does not self-heal; this is diagnostic only. */
+  onStreamGap?: (info: { lastSeq: number; nextSeq: number; event: string }) => void;
   signal?: AbortSignal;
 }): Promise<void> {
   const payload = {
@@ -1129,6 +1187,16 @@ export async function streamChat(input: {
   let buffer = '';
   let eventName = '';
   let dataLines: string[] = [];
+  let lastSeq = 0;
+  let turnId: string | null = null;
+
+  const reportInternalError = (message: string): void => {
+    input.onError?.({
+      code: 'INTERNAL_ERROR',
+      message,
+      retryable: false,
+    });
+  };
 
   const flushEvent = () => {
     if (dataLines.length === 0) return;
@@ -1141,12 +1209,32 @@ export async function streamChat(input: {
     try {
       parsed = JSON.parse(rawData);
     } catch (error) {
-      input.onError?.(
+      reportInternalError(
         `Invalid SSE payload for event '${currentEventName}': ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
       return;
+    }
+
+    // Seq ordering: every event (except the outer error fallback at seq=0)
+    // carries a monotonic per-turn sequence. A backtrack or skip indicates
+    // proxy/network reordering; log via onStreamGap so the UI can surface
+    // the anomaly without tearing down the stream.
+    if (typeof parsed.seq === 'number' && parsed.seq > 0) {
+      if (parsed.seq <= lastSeq) {
+        input.onStreamGap?.({
+          lastSeq,
+          nextSeq: parsed.seq,
+          event: currentEventName,
+        });
+      }
+      lastSeq = parsed.seq;
+    }
+    // Bind turnId from the first event that carries one; subsequent
+    // mismatches are silently ignored (server is the source of truth).
+    if (turnId == null && typeof parsed.turnId === 'string' && parsed.turnId.length > 0) {
+      turnId = parsed.turnId;
     }
 
     const requireString = (value: unknown, field: string): string => {
@@ -1170,13 +1258,31 @@ export async function streamChat(input: {
           input.onText?.(requireString(parsed.chunk, 'chunk'));
           break;
         case 'tool_delta':
-          input.onToolDelta?.(parsed);
+          input.onToolDelta?.({
+            id: requireString(parsed.id, 'id'),
+            name: requireString(parsed.name, 'name'),
+            variant: (parsed.variant ?? 'generic') as ToolVariant,
+            argumentsFragment: typeof parsed.argumentsFragment === 'string'
+              ? parsed.argumentsFragment
+              : '',
+          });
           break;
         case 'tool_start':
-          input.onToolStart?.(parsed);
+          input.onToolStart?.({
+            id: requireString(parsed.id, 'id'),
+            name: requireString(parsed.name, 'name'),
+            variant: (parsed.variant ?? 'generic') as ToolVariant,
+            arguments: parsed.arguments,
+          });
           break;
         case 'tool_end':
-          input.onToolEnd?.(parsed);
+          input.onToolEnd?.({
+            id: requireString(parsed.id, 'id'),
+            name: requireString(parsed.name, 'name'),
+            variant: (parsed.variant ?? 'generic') as ToolVariant,
+            arguments: parsed.arguments,
+            result: parsed.result,
+          });
           break;
         case 'todo_update':
           input.onTodoUpdate?.(parsed);
@@ -1197,14 +1303,24 @@ export async function streamChat(input: {
           }
           input.onPaused?.(enrichMessage(parsed.assistant));
           break;
+        case 'ping':
+          // Keep-alive — server-side 10s heartbeat to prevent proxy
+          // timeouts during long tool runs. No state change needed.
+          break;
         case 'error':
-          input.onError?.(parsed.message || 'Unknown stream error');
+          input.onError?.({
+            code: (parsed.code ?? 'INTERNAL_ERROR') as ApiErrorCode,
+            message: typeof parsed.message === 'string'
+              ? parsed.message
+              : 'Unknown stream error',
+            retryable: parsed.retryable === true,
+          });
           break;
         default:
           break;
       }
     } catch (error) {
-      input.onError?.(
+      reportInternalError(
         error instanceof Error ? error.message : String(error),
       );
     }
