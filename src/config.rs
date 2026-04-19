@@ -889,11 +889,11 @@ const fn default_browser_port() -> u16 {
 }
 
 const fn default_screencast_quality() -> u32 {
-    60
+    80
 }
 
 const fn default_screencast_max_width() -> u32 {
-    1280
+    1920
 }
 
 impl Default for BrowserConfig {

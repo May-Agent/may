@@ -17,6 +17,19 @@ import {
   parseTerminalToolStartArgs,
 } from '@/lib/parsers/toolRequest';
 import { extractStringField } from './partialJson';
+
+/**
+ * Streaming tool deltas often arrive before the model has emitted any actual
+ * content for a given field — buffers like `{`, `{"`, or `{"description":"`
+ * yield partial/empty values. Surface only *meaningful* text to the UI so the
+ * collapsed row never shows placeholder scaffolding like `{` or `"`.
+ */
+function sanitizeStreamedField(value: string | undefined): string {
+  if (!value) return '';
+  const trimmed = value.replace(/^[\s{}\[\]"',:]+/, '');
+  if (trimmed.length < 2) return '';
+  return value;
+}
 import {
   cloneTimelineSegments,
   closeThinkingSegment,
@@ -182,8 +195,10 @@ export function createStreamEventHandlers(
     const buffer = previousBuffer + (delta.argumentsFragment ?? '');
     state.toolArgumentsBufferById.set(toolId, buffer);
 
-    const description = extractStringField(buffer, 'description') ?? '';
-    const script = extractStringField(buffer, 'script') ?? '';
+    const description = sanitizeStreamedField(
+      extractStringField(buffer, 'description'),
+    );
+    const script = sanitizeStreamedField(extractStringField(buffer, 'script'));
 
     const lastLengths =
       state.toolDeltaLastLengthById.get(toolId) ?? { description: -1, script: -1 };
@@ -200,10 +215,10 @@ export function createStreamEventHandlers(
     const existingSegId = state.terminalSegmentByToolId.get(toolId);
     if (!existingSegId) {
       closeActiveThinkingSegment();
-      const segmentId = `terminal-delta-${toolId}`;
+      const segmentId = `terminal-${toolId}`;
       const cmd: TerminalExecution = {
         id: toolId,
-        description: description || 'Running command...',
+        description,
         input: script,
         output: '',
         mode: 'default',
@@ -217,6 +232,7 @@ export function createStreamEventHandlers(
           kind: 'terminal',
           offset: state.streamedText.length,
           commands: [cmd],
+          startedAt: Date.now(),
         },
       ];
       state.terminalSegmentByToolId.set(toolId, segmentId);
@@ -284,7 +300,12 @@ export function createStreamEventHandlers(
     }
   };
 
-  /** Helper for onToolStart — terminal tools get batched into segments. */
+  /** Helper for onToolStart — terminal tools get batched into segments.
+   *
+   * If a segment already exists for this tool-id (created optimistically from
+   * `tool_delta`), we *upgrade it in place* with the now-complete arguments.
+   * Creating a second segment here would orphan the delta one, leaving a
+   * stuck "running" row forever — exactly the double-display bug we had. */
   function appendTerminalToolStart(
     streamState: StreamState,
     tool: any,
@@ -293,6 +314,42 @@ export function createStreamEventHandlers(
     const args = parseTerminalToolStartArgs(tool.arguments);
     closeActiveThinkingSegment();
     const startedAt = Date.now();
+
+    // Case 1: delta already opened a segment for this tool — upgrade the
+    // partial command in place with full description/script/mode.
+    const existingSegmentId = streamState.terminalSegmentByToolId.get(toolId);
+    if (existingSegmentId) {
+      streamState.timelineSegments = streamState.timelineSegments.map(
+        (segment) => {
+          if (segment.kind !== 'terminal' || segment.id !== existingSegmentId) {
+            return segment;
+          }
+          return {
+            ...segment,
+            startedAt: segment.startedAt ?? startedAt,
+            endedAt: undefined,
+            commands: segment.commands.map((command) =>
+              command.id === toolId
+                ? {
+                    ...command,
+                    description: args.description,
+                    input: args.script,
+                    mode: args.mode ?? command.mode ?? 'default',
+                    status: 'running',
+                    startedAt: command.startedAt ?? startedAt,
+                  }
+                : command,
+            ),
+          };
+        },
+      );
+      streamState.lastStreamEventKind = 'tool';
+      return;
+    }
+
+    // Case 2: no delta preceded this start (provider chose not to stream
+    // deltas, or our delta handler skipped them). Fall back to the batching
+    // path that appends to the last terminal segment where possible.
     const nextExec: TerminalExecution = {
       id: toolId,
       description: args.description,

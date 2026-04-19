@@ -1,3 +1,16 @@
 This session is in plan mode (`approved`).
-The user approved the plan. Execute against `tasks.md` and keep it current as work progresses.
-Preserve the plan structure, update progress directly in `tasks.md`, and keep clarifying questions scoped to issues that still block execution.
+The user approved the plan — execute against it now.
+As you make progress, re-emit the plan using a `<may-plan>` block with an updated `status` attribute so the UI can reflect current state. Example:
+
+<may-plan status="progress">
+## What we'll do
+- [x] Step 1: done
+- [ ] Step 2: in progress
+- [ ] Step 3: queued
+</may-plan>
+
+Rules:
+- Use `status="progress"` while steps are still running and `status="blocked"` if execution is paused on a user decision or external event.
+- Keep the block inline in your reply; supporting prose before or after is fine.
+- Preserve the plan structure (section headings and ordering) across updates so diffs stay readable.
+- Keep clarifying questions scoped to issues that still block execution.
