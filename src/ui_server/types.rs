@@ -40,50 +40,116 @@ pub struct ApiErrorBody {
 
 // ── SSE Event Payloads ──────────────────────────────────────
 
+/// Semantic variant of a tool call. Selected on `tool_start` so the
+/// frontend can route to the correct presenter without re-inferring
+/// from the tool name. `Generic` covers MCP and unknown tools; the
+/// frontend must fall back to raw-arg partial JSON projection there.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolVariant {
+    Terminal,
+    TerminalInput,
+    TerminalKill,
+    TerminalRead,
+    Browser,
+    WebSearch,
+    WebFetch,
+    Ask,
+    Session,
+    Notify,
+    Task,
+    Generic,
+}
+
+impl ToolVariant {
+    /// Map a tool name to its rendering variant. Unknown tools fall
+    /// back to `Generic` so MCP and user-defined CLIs still stream.
+    #[must_use]
+    pub fn infer(tool_name: &str) -> Self {
+        match tool_name {
+            "terminal" => Self::Terminal,
+            "terminal_input" => Self::TerminalInput,
+            "terminal_kill" => Self::TerminalKill,
+            "terminal_read" => Self::TerminalRead,
+            "browser" => Self::Browser,
+            "web_search" | "websearch" => Self::WebSearch,
+            "web_fetch" | "webfetch" => Self::WebFetch,
+            "ask" => Self::Ask,
+            "session" => Self::Session,
+            "notify" => Self::Notify,
+            "task" => Self::Task,
+            _ => Self::Generic,
+        }
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SseStartEvent<'a> {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: &'a str,
     pub(crate) session_id: &'a str,
     pub(crate) assistant_id: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SseChunkEvent<'a> {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: &'a str,
     pub(crate) chunk: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SseToolStartEvent<'a> {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: &'a str,
     pub(crate) id: &'a str,
     pub(crate) name: &'a str,
+    pub(crate) variant: ToolVariant,
     pub(crate) arguments: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SseToolDeltaEvent<'a> {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: &'a str,
     pub(crate) id: &'a str,
     pub(crate) name: &'a str,
+    pub(crate) variant: ToolVariant,
     pub(crate) arguments_fragment: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SseToolEndEvent<'a> {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: &'a str,
     pub(crate) id: &'a str,
     pub(crate) name: &'a str,
+    pub(crate) variant: ToolVariant,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) arguments: Option<&'a str>,
     pub(crate) result: &'a ToolResult,
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SseErrorEvent<'a> {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: &'a str,
+    pub(crate) code: ApiErrorCode,
     pub(crate) message: &'a str,
+    pub(crate) retryable: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SseDoneEvent {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: String,
     pub(crate) session_id: String,
     pub(crate) assistant: ApiMessage,
 }
@@ -93,9 +159,20 @@ pub struct SseHeartbeat {
     pub(crate) ok: bool,
 }
 
+/// Chat-stream ping emitted every 10 s so proxies and the browser's
+/// own idle detection don't close the connection during long tool phases.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SsePingEvent<'a> {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: &'a str,
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SseTodoUpdateEvent {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: String,
     pub(crate) items: Vec<SseTodoItem>,
     pub(crate) total: usize,
     pub(crate) completed: usize,
@@ -107,9 +184,19 @@ pub struct SseTodoItem {
     pub(crate) checked: bool,
 }
 
-impl From<&crate::todo_parser::TodoChecklist> for SseTodoUpdateEvent {
-    fn from(checklist: &crate::todo_parser::TodoChecklist) -> Self {
+impl SseTodoUpdateEvent {
+    /// Build a todo-update payload with the given seq/turn context.
+    /// `From<&TodoChecklist>` was removed because the stream envelope
+    /// now carries ordering metadata that the checklist itself doesn't know.
+    #[must_use]
+    pub fn from_checklist(
+        checklist: &crate::todo_parser::TodoChecklist,
+        seq: u64,
+        turn_id: String,
+    ) -> Self {
         Self {
+            seq,
+            turn_id,
             items: checklist
                 .items
                 .iter()
@@ -686,13 +773,6 @@ pub struct ChatRequest {
     pub(crate) hidden_context_xml: Option<XmlBlock>,
     #[serde(default)]
     pub(crate) delivery_mode: PendingUserMessageMode,
-}
-
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatResponse {
-    pub(crate) session_id: String,
-    pub(crate) assistant: ApiMessage,
 }
 
 #[derive(Debug, serde::Deserialize)]
