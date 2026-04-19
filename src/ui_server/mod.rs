@@ -469,7 +469,7 @@ fn build_router(state: Arc<UiServerState>, mode: UiServerMode) -> Router {
         UiServerMode::Ui => {
             #[cfg(feature = "ui")]
             {
-                Route::new((api, EmbeddedStaticDir::new("/", &WEB_UI_DIST)))
+                Route::new((api, EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa()))
                     .middleware(State(state))
                     .build()
             }
