@@ -42,7 +42,6 @@ pub(crate) mod tag {
     pub const TERMINAL_RUNTIME_CONTEXT: &str = "terminal_runtime_context";
     pub const WORKSPACE: &str = "workspace";
     pub const WORKSPACE_WORKDIRS: &str = "workspace_workdirs";
-    pub const REMOTE_ENVIRONMENT_CONTEXT: &str = "remote_environment_context";
     pub const CONTAINER_ENVIRONMENT_CONTEXT: &str = "container_environment_context";
     pub const BROWSER: &str = "browser";
     pub const PROFILE_PERSONA: &str = "profile_persona";
@@ -68,7 +67,6 @@ pub(crate) struct RuntimeSystemContext {
     terminal_runtime: Option<String>,
     workspace: Option<String>,
     workspace_workdirs: Option<String>,
-    remote_environment: Option<String>,
     container_environment: Option<String>,
     browser: Option<String>,
     profile_persona: Option<String>,
@@ -88,7 +86,6 @@ impl RuntimeSystemContext {
             terminal_runtime: None,
             workspace: None,
             workspace_workdirs: None,
-            remote_environment: None,
             container_environment: None,
             browser: None,
             profile_persona: None,
@@ -113,11 +110,6 @@ impl RuntimeSystemContext {
 
     pub(crate) fn with_workspace_workdirs(mut self, workdirs: String) -> Self {
         self.workspace_workdirs = Some(workdirs);
-        self
-    }
-
-    pub(crate) fn with_remote_environment(mut self, remote_environment: String) -> Self {
-        self.remote_environment = Some(remote_environment);
         self
     }
 
@@ -182,11 +174,6 @@ impl RuntimeSystemContext {
             context,
             tag::WORKSPACE_WORKDIRS,
             self.workspace_workdirs.clone(),
-        );
-        reconcile_text_block(
-            context,
-            tag::REMOTE_ENVIRONMENT_CONTEXT,
-            self.remote_environment.clone(),
         );
         reconcile_text_block(
             context,
@@ -270,6 +257,7 @@ struct TerminalRuntimeContextTemplate {
     command_rules: Vec<String>,
     environment_rules: Vec<String>,
     modality_support: Vec<String>,
+    attached_remote_servers: Vec<crate::config::SshServerConfig>,
 }
 
 #[derive(Clone, Template)]
@@ -302,16 +290,6 @@ impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
                 .unwrap_or_else(|| "User-approved directory".to_string()),
         }
     }
-}
-
-#[derive(Clone, Template)]
-#[template(path = "remote_environment_context.txt", escape = "none")]
-struct RemoteEnvironmentContextTemplate {
-    operating_system: String,
-    sandbox: String,
-    cwd: String,
-    ssh_server_id: String,
-    ssh_target: String,
 }
 
 #[derive(Clone, Template)]
@@ -370,6 +348,7 @@ pub(crate) fn build_terminal_runtime_context(
     config: &MayAgentConfig,
     session_paths: &SessionPaths,
     model_info: Option<&aither_models::ModelEntry>,
+    attached_remote_servers: Vec<crate::config::SshServerConfig>,
 ) -> String {
     let mut modality_support = Vec::new();
     if let Some(info) = model_info {
@@ -445,6 +424,7 @@ pub(crate) fn build_terminal_runtime_context(
         ],
         environment_rules: environment_runtime_rules(&config.environment),
         modality_support,
+        attached_remote_servers,
     };
     template
         .render()
@@ -489,25 +469,6 @@ pub(crate) fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Opti
             .render()
             .unwrap_or_else(|error| panic!("failed to render workspace workdirs context: {error}")),
     )
-}
-
-pub(crate) fn build_remote_environment_context(
-    workspace: &MayWorkspace,
-    ssh_server: &crate::config::SshServerConfig,
-) -> String {
-    let template = RemoteEnvironmentContextTemplate {
-        operating_system: operating_system_hint(&AgentEnvironment::Remote {
-            ssh_server: ssh_server.clone(),
-        })
-        .to_string(),
-        sandbox: workspace.sandbox.display().to_string(),
-        cwd: workspace.cwd.display().to_string(),
-        ssh_server_id: ssh_server.name.clone(),
-        ssh_target: ssh_server.target.clone(),
-    };
-    template
-        .render()
-        .unwrap_or_else(|error| panic!("failed to render remote environment context: {error}"))
 }
 
 pub(crate) fn build_container_environment_context(cwd: &std::path::Path) -> String {
@@ -591,7 +552,6 @@ async fn load_prompt_subagents(
 fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static str {
     match environment {
         AgentEnvironment::Local => "local",
-        AgentEnvironment::Remote { .. } => "remote",
         AgentEnvironment::Container { .. } => "container",
     }
 }
@@ -599,7 +559,6 @@ fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static str {
 fn operating_system_hint(environment: &AgentEnvironment) -> &'static str {
     match environment {
         AgentEnvironment::Local => host_operating_system_label(),
-        AgentEnvironment::Remote { .. } => "unknown until detected on the remote host",
         AgentEnvironment::Container { .. } => "linux (managed container runtime)",
     }
 }
@@ -619,14 +578,6 @@ fn environment_runtime_rules(environment: &AgentEnvironment) -> Vec<String> {
             "This home environment runs on the user's local machine. Default to the session sandbox and approved workspace roots for writes.".to_string(),
             "Outside approved writable paths, treat the host as read-mostly and request approval before side effects.".to_string(),
             "Host automation must respect the local operating system and user presence.".to_string(),
-        ],
-        AgentEnvironment::Remote { ssh_server } => vec![
-            format!(
-                "This home environment is the remote SSH target `{}` (`{}`).",
-                ssh_server.name, ssh_server.target
-            ),
-            "Treat the remote machine as real infrastructure and avoid assuming its shell, package manager, or OS family until you verify them on-host.".to_string(),
-            "Prefer explicit, auditable commands and ask for approval before privileged or destructive operations.".to_string(),
         ],
         AgentEnvironment::Container { .. } => vec![
             "This home environment runs inside a managed container. Prefer direct terminal usage and assume the filesystem is writable unless a command says otherwise.".to_string(),

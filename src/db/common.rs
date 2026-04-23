@@ -10,10 +10,7 @@
 use skyzen_services::DbError as SkyDbError;
 
 use crate::ask_user::AnswerValue;
-use crate::profile::{
-    ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences,
-    RemoteProfilePreferences,
-};
+use crate::profile::{ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences};
 use crate::session::{ChatMessageStats, SessionPlanState, SessionRuntimeState};
 
 use super::entity::profiles;
@@ -440,6 +437,11 @@ pub(super) struct I32ValueRow {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct StringValueRow {
+    pub(super) value: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(super) struct I64ValueRow {
     pub(super) value: i64,
 }
@@ -522,7 +524,6 @@ pub struct UpdateScheduledTaskParams<'a> {
 pub enum ProfileEnvironmentKind {
     Local,
     Container,
-    Remote,
 }
 
 impl ProfileEnvironmentKind {
@@ -531,7 +532,6 @@ impl ProfileEnvironmentKind {
         match self {
             Self::Local => "local",
             Self::Container => "container",
-            Self::Remote => "remote",
         }
     }
 }
@@ -556,7 +556,10 @@ pub(super) fn parse_profile_environment(
     match value {
         "local" => Ok(ProfileEnvironmentKind::Local),
         "container" => Ok(ProfileEnvironmentKind::Container),
-        "remote" => Ok(ProfileEnvironmentKind::Remote),
+        "remote" => Err(ChatDbError::InvalidProfileEnvironment(
+            "remote is no longer a valid home environment; legacy rows should have been migrated to local"
+                .to_string(),
+        )),
         other => Err(ChatDbError::InvalidProfileEnvironment(other.to_string())),
     }
 }
@@ -671,39 +674,17 @@ pub(super) fn normalize_profile_preferences(
     let mut preferences = preferences.cloned().unwrap_or_default();
     match environment {
         ProfileEnvironmentKind::Local => {
-            preferences.remote = None;
             preferences.container = None;
         }
-        ProfileEnvironmentKind::Remote => {
-            let remote = preferences.remote.ok_or_else(|| {
-                ChatDbError::InvalidProfileEnvironment(
-                    "remote profile requires preferences.remote.ssh_server_id".to_string(),
-                )
-            })?;
-            remote
-                .normalized_ssh_server_id()
-                .map_err(ChatDbError::InvalidProfileEnvironment)?;
-            preferences.remote = Some(remote);
-            preferences.container = None;
-        }
-        ProfileEnvironmentKind::Container => {
-            preferences.remote = None;
-        }
+        ProfileEnvironmentKind::Container => {}
     }
-    Ok((preferences.remote.is_some() || preferences.container.is_some()).then_some(preferences))
+    Ok(preferences.container.is_some().then_some(preferences))
 }
 
 pub(super) fn build_profile_preferences(
     model: &profiles::Model,
     mounts: Vec<ContainerMountPreference>,
 ) -> Option<ProfilePreferences> {
-    let remote =
-        model
-            .remote_ssh_server_id
-            .as_ref()
-            .map(|ssh_server_id| RemoteProfilePreferences {
-                ssh_server_id: ssh_server_id.clone(),
-            });
     let container = if model.container_dockerfile.is_some() || !mounts.is_empty() {
         Some(ContainerProfilePreferences {
             dockerfile: model.container_dockerfile.clone(),
@@ -712,5 +693,7 @@ pub(super) fn build_profile_preferences(
     } else {
         None
     };
-    (remote.is_some() || container.is_some()).then_some(ProfilePreferences { remote, container })
+    container
+        .is_some()
+        .then_some(ProfilePreferences { container })
 }

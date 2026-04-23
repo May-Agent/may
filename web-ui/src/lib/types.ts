@@ -127,26 +127,18 @@ export interface PendingUserMessage {
   deliveryMode: PendingUserMessageMode;
 }
 
-export interface PersistedPermissionRequestPayload {
+export interface PersistedPermissionRequest {
+  id: string;
   mode: string;
   script: string;
   sessionId?: string | null;
 }
 
-export interface PersistedPermissionRequest {
+export interface PersistedWorkspaceRequest {
   id: string;
-  request: PersistedPermissionRequestPayload;
-}
-
-export interface PersistedWorkspaceRequestPayload {
   path: string;
   reason: string;
   sessionId?: string | null;
-}
-
-export interface PersistedWorkspaceRequest {
-  id: string;
-  request: PersistedWorkspaceRequestPayload;
 }
 
 export interface PersistedAskUserQuestion {
@@ -309,7 +301,7 @@ export interface BrowserStatusPayload {
 }
 
 export interface ProfileSessions {
-  profileId: string;
+  profile: import('./api/profiles').ProfileInfo;
   pinned: Array<
     | { type: 'session'; id: string; title: string; runtime: SessionRuntimeSummary }
     | {
@@ -348,10 +340,256 @@ export type UiEvent =
   | { kind: 'session_runtime'; payload: SessionRuntimePayload }
   | { kind: 'session_runtimes'; payload: SessionRuntimesPayload }
   | { kind: 'container_prepare'; payload: unknown }
-  | { kind: 'remote_access'; payload: unknown }
-  | { kind: 'request_logs'; payload: unknown }
+  | { kind: 'remote_access'; payload: { status: RemoteAccessStatusResponse } }
+  | { kind: 'request_logs'; payload: RequestLogsResponse }
   | { kind: 'notification_mailbox'; payload: unknown }
-  | { kind: 'network_access_logs'; payload: unknown };
+  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse };
+
+// ── Artifacts ──────────────────────────────────────────────
+
+export interface ArtifactEntry {
+  path: string;
+  name: string;
+  size: number;
+  isHtml: boolean;
+  fingerprint: string;
+}
+
+export interface SessionArtifactsResponse {
+  artifacts: ArtifactEntry[];
+}
+
+export interface ArtifactStreamPayload {
+  count: number;
+  signature: string;
+}
+
+// ── Plan / TASKS ───────────────────────────────────────────
+
+export interface SessionTasksPayload {
+  content: string;
+  planState: SessionPlanState;
+}
+
+export interface SessionPlanStateRequest {
+  planState: SessionPlanState;
+}
+
+export interface SessionPlanStateResponse {
+  planState: SessionPlanState;
+}
+
+// ── Memory ─────────────────────────────────────────────────
+
+export interface MemoryPayload {
+  content: string;
+}
+
+export interface MemorySaveRequest {
+  content: string;
+  explicitUserRequest?: boolean;
+}
+
+// ── Scheduled tasks (triggers) ─────────────────────────────
+
+export type TaskRunStatus = 'running' | 'success' | 'failed' | 'interrupted';
+export type TimeTriggerType = 'once' | 'cron';
+
+export type TaskTriggerRequest =
+  | { kind: 'time'; triggerType: TimeTriggerType; runAtUtc?: string | null; cronUtc?: string | null }
+  | { kind: 'event'; eventName: string }
+  | { kind: 'webhook' };
+
+export type TaskTriggerResponse =
+  | { kind: 'time'; triggerType: TimeTriggerType; runAtUtc?: string | null; cronUtc?: string | null }
+  | { kind: 'event'; eventName: string }
+  | { kind: 'webhook'; token: string; webhookPath: string };
+
+export interface ScheduledTaskResponse {
+  id: string;
+  profileId: string;
+  sessionId: string | null;
+  name: string;
+  trigger: TaskTriggerResponse;
+  scriptPath: string | null;
+  scriptInline: string | null;
+  needsNetwork: boolean;
+  approved: boolean;
+  enabled: boolean;
+  lastRunAt: string | null;
+  lastRunStatus: TaskRunStatus | null;
+  lastRunOutput: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateTaskRequest {
+  profileId: string;
+  sessionId?: string | null;
+  name: string;
+  trigger: TaskTriggerRequest;
+  scriptPath?: string | null;
+  scriptInline?: string | null;
+  needsNetwork?: boolean;
+}
+
+export interface UpdateTaskRequest {
+  name?: string | null;
+  enabled?: boolean | null;
+  cronExpression?: string | null;
+  runAt?: string | null;
+  scriptPath?: string | null;
+  scriptInline?: string | null;
+}
+
+// ── Network access ─────────────────────────────────────────
+
+export type NetworkAccessSource =
+  | 'chat'
+  | 'exec'
+  | 'task_local'
+  | 'task_validation_local'
+  | 'task_remote'
+  | 'task_container'
+  | 'task_validation_container';
+
+export interface NetworkAccessLogEntryResponse {
+  id: number;
+  sessionId: string | null;
+  profileId: string | null;
+  source: NetworkAccessSource;
+  mode: 'network';
+  domain: string;
+  port: number;
+  allowed: boolean;
+  reason: string | null;
+  timestamp: string;
+}
+
+export interface NetworkAccessLogsResponse {
+  items: NetworkAccessLogEntryResponse[];
+}
+
+// ── Request logs ───────────────────────────────────────────
+
+export interface RequestLogEntry {
+  sessionId: string;
+  timestamp: string;
+  model: string;
+  providerId: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  contextWindow: number | null;
+  elapsedMs: number;
+  ok: boolean;
+  error: string | null;
+}
+
+export interface RequestLogCacheSummary {
+  assistantMessageCount: number;
+  cacheHitMessageCount: number;
+  promptTokensTotal: number;
+  cacheReadTokensTotal: number;
+  cacheWriteTokensTotal: number;
+  cacheReadHitRate: number | null;
+}
+
+export interface RequestLogsResponse {
+  logs: RequestLogEntry[];
+  cacheSummary: RequestLogCacheSummary;
+}
+
+// ── Context debug ──────────────────────────────────────────
+
+export interface ContextDebugMessage {
+  role: string;
+  content: string;
+  attachments: string[];
+  toolCallId: string | null;
+  toolCallNames: string[];
+}
+
+export interface SessionContextWindowMetricsResponse {
+  usageFraction: number;
+  selectedModelContextWindow: number | null;
+  fastModelContextWindow: number | null;
+  effectiveContextWindow: number;
+  systemBlockCount: number;
+  reminderCount: number;
+  recentMessageCount: number;
+  recentSystemMessageCount: number;
+  hasHandoff: boolean;
+}
+
+export interface SessionContextWindowSnapshotResponse {
+  phase: string;
+  metrics: SessionContextWindowMetricsResponse;
+  assembledMessages: ContextDebugMessage[];
+}
+
+export interface SessionContextDebugResponse {
+  sessionId: string;
+  timestamp: string;
+  model: string;
+  providerId: string;
+  prompt: string;
+  promptAttachments: string[];
+  assembledMessages: ContextDebugMessage[];
+  windowSnapshot?: SessionContextWindowSnapshotResponse;
+}
+
+// ── Remote access ──────────────────────────────────────────
+
+export type RemoteAccessState = 'disabled' | 'starting' | 'running' | 'error';
+
+export interface RemoteAccessStatusResponse {
+  state: RemoteAccessState;
+  enabled: boolean;
+  publicUrl?: string | null;
+  lastError?: string | null;
+  recentLogs: string[];
+}
+
+// ── Profiles (expanded) ────────────────────────────────────
+
+export type ProfileEnvironmentKind = 'local' | 'container';
+
+export interface ProfileContainerMount {
+  hostPath: string;
+  containerPath: string;
+  access?: 'read_only' | 'read_write';
+}
+
+export interface ProfilePreferences {
+  container?: {
+    dockerfile?: string | null;
+    mounts?: ProfileContainerMount[] | null;
+  } | null;
+}
+
+export interface CreateProfileRequest {
+  name: string;
+  icon?: string | null;
+  environment?: ProfileEnvironmentKind;
+  containerImage?: string | null;
+  persona?: string | null;
+  preferences?: ProfilePreferences | null;
+  locationAware?: boolean;
+}
+
+export interface UpdateProfileRequest {
+  name?: string | null;
+  icon?: string | null;
+  environment?: ProfileEnvironmentKind | null;
+  containerImage?: string | null;
+  sortOrder?: number | null;
+  persona?: string | null;
+  preferences?: ProfilePreferences | null;
+  locationAware?: boolean | null;
+}
 
 // ── Profiles ────────────────────────────────────────────────
 

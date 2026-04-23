@@ -48,7 +48,78 @@ impl ChatDb {
         profile: profiles::Model,
     ) -> Result<crate::profile::ProfileInfo, ChatDbError> {
         let preferences = self.load_profile_preferences(&profile).await?;
-        crate::profile::ProfileInfo::from_db_parts(profile, preferences)
+        let attachments = self.list_profile_remote_servers(&profile.id).await?;
+        crate::profile::ProfileInfo::from_db_parts(profile, preferences, attachments)
+    }
+
+    /// Return SSH server names attached to this profile, ordered by
+    /// `sort_order` ascending.
+    pub async fn list_profile_remote_servers(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<String>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT ssh_server_name AS value FROM profile_remote_servers WHERE profile_id = ? ORDER BY sort_order ASC, ssh_server_name ASC",
+            profile_id
+        )
+        .fetch_all::<super::common::StringValueRow>()
+        .await?
+        .into_iter()
+        .map(|row| row.value)
+        .collect())
+    }
+
+    /// Remove all profile attachments that reference the given SSH server
+    /// name. Called when an SSH server is deleted from the global config so
+    /// no profile ends up pointing at a server that no longer exists.
+    pub async fn remove_profile_attachments_for_server(
+        &self,
+        ssh_server_name: &str,
+    ) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "DELETE FROM profile_remote_servers WHERE ssh_server_name = ?",
+            ssh_server_name
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// Replace the full attachment list for a profile with the given names,
+    /// preserving order. Caller must have validated that each name exists in
+    /// the global SSH server configuration.
+    pub async fn set_profile_remote_servers(
+        &self,
+        profile_id: &str,
+        names: &[String],
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "DELETE FROM profile_remote_servers WHERE profile_id = ?",
+            profile_id
+        )
+        .execute()
+        .await?;
+        for (ordinal, name) in names.iter().enumerate() {
+            let sort_order = i32::try_from(ordinal)
+                .map_err(|e| overflow_error("remote attachment ordinal", &e))?;
+            query!(
+                tx,
+                "INSERT INTO profile_remote_servers (profile_id, ssh_server_name, sort_order, created_at) VALUES (?, ?, ?, ?)",
+                profile_id,
+                name.as_str(),
+                sort_order,
+                now.as_str()
+            )
+            .execute()
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn load_container_profile_preferences(
@@ -72,13 +143,9 @@ impl ChatDb {
         let sort_order = self.max_profile_sort_order().await? + 1;
         let preferences = normalize_profile_preferences(params.environment, params.preferences)?;
         let container_image = match params.environment {
-            ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote => None,
+            ProfileEnvironmentKind::Local => None,
             ProfileEnvironmentKind::Container => params.container_image,
         };
-        let remote_ssh_server_id = preferences
-            .as_ref()
-            .and_then(|value| value.remote.as_ref())
-            .map(|value| value.ssh_server_id.as_str());
         let container_dockerfile = preferences
             .as_ref()
             .and_then(|value| value.container.as_ref())
@@ -91,7 +158,7 @@ impl ChatDb {
         let mut tx = self.db.begin().await?;
         query!(
             tx,
-            "INSERT INTO profiles (id, slug, name, icon, environment, container_image, container_id, persona, remote_ssh_server_id, container_dockerfile, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO profiles (id, slug, name, icon, environment, container_image, container_id, persona, container_dockerfile, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params.id,
             params.slug,
             params.name,
@@ -100,7 +167,6 @@ impl ChatDb {
             container_image,
             Option::<String>::None,
             params.persona,
-            remote_ssh_server_id,
             container_dockerfile,
             params.location_aware,
             10_i32,
@@ -163,10 +229,7 @@ impl ChatDb {
         }
         if let Some(environment) = params.environment {
             existing.environment = environment.as_str().to_string();
-            if matches!(
-                environment,
-                ProfileEnvironmentKind::Local | ProfileEnvironmentKind::Remote
-            ) {
+            if matches!(environment, ProfileEnvironmentKind::Local) {
                 existing.container_image = None;
                 existing.container_id = None;
             }
@@ -192,10 +255,6 @@ impl ChatDb {
             Some(preferences) => normalize_profile_preferences(environment, preferences)?,
             None => current_preferences,
         };
-        existing.remote_ssh_server_id = merged_preferences
-            .as_ref()
-            .and_then(|value| value.remote.as_ref())
-            .map(|value| value.ssh_server_id.clone());
         existing.container_dockerfile = merged_preferences
             .as_ref()
             .and_then(|value| value.container.as_ref())
@@ -209,14 +268,13 @@ impl ChatDb {
         let mut tx = self.db.begin().await?;
         query!(
             tx,
-            "UPDATE profiles SET name = ?, icon = ?, environment = ?, container_image = ?, container_id = ?, persona = ?, remote_ssh_server_id = ?, container_dockerfile = ?, location_aware = ?, pinned_limit = ?, sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE profiles SET name = ?, icon = ?, environment = ?, container_image = ?, container_id = ?, persona = ?, container_dockerfile = ?, location_aware = ?, pinned_limit = ?, sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
             existing.name.as_str(),
             existing.icon.as_deref(),
             existing.environment.as_str(),
             existing.container_image.as_deref(),
             existing.container_id.as_deref(),
             existing.persona.as_deref(),
-            existing.remote_ssh_server_id.as_deref(),
             existing.container_dockerfile.as_deref(),
             existing.location_aware,
             existing.pinned_limit,

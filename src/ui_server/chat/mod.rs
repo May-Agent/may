@@ -951,6 +951,14 @@ async fn run_agent_loop(
     let mut turn_hidden_context_xml: Option<String> = None;
 
     loop {
+        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let assistant_id = format!("assistant-{assistant_uuid}");
+        let started_at = Instant::now();
+
+        if !sink.on_start(&req.session_id, &assistant_id).await {
+            return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
+        }
+
         let PreparedAgent {
             session_id,
             mut agent,
@@ -988,9 +996,6 @@ async fn run_agent_loop(
             lookup_model_info(&current_model).and_then(aither_models::ModelEntry::max_input_tokens)
         });
 
-        let assistant_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_id = format!("assistant-{assistant_uuid}");
-        let started_at = Instant::now();
         let mut usage = Usage::default();
         let mut segment_text = String::new(); // current text segment, flushed on tool calls
         let mut full_text = String::new(); // accumulated full assistant text
@@ -1003,10 +1008,6 @@ async fn run_agent_loop(
         let tasks_db = state.db();
         let tasks_session_id = req.session_id.clone();
         let mut turn_persister = turn_persister::TurnPersister::new(session_id.as_str());
-
-        if !sink.on_start(&req.session_id, &assistant_id).await {
-            return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
-        }
 
         let mut terminal_error: Option<aither_agent::AgentError> = None;
         let mut cancellation_reason: Option<&'static str> = None;
@@ -1319,9 +1320,7 @@ async fn run_agent_loop(
                 log_base.failure(elapsed_ms_saturating(&started_at), err),
             )
             .await;
-            let _ = sink
-                .on_error(ApiErrorCode::InternalError, err, false)
-                .await;
+            let _ = sink.on_error(ApiErrorCode::InternalError, err, false).await;
             return Err(AgentLoopError::EmptyAssistantResponse);
         }
         if !has_assistant_text && has_tool_activity {
@@ -1593,6 +1592,7 @@ struct SessionContext {
     profile_environment: Option<crate::profile::ProfileEnvironment>,
     profile_id: Option<String>,
     plan_state: crate::session::SessionPlanState,
+    reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
 }
 
 struct PreparedAgent {
@@ -1673,10 +1673,6 @@ enum UiChatPreparationError {
     EnsureContainerImage(#[source] crate::container::ContainerError),
     #[error("container start failed: {0}")]
     StartContainer(#[source] crate::container::ContainerError),
-    #[error("remote profile model is missing")]
-    MissingRemoteProfileModel,
-    #[error("{0}")]
-    ResolveRemoteServer(String),
     #[error("location fetch failed: {0}")]
     LoadLocation(#[source] crate::location::LocationError),
     #[error("failed to create agent: {0}")]
@@ -1698,8 +1694,6 @@ impl UiChatPreparationError {
             Self::NoProviderAvailable { .. } => ApiErrorCode::ProviderUnavailable,
             Self::InvalidFileMentionPath(_) => ApiErrorCode::BadRequest,
             Self::MissingContainerProfileModel
-            | Self::MissingRemoteProfileModel
-            | Self::ResolveRemoteServer(_)
             | Self::ParseProfileEnvironment(_)
             | Self::InvalidContainerImageTag(_)
             | Self::InvalidContainerProfileConfiguration(_)
@@ -1739,8 +1733,6 @@ impl UiChatPreparationError {
             | Self::NoProviderAvailable { .. }
             | Self::InvalidFileMentionPath(_)
             | Self::MissingContainerProfileModel
-            | Self::MissingRemoteProfileModel
-            | Self::ResolveRemoteServer(_)
             | Self::ParseProfileEnvironment(_)
             | Self::InvalidContainerImageTag(_)
             | Self::InvalidContainerProfileConfiguration(_)
@@ -1990,7 +1982,7 @@ async fn resolve_session_context(
         let needs_title = session.title.is_none();
         if needs_title {
             let title = truncate_preview(&req.content);
-            db.update_session(session_id.as_str(), Some(title.as_str()), None)
+            db.update_session(session_id.as_str(), Some(title.as_str()), None, None)
                 .await
                 .map_err(UiChatPreparationError::UpdateSessionTitle)?;
             state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
@@ -2002,6 +1994,11 @@ async fn resolve_session_context(
 
     let sandbox_dir = SessionStore::new(MayHomePaths::new(state.may_dir.clone()))
         .sandbox_dir(session_id.as_str(), session.profile_id.as_deref());
+
+    let reasoning_effort = session
+        .reasoning_effort
+        .as_deref()
+        .and_then(parse_reasoning_effort_token);
 
     Ok(SessionContext {
         session_id,
@@ -2018,7 +2015,18 @@ async fn resolve_session_context(
         profile_environment,
         profile_id: session.profile_id,
         plan_state: runtime.plan_state,
+        reasoning_effort,
     })
+}
+
+fn parse_reasoning_effort_token(token: &str) -> Option<aither_core::llm::model::ReasoningEffort> {
+    use aither_core::llm::model::ReasoningEffort;
+    match token.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        _ => None,
+    }
 }
 
 fn session_paths_for_session(
@@ -2188,17 +2196,6 @@ async fn setup_agent_environment(
                 browser_backend,
             }
         }
-        Some(crate::profile::ProfileEnvironment::Remote { .. }) => {
-            let profile = ctx
-                .profile_model
-                .as_ref()
-                .ok_or(UiChatPreparationError::MissingRemoteProfileModel)?;
-            let config = state.config_snapshot();
-            let ssh_server =
-                crate::profile::remote::resolve_remote_profile_server(profile, &config.ssh_servers)
-                    .map_err(UiChatPreparationError::ResolveRemoteServer)?;
-            crate::agent::AgentEnvironment::Remote { ssh_server }
-        }
         _ => crate::agent::AgentEnvironment::Local,
     };
 
@@ -2301,7 +2298,7 @@ async fn prepare_agent_for_request(
         brokers.ask_user,
         state.db(),
         &ctx.current_model,
-        None,
+        ctx.reasoning_effort,
         ctx.profile_id.clone(),
         Some(
             state

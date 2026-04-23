@@ -83,8 +83,75 @@ impl ChatDb {
         Self::initialize_schema(&db).await?;
         Self::ensure_profile_preference_columns(&db).await?;
         Self::ensure_session_runtime_columns(&db).await?;
+        Self::ensure_session_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
+        Self::migrate_legacy_remote_profiles(&db).await?;
         Ok(Self { db })
+    }
+
+    async fn ensure_session_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "PRAGMA table_info(sessions)")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        let existing = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        if !existing.contains("reasoning_effort") {
+            query!(db, "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT")
+                .execute()
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent data migration: any row with `environment='remote'` is
+    /// re-homed to `'local'` and, if it referenced an `ssh_server`, the
+    /// server name is inserted into the new `profile_remote_servers` junction
+    /// table so the attachment is preserved.
+    async fn migrate_legacy_remote_profiles(db: &SkyDb) -> Result<(), ChatDbError> {
+        let legacy = query!(
+            db,
+            "SELECT id, remote_ssh_server_id FROM profiles WHERE environment = 'remote'"
+        )
+        .fetch_all::<LegacyRemoteProfileRow>()
+        .await?;
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        let count = legacy.len();
+        let now = jiff::Timestamp::now().to_string();
+        for row in legacy {
+            if let Some(server_name) = row
+                .remote_ssh_server_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                query!(
+                    db,
+                    "INSERT OR IGNORE INTO profile_remote_servers (profile_id, ssh_server_name, sort_order, created_at) VALUES (?, ?, 0, ?)",
+                    row.id.as_str(),
+                    server_name,
+                    now.as_str()
+                )
+                .execute()
+                .await?;
+            }
+            query!(
+                db,
+                "UPDATE profiles SET environment = 'local', remote_ssh_server_id = NULL WHERE id = ?",
+                row.id.as_str()
+            )
+            .execute()
+            .await?;
+        }
+        tracing::info!(
+            count,
+            "migrated legacy remote profiles to local home + attached SSH servers",
+        );
+        Ok(())
     }
 
     async fn ensure_session_runtime_columns(db: &SkyDb) -> Result<(), ChatDbError> {
@@ -295,6 +362,12 @@ pub(super) fn truncate_preview(content: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LegacyRemoteProfileRow {
+    id: String,
+    remote_ssh_server_id: Option<String>,
+}
+
 /// Persisted permission request from structured history rows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PermissionRequestPayload {
@@ -331,7 +404,7 @@ mod tests {
     use crate::PermissionRequestMode;
     use crate::db::ProfileEnvironmentKind;
     use crate::db::entity::{scheduled_task_runs, session_run_leases};
-    use crate::profile::{ProfileEnvironment, ProfilePreferences, RemoteProfilePreferences};
+    use crate::profile::ProfileEnvironment;
     use crate::session::{
         PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
         PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
@@ -889,7 +962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_remote_profile_with_typed_environment() {
+    async fn profile_remote_attachments_round_trip() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
         let db = ChatDb::open(&db_path)
@@ -898,70 +971,123 @@ mod tests {
 
         let model = db
             .create_profile(CreateProfileParams {
-                id: "remote-profile",
-                name: "Remote",
-                environment: ProfileEnvironmentKind::Remote,
+                id: "local-profile",
+                name: "Local",
+                environment: ProfileEnvironmentKind::Local,
                 container_image: None,
                 slug: None,
                 icon: None,
                 persona: None,
-                preferences: Some(&ProfilePreferences {
-                    remote: Some(RemoteProfilePreferences {
-                        ssh_server_id: "prod".to_string(),
-                    }),
-                    container: None,
-                }),
+                preferences: None,
                 location_aware: false,
             })
             .await
-            .expect("remote profile should be created");
+            .expect("local profile should be created");
+
+        db.set_profile_remote_servers(
+            &model.id,
+            &[
+                "prod".to_string(),
+                "staging".to_string(),
+                "edge".to_string(),
+            ],
+        )
+        .await
+        .expect("attachments should persist");
 
         let info = db
             .profile_info_from_model(model)
             .await
-            .expect("remote profile should deserialize");
-        match info.environment.kind() {
-            ProfileEnvironment::Remote { ssh_server_id } => assert_eq!(ssh_server_id, "prod"),
-            other => panic!("expected remote environment, got {other:?}"),
-        }
+            .expect("profile should deserialize");
+        assert!(matches!(info.environment.kind(), ProfileEnvironment::Local));
+        assert_eq!(
+            info.remote_attachments,
+            vec![
+                "prod".to_string(),
+                "staging".to_string(),
+                "edge".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn rejects_remote_profile_without_ssh_server_binding() {
+    async fn profile_remote_attachments_replace_on_rewrite() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
         let db = ChatDb::open(&db_path)
             .await
             .expect("db should initialize successfully");
 
-        // Whitespace-only ssh_server_id should be rejected at creation
-        // time by normalize_profile_preferences — we don't want the
-        // invalid row to persist in the first place.
-        let error = db
+        let model = db
             .create_profile(CreateProfileParams {
-                id: "remote-profile",
-                name: "Remote",
-                environment: ProfileEnvironmentKind::Remote,
+                id: "attach-profile",
+                name: "Attach",
+                environment: ProfileEnvironmentKind::Local,
                 container_image: None,
                 slug: None,
                 icon: None,
                 persona: None,
-                preferences: Some(&ProfilePreferences {
-                    remote: Some(RemoteProfilePreferences {
-                        ssh_server_id: "  ".to_string(),
-                    }),
-                    container: None,
-                }),
+                preferences: None,
                 location_aware: false,
             })
             .await
-            .expect_err("invalid remote preferences must fail fast");
-        assert!(
-            error
-                .to_string()
-                .contains("preferences.remote.ssh_server_id"),
-            "unexpected error: {error}"
-        );
+            .expect("profile should be created");
+
+        db.set_profile_remote_servers(&model.id, &["a".to_string(), "b".to_string()])
+            .await
+            .expect("initial attachments");
+        db.set_profile_remote_servers(&model.id, &["c".to_string()])
+            .await
+            .expect("rewrite attachments");
+        let attachments = db
+            .list_profile_remote_servers(&model.id)
+            .await
+            .expect("attachments should load");
+        assert_eq!(attachments, vec!["c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn legacy_remote_environment_migrates_to_local_with_attachment() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+
+        {
+            let db = ChatDb::open(&db_path)
+                .await
+                .expect("initial open should succeed");
+            // Manufacture a legacy row by writing directly: the newer
+            // create_profile path refuses `remote`.
+            let now = jiff::Timestamp::now().to_string();
+            super::query!(
+                db.db,
+                "INSERT INTO profiles (id, slug, name, icon, environment, container_image, container_id, persona, remote_ssh_server_id, container_dockerfile, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 'remote', NULL, NULL, NULL, 'prod', NULL, 0, 10, 99, ?, ?)",
+                "legacy-remote",
+                Option::<String>::None,
+                "Legacy Remote",
+                Option::<String>::None,
+                now.as_str(),
+                now.as_str()
+            )
+            .execute()
+            .await
+            .expect("legacy row should insert");
+        }
+
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("second open triggers migration");
+        let model = db
+            .get_profile("legacy-remote")
+            .await
+            .expect("lookup")
+            .expect("legacy profile preserved");
+        assert_eq!(model.environment, "local");
+        assert_eq!(model.remote_ssh_server_id, None);
+        let attachments = db
+            .list_profile_remote_servers("legacy-remote")
+            .await
+            .expect("attachments lookup");
+        assert_eq!(attachments, vec!["prod".to_string()]);
     }
 
     #[tokio::test]
@@ -1071,6 +1197,7 @@ mod tests {
             output_file: Some("outputs/amber-forest-thunder-pearl.txt".to_string()),
             output_preview: Some("preview".to_string()),
             input_notice: Some("input needed".to_string()),
+            background_reason: None,
         };
         db.write_session_runtime(session_id, &runtime)
             .await

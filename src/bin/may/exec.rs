@@ -1,8 +1,10 @@
 //! `may exec` subcommand implementation.
 //!
 //! Runs a one-shot terminal command inside a session's home
-//! environment (local, remote SSH, or container) and renders the
-//! combined stdout/stderr/task-id payload back to the caller.
+//! environment (local or container) and renders the combined
+//! stdout/stderr/task-id payload back to the caller. When the profile
+//! has attached SSH servers, the command may select one via
+//! `--ssh-server-id <name>` with `--mode ssh`.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -194,17 +196,28 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
         None => None,
     };
     let profile_environment = match (profile_model.clone(), profile_preferences.as_ref()) {
-        (Some(model), Some(preferences)) => Some(
-            ProfileInfo::from_db_parts(model, preferences.clone())
-                .map_err(|source| ExecError::InvalidProfile {
-                    profile_id: profile_id
-                        .clone()
-                        .expect("profile id present when model exists"),
-                    source,
-                })?
-                .environment
-                .into_kind(),
-        ),
+        (Some(model), Some(preferences)) => {
+            let attachments =
+                db.list_profile_remote_servers(&model.id)
+                    .await
+                    .map_err(|source| ExecError::LoadProfile {
+                        profile_id: profile_id
+                            .clone()
+                            .expect("profile id present when model exists"),
+                        source,
+                    })?;
+            Some(
+                ProfileInfo::from_db_parts(model, preferences.clone(), attachments)
+                    .map_err(|source| ExecError::InvalidProfile {
+                        profile_id: profile_id
+                            .clone()
+                            .expect("profile id present when model exists"),
+                        source,
+                    })?
+                    .environment
+                    .into_kind(),
+            )
+        }
         (None, None) => None,
         _ => panic!("profile preferences must exist exactly when profile model exists"),
     };
@@ -276,38 +289,21 @@ async fn build_exec_terminal_tool(
     >,
     ExecError,
 > {
+    let ssh_servers = resolve_attached_ssh_servers(context, may_config).await?;
+    let ssh_available = !ssh_servers.is_empty();
     let mut shell_sessions = aither_sandbox::ShellSessionRegistry::new(match environment {
         may_agent::AgentEnvironment::Container { .. } => ShellRuntimeAvailability {
             local: false,
             container: true,
-            ssh: false,
-        },
-        may_agent::AgentEnvironment::Remote { .. } => ShellRuntimeAvailability {
-            local: false,
-            container: false,
-            ssh: true,
+            ssh: ssh_available,
         },
         may_agent::AgentEnvironment::Local => ShellRuntimeAvailability {
             local: true,
             container: false,
-            ssh: !may_config.ssh_servers.is_empty(),
+            ssh: ssh_available,
         },
     });
 
-    let ssh_servers = match environment {
-        may_agent::AgentEnvironment::Remote { ssh_server } => vec![SshServer {
-            name: ssh_server.name.clone(),
-            target: ssh_server.target.clone(),
-        }],
-        _ => may_config
-            .ssh_servers
-            .iter()
-            .map(|server| SshServer {
-                name: server.name.clone(),
-                target: server.target.clone(),
-            })
-            .collect(),
-    };
     if !ssh_servers.is_empty() {
         shell_sessions = shell_sessions
             .with_ssh_servers(ssh_servers)
@@ -368,7 +364,6 @@ async fn build_exec_terminal_tool(
             cwd: context.sandbox_dir.clone(),
             db: context.db.clone(),
             browser_config: may_config.browser.clone(),
-            ssh_servers: may_config.ssh_servers.clone(),
             network_policy: may_config.preferences.network_policy.clone(),
             ask_user_broker: may_agent::ask_user::channel().0,
         },
@@ -413,7 +408,6 @@ where
             search_embedder,
             task_runtime: match environment {
                 may_agent::AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
-                may_agent::AgentEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
                 may_agent::AgentEnvironment::Local => TaskRuntimeKind::Local,
             },
             task_broker: Some(tool_dispatchers.task.clone()),
@@ -432,6 +426,30 @@ where
     )))
 }
 
+async fn resolve_attached_ssh_servers(
+    context: &ExecSessionContext,
+    may_config: &MayConfig,
+) -> Result<Vec<SshServer>, ExecError> {
+    let profile_id = context.profile_model.as_ref().map(|p| p.id.as_str());
+    let servers = may_agent::profile::resolve_attached_ssh_servers(
+        &context.db,
+        profile_id,
+        &may_config.ssh_servers,
+    )
+    .await
+    .map_err(|source| ExecError::InvalidProfile {
+        profile_id: profile_id.unwrap_or_default().to_string(),
+        source,
+    })?;
+    Ok(servers
+        .into_iter()
+        .map(|s| SshServer {
+            name: s.name,
+            target: s.target,
+        })
+        .collect())
+}
+
 fn select_exec_model(config: &MayConfig) -> &str {
     config
         .last_model
@@ -442,7 +460,7 @@ fn select_exec_model(config: &MayConfig) -> &str {
 
 fn select_exec_mode(
     args: &ExecArgs,
-    environment: &may_agent::AgentEnvironment,
+    _environment: &may_agent::AgentEnvironment,
 ) -> TerminalExecutionMode {
     if let Some(mode) = args.mode {
         return mode;
@@ -450,10 +468,7 @@ fn select_exec_mode(
     if args.ssh_server_id.is_some() {
         return TerminalExecutionMode::Ssh;
     }
-    match environment {
-        may_agent::AgentEnvironment::Remote { .. } => TerminalExecutionMode::Ssh,
-        _ => TerminalExecutionMode::Default,
-    }
+    TerminalExecutionMode::Default
 }
 
 fn render_exec_result(result: &TerminalResult) -> Result<(), ExecError> {
