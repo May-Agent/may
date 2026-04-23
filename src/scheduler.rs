@@ -12,8 +12,8 @@ use aither_core::llm::Tool;
 use aither_sandbox::{
     BollardContainerExec, Configured, ContainerExecHandle, ContainerLaunchSpec,
     ContainerShellRuntime, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, SshServer, TerminalArgs, TerminalExecutionMode, TerminalMode,
-    TerminalResult, TerminalTool, ToolRegistryBuilder, permission::PermissionError,
+    ShellSessionRegistry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalResult,
+    TerminalTool, ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -23,7 +23,6 @@ use serde::Serialize;
 use shell_escape::escape as shell_escape;
 
 use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKind};
-use crate::config::SshServerConfig;
 use crate::container::lifecycle::ContainerManager;
 use crate::db::entity::{profiles, scheduled_tasks};
 use crate::db::{ChatDb, NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
@@ -44,7 +43,6 @@ pub struct TaskRuntime {
     ui_event_bus: Option<UiEventBus>,
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
-    ssh_servers: Arc<ArcSwap<Vec<SshServerConfig>>>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
 }
@@ -374,7 +372,6 @@ impl TaskRuntime {
             ui_event_bus: None,
             may_dir,
             container_manager: None,
-            ssh_servers: Arc::new(ArcSwap::from_pointee(Vec::new())),
             network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
         };
@@ -400,16 +397,6 @@ impl TaskRuntime {
     pub fn with_container_manager(mut self, container_manager: Arc<ContainerManager>) -> Self {
         self.container_manager = Some(container_manager);
         self
-    }
-
-    #[must_use]
-    pub fn with_ssh_servers(self, ssh_servers: Vec<SshServerConfig>) -> Self {
-        self.set_ssh_servers(ssh_servers);
-        self
-    }
-
-    pub fn set_ssh_servers(&self, ssh_servers: Vec<SshServerConfig>) {
-        self.ssh_servers.store(Arc::new(ssh_servers));
     }
 
     pub fn with_network_policy(self, network_policy: NetworkPolicyConfig) -> Result<Self, String> {
@@ -482,7 +469,6 @@ impl TaskRuntime {
         let actual_runtime = match profile_info.environment.kind() {
             ProfileEnvironment::Local => TaskRuntimeKind::Local,
             ProfileEnvironment::Container { .. } => TaskRuntimeKind::Container,
-            ProfileEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
         };
         if runtime_kind != actual_runtime {
             return Err(format!(
@@ -760,7 +746,6 @@ impl TaskRuntime {
         match profile_info.environment.kind() {
             ProfileEnvironment::Local => self.validate_local(&profile.id, &script).await,
             ProfileEnvironment::Container { .. } => self.validate_container(profile, &script).await,
-            ProfileEnvironment::Remote { .. } => self.validate_remote(profile, &script).await,
         }
     }
 
@@ -900,10 +885,6 @@ impl TaskRuntime {
             }
             ProfileEnvironment::Container { .. } => {
                 self.execute_container(task, &profile, materialized.command.clone())
-                    .await
-            }
-            ProfileEnvironment::Remote { .. } => {
-                self.execute_remote(&profile, materialized.command.clone())
                     .await
             }
         };
@@ -1113,87 +1094,6 @@ impl TaskRuntime {
                 .with_readable_paths([script.host_working_dir.clone()])
                 .with_registry(registry)
         })
-    }
-
-    fn resolve_remote_server(&self, profile: &profiles::Model) -> Result<SshServerConfig, String> {
-        let configured_servers = self.ssh_servers.load();
-        crate::profile::remote::resolve_remote_profile_server(
-            profile,
-            configured_servers.as_slice(),
-        )
-    }
-
-    async fn remote_terminal_tool(
-        &self,
-        profile: &profiles::Model,
-        working_dir: &std::path::Path,
-    ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
-        let ssh_server = self.resolve_remote_server(profile)?;
-        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: false,
-            container: false,
-            ssh: true,
-        })
-        .with_ssh_servers(vec![SshServer {
-            name: ssh_server.name,
-            target: ssh_server.target,
-        }])
-        .map_err(|error| prefixed_error("failed to configure remote ssh server: ", &error))?;
-        let registry = Arc::new(ToolRegistryBuilder::new().build(working_dir.join("outputs")));
-        let network_policy = self.network_policy.load().as_ref().clone();
-        TerminalTool::new_exact(
-            working_dir,
-            SchedulerPermissionHandler {
-                db: self.db.clone(),
-                ui_event_bus: self.ui_event_bus.clone(),
-                profile_id: profile.id.clone(),
-                source: NetworkAccessSource::TaskRemote,
-                allow_network: true,
-                network_policy,
-            },
-            DefaultExecutor,
-        )
-        .await
-        .map_err(|error| {
-            init_terminal_tool_error("failed to initialize remote terminal tool: ", &error)
-        })
-        .map(|tool| {
-            tool.with_shell_sessions(shell_sessions)
-                .with_writable_paths([working_dir.to_path_buf()])
-                .with_readable_paths([working_dir.to_path_buf()])
-                .with_registry(registry)
-        })
-    }
-
-    async fn execute_remote(
-        &self,
-        profile: &profiles::Model,
-        command: String,
-    ) -> Result<String, String> {
-        let working_dir = self.may_dir.join("tasks").join("remote").join(&profile.id);
-        tokio::fs::create_dir_all(working_dir.join("outputs"))
-            .await
-            .map_err(|error| workspace_prepare_error(&working_dir, &error))?;
-        let terminal_tool = self.remote_terminal_tool(profile, &working_dir).await?;
-        run_terminal_command(&terminal_tool, TerminalExecutionMode::Ssh, None, command).await
-    }
-
-    async fn validate_remote(
-        &self,
-        profile: &profiles::Model,
-        script: &TaskScript,
-    ) -> Result<(), String> {
-        let terminal_tool = self
-            .remote_terminal_tool(profile, script.host_working_dir.as_path())
-            .await?;
-        run_terminal_command(
-            &terminal_tool,
-            TerminalExecutionMode::Ssh,
-            None,
-            build_validation_command(script),
-        )
-        .await
-        .map(|_| ())
     }
 
     async fn execute_container(

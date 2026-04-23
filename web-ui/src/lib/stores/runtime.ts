@@ -1,26 +1,40 @@
 import { create } from 'zustand';
 import type {
   BrowserStatusPayload,
+  NetworkAccessLogsResponse,
   ProfileSessions,
+  RemoteAccessStatusResponse,
+  RequestLogsResponse,
   SessionRuntimeSummary,
   UiEvent,
 } from '../types';
 import { openUiEventStream } from '../api/events';
 import { useSessionsStore } from './sessions';
+import type { NotificationMailboxEntry } from '../api/notifications';
+
+interface MailboxEventPayload {
+  items?: NotificationMailboxEntry[];
+}
 
 interface RuntimeState {
   connected: boolean;
+  activeProfileId: string | null;
   browser: BrowserStatusPayload | null;
   runtimes: Record<string, SessionRuntimeSummary>;
   profileSessions: ProfileSessions | null;
+  mailbox: NotificationMailboxEntry[];
+  networkAccess: NetworkAccessLogsResponse | null;
+  requestLogs: RequestLogsResponse | null;
+  remoteAccess: RemoteAccessStatusResponse | null;
   abort: (() => void) | null;
 
-  connect: () => Promise<void>;
+  connect: (profileId?: string | null) => Promise<void>;
   disconnect: () => void;
+  reconnectForProfile: (profileId: string | null) => Promise<void>;
+  seedProfileSessions: (profileId: string | null, payload: ProfileSessions) => void;
 }
 
 const SUBSCRIBED_TOPICS = [
-  'heartbeat',
   'config',
   'browser_status',
   'profile_sessions',
@@ -28,19 +42,26 @@ const SUBSCRIBED_TOPICS = [
   'session_runtimes',
   'remote_access',
   'notification_mailbox',
+  'network_access_logs',
+  'request_logs',
 ];
 
 export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   connected: false,
+  activeProfileId: null,
   browser: null,
   runtimes: {},
   profileSessions: null,
+  mailbox: [],
+  networkAccess: null,
+  requestLogs: null,
+  remoteAccess: null,
   abort: null,
 
-  async connect() {
+  async connect(profileId = null) {
     if (get().abort) return;
-    const handle = await openUiEventStream(SUBSCRIBED_TOPICS);
-    set({ abort: handle.abort, connected: true });
+    const handle = await openUiEventStream(SUBSCRIBED_TOPICS, { profileId });
+    set({ abort: handle.abort, connected: true, activeProfileId: profileId ?? null });
 
     (async () => {
       try {
@@ -66,6 +87,20 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
               set({ runtimes: next });
               break;
             }
+            case 'notification_mailbox': {
+              const payload = evt.payload as MailboxEventPayload;
+              set({ mailbox: payload.items ?? [] });
+              break;
+            }
+            case 'network_access_logs':
+              set({ networkAccess: evt.payload });
+              break;
+            case 'request_logs':
+              set({ requestLogs: evt.payload });
+              break;
+            case 'remote_access':
+              set({ remoteAccess: evt.payload.status });
+              break;
             default:
               break;
           }
@@ -81,5 +116,24 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   disconnect() {
     get().abort?.();
     set({ abort: null, connected: false });
+  },
+
+  async reconnectForProfile(profileId) {
+    const { activeProfileId, abort } = get();
+    if (activeProfileId === profileId && abort) return;
+    abort?.();
+    set({
+      abort: null,
+      connected: false,
+      activeProfileId: profileId,
+      profileSessions: null,
+    });
+    await get().connect(profileId);
+  },
+
+  seedProfileSessions(profileId, payload) {
+    if (payload.profile.id !== profileId) return;
+    if (get().profileSessions) return;
+    set({ profileSessions: payload });
   },
 }));

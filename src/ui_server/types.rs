@@ -29,6 +29,7 @@ pub enum ApiErrorCode {
     ContainerRuntimeUnavailable,
     ManagedPodmanApprovalRequired,
     LocationUnavailable,
+    UnknownSshServer,
 }
 
 /// Structured error body with a machine-readable `code` and human-readable `error` message.
@@ -721,7 +722,7 @@ impl ApiSession {
             messages,
             profile_id: summary.profile_id,
             model,
-            reasoning_effort: None,
+            reasoning_effort: summary.reasoning_effort.clone(),
             runtime: summary.runtime.clone().into(),
         }
     }
@@ -758,6 +759,21 @@ pub struct UpdateSessionRequest {
     pub(crate) title: Option<String>,
     #[serde(default)]
     pub(crate) model: Option<String>,
+    /// Tri-state reasoning-effort patch:
+    /// field absent → `None` (leave DB untouched);
+    /// field present + `null` → `Some(None)` (clear to NULL);
+    /// field present + string → `Some(Some(s))` (set).
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub(crate) reasoning_effort: Option<Option<String>>,
+}
+
+fn deserialize_optional_field<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

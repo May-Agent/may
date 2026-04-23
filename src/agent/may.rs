@@ -25,8 +25,8 @@ use super::runtime_context::{
     RuntimeSystemContext, build_base_system_prompt, build_browser_context,
     build_container_environment_context, build_location_context,
     build_macos_host_automation_context, build_memory_context_content, build_native_voice_context,
-    build_network_restrictions_context, build_plan_mode_context, build_remote_environment_context,
-    build_terminal_runtime_context, build_workspace_context, build_workspace_workdirs_context, tag,
+    build_network_restrictions_context, build_plan_mode_context, build_terminal_runtime_context,
+    build_workspace_context, build_workspace_workdirs_context, tag,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
@@ -67,14 +67,15 @@ pub enum MayAgentError {
 }
 
 /// Execution environment for a `MayAgent`.
+///
+/// Only `Local` and `Container` are valid home environments. SSH servers
+/// attached to the profile are surfaced through `MayAgentConfig::ssh_servers`
+/// and reached per-command via the `terminal` tool's `mode: "ssh"` +
+/// `ssh_server_id: <name>` parameters. There is no remote-home variant: remote
+/// is a per-invocation routing choice, not a session-level environment.
 pub enum AgentEnvironment {
     /// Native macOS sandbox via heel.
     Local,
-    /// Local home environment with one designated remote SSH target.
-    Remote {
-        /// The configured SSH target bound to this profile.
-        ssh_server: crate::config::SshServerConfig,
-    },
     /// Docker container-based isolation.
     Container {
         /// Container ID from Docker.
@@ -197,20 +198,14 @@ impl MayAgent {
             session_paths.workspace_config(),
         )?;
 
-        let ssh_servers: Vec<SshServer> = match &config.environment {
-            AgentEnvironment::Local | AgentEnvironment::Container { .. } => config
-                .ssh_servers
-                .iter()
-                .map(|s| SshServer {
-                    name: s.name.clone(),
-                    target: s.target.clone(),
-                })
-                .collect(),
-            AgentEnvironment::Remote { ssh_server } => vec![SshServer {
-                name: ssh_server.name.clone(),
-                target: ssh_server.target.clone(),
-            }],
-        };
+        let ssh_servers: Vec<SshServer> = config
+            .ssh_servers
+            .iter()
+            .map(|s| SshServer {
+                name: s.name.clone(),
+                target: s.target.clone(),
+            })
+            .collect();
         let ssh_enabled = !ssh_servers.is_empty();
 
         // Read global memory from the database.
@@ -229,6 +224,7 @@ impl MayAgent {
             &config,
             &session_paths,
             aither_models::lookup(config.model_id.as_str()),
+            config.ssh_servers.clone(),
         );
         runtime_system_context =
             runtime_system_context.with_terminal_runtime(terminal_runtime.clone());
@@ -265,14 +261,16 @@ impl MayAgent {
             (home.skills_dir(), home.subagents_dir())
         };
 
-        // Shell runtime depends on the environment
+        // Shell runtime depends on the home environment. SSH remains a
+        // per-command routing capability on top of Local (it cannot be the
+        // session-level runtime here).
         let availability = match &config.environment {
             AgentEnvironment::Container { .. } => ShellRuntimeAvailability {
                 local: false,
                 container: true,
-                ssh: false,
+                ssh: ssh_enabled,
             },
-            AgentEnvironment::Remote { .. } | AgentEnvironment::Local => ShellRuntimeAvailability {
+            AgentEnvironment::Local => ShellRuntimeAvailability {
                 local: true,
                 container: false,
                 ssh: ssh_enabled,
@@ -303,7 +301,6 @@ impl MayAgent {
                 search_embedder: config.search_embedder.clone(),
                 task_runtime: match &config.environment {
                     AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
-                    AgentEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
                     AgentEnvironment::Local => TaskRuntimeKind::Local,
                 },
                 task_broker: config.task_broker.clone(),
@@ -437,12 +434,6 @@ impl MayAgent {
                     builder = builder.system_text(tag::PLATFORM, macos_hint);
                 }
             }
-            AgentEnvironment::Remote { ssh_server } => {
-                let remote_context = build_remote_environment_context(&workspace, &ssh_server);
-                runtime_system_context =
-                    runtime_system_context.with_remote_environment(remote_context.clone());
-                builder = builder.system_text(tag::REMOTE_ENVIRONMENT_CONTEXT, remote_context);
-            }
         }
 
         let browser_context =
@@ -501,6 +492,18 @@ impl MayAgent {
             Parameters::default()
         };
 
+        let ssh_servers = crate::profile::resolve_attached_ssh_servers(
+            &db,
+            profile_id.as_deref(),
+            &may_config.ssh_servers,
+        )
+        .await
+        .map_err(|error| {
+            MayAgentError::Sandbox(format!(
+                "failed to load SSH attachments for profile {profile_id:?}: {error}"
+            ))
+        })?;
+
         let config = MayAgentConfig {
             llm,
             model_id: model.to_string(),
@@ -515,7 +518,7 @@ impl MayAgent {
             workspace_request_broker,
             ask_user_broker,
             image_generator: resolve_image_generator_config(may_config),
-            ssh_servers: may_config.ssh_servers.clone(),
+            ssh_servers,
             permission_approver,
             environment,
             profile_persona,

@@ -29,8 +29,8 @@ describe('parsePartialJson', () => {
     expect(parsePartialJson('{"command":"ls",')).toEqual({ command: 'ls' });
   });
 
-  test('recovers from trailing colon', () => {
-    expect(parsePartialJson('{"command":')).toEqual({ command: null });
+  test('drops incomplete key on trailing colon', () => {
+    expect(parsePartialJson('{"command":')).toEqual({});
   });
 
   test('handles nested objects mid-stream', () => {

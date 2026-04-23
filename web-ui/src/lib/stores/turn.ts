@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ChatRequestPayload, ChatStreamEvent } from '../types';
+import type { ApiMessage, ChatRequestPayload, ChatStreamEvent } from '../types';
 import { openChatStream } from '../api/chat';
 import { applyEvent, emptyTurn, type TurnState } from '../stream/reducer';
 import { useSessionsStore } from './sessions';
@@ -10,15 +10,20 @@ interface TurnSliceState {
   last: TurnState | null;
   /** Aborts the current stream. */
   abort: (() => void) | null;
+  /** Payload of the most recent send — used to retry after an error. */
+  lastPayload: ChatRequestPayload | null;
 
   send: (payload: ChatRequestPayload) => Promise<void>;
   cancel: () => void;
+  retry: () => Promise<void>;
+  dismissError: () => void;
 }
 
 export const useTurnStore = create<TurnSliceState>((set, get) => ({
   active: null,
   last: null,
   abort: null,
+  lastPayload: null,
 
   async send(payload) {
     get().cancel();
@@ -28,6 +33,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => ({
       active: emptyTurn('', payload.sessionId, ''),
       last: null,
       abort: null,
+      lastPayload: payload,
     });
 
     let handle;
@@ -51,6 +57,8 @@ export const useTurnStore = create<TurnSliceState>((set, get) => ({
 
     set({ abort: handle.abort });
 
+    let doneAssistant: ApiMessage | null = null;
+
     try {
       for await (const evt of handle.events as AsyncGenerator<ChatStreamEvent>) {
         set((prev) => {
@@ -59,8 +67,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => ({
         });
 
         if (evt.kind === 'done') {
-          const assistant = evt.assistant;
-          useSessionsStore.getState().appendMessage(assistant);
+          doneAssistant = evt.assistant;
         }
       }
     } catch (err) {
@@ -88,11 +95,25 @@ export const useTurnStore = create<TurnSliceState>((set, get) => ({
       last: prev.active,
       abort: null,
     }));
+
+    if (doneAssistant) {
+      useSessionsStore.getState().appendMessage(doneAssistant);
+    }
   },
 
   cancel() {
     const { abort } = get();
     if (abort) abort();
     set({ abort: null });
+  },
+
+  async retry() {
+    const { lastPayload } = get();
+    if (!lastPayload) return;
+    await get().send(lastPayload);
+  },
+
+  dismissError() {
+    set({ last: null });
   },
 }));

@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT, model TEXT, preview TEXT, message_count INTEGER NOT NULL, profile_id TEXT, pinned BOOLEAN NOT NULL, archived BOOLEAN NOT NULL, folder_id TEXT, pin_sort_order INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT, model TEXT, preview TEXT, message_count INTEGER NOT NULL, profile_id TEXT, pinned BOOLEAN NOT NULL, archived BOOLEAN NOT NULL, folder_id TEXT, pin_sort_order INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reasoning_effort TEXT);
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, timestamp TEXT, tool_call_id TEXT, provider_id TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, context_window INTEGER, elapsed_ms INTEGER);
 CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, slug TEXT UNIQUE, name TEXT NOT NULL, icon TEXT, environment TEXT NOT NULL, container_image TEXT, container_id TEXT, persona TEXT, remote_ssh_server_id TEXT, container_dockerfile TEXT, location_aware BOOLEAN NOT NULL, pinned_limit INTEGER NOT NULL, sort_order INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, name TEXT NOT NULL, sort_order INTEGER NOT NULL, created_at TEXT NOT NULL);
@@ -64,4 +64,6 @@ CREATE INDEX IF NOT EXISTS idx_session_pending_permissions_session ON session_pe
 CREATE INDEX IF NOT EXISTS idx_session_pending_workspace_session ON session_pending_workspace(session_id);
 CREATE TABLE IF NOT EXISTS session_tasks (session_id TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS global_memory (id INTEGER PRIMARY KEY CHECK (id = 1), content TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS profile_remote_servers (profile_id TEXT NOT NULL, ssh_server_name TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, PRIMARY KEY (profile_id, ssh_server_name));
+CREATE INDEX IF NOT EXISTS idx_profile_remote_servers_profile ON profile_remote_servers(profile_id, sort_order);
 PRAGMA journal_mode=WAL;

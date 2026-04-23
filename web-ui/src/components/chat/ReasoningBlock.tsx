@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ChevronDown, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/lib/i18n';
 
 interface ReasoningBlockProps {
   text: string;
@@ -9,6 +10,7 @@ interface ReasoningBlockProps {
 
 export function ReasoningBlock({ text, streaming }: ReasoningBlockProps) {
   const [open, setOpen] = useState(false);
+  const { t } = useTranslation();
   if (text.length === 0) return null;
   return (
     <div className="rounded-lg border border-dashed border-border/60 bg-muted/20 px-3 py-2">
@@ -19,7 +21,7 @@ export function ReasoningBlock({ text, streaming }: ReasoningBlockProps) {
       >
         <Sparkles className={cn('size-3.5', streaming && 'animate-pulse')} />
         <span className={streaming ? 'shimmer-text font-medium' : 'font-medium'}>
-          {streaming ? 'Thinking…' : 'Thought'}
+          {streaming ? `${t('chat.thinking')}…` : t('chat.thought')}
         </span>
         <ChevronDown className={cn('size-3 ml-auto transition-transform', open && 'rotate-180')} />
       </button>

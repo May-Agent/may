@@ -362,8 +362,13 @@ pub(super) async fn update_session(
     let mut model_to_persist: Option<String> = None;
     let requested_title = req.title.clone();
     let requested_model = req.model.clone();
+    let requested_effort_patch = req.reasoning_effort.clone();
     let next_title = requested_title.clone().or_else(|| session.title.clone());
     let next_model = requested_model.clone().or_else(|| session.model.clone());
+    let next_effort = match requested_effort_patch.as_ref() {
+        Some(patch) => patch.clone(),
+        None => session.reasoning_effort.clone(),
+    };
 
     if let Some(model) = next_model.clone()
         && session.model.as_deref() != Some(model.as_str())
@@ -371,9 +376,18 @@ pub(super) async fn update_session(
         model_to_persist = Some(model);
     }
 
-    db.update_session(&id, requested_title.as_deref(), requested_model.as_deref())
-        .await
-        .map_err(internal_error)?;
+    let effort_patch_ref = requested_effort_patch
+        .as_ref()
+        .map(|inner| inner.as_deref());
+
+    db.update_session(
+        &id,
+        requested_title.as_deref(),
+        requested_model.as_deref(),
+        effort_patch_ref,
+    )
+    .await
+    .map_err(internal_error)?;
 
     if let Some(model) = model_to_persist {
         persist_last_model(&state, &model)
@@ -400,7 +414,7 @@ pub(super) async fn update_session(
         messages: Vec::new(),
         profile_id: session.profile_id,
         model,
-        reasoning_effort: None,
+        reasoning_effort: next_effort,
         runtime: runtime.into(),
     }))
 }
