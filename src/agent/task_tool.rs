@@ -13,7 +13,6 @@ use crate::task_trigger::{NormalizedTaskTrigger, TaskTriggerRequest, TaskTrigger
 pub enum TaskRuntimeKind {
     Local,
     Container,
-    Remote,
 }
 
 impl TaskRuntimeKind {
@@ -22,7 +21,6 @@ impl TaskRuntimeKind {
         match self {
             Self::Local => "local",
             Self::Container => "container",
-            Self::Remote => "remote",
         }
     }
 }
@@ -122,7 +120,7 @@ impl TaskCreateRequest {
             TaskRuntimeKind::Local => self.args.needs_network.ok_or_else(|| {
                 "local(heel) task must explicitly set needs_network to true or false".to_string()
             })?,
-            TaskRuntimeKind::Container | TaskRuntimeKind::Remote => false,
+            TaskRuntimeKind::Container => false,
         };
 
         Ok(NormalizedTaskCreateRequest {

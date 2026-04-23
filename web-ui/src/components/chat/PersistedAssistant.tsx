@@ -27,10 +27,11 @@ function extractTools(toolEvent: unknown): TurnToolState[] {
       variant: evt.variant,
       argumentsRaw: '',
       status: 'done' as const,
-      seq: 0,
+      seq: evt.seq ?? 0,
     };
     if (evt.stage === 'start') {
       existing.argumentsRaw = evt.arguments ?? existing.argumentsRaw;
+      if (typeof evt.seq === 'number') existing.seq = evt.seq;
     } else {
       existing.argumentsRaw = evt.arguments ?? existing.argumentsRaw;
       existing.result = evt.result;
@@ -38,7 +39,7 @@ function extractTools(toolEvent: unknown): TurnToolState[] {
     }
     map.set(evt.id, existing);
   }
-  return Array.from(map.values());
+  return Array.from(map.values()).sort((a, b) => a.seq - b.seq);
 }
 
 export function PersistedAssistant({ message }: { message: ApiMessage }) {

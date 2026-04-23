@@ -230,7 +230,6 @@ where
             cwd: app.cwd.clone(),
             db: app.session_manager.db().clone(),
             browser_config: app.config.browser.clone(),
-            ssh_servers: app.config.ssh_servers.clone(),
             network_policy: app.config.preferences.network_policy.clone(),
             ask_user_broker: ask_user_broker.clone(),
         },

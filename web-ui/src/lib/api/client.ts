@@ -58,6 +58,28 @@ export async function apiPost<T>(
   }
 }
 
+export async function apiPut<T>(path: string, body?: unknown, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (body !== undefined && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  const res = await fetch(`/api${path}`, {
+    ...init,
+    method: 'PUT',
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw await decodeError(res);
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (text.length === 0) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return undefined as T;
+  }
+}
+
 export async function apiDelete<T>(path: string): Promise<T> {
   const res = await fetch(`/api${path}`, { method: 'DELETE' });
   if (!res.ok) throw await decodeError(res);

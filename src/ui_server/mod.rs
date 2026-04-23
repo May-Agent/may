@@ -216,7 +216,6 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
             .context("failed to load task runtime state")?
             .with_notifier(notification_service.clone())
             .with_ui_event_bus(ui_event_bus.clone())
-            .with_ssh_servers(config.ssh_servers.clone())
             .with_network_policy(config.preferences.network_policy.clone())
             .map_err(|error| anyhow!(error))?;
     if let Some(ref manager) = container_manager {
@@ -313,8 +312,9 @@ fn api_routes() -> Route {
     };
     use profiles::{
         archive_session, create_folder, create_profile, delete_folder, delete_profile,
-        get_profile_sessions, list_profiles, move_to_folder, pin_session, unarchive_session,
-        unpin_session, update_folder, update_profile,
+        get_profile_remote_servers, get_profile_sessions, list_profiles, move_to_folder,
+        pin_session, set_profile_remote_servers, unarchive_session, unpin_session, update_folder,
+        update_profile,
     };
     use remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
     use sessions::{
@@ -379,6 +379,8 @@ fn api_routes() -> Route {
                 "/{id}".delete(delete_profile),
                 "/{id}/sessions".at(get_profile_sessions),
                 "/{id}/folders".post(create_folder),
+                "/{id}/remotes".at(get_profile_remote_servers),
+                "/{id}/remotes".put(set_profile_remote_servers),
             ))),
         )),
         Route::new((

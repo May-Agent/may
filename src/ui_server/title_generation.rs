@@ -105,7 +105,12 @@ async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
         return;
     }
     if let Err(error) = db
-        .update_session(session_id.as_str(), Some(generated_title.as_str()), None)
+        .update_session(
+            session_id.as_str(),
+            Some(generated_title.as_str()),
+            None,
+            None,
+        )
         .await
     {
         tracing::warn!(

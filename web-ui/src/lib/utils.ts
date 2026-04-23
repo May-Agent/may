@@ -1,5 +1,16 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { formatDistanceToNow, type Locale as DateFnsLocale } from 'date-fns';
+import { enUS as dfEnUS } from 'date-fns/locale/en-US';
+import { zhTW as dfZhTW } from 'date-fns/locale/zh-TW';
+import { ja as dfJa } from 'date-fns/locale/ja';
+import { useLocaleStore, type Locale } from './i18n';
+
+const DATE_FNS_LOCALES: Record<Locale, DateFnsLocale> = {
+  'en-US': dfEnUS,
+  'zh-Hant': dfZhTW,
+  ja: dfJa,
+};
 
 export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs));
@@ -15,23 +26,19 @@ export function formatDurationMs(ms: number): string {
   return `${minutes}m ${remSeconds}s`;
 }
 
-export function formatRelativeTime(iso: string | number | Date): string {
-  const date = typeof iso === 'string' || typeof iso === 'number' ? new Date(iso) : iso;
-  if (Number.isNaN(date.getTime())) return '';
-  const diffMs = Date.now() - date.getTime();
-  const diffSec = Math.round(diffMs / 1000);
-  if (diffSec < 45) return 'just now';
-  if (diffSec < 90) return '1 min ago';
-  const diffMin = Math.round(diffSec / 60);
-  if (diffMin < 45) return `${diffMin} min ago`;
-  if (diffMin < 90) return '1 hour ago';
-  const diffHr = Math.round(diffMin / 60);
-  if (diffHr < 22) return `${diffHr} hours ago`;
-  if (diffHr < 36) return 'yesterday';
-  const diffDay = Math.round(diffHr / 24);
-  if (diffDay < 25) return `${diffDay} days ago`;
-  const diffMonth = Math.round(diffDay / 30);
-  if (diffMonth < 11) return `${diffMonth} months ago`;
-  const diffYear = Math.round(diffDay / 365);
-  return `${diffYear} year${diffYear === 1 ? '' : 's'} ago`;
+function toDate(value: string | number | Date): Date | null {
+  const date = typeof value === 'string' || typeof value === 'number' ? new Date(value) : value;
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+export function formatRelativeTime(value: string | number | Date, locale?: Locale): string {
+  const date = toDate(value);
+  if (!date) return '';
+  const active = locale ?? useLocaleStore.getState().locale;
+  return formatDistanceToNow(date, { addSuffix: true, locale: DATE_FNS_LOCALES[active] });
+}
+
+export function useFormatRelativeTime(): (value: string | number | Date) => string {
+  const locale = useLocaleStore((s) => s.locale);
+  return (value) => formatRelativeTime(value, locale);
 }

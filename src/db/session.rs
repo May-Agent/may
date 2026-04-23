@@ -55,7 +55,7 @@ impl ChatDb {
         let now = jiff::Timestamp::now().to_string();
         query!(
             self.db,
-            "INSERT INTO sessions (id, title, model, preview, message_count, profile_id, pinned, archived, folder_id, pin_sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id, title, model, preview, message_count, profile_id, pinned, archived, folder_id, pin_sort_order, created_at, updated_at, reasoning_effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             id,
             title,
             model,
@@ -67,7 +67,8 @@ impl ChatDb {
             Option::<String>::None,
             Option::<i32>::None,
             now.clone(),
-            now
+            now,
+            Option::<String>::None
         )
         .execute()
         .await?;
@@ -1182,12 +1183,16 @@ impl ChatDb {
         .is_some())
     }
 
-    /// Update session metadata (title and/or model).
+    /// Update session metadata (title, model, and/or reasoning effort).
+    ///
+    /// `reasoning_effort` uses a tri-state patch: `None` leaves the column
+    /// untouched, `Some(None)` clears it to NULL, `Some(Some(value))` sets it.
     pub async fn update_session(
         &self,
         id: &str,
         title: Option<&str>,
         model: Option<&str>,
+        reasoning_effort: Option<Option<&str>>,
     ) -> Result<(), ChatDbError> {
         let mut existing = self
             .get_session(id)
@@ -1199,10 +1204,13 @@ impl ChatDb {
         if let Some(model) = model {
             existing.model = Some(model.to_string());
         }
+        if let Some(effort_patch) = reasoning_effort {
+            existing.reasoning_effort = effort_patch.map(ToString::to_string);
+        }
         existing.updated_at = jiff::Timestamp::now().to_string();
         query!(
             self.db,
-            "UPDATE sessions SET title = ?, model = ?, preview = ?, message_count = ?, profile_id = ?, pinned = ?, archived = ?, folder_id = ?, pin_sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE sessions SET title = ?, model = ?, preview = ?, message_count = ?, profile_id = ?, pinned = ?, archived = ?, folder_id = ?, pin_sort_order = ?, created_at = ?, updated_at = ?, reasoning_effort = ? WHERE id = ?",
             existing.title.as_deref(),
             existing.model.as_deref(),
             existing.preview.as_deref(),
@@ -1214,6 +1222,7 @@ impl ChatDb {
             existing.pin_sort_order,
             existing.created_at.as_str(),
             existing.updated_at.as_str(),
+            existing.reasoning_effort.as_deref(),
             id
         )
         .execute()

@@ -31,8 +31,29 @@ export function createSession(payload?: { title?: string; profileId?: string | n
   return apiPost<ApiSession>('/sessions', payload ?? {});
 }
 
-export function renameSession(id: string, title: string): Promise<void> {
-  return apiPost<void>(`/sessions/${encodeURIComponent(id)}/rename`, { title });
+export type ReasoningEffortPatch = 'low' | 'medium' | 'high' | null;
+
+export interface UpdateSessionPatch {
+  title?: string;
+  model?: string;
+  /**
+   * Tri-state effort override: omit to leave unchanged, `null` to clear, or a
+   * specific level to set. The backend mirrors this semantics.
+   */
+  reasoningEffort?: ReasoningEffortPatch;
+}
+
+export async function updateSession(
+  id: string,
+  patch: UpdateSessionPatch,
+): Promise<ApiSession> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(`update session failed: ${res.status}`);
+  return (await res.json()) as ApiSession;
 }
 
 export function deleteSession(id: string): Promise<void> {
@@ -45,4 +66,16 @@ export function archiveSession(id: string): Promise<void> {
 
 export function unarchiveSession(id: string): Promise<void> {
   return apiPost<void>(`/sessions/${encodeURIComponent(id)}/unarchive`, {});
+}
+
+export function pinSession(id: string): Promise<void> {
+  return apiPost<void>(`/sessions/${encodeURIComponent(id)}/pin`, {});
+}
+
+export function unpinSession(id: string): Promise<void> {
+  return apiPost<void>(`/sessions/${encodeURIComponent(id)}/unpin`, {});
+}
+
+export function moveSessionToFolder(id: string, folderId: string | null): Promise<void> {
+  return apiPost<void>(`/sessions/${encodeURIComponent(id)}/move-to-folder`, { folderId });
 }

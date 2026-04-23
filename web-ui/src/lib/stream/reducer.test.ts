@@ -199,6 +199,60 @@ describe('reducer', () => {
     expect(t.text).toBe('Hello, world!');
   });
 
+  test('segments preserve chronological order of text and tool events', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'Let me search. ' },
+      {
+        kind: 'tool_start',
+        seq: 3,
+        turnId: 't1',
+        id: 'c1',
+        name: 'web_search',
+        variant: 'web_search',
+        arguments: '{"q":"may"}',
+      },
+      {
+        kind: 'tool_end',
+        seq: 4,
+        turnId: 't1',
+        id: 'c1',
+        name: 'web_search',
+        variant: 'web_search',
+        arguments: '{"q":"may"}',
+        result: {},
+      },
+      { kind: 'text', seq: 5, turnId: 't1', chunk: 'Found it. ' },
+      {
+        kind: 'tool_start',
+        seq: 6,
+        turnId: 't1',
+        id: 'c2',
+        name: 'web_fetch',
+        variant: 'web_fetch',
+        arguments: '{"url":"x"}',
+      },
+      { kind: 'text', seq: 7, turnId: 't1', chunk: 'Done.' },
+    ]);
+    const kinds = t.segments.map((s) => (s.kind === 'text' ? 'text' : s.toolId));
+    expect(kinds).toEqual(['text', 'c1', 'text', 'c2', 'text']);
+    expect(t.segments[0]).toMatchObject({ kind: 'text', text: 'Let me search. ' });
+    expect(t.segments[2]).toMatchObject({ kind: 'text', text: 'Found it. ' });
+    expect(t.segments[4]).toMatchObject({ kind: 'text', text: 'Done.' });
+    expect(t.text).toBe('Let me search. Found it. Done.');
+  });
+
+  test('consecutive text chunks coalesce into one segment', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'Hel' },
+      { kind: 'text', seq: 3, turnId: 't1', chunk: 'lo ' },
+      { kind: 'text', seq: 4, turnId: 't1', chunk: 'world' },
+    ]);
+    expect(t.segments.length).toBe(1);
+    expect(t.segments[0]).toMatchObject({ kind: 'text', text: 'Hello world' });
+  });
+
   test('ping bumps seq but leaves state otherwise untouched', () => {
     const t = stream([
       { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },

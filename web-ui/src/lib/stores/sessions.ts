@@ -6,8 +6,9 @@ import {
   deleteSession,
   getSession,
   listSessions,
-  renameSession,
+  updateSession,
   unarchiveSession,
+  type ReasoningEffortPatch,
 } from '../api/sessions';
 
 interface SessionSummary {
@@ -31,12 +32,14 @@ interface SessionsState {
   open: (id: string) => Promise<void>;
   createNew: (profileId?: string | null) => Promise<ApiSession>;
   rename: (id: string, title: string) => Promise<void>;
+  setModel: (id: string, model: string) => Promise<void>;
+  setReasoningEffort: (id: string, effort: ReasoningEffortPatch) => Promise<void>;
   remove: (id: string) => Promise<void>;
   archive: (id: string, archived: boolean) => Promise<void>;
 
   appendMessage: (msg: ApiMessage) => void;
   replaceMessage: (msg: ApiMessage) => void;
-  updateRuntime: (id: string, runtime: SessionRuntimeSummary) => void;
+  updateRuntime: (id: string, runtime: Partial<SessionRuntimeSummary>) => void;
 }
 
 export const useSessionsStore = create<SessionsState>((set, get) => ({
@@ -99,7 +102,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   },
 
   async rename(id, title) {
-    await renameSession(id, title);
+    await updateSession(id, { title });
     set((prev) => {
       const entry = prev.index[id];
       if (!entry) return prev;
@@ -108,6 +111,23 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
         active: prev.active?.id === id ? { ...prev.active, title } : prev.active,
       };
     });
+  },
+
+  async setModel(id, model) {
+    const updated = await updateSession(id, { model });
+    set((prev) => ({
+      active: prev.active?.id === id ? { ...prev.active, model: updated.model } : prev.active,
+    }));
+  },
+
+  async setReasoningEffort(id, effort) {
+    const updated = await updateSession(id, { reasoningEffort: effort });
+    set((prev) => ({
+      active:
+        prev.active?.id === id
+          ? { ...prev.active, reasoningEffort: updated.reasoningEffort ?? null }
+          : prev.active,
+    }));
   },
 
   async remove(id) {
@@ -141,16 +161,18 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     }));
   },
 
-  updateRuntime(id, runtime) {
+  updateRuntime(id, patch) {
     set((prev) => {
       const entry = prev.index[id];
       if (!entry) return prev;
+      const nextRuntime: SessionRuntimeSummary = { ...(entry.runtime ?? {}), ...patch };
+      const active =
+        prev.active?.id === id
+          ? { ...prev.active, runtime: { ...prev.active.runtime, ...patch } }
+          : prev.active;
       return {
-        index: { ...prev.index, [id]: { ...entry, runtime } },
-        active:
-          prev.active?.id === id
-            ? { ...prev.active, runtime }
-            : prev.active,
+        index: { ...prev.index, [id]: { ...entry, runtime: nextRuntime } },
+        active,
       };
     });
   },

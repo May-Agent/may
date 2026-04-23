@@ -13,7 +13,7 @@ use crate::browser_service::{
     BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus,
     persist_browser_page_capture,
 };
-use crate::config::{BrowserConfig, SshServerConfig};
+use crate::config::BrowserConfig;
 use crate::network_policy::NetworkPolicyConfig;
 use crate::notification::{NotificationManager, NotificationService};
 use crate::scheduler::TaskRuntime;
@@ -45,7 +45,6 @@ pub struct ToolDispatchConfig {
     pub cwd: PathBuf,
     pub db: ChatDb,
     pub browser_config: BrowserConfig,
-    pub ssh_servers: Vec<SshServerConfig>,
     pub network_policy: NetworkPolicyConfig,
     pub ask_user_broker: AskUserBroker,
 }
@@ -92,7 +91,6 @@ impl ToolDispatchers {
                 .map_err(ToolDispatchError::LoadTaskRuntime)?
                 .with_notifier(notification_service.clone())
                 .with_ui_event_bus(ui_event_bus)
-                .with_ssh_servers(config.ssh_servers.clone())
                 .with_network_policy(config.network_policy.clone())
                 .map_err(ToolDispatchError::ConfigureTaskRuntime)?,
         );

@@ -1,5 +1,6 @@
 import { CheckSquare, Square } from 'lucide-react';
 import type { SseTodoItem } from '@/lib/types';
+import { useTranslation } from '@/lib/i18n';
 
 interface TodoBlockProps {
   items: SseTodoItem[];
@@ -8,11 +9,12 @@ interface TodoBlockProps {
 }
 
 export function TodoBlock({ items, total, completed }: TodoBlockProps) {
+  const { t } = useTranslation();
   if (items.length === 0) return null;
   return (
     <div className="rounded-lg border border-border bg-card/40 px-3 py-2">
       <div className="flex items-center justify-between text-xs">
-        <span className="font-medium">Plan</span>
+        <span className="font-medium">{t('chat.plan')}</span>
         <span className="text-muted-foreground">
           {completed}/{total}
         </span>

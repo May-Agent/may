@@ -25,6 +25,10 @@ export interface TurnErrorState {
   retryable: boolean;
 }
 
+export type TurnSegment =
+  | { kind: 'text'; text: string; seq: number }
+  | { kind: 'tool'; toolId: string; seq: number };
+
 export interface TurnState {
   turnId: string;
   sessionId: string;
@@ -32,6 +36,13 @@ export interface TurnState {
   text: string;
   reasoning: string;
   tools: TurnToolState[];
+  /**
+   * Chronological segments, preserving the order in which text chunks and
+   * tool invocations arrived. Adjacent text chunks coalesce into one segment;
+   * each tool_start pushes a new tool segment. This keeps "let me search…"
+   * narration visually between the tool it introduces and the one after.
+   */
+  segments: TurnSegment[];
   todo: { items: SseTodoItem[]; total: number; completed: number } | null;
   error: TurnErrorState | null;
   status: 'streaming' | 'done';
@@ -50,11 +61,27 @@ export function emptyTurn(
     text: '',
     reasoning: '',
     tools: [],
+    segments: [],
     todo: null,
     error: null,
     status: 'streaming',
     lastSeq: 0,
   };
+}
+
+function appendTextSegment(segments: TurnSegment[], chunk: string, seq: number): TurnSegment[] {
+  const last = segments[segments.length - 1];
+  if (last && last.kind === 'text') {
+    const next = segments.slice(0, -1);
+    next.push({ kind: 'text', text: last.text + chunk, seq });
+    return next;
+  }
+  return [...segments, { kind: 'text', text: chunk, seq }];
+}
+
+function appendToolSegment(segments: TurnSegment[], toolId: string, seq: number): TurnSegment[] {
+  if (segments.some((s) => s.kind === 'tool' && s.toolId === toolId)) return segments;
+  return [...segments, { kind: 'tool', toolId, seq }];
 }
 
 function upsertTool(tools: TurnToolState[], id: string, apply: (tool: TurnToolState) => TurnToolState, fallback: () => TurnToolState): TurnToolState[] {
@@ -86,7 +113,12 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
       };
 
     case 'text':
-      return { ...state, text: state.text + event.chunk, lastSeq: event.seq };
+      return {
+        ...state,
+        text: state.text + event.chunk,
+        segments: appendTextSegment(state.segments, event.chunk, event.seq),
+        lastSeq: event.seq,
+      };
 
     case 'reasoning':
       return { ...state, reasoning: state.reasoning + event.chunk, lastSeq: event.seq };
@@ -112,7 +144,12 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           seq: event.seq,
         }),
       );
-      return { ...state, tools, lastSeq: event.seq };
+      return {
+        ...state,
+        tools,
+        segments: appendToolSegment(state.segments, event.id, event.seq),
+        lastSeq: event.seq,
+      };
     }
 
     case 'tool_delta': {
@@ -133,7 +170,12 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           seq: event.seq,
         }),
       );
-      return { ...state, tools, lastSeq: event.seq };
+      return {
+        ...state,
+        tools,
+        segments: appendToolSegment(state.segments, event.id, event.seq),
+        lastSeq: event.seq,
+      };
     }
 
     case 'tool_end': {
@@ -157,7 +199,12 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           seq: event.seq,
         }),
       );
-      return { ...state, tools, lastSeq: event.seq };
+      return {
+        ...state,
+        tools,
+        segments: appendToolSegment(state.segments, event.id, event.seq),
+        lastSeq: event.seq,
+      };
     }
 
     case 'todo_update':
@@ -175,13 +222,21 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         lastSeq: event.seq,
       };
 
-    case 'done':
+    case 'done': {
+      const finalText = event.assistant.content || state.text;
+      const hasTextSegment = state.segments.some((s) => s.kind === 'text');
+      const segments =
+        !hasTextSegment && finalText.length > 0
+          ? [...state.segments, { kind: 'text', text: finalText, seq: event.seq } as TurnSegment]
+          : state.segments;
       return {
         ...state,
-        text: event.assistant.content || state.text,
+        text: finalText,
+        segments,
         status: 'done',
         lastSeq: event.seq,
       };
+    }
 
     case 'ping':
       return { ...state, lastSeq: event.seq };

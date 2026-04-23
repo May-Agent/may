@@ -785,14 +785,16 @@ impl RuntimeDeps {
             }
             None => None,
         };
-        let profile_environment = match (profile_model.clone(), profile_preferences.clone()) {
-            (Some(profile), preferences) => Some(
-                crate::profile::ProfileInfo::from_db_parts(profile, preferences)?
+        let profile_environment = match profile_model.as_ref() {
+            Some(profile) => Some(
+                app.session_manager
+                    .db()
+                    .profile_info_from_model(profile.clone())
+                    .await?
                     .environment
                     .into_kind(),
             ),
-            (None, None) => None,
-            (None, Some(_)) => panic!("profile preferences cannot exist without a profile model"),
+            None => None,
         };
         let runtime = app
             .session_manager
@@ -1006,7 +1008,7 @@ impl RuntimeDeps {
             if let Some(title) =
                 generate_session_title(&config, &user_message, &assistant_response).await
                 && let Err(e) = db
-                    .update_session(session_id.as_str(), Some(&title), None)
+                    .update_session(session_id.as_str(), Some(&title), None, None)
                     .await
             {
                 tracing::warn!("Failed to update session title in DB: {}", e);

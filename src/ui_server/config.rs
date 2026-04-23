@@ -244,7 +244,6 @@ async fn run_save_full_config(
         .compile()
         .map_err(bad_request_error)?;
 
-    let ssh_servers = updated.ssh_servers.clone();
     updated.save().await.map_err(internal_error)?;
     if let Some(previous_browser_manager) = previous_browser_manager {
         previous_browser_manager
@@ -253,7 +252,6 @@ async fn run_save_full_config(
             .map_err(internal_error)?;
     }
     state.set_browser_manager(next_browser_manager);
-    state.task_runtime.set_ssh_servers(ssh_servers);
     state
         .task_runtime
         .set_network_policy(state.config_snapshot().preferences.network_policy.clone())
@@ -321,9 +319,7 @@ pub(super) async fn add_ssh_server(
             target: req.target,
         });
     });
-    let ssh_servers = updated.ssh_servers.clone();
     updated.save().await.map_err(internal_error)?;
-    state.task_runtime.set_ssh_servers(ssh_servers);
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }
@@ -336,9 +332,12 @@ pub(super) async fn remove_ssh_server(
     let updated = state.update_config(|config| {
         let _ = config.remove_ssh_server(name);
     });
-    let ssh_servers = updated.ssh_servers.clone();
     updated.save().await.map_err(internal_error)?;
-    state.task_runtime.set_ssh_servers(ssh_servers);
+    state
+        .db()
+        .remove_profile_attachments_for_server(name)
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }

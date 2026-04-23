@@ -115,6 +115,9 @@ pub struct SessionSummary {
     pub updated_at: Option<Timestamp>,
     /// Content preview for searching (concatenated messages).
     pub content_preview: String,
+    /// Optional per-session reasoning/thinking override ("low"|"medium"|"high").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Persisted runtime summary for refresh-safe UI state.
     #[serde(
         default,
@@ -143,6 +146,7 @@ impl SessionSummary {
             created_at,
             updated_at,
             content_preview: s.preview.unwrap_or_default(),
+            reasoning_effort: s.reasoning_effort,
             runtime: SessionRuntimeSummary::default(),
         }
     }
@@ -573,7 +577,7 @@ impl SessionManager {
         session.history.metadata.title = Some(title.clone());
 
         self.db
-            .update_session(session.id.as_str(), Some(&title), None)
+            .update_session(session.id.as_str(), Some(&title), None, None)
             .await?;
 
         Ok(())
@@ -587,7 +591,7 @@ impl SessionManager {
         session.history.metadata.model = Some(model.clone());
 
         self.db
-            .update_session(session.id.as_str(), None, Some(&model))
+            .update_session(session.id.as_str(), None, Some(&model), None)
             .await?;
 
         Ok(())

@@ -1,6 +1,6 @@
 import type { ChatRequestPayload, ChatStreamEvent } from '../types';
 import { ApiError, apiSseUrl } from './client';
-import { parseSseStream } from '../stream/sse';
+import { parseNamedSseStream } from '../stream/sse';
 
 export interface ChatStreamHandle {
   events: AsyncGenerator<ChatStreamEvent, void, void>;
@@ -36,9 +36,18 @@ export async function openChatStream(
   }
 
   return {
-    events: parseSseStream<ChatStreamEvent>(res, controller.signal),
+    events: mergeEventName(parseNamedSseStream<Record<string, unknown>>(res, controller.signal)),
     abort: () => controller.abort(),
   };
+}
+
+async function* mergeEventName(
+  source: AsyncGenerator<{ event: string; data: Record<string, unknown> }, void, void>,
+): AsyncGenerator<ChatStreamEvent, void, void> {
+  for await (const { event, data } of source) {
+    if (!data || typeof data !== 'object') continue;
+    yield { ...data, kind: event } as unknown as ChatStreamEvent;
+  }
 }
 
 export async function enqueueMessage(payload: ChatRequestPayload): Promise<void> {

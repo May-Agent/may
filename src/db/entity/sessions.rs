@@ -21,4 +21,7 @@ pub struct Model {
     pub pin_sort_order: Option<i32>,
     pub created_at: String,
     pub updated_at: String,
+    /// Per-session reasoning/thinking depth override ("low" | "medium" | "high").
+    /// NULL means "no override; provider/model default applies".
+    pub reasoning_effort: Option<String>,
 }
