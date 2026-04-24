@@ -67,8 +67,8 @@ function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
     case 'terminal_kill': {
       const description = projectField(raw, 'description');
       if (description.length > 0) return description;
-      const command = projectField(raw, 'command');
-      if (command.length > 0) return firstLine(command);
+      const script = projectField(raw, 'script');
+      if (script.length > 0) return firstLine(script);
       return fallback;
     }
     case 'web_search': {
@@ -99,11 +99,70 @@ function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
   }
 }
 
+interface OutputStream {
+  text: string;
+  truncated: boolean;
+}
+
+interface TerminalResult {
+  exitCode: number | null;
+  stdout: OutputStream | null;
+  stderr: OutputStream | null;
+}
+
+function extractOutputStream(entry: unknown): OutputStream | null {
+  if (!entry || typeof entry !== 'object') return null;
+  const content = (entry as Record<string, unknown>).content;
+  if (!content || typeof content !== 'object') return null;
+  const c = content as Record<string, unknown>;
+  if (c.type !== 'text' || typeof c.text !== 'string') return null;
+  if (c.text.length === 0) return null;
+  return { text: c.text, truncated: c.truncated === true };
+}
+
+function extractTerminalResult(result: unknown): TerminalResult | null {
+  if (!result || typeof result !== 'object') return null;
+  const r = result as Record<string, unknown>;
+  if (r.kind !== 'json' || !r.value || typeof r.value !== 'object') return null;
+  const v = r.value as Record<string, unknown>;
+  return {
+    exitCode: typeof v.exit_code === 'number' ? v.exit_code : null,
+    stdout: extractOutputStream(v.stdout),
+    stderr: extractOutputStream(v.stderr),
+  };
+}
+
+function extractGenericResultText(result: unknown): string | null {
+  if (!result || typeof result !== 'object') return null;
+  const r = result as Record<string, unknown>;
+  const kind = typeof r.kind === 'string' ? r.kind : null;
+  if (kind === 'text' || kind === 'tsv') {
+    return typeof r.text === 'string' && r.text.length > 0 ? r.text : null;
+  }
+  if (kind === 'error') {
+    return typeof r.message === 'string' ? r.message : null;
+  }
+  if (kind === 'json') {
+    if (r.value === undefined || r.value === null) return null;
+    return JSON.stringify(r.value, null, 2);
+  }
+  if (kind === 'done') return null;
+  return typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+}
+
+function hasError(result: unknown): boolean {
+  if (!result || typeof result !== 'object') return false;
+  const r = result as Record<string, unknown>;
+  if (r.kind === 'error') return true;
+  const terminal = extractTerminalResult(result);
+  return terminal !== null && terminal.exitCode !== null && terminal.exitCode !== 0;
+}
+
 function statusIcon(status: TurnToolState['status'], result: unknown) {
   if (status === 'streaming') {
     return <Loader2 className="size-3.5 animate-spin text-muted-foreground" />;
   }
-  if (typeof result === 'object' && result !== null && 'error' in (result as object)) {
+  if (hasError(result)) {
     return <X className="size-3.5 text-destructive" />;
   }
   return <Check className="size-3.5 text-emerald-500" />;
@@ -111,15 +170,16 @@ function statusIcon(status: TurnToolState['status'], result: unknown) {
 
 function TerminalDetails({ tool }: { tool: TurnToolState }) {
   const { t } = useTranslation();
-  const command = projectField(tool.argumentsRaw, 'command');
+  const script = projectField(tool.argumentsRaw, 'script');
   const mode = projectField(tool.argumentsRaw, 'mode');
   const escalated = mode === 'unsafe';
+  const terminal = extractTerminalResult(tool.result);
 
   return (
     <div className="space-y-1.5">
-      {command.length > 0 && (
+      {script.length > 0 && (
         <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono leading-relaxed whitespace-pre-wrap break-all">
-          {command}
+          {script}
           {tool.status === 'streaming' && (
             <span className="inline-block w-1.5 h-3 bg-foreground/70 animate-pulse ml-0.5 align-middle" />
           )}
@@ -130,35 +190,40 @@ function TerminalDetails({ tool }: { tool: TurnToolState }) {
           {t('tools.escalated')}
         </div>
       )}
-      <CommandOutput result={tool.result} />
+      {terminal && <TerminalOutput result={terminal} />}
     </div>
   );
 }
 
-function CommandOutput({ result }: { result: unknown }) {
+function TerminalOutput({ result }: { result: TerminalResult }) {
   const { t } = useTranslation();
-  if (!result || typeof result !== 'object') return null;
-  const rec = result as Record<string, unknown>;
-  const stdout = typeof rec.stdout === 'string' ? rec.stdout : '';
-  const stderr = typeof rec.stderr === 'string' ? rec.stderr : '';
-  const exit = typeof rec.exitCode === 'number' ? rec.exitCode : null;
-  if (!stdout && !stderr && exit === null) return null;
-  const failed = exit !== null && exit !== 0;
+  if (!result.stdout && !result.stderr && result.exitCode === null) return null;
+  const failed = result.exitCode !== null && result.exitCode !== 0;
 
   return (
     <div className="rounded-md border border-border bg-muted/20 p-2">
       <div className="text-[11px] text-muted-foreground">
         {t('tools.output')}
-        {failed && <span className="ml-1 text-destructive">· failed</span>}
+        {failed && <span className="ml-1 text-destructive">· exit {result.exitCode}</span>}
       </div>
-      {stdout && (
+      {result.stdout && (
         <pre className="mt-1 text-xs font-mono text-foreground/90 whitespace-pre-wrap max-h-64 overflow-auto scrollbar-thin">
-          {stdout}
+          {result.stdout.text}
+          {result.stdout.truncated && (
+            <span className="block text-[11px] text-muted-foreground">
+              {t('tools.truncated')}
+            </span>
+          )}
         </pre>
       )}
-      {stderr && (
+      {result.stderr && (
         <pre className="mt-1 text-xs font-mono text-destructive/90 whitespace-pre-wrap max-h-64 overflow-auto scrollbar-thin">
-          {stderr}
+          {result.stderr.text}
+          {result.stderr.truncated && (
+            <span className="block text-[11px] text-muted-foreground">
+              {t('tools.truncated')}
+            </span>
+          )}
         </pre>
       )}
     </div>
@@ -167,30 +232,31 @@ function CommandOutput({ result }: { result: unknown }) {
 
 function GenericDetails({ tool }: { tool: TurnToolState }) {
   const parsed = useMemo(() => parsePartialJson(tool.argumentsRaw), [tool.argumentsRaw]);
-  if (parsed === null || (typeof parsed === 'object' && Object.keys(parsed as object).length === 0)) {
-    if (tool.result === undefined) return null;
-    return <GenericResult result={tool.result} />;
-  }
+  const hasArgs =
+    parsed !== null &&
+    typeof parsed === 'object' &&
+    Object.keys(parsed as object).length > 0;
+  const resultText = extractGenericResultText(tool.result);
+  if (!hasArgs && resultText === null) return null;
   return (
     <div className="space-y-1.5">
-      <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono leading-relaxed whitespace-pre-wrap break-all max-h-48 overflow-auto scrollbar-thin">
-        {JSON.stringify(parsed, null, 2)}
-      </pre>
-      {tool.result !== undefined && <GenericResult result={tool.result} />}
+      {hasArgs && (
+        <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono leading-relaxed whitespace-pre-wrap break-all max-h-48 overflow-auto scrollbar-thin">
+          {JSON.stringify(parsed, null, 2)}
+        </pre>
+      )}
+      {resultText !== null && <GenericOutput text={resultText} />}
     </div>
   );
 }
 
-function GenericResult({ result }: { result: unknown }) {
+function GenericOutput({ text }: { text: string }) {
   const { t } = useTranslation();
-  if (result === undefined) return null;
-  const serialized = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-  if (!serialized || serialized === 'null') return null;
   return (
     <div className="rounded-md border border-border bg-muted/20 p-2">
       <div className="text-[11px] text-muted-foreground">{t('tools.output')}</div>
       <pre className="mt-1 text-xs font-mono text-foreground/90 whitespace-pre-wrap max-h-48 overflow-auto scrollbar-thin">
-        {serialized}
+        {text}
       </pre>
     </div>
   );

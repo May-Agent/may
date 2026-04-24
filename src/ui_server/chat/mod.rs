@@ -396,6 +396,68 @@ fn normalize_tool_start_for_sink(
     })
 }
 
+fn log_first_agent_event(
+    seen: &mut bool,
+    started_at: &Instant,
+    session_id: &str,
+    assistant_id: &str,
+    event_kind: &'static str,
+) {
+    if *seen {
+        return;
+    }
+    *seen = true;
+    tracing::info!(
+        session_id,
+        assistant_id,
+        event_kind,
+        elapsed_ms = elapsed_ms_saturating(started_at),
+        "chat stream first agent event"
+    );
+}
+
+fn log_first_visible_tool_event(
+    seen: &mut bool,
+    started_at: &Instant,
+    session_id: &str,
+    assistant_id: &str,
+    tool_id: &str,
+    tool_name: &str,
+    source: &'static str,
+) {
+    if *seen {
+        return;
+    }
+    *seen = true;
+    tracing::info!(
+        session_id,
+        assistant_id,
+        tool_id,
+        tool_name,
+        source,
+        elapsed_ms = elapsed_ms_saturating(started_at),
+        "chat stream first visible tool"
+    );
+}
+
+fn log_first_text_event(
+    seen: &mut bool,
+    started_at: &Instant,
+    session_id: &str,
+    assistant_id: &str,
+) {
+    if *seen {
+        return;
+    }
+    *seen = true;
+    tracing::info!(
+        session_id,
+        assistant_id,
+        elapsed_ms = elapsed_ms_saturating(started_at),
+        "chat stream first text"
+    );
+}
+
 /// Successful result from the shared agent loop.
 #[derive(Debug)]
 struct AgentRunResult {
@@ -1038,6 +1100,13 @@ async fn run_agent_loop(
         if !sink.on_start(&req.session_id, &assistant_id).await {
             return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
         }
+        tracing::info!(
+            session_id = %req.session_id,
+            assistant_id = %assistant_id,
+            attempt,
+            elapsed_ms = elapsed_ms_saturating(&started_at),
+            "chat stream start sent"
+        );
 
         let PreparedAgent {
             session_id,
@@ -1066,6 +1135,15 @@ async fn run_agent_loop(
                 return Err(error.into());
             }
         };
+        tracing::info!(
+            session_id = %session_id,
+            assistant_id = %assistant_id,
+            model = %current_model,
+            provider_id = %provider_id,
+            attempt,
+            elapsed_ms = elapsed_ms_saturating(&started_at),
+            "chat agent prepared"
+        );
         if attempt == 0 {
             max_retries = provider_candidate_count.saturating_sub(1);
         }
@@ -1094,6 +1172,9 @@ async fn run_agent_loop(
         let mut terminal_error: Option<aither_agent::AgentError> = None;
         let mut cancellation_reason: Option<&'static str> = None;
         let mut browser_takeover_paused = false;
+        let mut first_agent_event_seen = false;
+        let mut first_visible_tool_seen = false;
+        let mut first_text_seen = false;
         {
             agent.sync_runtime_context().await;
             let mut stream = std::pin::pin!(agent.run_with_hidden_context(
@@ -1120,6 +1201,13 @@ async fn run_agent_loop(
                 };
                 match event {
                     Ok(aither_agent::AgentEvent::Reasoning(text)) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "reasoning",
+                        );
                         reasoning_text.push_str(&text);
                         if !sink.on_reasoning(&text).await {
                             cancellation_reason =
@@ -1128,6 +1216,19 @@ async fn run_agent_loop(
                         }
                     }
                     Ok(aither_agent::AgentEvent::Text(text)) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "text",
+                        );
+                        log_first_text_event(
+                            &mut first_text_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                        );
                         segment_text.push_str(&text);
                         full_text.push_str(&text);
                         if !sink.on_text(&text).await {
@@ -1143,6 +1244,13 @@ async fn run_agent_loop(
                         name,
                         arguments_fragment,
                     }) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "tool_delta",
+                        );
                         match normalize_tool_delta_for_sink(
                             &mut pending_tool_streams,
                             &id,
@@ -1154,6 +1262,15 @@ async fn run_agent_loop(
                                 name,
                                 arguments,
                             }) => {
+                                log_first_visible_tool_event(
+                                    &mut first_visible_tool_seen,
+                                    &started_at,
+                                    session_id.as_str(),
+                                    assistant_id.as_str(),
+                                    id.as_str(),
+                                    name.as_str(),
+                                    "synthetic_start_from_delta",
+                                );
                                 if !sink.on_tool_start(&id, &name, &arguments).await {
                                     cancellation_reason =
                                         Some("client disconnected during tool stream");
@@ -1179,6 +1296,13 @@ async fn run_agent_loop(
                         name,
                         arguments,
                     }) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "tool_start",
+                        );
                         saw_tool_activity = true;
                         if matches!(
                             name.as_str(),
@@ -1216,13 +1340,31 @@ async fn run_agent_loop(
                             &id,
                             &name,
                             &arguments,
-                        ) && !sink.on_tool_start(&id, &name, &arguments).await
-                        {
-                            cancellation_reason = Some("client disconnected during tool stream");
-                            break;
+                        ) {
+                            log_first_visible_tool_event(
+                                &mut first_visible_tool_seen,
+                                &started_at,
+                                session_id.as_str(),
+                                assistant_id.as_str(),
+                                id.as_str(),
+                                name.as_str(),
+                                "canonical_start",
+                            );
+                            if !sink.on_tool_start(&id, &name, &arguments).await {
+                                cancellation_reason =
+                                    Some("client disconnected during tool stream");
+                                break;
+                            }
                         }
                     }
                     Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "tool_end",
+                        );
                         saw_tool_activity = true;
                         if name == "terminal" && result_waits_for_terminal_input(&result) {
                             set_session_runtime_state(

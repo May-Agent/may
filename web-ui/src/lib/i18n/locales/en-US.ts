@@ -158,6 +158,7 @@ export const enUS = {
     generic: 'Working',
     output: 'Output',
     escalated: 'Elevated permissions',
+    truncated: 'Output was truncated.',
   },
   runtime: {
     idle: 'Idle',
