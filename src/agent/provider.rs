@@ -1,13 +1,13 @@
 //! Provider selection and LLM client construction for `MayAgent`.
 //!
-//! Picks the best provider candidate for a given model id, validates
-//! generic provider proxies can actually serve the model via `/models`,
-//! and builds concrete `CloudProvider` clients with the right base URL,
-//! API key, and per-provider quirks (OpenRouter, DeepSeek, Ollama,
-//! LMStudio, Copilot, custom OpenAI-compatible proxies, etc.). Also
-//! exposes the thin [`RequestParameterizedModel`] wrapper that pins a
-//! `Parameters` struct onto every inference request routed through the
-//! wrapped model.
+//! Resolves an explicit `<provider_id>::<model_id>` selector into one
+//! concrete provider instance, then builds the `CloudProvider` client
+//! with the right base URL, API key, and per-provider quirks
+//! (OpenRouter, DeepSeek, Ollama, LMStudio, Copilot, custom
+//! OpenAI-compatible proxies, etc.). Also exposes the thin
+//! [`RequestParameterizedModel`] wrapper that pins a [`Parameters`]
+//! struct onto every inference request routed through the wrapped
+//! model.
 
 use std::collections::HashSet;
 
@@ -22,9 +22,10 @@ use aither_core::llm::{
 use futures_lite::Stream;
 
 use super::may::MayAgentError;
-use crate::config::{MatchMode, MayConfig, ProviderInstance, ProviderType, model_ids_match};
+use crate::config::{MayConfig, ProviderInstance, ProviderType};
 use crate::copilot::clear_copilot_credentials;
 use crate::embedding_provider::{EmbeddingModelResolution, resolve_embedding_model};
+use crate::model_selector::ModelSelector;
 
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
 
@@ -36,49 +37,33 @@ pub(super) fn err_api_key_required(provider: &str) -> String {
     format!("API key required for provider '{provider}'")
 }
 
-fn ordered_provider_ids_for_model(config: &MayConfig, model: &str) -> Vec<String> {
-    let strict = config.preferences.strict_model_matching;
-    let mapped_provider = config
-        .models
-        .provider_for_model(model, strict)
-        .map(str::to_string);
+fn resolve_model_selector(
+    may_config: &MayConfig,
+    selector: &str,
+) -> Result<(ModelSelector, ProviderInstance), MayAgentError> {
+    let selector = selector.parse::<ModelSelector>().map_err(|error| {
+        MayAgentError::MissingApiKey(format!("Invalid model selector '{selector}': {error}"))
+    })?;
 
-    let mut explicit = Vec::new();
-    let mut generic = Vec::new();
-
-    for (id, instance) in &config.provider {
-        if !instance.can_serve_model(id, model) {
-            continue;
-        }
-        if instance.is_generic_model_proxy(id) {
-            generic.push(id.clone());
-        } else {
-            explicit.push(id.clone());
-        }
+    let provider_id = selector.provider_id();
+    let Some(provider_instance) = may_config.provider.get(provider_id).cloned() else {
+        return Err(MayAgentError::MissingApiKey(err_no_provider(
+            selector.model_id(),
+        )));
+    };
+    if !provider_instance.is_valid(provider_id) {
+        return Err(MayAgentError::MissingApiKey(err_no_provider(
+            selector.model_id(),
+        )));
+    }
+    if !provider_instance.can_serve_model(provider_id, selector.model_id()) {
+        return Err(MayAgentError::Llm(format!(
+            "Provider '{provider_id}' cannot serve configured model '{}'",
+            selector.model_id()
+        )));
     }
 
-    explicit.sort_unstable();
-    generic.sort_unstable();
-
-    let mut ordered = explicit;
-    ordered.extend(generic);
-
-    if let Some(mapped) = mapped_provider
-        && let Some(index) = ordered.iter().position(|id| id == &mapped)
-    {
-        let preferred = ordered.remove(index);
-        ordered.insert(0, preferred);
-    }
-
-    ordered
-}
-
-/// A single `(model, provider_id)` candidate that `resolve_provider_runtime`
-/// can try in order until one successfully initializes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ProviderCandidate {
-    pub model: String,
-    pub provider_id: String,
+    Ok((selector, provider_instance))
 }
 
 /// Wraps a base [`LanguageModel`] so every request carries a pinned
@@ -114,43 +99,10 @@ where
     }
 }
 
-/// Returns every provider candidate capable of serving `model`,
-/// ordered by priority (explicit provider first, then proxy providers).
-pub fn provider_candidates_for_model(config: &MayConfig, model: &str) -> Vec<ProviderCandidate> {
-    ordered_provider_ids_for_model(config, model)
-        .into_iter()
-        .map(|provider_id| ProviderCandidate {
-            model: model.to_string(),
-            provider_id,
-        })
-        .collect()
-}
-
-/// Returns deduped candidates across several model tiers in priority order.
-pub fn provider_candidates_for_tiers(
-    config: &MayConfig,
-    tiers: &[crate::config::ModelTier],
-) -> Vec<ProviderCandidate> {
-    let mut candidates = Vec::new();
-    let mut seen = HashSet::<(String, String)>::new();
-
-    for tier in tiers {
-        for model in config.models.models_for_tier(*tier) {
-            for candidate in provider_candidates_for_model(config, model) {
-                if seen.insert((candidate.model.clone(), candidate.provider_id.clone())) {
-                    candidates.push(candidate);
-                }
-            }
-        }
-    }
-
-    candidates
-}
-
-/// Number of provider candidates that can serve `model`.
+/// Number of runnable provider candidates for `selector`.
 #[must_use]
-pub fn provider_candidate_count(config: &MayConfig, model: &str) -> usize {
-    provider_candidates_for_model(config, model).len()
+pub fn provider_candidate_count(config: &MayConfig, selector: &str) -> usize {
+    usize::from(resolve_model_selector(config, selector).is_ok())
 }
 
 /// The concrete runtime produced by [`resolve_provider_runtime`].
@@ -160,72 +112,16 @@ pub struct ResolvedProviderRuntime {
     pub search_embedder: EmbeddingModelResolution,
 }
 
-/// Walks provider candidates for `model` (starting at `provider_attempt`
-/// modulo candidate count) and returns the first candidate that passes
-/// generic-provider model validation and successfully initializes a
-/// `CloudProvider` client.
 pub async fn resolve_provider_runtime(
     may_config: &MayConfig,
-    model: &str,
-    provider_attempt: usize,
+    selector: &str,
+    _provider_attempt: usize,
 ) -> Result<ResolvedProviderRuntime, MayAgentError> {
-    let provider_candidates = provider_candidates_for_model(may_config, model);
-    let candidate_count = provider_candidates.len();
-    if candidate_count == 0 {
-        return Err(MayAgentError::MissingApiKey(err_no_provider(model)));
-    }
-    let start_index = provider_attempt % candidate_count;
-    let mut last_provider_error: Option<MayAgentError> = None;
-
-    let mut selected_provider: Option<(String, CloudProvider)> = None;
-    for offset in 0..candidate_count {
-        let index = (start_index + offset) % candidate_count;
-        let provider_id = provider_candidates[index].provider_id.clone();
-        let Some(provider_instance) = may_config.provider.get(&provider_id).cloned() else {
-            continue;
-        };
-
-        if let Err(error) = validate_generic_provider_model_support(
-            may_config,
-            &provider_id,
-            &provider_instance,
-            model,
-        )
-        .await
-        {
-            tracing::warn!(
-                model,
-                provider_id,
-                error = %error,
-                "provider candidate rejected during model support validation"
-            );
-            last_provider_error = Some(error);
-            continue;
-        }
-
-        match build_cloud_provider_from_instance(&provider_id, &provider_instance, model).await {
-            Ok(llm) => {
-                selected_provider = Some((provider_id, llm));
-                break;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    model,
-                    provider_id,
-                    error = %error,
-                    "failed to initialize provider candidate for model"
-                );
-                last_provider_error = Some(error);
-            }
-        }
-    }
-
-    let (provider_id, llm) = if let Some(selected) = selected_provider {
-        selected
-    } else {
-        return Err(last_provider_error
-            .unwrap_or_else(|| MayAgentError::MissingApiKey(err_no_provider(model))));
-    };
+    let (selector, provider_instance) = resolve_model_selector(may_config, selector)?;
+    let provider_id = selector.provider_id().to_string();
+    let llm =
+        build_cloud_provider_from_instance(&provider_id, &provider_instance, selector.model_id())
+            .await?;
 
     let search_embedder =
         EmbeddingModelResolution::from_result(resolve_embedding_model(may_config).await);
@@ -253,77 +149,50 @@ pub async fn resolve_provider_runtime(
     })
 }
 
-async fn validate_generic_provider_model_support(
-    config: &MayConfig,
-    provider_id: &str,
-    instance: &ProviderInstance,
-    model: &str,
-) -> Result<(), MayAgentError> {
-    if !instance.is_generic_model_proxy(provider_id) {
-        return Ok(());
-    }
-
-    let fetched = crate::models::fetch_models_for_provider_instance(provider_id, instance)
-        .await
-        .map_err(|error| {
-            MayAgentError::Llm(format!(
-                "Failed to validate model '{model}' for provider '{provider_id}' via /models: {error}"
-            ))
-        })?;
-
-    let mode = MatchMode::from_strict_flag(config.preferences.strict_model_matching);
-    let has_match = fetched
-        .iter()
-        .any(|candidate| model_ids_match(candidate.id.as_str(), model, mode));
-
-    if !has_match {
-        return Err(MayAgentError::Llm(format!(
-            "Provider '{provider_id}' does not advertise model '{model}' in /models"
-        )));
-    }
-
-    Ok(())
-}
-
 /// Builds a fast+balanced provider chain for background memory extraction.
 pub async fn build_fast_provider_chain(
     config: &MayConfig,
 ) -> Result<Vec<crate::memory::MemoryExtractionProvider>, MayAgentError> {
-    let candidates = provider_candidates_for_tiers(
-        config,
-        &[
-            crate::config::ModelTier::Fast,
-            crate::config::ModelTier::Balanced,
-        ],
-    );
+    let mut selectors = Vec::new();
+    let mut seen = HashSet::new();
+    for tier in [
+        crate::config::ModelTier::Fast,
+        crate::config::ModelTier::Balanced,
+    ] {
+        for selector in config.models.models_for_tier(tier) {
+            if seen.insert(selector.clone()) {
+                selectors.push(selector.clone());
+            }
+        }
+    }
 
-    if candidates.is_empty() {
+    if selectors.is_empty() {
         return Err(MayAgentError::MissingApiKey(
             ERR_NO_MODELS.trim().to_string(),
         ));
     }
-    let first_model = candidates[0].model.clone();
+    let first_model = selectors[0].model_id().to_string();
 
     let mut built = Vec::new();
     let mut last_error: Option<MayAgentError> = None;
 
-    for candidate in candidates {
-        let Some(instance) = config.get_provider(&candidate.provider_id) else {
-            continue;
+    for selector in selectors {
+        let provider_id = selector.provider_id().to_string();
+        let Some(instance) = config.get_provider(&provider_id) else {
+            panic!("configured model selector referenced unknown provider '{provider_id}'");
         };
 
-        match build_cloud_provider_from_instance(&candidate.provider_id, instance, &candidate.model)
-            .await
+        match build_cloud_provider_from_instance(&provider_id, instance, selector.model_id()).await
         {
             Ok(llm) => built.push(crate::memory::MemoryExtractionProvider {
-                provider_id: candidate.provider_id.clone(),
-                model: candidate.model.clone(),
+                provider_id: provider_id.clone(),
+                model: selector.model_id().to_string(),
                 llm,
             }),
             Err(error) => {
                 tracing::warn!(
-                    provider_id = %candidate.provider_id,
-                    model = %candidate.model,
+                    provider_id = %provider_id,
+                    model = selector.model_id(),
                     error = %error,
                     "failed to initialize memory extraction provider candidate"
                 );

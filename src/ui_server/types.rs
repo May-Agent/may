@@ -1,6 +1,4 @@
-use crate::config::{
-    BrowserBackendKind, LoadBalanceStrategy, ProviderType, RemoteAccessConfig, SshServerConfig,
-};
+use crate::config::{BrowserBackendKind, ProviderType, RemoteAccessConfig, SshServerConfig};
 use crate::network_policy::NetworkPolicyMode;
 use crate::session::{
     AttachmentKind, PendingUserMessage, PendingUserMessageMode, SessionPlanState,
@@ -876,6 +874,8 @@ impl From<aither_agent::ContextWindowMetrics> for SessionContextWindowMetricsRes
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfoItem {
     pub(crate) id: String,
+    pub(crate) model_id: String,
+    pub(crate) provider_id: String,
     pub(crate) nickname: String,
     pub(crate) context_window: Option<u32>,
     pub(crate) abilities: Vec<String>,
@@ -1166,16 +1166,13 @@ pub struct UiModelsConfig {
     pub(crate) image_generation: Vec<String>,
     pub(crate) embedding_model: Option<String>,
     pub(crate) embedding_dimensions: Option<usize>,
-    pub(crate) model_providers: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiPreferencesConfig {
-    pub(crate) load_balance_strategy: LoadBalanceStrategy,
     pub(crate) warn_on_model_change: bool,
     pub(crate) show_token_usage: bool,
-    pub(crate) strict_model_matching: bool,
     pub(crate) network_policy_mode: NetworkPolicyMode,
     pub(crate) network_policy_hosts: Vec<String>,
 }

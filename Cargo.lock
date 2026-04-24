@@ -1320,7 +1320,7 @@ version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb26fbd2a93308b1c1b74ac4e494a11ac10db57c476882240573bdf961463520"
 dependencies = [
- "async-std",
+ "async-net",
  "atomic-waker",
  "futures-core",
  "futures-io",
@@ -13263,7 +13263,7 @@ dependencies = [
 
 [[package]]
 name = "zenwave"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-fs",

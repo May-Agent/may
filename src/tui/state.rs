@@ -395,7 +395,7 @@ impl ConfigState {
         match self.section {
             ConfigSection::Providers => self.provider_ids.len() + 1,
             ConfigSection::Models => 4,
-            ConfigSection::Preferences => 3,
+            ConfigSection::Preferences => 2,
         }
     }
 

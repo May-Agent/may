@@ -73,11 +73,11 @@ export function ModelsSection() {
                     >
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5 truncate font-mono text-xs">
-                          {d.id}
+                          {d.modelId}
                           {active && <Check className="size-3.5 text-primary" />}
                         </div>
                         <div className="truncate text-xs text-muted-foreground">
-                          {d.displayName ?? d.tier ?? ''}
+                          {d.nickname ?? d.tier ?? ''}
                           {d.contextWindow ? ` · ${d.contextWindow.toLocaleString()} ctx` : ''}
                         </div>
                       </div>

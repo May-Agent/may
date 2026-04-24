@@ -6,6 +6,7 @@ use super::super::error::AppResult;
 use super::super::state::{AppMode, ConfigEditMode, ConfigSection, detect_api_key_from_env};
 use super::{App, SendAction, char_to_byte_index};
 use crate::config::{ModelTier, ProviderType, get_model_tier};
+use crate::model_selector::ModelSelector;
 
 impl App {
     /// Handle key in unified config mode.
@@ -143,19 +144,6 @@ impl App {
                         state.start_text_edit(&self.config.max_iterations.to_string());
                     }
                     1 => {
-                        // Toggle load balance strategy
-                        use crate::config::LoadBalanceStrategy;
-                        self.config.preferences.load_balance_strategy =
-                            match self.config.preferences.load_balance_strategy {
-                                LoadBalanceStrategy::RoundRobin => {
-                                    LoadBalanceStrategy::FailoverOnly
-                                }
-                                LoadBalanceStrategy::FailoverOnly => LoadBalanceStrategy::Random,
-                                LoadBalanceStrategy::Random => LoadBalanceStrategy::RoundRobin,
-                            };
-                        self.persist_config_background();
-                    }
-                    2 => {
                         // Toggle warn_on_model_change
                         self.config.preferences.warn_on_model_change =
                             !self.config.preferences.warn_on_model_change;
@@ -438,10 +426,14 @@ impl App {
             }
             ConfigSection::Models => {
                 // Parse comma-separated model list
-                let models: Vec<String> = value
+                let models: Vec<ModelSelector> = value
                     .split(',')
-                    .map(|s| s.trim().to_string())
+                    .map(str::trim)
                     .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.parse::<ModelSelector>()
+                            .expect("tui config edit must receive explicit model selectors")
+                    })
                     .collect();
                 match selected {
                     0 => self.config.models.advanced = models,
@@ -483,9 +475,9 @@ impl App {
 
             if provider_str == "unknown" {
                 // Custom/OpenRouter - use preset models
-                self.config.models.advanced = vec!["claude-opus-4".to_string()];
-                self.config.models.balanced = vec!["claude-sonnet-4".to_string()];
-                self.config.models.fast = vec!["claude-haiku-4".to_string()];
+                self.config.models.advanced = vec![ModelSelector::new(id, "claude-opus-4")];
+                self.config.models.balanced = vec![ModelSelector::new(id, "claude-sonnet-4")];
+                self.config.models.fast = vec![ModelSelector::new(id, "claude-haiku-4")];
                 return;
             }
 
@@ -500,13 +492,22 @@ impl App {
                 }
                 let tier = get_model_tier(&model_id);
                 if tier == ModelTier::Advanced && self.config.models.advanced.is_empty() {
-                    self.config.models.advanced.push(model_id.clone());
+                    self.config
+                        .models
+                        .advanced
+                        .push(ModelSelector::new(id, &model_id));
                 }
                 if tier == ModelTier::Balanced && self.config.models.balanced.is_empty() {
-                    self.config.models.balanced.push(model_id.clone());
+                    self.config
+                        .models
+                        .balanced
+                        .push(ModelSelector::new(id, &model_id));
                 }
                 if tier == ModelTier::Fast && self.config.models.fast.is_empty() {
-                    self.config.models.fast.push(model_id);
+                    self.config
+                        .models
+                        .fast
+                        .push(ModelSelector::new(id, model_id));
                 }
             }
             return;

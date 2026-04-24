@@ -11,6 +11,7 @@ use tokio::time::MissedTickBehavior;
 use crate::config::{MayConfig, ProviderInstance, SshServerConfig};
 use crate::copilot::{clear_copilot_credentials, has_copilot_token, save_copilot_token};
 use crate::mcp::MayMcpServerConfig;
+use crate::model_selector::ModelSelector;
 use crate::session::MayHomePaths;
 use crate::skill::SkillManager;
 use crate::ui_event_bus::UiEventTopics;
@@ -44,6 +45,17 @@ pub(super) struct CopilotAuthStreamQuery {
 fn scoped_skill_manager(state: &UiServerState, profile_id: &str) -> SkillManager {
     let home_paths = MayHomePaths::new(state.may_dir.clone());
     SkillManager::from_profile_home(&home_paths.profile_home(profile_id))
+}
+
+fn parse_selector_list(values: &[String]) -> Vec<ModelSelector> {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .parse::<ModelSelector>()
+                .expect("ui config save must receive valid model selectors")
+        })
+        .collect()
 }
 
 pub(super) async fn list_skills_for_profile(
@@ -92,19 +104,35 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
     UiFullConfig {
         providers,
         models: UiModelsConfig {
-            advanced: config.models.advanced.clone(),
-            balanced: config.models.balanced.clone(),
-            fast: config.models.fast.clone(),
-            image_generation: config.models.image_generation.clone(),
-            embedding_model: config.models.embedding_model.clone(),
+            advanced: config
+                .models
+                .advanced
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            balanced: config
+                .models
+                .balanced
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            fast: config.models.fast.iter().map(ToString::to_string).collect(),
+            image_generation: config
+                .models
+                .image_generation
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            embedding_model: config
+                .models
+                .embedding_model
+                .as_ref()
+                .map(ToString::to_string),
             embedding_dimensions: config.models.embedding_dimensions,
-            model_providers: config.models.model_providers.clone(),
         },
         preferences: UiPreferencesConfig {
-            load_balance_strategy: config.preferences.load_balance_strategy,
             warn_on_model_change: config.preferences.warn_on_model_change,
             show_token_usage: config.preferences.show_token_usage,
-            strict_model_matching: config.preferences.strict_model_matching,
             network_policy_mode: config.preferences.network_policy.mode,
             network_policy_hosts: config.preferences.network_policy.hosts.clone(),
         },
@@ -112,7 +140,7 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             font: config.appearance.font.clone(),
             theme: config.appearance.theme.clone(),
         },
-        last_model: config.last_model.clone(),
+        last_model: config.last_model.as_ref().map(ToString::to_string),
         max_iterations: config.max_iterations,
         browser: UiBrowserConfig {
             enabled: config.browser.enabled,
@@ -186,21 +214,23 @@ async fn run_save_full_config(
         }
 
         config.provider = provider_map;
-        config.models.advanced = req.models.advanced.clone();
-        config.models.balanced = req.models.balanced.clone();
-        config.models.fast = req.models.fast.clone();
-        config.models.image_generation = req.models.image_generation.clone();
+        config.models.advanced = parse_selector_list(&req.models.advanced);
+        config.models.balanced = parse_selector_list(&req.models.balanced);
+        config.models.fast = parse_selector_list(&req.models.fast);
+        config.models.image_generation = parse_selector_list(&req.models.image_generation);
         config.models.embedding_model = req
             .models
             .embedding_model
             .clone()
-            .filter(|value| !value.trim().is_empty());
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .parse::<ModelSelector>()
+                    .expect("ui config save must receive valid model selectors")
+            });
         config.models.embedding_dimensions = req.models.embedding_dimensions;
-        config.models.model_providers = req.models.model_providers.clone();
-        config.preferences.load_balance_strategy = req.preferences.load_balance_strategy;
         config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
         config.preferences.show_token_usage = req.preferences.show_token_usage;
-        config.preferences.strict_model_matching = req.preferences.strict_model_matching;
         config.preferences.network_policy.mode = req.preferences.network_policy_mode;
         config.preferences.network_policy.hosts = req
             .preferences
@@ -211,7 +241,11 @@ async fn run_save_full_config(
             .collect();
         config.appearance.font = req.appearance.font.clone();
         config.appearance.theme = req.appearance.theme;
-        config.last_model = req.last_model.clone();
+        config.last_model = req.last_model.clone().map(|value| {
+            value
+                .parse::<ModelSelector>()
+                .expect("ui config save must receive valid model selectors")
+        });
         config.max_iterations = req.max_iterations;
         config.browser.enabled = req.browser.enabled;
         config.browser.backend = req.browser.backend;

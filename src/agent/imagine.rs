@@ -189,26 +189,15 @@ fn build_image_provider(config: &ImageGeneratorConfig) -> Result<CloudProvider, 
 }
 
 pub fn resolve_image_generator_config(may_config: &MayConfig) -> Option<ImageGeneratorConfig> {
-    let model = may_config
+    let selector = may_config
         .default_model_for_tier(crate::config::ModelTier::ImageGeneration)?
-        .to_string();
-
-    let provider_id = may_config
-        .models
-        .provider_for_model(&model, may_config.preferences.strict_model_matching)
-        .map(std::string::ToString::to_string)
-        .or_else(|| {
-            let resolver = may_config.create_resolver();
-            resolver
-                .select_provider(&model)
-                .map(|selected| selected.id.to_string())
-        })?;
-
+        .clone();
+    let provider_id = selector.provider_id().to_string();
     let provider = may_config.provider.get(&provider_id)?.clone();
 
     Some(ImageGeneratorConfig {
         provider_id,
         provider,
-        model,
+        model: selector.model_id().to_string(),
     })
 }

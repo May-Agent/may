@@ -30,7 +30,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     }
 
     if let Some(model) = args.model.as_ref() {
-        app.config.last_model = Some(model.clone());
+        app.config.last_model = Some(
+            model
+                .parse::<may_agent::ModelSelector>()
+                .expect("oneshot model must be an explicit provider::model selector"),
+        );
     }
 
     let (workspace_broker, workspace_queue) = workspace_request::channel();

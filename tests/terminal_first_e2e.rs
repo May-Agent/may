@@ -16,6 +16,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use may_agent::MayConfig;
 use may_agent::config::{ProviderInstance, ProviderType};
+use may_agent::model_selector::ModelSelector;
 use may_agent::session::{SandboxResourceLayout, SessionId, initialize_session_persistence};
 use serde_json::Value;
 use serial_test::serial;
@@ -24,7 +25,9 @@ use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
+const TEST_PROVIDER_ID: &str = "mock";
 const TEST_MODEL: &str = "test-model";
+const TEST_SELECTOR: &str = "mock::test-model";
 const TEST_API_KEY: &str = "test-api-key";
 
 #[derive(Clone)]
@@ -382,13 +385,13 @@ impl TestHarness {
 
         let mut config = MayConfig::default();
         config.provider.insert(
-            "mock".to_string(),
+            TEST_PROVIDER_ID.to_string(),
             ProviderInstance::new(ProviderType::Custom)
                 .with_api_key(TEST_API_KEY)
                 .with_base_url(config_base_url),
         );
-        config.models.advanced = vec![TEST_MODEL.to_string()];
-        config.last_model = Some(TEST_MODEL.to_string());
+        config.models.advanced = vec![ModelSelector::new(TEST_PROVIDER_ID, TEST_MODEL)];
+        config.last_model = Some(ModelSelector::new(TEST_PROVIDER_ID, TEST_MODEL));
         config
             .save_to(&may_dir.join("config.toml"))
             .await
@@ -413,7 +416,7 @@ impl TestHarness {
         db.create_session_in_profile(
             &session_id,
             None,
-            Some(TEST_MODEL),
+            Some(TEST_SELECTOR),
             Some(default_profile_id.as_str()),
         )
         .await
@@ -931,7 +934,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .to_string();
     assert_eq!(
         created.get("model").and_then(Value::as_str),
-        Some(TEST_MODEL)
+        Some(TEST_SELECTOR)
     );
 
     let list_response = client
@@ -956,7 +959,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .put(format!("{}/api/sessions/{session_id}", server.base_url))
         .json(&serde_json::json!({
             "title": "Terminal first test",
-            "model": TEST_MODEL
+            "model": TEST_SELECTOR
         }))
         .send()
         .await

@@ -571,14 +571,17 @@ fn build_models_response(
     let mut model_map = std::collections::HashMap::<String, ModelInfoItem>::new();
 
     for item in fetched {
+        let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
         let new_entry = ModelInfoItem {
-            id: item.id.clone(),
+            id: selector.clone(),
+            model_id: item.id.clone(),
+            provider_id: item.provider_id.clone(),
             nickname: item.nickname,
             context_window: item.context_window,
             abilities: item.abilities,
         };
         model_map
-            .entry(item.id)
+            .entry(selector)
             .and_modify(|existing| {
                 // Prefer the entry with more abilities (richer metadata).
                 if new_entry.abilities.len() > existing.abilities.len() {
@@ -589,10 +592,11 @@ fn build_models_response(
     }
 
     for tier in crate::config::ModelTier::ALL {
-        for model in config.models.models_for_tier(*tier) {
-            model_map.entry(model.clone()).or_insert_with(|| {
+        for selector in config.models.models_for_tier(*tier) {
+            let selector_key = selector.to_string();
+            model_map.entry(selector_key.clone()).or_insert_with(|| {
                 let static_info = if include_static_metadata {
-                    lookup_model_info(model)
+                    lookup_model_info(selector.model_id())
                 } else {
                     None
                 };
@@ -606,10 +610,12 @@ fn build_models_response(
                             .collect::<Vec<_>>(),
                     )
                 } else {
-                    (model.clone(), None, Vec::new())
+                    (selector.model_id().to_string(), None, Vec::new())
                 };
                 ModelInfoItem {
-                    id: model.clone(),
+                    id: selector_key,
+                    model_id: selector.model_id().to_string(),
+                    provider_id: selector.provider_id().to_string(),
                     nickname,
                     context_window,
                     abilities,
@@ -623,14 +629,18 @@ fn build_models_response(
     // returning "OpenAI model" or "github") without needing a hardcoded blocklist.
     if include_static_metadata {
         for item in model_map.values_mut() {
-            if let Some(info) = lookup_model_info(&item.id) {
+            if let Some(info) = lookup_model_info(&item.model_id) {
                 item.nickname = info.id().to_string();
             }
         }
     }
 
     let mut details = model_map.into_values().collect::<Vec<_>>();
-    details.sort_by(|a, b| a.id.cmp(&b.id));
+    details.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then(a.model_id.cmp(&b.model_id))
+    });
     let models_list = details.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
     ModelsResponse {
         models: models_list,
@@ -664,11 +674,14 @@ fn build_provider_models_response(
         std::collections::HashMap::new();
 
     for item in fetched {
+        let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
         grouped
-            .entry(item.provider_id)
+            .entry(item.provider_id.clone())
             .or_default()
             .push(ModelInfoItem {
-                id: item.id,
+                id: selector,
+                model_id: item.id,
+                provider_id: item.provider_id,
                 nickname: item.nickname,
                 context_window: item.context_window,
                 abilities: item.abilities,
@@ -678,7 +691,7 @@ fn build_provider_models_response(
     let mut providers = grouped
         .into_iter()
         .map(|(provider_id, mut details)| {
-            details.sort_by(|a, b| a.id.cmp(&b.id));
+            details.sort_by(|a, b| a.model_id.cmp(&b.model_id));
             details.dedup_by(|a, b| a.id == b.id);
             let models_list = details.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
             ProviderModelsItem {
