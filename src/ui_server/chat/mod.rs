@@ -348,18 +348,15 @@ fn normalize_tool_delta_for_sink(
         pending.name.clear();
         pending.name.push_str(name);
     }
-    pending.buffered_arguments.push_str(arguments_fragment);
+    let arguments_fragment =
+        merge_tool_arguments(&mut pending.buffered_arguments, arguments_fragment);
 
     if pending.emitted_start_to_sink {
         return Some(SinkToolEvent::Delta {
             id: id.to_string(),
             name: pending.name.clone(),
-            arguments_fragment: arguments_fragment.to_string(),
+            arguments_fragment,
         });
-    }
-
-    if pending.name.is_empty() {
-        return None;
     }
 
     pending.emitted_start_to_sink = true;
@@ -377,23 +374,47 @@ fn normalize_tool_start_for_sink(
     arguments: &str,
 ) -> Option<SinkToolEvent> {
     let pending = pending_streams.entry(id.to_string()).or_default();
+    let name_changed = !name.is_empty() && pending.name != name;
     if !name.is_empty() {
         pending.name.clear();
         pending.name.push_str(name);
     }
-    pending.buffered_arguments.clear();
-    pending.buffered_arguments.push_str(arguments);
 
     if pending.emitted_start_to_sink {
-        return None;
+        let arguments_fragment = merge_tool_arguments(&mut pending.buffered_arguments, arguments);
+        if arguments_fragment.is_empty() && !name_changed {
+            return None;
+        }
+        return Some(SinkToolEvent::Delta {
+            id: id.to_string(),
+            name: pending.name.clone(),
+            arguments_fragment,
+        });
     }
 
+    pending.buffered_arguments.clear();
+    pending.buffered_arguments.push_str(arguments);
     pending.emitted_start_to_sink = true;
     Some(SinkToolEvent::Start {
         id: id.to_string(),
         name: pending.name.clone(),
         arguments: arguments.to_string(),
     })
+}
+
+fn merge_tool_arguments(buffered_arguments: &mut String, incoming: &str) -> String {
+    if incoming.is_empty() || incoming == buffered_arguments {
+        return String::new();
+    }
+
+    if incoming.starts_with(buffered_arguments.as_str()) {
+        let suffix = incoming[buffered_arguments.len()..].to_string();
+        buffered_arguments.push_str(suffix.as_str());
+        return suffix;
+    }
+
+    buffered_arguments.push_str(incoming);
+    incoming.to_string()
 }
 
 fn log_first_agent_event(
@@ -2815,6 +2836,102 @@ mod tests {
                 id: "tool-1".to_string(),
                 name: "terminal".to_string(),
                 arguments_fragment: "\"}".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn arguments_only_tool_delta_emits_placeholder_start_immediately() {
+        let mut pending = HashMap::new();
+
+        let first =
+            super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "", "{\"command\":\"date");
+        assert_eq!(
+            first,
+            Some(super::SinkToolEvent::Start {
+                id: "tool-1".to_string(),
+                name: String::new(),
+                arguments: "{\"command\":\"date".to_string(),
+            })
+        );
+
+        let named = super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "terminal", "\"}");
+        assert_eq!(
+            named,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "\"}".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn canonical_tool_start_updates_placeholder_name_after_synthetic_start() {
+        let mut pending = HashMap::new();
+        let first = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "",
+            "{\"command\":\"date\"}",
+        );
+        assert!(matches!(first, Some(super::SinkToolEvent::Start { .. })));
+
+        let canonical = super::normalize_tool_start_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date\"}",
+        );
+        assert_eq!(
+            canonical,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn accumulated_argument_snapshots_are_emitted_as_suffixes() {
+        let mut pending = HashMap::new();
+
+        let first = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"",
+        );
+        assert!(matches!(first, Some(super::SinkToolEvent::Start { .. })));
+
+        let second = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date",
+        );
+        assert_eq!(
+            second,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "date".to_string(),
+            })
+        );
+
+        let duplicate = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date",
+        );
+        assert_eq!(
+            duplicate,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: String::new(),
             })
         );
     }

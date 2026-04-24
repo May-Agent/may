@@ -158,6 +158,8 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         event.id,
         (existing) => ({
           ...existing,
+          name: event.name || existing.name,
+          variant: event.name ? event.variant : existing.variant,
           argumentsRaw: existing.argumentsRaw + event.argumentsFragment,
           seq: event.seq,
         }),
