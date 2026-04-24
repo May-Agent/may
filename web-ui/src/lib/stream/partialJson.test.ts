@@ -85,6 +85,19 @@ describe('projectField', () => {
     expect(frames.some((f) => f === 'listing')).toBe(true);
   });
 
+  test('streams multiline script content before JSON closes', () => {
+    const script = "python3 - <<'PY'\nfor i in range(3):\n    print(i)\nPY";
+    const input = JSON.stringify({ script });
+    const frames: string[] = [];
+    for (let i = 1; i <= input.length; i++) {
+      frames.push(projectField(input.slice(0, i), 'script'));
+    }
+
+    expect(frames.some((f) => f.includes('for i in range'))).toBe(true);
+    expect(frames.some((f) => f.includes('    print'))).toBe(true);
+    expect(frames[frames.length - 1]).toBe(script);
+  });
+
   test('returns empty string when field absent', () => {
     expect(projectField('{"other":"x"}', 'command')).toBe('');
   });
