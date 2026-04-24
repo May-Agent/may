@@ -688,19 +688,20 @@ pub async fn generate_session_title(
     use futures_lite::StreamExt;
 
     // Get a fast model
-    let model = config
+    let selector = config
         .default_model_for_tier(crate::config::ModelTier::Fast)
-        .or(config.last_model.as_deref())?;
-
-    // Find a provider for this model
-    let resolver = config.create_resolver();
-    let selected = resolver.select_provider(model)?;
+        .or(config.last_model.as_ref())?;
+    let provider_id = selector.provider_id();
+    let provider = config.get_provider(provider_id)?;
 
     // Build the cloud provider
-    let llm =
-        super::provider::build_cloud_provider_from_instance(selected.id, selected.instance, model)
-            .await
-            .ok()?;
+    let llm = super::provider::build_cloud_provider_from_instance(
+        provider_id,
+        provider,
+        selector.model_id(),
+    )
+    .await
+    .ok()?;
 
     // Truncate messages for prompt
     let user_truncated = truncate_at_char_boundary(user_message, 200);

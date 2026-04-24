@@ -2,8 +2,9 @@ import { apiGet } from './client';
 
 export interface ModelInfoItem {
   id: string;
-  providerId?: string | null;
-  displayName?: string | null;
+  modelId: string;
+  providerId: string;
+  nickname: string;
   contextWindow?: number | null;
   tier?: string | null;
 }

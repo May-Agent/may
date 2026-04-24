@@ -33,13 +33,18 @@ export function ModelPicker({ sessionId, currentModel, disabled }: ModelPickerPr
     })();
   }, [open, groups]);
 
+  const selectorLabel = (selector: string) => {
+    const [, modelId] = selector.split('::', 2);
+    return modelId ?? selector;
+  };
+
   const displayLabel = useMemo(() => {
-    if (!groups) return currentModel;
+    if (!groups) return selectorLabel(currentModel);
     for (const group of groups) {
       const hit = group.details.find((d) => d.id === currentModel);
-      if (hit) return hit.displayName?.trim() || hit.id;
+      if (hit) return hit.nickname?.trim() || hit.modelId;
     }
-    return currentModel;
+    return selectorLabel(currentModel);
   }, [groups, currentModel]);
 
   const handleSelect = useCallback(
@@ -92,12 +97,12 @@ export function ModelPicker({ sessionId, currentModel, disabled }: ModelPickerPr
                 className="text-[11px] uppercase tracking-wider text-muted-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:pb-1 [&_[cmdk-group-heading]]:pt-2"
               >
                 {group.details.map((detail) => {
-                  const label = detail.displayName?.trim() || detail.id;
+                  const label = detail.nickname?.trim() || detail.modelId;
                   const active = detail.id === currentModel;
                   return (
                     <Command.Item
                       key={detail.id}
-                      value={`${detail.id} ${label}`}
+                      value={`${detail.id} ${detail.modelId} ${label}`}
                       onSelect={() => void handleSelect(detail.id)}
                       className={cn(
                         'flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm aria-selected:bg-accent',

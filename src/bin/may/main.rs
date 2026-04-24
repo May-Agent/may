@@ -610,7 +610,13 @@ where
                             {
                                 tracing::warn!("Failed to save model to session: {}", e);
                             }
-                            app.config.last_model = Some(model);
+                            app.config.last_model = Some(
+                                model
+                                    .parse::<may_agent::ModelSelector>()
+                                    .expect(
+                                        "interactive model switch must persist a valid provider::model selector",
+                                    ),
+                            );
                             if let Err(e) = app.config.clone().save().await {
                                 tracing::warn!("Failed to save config: {}", e);
                             }

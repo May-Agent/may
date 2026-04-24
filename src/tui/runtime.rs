@@ -555,7 +555,7 @@ impl RuntimeDeps {
         let model = self
             .oneshot_model
             .clone()
-            .or_else(|| app.config.last_model.clone());
+            .or_else(|| app.config.last_model.as_ref().map(ToString::to_string));
         let (sandbox_dir, session_id, messages) = {
             let session = app
                 .session_manager
@@ -1040,15 +1040,15 @@ impl SelectedModel {
             return Self::new(model);
         }
 
-        if let Some(model) = config.last_model.as_deref() {
-            return Self::new(model);
+        if let Some(model) = config.last_model.as_ref().map(ToString::to_string) {
+            return Self::new(&model);
         }
 
         let model = config
             .default_model_for_tier(crate::config::ModelTier::Balanced)
             .ok_or(TuiRuntimeError::NoModelConfigured)?;
 
-        Self::new(model)
+        Self::new(&model.to_string())
     }
 
     fn as_str(&self) -> &str {

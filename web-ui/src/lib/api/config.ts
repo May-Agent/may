@@ -15,7 +15,6 @@ export type ProviderType =
   | 'xai'
   | 'custom';
 
-export type LoadBalanceStrategy = 'round_robin' | 'failover_only' | 'random';
 export type NetworkPolicyMode = 'disabled' | 'restricted' | 'allow_list' | 'deny_list';
 export type BrowserBackendKind = 'managed' | 'remote_cdp';
 
@@ -35,14 +34,11 @@ export interface UiModelsConfig {
   imageGeneration: string[];
   embeddingModel?: string | null;
   embeddingDimensions?: number | null;
-  modelProviders: Record<string, string>;
 }
 
 export interface UiPreferencesConfig {
-  loadBalanceStrategy: LoadBalanceStrategy;
   warnOnModelChange: boolean;
   showTokenUsage: boolean;
-  strictModelMatching: boolean;
   networkPolicyMode: NetworkPolicyMode;
   networkPolicyHosts: string[];
 }

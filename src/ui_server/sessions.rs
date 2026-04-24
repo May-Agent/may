@@ -294,7 +294,7 @@ pub(super) async fn create_session(
     let model = {
         let config = state.config_snapshot();
         req.model
-            .or_else(|| config.last_model.clone())
+            .or_else(|| config.last_model.as_ref().map(ToString::to_string))
             .or_else(|| preferred_advanced_model(&config))
             .ok_or_else(|| bad_request_error("No model configured"))?
     };

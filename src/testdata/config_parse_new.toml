@@ -7,10 +7,9 @@ api_key = "sk-ant-test"
 api_key = "or-test"
 
 [models]
-advanced = ["claude-opus-4"]
-balanced = ["claude-sonnet-4", "gpt-4o"]
-fast = ["claude-haiku-4"]
+advanced = ["anthropic::claude-opus-4"]
+balanced = ["anthropic::claude-sonnet-4", "openrouter::gpt-4o"]
+fast = ["anthropic::claude-haiku-4"]
 
 [preferences]
-load_balance_strategy = "round_robin"
 warn_on_model_change = true
