@@ -138,6 +138,35 @@ describe('reducer', () => {
     }
   });
 
+  test('tool_delta can upgrade placeholder tool metadata', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'tool_start',
+        seq: 2,
+        turnId: 't1',
+        id: 'c1',
+        name: '',
+        variant: 'generic',
+        arguments: '{"script":"date"}',
+      },
+      {
+        kind: 'tool_delta',
+        seq: 3,
+        turnId: 't1',
+        id: 'c1',
+        name: 'terminal',
+        variant: 'terminal',
+        argumentsFragment: '',
+      },
+    ]);
+
+    expect(t.tools.length).toBe(1);
+    expect(t.tools[0]?.name).toBe('terminal');
+    expect(t.tools[0]?.variant).toBe('terminal');
+    expect(t.tools[0]?.argumentsRaw).toBe('{"script":"date"}');
+  });
+
   test('todo_update replaces the plan snapshot', () => {
     const t = stream([
       { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },

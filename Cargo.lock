@@ -10202,10 +10202,12 @@ dependencies = [
  "async-net",
  "async-tungstenite 0.33.0",
  "base64 0.22.1",
+ "bytes",
  "color-eyre",
  "cookie",
  "ctrlc",
  "executor-core",
+ "flate2",
  "futures-channel",
  "futures-core",
  "futures-util",
@@ -10238,6 +10240,7 @@ dependencies = [
  "utoipa-redoc",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
