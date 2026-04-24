@@ -160,6 +160,7 @@ export const ja: Messages = {
     generic: '処理中',
     output: '結果',
     escalated: '権限を昇格',
+    truncated: '出力は省略されています。',
   },
   runtime: {
     idle: 'アイドル',

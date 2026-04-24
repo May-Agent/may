@@ -160,6 +160,7 @@ export const zhHant: Messages = {
     generic: '處理中',
     output: '結果',
     escalated: '已提升權限',
+    truncated: '輸出已截斷。',
   },
   runtime: {
     idle: '閒置',
