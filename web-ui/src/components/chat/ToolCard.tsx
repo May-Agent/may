@@ -1,4 +1,4 @@
-import { memo, useMemo } from 'react';
+import { memo, useEffect, useMemo, useRef } from 'react';
 import {
   Check,
   ChevronRight,
@@ -58,6 +58,15 @@ function firstLine(text: string): string {
   return nl === -1 ? text : text.slice(0, nl);
 }
 
+function isTerminalVariant(variant: ToolVariant): boolean {
+  return (
+    variant === 'terminal' ||
+    variant === 'terminal_input' ||
+    variant === 'terminal_read' ||
+    variant === 'terminal_kill'
+  );
+}
+
 function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
   const raw = tool.argumentsRaw;
   switch (tool.variant) {
@@ -65,10 +74,10 @@ function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
     case 'terminal_input':
     case 'terminal_read':
     case 'terminal_kill': {
-      const description = projectField(raw, 'description');
-      if (description.length > 0) return description;
       const script = projectField(raw, 'script');
       if (script.length > 0) return firstLine(script);
+      const description = projectField(raw, 'description');
+      if (description.length > 0) return description;
       return fallback;
     }
     case 'web_search': {
@@ -178,7 +187,7 @@ function TerminalDetails({ tool }: { tool: TurnToolState }) {
   return (
     <div className="space-y-1.5">
       {script.length > 0 && (
-        <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono leading-relaxed whitespace-pre-wrap break-all">
+        <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono leading-relaxed whitespace-pre-wrap break-words max-h-72 overflow-auto scrollbar-thin">
           {script}
           {tool.status === 'streaming' && (
             <span className="inline-block w-1.5 h-3 bg-foreground/70 animate-pulse ml-0.5 align-middle" />
@@ -276,14 +285,22 @@ function selectDetails(tool: TurnToolState) {
 
 export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
   const { t } = useTranslation();
+  const detailsRef = useRef<HTMLDetailsElement>(null);
   const Icon = VARIANT_ICON[tool.variant] ?? Wrench;
   const variantLabel = t(VARIANT_LABEL_KEY[tool.variant] ?? 'tools.generic');
   const primary = pickPrimaryLabel(tool, variantLabel);
   const streaming = tool.status === 'streaming';
   const details = selectDetails(tool);
+  const streamTerminalDetails = streaming && isTerminalVariant(tool.variant);
+
+  useEffect(() => {
+    if (streamTerminalDetails) {
+      detailsRef.current?.setAttribute('open', '');
+    }
+  }, [streamTerminalDetails]);
 
   return (
-    <details className="group">
+    <details ref={detailsRef} className="group">
       <summary
         className={cn(
           'flex items-center gap-2 rounded-md px-1.5 py-1 cursor-pointer list-none',
