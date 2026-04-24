@@ -316,6 +316,86 @@ impl ChatSink for CollectSink {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PendingToolStream {
+    name: String,
+    buffered_arguments: String,
+    emitted_start_to_sink: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SinkToolEvent {
+    Start {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    Delta {
+        id: String,
+        name: String,
+        arguments_fragment: String,
+    },
+}
+
+fn normalize_tool_delta_for_sink(
+    pending_streams: &mut std::collections::HashMap<String, PendingToolStream>,
+    id: &str,
+    name: &str,
+    arguments_fragment: &str,
+) -> Option<SinkToolEvent> {
+    let pending = pending_streams.entry(id.to_string()).or_default();
+    if !name.is_empty() {
+        pending.name.clear();
+        pending.name.push_str(name);
+    }
+    pending.buffered_arguments.push_str(arguments_fragment);
+
+    if pending.emitted_start_to_sink {
+        return Some(SinkToolEvent::Delta {
+            id: id.to_string(),
+            name: pending.name.clone(),
+            arguments_fragment: arguments_fragment.to_string(),
+        });
+    }
+
+    if pending.name.is_empty() {
+        return None;
+    }
+
+    pending.emitted_start_to_sink = true;
+    Some(SinkToolEvent::Start {
+        id: id.to_string(),
+        name: pending.name.clone(),
+        arguments: pending.buffered_arguments.clone(),
+    })
+}
+
+fn normalize_tool_start_for_sink(
+    pending_streams: &mut std::collections::HashMap<String, PendingToolStream>,
+    id: &str,
+    name: &str,
+    arguments: &str,
+) -> Option<SinkToolEvent> {
+    let pending = pending_streams.entry(id.to_string()).or_default();
+    if !name.is_empty() {
+        pending.name.clear();
+        pending.name.push_str(name);
+    }
+    pending.buffered_arguments.clear();
+    pending.buffered_arguments.push_str(arguments);
+
+    if pending.emitted_start_to_sink {
+        return None;
+    }
+
+    pending.emitted_start_to_sink = true;
+    Some(SinkToolEvent::Start {
+        id: id.to_string(),
+        name: pending.name.clone(),
+        arguments: arguments.to_string(),
+    })
+}
+
 /// Successful result from the shared agent loop.
 #[derive(Debug)]
 struct AgentRunResult {
@@ -1004,6 +1084,8 @@ async fn run_agent_loop(
         let mut saw_tool_activity = false;
         let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut pending_tool_streams: std::collections::HashMap<String, PendingToolStream> =
+            std::collections::HashMap::new();
         let mut last_todo_hash: Option<u64> = None;
         let tasks_db = state.db();
         let tasks_session_id = req.session_id.clone();
@@ -1061,7 +1143,36 @@ async fn run_agent_loop(
                         name,
                         arguments_fragment,
                     }) => {
-                        sink.on_tool_delta(&id, &name, &arguments_fragment).await;
+                        match normalize_tool_delta_for_sink(
+                            &mut pending_tool_streams,
+                            &id,
+                            &name,
+                            &arguments_fragment,
+                        ) {
+                            Some(SinkToolEvent::Start {
+                                id,
+                                name,
+                                arguments,
+                            }) => {
+                                if !sink.on_tool_start(&id, &name, &arguments).await {
+                                    cancellation_reason =
+                                        Some("client disconnected during tool stream");
+                                    break;
+                                }
+                            }
+                            Some(SinkToolEvent::Delta {
+                                id,
+                                name,
+                                arguments_fragment,
+                            }) => {
+                                if !sink.on_tool_delta(&id, &name, &arguments_fragment).await {
+                                    cancellation_reason =
+                                        Some("client disconnected during tool stream");
+                                    break;
+                                }
+                            }
+                            None => {}
+                        }
                     }
                     Ok(aither_agent::AgentEvent::ToolCallStart {
                         id,
@@ -1096,7 +1207,17 @@ async fn run_agent_loop(
                         turn_persister.push_tool_event(id.clone(), serialized);
                         update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                         tool_arguments_by_id.insert(id.clone(), arguments.clone());
-                        if !sink.on_tool_start(&id, &name, &arguments).await {
+                        if let Some(SinkToolEvent::Start {
+                            id,
+                            name,
+                            arguments,
+                        }) = normalize_tool_start_for_sink(
+                            &mut pending_tool_streams,
+                            &id,
+                            &name,
+                            &arguments,
+                        ) && !sink.on_tool_start(&id, &name, &arguments).await
+                        {
                             cancellation_reason = Some("client disconnected during tool stream");
                             break;
                         }
@@ -1121,6 +1242,7 @@ async fn run_agent_loop(
                         turn_persister.push_tool_event(id.clone(), serialized);
                         update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                         let arguments = tool_arguments_by_id.remove(&id);
+                        pending_tool_streams.remove(&id);
                         if !sink
                             .on_tool_end(&id, &name, arguments.as_deref(), &result)
                             .await
@@ -2457,6 +2579,7 @@ async fn take_over_alert_pending(state: &UiServerState, session_id: &SessionId) 
 #[cfg(test)]
 mod tests {
     use aither_core::llm::Message as LlmMessage;
+    use std::collections::HashMap;
 
     #[test]
     fn history_delta_since_snapshot_returns_suffix_after_anchor_id() {
@@ -2522,5 +2645,75 @@ mod tests {
 
         assert_eq!(snapshot.last_message_db_id, Some(42));
         assert!(snapshot.checkpoint.context.is_empty());
+    }
+
+    #[test]
+    fn first_tool_delta_emits_synthetic_start_then_later_deltas_stream_normally() {
+        let mut pending = HashMap::new();
+
+        let first = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date",
+        );
+        assert_eq!(
+            first,
+            Some(super::SinkToolEvent::Start {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments: "{\"command\":\"date".to_string(),
+            })
+        );
+
+        let second = super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "", "\"}");
+        assert_eq!(
+            second,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "\"}".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn canonical_tool_start_is_suppressed_after_synthetic_start() {
+        let mut pending = HashMap::new();
+        let first = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date\"}",
+        );
+        assert!(matches!(first, Some(super::SinkToolEvent::Start { .. })));
+
+        let canonical = super::normalize_tool_start_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date\"}",
+        );
+        assert_eq!(canonical, None);
+    }
+
+    #[test]
+    fn canonical_tool_start_emits_when_no_delta_arrived_first() {
+        let mut pending = HashMap::new();
+
+        let start = super::normalize_tool_start_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date\"}",
+        );
+        assert_eq!(
+            start,
+            Some(super::SinkToolEvent::Start {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments: "{\"command\":\"date\"}".to_string(),
+            })
+        );
     }
 }

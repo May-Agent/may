@@ -17,6 +17,7 @@ mod live_response;
 pub mod location;
 pub mod mcp;
 pub mod memory;
+pub mod model_selector;
 pub mod models;
 pub mod network_policy;
 pub mod notification;
@@ -49,6 +50,7 @@ pub use config::MayConfig;
 pub use db::ChatDb;
 pub use heel::configure_heel_binary;
 pub use mcp::{MayMcpServerConfig, McpConfig, McpManager, McpServerInfo};
+pub use model_selector::{ModelSelector, ModelSelectorParseError};
 pub use profile::{HomeEnvironment, PinnedItem, ProfileEnvironment, ProfileInfo, ProfileSessions};
 pub use session::{
     ChatHistory, ChatMessage, MayHomePaths, MessageRole, ProfileHomePaths, Session, SessionId,

@@ -27,8 +27,7 @@ pub use permission::{
     PermissionRequestMode, PermissionRequestModeParseError,
 };
 pub use provider::{
-    ProviderCandidate, ResolvedProviderRuntime, build_fast_provider_chain,
-    provider_candidate_count, provider_candidates_for_model, provider_candidates_for_tiers,
+    ResolvedProviderRuntime, build_fast_provider_chain, provider_candidate_count,
     resolve_provider_runtime,
 };
 pub use runner::{AgentHandle, AgentWorker, TuiEvent, spawn_worker};

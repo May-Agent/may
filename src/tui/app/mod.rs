@@ -1305,10 +1305,9 @@ impl App {
             "/model" => {
                 self.model_select_list = self.collect_all_models();
                 self.model_select_index = 0;
-                if let Some(current) = self
-                    .current_model
-                    .as_deref()
-                    .or(self.config.last_model.as_deref())
+                let fallback_model = self.config.last_model.as_ref().map(ToString::to_string);
+                let current = self.current_model.as_deref().or(fallback_model.as_deref());
+                if let Some(current) = current
                     && let Some(idx) = self.model_select_list.iter().position(|m| m == current)
                 {
                     self.model_select_index = idx;
@@ -1654,16 +1653,26 @@ impl App {
     /// Get model name for display.
     pub fn model_display(&self) -> String {
         // Show the actual model being used - no fallback
-        self.current_model
-            .clone()
-            .unwrap_or_else(|| "No model".to_string())
+        self.current_model.as_ref().map_or_else(
+            || "No model".to_string(),
+            |model| {
+                model.parse::<crate::ModelSelector>().map_or_else(
+                    |_| model.clone(),
+                    |selector| selector.model_id().to_string(),
+                )
+            },
+        )
     }
 
     /// Set the current model being used.
     pub fn set_current_model(&mut self, model: &str) {
         self.current_model = Some(model.to_string());
         // Also update context window from model info
-        if let Some(info) = aither_models::lookup(model) {
+        let lookup_model = model.parse::<crate::ModelSelector>().map_or_else(
+            |_| model.to_string(),
+            |selector| selector.model_id().to_string(),
+        );
+        if let Some(info) = aither_models::lookup(&lookup_model) {
             self.context_window = info.max_input_tokens();
         }
     }

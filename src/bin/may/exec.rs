@@ -122,7 +122,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
     let model = select_exec_model(&may_config);
     let shell_mode = select_exec_mode(&args, &environment);
     let terminal_tool =
-        build_exec_terminal_tool(&context, &environment, &may_config, model).await?;
+        build_exec_terminal_tool(&context, &environment, &may_config, &model).await?;
 
     let output = terminal_tool
         .call(TerminalArgs {
@@ -450,11 +450,12 @@ async fn resolve_attached_ssh_servers(
         .collect())
 }
 
-fn select_exec_model(config: &MayConfig) -> &str {
+fn select_exec_model(config: &MayConfig) -> String {
     config
         .last_model
-        .as_deref()
-        .or_else(|| config.models.advanced.first().map(String::as_str))
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| config.models.advanced.first().map(ToString::to_string))
         .unwrap_or_else(|| panic!("may exec requires at least one configured model"))
 }
 
