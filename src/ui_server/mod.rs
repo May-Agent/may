@@ -302,8 +302,8 @@ fn api_routes() -> Route {
     };
     use bootstrap::get_bootstrap;
     use browser::{
-        browser_offer, browser_start, browser_status, browser_stop, browser_takeover_start,
-        browser_takeover_stop,
+        browser_offer, browser_resize_viewport, browser_start, browser_status, browser_stop,
+        browser_takeover_start, browser_takeover_stop,
     };
     use chat::{chat_stream, enqueue_chat, remove_pending_message, stop_session_run};
     use config::{
@@ -449,6 +449,7 @@ fn api_routes() -> Route {
                 "/start".post(browser_start),
                 "/stop".post(browser_stop),
                 "/offer".post(browser_offer),
+                "/viewport".post(browser_resize_viewport),
                 "/takeover/start".post(browser_takeover_start),
                 "/takeover/stop".post(browser_takeover_stop),
             ))),
