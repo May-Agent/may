@@ -23,6 +23,7 @@ import type { ToolVariant } from '@/lib/types';
 import { parsePartialJson, projectField } from '@/lib/stream/partialJson';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
+import { useBrowserViewStore } from '@/lib/stores/browserView';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
 
 SyntaxHighlighter.registerLanguage('bash', bash);
@@ -388,6 +389,20 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
           {primary}
         </span>
         <span className="ml-auto flex items-center gap-1.5 shrink-0">
+          {tool.variant === 'browser' && (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                useBrowserViewStore.getState().setOpen(true);
+              }}
+            >
+              <ArrowUpRight className="size-3" />
+              {t('browserLive.openInToolCard')}
+            </button>
+          )}
           {statusIcon(tool.status, tool.result)}
           <ChevronRight className="size-3.5 text-muted-foreground transition-transform group-open:rotate-90" />
         </span>
