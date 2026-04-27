@@ -36,14 +36,21 @@ fn parse_terminal_mode(mode: TerminalExecutionMode) -> TerminalCommandMode {
 pub(super) fn parse_terminal_start(
     arguments: &str,
 ) -> (String, String, Option<TerminalCommandMode>) {
-    let parsed: TerminalArgs = serde_json::from_str(arguments).unwrap_or_else(|error| {
-        panic!("invalid terminal tool start payload: {error}; payload: {arguments}")
-    });
-    (
-        parsed.description,
-        parsed.script,
-        Some(parse_terminal_mode(parsed.mode)),
-    )
+    match serde_json::from_str::<TerminalArgs>(arguments) {
+        Ok(parsed) => (
+            parsed.description,
+            parsed.script,
+            Some(parse_terminal_mode(parsed.mode)),
+        ),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                payload = %arguments,
+                "terminal tool start payload did not satisfy TerminalArgs; surfacing as malformed call"
+            );
+            (String::new(), String::new(), None)
+        }
+    }
 }
 
 pub(super) fn parse_terminal_result_payload(

@@ -108,6 +108,10 @@ pub struct SseToolStartEvent<'a> {
     pub(crate) name: &'a str,
     pub(crate) variant: ToolVariant,
     pub(crate) arguments: &'a str,
+    /// Backend-projected summary fields. The frontend reads these directly
+    /// for the summary chip; no client-side partial-JSON parsing required.
+    #[serde(skip_serializing_if = "crate::ui_server::tool_summary::ToolSummary::is_empty")]
+    pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -119,6 +123,10 @@ pub struct SseToolDeltaEvent<'a> {
     pub(crate) name: &'a str,
     pub(crate) variant: ToolVariant,
     pub(crate) arguments_fragment: &'a str,
+    /// Backend-projected summary fields, recomputed from the cumulative
+    /// argument buffer at every delta.
+    #[serde(skip_serializing_if = "crate::ui_server::tool_summary::ToolSummary::is_empty")]
+    pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -132,6 +140,8 @@ pub struct SseToolEndEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) arguments: Option<&'a str>,
     pub(crate) result: &'a ToolResult,
+    #[serde(skip_serializing_if = "crate::ui_server::tool_summary::ToolSummary::is_empty")]
+    pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
 }
 
 #[derive(Debug, serde::Serialize)]

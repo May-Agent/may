@@ -1,6 +1,7 @@
 import type {
   ApiErrorCode,
   ChatStreamEvent,
+  ToolSummary,
   ToolVariant,
   SseTodoItem,
 } from '../types';
@@ -11,6 +12,11 @@ export interface TurnToolState {
   variant: ToolVariant;
   /** Raw accumulated JSON argument fragment (may be partial mid-stream). */
   argumentsRaw: string;
+  /**
+   * Backend-projected summary fields. Authoritative for display labels;
+   * the frontend never re-parses argumentsRaw to derive these.
+   */
+  summary: ToolSummary;
   /** Streaming status. */
   status: 'streaming' | 'done';
   /** Parsed result once tool_end arrives. */
@@ -132,6 +138,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           name: event.name,
           variant: event.variant,
           argumentsRaw: event.arguments,
+          summary: event.summary ?? existing.summary,
           status: 'streaming',
           seq: event.seq,
         }),
@@ -140,6 +147,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           name: event.name,
           variant: event.variant,
           argumentsRaw: event.arguments,
+          summary: event.summary ?? {},
           status: 'streaming',
           seq: event.seq,
         }),
@@ -161,6 +169,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           name: event.name || existing.name,
           variant: event.name ? event.variant : existing.variant,
           argumentsRaw: existing.argumentsRaw + event.argumentsFragment,
+          summary: event.summary ?? existing.summary,
           seq: event.seq,
         }),
         () => ({
@@ -168,6 +177,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           name: event.name,
           variant: event.variant,
           argumentsRaw: event.argumentsFragment,
+          summary: event.summary ?? {},
           status: 'streaming',
           seq: event.seq,
         }),
@@ -187,6 +197,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         (existing) => ({
           ...existing,
           argumentsRaw: event.arguments ?? existing.argumentsRaw,
+          summary: event.summary ?? existing.summary,
           status: 'done',
           result: event.result,
           seq: event.seq,
@@ -196,6 +207,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           name: event.name,
           variant: event.variant,
           argumentsRaw: event.arguments ?? '',
+          summary: event.summary ?? {},
           status: 'done',
           result: event.result,
           seq: event.seq,

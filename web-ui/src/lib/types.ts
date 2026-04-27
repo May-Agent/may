@@ -210,6 +210,21 @@ export interface SseReasoning {
   chunk: string;
 }
 
+/**
+ * Backend-projected summary fields. Populated server-side from cumulative
+ * argument JSON via `partial-json-fixer`. The frontend reads these directly
+ * for the summary chip — no client-side partial-JSON parsing.
+ */
+export interface ToolSummary {
+  description?: string | null;
+  script?: string | null;
+  query?: string | null;
+  url?: string | null;
+  action?: string | null;
+  target?: string | null;
+  prompt?: string | null;
+}
+
 export interface SseToolStart {
   kind: 'tool_start';
   seq: number;
@@ -218,6 +233,7 @@ export interface SseToolStart {
   name: string;
   variant: ToolVariant;
   arguments: string;
+  summary?: ToolSummary;
 }
 
 export interface SseToolDelta {
@@ -228,6 +244,7 @@ export interface SseToolDelta {
   name: string;
   variant: ToolVariant;
   argumentsFragment: string;
+  summary?: ToolSummary;
 }
 
 export interface SseToolEnd {
@@ -239,6 +256,7 @@ export interface SseToolEnd {
   variant: ToolVariant;
   arguments?: string;
   result: unknown;
+  summary?: ToolSummary;
 }
 
 export interface SseTodoItem {

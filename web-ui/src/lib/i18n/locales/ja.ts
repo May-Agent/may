@@ -124,6 +124,7 @@ export const ja: Messages = {
   chat: {
     thinking: '思考中',
     responding: '応答中',
+    scrollToBottom: '最新へ戻る',
     thought: '思考過程',
     plan: 'プラン',
     assistantStreaming: 'May が応答中',
@@ -160,7 +161,7 @@ export const ja: Messages = {
     generic: '処理中',
     output: '結果',
     escalated: '権限を昇格',
-    truncated: '出力は省略されています。',
+    viewFullOutput: '完全な出力を表示',
   },
   runtime: {
     idle: 'アイドル',
