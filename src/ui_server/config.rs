@@ -195,6 +195,9 @@ async fn run_save_full_config(
             crate::container::browser::BrowserManager::new(
                 next_browser_config,
                 state.may_dir.clone(),
+                crate::container::browser::BrowserLifecyclePublisher::new(
+                    state.browser_lifecycle_tx.clone(),
+                ),
             )
             .map_err(internal_error)?,
         ))
