@@ -11,6 +11,7 @@ import {
   type BrowserInputMessage,
   type BrowserStreamHandle,
   connectBrowserStream,
+  resizeBrowserViewport,
   sendBrowserInput,
   startBrowser,
   startTakeover,
@@ -88,6 +89,7 @@ export function BrowserLiveView() {
   const activeSession = useSessionsStore((s) => s.active);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const handleRef = useRef<BrowserStreamHandle | null>(null);
   const [connectionState, setConnectionState] = useState<RTCPeerConnectionState>('new');
   const [busy, setBusy] = useState(false);
@@ -95,6 +97,56 @@ export function BrowserLiveView() {
   const sessionId = activeSession?.id ?? null;
   const isRunning = browser?.running ?? false;
   const takeoverActive = browser?.takeoverSessionId === sessionId && sessionId !== null;
+
+  // Track the panel's rendered pixel size and ask the actor to resize
+  // the viewport to match. Debounced so a single drag-resize doesn't fire
+  // dozens of CDP round-trips.
+  useEffect(() => {
+    if (!open || !isRunning) return;
+    const stage = stageRef.current;
+    if (!stage) return;
+    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    let lastSent: { width: number; height: number; dpr: number } | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const flush = () => {
+      timer = null;
+      const rect = stage.getBoundingClientRect();
+      const width = Math.round(rect.width);
+      const height = Math.round(rect.height);
+      if (width === 0 || height === 0) return;
+      if (
+        lastSent &&
+        lastSent.width === width &&
+        lastSent.height === height &&
+        lastSent.dpr === dpr
+      ) {
+        return;
+      }
+      lastSent = { width, height, dpr };
+      void resizeBrowserViewport({
+        width,
+        height,
+        deviceScaleFactor: dpr,
+      }).catch(() => {
+        // Resize is best-effort — a transient failure just means the
+        // viewport stays at the previous resolution until the next
+        // observer tick.
+      });
+    };
+
+    const observer = new ResizeObserver(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(flush, 300);
+    });
+    observer.observe(stage);
+    flush();
+
+    return () => {
+      observer.disconnect();
+      if (timer) clearTimeout(timer);
+    };
+  }, [open, isRunning]);
 
   // Establish / tear down the WebRTC connection in step with panel
   // visibility, browser running state, and the active session.
@@ -257,7 +309,7 @@ export function BrowserLiveView() {
         </Button>
       </header>
 
-      <div className="relative flex-1 overflow-hidden bg-black/95">
+      <div ref={stageRef} className="relative flex-1 overflow-hidden bg-black/95">
         {!isRunning && (
           <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
             <span>{t('browserLive.notRunning')}</span>

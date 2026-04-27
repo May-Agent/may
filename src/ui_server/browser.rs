@@ -48,6 +48,25 @@ pub(super) struct BrowserTakeoverRequest {
     session_id: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BrowserResizeViewportRequest {
+    width: u32,
+    height: u32,
+    #[serde(default = "default_dpr")]
+    device_scale_factor: f64,
+}
+
+fn default_dpr() -> f64 {
+    1.0
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BrowserResizeViewportResponse {
+    ok: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum EnsureBrowserRuntimeError {
     #[error("browser automation is not enabled")]
@@ -254,6 +273,30 @@ async fn run_browser_offer(
         })?;
 
     Ok(WebRtcAnswerResponse { sdp: answer_sdp })
+}
+
+/// Resize the rendered viewport to follow the panel size on the client.
+pub(super) async fn browser_resize_viewport(
+    State(state): State<Arc<UiServerState>>,
+    Json(req): Json<BrowserResizeViewportRequest>,
+) -> SkyResult<Json<BrowserResizeViewportResponse>> {
+    let Some(bm) = state.browser_manager() else {
+        return Err(skyzen::Error::msg("Browser automation is not enabled")
+            .set_status(StatusCode::NOT_FOUND));
+    };
+    if req.width == 0 || req.height == 0 {
+        return Err(
+            skyzen::Error::msg("width and height must be positive integers")
+                .set_status(StatusCode::BAD_REQUEST),
+        );
+    }
+    bm.resize_viewport(req.width, req.height, req.device_scale_factor)
+        .await
+        .map_err(|error| {
+            skyzen::Error::msg(error_chain_text(&error))
+                .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+    Ok(Json(BrowserResizeViewportResponse { ok: true }))
 }
 
 /// Mark that user has taken over browser control for a session.

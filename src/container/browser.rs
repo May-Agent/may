@@ -25,6 +25,7 @@ use chromiumoxide::cdp::browser_protocol::accessibility::{
     AxNode, AxProperty, AxValue, EnableParams as AccessibilityEnableParams,
     GetFullAxTreeParams as GetFullAccessibilityTreeParams,
 };
+use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
     MouseButton,
@@ -393,6 +394,15 @@ enum BrowserCommand {
     SetTakeover {
         session_id: Option<String>,
     },
+    /// Resize the rendered viewport to match the live-view panel. Updates
+    /// the CDP emulation metrics and re-issues StartScreencast so the
+    /// next encoded frames carry the new resolution.
+    ResizeViewport {
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+        reply: oneshot::Sender<Result<(), BrowserError>>,
+    },
 }
 
 /// Sequential, transient lifecycle facts produced by the browser actor.
@@ -526,6 +536,40 @@ impl BrowserRuntime {
             });
         }
     }
+
+    async fn resize_viewport(
+        &self,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+    ) -> Result<(), BrowserError> {
+        let session = self.session.as_ref().ok_or(BrowserError::NotRunning)?;
+        let page = session.page.clone();
+        let dpr = if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
+            device_scale_factor
+        } else {
+            1.0
+        };
+        let params = SetDeviceMetricsOverrideParams::builder()
+            .width(i64::from(width))
+            .height(i64::from(height))
+            .device_scale_factor(dpr)
+            .mobile(false)
+            .build()
+            .map_err(|error| {
+                BrowserError::browser_operation(
+                    "build device metrics override params",
+                    std::io::Error::other(error),
+                )
+            })?;
+        page.execute(params).await.map_err(|error| {
+            BrowserError::browser_operation("set device metrics override", error)
+        })?;
+        // Force an IDR after a resize: the codec sees a new resolution
+        // and the next sample needs to be a keyframe anyway.
+        self.keyframe_request.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 // ── BrowserManager ─────────────────────────────────────────────────────────────
@@ -626,6 +670,18 @@ impl BrowserManager {
                     BrowserCommand::SetTakeover { session_id } => {
                         runtime.set_takeover(session_id);
                     }
+                    BrowserCommand::ResizeViewport {
+                        width,
+                        height,
+                        device_scale_factor,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            runtime
+                                .resize_viewport(width, height, device_scale_factor)
+                                .await,
+                        );
+                    }
                 }
             }
 
@@ -722,6 +778,29 @@ impl BrowserManager {
         let _ = self
             .command_tx
             .send(BrowserCommand::SetTakeover { session_id });
+    }
+
+    /// Resize the rendered viewport to match the live-view panel size.
+    pub async fn resize_viewport(
+        &self,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+    ) -> Result<(), BrowserError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(BrowserCommand::ResizeViewport {
+                width,
+                height,
+                device_scale_factor,
+                reply: reply_tx,
+            })
+            .map_err(|_| BrowserError::ActorClosed {
+                operation: "resize browser viewport",
+            })?;
+        reply_rx.await.map_err(|_| BrowserError::ActorClosed {
+            operation: "await resize viewport reply",
+        })?
     }
 
     pub async fn read_page(

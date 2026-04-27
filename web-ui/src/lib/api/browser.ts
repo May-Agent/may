@@ -21,6 +21,16 @@ export function stopTakeover(sessionId: string): Promise<{ ok: boolean; sessionI
   return apiPost('/browser/takeover/stop', { sessionId });
 }
 
+export interface BrowserResizeRequest {
+  width: number;
+  height: number;
+  deviceScaleFactor?: number;
+}
+
+export function resizeBrowserViewport(req: BrowserResizeRequest): Promise<{ ok: boolean }> {
+  return apiPost('/browser/viewport', req);
+}
+
 interface OfferAnswer {
   sdp: string;
 }
