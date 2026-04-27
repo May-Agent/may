@@ -193,16 +193,11 @@ async fn fetch_models_for_provider(
         .map(|p| {
             let model_id = p.name;
             let provider_description = p.description.trim();
-            let nickname = aither_models::lookup(&model_id)
-                .map(|info| info.id().to_string())
-                .or_else(|| {
-                    if provider_description.is_empty() {
-                        None
-                    } else {
-                        Some(provider_description.to_string())
-                    }
-                })
-                .unwrap_or_else(|| model_id.clone());
+            let nickname = if provider_description.is_empty() {
+                model_id.clone()
+            } else {
+                provider_description.to_string()
+            };
 
             let mut abilities: Vec<String> =
                 p.abilities.into_iter().map(ability_to_label).collect();
@@ -271,7 +266,6 @@ async fn fetch_openai_compatible_models(
                 .description
                 .clone()
                 .filter(|value| !value.trim().is_empty())
-                .or_else(|| aither_models::lookup(&model_id).map(|info| info.id().to_string()))
                 .unwrap_or_else(|| model_id.clone());
 
             let abilities = aither_models::lookup(&model_id)
