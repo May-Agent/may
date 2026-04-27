@@ -2174,9 +2174,12 @@ async fn cleanup_stale_chrome(port: u16, paths: Option<&ManagedBrowserPaths>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwapOption;
     use image::{Rgb, RgbImage};
 
-    use super::normalize_rgb_frame_for_h264;
+    use super::{normalize_rgb_frame_for_h264, takeover_allows_input};
 
     #[test]
     fn normalize_rgb_frame_for_h264_preserves_even_dimensions() {
@@ -2208,6 +2211,32 @@ mod tests {
         assert_eq!(*normalized.get_pixel(3, 1), Rgb([20, 20, 99]));
         assert_eq!(*normalized.get_pixel(1, 5), Rgb([10, 80, 99]));
         assert_eq!(*normalized.get_pixel(3, 5), Rgb([20, 80, 99]));
+    }
+
+    #[test]
+    fn takeover_gate_blocks_input_when_no_owner() {
+        let owner: ArcSwapOption<String> = ArcSwapOption::empty();
+        assert!(!takeover_allows_input("session-a", &owner));
+    }
+
+    #[test]
+    fn takeover_gate_blocks_input_for_non_matching_session() {
+        let owner = ArcSwapOption::new(Some(Arc::new("session-a".to_owned())));
+        assert!(!takeover_allows_input("session-b", &owner));
+    }
+
+    #[test]
+    fn takeover_gate_allows_input_for_owning_session() {
+        let owner = ArcSwapOption::new(Some(Arc::new("session-a".to_owned())));
+        assert!(takeover_allows_input("session-a", &owner));
+    }
+
+    #[test]
+    fn takeover_gate_releases_after_clear() {
+        let owner = ArcSwapOption::new(Some(Arc::new("session-a".to_owned())));
+        assert!(takeover_allows_input("session-a", &owner));
+        owner.store(None);
+        assert!(!takeover_allows_input("session-a", &owner));
     }
 }
 
