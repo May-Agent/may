@@ -31,8 +31,8 @@ use chromiumoxide::cdp::browser_protocol::input::{
     MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
-    StartScreencastParams,
+    AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat, EventScreencastFrame,
+    ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
 };
 use chromiumoxide::cdp::browser_protocol::target::{TargetId, TargetInfo};
 use chromiumoxide::error::CdpError;
@@ -959,8 +959,11 @@ impl BrowserRuntime {
                             profile_dir = %paths.profile_dir.display(),
                             "Launching managed browser"
                         );
-                        let browser_config =
-                            build_managed_browser_launch_config(config.port, &paths)?;
+                        let browser_config = build_managed_browser_launch_config(
+                            config.port,
+                            &paths,
+                            config.stealth_enabled,
+                        )?;
                         let (browser, handler) =
                             Browser::launch(browser_config).await.map_err(|error| {
                                 BrowserError::browser_operation("launch managed browser", error)
@@ -1009,6 +1012,24 @@ impl BrowserRuntime {
                 page
             }
         });
+
+        if config.stealth_enabled {
+            // Page.addScriptToEvaluateOnNewDocument runs the shim before
+            // any page script across every navigation, so each fresh
+            // document boots with the patched fingerprints in place.
+            let stealth_params = AddScriptToEvaluateOnNewDocumentParams::builder()
+                .source(include_str!("stealth.js"))
+                .build()
+                .map_err(|error| {
+                    BrowserError::browser_operation(
+                        "build stealth shim params",
+                        std::io::Error::other(error),
+                    )
+                })?;
+            page.execute(stealth_params).await.map_err(|error| {
+                BrowserError::browser_operation("inject stealth shim", error)
+            })?;
+        }
 
         let max_width = i64::from(config.screencast_max_width);
         let max_height = i64::from(config.screencast_max_height);
@@ -1357,21 +1378,32 @@ fn managed_browser_debugger_metadata_url(port: u16) -> reqwest::Url {
 fn build_managed_browser_launch_config(
     port: u16,
     paths: &ManagedBrowserPaths,
+    stealth_enabled: bool,
 ) -> Result<BrowserConfig, BrowserError> {
-    BrowserConfig::builder()
+    let mut builder = BrowserConfig::builder()
         .new_headless_mode()
         .port(port)
         .arg("--remote-allow-origins=*")
         .arg("--remote-debugging-address=0.0.0.0")
         .user_data_dir(paths.profile_dir.clone())
-        .chrome_executable(paths.executable.clone())
-        .build()
-        .map_err(|error| {
-            BrowserError::browser_operation(
-                "build browser launch config",
-                std::io::Error::other(error),
-            )
-        })
+        .chrome_executable(paths.executable.clone());
+    if stealth_enabled {
+        // The single most-detected automation signal is the
+        // AutomationControlled blink feature — fingerprinting libraries
+        // read it before they reach for navigator.webdriver. Combined
+        // with the Page.addScriptToEvaluateOnNewDocument shim below,
+        // stock bot.sannysoft.com / creepjs reads pass.
+        builder = builder
+            .arg("--disable-blink-features=AutomationControlled")
+            .arg("--no-default-browser-check")
+            .arg("--no-first-run");
+    }
+    builder.build().map_err(|error| {
+        BrowserError::browser_operation(
+            "build browser launch config",
+            std::io::Error::other(error),
+        )
+    })
 }
 
 async fn wait_for_local_browser_websocket_endpoint(
