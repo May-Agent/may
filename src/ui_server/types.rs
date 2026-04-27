@@ -1205,8 +1205,11 @@ pub struct UiBrowserConfig {
     pub(crate) backend: BrowserBackendKind,
     pub(crate) port: u16,
     pub(crate) remote_cdp_endpoint: Option<String>,
-    pub(crate) screencast_quality: u32,
+    pub(crate) screencast_jpeg_quality: u32,
+    pub(crate) encoder_initial_bitrate_kbps: u32,
     pub(crate) screencast_max_width: u32,
+    pub(crate) screencast_max_height: u32,
+    pub(crate) every_nth_frame: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -100,12 +100,6 @@ pub enum BrowserError {
         #[source]
         source: BoxError,
     },
-    #[error("encoder operation failed during {operation}")]
-    EncoderOperation {
-        operation: &'static str,
-        #[source]
-        source: BoxError,
-    },
     #[error("provisioning operation failed during {operation}")]
     ProvisioningOperation {
         operation: &'static str,
@@ -141,16 +135,6 @@ impl BrowserError {
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         Self::WebRtcOperation {
-            operation,
-            source: Box::new(source),
-        }
-    }
-
-    fn encoder_operation(
-        operation: &'static str,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self::EncoderOperation {
             operation,
             source: Box::new(source),
         }
@@ -948,14 +932,15 @@ impl BrowserRuntime {
         });
 
         let max_width = i64::from(config.screencast_max_width);
-        let max_height = max_width * 5 / 8;
+        let max_height = i64::from(config.screencast_max_height);
+        let every_nth_frame = i64::from(config.every_nth_frame.max(1));
         let start_screencast = page.execute(
             StartScreencastParams::builder()
                 .format(StartScreencastFormat::Jpeg)
-                .quality(i64::from(config.screencast_quality))
+                .quality(i64::from(config.screencast_jpeg_quality))
                 .max_width(max_width)
                 .max_height(max_height)
-                .every_nth_frame(1)
+                .every_nth_frame(every_nth_frame)
                 .build(),
         );
         match &backing {
@@ -983,7 +968,7 @@ impl BrowserRuntime {
         let (cdp_reader, sample_writer) = start_encoding_pipeline(
             page.clone(),
             self.video_track.clone(),
-            config.screencast_quality,
+            config.encoder_initial_bitrate_kbps,
             self.keyframe_request.clone(),
         )
         .await?;
@@ -1766,7 +1751,7 @@ async fn capture_page_screenshot(
 async fn start_encoding_pipeline(
     page: Arc<Page>,
     video_track: Arc<TrackLocalStaticSample>,
-    screencast_quality: u32,
+    initial_bitrate_kbps: u32,
     keyframe_request: Arc<AtomicBool>,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), BrowserError> {
     let mut event_stream = page
@@ -1776,7 +1761,11 @@ async fn start_encoding_pipeline(
             BrowserError::browser_operation("subscribe to screencast frames", error)
         })?;
 
-    let (jpeg_tx, jpeg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // Bounded queue. On full we drop the *new* frame rather than block:
+    // for screen content there are no decode dependencies between frames
+    // so a fresher frame loses no information when the next one arrives,
+    // and not blocking keeps the CDP reader from stalling the actor.
+    let (jpeg_tx, jpeg_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(JPEG_QUEUE_CAPACITY);
     let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<EncodedSample>(16);
 
     let page_ack = page.clone();
@@ -1799,19 +1788,24 @@ async fn start_encoding_pipeline(
                 }
             };
 
-            if jpeg_tx.send(jpeg_bytes).is_err() {
-                break;
+            match jpeg_tx.try_send(jpeg_bytes) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!("encoder queue saturated, dropping screencast frame");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
         tracing::info!("CDP screencast reader stopped");
     });
 
-    std::thread::Builder::new()
-        .name("browser-encoder".into())
-        .spawn(move || {
-            encode_loop(jpeg_rx, sample_tx, screencast_quality, keyframe_request);
-        })
-        .map_err(|error| BrowserError::encoder_operation("spawn browser encoder thread", error))?;
+    // Encoder is CPU-bound so it goes on the blocking pool, not the
+    // tokio worker threads. spawn_blocking returns a JoinHandle the same
+    // shape as tokio::spawn, so the rest of the pipeline lifecycle
+    // (abort on session stop) is uniform.
+    tokio::task::spawn_blocking(move || {
+        encode_loop(jpeg_rx, sample_tx, initial_bitrate_kbps, keyframe_request);
+    });
 
     let sample_writer = tokio::spawn(async move {
         while let Some(encoded) = sample_rx.recv().await {
@@ -1832,12 +1826,17 @@ async fn start_encoding_pipeline(
     Ok((cdp_reader, sample_writer))
 }
 
-// ── H.264 encoding loop (dedicated thread) ─────────────────────────────────────
+/// Capacity of the JPEG → encoder queue. Tuned so a transient encoder
+/// stall (~250 ms at 30 fps) absorbs without dropping frames, while still
+/// catching unbounded growth on a stuck consumer.
+const JPEG_QUEUE_CAPACITY: usize = 8;
+
+// ── H.264 encoding loop (dedicated blocking task) ──────────────────────────────
 
 fn encode_loop(
-    frame_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    mut frame_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     sample_tx: tokio::sync::mpsc::Sender<EncodedSample>,
-    quality: u32,
+    initial_bitrate_kbps: u32,
     keyframe_request: Arc<AtomicBool>,
 ) {
     use openh264::OpenH264API;
@@ -1847,7 +1846,7 @@ fn encode_loop(
     // Screen Content Real-Time mode: optimized for text/UI edges, solid backgrounds
     let config = EncoderConfig::new()
         .usage_type(UsageType::ScreenContentRealTime)
-        .bitrate(BitRate::from_bps(quality * 40_000))
+        .bitrate(BitRate::from_bps(initial_bitrate_kbps.saturating_mul(1000)))
         .max_frame_rate(FrameRate::from_hz(30.0));
 
     let api = OpenH264API::from_source();
@@ -1863,7 +1862,10 @@ fn encode_loop(
     let mut last_keyframe = Instant::now();
     let keyframe_interval = Duration::from_secs(2);
 
-    while let Ok(jpeg_bytes) = frame_rx.recv() {
+    // `blocking_recv` is the documented bridge between tokio mpsc and
+     // a `spawn_blocking` task. It blocks the current OS thread (which
+     // is the blocking-pool thread we own here) until a frame arrives.
+    while let Some(jpeg_bytes) = frame_rx.blocking_recv() {
         // Decode JPEG → RGB
         let img = match image::load_from_memory_with_format(&jpeg_bytes, image::ImageFormat::Jpeg) {
             Ok(img) => img,
