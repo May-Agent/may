@@ -4,32 +4,36 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { SectionHeader } from './SectionHeader';
 import { useTranslation } from '@/lib/i18n';
-import { listModelsByProvider, type ProviderModelsGroup } from '@/lib/api/models';
 import { getConfig } from '@/lib/api/config';
 import { setLastModel } from '@/lib/api/profiles';
+import { useModelsStore } from '@/lib/stores/models';
 import { cn } from '@/lib/utils';
 
 export function ModelsSection() {
   const { t } = useTranslation();
-  const [groups, setGroups] = useState<ProviderModelsGroup[]>([]);
+  const groups = useModelsStore((s) => s.groups) ?? [];
+  const refreshModels = useModelsStore((s) => s.refresh);
+  const modelsLoading = useModelsStore((s) => s.loading);
+  const fetchedAt = useModelsStore((s) => s.fetchedAt);
   const [current, setCurrent] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [currentLoaded, setCurrentLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
 
-  const refresh = async () => {
-    setLoading(true);
-    try {
-      const [res, cfg] = await Promise.all([listModelsByProvider(), getConfig()]);
-      setGroups(res.providers);
-      setCurrent(cfg.fullConfig.lastModel ?? null);
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // The models list is SWR-cached and shared across the app; only the
+  // "default model" pointer is local-page state that we still fetch here.
   useEffect(() => {
-    refresh();
-  }, []);
+    void refreshModels();
+    void (async () => {
+      try {
+        const cfg = await getConfig();
+        setCurrent(cfg.fullConfig.lastModel ?? null);
+      } finally {
+        setCurrentLoaded(true);
+      }
+    })();
+  }, [refreshModels]);
+
+  const loading = !currentLoaded || (modelsLoading && fetchedAt === null);
 
   const markDefault = async (model: string) => {
     setBusy(true);
