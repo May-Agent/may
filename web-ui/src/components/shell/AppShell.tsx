@@ -3,6 +3,7 @@ import { Outlet } from 'react-router-dom';
 import { Toaster } from 'sonner';
 import { Sidebar } from './Sidebar';
 import { CommandPalette } from './CommandPalette';
+import { BrowserLiveView } from '@/components/browser/BrowserLiveView';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { InteractionLayer } from '@/components/interactions/InteractionLayer';
 import { useRuntimeStore } from '@/lib/stores/runtime';
@@ -76,6 +77,7 @@ export function AppShell() {
         <main className="flex-1 overflow-hidden">
           <Outlet />
         </main>
+        <BrowserLiveView />
         <InteractionLayer />
         <CommandPalette />
         <Toaster theme={toasterTheme} richColors closeButton position="top-right" />

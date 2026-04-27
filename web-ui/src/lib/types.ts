@@ -350,10 +350,24 @@ export interface SessionRuntimesPayload {
   sessions: SessionRuntimePayload[];
 }
 
+export type BrowserLifecycleEvent =
+  | { kind: 'chromeFetching'; progressBytes: number; totalBytes: number | null }
+  | { kind: 'starting' }
+  | { kind: 'ready' }
+  | { kind: 'navigating'; url: string }
+  | { kind: 'pageLoaded'; url: string; title: string | null }
+  | { kind: 'peerConnected'; count: number }
+  | { kind: 'peerDisconnected'; count: number }
+  | { kind: 'takeoverChanged'; sessionId: string | null }
+  | { kind: 'encoderStalled' }
+  | { kind: 'stopped' }
+  | { kind: 'error'; message: string };
+
 export type UiEvent =
   | { kind: 'heartbeat'; ok: boolean }
   | { kind: 'config'; payload: unknown }
   | { kind: 'browser_status'; payload: BrowserStatusPayload }
+  | { kind: 'browser_lifecycle'; payload: BrowserLifecycleEvent }
   | { kind: 'profile_sessions'; payload: ProfileSessionsPayload }
   | { kind: 'session_runtime'; payload: SessionRuntimePayload }
   | { kind: 'session_runtimes'; payload: SessionRuntimesPayload }
