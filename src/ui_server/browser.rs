@@ -30,6 +30,10 @@ pub(super) struct BrowserStatus {
 #[serde(rename_all = "camelCase")]
 pub(super) struct WebRtcOfferRequest {
     sdp: String,
+    /// Session that initiated the offer. Required so the actor's takeover
+    /// gate can match DataChannel input messages against the current
+    /// owner; rejected as 400 if missing or empty.
+    session_id: String,
 }
 
 #[derive(serde::Serialize)]
@@ -233,9 +237,21 @@ async fn run_browser_offer(
             .set_status(StatusCode::NOT_FOUND));
     };
 
-    let answer_sdp = bm.handle_offer(req.sdp).await.map_err(|error| {
-        skyzen::Error::msg(error_chain_text(&error)).set_status(StatusCode::INTERNAL_SERVER_ERROR)
-    })?;
+    let session_id = req.session_id.trim();
+    if session_id.is_empty() {
+        return Err(
+            skyzen::Error::msg("sessionId is required for browser offer")
+                .set_status(StatusCode::BAD_REQUEST),
+        );
+    }
+
+    let answer_sdp = bm
+        .handle_offer(session_id.to_string(), req.sdp)
+        .await
+        .map_err(|error| {
+            skyzen::Error::msg(error_chain_text(&error))
+                .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
 
     Ok(WebRtcAnswerResponse { sdp: answer_sdp })
 }
@@ -260,6 +276,9 @@ pub(super) async fn browser_takeover_start(
         .map_err(|error| {
             skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
+    if let Some(bm) = state.browser_manager() {
+        bm.set_takeover(Some(session_id.clone()));
+    }
     state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
     Ok(Json(BrowserTakeoverResponse {
         ok: true,
@@ -287,6 +306,9 @@ pub(super) async fn browser_takeover_stop(
         .map_err(|error| {
             skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
+    if let Some(bm) = state.browser_manager() {
+        bm.set_takeover(None);
+    }
     if runtime.can_dispatch_follow_up() {
         spawn_follow_up_runs(state.clone(), session_id.clone());
     }
