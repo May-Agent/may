@@ -858,6 +858,129 @@ pub async fn prepare_browser_runtime(
     })?;
     if config.requires_managed_runtime() {
         let _ = provision_managed_browser(may_dir).await?;
+        if let Some(seed) = config.system_profile.as_ref() {
+            seed_system_profile_if_empty(may_dir, seed).await?;
+        }
+    }
+    Ok(())
+}
+
+/// First-run seed for the managed Chrome profile from a real system
+/// Chrome user-data-dir. Idempotent: if the managed profile already has
+/// any content the seed is skipped, so re-running with `system_profile`
+/// set never overwrites accumulated session state.
+async fn seed_system_profile_if_empty(
+    may_dir: &Path,
+    seed: &crate::config::SystemProfileConfig,
+) -> Result<(), BrowserError> {
+    let target = crate::session::MayHomePaths::new(may_dir.to_path_buf()).browser_profile_dir();
+
+    let already_seeded = match tokio::fs::read_dir(&target).await {
+        Ok(mut iter) => iter.next_entry().await.ok().flatten().is_some(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(BrowserError::browser_operation(
+                "inspect managed browser profile dir",
+                error,
+            ));
+        }
+    };
+    if already_seeded {
+        return Ok(());
+    }
+
+    let source = seed.path.clone();
+    if tokio::fs::metadata(&source).await.is_err() {
+        return Err(BrowserError::browser_operation(
+            "stat system browser profile source",
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("system profile path missing: {}", source.display()),
+            ),
+        ));
+    }
+
+    if seed.copy_on_first_use {
+        tokio::fs::create_dir_all(&target).await.map_err(|error| {
+            BrowserError::browser_operation("prepare managed browser profile dir", error)
+        })?;
+        let target_clone = target.clone();
+        // fs_extra is a sync API and copying a Chrome profile can move
+        // hundreds of MB; do it on the blocking pool so the actor isn't
+        // pinned during seeding.
+        tokio::task::spawn_blocking(move || copy_dir_recursive(&source, &target_clone))
+            .await
+            .map_err(|error| {
+                BrowserError::browser_operation(
+                    "join system profile copy task",
+                    std::io::Error::other(error.to_string()),
+                )
+            })??;
+        tracing::info!(
+            target = %target.display(),
+            "Seeded managed browser profile from system Chrome"
+        );
+    } else {
+        // In-place mode: symlink the source into the managed location
+        // so May reads/writes the user's real profile directly.
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                BrowserError::browser_operation("prepare managed browser profile parent", error)
+            })?;
+        }
+        let source_for_symlink = source.clone();
+        let target_for_symlink = target.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&source_for_symlink, &target_for_symlink)
+            }
+            #[cfg(not(unix))]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "system profile in-place mode requires unix symlinks",
+                ))
+            }
+        })
+        .await
+        .map_err(|error| {
+            BrowserError::browser_operation(
+                "join system profile symlink task",
+                std::io::Error::other(error.to_string()),
+            )
+        })?
+        .map_err(|error| {
+            BrowserError::browser_operation("symlink system profile in place", error)
+        })?;
+    }
+
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), BrowserError> {
+    for entry in WalkDir::new(src) {
+        let entry = entry
+            .map_err(|error| BrowserError::browser_operation("walk system profile", error))?;
+        let from = entry.path();
+        let relative = from.strip_prefix(src).map_err(|error| {
+            BrowserError::browser_operation("strip prefix during profile copy", error)
+        })?;
+        let to = dst.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&to).map_err(|error| {
+                BrowserError::browser_operation("create dir during profile copy", error)
+            })?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    BrowserError::browser_operation("create dir during profile copy", error)
+                })?;
+            }
+            std::fs::copy(from, &to).map_err(|error| {
+                BrowserError::browser_operation("copy file during profile copy", error)
+            })?;
+        }
     }
     Ok(())
 }
