@@ -48,6 +48,11 @@ export interface UiAppearanceConfig {
   theme: string;
 }
 
+export interface UiSystemProfileConfig {
+  path: string;
+  copyOnFirstUse: boolean;
+}
+
 export interface UiBrowserConfig {
   enabled: boolean;
   backend: BrowserBackendKind;
@@ -59,6 +64,7 @@ export interface UiBrowserConfig {
   screencastMaxHeight: number;
   everyNthFrame: number;
   stealthEnabled: boolean;
+  systemProfile?: UiSystemProfileConfig | null;
 }
 
 export interface UiRemoteAccessConfig {
