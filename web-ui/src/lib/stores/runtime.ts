@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type {
+  BrowserLifecycleEvent,
   BrowserStatusPayload,
   NetworkAccessLogsResponse,
   ProfileSessions,
@@ -11,7 +12,29 @@ import type {
 import { openUiEventStream } from '../api/events';
 import { useSessionsStore } from './sessions';
 import { useModelsStore } from './models';
+import { useBrowserViewStore } from './browserView';
 import type { NotificationMailboxEntry } from '../api/notifications';
+
+/// Aggregated browser lifecycle snapshot: the runtime store keeps the
+/// most recent lifecycle event plus a few derived counters so consumers
+/// can render a compact status pill without replaying the full history.
+export interface BrowserLifecycleSnapshot {
+  last: BrowserLifecycleEvent | null;
+  peerCount: number;
+  takeoverSessionId: string | null;
+  pageUrl: string | null;
+  pageTitle: string | null;
+  errorMessage: string | null;
+}
+
+const EMPTY_LIFECYCLE: BrowserLifecycleSnapshot = {
+  last: null,
+  peerCount: 0,
+  takeoverSessionId: null,
+  pageUrl: null,
+  pageTitle: null,
+  errorMessage: null,
+};
 
 interface MailboxEventPayload {
   items?: NotificationMailboxEntry[];
@@ -21,6 +44,7 @@ interface RuntimeState {
   connected: boolean;
   activeProfileId: string | null;
   browser: BrowserStatusPayload | null;
+  browserLifecycle: BrowserLifecycleSnapshot;
   runtimes: Record<string, SessionRuntimeSummary>;
   profileSessions: ProfileSessions | null;
   mailbox: NotificationMailboxEntry[];
@@ -38,6 +62,7 @@ interface RuntimeState {
 const SUBSCRIBED_TOPICS = [
   'config',
   'browser_status',
+  'browser_lifecycle',
   'profile_sessions',
   'session_runtime',
   'session_runtimes',
@@ -47,10 +72,43 @@ const SUBSCRIBED_TOPICS = [
   'request_logs',
 ];
 
+function reduceLifecycle(
+  prev: BrowserLifecycleSnapshot,
+  event: BrowserLifecycleEvent,
+): BrowserLifecycleSnapshot {
+  switch (event.kind) {
+    case 'peerConnected':
+      return { ...prev, last: event, peerCount: event.count };
+    case 'peerDisconnected':
+      return { ...prev, last: event, peerCount: event.count };
+    case 'takeoverChanged':
+      return { ...prev, last: event, takeoverSessionId: event.sessionId };
+    case 'navigating':
+      return { ...prev, last: event, pageUrl: event.url, pageTitle: null };
+    case 'pageLoaded':
+      return {
+        ...prev,
+        last: event,
+        pageUrl: event.url,
+        pageTitle: event.title ?? prev.pageTitle,
+      };
+    case 'error':
+      return { ...prev, last: event, errorMessage: event.message };
+    case 'stopped':
+      return { ...EMPTY_LIFECYCLE, last: event };
+    case 'starting':
+    case 'ready':
+    case 'chromeFetching':
+    case 'encoderStalled':
+      return { ...prev, last: event, errorMessage: null };
+  }
+}
+
 export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   connected: false,
   activeProfileId: null,
   browser: null,
+  browserLifecycle: EMPTY_LIFECYCLE,
   runtimes: {},
   profileSessions: null,
   mailbox: [],
@@ -79,6 +137,22 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
             case 'browser_status':
               set({ browser: evt.payload });
               break;
+            case 'browser_lifecycle': {
+              const event = evt.payload;
+              set((prev) => ({
+                browserLifecycle: reduceLifecycle(prev.browserLifecycle, event),
+              }));
+              // First time a peer attaches, gently nudge the panel open
+              // unless the user has explicitly closed it before.
+              if (event.kind === 'peerConnected' && event.count > 0) {
+                const view = useBrowserViewStore.getState();
+                if (!view.autoOpenedThisSession) {
+                  view.markAutoOpened();
+                  if (!view.open) view.setOpen(true);
+                }
+              }
+              break;
+            }
             case 'profile_sessions':
               set({ profileSessions: evt.payload.profileSessions });
               break;

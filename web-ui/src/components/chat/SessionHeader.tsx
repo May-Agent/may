@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Pencil, Check, X, Folder } from 'lucide-react';
+import { Pencil, Check, X, Folder, Globe2 } from 'lucide-react';
 import type { ApiSession } from '@/lib/types';
 import { Button } from '@/components/ui/button';
 import { useSessionsStore } from '@/lib/stores/sessions';
+import { useBrowserViewStore } from '@/lib/stores/browserView';
+import { useRuntimeStore } from '@/lib/stores/runtime';
 import { RuntimePhaseBadge } from '@/components/shell/RuntimePhaseDot';
 import { useTranslation } from '@/lib/i18n';
 import { ContextRing } from './ContextRing';
@@ -13,6 +15,9 @@ export function SessionHeader({ session }: { session: ApiSession }) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(session.title);
   const [artifactsOpen, setArtifactsOpen] = useState(false);
+  const browserViewOpen = useBrowserViewStore((s) => s.open);
+  const toggleBrowserView = useBrowserViewStore((s) => s.toggle);
+  const browserEnabled = useRuntimeStore((s) => s.browser?.enabled ?? false);
   const { t } = useTranslation();
 
   useEffect(() => {
@@ -63,6 +68,16 @@ export function SessionHeader({ session }: { session: ApiSession }) {
           </h2>
           <RuntimePhaseBadge state={session.runtime?.state} />
           <ContextRing sessionId={session.id} />
+          {browserEnabled && (
+            <Button
+              size="icon"
+              variant={browserViewOpen ? 'secondary' : 'ghost'}
+              onClick={toggleBrowserView}
+              aria-label={browserViewOpen ? t('browserLive.close') : t('browserLive.open')}
+            >
+              <Globe2 className="size-3.5" />
+            </Button>
+          )}
           <Button
             size="icon"
             variant="ghost"
