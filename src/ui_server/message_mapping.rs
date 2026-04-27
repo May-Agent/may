@@ -141,22 +141,29 @@ fn flush_trailing_tools_in_turn(
     }
 }
 
-/// Enrich a stored `ToolEventRecord` with `variant` + `seq` for the API shape that
-/// the frontend's persisted-assistant renderer expects.
+/// Enrich a stored `ToolEventRecord` with `variant` + `seq` + `summary`
+/// for the API shape that the frontend's persisted-assistant renderer
+/// expects. Summary is projected server-side so refresh and live stream
+/// surface identical labels.
 fn tool_event_to_api_json(record: &ToolEventRecord, seq: usize) -> Value {
     match record {
         ToolEventRecord::Start {
             id,
             name,
             arguments,
-        } => json!({
-            "stage": "start",
-            "id": id,
-            "name": name,
-            "variant": ToolVariant::infer(name),
-            "arguments": arguments,
-            "seq": seq,
-        }),
+        } => {
+            let variant = ToolVariant::infer(name);
+            let summary = super::tool_summary::project_tool_summary(arguments, variant);
+            json!({
+                "stage": "start",
+                "id": id,
+                "name": name,
+                "variant": variant,
+                "arguments": arguments,
+                "seq": seq,
+                "summary": summary,
+            })
+        }
         ToolEventRecord::End { id, name, result } => json!({
             "stage": "end",
             "id": id,

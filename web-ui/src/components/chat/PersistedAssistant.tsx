@@ -1,6 +1,5 @@
-import type { ApiMessage } from '@/lib/types';
+import type { ApiMessage, ToolSummary, ToolVariant } from '@/lib/types';
 import type { TurnToolState } from '@/lib/stream/reducer';
-import type { ToolVariant } from '@/lib/types';
 import { MessageText } from './MessageText';
 import { ReasoningBlock } from './ReasoningBlock';
 import { ToolCard } from './ToolCard';
@@ -13,6 +12,7 @@ interface PersistedToolEvent {
   arguments?: string;
   result?: unknown;
   seq?: number;
+  summary?: ToolSummary;
 }
 
 function extractTools(toolEvent: unknown): TurnToolState[] {
@@ -26,14 +26,17 @@ function extractTools(toolEvent: unknown): TurnToolState[] {
       name: evt.name,
       variant: evt.variant,
       argumentsRaw: '',
+      summary: {} as ToolSummary,
       status: 'done' as const,
       seq: evt.seq ?? 0,
     };
     if (evt.stage === 'start') {
       existing.argumentsRaw = evt.arguments ?? existing.argumentsRaw;
+      if (evt.summary) existing.summary = evt.summary;
       if (typeof evt.seq === 'number') existing.seq = evt.seq;
     } else {
       existing.argumentsRaw = evt.arguments ?? existing.argumentsRaw;
+      if (evt.summary) existing.summary = evt.summary;
       existing.result = evt.result;
       existing.status = 'done';
     }

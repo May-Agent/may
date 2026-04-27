@@ -112,7 +112,7 @@ export function Composer({
 
   return (
     <div
-      className="rounded-2xl border border-border bg-card shadow-sm"
+      className="rounded-2xl border border-border/60 bg-background/70 shadow-lg backdrop-blur-xl backdrop-saturate-150"
       onDragOver={(e) => e.preventDefault()}
       onDrop={handleDrop}
     >

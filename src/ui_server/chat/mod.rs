@@ -85,14 +85,27 @@ trait ChatSink {
     async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool;
     async fn on_text(&mut self, chunk: &str) -> bool;
     async fn on_reasoning(&mut self, chunk: &str) -> bool;
-    async fn on_tool_delta(&mut self, id: &str, name: &str, arguments_fragment: &str) -> bool;
-    async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool;
+    async fn on_tool_delta(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments_fragment: &str,
+        summary: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool;
+    async fn on_tool_start(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        summary: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool;
     async fn on_tool_end(
         &mut self,
         id: &str,
         name: &str,
         arguments: Option<&str>,
         result: &ToolResult,
+        summary: crate::ui_server::tool_summary::ToolSummary,
     ) -> bool;
     async fn on_todo_update(&mut self, checklist: &crate::todo_parser::TodoChecklist) -> bool;
     async fn on_error(&mut self, code: ApiErrorCode, message: &str, retryable: bool) -> bool;
@@ -203,7 +216,13 @@ impl ChatSink for SseSink {
         .await
     }
 
-    async fn on_tool_delta(&mut self, id: &str, name: &str, arguments_fragment: &str) -> bool {
+    async fn on_tool_delta(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments_fragment: &str,
+        summary: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
         let seq = self.next_seq();
         send_event(
             &self.sender,
@@ -215,12 +234,19 @@ impl ChatSink for SseSink {
                 name,
                 variant: ToolVariant::infer(name),
                 arguments_fragment,
+                summary,
             },
         )
         .await
     }
 
-    async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool {
+    async fn on_tool_start(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        summary: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
         let seq = self.next_seq();
         send_event(
             &self.sender,
@@ -232,6 +258,7 @@ impl ChatSink for SseSink {
                 name,
                 variant: ToolVariant::infer(name),
                 arguments,
+                summary,
             },
         )
         .await
@@ -243,6 +270,7 @@ impl ChatSink for SseSink {
         name: &str,
         arguments: Option<&str>,
         result: &ToolResult,
+        summary: crate::ui_server::tool_summary::ToolSummary,
     ) -> bool {
         let seq = self.next_seq();
         send_event(
@@ -256,6 +284,7 @@ impl ChatSink for SseSink {
                 variant: ToolVariant::infer(name),
                 arguments,
                 result,
+                summary,
             },
         )
         .await
@@ -299,13 +328,32 @@ impl ChatSink for CollectSink {
     async fn on_reasoning(&mut self, _: &str) -> bool {
         true
     }
-    async fn on_tool_delta(&mut self, _: &str, _: &str, _: &str) -> bool {
+    async fn on_tool_delta(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
         true
     }
-    async fn on_tool_start(&mut self, _: &str, _: &str, _: &str) -> bool {
+    async fn on_tool_start(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
         true
     }
-    async fn on_tool_end(&mut self, _: &str, _: &str, _: Option<&str>, _: &ToolResult) -> bool {
+    async fn on_tool_end(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: &ToolResult,
+        _: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
         true
     }
     async fn on_todo_update(&mut self, _: &crate::todo_parser::TodoChecklist) -> bool {
@@ -335,6 +383,27 @@ enum SinkToolEvent {
         name: String,
         arguments_fragment: String,
     },
+}
+
+/// Project the cumulative tool argument buffer into a structured summary.
+///
+/// We prefer the live `pending_tool_streams` buffer because it carries the
+/// authoritative cumulative state for delta-streamed tools. When that's
+/// missing (e.g. a `ToolCallStart`-only path that never went through
+/// deltas, or after the pending entry is reaped at tool end), `fallback`
+/// — typically the captured arguments string — fills in.
+fn project_tool_summary_for_sink(
+    pending_streams: &std::collections::HashMap<String, PendingToolStream>,
+    id: &str,
+    name: &str,
+    fallback: Option<&str>,
+) -> crate::ui_server::tool_summary::ToolSummary {
+    let raw = pending_streams
+        .get(id)
+        .map(|p| p.buffered_arguments.as_str())
+        .or(fallback)
+        .unwrap_or("");
+    crate::ui_server::tool_summary::project_tool_summary(raw, ToolVariant::infer(name))
 }
 
 fn normalize_tool_delta_for_sink(
@@ -1272,6 +1341,13 @@ async fn run_agent_loop(
                             assistant_id.as_str(),
                             "tool_delta",
                         );
+                        tracing::trace!(
+                            target: "may::chat::tool_delta",
+                            id = %id,
+                            name = %name,
+                            fragment = %arguments_fragment,
+                            "incoming ToolCallDelta from aither"
+                        );
                         match normalize_tool_delta_for_sink(
                             &mut pending_tool_streams,
                             &id,
@@ -1292,7 +1368,13 @@ async fn run_agent_loop(
                                     name.as_str(),
                                     "synthetic_start_from_delta",
                                 );
-                                if !sink.on_tool_start(&id, &name, &arguments).await {
+                                let summary = project_tool_summary_for_sink(
+                                    &pending_tool_streams,
+                                    &id,
+                                    &name,
+                                    Some(arguments.as_str()),
+                                );
+                                if !sink.on_tool_start(&id, &name, &arguments, summary).await {
                                     cancellation_reason =
                                         Some("client disconnected during tool stream");
                                     break;
@@ -1303,7 +1385,16 @@ async fn run_agent_loop(
                                 name,
                                 arguments_fragment,
                             }) => {
-                                if !sink.on_tool_delta(&id, &name, &arguments_fragment).await {
+                                let summary = project_tool_summary_for_sink(
+                                    &pending_tool_streams,
+                                    &id,
+                                    &name,
+                                    None,
+                                );
+                                if !sink
+                                    .on_tool_delta(&id, &name, &arguments_fragment, summary)
+                                    .await
+                                {
                                     cancellation_reason =
                                         Some("client disconnected during tool stream");
                                     break;
@@ -1371,7 +1462,13 @@ async fn run_agent_loop(
                                 name.as_str(),
                                 "canonical_start",
                             );
-                            if !sink.on_tool_start(&id, &name, &arguments).await {
+                            let summary = project_tool_summary_for_sink(
+                                &pending_tool_streams,
+                                &id,
+                                &name,
+                                Some(arguments.as_str()),
+                            );
+                            if !sink.on_tool_start(&id, &name, &arguments, summary).await {
                                 cancellation_reason =
                                     Some("client disconnected during tool stream");
                                 break;
@@ -1405,9 +1502,15 @@ async fn run_agent_loop(
                         turn_persister.push_tool_event(id.clone(), serialized);
                         update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                         let arguments = tool_arguments_by_id.remove(&id);
+                        let summary = project_tool_summary_for_sink(
+                            &pending_tool_streams,
+                            &id,
+                            &name,
+                            arguments.as_deref(),
+                        );
                         pending_tool_streams.remove(&id);
                         if !sink
-                            .on_tool_end(&id, &name, arguments.as_deref(), &result)
+                            .on_tool_end(&id, &name, arguments.as_deref(), &result, summary)
                             .await
                         {
                             cancellation_reason = Some("client disconnected during tool stream");
@@ -2808,6 +2911,77 @@ mod tests {
 
         assert_eq!(snapshot.last_message_db_id, Some(42));
         assert!(snapshot.checkpoint.context.is_empty());
+    }
+
+    /// aither's OpenAI adapter emits `ToolCallDelta` where `arguments_fragment`
+    /// is the CUMULATIVE argument string so far (see `aither/openai/src/client.rs`
+    /// line 1099–1104). `normalize_tool_delta_for_sink` MUST decompose these
+    /// cumulative snapshots into true incremental suffixes so the frontend can
+    /// concatenate them into valid JSON. A regression here would drop the
+    /// opening `{"` and break every tool summary.
+    #[test]
+    fn cumulative_tool_deltas_decompose_into_incremental_suffixes() {
+        let mut pending = HashMap::new();
+
+        // OutputItemAdded fires an initial empty delta — becomes Start(args="").
+        let e1 =
+            super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "terminal", "");
+        assert_eq!(
+            e1,
+            Some(super::SinkToolEvent::Start {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments: String::new(),
+            })
+        );
+
+        // First real cumulative snapshot carries `{"description`.
+        let e2 = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"description",
+        );
+        assert_eq!(
+            e2,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "{\"description".to_string(),
+            })
+        );
+
+        // Next cumulative: previous prefix is extended — emit only the suffix.
+        let e3 = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"description\":\"Get",
+        );
+        assert_eq!(
+            e3,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "\":\"Get".to_string(),
+            })
+        );
+
+        // Re-sending the same cumulative string is a no-op (empty fragment).
+        let e4 = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"description\":\"Get",
+        );
+        assert_eq!(
+            e4,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: String::new(),
+            })
+        );
     }
 
     #[test]

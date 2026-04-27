@@ -20,6 +20,7 @@ mod state;
 mod tasks;
 mod terminal_parsing;
 mod title_generation;
+mod tool_summary;
 mod types;
 
 use std::net::SocketAddr;

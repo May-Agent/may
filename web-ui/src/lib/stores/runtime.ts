@@ -85,6 +85,13 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
               const next: Record<string, SessionRuntimeSummary> = {};
               for (const r of evt.payload.sessions) next[r.sessionId] = r.runtime;
               set({ runtimes: next });
+              const activeId = useSessionsStore.getState().active?.id;
+              if (activeId) {
+                const match = evt.payload.sessions.find((r) => r.sessionId === activeId);
+                if (match) {
+                  useSessionsStore.getState().updateRuntime(activeId, match.runtime);
+                }
+              }
               break;
             }
             case 'notification_mailbox': {

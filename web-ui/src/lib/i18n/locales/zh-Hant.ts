@@ -124,6 +124,7 @@ export const zhHant: Messages = {
   chat: {
     thinking: '思考中',
     responding: '回應中',
+    scrollToBottom: '回到最新',
     thought: '思考過程',
     plan: '計畫',
     assistantStreaming: 'May 正在回覆',
@@ -160,7 +161,7 @@ export const zhHant: Messages = {
     generic: '處理中',
     output: '結果',
     escalated: '已提升權限',
-    truncated: '輸出已截斷。',
+    viewFullOutput: '檢視完整輸出',
   },
   runtime: {
     idle: '閒置',

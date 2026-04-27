@@ -122,6 +122,7 @@ export const enUS = {
   chat: {
     thinking: 'Thinking',
     responding: 'Responding',
+    scrollToBottom: 'Jump to latest',
     thought: 'Thought',
     plan: 'Plan',
     assistantStreaming: 'May is responding',
@@ -158,7 +159,7 @@ export const enUS = {
     generic: 'Working',
     output: 'Output',
     escalated: 'Elevated permissions',
-    truncated: 'Output was truncated.',
+    viewFullOutput: 'View full output',
   },
   runtime: {
     idle: 'Idle',

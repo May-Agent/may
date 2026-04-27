@@ -7098,6 +7098,7 @@ dependencies = [
  "open",
  "openh264",
  "p256",
+ "partial-json-fixer",
  "petname",
  "pulldown-cmark",
  "quick-xml 0.37.5",
@@ -8091,6 +8092,12 @@ dependencies = [
  "twox-hash",
  "zstd",
 ]
+
+[[package]]
+name = "partial-json-fixer"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35ffd90b3f3b6477db7478016b9efb1b7e9d38eafd095f0542fe0ec2ea884a13"
 
 [[package]]
 name = "paste"
