@@ -53,8 +53,11 @@ export interface UiBrowserConfig {
   backend: BrowserBackendKind;
   port: number;
   remoteCdpEndpoint?: string | null;
-  screencastQuality: number;
+  screencastJpegQuality: number;
+  encoderInitialBitrateKbps: number;
   screencastMaxWidth: number;
+  screencastMaxHeight: number;
+  everyNthFrame: number;
 }
 
 export interface UiRemoteAccessConfig {
