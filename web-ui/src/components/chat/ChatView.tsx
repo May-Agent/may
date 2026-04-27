@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react';
-import { AlertCircle, AlertTriangle, RotateCw, X } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AlertCircle, AlertTriangle, ArrowDown, RotateCw, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { useTurnStore } from '@/lib/stores/turn';
@@ -17,6 +17,9 @@ import { useTranslation } from '@/lib/i18n';
 import type { ApiAttachment } from '@/lib/types';
 import { enqueueMessage } from '@/lib/api/chat';
 import { isConfigUsable } from '@/lib/api/config';
+import { cn } from '@/lib/utils';
+
+const STICKY_BOTTOM_THRESHOLD_PX = 48;
 
 export function ChatView({ sessionId }: { sessionId: string }) {
   const open = useSessionsStore((s) => s.open);
@@ -35,12 +38,26 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const { t } = useTranslation();
 
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const stickyBottomRef = useRef(true);
+  const [showJumpButton, setShowJumpButton] = useState(false);
 
   useEffect(() => {
     open(sessionId);
   }, [sessionId, open]);
 
+  const handleScroll = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = gap < STICKY_BOTTOM_THRESHOLD_PX;
+    stickyBottomRef.current = atBottom;
+    setShowJumpButton(!atBottom);
+  }, []);
+
+  // Auto-scroll only if the user is pinned to the bottom. Avoids the jank
+  // of yanking the viewport away from the user mid-read.
   useEffect(() => {
+    if (!stickyBottomRef.current) return;
     const el = scrollerRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
@@ -50,6 +67,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     activeTurn?.tools.length,
     activeTurn?.reasoning.length,
   ]);
+
+  const scrollToBottom = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    stickyBottomRef.current = true;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  }, []);
 
   if (!active || active.id !== sessionId) {
     return (
@@ -81,6 +105,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       attachments,
     };
     appendMessage(userMessage);
+    // Sending a new message is an explicit user intent to follow the tail.
+    stickyBottomRef.current = true;
 
     if (deliveryMode === 'queue' && streaming) {
       await enqueueMessage({
@@ -96,14 +122,18 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   };
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col">
       <SessionHeader session={active} />
       <PlanBanner
         sessionId={active.id}
         planState={active.runtime?.planState ?? 'disabled'}
       />
       <BrowserTakeoverBanner session={active} />
-      <ScrollArea ref={scrollerRef} className="flex-1 px-6 py-6">
+      <ScrollArea
+        ref={scrollerRef}
+        onScroll={handleScroll}
+        className="flex-1 px-6 pt-6 pb-48"
+      >
         <div className="mx-auto w-full max-w-3xl space-y-6">
           {messages.map((msg) => {
             if (msg.role === 'user') {
@@ -136,8 +166,27 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           )}
         </div>
       </ScrollArea>
-      <div className="border-t border-border bg-background/70 px-6 py-4 backdrop-blur">
-        <div className="mx-auto w-full max-w-3xl space-y-3">
+
+      <div
+        className={cn(
+          'pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-6 pb-5',
+        )}
+      >
+        <div className="pointer-events-auto mx-auto w-full max-w-3xl space-y-2">
+          {showJumpButton && (
+            <div className="flex justify-center">
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={scrollToBottom}
+                className="h-8 gap-1 rounded-full border border-border/60 bg-background/80 px-3 shadow-md backdrop-blur-xl hover:bg-background"
+                aria-label={t('chat.scrollToBottom')}
+              >
+                <ArrowDown className="size-3.5" />
+                <span className="text-xs">{t('chat.scrollToBottom')}</span>
+              </Button>
+            </div>
+          )}
           {!configUsable && (
             <ConfigGuardCard
               onOpenSettings={() => navigate('/settings?section=providers')}

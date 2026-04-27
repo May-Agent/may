@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef } from 'react';
 import {
+  ArrowUpRight,
   Check,
   ChevronRight,
   Globe,
@@ -13,11 +14,18 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
+import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter';
+import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash';
+import oneLight from 'react-syntax-highlighter/dist/esm/styles/prism/one-light';
 import { cn } from '@/lib/utils';
 import type { TurnToolState } from '@/lib/stream/reducer';
 import type { ToolVariant } from '@/lib/types';
 import { parsePartialJson, projectField } from '@/lib/stream/partialJson';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
+import { useSessionsStore } from '@/lib/stores/sessions';
+import { outputsPreviewUrl } from '@/lib/api/artifacts';
+
+SyntaxHighlighter.registerLanguage('bash', bash);
 
 interface ToolCardProps {
   tool: TurnToolState;
@@ -68,49 +76,45 @@ function isTerminalVariant(variant: ToolVariant): boolean {
 }
 
 function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
-  const raw = tool.argumentsRaw;
+  // The backend projects authoritative summary fields from the cumulative
+  // tool arguments (`partial-json-fixer` server-side). The frontend never
+  // re-parses argumentsRaw to pick a label — that path is bug-prone and
+  // got the description/script ordering wrong twice. Trust tool.summary.
+  const s = tool.summary ?? {};
   switch (tool.variant) {
     case 'terminal':
     case 'terminal_input':
     case 'terminal_read':
     case 'terminal_kill': {
-      const script = projectField(raw, 'script');
-      if (script.length > 0) return firstLine(script);
-      const description = projectField(raw, 'description');
-      if (description.length > 0) return description;
+      if (s.description) return s.description;
+      if (s.script) return firstLine(s.script);
       return fallback;
     }
-    case 'web_search': {
-      const query = projectField(raw, 'query');
-      return query.length > 0 ? `“${query}”` : fallback;
-    }
-    case 'web_fetch': {
-      const url = projectField(raw, 'url');
-      return url.length > 0 ? url : fallback;
-    }
+    case 'web_search':
+      return s.query ? `“${s.query}”` : fallback;
+    case 'web_fetch':
+      return s.url ?? fallback;
     case 'browser': {
-      const action = projectField(raw, 'action');
-      const target = projectField(raw, 'target') || projectField(raw, 'url');
-      if (action.length > 0 && target.length > 0) return `${action} ${target}`;
-      return action || target || fallback;
+      if (s.action && s.target) return `${s.action} ${s.target}`;
+      return s.action || s.target || fallback;
     }
-    case 'task': {
-      const description = projectField(raw, 'description');
-      if (description.length > 0) return description;
-      const prompt = projectField(raw, 'prompt');
-      if (prompt.length > 0) return firstLine(prompt);
-      return fallback;
-    }
-    default: {
-      const description = projectField(raw, 'description');
-      return description.length > 0 ? description : fallback;
-    }
+    case 'task':
+      return s.description || (s.prompt ? firstLine(s.prompt) : fallback);
+    default:
+      return s.description ?? fallback;
   }
 }
 
 interface OutputStream {
   text: string;
   truncated: boolean;
+  /**
+   * Relative outputs/* path when the full payload is persisted to disk.
+   * Truncation in itself is an internal context-management concern and is
+   * never surfaced to the user as a warning; we only expose it indirectly
+   * by offering a link to the full file when one exists.
+   */
+  url: string | null;
 }
 
 interface TerminalResult {
@@ -121,12 +125,14 @@ interface TerminalResult {
 
 function extractOutputStream(entry: unknown): OutputStream | null {
   if (!entry || typeof entry !== 'object') return null;
-  const content = (entry as Record<string, unknown>).content;
+  const e = entry as Record<string, unknown>;
+  const content = e.content;
   if (!content || typeof content !== 'object') return null;
   const c = content as Record<string, unknown>;
   if (c.type !== 'text' || typeof c.text !== 'string') return null;
   if (c.text.length === 0) return null;
-  return { text: c.text, truncated: c.truncated === true };
+  const url = typeof e.url === 'string' && e.url.length > 0 ? e.url : null;
+  return { text: c.text, truncated: c.truncated === true, url };
 }
 
 function extractTerminalResult(result: unknown): TerminalResult | null {
@@ -177,63 +183,134 @@ function statusIcon(status: TurnToolState['status'], result: unknown) {
   return <Check className="size-3.5 text-emerald-500" />;
 }
 
-function TerminalDetails({ tool }: { tool: TurnToolState }) {
+const shellHighlighterStyle: React.CSSProperties = {
+  margin: 0,
+  padding: 0,
+  background: 'transparent',
+  fontSize: 'inherit',
+  lineHeight: 'inherit',
+  flex: 1,
+  minWidth: 0,
+};
+
+function ShellBlock({ script }: { script: string }) {
+  return (
+    <div className="flex gap-2 text-xs font-mono leading-relaxed">
+      <span className="shrink-0 text-muted-foreground select-none">$</span>
+      <SyntaxHighlighter
+        language="bash"
+        style={oneLight}
+        customStyle={shellHighlighterStyle}
+        codeTagProps={{ style: { background: 'transparent', fontFamily: 'inherit' } }}
+        PreTag="div"
+        wrapLongLines
+        className="whitespace-pre-wrap break-all"
+      >
+        {script}
+      </SyntaxHighlighter>
+    </div>
+  );
+}
+
+function OutputBlock({
+  text,
+  fullOutputHref,
+  tone = 'stdout',
+  label,
+}: {
+  text: string;
+  /** When provided, renders an unobtrusive link to the full stored payload. */
+  fullOutputHref?: string;
+  tone?: 'stdout' | 'stderr';
+  label?: string;
+}) {
   const { t } = useTranslation();
-  const script = projectField(tool.argumentsRaw, 'script');
+  return (
+    <div className="space-y-0.5">
+      {label && (
+        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          {label}
+        </div>
+      )}
+      <pre
+        className={cn(
+          'whitespace-pre-wrap text-xs font-mono max-h-64 overflow-auto scrollbar-thin',
+          tone === 'stderr' ? 'text-destructive/90' : 'text-foreground/80',
+        )}
+      >
+        {text}
+      </pre>
+      {fullOutputHref && (
+        <a
+          href={fullOutputHref}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          {t('tools.viewFullOutput')}
+          <ArrowUpRight className="size-3" />
+        </a>
+      )}
+    </div>
+  );
+}
+
+function TerminalDetails({
+  tool,
+  primary,
+}: {
+  tool: TurnToolState;
+  primary: string;
+}) {
+  const { t } = useTranslation();
+  const sessionId = useSessionsStore((s) => s.active?.id ?? null);
+  const script = tool.summary?.script ?? '';
   const mode = projectField(tool.argumentsRaw, 'mode');
   const escalated = mode === 'unsafe';
   const terminal = extractTerminalResult(tool.result);
+  const scriptRedundant = script.length > 0 && firstLine(script) === primary;
+  const showScript = script.length > 0 && !scriptRedundant;
+  const hasOutput =
+    terminal !== null &&
+    (terminal.stdout !== null || terminal.stderr !== null || terminal.exitCode !== null);
+  if (!showScript && !escalated && !hasOutput) return null;
+  const failed =
+    terminal !== null && terminal.exitCode !== null && terminal.exitCode !== 0;
+
+  const hrefFor = (stream: OutputStream): string | undefined =>
+    sessionId && stream.url ? outputsPreviewUrl(sessionId, stream.url) : undefined;
 
   return (
-    <div className="space-y-1.5">
-      {script.length > 0 && (
-        <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono leading-relaxed whitespace-pre-wrap break-words max-h-72 overflow-auto scrollbar-thin">
-          {script}
-          {tool.status === 'streaming' && (
-            <span className="inline-block w-1.5 h-3 bg-foreground/70 animate-pulse ml-0.5 align-middle" />
-          )}
-        </pre>
-      )}
+    <div className="space-y-2">
+      {showScript && <ShellBlock script={script} />}
       {escalated && (
         <div className="text-[11px] uppercase tracking-wider text-amber-600 dark:text-amber-400">
           {t('tools.escalated')}
         </div>
       )}
-      {terminal && <TerminalOutput result={terminal} />}
-    </div>
-  );
-}
-
-function TerminalOutput({ result }: { result: TerminalResult }) {
-  const { t } = useTranslation();
-  if (!result.stdout && !result.stderr && result.exitCode === null) return null;
-  const failed = result.exitCode !== null && result.exitCode !== 0;
-
-  return (
-    <div className="rounded-md border border-border bg-muted/20 p-2">
-      <div className="text-[11px] text-muted-foreground">
-        {t('tools.output')}
-        {failed && <span className="ml-1 text-destructive">· exit {result.exitCode}</span>}
-      </div>
-      {result.stdout && (
-        <pre className="mt-1 text-xs font-mono text-foreground/90 whitespace-pre-wrap max-h-64 overflow-auto scrollbar-thin">
-          {result.stdout.text}
-          {result.stdout.truncated && (
-            <span className="block text-[11px] text-muted-foreground">
-              {t('tools.truncated')}
-            </span>
+      {hasOutput && terminal && (
+        <div className="space-y-2">
+          {terminal.stdout && (
+            <OutputBlock
+              text={terminal.stdout.text}
+              fullOutputHref={hrefFor(terminal.stdout)}
+              label={terminal.stderr !== null ? 'stdout' : undefined}
+            />
           )}
-        </pre>
-      )}
-      {result.stderr && (
-        <pre className="mt-1 text-xs font-mono text-destructive/90 whitespace-pre-wrap max-h-64 overflow-auto scrollbar-thin">
-          {result.stderr.text}
-          {result.stderr.truncated && (
-            <span className="block text-[11px] text-muted-foreground">
-              {t('tools.truncated')}
-            </span>
+          {terminal.stderr && (
+            <OutputBlock
+              text={terminal.stderr.text}
+              fullOutputHref={hrefFor(terminal.stderr)}
+              tone="stderr"
+              label="stderr"
+            />
           )}
-        </pre>
+          {failed && (
+            <div className="text-[11px] text-destructive">
+              exit {terminal.exitCode}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
@@ -248,36 +325,24 @@ function GenericDetails({ tool }: { tool: TurnToolState }) {
   const resultText = extractGenericResultText(tool.result);
   if (!hasArgs && resultText === null) return null;
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-2">
       {hasArgs && (
-        <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono leading-relaxed whitespace-pre-wrap break-all max-h-48 overflow-auto scrollbar-thin">
+        <pre className="text-xs font-mono text-foreground/80 whitespace-pre-wrap break-all max-h-48 overflow-auto scrollbar-thin">
           {JSON.stringify(parsed, null, 2)}
         </pre>
       )}
-      {resultText !== null && <GenericOutput text={resultText} />}
+      {resultText !== null && <OutputBlock text={resultText} />}
     </div>
   );
 }
 
-function GenericOutput({ text }: { text: string }) {
-  const { t } = useTranslation();
-  return (
-    <div className="rounded-md border border-border bg-muted/20 p-2">
-      <div className="text-[11px] text-muted-foreground">{t('tools.output')}</div>
-      <pre className="mt-1 text-xs font-mono text-foreground/90 whitespace-pre-wrap max-h-48 overflow-auto scrollbar-thin">
-        {text}
-      </pre>
-    </div>
-  );
-}
-
-function selectDetails(tool: TurnToolState) {
+function selectDetails(tool: TurnToolState, primary: string) {
   switch (tool.variant) {
     case 'terminal':
     case 'terminal_input':
     case 'terminal_read':
     case 'terminal_kill':
-      return <TerminalDetails tool={tool} />;
+      return <TerminalDetails tool={tool} primary={primary} />;
     default:
       return <GenericDetails tool={tool} />;
   }
@@ -290,7 +355,7 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
   const variantLabel = t(VARIANT_LABEL_KEY[tool.variant] ?? 'tools.generic');
   const primary = pickPrimaryLabel(tool, variantLabel);
   const streaming = tool.status === 'streaming';
-  const details = selectDetails(tool);
+  const details = selectDetails(tool, primary);
   const streamTerminalDetails = streaming && isTerminalVariant(tool.variant);
 
   useEffect(() => {
@@ -327,11 +392,7 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
           <ChevronRight className="size-3.5 text-muted-foreground transition-transform group-open:rotate-90" />
         </span>
       </summary>
-      {details && (
-        <div className="mt-1 ml-5 pl-2 border-l border-border/60 py-1 space-y-1.5">
-          {details}
-        </div>
-      )}
+      {details && <div className="mt-1.5 ml-5 space-y-2">{details}</div>}
     </details>
   );
 });
