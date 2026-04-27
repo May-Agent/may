@@ -791,6 +791,13 @@ pub struct BrowserConfig {
     /// outbound bitrate for free.
     #[serde(default = "default_every_nth_frame")]
     pub every_nth_frame: u32,
+    /// Disable common automation fingerprints surfaced to target sites:
+    /// the AutomationControlled blink feature, navigator.webdriver,
+    /// chrome.runtime stub, plugin/language emptiness, and WebGL
+    /// vendor/renderer overrides. Default on; turn off to debug a site
+    /// that misbehaves under the stealth shim.
+    #[serde(default = "default_stealth_enabled")]
+    pub stealth_enabled: bool,
 }
 
 const fn default_browser_port() -> u16 {
@@ -817,6 +824,10 @@ const fn default_every_nth_frame() -> u32 {
     2
 }
 
+const fn default_stealth_enabled() -> bool {
+    true
+}
+
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
@@ -829,6 +840,7 @@ impl Default for BrowserConfig {
             screencast_max_width: default_screencast_max_width(),
             screencast_max_height: default_screencast_max_height(),
             every_nth_frame: default_every_nth_frame(),
+            stealth_enabled: default_stealth_enabled(),
         }
     }
 }

@@ -58,6 +58,7 @@ export interface UiBrowserConfig {
   screencastMaxWidth: number;
   screencastMaxHeight: number;
   everyNthFrame: number;
+  stealthEnabled: boolean;
 }
 
 export interface UiRemoteAccessConfig {

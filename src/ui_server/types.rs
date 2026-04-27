@@ -1210,6 +1210,7 @@ pub struct UiBrowserConfig {
     pub(crate) screencast_max_width: u32,
     pub(crate) screencast_max_height: u32,
     pub(crate) every_nth_frame: u32,
+    pub(crate) stealth_enabled: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
