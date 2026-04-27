@@ -17,10 +17,11 @@ use super::error::bad_request_error;
 use super::helpers::send_event;
 use super::state::UiServerState;
 use super::types::{
-    BrowserStatusEventPayload, NetworkAccessLogEntryResponse, NetworkAccessLogsResponse,
-    NotificationMailboxEntryResponse, NotificationMailboxResponse, ProfileSessionsEventPayload,
-    RemoteAccessEventPayload, RequestLogsResponse, SessionRuntimeEventPayload,
-    SessionRuntimeSnapshotItem, SessionRuntimesEventPayload, SseHeartbeat,
+    BrowserLifecycleEvent, BrowserStatusEventPayload, NetworkAccessLogEntryResponse,
+    NetworkAccessLogsResponse, NotificationMailboxEntryResponse, NotificationMailboxResponse,
+    ProfileSessionsEventPayload, RemoteAccessEventPayload, RequestLogsResponse,
+    SessionRuntimeEventPayload, SessionRuntimeSnapshotItem, SessionRuntimesEventPayload,
+    SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -77,6 +78,11 @@ pub(super) async fn stream_events(
     let (sender, sse) = Sse::channel();
     let state_cloned = state.clone();
     let mut topic_rx = state.ui_event_bus.subscribe();
+    // Lifecycle events are sequential transients, not snapshots, so they
+    // ride a dedicated broadcast — but stay inside the single SSE stream as
+    // a distinct event kind, per AGENTS.md.
+    let mut lifecycle_rx = state.browser_lifecycle_subscribe();
+    let lifecycle_subscribed = subscribed_topics.contains(UiEventTopics::BROWSER_LIFECYCLE);
 
     state.tokio_handle.spawn(async move {
         let mut signatures = EventSignatures::default();
@@ -134,6 +140,19 @@ pub(super) async fn stream_events(
                         &mut signatures,
                     ).await {
                         break;
+                    }
+                }
+                lifecycle = lifecycle_rx.recv(), if lifecycle_subscribed => {
+                    match lifecycle {
+                        Ok(event) => {
+                            if !send_event(&sender, "browser_lifecycle", &event).await {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "browser lifecycle stream lagged; dropping events");
+                        }
+                        Err(RecvError::Closed) => {}
                     }
                 }
                 _ = heartbeat.tick() => {

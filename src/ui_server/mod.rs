@@ -225,6 +225,11 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
     let task_runtime = Arc::new(task_runtime);
     let container_prepare = state::ContainerPrepareTracker::new(ui_event_bus.clone());
 
+    // Capacity must be high enough that a slow SSE client cannot block the
+    // browser actor's hot path; lifecycle events are small and high-volume
+    // during Chrome boot / page navigations.
+    let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(256);
+
     let state = Arc::new(UiServerState {
         tokio_handle: tokio::runtime::Handle::current(),
         db: db_for_archive.clone(),
@@ -242,6 +247,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         container_manager,
         browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
         browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
+        browser_lifecycle_tx,
         remote_access_manager,
         notification_service: notification_service.clone(),
         memory_processor,

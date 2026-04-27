@@ -18,6 +18,7 @@ pub enum UiEventTopic {
     SessionRuntimes = 1 << 7,
     ProfileSessions = 1 << 8,
     RemoteAccess = 1 << 9,
+    BrowserLifecycle = 1 << 10,
 }
 
 impl UiEventTopic {
@@ -37,6 +38,7 @@ impl UiEventTopic {
             Self::SessionRuntimes => "session_runtimes",
             Self::ProfileSessions => "profile_sessions",
             Self::RemoteAccess => "remote_access",
+            Self::BrowserLifecycle => "browser_lifecycle",
         }
     }
 }
@@ -56,6 +58,7 @@ impl FromStr for UiEventTopic {
             "session_runtimes" => Ok(Self::SessionRuntimes),
             "profile_sessions" => Ok(Self::ProfileSessions),
             "remote_access" => Ok(Self::RemoteAccess),
+            "browser_lifecycle" => Ok(Self::BrowserLifecycle),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -76,6 +79,7 @@ impl UiEventTopics {
     pub const SESSION_RUNTIMES: Self = Self(UiEventTopic::SessionRuntimes.bit());
     pub const PROFILE_SESSIONS: Self = Self(UiEventTopic::ProfileSessions.bit());
     pub const REMOTE_ACCESS: Self = Self(UiEventTopic::RemoteAccess.bit());
+    pub const BROWSER_LIFECYCLE: Self = Self(UiEventTopic::BrowserLifecycle.bit());
     pub const ALL: Self = Self(
         Self::CONFIG.0
             | Self::REQUEST_LOGS.0
@@ -86,7 +90,8 @@ impl UiEventTopics {
             | Self::SESSION_RUNTIME.0
             | Self::SESSION_RUNTIMES.0
             | Self::PROFILE_SESSIONS.0
-            | Self::REMOTE_ACCESS.0,
+            | Self::REMOTE_ACCESS.0
+            | Self::BROWSER_LIFECYCLE.0,
     );
 
     pub const fn is_empty(self) -> bool {

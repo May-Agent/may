@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::time::Instant as TokioInstant;
 
@@ -21,6 +22,7 @@ use crate::live_response::LiveResponseRegistry;
 use crate::mcp::{MayMcpServerConfig, McpManager, McpServerInfo};
 use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
+use crate::ui_server::types::BrowserLifecycleEvent;
 use crate::workspace_request::RequestWorkspaceArgs;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
@@ -419,6 +421,9 @@ pub struct UiServerState {
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
     pub(crate) browser_manager: ArcSwapOption<crate::container::browser::BrowserManager>,
     pub(crate) browser_owner_session_id: ArcSwapOption<String>,
+    /// Sequential lifecycle facts emitted by the browser actor, fanned out
+    /// to every active SSE client subscribed to `browser_lifecycle`.
+    pub(crate) browser_lifecycle_tx: broadcast::Sender<BrowserLifecycleEvent>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
@@ -471,6 +476,12 @@ impl UiServerState {
         browser_manager: Option<Arc<crate::container::browser::BrowserManager>>,
     ) {
         self.browser_manager.store(browser_manager);
+    }
+
+    pub(crate) fn browser_lifecycle_subscribe(
+        &self,
+    ) -> broadcast::Receiver<BrowserLifecycleEvent> {
+        self.browser_lifecycle_tx.subscribe()
     }
 }
 
