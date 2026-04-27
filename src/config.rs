@@ -798,6 +798,31 @@ pub struct BrowserConfig {
     /// that misbehaves under the stealth shim.
     #[serde(default = "default_stealth_enabled")]
     pub stealth_enabled: bool,
+    /// Optional source for seeding the managed browser's profile from a
+    /// real system Chrome profile. The first time the managed profile
+    /// directory is empty, May copies from this path so cookies and
+    /// logged-in state carry over; subsequent runs use the may-managed
+    /// copy and never touch the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_profile: Option<SystemProfileConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemProfileConfig {
+    /// Absolute path to a Chromium-family user-data-dir/profile-dir to
+    /// seed from on first launch.
+    pub path: PathBuf,
+    /// When true (default) the source profile is copied into May's home
+    /// dir and never written to again. Setting this to false lets May
+    /// use the source profile in-place — only safe when no other
+    /// browser instance is running against it.
+    #[serde(default = "default_system_profile_copy")]
+    pub copy_on_first_use: bool,
+}
+
+const fn default_system_profile_copy() -> bool {
+    true
 }
 
 const fn default_browser_port() -> u16 {
@@ -841,6 +866,7 @@ impl Default for BrowserConfig {
             screencast_max_height: default_screencast_max_height(),
             every_nth_frame: default_every_nth_frame(),
             stealth_enabled: default_stealth_enabled(),
+            system_profile: None,
         }
     }
 }

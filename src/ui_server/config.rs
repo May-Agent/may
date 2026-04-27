@@ -153,6 +153,12 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             screencast_max_height: config.browser.screencast_max_height,
             every_nth_frame: config.browser.every_nth_frame,
             stealth_enabled: config.browser.stealth_enabled,
+            system_profile: config.browser.system_profile.as_ref().map(|sp| {
+                crate::ui_server::types::UiSystemProfileConfig {
+                    path: sp.path.display().to_string(),
+                    copy_on_first_use: sp.copy_on_first_use,
+                }
+            }),
         },
         remote_access: UiRemoteAccessConfig::from(&config.remote_access),
     }
@@ -194,6 +200,12 @@ async fn run_save_full_config(
             screencast_max_height: req.browser.screencast_max_height,
             every_nth_frame: req.browser.every_nth_frame,
             stealth_enabled: req.browser.stealth_enabled,
+            system_profile: req.browser.system_profile.as_ref().map(|sp| {
+                crate::config::SystemProfileConfig {
+                    path: std::path::PathBuf::from(&sp.path),
+                    copy_on_first_use: sp.copy_on_first_use,
+                }
+            }),
         };
         next_browser_config.validate().map_err(bad_request_error)?;
         crate::container::browser::prepare_browser_runtime(&next_browser_config, &state.may_dir)
@@ -272,6 +284,13 @@ async fn run_save_full_config(
         config.browser.screencast_max_height = req.browser.screencast_max_height;
         config.browser.every_nth_frame = req.browser.every_nth_frame;
         config.browser.stealth_enabled = req.browser.stealth_enabled;
+        config.browser.system_profile =
+            req.browser.system_profile.as_ref().map(|sp| {
+                crate::config::SystemProfileConfig {
+                    path: std::path::PathBuf::from(&sp.path),
+                    copy_on_first_use: sp.copy_on_first_use,
+                }
+            });
         config.remote_access.enabled = req.remote_access.enabled;
         config.remote_access.cloudflared_binary = req.remote_access.cloudflared_binary.clone();
         config.remote_access.tunnel_token = req
