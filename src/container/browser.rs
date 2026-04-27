@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use base64::Engine;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::accessibility::{
@@ -46,7 +47,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use walkdir::WalkDir;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
+use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -310,7 +311,6 @@ struct BrowserSession {
     _handler: tokio::task::JoinHandle<()>,
     _cdp_reader: tokio::task::JoinHandle<()>,
     _sample_writer: tokio::task::JoinHandle<()>,
-    _audio_writer: tokio::task::JoinHandle<()>,
 }
 
 enum BrowserSessionBacking {
@@ -388,6 +388,10 @@ enum BrowserCommand {
         reply: oneshot::Sender<Result<(), BrowserError>>,
     },
     HandleOffer {
+        /// Session that originated the offer; the actor records it on the
+        /// peer so the takeover gate knows which DataChannel may drive
+        /// browser input.
+        session_id: String,
         offer_sdp: String,
         reply: oneshot::Sender<Result<String, BrowserError>>,
     },
@@ -398,6 +402,12 @@ enum BrowserCommand {
     },
     DropPeer {
         peer_id: String,
+    },
+    /// Mirror takeover ownership from the database into the actor so the
+    /// DataChannel input gate has a consistent, lock-free view without
+    /// async DB round-trips on the hot path.
+    SetTakeover {
+        session_id: Option<String>,
     },
 }
 
@@ -471,7 +481,6 @@ impl BrowserLifecyclePublisher {
 struct BrowserRuntime {
     session: Option<BrowserSession>,
     video_track: Arc<TrackLocalStaticSample>,
-    audio_track: Arc<TrackLocalStaticSample>,
     webrtc_api: webrtc::api::API,
     peers: HashMap<String, Arc<RTCPeerConnection>>,
     lifecycle: BrowserLifecyclePublisher,
@@ -480,24 +489,39 @@ struct BrowserRuntime {
     /// so the new viewer doesn't have to wait up to 2 s for the next
     /// scheduled keyframe.
     keyframe_request: Arc<AtomicBool>,
+    /// The session currently authorised to drive the browser via its
+    /// DataChannel. `None` means the agent owns the page and any peer
+    /// input is silently dropped.
+    takeover_owner: Arc<ArcSwapOption<String>>,
 }
 
 impl BrowserRuntime {
     fn new(
         video_track: Arc<TrackLocalStaticSample>,
-        audio_track: Arc<TrackLocalStaticSample>,
         webrtc_api: webrtc::api::API,
         lifecycle: BrowserLifecyclePublisher,
     ) -> Self {
         Self {
             session: None,
             video_track,
-            audio_track,
             webrtc_api,
             peers: HashMap::new(),
             lifecycle,
             keyframe_request: Arc::new(AtomicBool::new(false)),
+            takeover_owner: Arc::new(ArcSwapOption::empty()),
         }
+    }
+
+    fn set_takeover(&self, session_id: Option<String>) {
+        let next = session_id.clone().map(Arc::new);
+        let previous = self.takeover_owner.load_full();
+        let previous_id = previous.as_ref().map(|s| s.as_ref().clone());
+        if previous_id == session_id {
+            return;
+        }
+        self.takeover_owner.store(next);
+        self.lifecycle
+            .emit(BrowserLifecycleEvent::TakeoverChanged { session_id });
     }
 
     fn publish_snapshot(&self, snapshot_tx: &watch::Sender<BrowserRuntimeSnapshot>) {
@@ -570,17 +594,6 @@ impl BrowserManager {
             "video".to_owned(),
             "browser-screencast".to_owned(),
         ));
-        let audio_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                clock_rate: 48_000,
-                channels: 2,
-                ..Default::default()
-            },
-            "audio".to_owned(),
-            "browser-audio".to_owned(),
-        ));
-
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let actor_tx = command_tx.clone();
         let (snapshot_tx, snapshot_rx) = watch::channel(BrowserRuntimeSnapshot::default());
@@ -588,7 +601,7 @@ impl BrowserManager {
         let may_dir_for_actor = may_dir.clone();
 
         tokio::spawn(async move {
-            let mut runtime = BrowserRuntime::new(video_track, audio_track, api, lifecycle);
+            let mut runtime = BrowserRuntime::new(video_track, api, lifecycle);
             runtime.publish_snapshot(&snapshot_tx);
 
             while let Some(command) = command_rx.recv().await {
@@ -605,8 +618,16 @@ impl BrowserManager {
                         runtime.publish_snapshot(&snapshot_tx);
                         let _ = reply.send(result);
                     }
-                    BrowserCommand::HandleOffer { offer_sdp, reply } => {
-                        let _ = reply.send(runtime.handle_offer(offer_sdp, actor_tx.clone()).await);
+                    BrowserCommand::HandleOffer {
+                        session_id,
+                        offer_sdp,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            runtime
+                                .handle_offer(session_id, offer_sdp, actor_tx.clone())
+                                .await,
+                        );
                     }
                     BrowserCommand::ReadPage {
                         url,
@@ -617,6 +638,9 @@ impl BrowserManager {
                     }
                     BrowserCommand::DropPeer { peer_id } => {
                         runtime.drop_peer(peer_id.as_str());
+                    }
+                    BrowserCommand::SetTakeover { session_id } => {
+                        runtime.set_takeover(session_id);
                     }
                 }
             }
@@ -685,10 +709,19 @@ impl BrowserManager {
     /// 1. Client creates offer (recvonly video + `DataChannel`)
     /// 2. Server creates answer with video track + ICE candidates
     /// 3. Connection established, video flows, `DataChannel` ready for input
-    pub async fn handle_offer(&self, offer_sdp: String) -> Result<String, BrowserError> {
+    ///
+    /// `session_id` identifies which May session originated the offer; it
+    /// is recorded on the peer so the takeover gate can match input
+    /// messages against the current `takeover_owner`.
+    pub async fn handle_offer(
+        &self,
+        session_id: String,
+        offer_sdp: String,
+    ) -> Result<String, BrowserError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(BrowserCommand::HandleOffer {
+                session_id,
                 offer_sdp,
                 reply: reply_tx,
             })
@@ -698,6 +731,13 @@ impl BrowserManager {
         reply_rx.await.map_err(|_| BrowserError::ActorClosed {
             operation: "await webrtc offer reply",
         })?
+    }
+
+    /// Mirror takeover ownership into the actor. Pass `None` to clear.
+    pub fn set_takeover(&self, session_id: Option<String>) {
+        let _ = self
+            .command_tx
+            .send(BrowserCommand::SetTakeover { session_id });
     }
 
     pub async fn read_page(
@@ -947,7 +987,6 @@ impl BrowserRuntime {
             self.keyframe_request.clone(),
         )
         .await?;
-        let audio_writer = start_audio_pipeline(self.audio_track.clone());
 
         self.session = Some(BrowserSession {
             browser,
@@ -956,7 +995,6 @@ impl BrowserRuntime {
             _handler: handler_task,
             _cdp_reader: cdp_reader,
             _sample_writer: sample_writer,
-            _audio_writer: audio_writer,
         });
 
         tracing::info!(backend = ?config.backend, "Browser started with WebRTC streaming");
@@ -973,7 +1011,6 @@ impl BrowserRuntime {
         if let Some(mut session) = self.session.take() {
             session._cdp_reader.abort();
             session._sample_writer.abort();
-            session._audio_writer.abort();
             session._handler.abort();
             match session.backing {
                 BrowserSessionBacking::Managed { owns_process } => {
@@ -996,6 +1033,7 @@ impl BrowserRuntime {
 
     async fn handle_offer(
         &mut self,
+        session_id: String,
         offer_sdp: String,
         peer_events: mpsc::UnboundedSender<BrowserCommand>,
     ) -> Result<String, BrowserError> {
@@ -1027,21 +1065,22 @@ impl BrowserRuntime {
             .add_track(Arc::clone(&self.video_track) as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .map_err(|error| BrowserError::web_rtc_operation("add video track", error))?;
-        let audio_rtp_sender = peer_connection
-            .add_track(Arc::clone(&self.audio_track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await
-            .map_err(|error| BrowserError::web_rtc_operation("add audio track", error))?;
 
+        // No audio track is offered: there is no audio source plumbed
+        // through CDP, and previously we advertised an Opus track that
+        // only carried silence. That forced every viewer to negotiate an
+        // audio m-line for nothing and drained RTCP into /dev/null.
         tokio::spawn(async move {
             let mut buf = vec![0u8; 1500];
             while video_rtp_sender.read(&mut buf).await.is_ok() {}
         });
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 1500];
-            while audio_rtp_sender.read(&mut buf).await.is_ok() {}
-        });
 
-        setup_data_channel_handler(&peer_connection, page);
+        setup_data_channel_handler(
+            &peer_connection,
+            page,
+            session_id,
+            self.takeover_owner.clone(),
+        );
 
         let peer_id = uuid::Uuid::new_v4().to_string();
         setup_peer_connection_lifecycle(&peer_connection, peer_id.clone(), peer_events);
@@ -1793,26 +1832,6 @@ async fn start_encoding_pipeline(
     Ok((cdp_reader, sample_writer))
 }
 
-fn start_audio_pipeline(audio_track: Arc<TrackLocalStaticSample>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(20));
-        let silence_frame = bytes::Bytes::from_static(&[0xF8, 0xFF, 0xFE]);
-        loop {
-            ticker.tick().await;
-            if let Err(e) = audio_track
-                .write_sample(&Sample {
-                    data: silence_frame.clone(),
-                    duration: Duration::from_millis(20),
-                    ..Default::default()
-                })
-                .await
-            {
-                tracing::trace!(error = %e, "WebRTC audio sample write skipped");
-            }
-        }
-    })
-}
-
 // ── H.264 encoding loop (dedicated thread) ─────────────────────────────────────
 
 fn encode_loop(
@@ -1961,21 +1980,33 @@ fn setup_peer_connection_lifecycle(
     }));
 }
 
-fn setup_data_channel_handler(pc: &RTCPeerConnection, page: Arc<Page>) {
+fn setup_data_channel_handler(
+    pc: &RTCPeerConnection,
+    page: Arc<Page>,
+    peer_session_id: String,
+    takeover_owner: Arc<ArcSwapOption<String>>,
+) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let page = page.clone();
+        let peer_session_id = peer_session_id.clone();
+        let takeover_owner = takeover_owner.clone();
         Box::pin(async move {
             let label = dc.label().to_owned();
             tracing::debug!(label, "DataChannel opened for browser input");
 
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let page = page.clone();
+                let peer_session_id = peer_session_id.clone();
+                let takeover_owner = takeover_owner.clone();
                 Box::pin(async move {
                     let text = match String::from_utf8(msg.data.to_vec()) {
                         Ok(s) => s,
                         Err(_) => return,
                     };
-                    if let Err(e) = handle_input_message(&page, &text).await {
+                    if let Err(e) =
+                        handle_input_message(&page, &text, &peer_session_id, &takeover_owner)
+                            .await
+                    {
                         tracing::warn!(error = %e, "Browser input handling failed");
                     }
                 })
@@ -1984,9 +2015,39 @@ fn setup_data_channel_handler(pc: &RTCPeerConnection, page: Arc<Page>) {
     }));
 }
 
-async fn handle_input_message(page: &Page, text: &str) -> Result<(), BrowserError> {
+/// Returns true if the `peer_session_id` currently owns input over the
+/// browser. Pure function over the snapshot — exercised by the takeover
+/// gate unit test.
+fn takeover_allows_input(
+    peer_session_id: &str,
+    takeover_owner: &ArcSwapOption<String>,
+) -> bool {
+    let owner = takeover_owner.load();
+    owner
+        .as_ref()
+        .map(|owner_id| owner_id.as_str() == peer_session_id)
+        .unwrap_or(false)
+}
+
+async fn handle_input_message(
+    page: &Page,
+    text: &str,
+    peer_session_id: &str,
+    takeover_owner: &ArcSwapOption<String>,
+) -> Result<(), BrowserError> {
     let msg: InputMessage = serde_json::from_str(text)
         .map_err(|source| BrowserError::InvalidInputPayload { source })?;
+
+    if !takeover_allows_input(peer_session_id, takeover_owner) {
+        // Silently drop input when this peer has not been granted
+        // takeover. The agent owns the page in that state and arbitrary
+        // user clicks would race with agent-driven CDP commands.
+        tracing::debug!(
+            peer_session_id,
+            "browser input dropped — peer is not the takeover owner"
+        );
+        return Ok(());
+    }
 
     match msg {
         InputMessage::Mouse(input) => dispatch_mouse(page, input).await,
