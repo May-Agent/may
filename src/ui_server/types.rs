@@ -251,6 +251,46 @@ pub struct BrowserStatusEventPayload {
     pub(crate) takeover_session_id: Option<String>,
 }
 
+// ── Browser Lifecycle SSE Event Payload ─────────────────────
+
+/// Sequential, transient lifecycle facts produced by the browser actor.
+///
+/// Unlike `BrowserStatusEventPayload`, which is a snapshot reconciled on
+/// every topic notification, lifecycle events are point-in-time and must
+/// be streamed in order. Each variant should be cheap to construct so the
+/// actor can emit progress events from hot paths.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum BrowserLifecycleEvent {
+    ChromeFetching {
+        progress_bytes: u64,
+        total_bytes: Option<u64>,
+    },
+    Starting,
+    Ready,
+    Navigating {
+        url: String,
+    },
+    PageLoaded {
+        url: String,
+        title: Option<String>,
+    },
+    PeerConnected {
+        count: usize,
+    },
+    PeerDisconnected {
+        count: usize,
+    },
+    TakeoverChanged {
+        session_id: Option<String>,
+    },
+    EncoderStalled,
+    Stopped,
+    Error {
+        message: String,
+    },
+}
+
 // ── Generic OK Responses ────────────────────────────────────
 
 #[derive(Debug, serde::Serialize)]
