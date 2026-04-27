@@ -147,8 +147,11 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             backend: config.browser.backend,
             port: config.browser.port,
             remote_cdp_endpoint: config.browser.remote_cdp_endpoint.clone(),
-            screencast_quality: config.browser.screencast_quality,
+            screencast_jpeg_quality: config.browser.screencast_jpeg_quality,
+            encoder_initial_bitrate_kbps: config.browser.encoder_initial_bitrate_kbps,
             screencast_max_width: config.browser.screencast_max_width,
+            screencast_max_height: config.browser.screencast_max_height,
+            every_nth_frame: config.browser.every_nth_frame,
         },
         remote_access: UiRemoteAccessConfig::from(&config.remote_access),
     }
@@ -184,8 +187,11 @@ async fn run_save_full_config(
                 .remote_cdp_endpoint
                 .clone()
                 .filter(|value| !value.trim().is_empty()),
-            screencast_quality: req.browser.screencast_quality,
+            screencast_jpeg_quality: req.browser.screencast_jpeg_quality,
+            encoder_initial_bitrate_kbps: req.browser.encoder_initial_bitrate_kbps,
             screencast_max_width: req.browser.screencast_max_width,
+            screencast_max_height: req.browser.screencast_max_height,
+            every_nth_frame: req.browser.every_nth_frame,
         };
         next_browser_config.validate().map_err(bad_request_error)?;
         crate::container::browser::prepare_browser_runtime(&next_browser_config, &state.may_dir)
@@ -258,8 +264,11 @@ async fn run_save_full_config(
             .remote_cdp_endpoint
             .clone()
             .filter(|value| !value.trim().is_empty());
-        config.browser.screencast_quality = req.browser.screencast_quality;
+        config.browser.screencast_jpeg_quality = req.browser.screencast_jpeg_quality;
+        config.browser.encoder_initial_bitrate_kbps = req.browser.encoder_initial_bitrate_kbps;
         config.browser.screencast_max_width = req.browser.screencast_max_width;
+        config.browser.screencast_max_height = req.browser.screencast_max_height;
+        config.browser.every_nth_frame = req.browser.every_nth_frame;
         config.remote_access.enabled = req.remote_access.enabled;
         config.remote_access.cloudflared_binary = req.remote_access.cloudflared_binary.clone();
         config.remote_access.tunnel_token = req

@@ -768,24 +768,53 @@ pub struct BrowserConfig {
     /// CDP endpoint for a remotely managed browser runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cdp_endpoint: Option<String>,
-    /// JPEG quality for screencast frames (1-100). Lower = less bandwidth.
-    #[serde(default = "default_screencast_quality")]
-    pub screencast_quality: u32,
+    /// JPEG quality for raw screencast frames (1-100). Trades CPU for
+    /// fidelity at the *first* lossy stage of the pipeline.
+    #[serde(default = "default_screencast_jpeg_quality")]
+    pub screencast_jpeg_quality: u32,
+    /// Initial H.264 target bitrate in kilobits per second. The encoder
+    /// thread starts here; the adaptive ABR loop may lower it on RTCP
+    /// REMB drops and ramp back up on recovery.
+    #[serde(default = "default_encoder_initial_bitrate_kbps")]
+    pub encoder_initial_bitrate_kbps: u32,
     /// Max width for screencast frames in pixels. Lower = less bandwidth.
+    /// Updated by the viewport-resize command when the panel is resized.
     #[serde(default = "default_screencast_max_width")]
     pub screencast_max_width: u32,
+    /// Max height for screencast frames in pixels. Independent of width
+    /// so the screencast can match the rendered viewport instead of being
+    /// clipped to a hardcoded aspect ratio.
+    #[serde(default = "default_screencast_max_height")]
+    pub screencast_max_height: u32,
+    /// Encode every Nth screencast frame. 1 = every frame (max fps).
+    /// 2 caps to ~15 fps which is plenty for screen content and halves
+    /// outbound bitrate for free.
+    #[serde(default = "default_every_nth_frame")]
+    pub every_nth_frame: u32,
 }
 
 const fn default_browser_port() -> u16 {
     39222
 }
 
-const fn default_screencast_quality() -> u32 {
+const fn default_screencast_jpeg_quality() -> u32 {
     80
+}
+
+const fn default_encoder_initial_bitrate_kbps() -> u32 {
+    4000
 }
 
 const fn default_screencast_max_width() -> u32 {
     1920
+}
+
+const fn default_screencast_max_height() -> u32 {
+    1200
+}
+
+const fn default_every_nth_frame() -> u32 {
+    2
 }
 
 impl Default for BrowserConfig {
@@ -795,8 +824,11 @@ impl Default for BrowserConfig {
             backend: BrowserBackendKind::Managed,
             port: default_browser_port(),
             remote_cdp_endpoint: None,
-            screencast_quality: default_screencast_quality(),
+            screencast_jpeg_quality: default_screencast_jpeg_quality(),
+            encoder_initial_bitrate_kbps: default_encoder_initial_bitrate_kbps(),
             screencast_max_width: default_screencast_max_width(),
+            screencast_max_height: default_screencast_max_height(),
+            every_nth_frame: default_every_nth_frame(),
         }
     }
 }
