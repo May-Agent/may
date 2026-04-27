@@ -4,8 +4,8 @@ import { Command } from 'cmdk';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { useTranslation } from '@/lib/i18n';
-import { listModelsByProvider, type ProviderModelsGroup } from '@/lib/api/models';
 import { useSessionsStore } from '@/lib/stores/sessions';
+import { useModelsStore } from '@/lib/stores/models';
 import { cn } from '@/lib/utils';
 
 interface ModelPickerProps {
@@ -16,22 +16,15 @@ interface ModelPickerProps {
 
 export function ModelPicker({ sessionId, currentModel, disabled }: ModelPickerProps) {
   const [open, setOpen] = useState(false);
-  const [groups, setGroups] = useState<ProviderModelsGroup[] | null>(null);
   const [pending, setPending] = useState(false);
   const setModel = useSessionsStore((s) => s.setModel);
+  const groups = useModelsStore((s) => s.groups);
+  const refresh = useModelsStore((s) => s.refresh);
   const { t } = useTranslation();
 
   useEffect(() => {
-    if (!open || groups) return;
-    void (async () => {
-      try {
-        const res = await listModelsByProvider();
-        setGroups(res.providers);
-      } catch {
-        setGroups([]);
-      }
-    })();
-  }, [open, groups]);
+    if (open) void refresh();
+  }, [open, refresh]);
 
   const selectorLabel = (selector: string) => {
     const [, modelId] = selector.split('::', 2);

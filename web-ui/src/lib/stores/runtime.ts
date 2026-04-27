@@ -10,6 +10,7 @@ import type {
 } from '../types';
 import { openUiEventStream } from '../api/events';
 import { useSessionsStore } from './sessions';
+import { useModelsStore } from './models';
 import type { NotificationMailboxEntry } from '../api/notifications';
 
 interface MailboxEventPayload {
@@ -68,6 +69,12 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
         for await (const evt of handle.events as AsyncGenerator<UiEvent>) {
           switch (evt.kind) {
             case 'heartbeat':
+              break;
+            case 'config':
+              // Provider/model configuration changed server-side; invalidate
+              // the cached models so the picker reflects the change without
+              // a manual refresh.
+              void useModelsStore.getState().refresh();
               break;
             case 'browser_status':
               set({ browser: evt.payload });
