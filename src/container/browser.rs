@@ -1055,9 +1055,35 @@ impl BrowserRuntime {
         // through CDP, and previously we advertised an Opus track that
         // only carried silence. That forced every viewer to negotiate an
         // audio m-line for nothing and drained RTCP into /dev/null.
+        let keyframe_request_for_rtcp = self.keyframe_request.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 1500];
-            while video_rtp_sender.read(&mut buf).await.is_ok() {}
+            // Drain RTCP from the peer and translate viewer feedback into
+            // encoder hints. PLI / FIR mean the decoder has lost sync
+            // (packet loss, codec reset) and needs an IDR; we flip the
+            // shared atomic and the encoder thread emits a keyframe on
+            // its next iteration. Other RTCP types (RR / TWCC / REMB)
+            // are reserved for the ABR follow-up and currently ignored.
+            loop {
+                match video_rtp_sender.read_rtcp().await {
+                    Ok((packets, _)) => {
+                        for packet in packets {
+                            let any = packet.as_any();
+                            if any
+                                .downcast_ref::<webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>()
+                                .is_some()
+                                || any
+                                    .downcast_ref::<webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest>()
+                                    .is_some()
+                            {
+                                tracing::debug!("RTCP PLI/FIR received; requesting IDR");
+                                keyframe_request_for_rtcp
+                                    .store(true, Ordering::Release);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         });
 
         setup_data_channel_handler(
