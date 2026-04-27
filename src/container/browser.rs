@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -474,6 +475,11 @@ struct BrowserRuntime {
     webrtc_api: webrtc::api::API,
     peers: HashMap<String, Arc<RTCPeerConnection>>,
     lifecycle: BrowserLifecyclePublisher,
+    /// Set to `true` when a new peer is about to subscribe to the video
+    /// track. The encoder loop swaps it back to `false` and forces an IDR
+    /// so the new viewer doesn't have to wait up to 2 s for the next
+    /// scheduled keyframe.
+    keyframe_request: Arc<AtomicBool>,
 }
 
 impl BrowserRuntime {
@@ -490,6 +496,7 @@ impl BrowserRuntime {
             webrtc_api,
             peers: HashMap::new(),
             lifecycle,
+            keyframe_request: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -937,6 +944,7 @@ impl BrowserRuntime {
             page.clone(),
             self.video_track.clone(),
             config.screencast_quality,
+            self.keyframe_request.clone(),
         )
         .await?;
         let audio_writer = start_audio_pipeline(self.audio_track.clone());
@@ -1051,6 +1059,11 @@ impl BrowserRuntime {
             .map_err(|error| BrowserError::web_rtc_operation("create answer", error))?;
 
         let mut gather_complete = peer_connection.gathering_complete_promise().await;
+
+        // Flip the IDR request *before* the answer is sent so the encoder
+        // emits a keyframe in the very next GOP, giving the new viewer a
+        // decodable first frame as soon as RTP packets start flowing.
+        self.keyframe_request.store(true, Ordering::Release);
 
         peer_connection
             .set_local_description(answer)
@@ -1715,6 +1728,7 @@ async fn start_encoding_pipeline(
     page: Arc<Page>,
     video_track: Arc<TrackLocalStaticSample>,
     screencast_quality: u32,
+    keyframe_request: Arc<AtomicBool>,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), BrowserError> {
     let mut event_stream = page
         .event_listener::<EventScreencastFrame>()
@@ -1756,7 +1770,7 @@ async fn start_encoding_pipeline(
     std::thread::Builder::new()
         .name("browser-encoder".into())
         .spawn(move || {
-            encode_loop(jpeg_rx, sample_tx, screencast_quality);
+            encode_loop(jpeg_rx, sample_tx, screencast_quality, keyframe_request);
         })
         .map_err(|error| BrowserError::encoder_operation("spawn browser encoder thread", error))?;
 
@@ -1805,6 +1819,7 @@ fn encode_loop(
     frame_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     sample_tx: tokio::sync::mpsc::Sender<EncodedSample>,
     quality: u32,
+    keyframe_request: Arc<AtomicBool>,
 ) {
     use openh264::OpenH264API;
     use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, UsageType};
@@ -1847,8 +1862,11 @@ fn encode_loop(
         let duration = last_frame_time.map_or(Duration::from_millis(33), |t| now.duration_since(t));
         last_frame_time = Some(now);
 
-        // Periodic keyframes for new viewers / packet loss recovery
-        if now.duration_since(last_keyframe) > keyframe_interval {
+        // Force IDR on viewer-join (drains the request flag) or on the
+        // periodic interval. Without this a fresh peer can wait up to
+        // `keyframe_interval` for the next decodable frame.
+        let join_idr = keyframe_request.swap(false, Ordering::AcqRel);
+        if join_idr || now.duration_since(last_keyframe) > keyframe_interval {
             encoder.force_intra_frame();
             last_keyframe = now;
         }
