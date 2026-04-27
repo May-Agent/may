@@ -505,7 +505,11 @@ impl BrowserRuntime {
     }
 
     fn drop_peer(&mut self, peer_id: &str) {
-        self.peers.remove(peer_id);
+        if self.peers.remove(peer_id).is_some() {
+            self.lifecycle.emit(BrowserLifecycleEvent::PeerDisconnected {
+                count: self.peers.len(),
+            });
+        }
     }
 }
 
@@ -774,6 +778,23 @@ impl BrowserRuntime {
             return Ok(());
         }
 
+        self.lifecycle.emit(BrowserLifecycleEvent::Starting);
+
+        let result = self.start_inner(config, may_dir).await;
+        match &result {
+            Ok(()) => self.lifecycle.emit(BrowserLifecycleEvent::Ready),
+            Err(error) => self.lifecycle.emit(BrowserLifecycleEvent::Error {
+                message: error.to_string(),
+            }),
+        }
+        result
+    }
+
+    async fn start_inner(
+        &mut self,
+        config: &MayBrowserConfig,
+        may_dir: &Path,
+    ) -> Result<(), BrowserError> {
         let (mut browser, mut handler, backing) = match config.backend {
             BrowserBackendKind::Managed => {
                 let paths =
@@ -940,6 +961,7 @@ impl BrowserRuntime {
             let _ = peer.close().await;
         }
 
+        let was_running = self.session.is_some();
         if let Some(mut session) = self.session.take() {
             session._cdp_reader.abort();
             session._sample_writer.abort();
@@ -955,6 +977,10 @@ impl BrowserRuntime {
                 }
             }
             tracing::info!("Browser stopped");
+        }
+
+        if was_running {
+            self.lifecycle.emit(BrowserLifecycleEvent::Stopped);
         }
 
         Ok(())
@@ -1048,6 +1074,9 @@ impl BrowserRuntime {
         })?;
 
         self.peers.insert(peer_id, peer_connection);
+        self.lifecycle.emit(BrowserLifecycleEvent::PeerConnected {
+            count: self.peers.len(),
+        });
         Ok(local_desc.sdp)
     }
 
@@ -1062,7 +1091,15 @@ impl BrowserRuntime {
             .ok_or(BrowserError::NotRunning)?
             .page
             .clone();
-        read_page_capture(page, url, options).await
+        self.lifecycle.emit(BrowserLifecycleEvent::Navigating {
+            url: url.to_string(),
+        });
+        let capture = read_page_capture(page, url, options).await?;
+        self.lifecycle.emit(BrowserLifecycleEvent::PageLoaded {
+            url: capture.page.url.clone(),
+            title: Some(capture.page.title.clone()).filter(|t| !t.is_empty()),
+        });
+        Ok(capture)
     }
 }
 
