@@ -400,12 +400,80 @@ enum BrowserCommand {
     },
 }
 
+/// Sequential, transient lifecycle facts produced by the browser actor.
+///
+/// Unlike `BrowserStatusEventPayload`, which is a snapshot reconciled on
+/// every topic notification, lifecycle events are point-in-time and must
+/// be streamed in order. They ride the existing `/api/events` SSE stream
+/// as the `browser_lifecycle` event kind (see `AGENTS.md`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum BrowserLifecycleEvent {
+    ChromeFetching {
+        progress_bytes: u64,
+        total_bytes: Option<u64>,
+    },
+    Starting,
+    Ready,
+    Navigating {
+        url: String,
+    },
+    PageLoaded {
+        url: String,
+        title: Option<String>,
+    },
+    PeerConnected {
+        count: usize,
+    },
+    PeerDisconnected {
+        count: usize,
+    },
+    TakeoverChanged {
+        session_id: Option<String>,
+    },
+    EncoderStalled,
+    Stopped,
+    Error {
+        message: String,
+    },
+}
+
+/// Lightweight publisher used by the browser actor to emit lifecycle
+/// events without holding an `Option<broadcast::Sender>` everywhere.
+/// Cloning is cheap; emissions are fire-and-forget.
+#[derive(Clone)]
+pub struct BrowserLifecyclePublisher {
+    tx: tokio::sync::broadcast::Sender<BrowserLifecycleEvent>,
+}
+
+impl BrowserLifecyclePublisher {
+    #[must_use]
+    pub fn new(tx: tokio::sync::broadcast::Sender<BrowserLifecycleEvent>) -> Self {
+        Self { tx }
+    }
+
+    /// A publisher that drops every event. Used by standalone CLI flows
+    /// (`may browser` IPC subprocess) where there is no SSE consumer.
+    #[must_use]
+    pub fn noop() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        Self { tx }
+    }
+
+    pub fn emit(&self, event: BrowserLifecycleEvent) {
+        // Fire-and-forget: a closed channel just means nobody is currently
+        // subscribed (no SSE clients), which is fine.
+        let _ = self.tx.send(event);
+    }
+}
+
 struct BrowserRuntime {
     session: Option<BrowserSession>,
     video_track: Arc<TrackLocalStaticSample>,
     audio_track: Arc<TrackLocalStaticSample>,
     webrtc_api: webrtc::api::API,
     peers: HashMap<String, Arc<RTCPeerConnection>>,
+    lifecycle: BrowserLifecyclePublisher,
 }
 
 impl BrowserRuntime {
@@ -413,6 +481,7 @@ impl BrowserRuntime {
         video_track: Arc<TrackLocalStaticSample>,
         audio_track: Arc<TrackLocalStaticSample>,
         webrtc_api: webrtc::api::API,
+        lifecycle: BrowserLifecyclePublisher,
     ) -> Self {
         Self {
             session: None,
@@ -420,6 +489,7 @@ impl BrowserRuntime {
             audio_track,
             webrtc_api,
             peers: HashMap::new(),
+            lifecycle,
         }
     }
 
@@ -452,7 +522,11 @@ pub struct BrowserManager {
 
 impl BrowserManager {
     /// Create a new browser manager. Sets up the WebRTC API and shared video track.
-    pub fn new(config: MayBrowserConfig, may_dir: PathBuf) -> Result<Self, BrowserError> {
+    pub fn new(
+        config: MayBrowserConfig,
+        may_dir: PathBuf,
+        lifecycle: BrowserLifecyclePublisher,
+    ) -> Result<Self, BrowserError> {
         config
             .validate()
             .map_err(|error| BrowserError::browser_operation("validate browser config", error))?;
@@ -503,7 +577,7 @@ impl BrowserManager {
         let may_dir_for_actor = may_dir.clone();
 
         tokio::spawn(async move {
-            let mut runtime = BrowserRuntime::new(video_track, audio_track, api);
+            let mut runtime = BrowserRuntime::new(video_track, audio_track, api, lifecycle);
             runtime.publish_snapshot(&snapshot_tx);
 
             while let Some(command) = command_rx.recv().await {

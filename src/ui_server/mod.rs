@@ -132,6 +132,11 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         }
     };
 
+    // Capacity must be high enough that a slow SSE client cannot block the
+    // browser actor's hot path; lifecycle events are small and high-volume
+    // during Chrome boot / page navigations.
+    let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(256);
+
     // Initialize the May-managed browser runtime only when the feature is enabled.
     let browser_manager = if config.browser.enabled {
         tracing::info!(backend = ?config.browser.backend, "Browser integration enabled");
@@ -139,6 +144,9 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
             Ok(_) => match crate::container::browser::BrowserManager::new(
                 config.browser.clone(),
                 may_dir.clone(),
+                crate::container::browser::BrowserLifecyclePublisher::new(
+                    browser_lifecycle_tx.clone(),
+                ),
             ) {
                 Ok(manager) => Some(Arc::new(manager)),
                 Err(error) => {
@@ -224,11 +232,6 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
     }
     let task_runtime = Arc::new(task_runtime);
     let container_prepare = state::ContainerPrepareTracker::new(ui_event_bus.clone());
-
-    // Capacity must be high enough that a slow SSE client cannot block the
-    // browser actor's hot path; lifecycle events are small and high-volume
-    // during Chrome boot / page navigations.
-    let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(256);
 
     let state = Arc::new(UiServerState {
         tokio_handle: tokio::runtime::Handle::current(),

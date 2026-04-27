@@ -337,8 +337,12 @@ async fn run_browser_service(
     let listener =
         tokio::net::UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
     let browser_manager = Arc::new(
-        may_agent::container::browser::BrowserManager::new(config.browser.clone(), may_dir.clone())
-            .map_err(|error| error.to_string())?,
+        may_agent::container::browser::BrowserManager::new(
+            config.browser.clone(),
+            may_dir.clone(),
+            may_agent::container::browser::BrowserLifecyclePublisher::noop(),
+        )
+        .map_err(|error| error.to_string())?,
     );
 
     loop {
