@@ -91,7 +91,7 @@ impl RestArgs {
 
 impl ExecArgs {
     pub fn help_text() -> &'static str {
-        "Usage: may exec --session <id> [--ssh-server <id>] [--timeout <sec>] [--max-lines <n>] [--raw] [--] <command...>\n\nExec runs a terminal command in the session home environment. Remote profile sessions execute over SSH automatically, and container profile sessions execute inside the configured container environment."
+        "Usage: may exec --session <id> [--ssh-server <id>] [--timeout <sec>] [--max-lines <n>] [--raw] [--] <command...>\n\nExec runs a terminal command in the session home environment. Use --ssh-server to target an attached SSH environment, and container profile sessions execute inside the configured container environment."
     }
 }
 

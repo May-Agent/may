@@ -151,6 +151,19 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    pub async fn clear_waiting_permission_request(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self
+            .db
+            .clear_waiting_permission_request(session_id, request_id)
+            .await?;
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
+        Ok(summary)
+    }
+
     pub async fn set_waiting_workspace(
         &self,
         session_id: &str,

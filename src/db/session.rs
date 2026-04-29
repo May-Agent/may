@@ -925,6 +925,26 @@ impl ChatDb {
         self.load_session_runtime_summary(session_id).await
     }
 
+    /// Clear a single waiting-permission row by its `request_id`.
+    ///
+    /// Use this when responding to a specific permission prompt so a fresh row
+    /// inserted by the resumed agent for the *next* permission isn't wiped by a
+    /// session-wide delete.
+    pub async fn clear_waiting_permission_request(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        query!(
+            self.db,
+            "DELETE FROM session_pending_permissions WHERE request_id = ?",
+            request_id
+        )
+        .execute()
+        .await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
     /// Persist or clear a waiting workspace request via direct SQL.
     pub async fn set_waiting_workspace(
         &self,
