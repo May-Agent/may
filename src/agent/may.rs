@@ -18,7 +18,7 @@ use executor_core::DefaultExecutor;
 use futures_lite::{Stream, StreamExt};
 
 use super::hooks::{ContextSnapshotHook, PendingSteerHook};
-use super::imagine::{ImageGeneratorConfig, ImagineTool, resolve_image_generator_config};
+use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::permission::PermissionApprover;
 use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
 use super::runtime_context::{
@@ -31,12 +31,14 @@ use super::runtime_context::{
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
-use crate::ask_user::{AskUserBroker, AskUserTool};
+use crate::ask_user::AskUserBroker;
 use crate::config::MayConfig;
 use crate::embedding_provider::EmbeddingModelResolution;
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::session::{SessionId, SessionPaths, SessionPlanState};
-use crate::terminal_commands::{SharedTerminalCommandConfig, register_shared_terminal_commands};
+use crate::terminal_commands::{
+    ImagineCommandConfig, SharedTerminalCommandConfig, register_shared_terminal_commands,
+};
 use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::workspace::Workspace as MayWorkspace;
 use crate::workspace_request::WorkspaceRequestBroker;
@@ -234,13 +236,8 @@ impl MayAgent {
         // Clone LLM for terminal IPC commands before moving it into the builder.
         let terminal_command_llm = llm.clone();
 
-        // Create tools
         let ssh_authorizer_broker = config.ask_user_broker.clone();
-        let ask_user = AskUserTool::new(
-            config.session_id.as_str().to_string(),
-            config.ask_user_broker,
-        );
-        let imagine = ImagineTool {
+        let imagine_config = ImagineCommandConfig {
             generator: config.image_generator,
             artifacts_dir: session_paths.artifacts_dir(),
         };
@@ -286,8 +283,6 @@ impl MayAgent {
             config.max_iterations
         };
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
-            .tool(ask_user)
-            .tool(imagine)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook);
         let terminal_command_factory = builder.terminal_tool_factory();
@@ -299,6 +294,8 @@ impl MayAgent {
                 may_dir: config.may_dir.clone(),
                 sandbox_dir: config.sandbox_dir.clone(),
                 search_embedder: config.search_embedder.clone(),
+                ask_user_broker: Some(config.ask_user_broker),
+                imagine: Some(imagine_config),
                 task_runtime: match &config.environment {
                     AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
                     AgentEnvironment::Local => TaskRuntimeKind::Local,
