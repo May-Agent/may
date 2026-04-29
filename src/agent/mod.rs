@@ -3,7 +3,7 @@
 pub(crate) mod browser_tool;
 mod environment;
 mod hooks;
-mod imagine;
+pub(crate) mod imagine;
 mod may;
 pub(crate) mod notify_tool;
 mod permission;
@@ -20,6 +20,7 @@ pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
 };
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
+pub use imagine::ImageGeneratorConfig;
 pub use may::{AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, generate_session_title};
 pub use notify_tool::{NotifyArgs, NotifyBroker, NotifyResult, channel as notify_channel};
 pub use permission::{

@@ -198,17 +198,19 @@ function ShellBlock({ script }: { script: string }) {
   return (
     <div className="flex gap-2 text-xs font-mono leading-relaxed">
       <span className="shrink-0 text-muted-foreground select-none">$</span>
-      <SyntaxHighlighter
-        language="bash"
-        style={oneLight}
-        customStyle={shellHighlighterStyle}
-        codeTagProps={{ style: { background: 'transparent', fontFamily: 'inherit' } }}
-        PreTag="div"
-        wrapLongLines
-        className="whitespace-pre-wrap break-all"
-      >
-        {script}
-      </SyntaxHighlighter>
+      <div className="flex-1 min-w-0 max-h-64 overflow-auto scrollbar-thin">
+        <SyntaxHighlighter
+          language="bash"
+          style={oneLight}
+          customStyle={shellHighlighterStyle}
+          codeTagProps={{ style: { background: 'transparent', fontFamily: 'inherit' } }}
+          PreTag="div"
+          wrapLongLines
+          className="whitespace-pre-wrap break-all"
+        >
+          {script}
+        </SyntaxHighlighter>
+      </div>
     </div>
   );
 }

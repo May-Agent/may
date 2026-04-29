@@ -22,13 +22,17 @@ pub(super) async fn respond_permission_request(
         .ok_or_else(|| bad_request_error("permission request not found or already resolved"))?;
     let session_id = pending.session_id;
 
-    let responded = state.permission_approver.respond(&req.id, req.approved);
-
+    // Delete the specific pending row BEFORE waking the agent. If we deleted
+    // session-wide afterwards, the agent — resumed by `respond` below — could
+    // emit and persist a brand-new permission request before our DELETE ran,
+    // wiping the new row and leaving the next Approve click with a 400.
     let mut runtime = state
         .runtime_service
-        .set_waiting_permission(&session_id, None)
+        .clear_waiting_permission_request(&session_id, &req.id)
         .await
         .map_err(internal_error)?;
+
+    let responded = state.permission_approver.respond(&req.id, req.approved);
     if !responded {
         tracing::warn!(request_id = %req.id, session_id = %session_id, "permission response arrived without a live waiter");
     }

@@ -4,7 +4,7 @@
 //! environment (local or container) and renders the combined
 //! stdout/stderr/task-id payload back to the caller. When the profile
 //! has attached SSH servers, the command may select one via
-//! `--ssh-server-id <name>` with `--mode ssh`.
+//! `--ssh-server <name>`.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -406,6 +406,8 @@ where
             may_dir: context.may_dir.clone(),
             sandbox_dir: context.sandbox_dir.clone(),
             search_embedder,
+            ask_user_broker: None,
+            imagine: None,
             task_runtime: match environment {
                 may_agent::AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
                 may_agent::AgentEnvironment::Local => TaskRuntimeKind::Local,

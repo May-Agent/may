@@ -1228,7 +1228,7 @@ async fn rebuild_semantic_index(
         .await?;
     }
 
-    rag.save()?;
+    rag.save().await?;
     Ok(())
 }
 
@@ -1628,7 +1628,7 @@ async fn run_semantic_query(
         .deduplication(false)
         .auto_save(false)
         .build()?;
-    rag.load()?;
+    rag.load().await?;
 
     let rows = rag
         .search_with_k(args.query.as_str(), args.scan_limit)
