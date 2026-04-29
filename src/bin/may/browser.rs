@@ -420,7 +420,7 @@ async fn run_browser_service(
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok::<BrowserServiceResponse, String>(BrowserServiceResponse::ReadOk {
-                    payload: page,
+                    payload: Box::new(page),
                 })
             }
             .await
