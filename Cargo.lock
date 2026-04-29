@@ -122,6 +122,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "heck 0.5.0",
  "indexmap 2.13.0",
+ "num-traits",
  "pin-project-lite",
  "quick-xml 0.37.5",
  "schemars 1.2.0",
