@@ -1,0 +1,46 @@
+name: Test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: may
+      # Path deps resolve against sibling checkouts.
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/aither
+          path: aither
+      - uses: actions/checkout@v4
+        with:
+          repository: zen-rs/skyzen
+          path: skyzen
+      - uses: actions/checkout@v4
+        with:
+          repository: zen-rs/zenwave
+          path: zenwave
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: may
+          shared-key: test-${{ matrix.os }}
+      - run: cargo nextest run --workspace --no-tests warn
+        working-directory: may
+      - run: cargo test --doc --workspace
+        working-directory: may
