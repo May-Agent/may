@@ -26,7 +26,7 @@ use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKi
 use crate::container::lifecycle::ContainerManager;
 use crate::db::entity::{profiles, scheduled_tasks};
 use crate::db::{ChatDb, NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
-use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
+use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError};
 use crate::notification::{NotificationPayload, NotificationService};
 use crate::profile::ProfileEnvironment;
 use crate::task_trigger::{
@@ -399,12 +399,18 @@ impl TaskRuntime {
         self
     }
 
-    pub fn with_network_policy(self, network_policy: NetworkPolicyConfig) -> Result<Self, String> {
+    pub fn with_network_policy(
+        self,
+        network_policy: NetworkPolicyConfig,
+    ) -> Result<Self, NetworkPolicyError> {
         self.set_network_policy(network_policy)?;
         Ok(self)
     }
 
-    pub fn set_network_policy(&self, network_policy: NetworkPolicyConfig) -> Result<(), String> {
+    pub fn set_network_policy(
+        &self,
+        network_policy: NetworkPolicyConfig,
+    ) -> Result<(), NetworkPolicyError> {
         let compiled = network_policy.compile()?;
         self.network_policy.store(Arc::new(compiled));
         Ok(())
@@ -1072,6 +1078,12 @@ impl TaskRuntime {
         let registry =
             Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
+        let network_audit = aither_sandbox::open_network_audit_log(
+            self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
+            crate::config::NETWORK_AUDIT_MAX_FILES,
+        )
+        .await
+        .map_err(|error| init_terminal_tool_error("failed to open network audit log: ", &error))?;
         TerminalTool::new_exact(
             &script.host_working_dir,
             SchedulerPermissionHandler {
@@ -1089,7 +1101,8 @@ impl TaskRuntime {
             init_terminal_tool_error("failed to initialize local terminal tool: ", &error)
         })
         .map(|tool| {
-            tool.with_shell_sessions(shell_sessions)
+            tool.with_network_audit_log(network_audit)
+                .with_shell_sessions(shell_sessions)
                 .with_writable_paths([script.host_working_dir.clone()])
                 .with_readable_paths([script.host_working_dir.clone()])
                 .with_registry(registry)

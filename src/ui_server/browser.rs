@@ -319,6 +319,10 @@ pub(super) async fn browser_takeover_start(
         .map_err(|error| {
             skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
+    // Interrupt an in-flight model request immediately. The chat loop checks
+    // the persisted takeover owner after cancellation and records the run as a
+    // takeover pause rather than an ordinary user cancellation.
+    state.run_cancellation_registry.cancel(session_id.as_str());
     if let Some(bm) = state.browser_manager() {
         bm.set_takeover(Some(session_id.clone()));
     }

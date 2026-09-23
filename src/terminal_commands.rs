@@ -30,6 +30,12 @@ pub struct ImagineCommandConfig {
 #[derive(Clone)]
 pub struct SharedTerminalCommandConfig<LLM> {
     pub llm: LLM,
+    /// Tier override for `ask --model flagship`; falls back to `llm`.
+    pub ask_flagship: Option<LLM>,
+    /// Tier override for `ask --model balanced`; falls back to `llm`.
+    pub ask_balanced: Option<LLM>,
+    /// Tier override for `ask --model fast` (the default tier); falls back to `llm`.
+    pub ask_fast: Option<LLM>,
     pub session_id: String,
     pub may_dir: PathBuf,
     pub sandbox_dir: PathBuf,
@@ -57,11 +63,10 @@ where
 
     register_tool_with_description(builder, &mut descriptions, WebSearchTool::default());
     register_tool_with_description(builder, &mut descriptions, WebFetchTool::new());
-    register_tool_with_description(
-        builder,
-        &mut descriptions,
-        AskCommand::new(config.llm.clone()),
-    );
+    let ask_command = AskCommand::new(config.ask_fast.unwrap_or_else(|| config.llm.clone()))
+        .with_flagship(config.ask_flagship.unwrap_or_else(|| config.llm.clone()))
+        .with_balanced(config.ask_balanced.unwrap_or_else(|| config.llm.clone()));
+    register_tool_with_description(builder, &mut descriptions, ask_command);
     register_tool_with_description(
         builder,
         &mut descriptions,
@@ -115,7 +120,7 @@ where
         register_tool_with_description(
             builder,
             &mut descriptions,
-            NotifyTool::new(Some(notify_broker)),
+            NotifyTool::new(Some(notify_broker)).for_session(config.session_id.clone()),
         );
     }
 
@@ -276,6 +281,9 @@ mod tests {
             &mut builder,
             SharedTerminalCommandConfig {
                 llm: MockLlm,
+                ask_flagship: None,
+                ask_balanced: None,
+                ask_fast: None,
                 session_id: "session-1".to_string(),
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
@@ -323,6 +331,9 @@ mod tests {
             &mut builder,
             SharedTerminalCommandConfig {
                 llm: MockLlm,
+                ask_flagship: None,
+                ask_balanced: None,
+                ask_fast: None,
                 session_id: "session-1".to_string(),
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),

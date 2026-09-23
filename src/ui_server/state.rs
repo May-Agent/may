@@ -478,9 +478,7 @@ impl UiServerState {
         self.browser_manager.store(browser_manager);
     }
 
-    pub(crate) fn browser_lifecycle_subscribe(
-        &self,
-    ) -> broadcast::Receiver<BrowserLifecycleEvent> {
+    pub(crate) fn browser_lifecycle_subscribe(&self) -> broadcast::Receiver<BrowserLifecycleEvent> {
         self.browser_lifecycle_tx.subscribe()
     }
 }

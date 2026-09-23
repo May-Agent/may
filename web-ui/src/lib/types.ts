@@ -183,7 +183,7 @@ export interface ChatRequestPayload {
   content: string;
   attachments?: ApiAttachment[];
   hiddenContextXml?: string;
-  deliveryMode?: 'immediate' | 'queue';
+  deliveryMode?: PendingUserMessageMode;
 }
 
 // ── SSE events on /api/chat/stream ──────────────────────────
@@ -321,20 +321,24 @@ export interface BrowserStatusPayload {
 export interface ProfileSessions {
   profile: import('./api/profiles').ProfileInfo;
   pinned: Array<
-    | { type: 'session'; id: string; title: string; runtime: SessionRuntimeSummary }
+    | ({ type: 'session' } & ProfileSessionSummary)
     | {
         type: 'folder';
         id: string;
         name: string;
-        sessions: Array<{
-          id: string;
-          title: string;
-          runtime: SessionRuntimeSummary;
-        }>;
+        sessions: ProfileSessionSummary[];
       }
   >;
-  regular: Array<{ id: string; title: string; runtime: SessionRuntimeSummary; profileId?: string | null }>;
-  archived: Array<{ id: string; title: string; runtime: SessionRuntimeSummary; profileId?: string | null }>;
+  regular: ProfileSessionSummary[];
+  archived: ProfileSessionSummary[];
+}
+
+export interface ProfileSessionSummary {
+  id: string;
+  title: string | null;
+  runtime: SessionRuntimeSummary;
+  updated_at?: string | null;
+  profile_id?: string | null;
 }
 
 export type ProfileSessionsPayload = {
@@ -394,6 +398,15 @@ export interface SessionArtifactsResponse {
 export interface ArtifactStreamPayload {
   count: number;
   signature: string;
+}
+
+export interface SlidevPreviewResponse {
+  previewUrl?: string;
+  diagnostics: string[];
+}
+
+export interface ArtifactDiagnosticsResponse {
+  repairScheduled: boolean;
 }
 
 // ── Plan / TASKS ───────────────────────────────────────────

@@ -37,8 +37,9 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
 
 const fn display_mode_from_execution_mode(mode: TerminalExecutionMode) -> TerminalMode {
     match mode {
-        TerminalExecutionMode::Default | TerminalExecutionMode::Ssh => TerminalMode::Network,
-        TerminalExecutionMode::Sandboxed => TerminalMode::Sandboxed,
+        TerminalExecutionMode::Default
+        | TerminalExecutionMode::Ssh
+        | TerminalExecutionMode::Sandboxed => TerminalMode::Sandboxed,
         TerminalExecutionMode::Unsafe => TerminalMode::Unsafe,
     }
 }

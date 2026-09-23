@@ -29,7 +29,17 @@ export function NotificationsSection() {
   };
 
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    void getMailbox()
+      .then((mailbox) => {
+        if (!cancelled) setItems(mailbox.items);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const ack = async (id: string) => {

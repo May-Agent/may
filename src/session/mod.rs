@@ -19,6 +19,7 @@ pub use context_snapshot::{
 };
 pub use history::{
     ChatHistory, ChatMessage, ChatMessageStats, HistoryReplayError, MessageRole, SessionMetadata,
+    ToolEventRecord,
 };
 pub use layout::{MayHomePaths, ProfileHomePaths, SessionPaths};
 pub use manager::{

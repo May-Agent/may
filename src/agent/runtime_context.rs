@@ -159,10 +159,9 @@ impl RuntimeSystemContext {
     }
 
     pub(crate) fn reconcile(&mut self, context: &mut aither_agent::Context) {
-        reconcile_text_block(
+        reconcile_memory_block(
             context,
-            tag::MEMORY,
-            Some(build_memory_context_content(&self.last_memory_content)),
+            build_memory_context_content(&self.last_memory_content),
         );
         reconcile_text_block(
             context,
@@ -224,6 +223,44 @@ fn reconcile_text_block(
     }
 }
 
+/// Reminder surfaced to the model when MEMORY.md changed mid-session.
+#[derive(serde::Serialize)]
+struct MemoryUpdate {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+/// Reconciles the MEMORY block without invalidating the KV-cache prefix.
+///
+/// Mid-session memory changes are staged into the context (applied on the
+/// next reassembly, when the cache is invalidated anyway) and surfaced to
+/// the model as an appended diff alert instead of a block rewrite.
+fn reconcile_memory_block(context: &mut aither_agent::Context, desired: String) {
+    if !context.has_system_block(tag::MEMORY) {
+        context.insert_system_text(tag::MEMORY, desired);
+        return;
+    }
+    if context.staged_system_update(tag::MEMORY) == Some(desired.as_str()) {
+        return;
+    }
+    let current = context
+        .system_blocks()
+        .get(tag::MEMORY)
+        .cloned()
+        .unwrap_or_default();
+    if context.stage_system_text(tag::MEMORY, desired.clone()) {
+        let diff = similar::TextDiff::from_lines(&current, &desired)
+            .unified_diff()
+            .context_radius(2)
+            .to_string();
+        context.insert_reminder(&MemoryUpdate {
+            content: format!(
+                "MEMORY.md changed since this conversation started. The memory block above is the previous version; apply this diff mentally (the context will fold it in later):\n{diff}"
+            ),
+        });
+    }
+}
+
 #[derive(Clone, Template)]
 #[template(path = "browser_context.txt", escape = "none")]
 struct BrowserTemplate {
@@ -249,6 +286,7 @@ struct TerminalRuntimeContextTemplate {
     model_id: String,
     home_environment_kind: String,
     operating_system: String,
+    shell_dialect: &'static str,
     home_directory: String,
     session_directory: String,
     current_working_directory: String,
@@ -384,9 +422,10 @@ pub(crate) fn build_terminal_runtime_context(
         model_id: config.model_id.clone(),
         home_environment_kind: home_environment_kind_label(&config.environment).to_string(),
         operating_system: operating_system_hint(&config.environment).to_string(),
+        shell_dialect: "POSIX sh",
         home_directory: session_paths.home_root().display().to_string(),
         session_directory: session_paths.root().display().to_string(),
-        current_working_directory: config.cwd.display().to_string(),
+        current_working_directory: session_paths.root().display().to_string(),
         home_layout: vec![
             "/sessions - per-session sandboxes under this home environment".to_string(),
             "/skills - profile/home-scoped skills, exposed read-only inside the session"
@@ -409,11 +448,11 @@ pub(crate) fn build_terminal_runtime_context(
         command_rules: vec![
             "The only native execution tool is `terminal`. `terminal_kill`, `terminal_input`, and `terminal_read` manage background terminal jobs. Higher-level capabilities are terminal CLI commands exposed through the IPC bridge rather than extra native tools; rely on runtime tool descriptions and command `--help` output instead of assuming a static command list.".to_string(),
             "Issue at most one tool call per assistant turn. If you need multiple operations or parallel work, compose them inside one terminal command with shell control flow, pipelines, or background jobs instead of emitting multiple tool calls in the same response.".to_string(),
+            "Read a selected skill completely before acting on it. The terminal call that reads the skill must finish before any task command that depends on those instructions.".to_string(),
             "IPC-backed commands are only valid when executed inside this profile's home environment. If you get a system-reminder because you tried to call a non-existent direct tool, immediately retry through `terminal` with the corresponding CLI command.".to_string(),
             "Commands run in the current session home environment by default unless you explicitly target another environment. Treat the home environment as the place where profile-scoped state, IPC commands, and durable session directories live.".to_string(),
             "Every terminal command call must set timeout. timeout=0 means immediate background execution. timeout>0 runs in foreground until timeout and then promotes to a background task if still running.".to_string(),
             "Inline command results are previews, not guaranteed byte-for-byte raw output. May may clean, fold, summarize, or structurally compress large outputs before putting them in context.".to_string(),
-            "When exact fidelity matters, call `terminal` with raw=true. If output overflows, the complete result is persisted under session outputs/ and only a preview plus file reference is returned inline.".to_string(),
             "Treat context as memory and the filesystem as disk. After compaction, restart, or long runs, recover prior tool results from outputs/, data/, files/, artifacts/, or tasks.md instead of assuming the inline preview was complete.".to_string(),
             "For large saved outputs, use normal shell tools such as `head`, `tail`, `sed`, `rg`, `jq`, or the `ask` command against files to recall only the relevant slice.".to_string(),
             "Background tasks persist output to files. Use terminal_read for incremental reads, terminal_input for stdin when the process needs user input, and terminal_kill to stop them.".to_string(),
@@ -743,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_system_context_refreshes_memory_from_db() {
+    fn runtime_system_context_stages_memory_updates_with_diff_alert() {
         let db = test_db();
         tokio_test::block_on(db.set_global_memory("before")).expect("write initial memory");
 
@@ -755,11 +794,35 @@ mod tests {
         tokio_test::block_on(runtime_context.sync_memory_content());
         runtime_context.reconcile(&mut context);
 
+        // Cache-friendly: the live block still holds the old content; the
+        // change is staged and surfaced as an appended diff alert.
+        let memory = context
+            .system_blocks()
+            .get(tag::MEMORY)
+            .expect("memory block should be present");
+        assert_eq!(memory, &build_memory_context_content("before"));
+        assert_eq!(
+            context.staged_system_update(tag::MEMORY),
+            Some(build_memory_context_content("after").as_str())
+        );
+        let reminders = context.reminders();
+        assert_eq!(reminders.len(), 1);
+        assert!(reminders[0].contains("MEMORY.md changed"));
+        assert!(reminders[0].contains("+after"));
+
+        // Repeated reconciles with the same staged content stay quiet.
+        runtime_context.reconcile(&mut context);
+        assert_eq!(context.reminders().len(), 1);
+
+        // Reassembly folds the staged update in and clears the alert.
+        let report = context.reassemble();
+        assert_eq!(report.staged_updates_applied, 1);
         let memory = context
             .system_blocks()
             .get(tag::MEMORY)
             .expect("memory block should be present");
         assert_eq!(memory, &build_memory_context_content("after"));
+        assert!(context.reminders().is_empty());
     }
 
     #[test]

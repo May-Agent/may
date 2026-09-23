@@ -16,7 +16,9 @@ use skyzen::responder::Sse;
 use skyzen::utils::{Json, State};
 
 use aither_agent::{BrowserBackend, StaticCdpBrowser};
-use aither_core::llm::{Message as LlmMessage, Role as LlmRole, ToolResult, Usage};
+use aither_core::llm::{
+    Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
+};
 use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{
     BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec, Content, OutputEntry,
@@ -68,6 +70,29 @@ fn stopped_terminal_tool_result() -> ToolResult {
         background_reason: None,
     })
     .expect("stopped terminal tool result must serialize")
+}
+
+fn persist_stopped_terminal_calls(
+    terminal_snapshot: &mut TerminalStateSnapshot,
+    turn_persister: &mut turn_persister::TurnPersister,
+) -> Result<(), crate::db::ChatDbError> {
+    let running_terminal_ids = terminal_snapshot
+        .running_by_call_id
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for call_id in running_terminal_ids {
+        let record = ToolEventRecord::End {
+            id: call_id.clone(),
+            name: "terminal".to_string(),
+            result: stopped_terminal_tool_result(),
+        };
+        let serialized = serde_json::to_string(&record)
+            .map_err(|error| crate::db::ChatDbError::Storage(error.to_string()))?;
+        turn_persister.push_tool_event(call_id, serialized);
+        update_terminal_snapshot_from_tool_event(terminal_snapshot, &record);
+    }
+    Ok(())
 }
 
 // ── ChatSink trait ──────────────────────────────────────────
@@ -735,7 +760,13 @@ async fn clear_running_state_if_needed(
     state
         .runtime_service
         .clear_running_if_needed(session_id)
-        .await
+        .await?;
+    // A chat turn persists its buffered messages before reaching this boundary.
+    // Refresh the profile snapshot only after the turn has settled so every UI
+    // client can invalidate its active-session history without racing the
+    // per-turn chat stream.
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+    Ok(())
 }
 
 async fn set_terminal_runtime_state(
@@ -829,6 +860,17 @@ pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String
         run_registration.close().await;
         let _ = clear_running_state_if_needed(&state, &session_id).await;
     });
+}
+
+async fn spawn_follow_up_runs_if_dispatchable(
+    state: &Arc<UiServerState>,
+    session_id: &str,
+) -> Result<(), crate::db::ChatDbError> {
+    let runtime = state.runtime_service.get(session_id).await?;
+    if runtime.can_dispatch_follow_up() {
+        spawn_follow_up_runs(state.clone(), session_id.to_string());
+    }
+    Ok(())
 }
 
 pub(super) async fn resume_pending_follow_up_runs(
@@ -1592,6 +1634,15 @@ async fn run_agent_loop(
             }
         }
 
+        // Browser takeover may have cancelled the stream before another agent
+        // event arrived, so classify the terminal state once more after the
+        // loop. This turns the immediate cancellation into a resumable
+        // takeover pause and preserves the post-takeover system alert.
+        if !browser_takeover_paused && is_takeover_active_for_session(state, &session_id).await {
+            browser_takeover_paused = true;
+            cancellation_reason = None;
+        }
+
         let log_base = RequestLogEntry::new(
             session_id.as_str(),
             &current_model,
@@ -1604,6 +1655,7 @@ async fn run_agent_loop(
             const TAKEOVER_PAUSED_MESSAGE: &str =
                 "Browser takeover is active for this session; model execution paused";
 
+            persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
             if !segment_text.trim().is_empty() {
                 turn_persister.push_assistant(segment_text.clone());
             }
@@ -1662,23 +1714,13 @@ async fn run_agent_loop(
 
         if let Some(reason) = cancellation_reason {
             if reason == "run cancelled by user" {
-                // Synthesize stopped-end records for all running tool calls
-                let running_terminal_ids = terminal_snapshot
-                    .running_by_call_id
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for call_id in running_terminal_ids {
-                    let record = ToolEventRecord::End {
-                        id: call_id.clone(),
-                        name: "terminal".to_string(),
-                        result: stopped_terminal_tool_result(),
-                    };
-                    let serialized = serde_json::to_string(&record)
-                        .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
-                    turn_persister.push_tool_event(call_id, serialized);
-                    update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
-                }
+                let killed = agent.kill_running_terminal_jobs().await;
+                tracing::info!(
+                    session_id = %session_id,
+                    killed,
+                    "stopped terminal jobs after user cancelled the run"
+                );
+                persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
             }
             if !segment_text.trim().is_empty() {
                 turn_persister.push_assistant(segment_text.clone());
@@ -1791,6 +1833,7 @@ async fn stream_chat_events(
             send_event(&sender, "paused", &done_event).await;
             run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
+            spawn_follow_up_runs_if_dispatchable(&state, &response_session_id).await?;
             Ok(())
         }
         // Errors are already sent to the sink via on_error in run_agent_loop.
@@ -1827,10 +1870,17 @@ async fn run_chat_collect_with_receiver(
         use_persisted_context_snapshot,
     )
     .await;
+    let takeover_paused = matches!(&result, Err(AgentLoopError::BrowserTakeoverPaused(_)));
     clear_running_state_if_needed(&state, &req.session_id)
         .await
         .map_err(internal_error)
         .map_err(ChatCollectError::from)?;
+    if takeover_paused {
+        spawn_follow_up_runs_if_dispatchable(&state, &req.session_id)
+            .await
+            .map_err(internal_error)
+            .map_err(ChatCollectError::from)?;
+    }
     match result {
         Ok(_) | Err(AgentLoopError::BrowserTakeoverPaused(_)) => Ok(()),
         Err(AgentLoopError::Preparation(error)) => Err(ChatCollectError::Preparation(error)),
@@ -1896,7 +1946,7 @@ fn map_context_debug_message(message: &LlmMessage) -> crate::db::ContextDebugSna
         attachments: message
             .attachments()
             .iter()
-            .map(url::Url::to_string)
+            .map(|attachment| attachment.url().to_string())
             .collect(),
         tool_call_id: message.tool_call_id().map(ToString::to_string),
         tool_call_names: message
@@ -1913,12 +1963,12 @@ async fn persist_context_debug_snapshot(
     model: &str,
     provider_id: &str,
     prompt: &str,
-    prompt_attachments: &[url::Url],
+    prompt_attachments: &[LlmAttachment],
     assembled_messages: &[LlmMessage],
 ) -> Result<(), crate::db::ChatDbError> {
     let prompt_attachments = prompt_attachments
         .iter()
-        .map(url::Url::to_string)
+        .map(|attachment| attachment.url().to_string())
         .collect::<Vec<_>>();
     let assembled_messages = assembled_messages
         .iter()
@@ -1991,7 +2041,7 @@ struct PreparedAgent {
     profile_id: Option<String>,
     hidden_context_xml: Option<String>,
     prompt: String,
-    attachments: Vec<url::Url>,
+    attachments: Vec<LlmAttachment>,
     provider_candidate_count: usize,
 }
 
@@ -2924,8 +2974,7 @@ mod tests {
         let mut pending = HashMap::new();
 
         // OutputItemAdded fires an initial empty delta — becomes Start(args="").
-        let e1 =
-            super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "terminal", "");
+        let e1 = super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "terminal", "");
         assert_eq!(
             e1,
             Some(super::SinkToolEvent::Start {

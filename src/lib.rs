@@ -19,7 +19,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model_selector;
 pub mod models;
-pub mod network_policy;
+pub use aither_sandbox::network_policy;
 pub mod notification;
 pub mod profile;
 pub mod prompt_mentions;

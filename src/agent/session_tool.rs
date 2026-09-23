@@ -239,6 +239,10 @@ enum SessionToolError {
     MissingActionSessionId { action: &'static str },
     #[error("session '{session_id}' was not found")]
     SessionNotFound { session_id: String },
+    #[error(
+        "every matching message is already present in the current context window; refine the query to recall older or other-session content"
+    )]
+    AllResultsAlreadyInContext,
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +352,7 @@ impl Tool for SessionTool {
             self.index_meta_path(),
             self.semantic_index_path(),
             self.embedder.clone(),
+            self.current_session_id.clone(),
             plan,
         )
         .await
@@ -396,6 +401,7 @@ async fn execute_plan(
     index_meta_path: PathBuf,
     semantic_index_path: PathBuf,
     embedder: EmbeddingModelResolution,
+    current_session_id: String,
     plan: SessionExecutionPlan,
 ) -> Result<ToolResult, SessionToolError> {
     match plan {
@@ -406,6 +412,7 @@ async fn execute_plan(
                 index_meta_path,
                 semantic_index_path,
                 embedder,
+                current_session_id,
                 args,
             )
             .await
@@ -422,6 +429,7 @@ async fn execute_search(
     index_meta_path: PathBuf,
     semantic_index_path: PathBuf,
     embedder: EmbeddingModelResolution,
+    current_session_id: String,
     args: SessionArgs,
 ) -> Result<ToolResult, SessionToolError> {
     let query_enabled = args.query.trim() != "*" && !args.query.trim().is_empty();
@@ -445,7 +453,14 @@ async fn execute_search(
         let embedder = embedder.require_ready(
             "session semantic search requires a global models.embedding_model and at least one enabled provider that supports it",
         )?;
-        return run_semantic_query(semantic_index_path, embedder, args).await;
+        return run_semantic_query(
+            semantic_index_path,
+            embedder,
+            &db,
+            &current_session_id,
+            args,
+        )
+        .await;
     }
 
     let mut candidates = match args.search_mode {
@@ -570,7 +585,50 @@ async fn execute_search(
     });
 
     let total_matches = rows.len();
+    let rows = drop_rows_already_in_context(&db, &current_session_id, rows).await?;
+    if total_matches > 0 && rows.is_empty() {
+        return Err(SessionToolError::AllResultsAlreadyInContext);
+    }
     finalize_rows_with_total(rows, total_matches, &args)
+}
+
+/// Removes current-session hits whose content already appears in the exact
+/// persisted context window from the latest checkpoint.
+async fn drop_rows_already_in_context(
+    db: &ChatDb,
+    current_session_id: &str,
+    rows: Vec<SessionMatchRow>,
+) -> Result<Vec<SessionMatchRow>, SessionToolError> {
+    if !rows.iter().any(|row| row.session_id == current_session_id) {
+        return Ok(rows);
+    }
+    let Some(snapshot) = db.get_session_context_snapshot(current_session_id).await? else {
+        return Ok(rows);
+    };
+    Ok(filter_rows_against_messages(
+        current_session_id,
+        &snapshot.checkpoint.context_window.messages,
+        rows,
+    ))
+}
+
+fn filter_rows_against_messages(
+    current_session_id: &str,
+    window: &[aither_core::llm::Message],
+    rows: Vec<SessionMatchRow>,
+) -> Vec<SessionMatchRow> {
+    rows.into_iter()
+        .filter(|row| {
+            if row.session_id != current_session_id {
+                return true;
+            }
+            let content = row.content.trim();
+            content.is_empty()
+                || !window
+                    .iter()
+                    .any(|message| message.content().contains(content))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1602,6 +1660,8 @@ fn row_matches_session_filters(row: &SessionMatchRow, args: &SessionArgs) -> boo
 async fn run_semantic_query(
     semantic_index_path: PathBuf,
     embedder: MayEmbeddingModel,
+    db: &ChatDb,
+    current_session_id: &str,
     args: SessionArgs,
 ) -> Result<ToolResult, SessionToolError> {
     if args.query.trim() == "*" {
@@ -1660,6 +1720,10 @@ async fn run_semantic_query(
         .collect::<Vec<_>>();
 
     let total_matches = rows.len();
+    let rows = drop_rows_already_in_context(db, current_session_id, rows).await?;
+    if total_matches > 0 && rows.is_empty() {
+        return Err(SessionToolError::AllResultsAlreadyInContext);
+    }
     finalize_rows_with_total(rows, total_matches, &args)
 }
 
@@ -2103,5 +2167,41 @@ mod tests {
 
         assert!(filter.contains("title LIKE '%owner''s update%'"));
         assert!(!filter.contains("owner's update%' OR"));
+    }
+
+    fn match_row(session_id: &str, message_id: i64, content: &str) -> SessionMatchRow {
+        SessionMatchRow {
+            session_id: session_id.to_string(),
+            profile_id: "profile".to_string(),
+            title: "title".to_string(),
+            model: "model".to_string(),
+            archived: false,
+            role: "user".to_string(),
+            content: content.to_string(),
+            preview: String::new(),
+            timestamp: String::new(),
+            updated_at: String::new(),
+            message_id,
+            message_count: 1,
+            score: 1.0,
+            matched_by: vec![SessionSearchMode::Text],
+        }
+    }
+
+    #[test]
+    fn current_context_filter_removes_only_visible_current_session_hits() {
+        let window = vec![aither_core::llm::Message::user(
+            "Already visible current-session content",
+        )];
+        let rows = vec![
+            match_row("current", 1, "Already visible current-session content"),
+            match_row("current", 2, "Older content not in the window"),
+            match_row("other", 3, "Already visible current-session content"),
+        ];
+
+        let filtered = filter_rows_against_messages("current", &window, rows);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].message_id, 2);
+        assert_eq!(filtered[1].session_id, "other");
     }
 }

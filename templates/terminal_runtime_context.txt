@@ -1,6 +1,7 @@
 Model: {{ model_id }}
 Home environment kind: {{ home_environment_kind }}
 Operating system hint: {{ operating_system }}
+Terminal shell dialect: {{ shell_dialect }}
 Home environment directory: {{ home_directory }}
 Session directory: {{ session_directory }}
 Current working directory: {{ current_working_directory }}

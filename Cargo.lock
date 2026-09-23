@@ -130,7 +130,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
- "similar",
+ "similar 2.7.0",
  "tracing",
  "url",
  "uuid",
@@ -353,6 +353,7 @@ dependencies = [
  "bollard",
  "executor-core",
  "futures-lite 2.6.1",
+ "globset",
  "heel",
  "human-hash",
  "image",
@@ -3778,9 +3779,9 @@ dependencies = [
 
 [[package]]
 name = "ethnum"
-version = "1.5.2"
+version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca81e6b4777c89fd810c25a4be2b1bd93ea034fbe58e6a75216a34c6b82c539b"
+checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 
 [[package]]
 name = "euclid"
@@ -4885,6 +4886,7 @@ dependencies = [
  "executor-core",
  "futures-lite 2.6.1",
  "http-body-util",
+ "humantime",
  "hyper 1.8.1",
  "landlock",
  "libc",
@@ -4902,6 +4904,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.8.23",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "which 7.0.3",
  "windows",
@@ -7093,6 +7096,7 @@ dependencies = [
  "jiff",
  "lance-index",
  "lancedb",
+ "mime",
  "mime_guess",
  "notify",
  "nucleo",
@@ -7116,6 +7120,7 @@ dependencies = [
  "serial_test",
  "shell-escape",
  "shell-words",
+ "similar 3.1.1",
  "skyzen",
  "skyzen-services",
  "sqlparser",
@@ -9311,7 +9316,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.5",
 ]
@@ -10180,6 +10185,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
+name = "similar"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6505efef05804732ed8a3f2d4f279429eb485bd69d5b0cc6b19cc02005cda16"
+dependencies = [
+ "bstr",
+]
+
+[[package]]
 name = "siphasher"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10202,7 +10216,7 @@ dependencies = [
 
 [[package]]
 name = "skyzen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel 2.5.0",
  "async-fs",
@@ -10248,23 +10262,25 @@ dependencies = [
  "utoipa-redoc",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
 [[package]]
 name = "skyzen-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "executor-core",
  "eyre",
  "http-kit",
+ "serde",
+ "serde_json",
  "utoipa",
 ]
 
 [[package]]
 name = "skyzen-hyper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "executor-core",
  "futures-util",
@@ -10277,7 +10293,7 @@ dependencies = [
 
 [[package]]
 name = "skyzen-macros"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12238,6 +12254,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "web-push"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13274,7 +13303,7 @@ dependencies = [
 
 [[package]]
 name = "zenwave"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -13313,7 +13342,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.5",
 ]
