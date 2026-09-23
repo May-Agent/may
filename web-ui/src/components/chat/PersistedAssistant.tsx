@@ -45,7 +45,13 @@ function extractTools(toolEvent: unknown): TurnToolState[] {
   return Array.from(map.values()).sort((a, b) => a.seq - b.seq);
 }
 
-export function PersistedAssistant({ message }: { message: ApiMessage }) {
+export function PersistedAssistant({
+  message,
+  sessionId,
+}: {
+  message: ApiMessage;
+  sessionId: string;
+}) {
   const tools = extractTools(message.toolEvent);
   const reasoning = typeof message.thinking === 'string' ? message.thinking : '';
   return (
@@ -54,7 +60,7 @@ export function PersistedAssistant({ message }: { message: ApiMessage }) {
       {tools.map((tool) => (
         <ToolCard key={tool.id} tool={tool} />
       ))}
-      {message.content.length > 0 && <MessageText text={message.content} />}
+      {message.content.length > 0 && <MessageText text={message.content} sessionId={sessionId} />}
     </div>
   );
 }

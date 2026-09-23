@@ -138,9 +138,64 @@ pub(super) async fn consume_notification_callback(
         })?;
     state.notify_ui_events(UiEventTopics::NOTIFICATION_MAILBOX);
 
+    let mut target_session_id = callback.session_id.clone();
+    if callback.callback_consumed && callback.has_callback {
+        let source_session_id = callback.session_id.as_deref().ok_or_else(|| {
+            bad_request_error("notification callback is missing its source session")
+        })?;
+        let source = state
+            .db()
+            .get_session(source_session_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| bad_request_error("notification callback source session not found"))?;
+        let profile_id = callback
+            .profile_id
+            .as_deref()
+            .or(source.profile_id.as_deref())
+            .ok_or_else(|| bad_request_error("notification callback source profile not found"))?;
+        let model = source
+            .model
+            .as_deref()
+            .ok_or_else(|| bad_request_error("notification callback source model not found"))?;
+        let new_session_id =
+            super::sessions::create_session_for_profile(&state, Some(profile_id), model).await?;
+        let now = jiff::Timestamp::now().to_string();
+        if let Some(context) = callback.callback_context_xml.as_deref() {
+            state
+                .db()
+                .append_message(
+                    &new_session_id,
+                    crate::session::MessageRole::System,
+                    context,
+                    Some(now.as_str()),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(internal_error)?;
+        }
+        if let Some(welcome) = callback.callback_message.as_deref() {
+            state
+                .db()
+                .append_message(
+                    &new_session_id,
+                    crate::session::MessageRole::Assistant,
+                    welcome,
+                    Some(now.as_str()),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(internal_error)?;
+        }
+        target_session_id = Some(new_session_id);
+        state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
+    }
+
     Ok(Json(super::types::NotificationCallbackResponse {
         notification_id: callback.id,
-        session_id: callback.session_id,
+        session_id: target_session_id,
         profile_id: callback.profile_id,
         has_callback: callback.has_callback,
         callback_consumed: callback.callback_consumed,

@@ -35,7 +35,17 @@ export function SkillsSection() {
   };
 
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    void listSkills()
+      .then((skills) => {
+        if (!cancelled) setItems(skills);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const onSubmit = form.handleSubmit(async ({ repo }) => {

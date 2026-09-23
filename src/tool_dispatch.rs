@@ -27,7 +27,7 @@ pub enum ToolDispatchError {
     #[error("failed to load task runtime: {0}")]
     LoadTaskRuntime(crate::db::ChatDbError),
     #[error("failed to configure task runtime: {0}")]
-    ConfigureTaskRuntime(String),
+    ConfigureTaskRuntime(aither_sandbox::NetworkPolicyError),
 }
 
 #[derive(Debug, Clone)]
@@ -309,13 +309,10 @@ async fn handle_browser_request(
                         resolve_browser_session_paths(browser_service, session_id.as_str())
                             .await
                             .map_err(BrowserToolError::request_failed)?;
-                    let page = persist_browser_page_capture(
-                        session_id.as_str(),
-                        &session_paths,
-                        *payload,
-                    )
-                    .await
-                    .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+                    let page =
+                        persist_browser_page_capture(session_id.as_str(), &session_paths, *payload)
+                            .await
+                            .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
                     Ok(BrowserResult {
                         running: true,
                         cdp_endpoint: status.cdp_endpoint,

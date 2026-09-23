@@ -153,14 +153,13 @@ export function BrowserLiveView() {
   useEffect(() => {
     if (!open || !isRunning || !sessionId) return;
     let cancelled = false;
+    const video = videoRef.current;
     (async () => {
       try {
         const handle = await connectBrowserStream({
           sessionId,
           onTrack: (stream) => {
-            if (videoRef.current) {
-              videoRef.current.srcObject = stream;
-            }
+            if (video) video.srcObject = stream;
           },
           onConnectionStateChange: (state) => {
             setConnectionState(state);
@@ -183,7 +182,7 @@ export function BrowserLiveView() {
       cancelled = true;
       handleRef.current?.close();
       handleRef.current = null;
-      if (videoRef.current) videoRef.current.srcObject = null;
+      if (video) video.srcObject = null;
       setConnectionState('new');
     };
   }, [open, isRunning, sessionId, t]);

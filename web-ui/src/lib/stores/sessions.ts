@@ -30,6 +30,7 @@ interface SessionsState {
 
   load: () => Promise<void>;
   open: (id: string) => Promise<void>;
+  refreshActive: (id: string) => Promise<void>;
   createNew: (profileId?: string | null) => Promise<ApiSession>;
   rename: (id: string, title: string) => Promise<void>;
   setModel: (id: string, model: string) => Promise<void>;
@@ -41,6 +42,8 @@ interface SessionsState {
   replaceMessage: (msg: ApiMessage) => void;
   updateRuntime: (id: string, runtime: Partial<SessionRuntimeSummary>) => void;
 }
+
+let activeRequestGeneration = 0;
 
 export const useSessionsStore = create<SessionsState>((set, get) => ({
   index: {},
@@ -67,20 +70,42 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   },
 
   async open(id: string) {
+    const generation = ++activeRequestGeneration;
     set({ loading: true, error: null });
     try {
       const session = await getSession(id);
+      if (generation !== activeRequestGeneration) return;
       set({
         active: session,
         activeMessages: session.messages ?? [],
         loading: false,
       });
     } catch (err) {
+      if (generation !== activeRequestGeneration) return;
       set({ loading: false, error: err instanceof Error ? err.message : String(err) });
     }
   },
 
+  async refreshActive(id: string) {
+    const generation = ++activeRequestGeneration;
+    try {
+      const session = await getSession(id);
+      if (generation !== activeRequestGeneration) return;
+      set((prev) => {
+        if (prev.active?.id !== id) return prev;
+        return {
+          active: session,
+          activeMessages: session.messages ?? [],
+        };
+      });
+    } catch (err) {
+      if (generation !== activeRequestGeneration) return;
+      set({ error: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
   async createNew(profileId) {
+    activeRequestGeneration += 1;
     const created = await createSession({ profileId: profileId ?? null });
     set((prev) => ({
       index: {
@@ -132,6 +157,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
 
   async remove(id) {
     await deleteSession(id);
+    activeRequestGeneration += 1;
     set((prev) => {
       const { [id]: _, ...rest } = prev.index;
       return {

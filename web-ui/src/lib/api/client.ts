@@ -14,13 +14,18 @@ export class ApiError extends Error {
 interface ApiErrorBody {
   code?: ApiErrorCode;
   message?: string;
+  error?: string;
 }
 
 async function decodeError(response: Response): Promise<ApiError> {
   const status = response.status;
   try {
     const body = (await response.json()) as ApiErrorBody;
-    return new ApiError(body.code ?? 'internal_error', body.message ?? response.statusText, status);
+    return new ApiError(
+      body.code ?? 'internal_error',
+      body.message ?? body.error ?? response.statusText,
+      status,
+    );
   } catch {
     return new ApiError('internal_error', response.statusText, status);
   }

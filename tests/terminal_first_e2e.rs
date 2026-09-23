@@ -1,3 +1,5 @@
+//! End-to-end tests for May's terminal-first execution and REST/SSE contracts.
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -129,6 +131,7 @@ impl MockScenarioState {
                                 "call-terminal",
                                 "terminal",
                                 &serde_json::json!({
+                                    "description": "Ask the terminal for the user's name",
                                     "script": "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
                                     "mode": "sandboxed",
                                     "timeout": 0,
@@ -224,7 +227,6 @@ impl MockScenarioState {
 
 enum MockHttpResponse {
     Sse(Vec<MockSseFrame>),
-    Json(StatusCode, Value),
 }
 
 impl MockHttpResponse {
@@ -337,7 +339,6 @@ async fn handle_mock_openai_request(
 
     Ok(match response {
         MockHttpResponse::Sse(frames) => sse_response(frames),
-        MockHttpResponse::Json(status, value) => json_response(status, value),
     })
 }
 
@@ -397,18 +398,34 @@ impl TestHarness {
             .await
             .expect("test config should be written");
 
+        seed_container_heel_cache(&may_dir).await;
+        warm_may_binary().await;
+
         Self { home, may_dir }
     }
 
+    /// Session in the local profile. Terminal-first contract tests use this so
+    /// they exercise Leash, the session filesystem, and IPC independently of
+    /// an optional host container runtime.
     async fn create_session(&self) -> TestSession {
-        let (store, db, default_profile_id) = initialize_session_persistence(&self.may_dir)
+        self.create_session_in_profile("local").await
+    }
+
+    async fn create_session_in_profile(&self, profile_slug: &str) -> TestSession {
+        let (store, db, _default_profile_id) = initialize_session_persistence(&self.may_dir)
             .await
             .expect("session persistence should initialize");
+        let profile_id = db
+            .get_profile_by_slug(profile_slug)
+            .await
+            .expect("profile lookup should succeed")
+            .unwrap_or_else(|| panic!("default profile `{profile_slug}` should exist"))
+            .id;
         let session_id = SessionId::new().to_string();
         store
             .create_session_dirs(
                 &session_id,
-                Some(default_profile_id.as_str()),
+                Some(profile_id.as_str()),
                 SandboxResourceLayout::Symlinked,
             )
             .await
@@ -417,14 +434,13 @@ impl TestHarness {
             &session_id,
             None,
             Some(TEST_SELECTOR),
-            Some(default_profile_id.as_str()),
+            Some(profile_id.as_str()),
         )
         .await
         .expect("session row should be created");
-        let sandbox_dir = store.sandbox_dir(&session_id, Some(default_profile_id.as_str()));
+        let sandbox_dir = store.sandbox_dir(&session_id, Some(profile_id.as_str()));
         TestSession {
             id: session_id,
-            profile_id: default_profile_id,
             sandbox_dir,
         }
     }
@@ -436,7 +452,6 @@ impl TestHarness {
 
 struct TestSession {
     id: String,
-    profile_id: String,
     sandbox_dir: PathBuf,
 }
 
@@ -464,6 +479,12 @@ impl RunningUiServer {
             .arg(port.to_string())
             .current_dir(home)
             .env("HOME", home)
+            // Module-level directives outrank May's baked crate-level filter,
+            // keeping failed assertions diagnosable from captured logs.
+            .env(
+                "RUST_LOG",
+                "aither_openai::client=debug,may_agent::ui_server::chat=debug",
+            )
             .stdin(Stdio::null())
             .stdout(StdStdio::from(log_file))
             .stderr(StdStdio::from(log_file_err));
@@ -475,11 +496,40 @@ impl RunningUiServer {
         }
         let child = command.spawn().expect("may rest should spawn");
         let base_url = format!("http://127.0.0.1:{port}");
-        wait_for_http_ok(&format!("{base_url}/api/health"), Duration::from_secs(15)).await;
-        Self {
+        let mut server = Self {
             child,
             base_url,
             log_path,
+        };
+        server.wait_until_healthy(Duration::from_secs(15)).await;
+        server
+    }
+
+    async fn wait_until_healthy(&mut self, timeout_duration: Duration) {
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/health", self.base_url);
+        let deadline = Instant::now() + timeout_duration;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "ui server exited with {status} before becoming healthy; server logs:\n{}",
+                    self.logs().await
+                );
+            }
+            let healthy = match client.get(&url).send().await {
+                Ok(response) => response.status().is_success(),
+                Err(_) => false,
+            };
+            if healthy {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ui server did not become healthy within {:?}; server logs:\n{}",
+                timeout_duration,
+                self.logs().await
+            );
+            sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -498,6 +548,22 @@ impl RunningUiServer {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
+}
+
+/// The first load of a freshly rebuilt (large, ad-hoc-signed) debug binary
+/// can stall many seconds inside dyld/AMFI code-signature validation. Pay
+/// that cost here so server spawns stay within their health-check timeout.
+async fn warm_may_binary() {
+    let output = Command::new(may_binary_path())
+        .arg("--help")
+        .output()
+        .await
+        .expect("may --help should run");
+    assert!(
+        output.status.success(),
+        "may --help should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn may_binary_path() -> PathBuf {
@@ -520,6 +586,34 @@ fn may_binary_path() -> PathBuf {
     candidate
 }
 
+/// Copy the developer machine's managed container heel cache (Linux binary +
+/// release state) into the test home, so container bootstrap inside tests
+/// does not depend on the GitHub release API.
+async fn seed_container_heel_cache(may_dir: &Path) {
+    let Ok(real_home) = std::env::var("HOME") else {
+        return;
+    };
+    let source = PathBuf::from(real_home).join(".may/container/heel");
+    if !source.join("bin/heel").exists() {
+        return;
+    }
+    let dest = may_dir.join("container/heel");
+    tokio::fs::create_dir_all(dest.join("bin"))
+        .await
+        .expect("container heel cache dir should be created");
+    tokio::fs::copy(source.join("bin/heel"), dest.join("bin/heel"))
+        .await
+        .expect("container heel binary should copy");
+    if source.join("release-state.json").exists() {
+        tokio::fs::copy(
+            source.join("release-state.json"),
+            dest.join("release-state.json"),
+        )
+        .await
+        .expect("container heel release state should copy");
+    }
+}
+
 fn optional_heel_bin() -> Option<String> {
     if let Ok(path) = std::env::var("HEEL_BIN") {
         let candidate = PathBuf::from(path);
@@ -528,14 +622,17 @@ fn optional_heel_bin() -> Option<String> {
         }
     }
 
-    let known_paths = [
-        "/tmp/heel-release/heel-aarch64-apple-darwin",
-        "/Users/lexoliu/.may/container/heel/bin/heel",
+    // Host-runnable heel binaries only: the sibling native-sandbox build and
+    // the CI release drop. The container heel under ~/.may is a Linux ELF and
+    // must never be offered for host-side sandboxing.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        manifest_dir.join("../native-sandbox/target/debug/heel"),
+        PathBuf::from("/tmp/heel-release/heel-aarch64-apple-darwin"),
     ];
-    known_paths.iter().find_map(|path| {
-        let candidate = PathBuf::from(path);
-        candidate.exists().then(|| candidate.display().to_string())
-    })
+    candidates
+        .into_iter()
+        .find_map(|candidate| candidate.exists().then(|| candidate.display().to_string()))
 }
 
 fn required_heel_bin() -> String {
@@ -596,6 +693,23 @@ struct TestSseEvent {
     data: String,
 }
 
+/// Drain a chat SSE response into `(event kind, parsed data)` pairs until the
+/// turn finishes (`done`/`paused`/`error`) or the server closes the stream.
+async fn collect_sse_events(response: reqwest::Response) -> Vec<(String, Value)> {
+    let mut reader = SseReader::new(response);
+    let mut events = Vec::new();
+    while let Some(event) = reader.next_event().await {
+        let data: Value = serde_json::from_str(&event.data).unwrap_or(Value::Null);
+        let kind = event.event;
+        let finished = matches!(kind.as_str(), "done" | "paused" | "error");
+        events.push((kind, data));
+        if finished {
+            break;
+        }
+    }
+    events
+}
+
 fn split_sse_block(buffer: &str) -> Option<(TestSseEvent, String)> {
     let delimiter = if let Some(position) = buffer.find("\n\n") {
         (position, 2)
@@ -613,10 +727,11 @@ fn parse_sse_block(block: &str) -> TestSseEvent {
     let mut event = String::new();
     let mut data_lines = Vec::new();
     for line in block.lines() {
-        if let Some(value) = line.strip_prefix("event: ") {
-            event = value.to_string();
-        } else if let Some(value) = line.strip_prefix("data: ") {
-            data_lines.push(value.to_string());
+        // Per the SSE spec, a single space after the field colon is optional.
+        if let Some(value) = line.strip_prefix("event:") {
+            event = value.strip_prefix(' ').unwrap_or(value).to_string();
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data_lines.push(value.strip_prefix(' ').unwrap_or(value).to_string());
         }
     }
     TestSseEvent {
@@ -633,38 +748,17 @@ fn reserve_tcp_port() -> u16 {
         .port()
 }
 
-async fn wait_for_http_ok(url: &str, timeout_duration: Duration) {
-    let client = reqwest::Client::new();
-    wait_for_condition(timeout_duration, || {
-        let client = client.clone();
-        let url = url.to_string();
-        async move {
-            match client.get(url).send().await {
-                Ok(response) => response.status().is_success(),
-                Err(_) => false,
-            }
-        }
-    })
-    .await;
-}
-
-async fn wait_for_condition<F, Fut>(timeout_duration: Duration, mut predicate: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = Instant::now() + timeout_duration;
-    loop {
-        if predicate().await {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "condition was not satisfied within {:?}",
-            timeout_duration
-        );
-        sleep(Duration::from_millis(50)).await;
-    }
+fn runtime_is_idle(runtime: &Value) -> bool {
+    let state_idle = match runtime.get("state") {
+        None => true,
+        Some(state) => state.as_str() == Some("idle"),
+    };
+    let terminal_clear = runtime
+        .get("interactions")
+        .and_then(|interactions| interactions.get("terminal"))
+        .and_then(|terminal| terminal.get("taskId"))
+        .is_none_or(Value::is_null);
+    state_idle && terminal_clear
 }
 
 async fn wait_for_runtime_state_clear(
@@ -677,7 +771,7 @@ async fn wait_for_runtime_state_clear(
     let deadline = Instant::now() + timeout_duration;
     loop {
         let last_runtime = get_runtime(client, base_url, session_id).await;
-        if last_runtime.get("state").is_none() {
+        if runtime_is_idle(&last_runtime) {
             return;
         }
         assert!(
@@ -740,9 +834,13 @@ fn terminal_task_id_from_latest_tool_output(request: &Value) -> Option<String> {
 }
 
 async fn create_session_via_api(client: &reqwest::Client, base_url: &str) -> String {
+    // Chat round-trip tests run in the local profile: the container-backed
+    // default profile would spend the assertions' timeout budget on
+    // first-run container provisioning.
+    let profile_id = local_profile_id_via_api(client, base_url).await;
     let response = client
         .post(format!("{base_url}/api/sessions"))
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({ "profileId": profile_id }))
         .send()
         .await
         .expect("create session request should succeed");
@@ -755,6 +853,27 @@ async fn create_session_via_api(client: &reqwest::Client, base_url: &str) -> Str
         .get("id")
         .and_then(Value::as_str)
         .expect("create session response should include id")
+        .to_string()
+}
+
+async fn local_profile_id_via_api(client: &reqwest::Client, base_url: &str) -> String {
+    let response = client
+        .get(format!("{base_url}/api/profiles"))
+        .send()
+        .await
+        .expect("list profiles request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let profiles: Value = response
+        .json()
+        .await
+        .expect("profiles response should be valid JSON");
+    profiles
+        .as_array()
+        .expect("profiles response should be an array")
+        .iter()
+        .find(|profile| profile.get("slug").and_then(Value::as_str) == Some("local"))
+        .and_then(|profile| profile.get("id").and_then(Value::as_str))
+        .expect("default local profile should exist")
         .to_string()
 }
 
@@ -826,9 +945,12 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         "pwd command failed: {}",
         String::from_utf8_lossy(&pwd_output.stderr)
     );
+    let expected_workdir = tokio::fs::canonicalize(&session.sandbox_dir)
+        .await
+        .expect("session sandbox directory should canonicalize");
     assert_eq!(
         String::from_utf8_lossy(&pwd_output.stdout).trim(),
-        "/workspace"
+        expected_workdir.display().to_string()
     );
 
     let layout_output = Command::new(&binary)
@@ -877,7 +999,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
         .arg("--mode")
         .arg("sandboxed")
         .arg("--")
-        .arg("perl -e 'print \"x\" x 6000'")
+        .arg("perl -e 'print \"x\" x 60000'")
         .env("HOME", harness.home_path())
         .env("HEEL_BIN", &heel_bin)
         .output()
@@ -905,7 +1027,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
     let stored_contents = tokio::fs::read_to_string(&stored_path)
         .await
         .expect("stored output file should be readable");
-    assert_eq!(stored_contents.len(), 6000);
+    assert_eq!(stored_contents.len(), 60000);
     assert!(stored_contents.chars().all(|ch| ch == 'x'));
 }
 
@@ -991,9 +1113,10 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
     assert_eq!(
         fetched
             .get("runtime")
-            .and_then(Value::as_object)
-            .is_none_or(|runtime| runtime.is_empty()),
-        true
+            .and_then(|runtime| runtime.get("state"))
+            .and_then(Value::as_str),
+        Some("idle"),
+        "session without an active run should expose an idle runtime: {fetched}"
     );
 
     let delete_response = client
@@ -1036,20 +1159,16 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         let session_id = session_id.clone();
         async move {
             let response = client
-                .post(format!("{base_url}/api/chat"))
+                .post(format!("{base_url}/api/chat/stream"))
                 .json(&serde_json::json!({
                     "sessionId": session_id,
                     "content": "Say several chunks slowly."
                 }))
                 .send()
                 .await
-                .expect("chat request should succeed");
-            let status = response.status();
-            let payload: Value = response
-                .json()
-                .await
-                .expect("chat cancellation response should be valid JSON");
-            (status, payload)
+                .expect("chat stream request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+            collect_sse_events(response).await
         }
     });
 
@@ -1077,12 +1196,16 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         .expect("stop session request should succeed");
     assert_eq!(stop_response.status(), StatusCode::OK);
 
-    let (chat_status, chat_payload) = chat_task.await.expect("chat task should join");
-    assert_eq!(
-        chat_status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "cancelled synchronous chat should surface cancellation, got payload: {chat_payload}"
-    );
+    let events = tokio::time::timeout(Duration::from_secs(15), chat_task)
+        .await
+        .expect("cancelled chat stream should terminate promptly")
+        .expect("chat task should join");
+    if !events.iter().any(|(kind, _)| kind == "text") {
+        panic!(
+            "stream should deliver partial text before cancellation; events: {events:?}; server logs:\n{}",
+            server.logs().await
+        );
+    }
 
     wait_for_runtime_state_clear(
         &client,
@@ -1130,20 +1253,16 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
         let session_id = session_id.clone();
         async move {
             let response = client
-                .post(format!("{base_url}/api/chat"))
+                .post(format!("{base_url}/api/chat/stream"))
                 .json(&serde_json::json!({
                     "sessionId": session_id,
                     "content": "Please ask the terminal for my name and answer with the result."
                 }))
                 .send()
                 .await
-                .expect("chat request should succeed");
-            let status = response.status();
-            let payload: Value = response
-                .json()
-                .await
-                .expect("chat response should be valid JSON");
-            (status, payload)
+                .expect("chat stream request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+            collect_sse_events(response).await
         }
     });
 
@@ -1183,34 +1302,35 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
         "background output file should point into outputs dir: {output_file}"
     );
 
-    let (status, chat_payload) = chat_task.await.expect("chat task should join");
+    let events = tokio::time::timeout(Duration::from_secs(60), chat_task)
+        .await
+        .expect("chat stream should finish before timeout")
+        .expect("chat task should join");
     let server_logs = server.logs().await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "terminal round-trip chat failed with payload: {chat_payload}; server logs:\n{server_logs}"
-    );
-    assert_eq!(
-        chat_payload
-            .get("assistant")
-            .and_then(|assistant| assistant.get("content"))
-            .and_then(Value::as_str),
-        Some("terminal flow complete")
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "terminal round-trip chat should complete with a done event; events: {events:?}; server logs:\n{server_logs}"
     );
 
-    let executions = chat_payload
-        .get("assistant")
-        .and_then(|assistant| assistant.get("terminalExecutions"))
-        .and_then(Value::as_array)
-        .expect("chat response should include terminal executions");
+    let assistant_text: String = events
+        .iter()
+        .filter(|(kind, _)| kind == "text")
+        .filter_map(|(_, data)| data.get("chunk").and_then(Value::as_str))
+        .collect();
     assert!(
-        executions.iter().any(|execution| {
-            execution
-                .get("input")
-                .and_then(Value::as_str)
-                .is_some_and(|input| input.contains("read name"))
+        assistant_text.contains("terminal flow complete"),
+        "assistant text should include the final answer: {assistant_text:?}"
+    );
+
+    assert!(
+        events.iter().any(|(kind, data)| {
+            kind == "tool_start"
+                && data
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .is_some_and(|arguments| arguments.contains("read name"))
         }),
-        "chat response should record the terminal execution"
+        "chat stream should record the terminal execution; events: {events:?}"
     );
 
     wait_for_runtime_condition(
@@ -1220,13 +1340,7 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
         &server,
         Duration::from_secs(10),
         "terminal runtime to clear after background completion",
-        |runtime| {
-            runtime.get("state").is_none()
-                && runtime
-                    .get("interactions")
-                    .and_then(|interactions| interactions.get("terminal"))
-                    .is_none()
-        },
+        runtime_is_idle,
     )
     .await;
 

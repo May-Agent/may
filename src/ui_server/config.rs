@@ -285,12 +285,13 @@ async fn run_save_full_config(
         config.browser.every_nth_frame = req.browser.every_nth_frame;
         config.browser.stealth_enabled = req.browser.stealth_enabled;
         config.browser.system_profile =
-            req.browser.system_profile.as_ref().map(|sp| {
-                crate::config::SystemProfileConfig {
+            req.browser
+                .system_profile
+                .as_ref()
+                .map(|sp| crate::config::SystemProfileConfig {
                     path: std::path::PathBuf::from(&sp.path),
                     copy_on_first_use: sp.copy_on_first_use,
-                }
-            });
+                });
         config.remote_access.enabled = req.remote_access.enabled;
         config.remote_access.cloudflared_binary = req.remote_access.cloudflared_binary.clone();
         config.remote_access.tunnel_token = req

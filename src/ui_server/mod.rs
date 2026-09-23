@@ -96,12 +96,6 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         .parse()
         .with_context(|| format!("Invalid host/port: {host}:{port}"))?;
 
-    // SAFETY: Called before any other threads are spawned. The skyzen framework
-    // reads SKYZEN_ADDRESS at startup to discover the server's listen address.
-    unsafe {
-        std::env::set_var("SKYZEN_ADDRESS", addr.to_string());
-    }
-
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
 
@@ -283,7 +277,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
     let state_for_server = state.clone();
     tokio::task::spawn_blocking(move || {
         native::init_logging();
-        native::launch(move || {
+        native::launch(Some(addr), move || {
             let state = state_for_server;
             async move { build_router(state, mode) }
         });
@@ -296,8 +290,9 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
 
 fn api_routes() -> Route {
     use artifacts::{
-        get_artifact_preview, get_output_preview, get_session_runtime, get_slidev_static_asset,
-        list_session_artifacts, map_container_local_url, prepare_slidev_preview,
+        get_artifact_preview, get_artifact_runtime_bridge, get_artifact_runtime_preview,
+        get_output_preview, get_session_runtime, get_slidev_static_asset, list_session_artifacts,
+        map_container_local_url, prepare_slidev_preview, report_artifact_diagnostics,
         stream_session_artifacts,
     };
     use bootstrap::get_bootstrap;
@@ -340,6 +335,7 @@ fn api_routes() -> Route {
     Route::new((
         Route::new((
             "/health".at(health),
+            "/artifact-runtime.js".at(get_artifact_runtime_bridge),
             "/bootstrap".at(get_bootstrap),
             "/models".route(Route::new((
                 "".at(models),
@@ -373,7 +369,9 @@ fn api_routes() -> Route {
                         "/artifacts/local-url-map".post(map_container_local_url),
                     )),
                     Route::new((
+                        "/artifacts/runtime/preview".at(get_artifact_runtime_preview),
                         "/artifacts/stream".at(stream_session_artifacts),
+                        "/artifacts/diagnostics".post(report_artifact_diagnostics),
                         "/pin".post(pin_session),
                         "/unpin".post(unpin_session),
                         "/archive".post(archive_session),

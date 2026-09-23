@@ -140,6 +140,7 @@ include_dir = "0.7"
 itertools = "0.14.0"
 tempfile = "3.24.0"
 git2 = "0.20.3"
+mime = "0.3"
 mime_guess = "2"
 rustls = { version = "0.23", features = ["ring"] }
 regex = "1.12"
@@ -154,6 +155,7 @@ lancedb = { version = "0.23.1", default-features = false }
 lance-index = "1.0.1"
 arrow-array = "56.2"
 arrow-schema = "56.2"
+similar = "3.1.1"
 
 [dev-dependencies]
 serial_test = "3"

@@ -1,16 +1,8 @@
-This session is in plan mode (`approved`).
-The user approved the plan — execute against it now.
-As you make progress, re-emit the plan using a `<may-plan>` block with an updated `status` attribute so the UI can reflect current state. Example:
+This session's plan is approved. Implement it completely.
 
-<may-plan status="progress">
-## What we'll do
-- [x] Step 1: done
-- [ ] Step 2: in progress
-- [ ] Step 3: queued
-</may-plan>
-
-Rules:
-- Use `status="progress"` while steps are still running and `status="blocked"` if execution is paused on a user decision or external event.
-- Keep the block inline in your reply; supporting prose before or after is fine.
-- Preserve the plan structure (section headings and ordering) across updates so diffs stay readable.
-- Keep clarifying questions scoped to issues that still block execution.
+`tasks.md` is the canonical execution document:
+- Update checkbox state as each item starts and completes.
+- Keep phase notes, blockers, and newly discovered work accurate.
+- Do not leave completed work unchecked or silently drop pending work.
+- When `tasks.md` changes, emit the exact tag `<tasks />`; May renders the current document in the plan panel instead of requiring you to repeat it in chat.
+- Continue until every approved item is completed, unless a genuine external blocker requires user input.

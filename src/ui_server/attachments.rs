@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use aither_core::llm::Attachment as LlmAttachment;
 use aither_models::{Ability, lookup as lookup_model_info};
 use base64::Engine;
 use serde::Serialize;
@@ -11,7 +12,7 @@ use crate::agent::generate_session_title;
 use crate::session::AttachmentKind;
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::load_session_paths;
+use super::helpers::{load_session_paths, parse_safe_relative_path};
 use super::state::UiServerState;
 use super::types::{ApiAttachment, ChatRequest};
 
@@ -96,27 +97,24 @@ pub(super) async fn build_prompt_and_attachments(
     state: &UiServerState,
     req: &ChatRequest,
     model_id: &str,
-) -> SkyResult<(String, Vec<url::Url>)> {
+) -> SkyResult<(String, Vec<LlmAttachment>)> {
     let modality_support = ModelModalitySupport::for_model(model_id);
     let mut attachments = Vec::new();
     let mut prompt_sections = Vec::new();
     let mut xml_items = Vec::new();
     let mut offloaded_xml_items = Vec::new();
+    let mut canonical_session_root = None;
 
     for attachment in &req.attachments {
         let required_modality = AttachmentModality::for_attachment_type(attachment.attachment_type);
         let supported = required_modality
             .as_ref()
             .is_none_or(|modality| modality_support.supports(modality));
-
         let upload_data_url = attachment.upload_data_url.as_deref().or_else(|| {
-            if attachment.attachment_type == AttachmentKind::Image
-                && attachment.url.starts_with("data:")
-            {
-                Some(attachment.url.as_str())
-            } else {
-                None
-            }
+            attachment
+                .url
+                .starts_with("data:")
+                .then_some(attachment.url.as_str())
         });
         let uploaded = match upload_data_url {
             Some(data_url) => {
@@ -124,17 +122,33 @@ pub(super) async fn build_prompt_and_attachments(
             }
             None => None,
         };
-        let maybe_relative_path = uploaded
-            .as_ref()
-            .map(|(_, relative_path)| relative_path.clone());
 
         if !supported {
+            let relative_path = match uploaded.as_ref() {
+                Some((_, relative_path)) => Some(relative_path.clone()),
+                None if !attachment.url.trim().is_empty() => {
+                    let source = resolve_native_attachment_source(
+                        state,
+                        &req.session_id,
+                        attachment.url.as_str(),
+                        &mut canonical_session_root,
+                    )
+                    .await?;
+                    let Some(relative_path) = source.relative_path else {
+                        return Err(bad_request_error(
+                            "Unsupported remote modality must be uploaded so May can preserve it",
+                        ));
+                    };
+                    Some(relative_path)
+                }
+                None => None,
+            };
             offloaded_xml_items.push(build_offloaded_attachment_xml(
                 attachment,
                 required_modality
                     .as_ref()
                     .expect("unsupported attachment must have modality"),
-                maybe_relative_path.as_deref(),
+                relative_path.as_deref(),
                 model_id,
             ));
             if let Some(text) = &attachment.text_content {
@@ -153,21 +167,25 @@ pub(super) async fn build_prompt_and_attachments(
                 reason: None,
             });
 
-            if attachment.attachment_type == AttachmentKind::Image {
-                let url = url::Url::from_file_path(saved_path).map_err(|()| {
-                    SkyError::msg("Failed to map image path to URL")
-                        .set_status(StatusCode::INTERNAL_SERVER_ERROR)
-                })?;
-                attachments.push(url);
+            if let Some(modality) = required_modality.as_ref() {
+                let media_type = resolve_attachment_media_type(
+                    attachment,
+                    modality,
+                    upload_data_url,
+                    Some(saved_path.as_path()),
+                    None,
+                )?;
+                let url = path_to_file_url(saved_path.as_path())?;
+                attachments.push(LlmAttachment::new(url, media_type));
             }
             continue;
         }
 
         if let Some(text) = &attachment.text_content {
-            if text.chars().count() <= INLINE_PASTED_TEXT_THRESHOLD {
+            if text.len() <= INLINE_PASTED_TEXT_THRESHOLD {
                 prompt_sections.push(PromptSection::PastedText(text.clone()));
             } else {
-                let (saved_path, relative_path) =
+                let (_, relative_path) =
                     save_large_pasted_text(state, &req.session_id, text).await?;
                 xml_items.push(AttachmentXml {
                     name: attachment.name.clone(),
@@ -177,15 +195,34 @@ pub(super) async fn build_prompt_and_attachments(
                     required_modality: None,
                     reason: None,
                 });
-
-                if attachment.attachment_type == AttachmentKind::Image {
-                    let url = url::Url::from_file_path(saved_path).map_err(|()| {
-                        SkyError::msg("Failed to map image path to URL")
-                            .set_status(StatusCode::INTERNAL_SERVER_ERROR)
-                    })?;
-                    attachments.push(url);
-                }
             }
+            continue;
+        }
+
+        if let Some(modality) = required_modality.as_ref() {
+            let source = resolve_native_attachment_source(
+                state,
+                &req.session_id,
+                attachment.url.as_str(),
+                &mut canonical_session_root,
+            )
+            .await?;
+            let media_type = resolve_attachment_media_type(
+                attachment,
+                modality,
+                None,
+                source.local_path.as_deref(),
+                Some(&source.url),
+            )?;
+            xml_items.push(AttachmentXml {
+                name: attachment.name.clone(),
+                attachment_type: attachment.attachment_type.clone(),
+                path: source.relative_path,
+                offloaded: None,
+                required_modality: None,
+                reason: None,
+            });
+            attachments.push(LlmAttachment::new(source.url, media_type));
             continue;
         }
 
@@ -222,6 +259,160 @@ fn render_prompt(base: &str, sections: &[PromptSection]) -> SkyResult<String> {
     Ok(blocks.join("\n\n"))
 }
 
+struct NativeAttachmentSource {
+    url: url::Url,
+    relative_path: Option<String>,
+    local_path: Option<PathBuf>,
+}
+
+async fn resolve_native_attachment_source(
+    state: &UiServerState,
+    session_id: &str,
+    raw: &str,
+    canonical_session_root: &mut Option<PathBuf>,
+) -> SkyResult<NativeAttachmentSource> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(bad_request_error("multimodal attachment URL is required"));
+    }
+
+    if let Ok(url) = url::Url::parse(trimmed) {
+        return match url.scheme() {
+            "http" | "https" => Ok(NativeAttachmentSource {
+                url,
+                relative_path: None,
+                local_path: None,
+            }),
+            "file" => {
+                let path = url.to_file_path().map_err(|()| {
+                    bad_request_error("attachment file URL could not be converted to a path")
+                })?;
+                resolve_session_file_source(state, session_id, path, canonical_session_root).await
+            }
+            scheme => Err(bad_request_error(format!(
+                "unsupported multimodal attachment URL scheme '{scheme}'"
+            ))),
+        };
+    }
+
+    let relative_path = parse_safe_relative_path(trimmed, "attachment path")?;
+    let session_root =
+        canonical_session_root_path(state, session_id, canonical_session_root).await?;
+    resolve_session_file_source(
+        state,
+        session_id,
+        session_root.join(relative_path),
+        canonical_session_root,
+    )
+    .await
+}
+
+async fn resolve_session_file_source(
+    state: &UiServerState,
+    session_id: &str,
+    path: PathBuf,
+    canonical_session_root: &mut Option<PathBuf>,
+) -> SkyResult<NativeAttachmentSource> {
+    let session_root =
+        canonical_session_root_path(state, session_id, canonical_session_root).await?;
+    let canonical_path = async_fs::canonicalize(&path)
+        .await
+        .map_err(|_| bad_request_error("attachment file does not exist"))?;
+    if !canonical_path.starts_with(&session_root) {
+        return Err(bad_request_error(
+            "attachment file must remain inside the session directory",
+        ));
+    }
+    let metadata = async_fs::metadata(&canonical_path)
+        .await
+        .map_err(internal_error)?;
+    if !metadata.is_file() {
+        return Err(bad_request_error("attachment path must reference a file"));
+    }
+    let relative_path = canonical_path
+        .strip_prefix(&session_root)
+        .map_err(internal_error)?
+        .to_string_lossy()
+        .into_owned();
+    Ok(NativeAttachmentSource {
+        url: path_to_file_url(&canonical_path)?,
+        relative_path: Some(relative_path),
+        local_path: Some(canonical_path),
+    })
+}
+
+async fn canonical_session_root_path(
+    state: &UiServerState,
+    session_id: &str,
+    cached: &mut Option<PathBuf>,
+) -> SkyResult<PathBuf> {
+    if let Some(root) = cached {
+        return Ok(root.clone());
+    }
+    let paths = load_session_paths(state, session_id).await?;
+    let canonical = async_fs::canonicalize(paths.root())
+        .await
+        .map_err(internal_error)?;
+    *cached = Some(canonical.clone());
+    Ok(canonical)
+}
+
+fn path_to_file_url(path: &Path) -> SkyResult<url::Url> {
+    url::Url::from_file_path(path).map_err(|()| {
+        SkyError::msg("Failed to map multimodal attachment path to URL")
+            .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+    })
+}
+
+fn resolve_attachment_media_type(
+    attachment: &ApiAttachment,
+    modality: &AttachmentModality,
+    data_url: Option<&str>,
+    local_path: Option<&Path>,
+    source_url: Option<&url::Url>,
+) -> SkyResult<mime::Mime> {
+    let media_type = data_url
+        .map(data_url_media_type)
+        .transpose()?
+        .or_else(|| local_path.and_then(|path| mime_guess::from_path(path).first()))
+        .or_else(|| mime_guess::from_path(&attachment.name).first())
+        .or_else(|| source_url.and_then(|url| mime_guess::from_path(url.path()).first()))
+        .or_else(|| matches!(modality, AttachmentModality::Pdf).then_some(mime::APPLICATION_PDF))
+        .ok_or_else(|| {
+            bad_request_error(format!(
+                "unable to determine MIME type for attachment '{}'",
+                attachment.name
+            ))
+        })?;
+
+    if !modality.accepts(&media_type) {
+        return Err(bad_request_error(format!(
+            "attachment '{}' declares {} but MIME type is '{}'",
+            attachment.name,
+            modality.label(),
+            media_type
+        )));
+    }
+    Ok(media_type)
+}
+
+fn data_url_media_type(data_url: &str) -> SkyResult<mime::Mime> {
+    let (header, _) = data_url
+        .split_once(',')
+        .ok_or_else(|| bad_request_error("invalid attachment data URL"))?;
+    let metadata = header
+        .strip_prefix("data:")
+        .ok_or_else(|| bad_request_error("invalid attachment data URL"))?;
+    let media_type = metadata
+        .split(';')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| bad_request_error("attachment data URL is missing MIME type"))?;
+    media_type
+        .parse()
+        .map_err(|error| bad_request_error(format!("invalid attachment MIME type: {error}")))
+}
+
 // ── Modality support ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -249,6 +440,16 @@ impl AttachmentModality {
             Self::Audio => "audio",
             Self::Video => "video",
             Self::Pdf => "pdf",
+        }
+    }
+
+    fn accepts(self, media_type: &mime::Mime) -> bool {
+        let raw = media_type.as_ref();
+        match self {
+            Self::Vision => raw.starts_with("image/"),
+            Self::Audio => raw.starts_with("audio/"),
+            Self::Video => raw.starts_with("video/"),
+            Self::Pdf => raw == "application/pdf",
         }
     }
 }
@@ -326,6 +527,11 @@ async fn save_upload_data_url(
 
     if !header.starts_with("data:") {
         return Ok(None);
+    }
+    if !header.ends_with(";base64") {
+        return Err(bad_request_error(
+            "attachment data URL must use base64 encoding",
+        ));
     }
 
     let bytes = base64::engine::general_purpose::STANDARD
@@ -460,5 +666,87 @@ fn sanitize_upload_stem(raw: &str) -> String {
         "upload".to_string()
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attachment(name: &str, attachment_type: AttachmentKind) -> ApiAttachment {
+        ApiAttachment {
+            id: "attachment-test".to_string(),
+            name: name.to_string(),
+            attachment_type,
+            url: String::new(),
+            upload_data_url: None,
+            text_content: None,
+        }
+    }
+
+    #[test]
+    fn data_url_media_type_is_parsed_exactly() {
+        let media_type =
+            data_url_media_type("data:audio/wav;base64,AA==").expect("parse data URL MIME type");
+        assert_eq!(media_type.as_ref(), "audio/wav");
+    }
+
+    #[test]
+    fn supported_modalities_keep_exact_media_types() {
+        let cases = [
+            (
+                AttachmentKind::Image,
+                AttachmentModality::Vision,
+                "image/png",
+            ),
+            (
+                AttachmentKind::Audio,
+                AttachmentModality::Audio,
+                "audio/wav",
+            ),
+            (
+                AttachmentKind::Video,
+                AttachmentModality::Video,
+                "video/mp4",
+            ),
+            (
+                AttachmentKind::Pdf,
+                AttachmentModality::Pdf,
+                "application/pdf",
+            ),
+        ];
+        for (kind, modality, media_type) in cases {
+            let value = attachment("upload.bin", kind);
+            let data_url = format!("data:{media_type};base64,AA==");
+            let resolved = resolve_attachment_media_type(
+                &value,
+                &modality,
+                Some(data_url.as_str()),
+                None,
+                None,
+            )
+            .expect("resolve attachment media type");
+            assert_eq!(resolved.as_ref(), media_type);
+        }
+    }
+
+    #[test]
+    fn mismatched_attachment_modality_fails() {
+        let value = attachment("recording.wav", AttachmentKind::Image);
+        let error = resolve_attachment_media_type(
+            &value,
+            &AttachmentModality::Vision,
+            Some("data:audio/wav;base64,AA=="),
+            None,
+            None,
+        )
+        .expect_err("MIME mismatch must fail");
+        assert!(error.to_string().contains("declares vision"));
+    }
+
+    #[test]
+    fn text_attachment_has_no_native_modality() {
+        assert!(AttachmentModality::for_attachment_type(AttachmentKind::Text).is_none());
+        assert!(AttachmentModality::for_attachment_type(AttachmentKind::Document).is_none());
     }
 }

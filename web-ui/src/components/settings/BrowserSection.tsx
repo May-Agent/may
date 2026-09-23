@@ -14,17 +14,18 @@ export function BrowserSection() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
-  const refresh = async () => {
-    setLoading(true);
-    try {
-      setStatus(await getBrowserStatus());
-    } finally {
-      setLoading(false);
-    }
-  };
-
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    void getBrowserStatus()
+      .then((next) => {
+        if (!cancelled) setStatus(next);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const toggle = async () => {

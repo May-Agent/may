@@ -53,62 +53,13 @@ use std::path::{Path, PathBuf};
 use crate::model_selector::ModelSelector;
 use crate::network_policy::NetworkPolicyConfig;
 
-/// Infer model tier from aither-models metadata.
-///
-/// Uses model mode, pricing percentiles, and context window as signals.
-#[must_use]
-pub fn get_model_tier(model_id: &str) -> ModelTier {
-    let chat_price_breakpoints = chat_price_breakpoints();
-    aither_models::lookup(model_id).map_or(ModelTier::Balanced, |info| {
-        infer_model_tier(info, chat_price_breakpoints)
-    })
-}
+pub use aither_models::{ModelTier, tier as get_model_tier};
 
-fn chat_price_breakpoints() -> Option<(f64, f64)> {
-    let mut prices = aither_models::models_by_mode(aither_models::ModelMode::Chat)
-        .map(|info| info.pricing().output_per_token())
-        .filter(|price| price.is_finite() && *price > 0.0)
-        .collect::<Vec<_>>();
-    if prices.len() < 3 {
-        return None;
-    }
+/// Directory under `~/.may` where rolling network audit logs are stored.
+pub const NETWORK_AUDIT_LOG_SUBDIR: &str = "logs/network";
 
-    prices.sort_by(f64::total_cmp);
-    let low_index = prices.len() / 3;
-    let high_index = (prices.len() * 2) / 3;
-    Some((prices[low_index], prices[high_index]))
-}
-
-fn infer_model_tier(
-    info: &aither_models::ModelEntry,
-    chat_price_breakpoints: Option<(f64, f64)>,
-) -> ModelTier {
-    match info.mode() {
-        aither_models::ModelMode::ImageGeneration => return ModelTier::ImageGeneration,
-        aither_models::ModelMode::Chat => {}
-        _ => return ModelTier::Balanced,
-    }
-
-    let output_price = info.pricing().output_per_token();
-    if let Some((fast_ceiling, advanced_floor)) = chat_price_breakpoints
-        && output_price.is_finite()
-        && output_price > 0.0
-    {
-        if output_price <= fast_ceiling {
-            return ModelTier::Fast;
-        }
-        if output_price >= advanced_floor {
-            return ModelTier::Advanced;
-        }
-        return ModelTier::Balanced;
-    }
-
-    match info.max_input_tokens() {
-        Some(tokens) if tokens <= 32_768 => ModelTier::Fast,
-        Some(tokens) if tokens >= 200_000 => ModelTier::Advanced,
-        _ => ModelTier::Balanced,
-    }
-}
+/// Number of rotated daily network audit log files retained.
+pub const NETWORK_AUDIT_MAX_FILES: usize = 14;
 
 fn normalize_base_url(url: &str) -> &str {
     url.trim_end_matches('/')
@@ -392,51 +343,6 @@ pub enum ApiFormat {
     OpenAI,
     Anthropic,
     Gemini,
-}
-
-/// Model tier preference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelTier {
-    /// Flagship models - highest capability
-    Advanced,
-    /// Balanced models - good capability/cost ratio
-    #[default]
-    Balanced,
-    /// Fast models - optimized for speed
-    Fast,
-    /// Image generation models
-    ImageGeneration,
-}
-
-impl ModelTier {
-    /// All tiers for iteration.
-    pub const ALL: &'static [Self] = &[
-        Self::Advanced,
-        Self::Balanced,
-        Self::Fast,
-        Self::ImageGeneration,
-    ];
-
-    #[must_use]
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::Advanced => "Advanced (Flagship)",
-            Self::Balanced => "Balanced",
-            Self::Fast => "Fast",
-            Self::ImageGeneration => "Image Generation",
-        }
-    }
-
-    #[must_use]
-    pub const fn short_name(self) -> &'static str {
-        match self {
-            Self::Advanced => "advanced",
-            Self::Balanced => "balanced",
-            Self::Fast => "fast",
-            Self::ImageGeneration => "image",
-        }
-    }
 }
 
 /// A configured provider instance with credentials.
@@ -1123,7 +1029,7 @@ impl MayConfig {
     #[must_use]
     pub fn available_models(&self) -> Vec<AvailableModel> {
         let mut models = Vec::new();
-        let chat_price_breakpoints = chat_price_breakpoints();
+        let registry = aither_models::ModelRegistry::bundled();
 
         for (id, instance) in &self.provider {
             if !instance.is_valid(id) {
@@ -1142,7 +1048,7 @@ impl MayConfig {
                         selector: ModelSelector::new(id, info.id()),
                         id: info.id().to_string(),
                         provider_id: id.clone(),
-                        tier: Some(infer_model_tier(info, chat_price_breakpoints)),
+                        tier: Some(registry.tier_of(info)),
                     });
                 }
                 continue;
@@ -1167,7 +1073,7 @@ impl MayConfig {
                     selector: ModelSelector::new(id, info.id()),
                     id: info.id().to_string(),
                     provider_id: id.clone(),
-                    tier: Some(infer_model_tier(info, chat_price_breakpoints)),
+                    tier: Some(registry.tier_of(info)),
                 });
             }
         }

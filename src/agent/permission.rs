@@ -67,7 +67,7 @@ impl core::str::FromStr for PermissionRequestMode {
 impl From<TerminalMode> for PermissionRequestMode {
     fn from(value: TerminalMode) -> Self {
         match value {
-            TerminalMode::Sandboxed | TerminalMode::Network => Self::Default,
+            TerminalMode::Sandboxed => Self::Default,
             TerminalMode::Unsafe => Self::Unsafe,
         }
     }
@@ -79,7 +79,6 @@ impl From<TerminalMode> for PermissionRequestMode {
 #[serde(rename_all = "lowercase")]
 pub enum PermissionHistoryMode {
     Sandboxed,
-    Network,
     Unsafe,
 }
 
@@ -89,7 +88,6 @@ impl PermissionHistoryMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Sandboxed => "sandboxed",
-            Self::Network => "network",
             Self::Unsafe => "unsafe",
         }
     }
@@ -113,7 +111,6 @@ impl core::str::FromStr for PermissionHistoryMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "sandboxed" => Ok(Self::Sandboxed),
-            "network" => Ok(Self::Network),
             "unsafe" => Ok(Self::Unsafe),
             other => Err(PermissionHistoryModeParseError {
                 value: other.to_string(),
@@ -126,7 +123,6 @@ impl From<TerminalMode> for PermissionHistoryMode {
     fn from(value: TerminalMode) -> Self {
         match value {
             TerminalMode::Sandboxed => Self::Sandboxed,
-            TerminalMode::Network => Self::Network,
             TerminalMode::Unsafe => Self::Unsafe,
         }
     }
@@ -258,21 +254,6 @@ impl PermissionApprover {
             )));
         };
 
-        if mode == TerminalMode::Network
-            && let Some(runtime_service) = &self.runtime_service
-            && runtime_service
-                .db()
-                .session_has_approved_permission_mode(
-                    &session_id,
-                    PermissionHistoryMode::from(mode),
-                )
-                .await
-                .map_err(anyhow::Error::from)
-                .map_err(PermissionError::Internal)?
-        {
-            return Ok(true);
-        }
-
         let payload = PermissionRequest {
             mode: mode.into(),
             script,
@@ -313,7 +294,7 @@ impl Default for PermissionApprover {
 impl PermissionHandler for PermissionApprover {
     async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
         match mode {
-            TerminalMode::Sandboxed | TerminalMode::Network => Ok(true),
+            TerminalMode::Sandboxed => Ok(true),
             TerminalMode::Unsafe => {
                 let approved = self.request_and_wait(mode, script.to_string()).await?;
                 if approved {
@@ -337,7 +318,7 @@ impl PermissionHandler for PermissionApprover {
             return false;
         }
         match mode {
-            TerminalMode::Sandboxed | TerminalMode::Network => false,
+            TerminalMode::Sandboxed => false,
             TerminalMode::Unsafe => true,
         }
     }

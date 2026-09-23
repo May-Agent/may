@@ -1,5 +1,10 @@
-import { apiGet, apiSseUrl } from './client';
-import type { SessionArtifactsResponse, ArtifactStreamPayload } from '../types';
+import { apiGet, apiPost, apiSseUrl } from './client';
+import type {
+  ArtifactDiagnosticsResponse,
+  ArtifactStreamPayload,
+  SessionArtifactsResponse,
+  SlidevPreviewResponse,
+} from '../types';
 import { parseNamedSseStream } from '../stream/sse';
 
 export function listArtifacts(sessionId: string): Promise<SessionArtifactsResponse> {
@@ -13,9 +18,40 @@ export function artifactPreviewUrl(sessionId: string, path: string): string {
   return `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/preview?${qs.toString()}`;
 }
 
+export function artifactRuntimePreviewUrl(
+  sessionId: string,
+  path: string,
+  artifactType: string,
+): string {
+  const qs = new URLSearchParams({ path, artifactType });
+  return `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/runtime/preview?${qs.toString()}`;
+}
+
 export function outputsPreviewUrl(sessionId: string, path: string): string {
   const qs = new URLSearchParams({ path });
   return `/api/sessions/${encodeURIComponent(sessionId)}/outputs/preview?${qs.toString()}`;
+}
+
+export function prepareSlidevPreview(
+  sessionId: string,
+  path: string,
+): Promise<SlidevPreviewResponse> {
+  const qs = new URLSearchParams({ path });
+  return apiGet<SlidevPreviewResponse>(
+    `/sessions/${encodeURIComponent(sessionId)}/artifacts/slidev/preview?${qs.toString()}`,
+  );
+}
+
+export function reportArtifactDiagnostics(
+  sessionId: string,
+  path: string,
+  artifactType: string,
+  diagnostics: string[],
+): Promise<ArtifactDiagnosticsResponse> {
+  return apiPost<ArtifactDiagnosticsResponse>(
+    `/sessions/${encodeURIComponent(sessionId)}/artifacts/diagnostics`,
+    { path, artifactType, diagnostics },
+  );
 }
 
 export type ArtifactStreamEvent =

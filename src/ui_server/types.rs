@@ -222,22 +222,7 @@ impl SseTodoUpdateEvent {
 
 // ── Tool Event Records (stored in DB history) ───────────────
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "stage")]
-pub enum ToolEventRecord {
-    #[serde(rename = "start")]
-    Start {
-        id: String,
-        name: String,
-        arguments: String,
-    },
-    #[serde(rename = "end")]
-    End {
-        id: String,
-        name: String,
-        result: ToolResult,
-    },
-}
+pub use crate::session::ToolEventRecord;
 
 // ── Config SSE Event Payload ────────────────────────────────
 
@@ -1138,10 +1123,67 @@ pub struct ArtifactPreviewQuery {
     pub(crate) path: String,
 }
 
+const MAX_ARTIFACT_TYPE_BYTES: usize = 64;
+
+#[derive(Debug, Clone)]
+pub struct ArtifactType(String);
+
+impl ArtifactType {
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ArtifactType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        if value.is_empty() || value.len() > MAX_ARTIFACT_TYPE_BYTES {
+            return Err(serde::de::Error::custom(
+                "artifact type must contain between 1 and 64 bytes",
+            ));
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(serde::de::Error::custom(
+                "artifact type must contain only lowercase ASCII letters, digits, and hyphens",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactRuntimePreviewQuery {
+    pub(crate) path: String,
+    pub(crate) artifact_type: ArtifactType,
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlidevPreviewResponse {
-    pub(crate) preview_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) preview_url: Option<String>,
+    pub(crate) diagnostics: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactDiagnosticsRequest {
+    pub(crate) path: String,
+    pub(crate) artifact_type: ArtifactType,
+    pub(crate) diagnostics: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactDiagnosticsResponse {
+    pub(crate) repair_scheduled: bool,
 }
 
 #[derive(Debug, Clone)]

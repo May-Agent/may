@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Pencil, Check, X, Folder, Globe2 } from 'lucide-react';
 import type { ApiSession } from '@/lib/types';
 import { Button } from '@/components/ui/button';
@@ -19,10 +19,6 @@ export function SessionHeader({ session }: { session: ApiSession }) {
   const toggleBrowserView = useBrowserViewStore((s) => s.toggle);
   const browserEnabled = useRuntimeStore((s) => s.browser?.enabled ?? false);
   const { t } = useTranslation();
-
-  useEffect(() => {
-    setTitle(session.title);
-  }, [session.title]);
 
   const submit = async () => {
     const next = title.trim();
@@ -86,7 +82,15 @@ export function SessionHeader({ session }: { session: ApiSession }) {
           >
             <Folder className="size-3.5" />
           </Button>
-          <Button size="icon" variant="ghost" onClick={() => setEditing(true)} aria-label={t('common.rename')}>
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={() => {
+              setTitle(session.title);
+              setEditing(true);
+            }}
+            aria-label={t('common.rename')}
+          >
             <Pencil className="size-3.5" />
           </Button>
           <ArtifactsDrawer

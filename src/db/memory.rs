@@ -143,14 +143,23 @@ impl ChatDb {
         Ok(())
     }
 
-    /// List profile memory jobs still marked dirty.
-    pub async fn list_dirty_profile_memory_jobs(
+    /// List dirty profile-memory jobs due for refresh.
+    ///
+    /// Previously processed profiles become due once `last_processed_at` is at
+    /// or before `refresh_cutoff`. New profiles get a short batching grace and
+    /// become due once their dirty `updated_at` is at or before
+    /// `initial_cutoff`.
+    pub async fn list_due_profile_memory_jobs(
         &self,
+        refresh_cutoff: &str,
+        initial_cutoff: &str,
     ) -> Result<Vec<profile_memory_jobs::Model>, ChatDbError> {
         Ok(query!(
             self.db,
-            "SELECT * FROM profile_memory_jobs WHERE dirty = ? ORDER BY updated_at ASC",
-            true
+            "SELECT * FROM profile_memory_jobs WHERE dirty = ? AND ((last_processed_at IS NULL AND updated_at <= ?) OR last_processed_at <= ?) ORDER BY COALESCE(last_processed_at, updated_at) ASC",
+            true,
+            initial_cutoff,
+            refresh_cutoff
         )
         .fetch_all::<profile_memory_jobs::Model>()
         .await?)

@@ -149,6 +149,67 @@ pub async fn resolve_provider_runtime(
     })
 }
 
+/// Tier-resolved models for the `ask` terminal command.
+///
+/// `None` for a tier means no distinct model is configured (or it failed to
+/// initialize) and the session model should answer that tier.
+#[derive(Clone, Default)]
+pub struct AskTierModels {
+    pub flagship: Option<CloudProvider>,
+    pub balanced: Option<CloudProvider>,
+    pub fast: Option<CloudProvider>,
+}
+
+/// Resolves per-tier models for the `ask` command from the configured tier
+/// defaults, skipping tiers that resolve to the session's own model.
+pub async fn resolve_ask_tier_models(
+    config: &MayConfig,
+    session_provider_id: &str,
+    session_model_id: &str,
+) -> AskTierModels {
+    let mut models = AskTierModels::default();
+    for (tier, slot) in [
+        (crate::config::ModelTier::Advanced, &mut models.flagship),
+        (crate::config::ModelTier::Balanced, &mut models.balanced),
+        (crate::config::ModelTier::Fast, &mut models.fast),
+    ] {
+        let Some(selector) = config.default_model_for_tier(tier) else {
+            continue;
+        };
+        if selector.provider_id() == session_provider_id && selector.model_id() == session_model_id
+        {
+            continue;
+        }
+        let Some(instance) = config.get_provider(selector.provider_id()) else {
+            tracing::warn!(
+                tier = ?tier,
+                provider_id = selector.provider_id(),
+                "ask tier model references an unknown provider; tier falls back to session model"
+            );
+            continue;
+        };
+        match build_cloud_provider_from_instance(
+            selector.provider_id(),
+            instance,
+            selector.model_id(),
+        )
+        .await
+        {
+            Ok(llm) => *slot = Some(llm),
+            Err(error) => {
+                tracing::warn!(
+                    tier = ?tier,
+                    provider_id = selector.provider_id(),
+                    model = selector.model_id(),
+                    error = %error,
+                    "failed to initialize ask tier model; tier falls back to session model"
+                );
+            }
+        }
+    }
+    models
+}
+
 /// Builds a fast+balanced provider chain for background memory extraction.
 pub async fn build_fast_provider_chain(
     config: &MayConfig,
