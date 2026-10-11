@@ -37,7 +37,7 @@ pub enum SessionError {
 }
 
 /// Unique session identifier (four random words joined by `-`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, skyzen::ToSchema)]
 #[serde(transparent)]
 pub struct SessionId(String);
 
@@ -100,7 +100,7 @@ pub struct Session {
 }
 
 /// Summary of a session for listing.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 pub struct SessionSummary {
     pub id: SessionId,
     pub title: Option<String>,
@@ -111,7 +111,9 @@ pub struct SessionSummary {
     pub folder_id: Option<String>,
     pub pin_sort_order: Option<i32>,
     pub message_count: usize,
+    #[schema(value_type = Option<String>)]
     pub created_at: Option<Timestamp>,
+    #[schema(value_type = Option<String>)]
     pub updated_at: Option<Timestamp>,
     /// Content preview for searching (concatenated messages).
     pub content_preview: String,

@@ -15,7 +15,12 @@ use crate::db::ChatDb;
 
 const PREFERENCE_PROMPT: &str = include_str!("../templates/preference_extraction_prompt.txt");
 const RECENCY_PROMPT: &str = include_str!("../templates/recency_extraction_prompt.txt");
-const MEMORY_PROCESS_INTERVAL: Duration = Duration::from_secs(45);
+/// Cheap DB sweep cadence; extraction itself runs at most once per profile/day.
+const MEMORY_JOB_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// A dirty profile is refreshed at most once per 24 hours.
+const MEMORY_REFRESH_AGE: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
+/// Batch the first few chat turns before creating a profile's initial memory.
+const INITIAL_MEMORY_GRACE: jiff::SignedDuration = jiff::SignedDuration::from_secs(15 * 60);
 const MAX_PROFILE_SESSIONS: usize = 3;
 const MAX_SESSION_MESSAGES: usize = 80;
 const MAX_CONVERSATION_CHARS: usize = 30_000;
@@ -69,13 +74,25 @@ impl MemoryProcessor {
     }
 
     async fn worker(db: ChatDb, providers: Vec<MemoryExtractionProvider>) {
-        let mut ticker = tokio::time::interval(MEMORY_PROCESS_INTERVAL);
+        let mut ticker = tokio::time::interval(MEMORY_JOB_SWEEP_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             ticker.tick().await;
+            let now = jiff::Timestamp::now();
+            let refresh_cutoff = now
+                .checked_sub(MEMORY_REFRESH_AGE)
+                .expect("24h profile-memory cutoff subtraction must not overflow")
+                .to_string();
+            let initial_cutoff = now
+                .checked_sub(INITIAL_MEMORY_GRACE)
+                .expect("15m initial profile-memory cutoff subtraction must not overflow")
+                .to_string();
 
-            let dirty_jobs = match db.list_dirty_profile_memory_jobs().await {
+            let dirty_jobs = match db
+                .list_due_profile_memory_jobs(&refresh_cutoff, &initial_cutoff)
+                .await
+            {
                 Ok(dirty_jobs) => dirty_jobs,
                 Err(error) => {
                     tracing::warn!(error = %error, "failed to load dirty profile memory jobs");

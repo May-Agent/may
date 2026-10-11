@@ -254,7 +254,7 @@ impl McpConnectionState {
 }
 
 /// Server information for display in UI.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpServerSource {
     Url { url: String },
@@ -279,7 +279,7 @@ impl std::fmt::Display for McpServerSource {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum McpServerStatus {
     Disconnected,
@@ -312,7 +312,7 @@ impl std::fmt::Display for McpServerStatus {
 }
 
 /// Server information for display in UI.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 pub struct McpServerInfo {
     /// Server name (configuration key).
     pub name: String,

@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use aither_cloud::{
-    CloudProvider, claude::Claude, copilot::Copilot, gemini::Gemini, openai::OpenAI,
+    CloudProvider, claude::Claude, codex::Codex, copilot::Copilot, gemini::Gemini, openai::OpenAI,
 };
 use aither_core::LanguageModel;
 use aither_core::llm::{
@@ -149,6 +149,67 @@ pub async fn resolve_provider_runtime(
     })
 }
 
+/// Tier-resolved models for the `ask` terminal command.
+///
+/// `None` for a tier means no distinct model is configured (or it failed to
+/// initialize) and the session model should answer that tier.
+#[derive(Clone, Default)]
+pub struct AskTierModels {
+    pub flagship: Option<CloudProvider>,
+    pub balanced: Option<CloudProvider>,
+    pub fast: Option<CloudProvider>,
+}
+
+/// Resolves per-tier models for the `ask` command from the configured tier
+/// defaults, skipping tiers that resolve to the session's own model.
+pub async fn resolve_ask_tier_models(
+    config: &MayConfig,
+    session_provider_id: &str,
+    session_model_id: &str,
+) -> AskTierModels {
+    let mut models = AskTierModels::default();
+    for (tier, slot) in [
+        (crate::config::ModelTier::Advanced, &mut models.flagship),
+        (crate::config::ModelTier::Balanced, &mut models.balanced),
+        (crate::config::ModelTier::Fast, &mut models.fast),
+    ] {
+        let Some(selector) = config.default_model_for_tier(tier) else {
+            continue;
+        };
+        if selector.provider_id() == session_provider_id && selector.model_id() == session_model_id
+        {
+            continue;
+        }
+        let Some(instance) = config.get_provider(selector.provider_id()) else {
+            tracing::warn!(
+                tier = ?tier,
+                provider_id = selector.provider_id(),
+                "ask tier model references an unknown provider; tier falls back to session model"
+            );
+            continue;
+        };
+        match build_cloud_provider_from_instance(
+            selector.provider_id(),
+            instance,
+            selector.model_id(),
+        )
+        .await
+        {
+            Ok(llm) => *slot = Some(llm),
+            Err(error) => {
+                tracing::warn!(
+                    tier = ?tier,
+                    provider_id = selector.provider_id(),
+                    model = selector.model_id(),
+                    error = %error,
+                    "failed to initialize ask tier model; tier falls back to session model"
+                );
+            }
+        }
+    }
+    models
+}
+
 /// Builds a fast+balanced provider chain for background memory extraction.
 pub async fn build_fast_provider_chain(
     config: &MayConfig,
@@ -275,6 +336,28 @@ pub(super) async fn build_cloud_provider_from_instance(
                 .with_model(model)
                 .into()
         }
+        ProviderType::Chatgpt => {
+            let Some(credentials) = crate::chatgpt::load_credentials().await? else {
+                return Err(MayAgentError::MissingApiKey(
+                    "ChatGPT not authenticated. Use /config to set up OAuth.".to_string(),
+                ));
+            };
+            let mut client = Codex::new(credentials, model).on_refresh(|rotated| {
+                // Persist rotated credentials in the background; the refresh
+                // token is single-use so losing it would force re-login.
+                let rotated = rotated.clone();
+                executor_core::spawn(async move {
+                    if let Err(e) = crate::chatgpt::save_credentials(&rotated).await {
+                        tracing::warn!("failed to persist rotated ChatGPT tokens: {e}");
+                    }
+                })
+                .detach();
+            });
+            if let Some(url) = base_url {
+                client = client.with_base_url(url);
+            }
+            client.into()
+        }
         ProviderType::Ollama => {
             let url = base_url.unwrap_or("http://localhost:11434/v1");
             OpenAI::new(api_key)
@@ -314,11 +397,10 @@ pub(super) async fn build_cloud_provider_from_instance(
     Ok(llm)
 }
 
-const fn is_copilot_unauthorized(err: &crate::copilot::CopilotTokenError) -> bool {
+fn is_copilot_unauthorized(err: &crate::copilot::CopilotTokenError) -> bool {
     matches!(
         err,
-        crate::copilot::CopilotTokenError::Exchange(
-            aither_copilot::CopilotError::Http(zenwave::Error::Http { status, .. })
-        ) if status.as_u16() == 401
+        crate::copilot::CopilotTokenError::Exchange(error)
+            if error.status() == Some(401)
     )
 }

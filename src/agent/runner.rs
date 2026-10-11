@@ -19,6 +19,7 @@
 //! ```
 
 use aither_agent::{AgentEvent, CompactResult};
+use aither_core::llm::Attachment;
 use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
 use futures_lite::StreamExt;
@@ -45,7 +46,7 @@ enum WorkerCommand {
     Run {
         prompt: String,
         hidden_context: Option<String>,
-        attachments: Vec<url::Url>,
+        attachments: Vec<Attachment>,
         event_tx: Sender<TuiEvent>,
     },
     /// Compact conversation history.
@@ -80,7 +81,7 @@ impl AgentWorker {
         &self,
         prompt: String,
         hidden_context: Option<String>,
-        attachments: Vec<url::Url>,
+        attachments: Vec<Attachment>,
     ) -> AgentHandle {
         const ERR_WORKER_CHANNEL_CLOSED: &str =
             include_str!("../texts/agent_worker_channel_closed.txt");
@@ -234,7 +235,7 @@ async fn run_agent_prompt(
     agent: &mut MayAgent,
     prompt: &str,
     hidden_context: Option<&str>,
-    attachments: Vec<url::Url>,
+    attachments: Vec<Attachment>,
     command_rx: &Receiver<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
 ) -> bool {
