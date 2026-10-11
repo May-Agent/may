@@ -186,7 +186,7 @@ enum InputMessage {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-enum MouseEventType {
+pub enum MouseEventType {
     MousePressed,
     MouseReleased,
     MouseMoved,
@@ -698,7 +698,7 @@ impl BrowserManager {
     }
 
     /// Whether the browser is currently running.
-    pub async fn is_running(&self) -> bool {
+    pub fn is_running(&self) -> bool {
         self.snapshot_rx.borrow().running
     }
 
@@ -1630,7 +1630,7 @@ async fn acquire_browser_page(browser: &mut Browser) -> Result<Page, BrowserErro
                     page_target_id = Some(target_id.clone());
                     target_id
                 }
-                Err(error) if start.elapsed() < timeout => {
+                Err(_) if start.elapsed() < timeout => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }

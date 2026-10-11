@@ -71,7 +71,9 @@ struct TaskCatalog {
     tasks: Vec<scheduled_tasks::Model>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRunStatus {
     Running,
@@ -542,7 +544,7 @@ impl TaskRuntime {
 
         for task in &tasks.tasks {
             let trigger = stored_task_trigger(task)?;
-            let is_due = self.is_due(task, &trigger, now)?;
+            let is_due = Self::is_due(task, &trigger, now)?;
 
             if is_due {
                 let PersistedTaskTrigger::Time { trigger_type } = trigger else {
@@ -627,7 +629,6 @@ impl TaskRuntime {
     }
 
     fn is_due(
-        &self,
         task: &scheduled_tasks::Model,
         trigger: &PersistedTaskTrigger,
         now: jiff::Timestamp,
@@ -635,17 +636,16 @@ impl TaskRuntime {
         match trigger {
             PersistedTaskTrigger::Time {
                 trigger_type: TimeTriggerType::Cron,
-            } => self.is_cron_due(task, now),
+            } => Self::is_cron_due(task, now),
             PersistedTaskTrigger::Time {
                 trigger_type: TimeTriggerType::Once,
-            } => self.is_once_due(task, now),
+            } => Self::is_once_due(task, now),
             PersistedTaskTrigger::Event { .. } | PersistedTaskTrigger::Webhook { .. } => Ok(false),
         }
     }
 
     /// Check if a cron task is due.
     fn is_cron_due(
-        &self,
         task: &scheduled_tasks::Model,
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
@@ -692,7 +692,6 @@ impl TaskRuntime {
 
     /// Check if a one-time task is due.
     fn is_once_due(
-        &self,
         task: &scheduled_tasks::Model,
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
@@ -1181,7 +1180,7 @@ impl TaskRuntime {
             .ensure_running(&launch_spec)
             .await
             .map_err(|error| prefixed_error("failed to start container: ", &error))?;
-        container_manager.touch_activity(&container_id).await;
+        container_manager.touch_activity(&container_id);
 
         let container_runtime = ContainerShellRuntime::new(
             container_id.clone(),
@@ -1230,7 +1229,7 @@ impl TaskRuntime {
             command,
         )
         .await;
-        container_manager.touch_activity(&container_id).await;
+        container_manager.touch_activity(&container_id);
         result
     }
 
@@ -1314,7 +1313,7 @@ impl TaskRuntime {
             .ensure_running(&launch_spec)
             .await
             .map_err(|error| prefixed_error("failed to start container: ", &error))?;
-        container_manager.touch_activity(&container_id).await;
+        container_manager.touch_activity(&container_id);
 
         let container_runtime = ContainerShellRuntime::new(
             container_id.clone(),
@@ -1362,7 +1361,7 @@ impl TaskRuntime {
         )
         .await
         .map(|_| ());
-        container_manager.touch_activity(&container_id).await;
+        container_manager.touch_activity(&container_id);
         result
     }
 }

@@ -89,7 +89,7 @@ pub(super) async fn ensure_browser_runtime_started(
     let browser_manager = state
         .browser_manager()
         .ok_or(EnsureBrowserRuntimeError::Unavailable)?;
-    if browser_manager.is_running().await {
+    if browser_manager.is_running() {
         return Ok(browser_manager);
     }
 
@@ -125,7 +125,7 @@ pub(super) async fn browser_status(
             takeover_session_id,
         }));
     };
-    let running = bm.is_running().await;
+    let running = bm.is_running();
     Ok(Json(BrowserStatus {
         enabled,
         running,

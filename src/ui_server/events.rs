@@ -17,11 +17,10 @@ use super::error::bad_request_error;
 use super::helpers::send_event;
 use super::state::UiServerState;
 use super::types::{
-    BrowserLifecycleEvent, BrowserStatusEventPayload, NetworkAccessLogEntryResponse,
-    NetworkAccessLogsResponse, NotificationMailboxEntryResponse, NotificationMailboxResponse,
-    ProfileSessionsEventPayload, RemoteAccessEventPayload, RequestLogsResponse,
-    SessionRuntimeEventPayload, SessionRuntimeSnapshotItem, SessionRuntimesEventPayload,
-    SseHeartbeat,
+    BrowserStatusEventPayload, NetworkAccessLogEntryResponse, NetworkAccessLogsResponse,
+    NotificationMailboxEntryResponse, NotificationMailboxResponse, ProfileSessionsEventPayload,
+    RemoteAccessEventPayload, RequestLogsResponse, SessionRuntimeEventPayload,
+    SessionRuntimeSnapshotItem, SessionRuntimesEventPayload, SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -327,7 +326,7 @@ async fn emit_browser_status_if_changed(
     let enabled = state.config_snapshot().browser.enabled;
     let owner_session_id = state.browser_owner_session_id();
     let running = if let Some(manager) = browser_manager.as_ref() {
-        manager.is_running().await
+        manager.is_running()
     } else {
         false
     };
