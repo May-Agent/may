@@ -622,12 +622,12 @@ fn optional_heel_bin() -> Option<String> {
         }
     }
 
-    // Host-runnable heel binaries only: the sibling native-sandbox build and
-    // the CI release drop. The container heel under ~/.may is a Linux ELF and
-    // must never be offered for host-side sandboxing.
+    // Host-runnable heel binaries only: the sibling heel build and the CI
+    // release drop. The container heel under ~/.may is a Linux ELF and must
+    // never be offered for host-side sandboxing.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidates = [
-        manifest_dir.join("../native-sandbox/target/debug/heel"),
+        manifest_dir.join("../heel/target/debug/heel"),
         PathBuf::from("/tmp/heel-release/heel-aarch64-apple-darwin"),
     ];
     candidates

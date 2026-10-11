@@ -1283,7 +1283,7 @@ mod tests {
 
     #[test]
     fn test_provider_can_serve_model() {
-        let anthropic_model = "claude-sonnet-4-20250514";
+        let anthropic_model = "claude-sonnet-4-5-20250929";
 
         // OpenAI can serve GPT models even when catalog canonical IDs collide across providers.
         assert!(ProviderType::OpenAI.can_serve_model("gpt-4o"));
