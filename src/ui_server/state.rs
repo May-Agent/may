@@ -25,7 +25,7 @@ use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use crate::ui_server::types::BrowserLifecycleEvent;
 use crate::workspace_request::RequestWorkspaceArgs;
 
-#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerPrepareStage {
     Checking,
@@ -34,7 +34,7 @@ pub enum ContainerPrepareStage {
     Failed,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 pub struct ContainerPrepareStatus {
     pub(crate) profile_id: String,
     pub(crate) stage: ContainerPrepareStage,
@@ -42,7 +42,7 @@ pub struct ContainerPrepareStatus {
     pub(crate) recent_logs: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 pub struct ContainerPrepareStatusesPayload {
     pub(crate) statuses: Vec<ContainerPrepareStatus>,
 }
@@ -478,14 +478,12 @@ impl UiServerState {
         self.browser_manager.store(browser_manager);
     }
 
-    pub(crate) fn browser_lifecycle_subscribe(
-        &self,
-    ) -> broadcast::Receiver<BrowserLifecycleEvent> {
+    pub(crate) fn browser_lifecycle_subscribe(&self) -> broadcast::Receiver<BrowserLifecycleEvent> {
         self.browser_lifecycle_tx.subscribe()
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum UiAnswerInput {
     Selected { values: Vec<String> },
@@ -529,14 +527,14 @@ impl TryFrom<UiAnswerInput> for AnswerValue {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiQuestionAnswer {
     pub(crate) section: String,
     pub(crate) answer: UiAnswerInput,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AskUserRespondRequest {
     pub(crate) id: String,

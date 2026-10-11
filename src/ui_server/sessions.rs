@@ -230,7 +230,7 @@ fn map_context_window_message(message: &LlmMessage) -> ContextDebugMessage {
         attachments: message
             .attachments()
             .iter()
-            .map(url::Url::to_string)
+            .map(|attachment| attachment.url().to_string())
             .collect(),
         tool_call_id: message.tool_call_id().map(ToString::to_string),
         tool_call_names: message
@@ -286,25 +286,18 @@ async fn archive_existing_tasks_if_replaced(
     async_fs::write(paths.data_dir().join(file_name), previous_content).await
 }
 
-pub(super) async fn create_session(
-    Json(req): Json<CreateSessionRequest>,
-    State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Json<ApiSession>> {
-    let requested_profile_id = req.profile_id.clone();
-    let model = {
-        let config = state.config_snapshot();
-        req.model
-            .or_else(|| config.last_model.as_ref().map(ToString::to_string))
-            .or_else(|| preferred_advanced_model(&config))
-            .ok_or_else(|| bad_request_error("No model configured"))?
-    };
-
-    let resolved_profile_id = requested_profile_id
-        .clone()
-        .or_else(|| Some(state.default_profile_id.clone()));
+/// Creates the durable DB row and session directory layout for a profile.
+///
+/// Shared by the regular create-session endpoint and notification callbacks,
+/// which open a fresh conversation in the originating profile.
+pub(super) async fn create_session_for_profile(
+    state: &Arc<UiServerState>,
+    profile_id: Option<&str>,
+    model: &str,
+) -> SkyResult<String> {
     let id = SessionId::new().to_string();
     let db = state.db();
-    let layout = match resolved_profile_id.as_deref() {
+    let layout = match profile_id {
         Some(profile_id) => {
             let profile = db
                 .get_profile(profile_id)
@@ -326,17 +319,32 @@ pub(super) async fn create_session(
     };
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     store
-        .create_session_dirs(&id, resolved_profile_id.as_deref(), layout)
+        .create_session_dirs(&id, profile_id, layout)
         .await
         .map_err(internal_error)?;
-    db.create_session_in_profile(
-        &id,
-        None,
-        Some(model.as_str()),
-        resolved_profile_id.as_deref(),
-    )
-    .await
-    .map_err(internal_error)?;
+    db.create_session_in_profile(&id, None, Some(model), profile_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(id)
+}
+
+pub(super) async fn create_session(
+    Json(req): Json<CreateSessionRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiSession>> {
+    let requested_profile_id = req.profile_id.clone();
+    let model = {
+        let config = state.config_snapshot();
+        req.model
+            .or_else(|| config.last_model.as_ref().map(ToString::to_string))
+            .or_else(|| preferred_advanced_model(&config))
+            .ok_or_else(|| bad_request_error("No model configured"))?
+    };
+
+    let resolved_profile_id = requested_profile_id
+        .clone()
+        .or_else(|| Some(state.default_profile_id.clone()));
+    let id = create_session_for_profile(&state, resolved_profile_id.as_deref(), &model).await?;
 
     persist_last_model(&state, &model)
         .await

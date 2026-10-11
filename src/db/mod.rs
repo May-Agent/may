@@ -239,12 +239,6 @@ impl ChatDb {
 
     // ── Permission / AskUser Queries ─────────────────────────────
 
-    /// Check if network permission was ever approved in a session.
-    pub async fn has_network_approval(&self, session_id: &str) -> Result<bool, ChatDbError> {
-        self.session_has_approved_permission_mode(session_id, PermissionHistoryMode::Network)
-            .await
-    }
-
     /// Find unanswered permission requests in a session.
     pub async fn pending_permission_requests(
         &self,
@@ -252,7 +246,9 @@ impl ChatDb {
     ) -> Result<Vec<PermissionRequestPayload>, ChatDbError> {
         query!(
             self.db,
-            "SELECT request.request_id AS request_id, request.mode AS mode, request.script AS script FROM messages AS message INNER JOIN message_permission_requests AS request ON request.message_id = message.id WHERE message.session_id = ? AND NOT EXISTS (SELECT 1 FROM message_permission_responses AS response INNER JOIN messages AS response_message ON response_message.id = response.message_id WHERE response.request_id = request.request_id AND response_message.session_id = message.session_id) ORDER BY message.id ASC",
+            // `mode != 'network'` excludes rows persisted before the network
+            // escalation mode was removed; they can no longer be answered.
+            "SELECT request.request_id AS request_id, request.mode AS mode, request.script AS script FROM messages AS message INNER JOIN message_permission_requests AS request ON request.message_id = message.id WHERE message.session_id = ? AND request.mode != 'network' AND NOT EXISTS (SELECT 1 FROM message_permission_responses AS response INNER JOIN messages AS response_message ON response_message.id = response.message_id WHERE response.request_id = request.request_id AND response_message.session_id = message.session_id) ORDER BY message.id ASC",
             session_id
         )
         .fetch_all::<PermissionRequestMessageRow>()
@@ -362,7 +358,7 @@ pub(super) fn truncate_preview(content: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 struct LegacyRemoteProfileRow {
     id: String,
     remote_ssh_server_id: Option<String>,
@@ -377,7 +373,7 @@ pub struct PermissionRequestPayload {
 }
 
 /// Persisted permission response from structured history rows.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct PermissionResponsePayload {
     pub id: String,
     pub approved: bool,
@@ -850,6 +846,56 @@ mod tests {
                 .await
                 .expect("restart recovery should preserve takeover alert as pending")
         );
+    }
+
+    #[tokio::test]
+    async fn takeover_resume_becomes_dispatchable_after_cancelled_run_settles() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db should initialize successfully");
+        let session_id = "takeover-race";
+        db.create_session(session_id, Some("Takeover race"), Some("test-model"))
+            .await
+            .expect("session should be created");
+        db.set_session_runtime_state(session_id, SessionRuntimeState::Running)
+            .await
+            .expect("run should be marked active");
+        db.set_browser_takeover_owner(session_id)
+            .await
+            .expect("takeover should be active");
+        db.set_pending_immediate_message(
+            session_id,
+            test_pending_message("", PendingUserMessageMode::Steer),
+        )
+        .await
+        .expect("resume message should be queued");
+
+        let released = db
+            .clear_browser_takeover_owner(session_id)
+            .await
+            .expect("takeover should be released");
+        assert!(
+            !released.can_dispatch_follow_up(),
+            "the still-running cancelled turn must retain the dispatch gate"
+        );
+
+        assert!(
+            db.clear_running_if_idle(session_id)
+                .await
+                .expect("cancelled run should settle")
+        );
+        let settled = db
+            .get_session_runtime(session_id)
+            .await
+            .expect("runtime should load")
+            .expect("runtime should exist");
+        assert!(
+            settled.can_dispatch_follow_up(),
+            "resume must become dispatchable after the cancelled run settles"
+        );
+        assert!(settled.interactions.browser.takeover_alert_pending);
     }
 
     #[tokio::test]

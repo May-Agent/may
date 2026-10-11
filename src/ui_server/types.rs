@@ -10,7 +10,7 @@ use aither_core::llm::ToolResult;
 // ── Typed API Errors ────────────────────────────────────────
 
 /// Machine-readable error codes sent to the frontend, eliminating string-matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiErrorCode {
     BadRequest,
@@ -31,7 +31,7 @@ pub enum ApiErrorCode {
 }
 
 /// Structured error body with a machine-readable `code` and human-readable `error` message.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 pub struct ApiErrorBody {
     pub(crate) code: ApiErrorCode,
     pub(crate) error: String,
@@ -43,7 +43,7 @@ pub struct ApiErrorBody {
 /// frontend can route to the correct presenter without re-inferring
 /// from the tool name. `Generic` covers MCP and unknown tools; the
 /// frontend must fall back to raw-arg partial JSON projection there.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolVariant {
     Terminal,
@@ -82,7 +82,7 @@ impl ToolVariant {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseStartEvent<'a> {
     pub(crate) seq: u64,
@@ -91,7 +91,7 @@ pub struct SseStartEvent<'a> {
     pub(crate) assistant_id: &'a str,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseChunkEvent<'a> {
     pub(crate) seq: u64,
@@ -99,7 +99,7 @@ pub struct SseChunkEvent<'a> {
     pub(crate) chunk: &'a str,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseToolStartEvent<'a> {
     pub(crate) seq: u64,
@@ -114,7 +114,7 @@ pub struct SseToolStartEvent<'a> {
     pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseToolDeltaEvent<'a> {
     pub(crate) seq: u64,
@@ -129,7 +129,7 @@ pub struct SseToolDeltaEvent<'a> {
     pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseToolEndEvent<'a> {
     pub(crate) seq: u64,
@@ -139,12 +139,13 @@ pub struct SseToolEndEvent<'a> {
     pub(crate) variant: ToolVariant,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) arguments: Option<&'a str>,
+    #[schema(value_type = serde_json::Value)]
     pub(crate) result: &'a ToolResult,
     #[serde(skip_serializing_if = "crate::ui_server::tool_summary::ToolSummary::is_empty")]
     pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseErrorEvent<'a> {
     pub(crate) seq: u64,
@@ -154,7 +155,7 @@ pub struct SseErrorEvent<'a> {
     pub(crate) retryable: bool,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseDoneEvent {
     pub(crate) seq: u64,
@@ -163,21 +164,21 @@ pub struct SseDoneEvent {
     pub(crate) assistant: ApiMessage,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 pub struct SseHeartbeat {
     pub(crate) ok: bool,
 }
 
 /// Chat-stream ping emitted every 10 s so proxies and the browser's
 /// own idle detection don't close the connection during long tool phases.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SsePingEvent<'a> {
     pub(crate) seq: u64,
     pub(crate) turn_id: &'a str,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseTodoUpdateEvent {
     pub(crate) seq: u64,
@@ -187,7 +188,7 @@ pub struct SseTodoUpdateEvent {
     pub(crate) completed: usize,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 pub struct SseTodoItem {
     pub(crate) text: String,
     pub(crate) checked: bool,
@@ -222,26 +223,11 @@ impl SseTodoUpdateEvent {
 
 // ── Tool Event Records (stored in DB history) ───────────────
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "stage")]
-pub enum ToolEventRecord {
-    #[serde(rename = "start")]
-    Start {
-        id: String,
-        name: String,
-        arguments: String,
-    },
-    #[serde(rename = "end")]
-    End {
-        id: String,
-        name: String,
-        result: ToolResult,
-    },
-}
+pub use crate::session::ToolEventRecord;
 
 // ── Config SSE Event Payload ────────────────────────────────
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserStatusEventPayload {
     pub(crate) enabled: bool,
@@ -257,33 +243,33 @@ pub use crate::container::browser::BrowserLifecycleEvent;
 
 // ── Generic OK Responses ────────────────────────────────────
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserTakeoverResponse {
     pub(crate) ok: bool,
     pub(crate) session_id: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskTriggerStatus {
     Triggered,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 pub struct TaskTriggerResponse {
     pub(crate) ok: bool,
     pub(crate) status: TaskTriggerStatus,
     pub(crate) triggered: usize,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 pub struct NotificationSentResponse {
     pub(crate) ok: bool,
     pub(crate) sent: usize,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationMailboxStatus {
     Pending,
@@ -291,7 +277,7 @@ pub enum NotificationMailboxStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationMailboxEntryResponse {
     pub(crate) id: String,
@@ -330,13 +316,13 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationMailboxResponse {
     pub(crate) items: Vec<NotificationMailboxEntryResponse>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationCallbackResponse {
     pub(crate) notification_id: String,
@@ -348,7 +334,7 @@ pub struct NotificationCallbackResponse {
     pub(crate) callback_message: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkAccessLogEntryResponse {
     pub(crate) id: i32,
@@ -386,13 +372,13 @@ impl From<crate::db::entity::network_access_logs::Model> for NetworkAccessLogEnt
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkAccessLogsResponse {
     pub(crate) items: Vec<NetworkAccessLogEntryResponse>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteAccessState {
     Disabled,
@@ -401,7 +387,7 @@ pub enum RemoteAccessState {
     Error,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAccessStatusResponse {
     pub(crate) state: RemoteAccessState,
@@ -414,13 +400,13 @@ pub struct RemoteAccessStatusResponse {
     pub(crate) recent_logs: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAccessEventPayload {
     pub(crate) status: RemoteAccessStatusResponse,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTasksPayload {
     pub(crate) content: String,
@@ -428,19 +414,19 @@ pub struct SessionTasksPayload {
     pub(crate) plan_state: SessionPlanState,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionPlanStateRequest {
     pub(crate) plan_state: SessionPlanState,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionPlanStateResponse {
     pub(crate) plan_state: SessionPlanState,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiHealth {
     pub(crate) ok: bool,
@@ -448,7 +434,7 @@ pub struct ApiHealth {
 
 pub const API_OK: ApiHealth = ApiHealth { ok: true };
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestStats {
     #[serde(default)]
@@ -469,7 +455,7 @@ pub struct RequestStats {
     pub(crate) elapsed_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestLogEntry {
     pub(crate) session_id: String,
@@ -519,7 +505,7 @@ impl From<crate::db::entity::request_logs::Model> for RequestLogEntry {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestLogCacheSummary {
     pub(crate) assistant_message_count: u64,
@@ -593,20 +579,20 @@ impl RequestLogEntry {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestLogsResponse {
     pub(crate) logs: Vec<RequestLogEntry>,
     pub(crate) cache_summary: RequestLogCacheSummary,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryPayload {
     pub(crate) content: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiAttachment {
     pub(crate) id: String,
@@ -625,7 +611,7 @@ pub struct ApiAttachment {
 /// This identifies the terminal command execution tool in the protocol.
 pub const TERMINAL_TOOL_NAME: &str = "terminal";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TerminalExecutionStatus {
     Running,
@@ -634,7 +620,7 @@ pub enum TerminalExecutionStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TerminalCommandMode {
     Default,
@@ -643,7 +629,7 @@ pub enum TerminalCommandMode {
     Ssh,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiTerminalExecution {
     pub(crate) id: String,
@@ -655,7 +641,7 @@ pub struct ApiTerminalExecution {
     pub(crate) mode: TerminalCommandMode,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalStateSnapshot {
     #[serde(default)]
@@ -672,7 +658,7 @@ impl TerminalStateSnapshot {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiMessage {
     pub(crate) id: String,
@@ -695,7 +681,7 @@ pub struct ApiMessage {
     pub(crate) stats: Option<RequestStats>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiSession {
     pub(crate) id: String,
@@ -755,7 +741,7 @@ impl ApiSession {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionRequest {
     #[serde(default)]
@@ -764,7 +750,7 @@ pub struct CreateSessionRequest {
     pub(crate) profile_id: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSessionRequest {
     #[serde(default)]
@@ -788,7 +774,7 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatRequest {
     pub(crate) session_id: String,
@@ -803,7 +789,7 @@ pub struct ChatRequest {
     pub(crate) delivery_mode: PendingUserMessageMode,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RemovePendingMessageRequest {
     pub(crate) kind: PendingMessageKind,
@@ -811,14 +797,14 @@ pub struct RemovePendingMessageRequest {
     pub(crate) index: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingMessageKind {
     PendingImmediate,
     Queued,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextDebugMessage {
     pub(crate) role: String,
@@ -831,7 +817,7 @@ pub struct ContextDebugMessage {
     pub(crate) tool_call_names: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionContextDebugResponse {
     pub(crate) session_id: String,
@@ -846,15 +832,16 @@ pub struct SessionContextDebugResponse {
     pub(crate) window_snapshot: Option<SessionContextWindowSnapshotResponse>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionContextWindowSnapshotResponse {
+    #[schema(value_type = String)]
     pub(crate) phase: aither_agent::ContextWindowPhase,
     pub(crate) metrics: SessionContextWindowMetricsResponse,
     pub(crate) assembled_messages: Vec<ContextDebugMessage>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionContextWindowMetricsResponse {
     pub(crate) usage_fraction: f32,
@@ -884,7 +871,7 @@ impl From<aither_agent::ContextWindowMetrics> for SessionContextWindowMetricsRes
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfoItem {
     pub(crate) id: String,
@@ -895,7 +882,7 @@ pub struct ModelInfoItem {
     pub(crate) abilities: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsResponse {
     pub(crate) models: Vec<String>,
@@ -903,7 +890,7 @@ pub struct ModelsResponse {
     pub(crate) details: Vec<ModelInfoItem>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelsItem {
     pub(crate) provider_id: String,
@@ -912,13 +899,13 @@ pub struct ProviderModelsItem {
     pub(crate) details: Vec<ModelInfoItem>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelsResponse {
     pub(crate) providers: Vec<ProviderModelsItem>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionPollItem {
     pub(crate) id: String,
@@ -926,7 +913,7 @@ pub struct PermissionPollItem {
     pub(crate) request: crate::agent::PermissionRequest,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspacePollItem {
     pub(crate) id: String,
@@ -936,13 +923,13 @@ pub struct WorkspacePollItem {
     pub(crate) session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserInteractionResponse {
     pub(crate) takeover_active: bool,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInteractionResponse {
     pub(crate) task_id: Option<String>,
@@ -950,10 +937,11 @@ pub struct TerminalInteractionResponse {
     pub(crate) output_preview: Option<String>,
     pub(crate) input_notice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
     pub(crate) background_reason: Option<aither_sandbox::BackgroundReason>,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInteractionResponse {
     pub(crate) browser: BrowserInteractionResponse,
@@ -1001,21 +989,21 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionRespondRequest {
     pub(crate) id: String,
     pub(crate) approved: bool,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRespondRequest {
     pub(crate) id: String,
     pub(crate) approved: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiConfigResponse {
     pub(crate) ssh_servers: Vec<SshServerConfig>,
@@ -1025,7 +1013,7 @@ pub struct UiConfigResponse {
     pub(crate) full_config: UiFullConfig,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapProfileSessionsError {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1033,7 +1021,7 @@ pub struct BootstrapProfileSessionsError {
     pub(crate) message: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiBootstrapResponse {
     pub(crate) sessions: Vec<ApiSession>,
@@ -1048,7 +1036,7 @@ pub struct UiBootstrapResponse {
     pub(crate) default_profile_skills: Vec<SkillInfoDto>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeResponse {
     pub(crate) state: SessionRuntimeState,
@@ -1083,33 +1071,33 @@ impl Default for SessionRuntimeResponse {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeEventPayload {
     pub(crate) session_id: String,
     pub(crate) runtime: SessionRuntimeResponse,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSnapshotItem {
     pub(crate) session_id: String,
     pub(crate) runtime: SessionRuntimeResponse,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimesEventPayload {
     pub(crate) sessions: Vec<SessionRuntimeSnapshotItem>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileSessionsEventPayload {
     pub(crate) profile_sessions: crate::profile::ProfileSessions,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactEntry {
     pub(crate) path: String,
@@ -1119,29 +1107,88 @@ pub struct ArtifactEntry {
     pub(crate) fingerprint: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionArtifactsResponse {
     pub(crate) artifacts: Vec<ArtifactEntry>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactStreamPayload {
     pub(crate) count: usize,
     pub(crate) signature: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactPreviewQuery {
     pub(crate) path: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+const MAX_ARTIFACT_TYPE_BYTES: usize = 64;
+
+#[derive(Debug, Clone)]
+pub struct ArtifactType(String);
+
+impl ArtifactType {
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ArtifactType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        if value.is_empty() || value.len() > MAX_ARTIFACT_TYPE_BYTES {
+            return Err(serde::de::Error::custom(
+                "artifact type must contain between 1 and 64 bytes",
+            ));
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(serde::de::Error::custom(
+                "artifact type must contain only lowercase ASCII letters, digits, and hyphens",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactRuntimePreviewQuery {
+    pub(crate) path: String,
+    #[schema(value_type = String)]
+    pub(crate) artifact_type: ArtifactType,
+}
+
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SlidevPreviewResponse {
-    pub(crate) preview_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) preview_url: Option<String>,
+    pub(crate) diagnostics: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactDiagnosticsRequest {
+    pub(crate) path: String,
+    #[schema(value_type = String)]
+    pub(crate) artifact_type: ArtifactType,
+    pub(crate) diagnostics: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactDiagnosticsResponse {
+    pub(crate) repair_scheduled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1160,7 +1207,7 @@ impl skyzen::extract::Extractor for IfNoneMatchHeader {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiProviderConfig {
     pub(crate) id: String,
@@ -1171,7 +1218,7 @@ pub struct UiProviderConfig {
     pub(crate) enabled: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiModelsConfig {
     pub(crate) advanced: Vec<String>,
@@ -1182,23 +1229,24 @@ pub struct UiModelsConfig {
     pub(crate) embedding_dimensions: Option<usize>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiPreferencesConfig {
     pub(crate) warn_on_model_change: bool,
     pub(crate) show_token_usage: bool,
+    #[schema(value_type = String)]
     pub(crate) network_policy_mode: NetworkPolicyMode,
     pub(crate) network_policy_hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiAppearanceConfig {
     pub(crate) font: String,
     pub(crate) theme: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiBrowserConfig {
     pub(crate) enabled: bool,
@@ -1215,14 +1263,14 @@ pub struct UiBrowserConfig {
     pub(crate) system_profile: Option<UiSystemProfileConfig>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiSystemProfileConfig {
     pub(crate) path: String,
     pub(crate) copy_on_first_use: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiRemoteAccessConfig {
     pub(crate) enabled: bool,
@@ -1244,7 +1292,7 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiFullConfig {
     pub(crate) providers: Vec<UiProviderConfig>,
@@ -1257,14 +1305,14 @@ pub struct UiFullConfig {
     pub(crate) remote_access: UiRemoteAccessConfig,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SshServerRequest {
     pub(crate) name: String,
     pub(crate) target: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpCreateRequest {
     Process {
@@ -1281,19 +1329,19 @@ pub enum McpCreateRequest {
     },
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillInstallRequest {
     pub(crate) repo: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotStatusResponse {
     pub(crate) authenticated: bool,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotStartResponse {
     pub(crate) device_code: String,
@@ -1302,14 +1350,14 @@ pub struct CopilotStartResponse {
     pub(crate) interval: u64,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotAuthEvent {
     pub(crate) status: CopilotAuthStatus,
     pub(crate) message: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CopilotAuthStatus {
     Pending,
@@ -1319,7 +1367,7 @@ pub enum CopilotAuthStatus {
     Error,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillInfoDto {
     pub(crate) name: String,
@@ -1328,13 +1376,13 @@ pub struct SkillInfoDto {
     pub(crate) source: crate::skill::SkillSource,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LastModelRequest {
     pub(crate) model: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MemorySaveRequest {
     pub(crate) content: String,
@@ -1342,13 +1390,13 @@ pub struct MemorySaveRequest {
     pub(crate) explicit_user_request: bool,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalUrlMapRequest {
     pub(crate) url: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalUrlMapResponse {
     pub(crate) mapped_url: String,
