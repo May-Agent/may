@@ -19,6 +19,7 @@ mod exec;
 mod oneshot;
 
 use std::io;
+use std::mem;
 use std::panic;
 
 use aither_agent::AgentEvent;
@@ -1163,7 +1164,7 @@ where
     loop {
         if let Some(event) = events.next().await {
             app.handle_event(event)?;
-            if app.mode != auth_mode {
+            if mem::discriminant(&app.mode) != mem::discriminant(&auth_mode) {
                 break;
             }
         }

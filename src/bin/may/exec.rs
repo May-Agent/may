@@ -125,17 +125,20 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         build_exec_terminal_tool(&context, &environment, &may_config, &model).await?;
 
     let output = terminal_tool
-        .call(TerminalArgs {
-            description: "execute the requested shell command".to_string(),
-            script: args.script,
-            mode: shell_mode,
-            ssh_server_id: args.ssh_server_id,
-            expect: OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            timeout: args.timeout,
-            max_lines: args.max_lines,
-            raw: args.raw,
-        })
+        .call(
+            TerminalArgs {
+                description: "execute the requested shell command".to_string(),
+                script: args.script,
+                mode: shell_mode,
+                ssh_server_id: args.ssh_server_id,
+                expect: OutputFormat::Text,
+                resolution: aither_sandbox::MediaResolution::Auto,
+                timeout: args.timeout,
+                max_lines: args.max_lines,
+                raw: args.raw,
+            },
+            aither_core::llm::ToolContext::new(),
+        )
         .await
         .map_err(ExecError::TerminalCall)?;
 

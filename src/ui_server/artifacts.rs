@@ -1559,7 +1559,7 @@ async fn resolve_container_proxy_target(
                 .set_status(StatusCode::BAD_GATEWAY)
         })?;
 
-    container_manager.touch_activity(&container_id).await;
+    container_manager.touch_activity(&container_id);
 
     Ok(ResolvedContainerProxyTarget {
         container_id,
@@ -1611,9 +1611,7 @@ pub(super) async fn map_container_local_url(
         .await
         .map_err(internal_error)?;
     if let Some(container_manager) = state.container_manager.as_ref() {
-        container_manager
-            .touch_activity(&resolved.container_id)
-            .await;
+        container_manager.touch_activity(&resolved.container_id);
     }
     Ok(Json(LocalUrlMapResponse {
         mapped_url: mapped_url_from_target(mapped_port, &target_url),

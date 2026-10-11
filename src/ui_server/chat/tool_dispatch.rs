@@ -10,7 +10,6 @@
 use std::sync::Arc;
 
 use aither_agent::ask_user;
-use futures_lite::StreamExt;
 
 use crate::agent::browser_tool::BrowserToolError;
 use crate::notification::{NotificationPayload, NotificationService};
@@ -71,7 +70,7 @@ pub(super) async fn handle_browser_request(
     match request.args {
         crate::agent::browser_tool::BrowserArgs::Status => {
             Ok(crate::agent::browser_tool::BrowserResult {
-                running: browser_manager.is_running().await,
+                running: browser_manager.is_running(),
                 cdp_endpoint: None,
                 page: None,
             })
@@ -102,7 +101,7 @@ pub(super) async fn handle_browser_request(
             })
         }
         crate::agent::browser_tool::BrowserArgs::CdpEndpoint => {
-            if !browser_manager.is_running().await {
+            if !browser_manager.is_running() {
                 return Err(browser_not_running_error());
             }
             Ok(crate::agent::browser_tool::BrowserResult {
