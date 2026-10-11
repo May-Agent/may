@@ -52,7 +52,17 @@ export function McpSection() {
   };
 
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    void listMcpServers()
+      .then((servers) => {
+        if (!cancelled) setItems(servers);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const onSubmit = form.handleSubmit(async (values) => {

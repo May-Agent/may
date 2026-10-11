@@ -42,19 +42,45 @@ transition: [from design guide]
 EOF
 ```
 
-### Step 2: Render to PNG
+### Step 2: Start the Slide Preview
 
-Use the May-managed browser/runtime for rendering. Do not install or manage Playwright browser binaries from the agent side.
+Use the session-scoped Slidev runtime prepared by the main agent. Bun manages the
+dependencies, while Node runs Slidev for compatibility. Do not run `bunx`, install
+packages, or launch a browser process from a slide creator. Fail immediately if
+the prepared runtime is missing.
+
+Start the server with a native `terminal` call using `timeout=0`. Do not use shell
+`&`; retain the returned task id so the server can be stopped after verification.
 
 ```bash
-cd artifacts/temp && bunx @slidev/cli export --format png slide_N.md --timeout 30000
+test -f artifacts/temp/node_modules/@slidev/cli/bin/slidev.mjs
+(cd artifacts/temp && node ../../skills/slide/assets/start_slide_server.mjs slide_N.md slide_N.url)
 ```
 
-This creates `slide_N-001.png`.
+The helper waits for Slidev to become ready, then writes an embedded, control-free
+preview URL to `artifacts/temp/slide_N.url`.
+
+The native terminal call returns as soon as the server becomes a background task.
+Wait for the helper's ready file before reading it:
+
+```bash
+node skills/slide/assets/wait_for_file.mjs artifacts/temp/slide_N.url
+```
+
+This wait is mandatory. Do not read the URL immediately after starting the server,
+and do not replace a missing URL with an empty string or a guessed port.
 
 ### Step 3: View and Verify
 
+Use the shared May-managed browser to capture the slide. The browser command
+persists its screenshot and returns the path as JSON; move that image into the
+temporary slide workspace before viewing it:
+
 ```bash
+url=$(cat artifacts/temp/slide_N.url)
+browser read "$url" --detail brief --screenshot viewport --format json > artifacts/temp/slide_N.browser.json
+image=$(jq -er '.page.screenshot.artifactPath' artifacts/temp/slide_N.browser.json)
+mv "$image" artifacts/temp/slide_N-001.png
 cat artifacts/temp/slide_N-001.png
 ```
 
@@ -70,8 +96,12 @@ The image will be sent to you for visual inspection. Check:
 If the slide doesn't look right:
 1. Identify the issue (layout, spacing, content overflow)
 2. Modify the slide markdown
-3. Re-export and re-verify
+3. Capture the same preview URL again and re-verify
 4. Repeat until satisfied
+
+After the final verification, stop the preview server with `terminal_kill` and
+the task id returned in Step 2. Do not close the shared browser; the main agent
+closes it after all slide creators finish.
 
 ### Step 5: Return Final Markdown
 

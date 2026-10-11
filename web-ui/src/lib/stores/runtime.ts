@@ -72,6 +72,50 @@ const SUBSCRIBED_TOPICS = [
   'request_logs',
 ];
 
+function updateProfileSessionRuntimes(
+  profileSessions: ProfileSessions | null,
+  runtimes: Record<string, SessionRuntimeSummary>,
+): ProfileSessions | null {
+  if (!profileSessions) return null;
+  const update = <T extends { id: string; runtime: SessionRuntimeSummary }>(item: T): T => {
+    const runtime = runtimes[item.id];
+    return runtime ? { ...item, runtime } : item;
+  };
+  return {
+    ...profileSessions,
+    pinned: profileSessions.pinned.map((item) =>
+      item.type === 'session'
+        ? update(item)
+        : { ...item, sessions: item.sessions.map(update) },
+    ),
+    regular: profileSessions.regular.map(update),
+    archived: profileSessions.archived.map(update),
+  };
+}
+
+function findProfileSession(profileSessions: ProfileSessions, sessionId: string) {
+  for (const item of profileSessions.pinned) {
+    if (item.type === 'session') {
+      if (item.id === sessionId) return item;
+      continue;
+    }
+    const nested = item.sessions.find((session) => session.id === sessionId);
+    if (nested) return nested;
+  }
+  return [...profileSessions.regular, ...profileSessions.archived].find(
+    (session) => session.id === sessionId,
+  );
+}
+
+function refreshChangedActiveSession(profileSessions: ProfileSessions) {
+  const sessions = useSessionsStore.getState();
+  const active = sessions.active;
+  if (!active) return;
+  const summary = findProfileSession(profileSessions, active.id);
+  if (!summary?.updated_at || summary.updated_at === active.lastModified) return;
+  void sessions.refreshActive(active.id);
+}
+
 function reduceLifecycle(
   prev: BrowserLifecycleSnapshot,
   event: BrowserLifecycleEvent,
@@ -153,19 +197,31 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
               }
               break;
             }
-            case 'profile_sessions':
-              set({ profileSessions: evt.payload.profileSessions });
+            case 'profile_sessions': {
+              const profileSessions = evt.payload.profileSessions;
+              set({ profileSessions });
+              refreshChangedActiveSession(profileSessions);
               break;
+            }
             case 'session_runtime': {
               const { sessionId, runtime } = evt.payload;
-              set((prev) => ({ runtimes: { ...prev.runtimes, [sessionId]: runtime } }));
+              set((prev) => {
+                const runtimes = { ...prev.runtimes, [sessionId]: runtime };
+                return {
+                  runtimes,
+                  profileSessions: updateProfileSessionRuntimes(prev.profileSessions, runtimes),
+                };
+              });
               useSessionsStore.getState().updateRuntime(sessionId, runtime);
               break;
             }
             case 'session_runtimes': {
               const next: Record<string, SessionRuntimeSummary> = {};
               for (const r of evt.payload.sessions) next[r.sessionId] = r.runtime;
-              set({ runtimes: next });
+              set((prev) => ({
+                runtimes: next,
+                profileSessions: updateProfileSessionRuntimes(prev.profileSessions, next),
+              }));
               const activeId = useSessionsStore.getState().active?.id;
               if (activeId) {
                 const match = evt.payload.sessions.find((r) => r.sessionId === activeId);

@@ -12,6 +12,8 @@ import json from 'react-syntax-highlighter/dist/esm/languages/prism/json';
 import css from 'react-syntax-highlighter/dist/esm/languages/prism/css';
 import markdown from 'react-syntax-highlighter/dist/esm/languages/prism/markdown';
 import oneLight from 'react-syntax-highlighter/dist/esm/styles/prism/one-light';
+import { parseArtifactTags } from '@/lib/artifactTags';
+import { SlidevArtifact } from './SlidevArtifact';
 
 for (const [name, lang] of Object.entries({
   bash,
@@ -38,6 +40,7 @@ for (const [name, lang] of Object.entries({
 interface MessageTextProps {
   text: string;
   streaming?: boolean;
+  sessionId?: string;
 }
 
 const codeBlockStyle: React.CSSProperties = {
@@ -119,11 +122,32 @@ const streamdownComponents = {
   code: InlineCode,
 };
 
-export const MessageText = memo(function MessageText({ text, streaming }: MessageTextProps) {
-  if (text.length === 0) return null;
+export const MessageText = memo(function MessageText({
+  text,
+  streaming,
+  sessionId,
+}: MessageTextProps) {
+  // `<tasks />` is a control tag: the backend independently watches tasks.md
+  // and the PlanBanner renders the canonical document. Do not expose the raw
+  // XML marker as assistant prose.
+  const withoutTasks = text.replace(/<tasks\s*\/>/gi, '');
+  const { visibleText, artifacts } = parseArtifactTags(withoutTasks);
+  if (visibleText.length === 0 && artifacts.length === 0 && !streaming) return null;
   return (
-    <div className="prose prose-sm dark:prose-invert max-w-none">
-      <Streamdown components={streamdownComponents}>{text}</Streamdown>
+    <div>
+      {visibleText.length > 0 && (
+        <div className="prose prose-sm dark:prose-invert max-w-none">
+          <Streamdown components={streamdownComponents}>{visibleText}</Streamdown>
+        </div>
+      )}
+      {sessionId &&
+        artifacts.map((artifact) => (
+          <SlidevArtifact
+            key={`${artifact.type}:${artifact.path}`}
+            sessionId={sessionId}
+            path={artifact.path}
+          />
+        ))}
       {streaming && (
         <span className="inline-block w-1.5 h-3.5 bg-foreground/70 animate-pulse ml-0.5 align-middle" />
       )}
