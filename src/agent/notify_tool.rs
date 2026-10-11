@@ -16,13 +16,15 @@ pub struct NotifyArgs {
     pub title: String,
     /// Notification body text.
     pub body: String,
-    /// Optional target session id for callback routing.
+    /// Optional source session id used to resolve the callback profile.
+    /// Defaults to the current session when invoked through May.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Optional hidden XML context injected on notification click.
+    /// Optional hidden XML system context for the new callback conversation.
     #[serde(default)]
     pub callback_context_xml: Option<XmlBlock>,
-    /// Optional user-visible message sent on notification click.
+    /// Optional welcome message persisted as the first assistant message in
+    /// the new callback conversation.
     #[serde(default)]
     pub callback_message: Option<String>,
 }
@@ -57,15 +59,26 @@ pub fn channel() -> (NotifyBroker, NotifyQueue) {
 #[derive(Clone)]
 pub struct NotifyTool {
     broker: Option<NotifyBroker>,
+    default_session_id: Option<String>,
 }
 
 impl NotifyTool {
     #[must_use]
     pub const fn new(broker: Option<NotifyBroker>) -> Self {
-        Self { broker }
+        Self {
+            broker,
+            default_session_id: None,
+        }
     }
 
-    fn normalize_args(args: NotifyArgs) -> aither_core::Result<NotifyArgs> {
+    /// Sets the source session used to resolve the profile for callback mode.
+    #[must_use]
+    pub fn for_session(mut self, session_id: impl Into<String>) -> Self {
+        self.default_session_id = Some(session_id.into());
+        self
+    }
+
+    fn normalize_args(&self, args: NotifyArgs) -> aither_core::Result<NotifyArgs> {
         if args.title.trim().is_empty() {
             return Err(NotifyToolError::EmptyTitle.into());
         }
@@ -95,7 +108,8 @@ impl NotifyTool {
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned),
+                .map(ToOwned::to_owned)
+                .or_else(|| self.default_session_id.clone()),
             callback_context_xml,
             callback_message,
         })
@@ -110,9 +124,13 @@ impl Tool for NotifyTool {
     type Arguments = NotifyArgs;
     type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let broker = self.broker.as_ref().ok_or(NotifyToolError::Unavailable)?;
-        let args = Self::normalize_args(args)?;
+        let args = self.normalize_args(args)?;
         let response = broker.request(args).await?;
         let result = response.map_err(NotifyToolError::Rejected)?;
 

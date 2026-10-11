@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use aither_core::llm::Tool;
 use aither_sandbox::{
-    BollardContainerExec, Configured, ContainerExecHandle, ContainerLaunchSpec,
-    ContainerShellRuntime, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalResult,
-    TerminalTool, ToolRegistryBuilder, permission::PermissionError,
+    AnyContainerExec, BollardContainerExec, Configured, ContainerLaunchSpec, ContainerShellRuntime,
+    OutputFormat, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, TerminalArgs,
+    TerminalExecutionMode, TerminalMode, TerminalResult, TerminalTool, ToolRegistryBuilder,
+    permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -26,7 +26,7 @@ use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKi
 use crate::container::lifecycle::ContainerManager;
 use crate::db::entity::{profiles, scheduled_tasks};
 use crate::db::{ChatDb, NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
-use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
+use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError};
 use crate::notification::{NotificationPayload, NotificationService};
 use crate::profile::ProfileEnvironment;
 use crate::task_trigger::{
@@ -71,7 +71,7 @@ struct TaskCatalog {
     tasks: Vec<scheduled_tasks::Model>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRunStatus {
     Running,
@@ -399,12 +399,18 @@ impl TaskRuntime {
         self
     }
 
-    pub fn with_network_policy(self, network_policy: NetworkPolicyConfig) -> Result<Self, String> {
+    pub fn with_network_policy(
+        self,
+        network_policy: NetworkPolicyConfig,
+    ) -> Result<Self, NetworkPolicyError> {
         self.set_network_policy(network_policy)?;
         Ok(self)
     }
 
-    pub fn set_network_policy(&self, network_policy: NetworkPolicyConfig) -> Result<(), String> {
+    pub fn set_network_policy(
+        &self,
+        network_policy: NetworkPolicyConfig,
+    ) -> Result<(), NetworkPolicyError> {
         let compiled = network_policy.compile()?;
         self.network_policy.store(Arc::new(compiled));
         Ok(())
@@ -1072,6 +1078,12 @@ impl TaskRuntime {
         let registry =
             Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
+        let network_audit = aither_sandbox::open_network_audit_log(
+            self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
+            crate::config::NETWORK_AUDIT_MAX_FILES,
+        )
+        .await
+        .map_err(|error| init_terminal_tool_error("failed to open network audit log: ", &error))?;
         TerminalTool::new_exact(
             &script.host_working_dir,
             SchedulerPermissionHandler {
@@ -1089,7 +1101,8 @@ impl TaskRuntime {
             init_terminal_tool_error("failed to initialize local terminal tool: ", &error)
         })
         .map(|tool| {
-            tool.with_shell_sessions(shell_sessions)
+            tool.with_network_audit_log(network_audit)
+                .with_shell_sessions(shell_sessions)
                 .with_writable_paths([script.host_working_dir.clone()])
                 .with_readable_paths([script.host_working_dir.clone()])
                 .with_registry(registry)
@@ -1173,7 +1186,7 @@ impl TaskRuntime {
         let container_runtime = ContainerShellRuntime::new(
             container_id.clone(),
             container_manager.runtime().host_gateway().to_string(),
-            ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
+            AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
                 container_manager.runtime().client.clone(),
             )))),
         );
@@ -1306,7 +1319,7 @@ impl TaskRuntime {
         let container_runtime = ContainerShellRuntime::new(
             container_id.clone(),
             container_manager.runtime().host_gateway().to_string(),
-            ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
+            AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
                 container_manager.runtime().client.clone(),
             )))),
         );
@@ -1390,17 +1403,20 @@ async fn run_terminal_command(
     script: String,
 ) -> Result<String, String> {
     let output = terminal_tool
-        .call(TerminalArgs {
-            description: "run the scheduled task script".to_string(),
-            script,
-            mode,
-            ssh_server_id,
-            expect: OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            timeout: 300,
-            max_lines: 800,
-            raw: false,
-        })
+        .call(
+            TerminalArgs {
+                description: "run the scheduled task script".to_string(),
+                script,
+                mode,
+                ssh_server_id,
+                expect: OutputFormat::Text,
+                resolution: aither_sandbox::MediaResolution::Auto,
+                timeout: 300,
+                max_lines: 800,
+                raw: false,
+            },
+            aither_core::llm::ToolContext::new(),
+        )
         .await
         .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
 

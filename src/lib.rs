@@ -4,8 +4,10 @@
 //! with session management, persistent chat history, and sandboxed execution.
 
 pub mod agent;
+pub mod auth_store;
 pub mod browser_service;
 pub mod bundle;
+pub mod chatgpt;
 pub mod config;
 pub mod container;
 pub mod copilot;
@@ -19,7 +21,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model_selector;
 pub mod models;
-pub mod network_policy;
+pub use aither_sandbox::network_policy;
 pub mod notification;
 pub mod profile;
 pub mod prompt_mentions;

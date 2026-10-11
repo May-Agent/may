@@ -1,6 +1,8 @@
 //! Model fetching from provider APIs.
 
-use aither_cloud::{ClaudeProvider, CloudModelProvider, CopilotProvider, GeminiProvider};
+use aither_cloud::{
+    ClaudeProvider, CloudModelProvider, CodexProvider, CopilotProvider, GeminiProvider,
+};
 use aither_core::llm::{LanguageModelProvider, model::Ability};
 use aither_models::lookup as lookup_model_info;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -19,6 +21,10 @@ pub enum ModelFetchError {
     CopilotNotAuthenticated,
     #[error("Copilot auth error: {0}")]
     CopilotAuth(#[from] crate::copilot::CopilotTokenError),
+    #[error("ChatGPT not authenticated")]
+    ChatgptNotAuthenticated,
+    #[error("ChatGPT auth error: {0}")]
+    ChatgptAuth(#[from] crate::chatgpt::ChatgptAuthError),
 }
 
 /// Fetched model info.
@@ -171,6 +177,22 @@ async fn fetch_models_for_provider(
             CopilotProvider::new(credentials.token)
                 .base_url(credentials.api_endpoint)
                 .into()
+        }
+        ProviderType::Chatgpt => {
+            let mut credentials = crate::chatgpt::load_credentials()
+                .await?
+                .ok_or(ModelFetchError::ChatgptNotAuthenticated)?;
+            if credentials.is_expired(std::time::Duration::from_secs(60)) {
+                credentials = aither_codex::auth::refresh_tokens(&credentials.refresh_token)
+                    .await
+                    .map_err(crate::chatgpt::ChatgptAuthError::Codex)?;
+                crate::chatgpt::save_credentials(&credentials).await?;
+            }
+            let mut provider = CodexProvider::new(credentials);
+            if let Some(url) = base_url {
+                provider = provider.with_base_url(url);
+            }
+            provider.into()
         }
         ProviderType::OpenAI
         | ProviderType::OpenRouter

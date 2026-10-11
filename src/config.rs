@@ -53,62 +53,13 @@ use std::path::{Path, PathBuf};
 use crate::model_selector::ModelSelector;
 use crate::network_policy::NetworkPolicyConfig;
 
-/// Infer model tier from aither-models metadata.
-///
-/// Uses model mode, pricing percentiles, and context window as signals.
-#[must_use]
-pub fn get_model_tier(model_id: &str) -> ModelTier {
-    let chat_price_breakpoints = chat_price_breakpoints();
-    aither_models::lookup(model_id).map_or(ModelTier::Balanced, |info| {
-        infer_model_tier(info, chat_price_breakpoints)
-    })
-}
+pub use aither_models::{ModelTier, tier as get_model_tier};
 
-fn chat_price_breakpoints() -> Option<(f64, f64)> {
-    let mut prices = aither_models::models_by_mode(aither_models::ModelMode::Chat)
-        .map(|info| info.pricing().output_per_token())
-        .filter(|price| price.is_finite() && *price > 0.0)
-        .collect::<Vec<_>>();
-    if prices.len() < 3 {
-        return None;
-    }
+/// Directory under `~/.may` where rolling network audit logs are stored.
+pub const NETWORK_AUDIT_LOG_SUBDIR: &str = "logs/network";
 
-    prices.sort_by(f64::total_cmp);
-    let low_index = prices.len() / 3;
-    let high_index = (prices.len() * 2) / 3;
-    Some((prices[low_index], prices[high_index]))
-}
-
-fn infer_model_tier(
-    info: &aither_models::ModelEntry,
-    chat_price_breakpoints: Option<(f64, f64)>,
-) -> ModelTier {
-    match info.mode() {
-        aither_models::ModelMode::ImageGeneration => return ModelTier::ImageGeneration,
-        aither_models::ModelMode::Chat => {}
-        _ => return ModelTier::Balanced,
-    }
-
-    let output_price = info.pricing().output_per_token();
-    if let Some((fast_ceiling, advanced_floor)) = chat_price_breakpoints
-        && output_price.is_finite()
-        && output_price > 0.0
-    {
-        if output_price <= fast_ceiling {
-            return ModelTier::Fast;
-        }
-        if output_price >= advanced_floor {
-            return ModelTier::Advanced;
-        }
-        return ModelTier::Balanced;
-    }
-
-    match info.max_input_tokens() {
-        Some(tokens) if tokens <= 32_768 => ModelTier::Fast,
-        Some(tokens) if tokens >= 200_000 => ModelTier::Advanced,
-        _ => ModelTier::Balanced,
-    }
-}
+/// Number of rotated daily network audit log files retained.
+pub const NETWORK_AUDIT_MAX_FILES: usize = 14;
 
 fn normalize_base_url(url: &str) -> &str {
     url.trim_end_matches('/')
@@ -137,7 +88,7 @@ pub enum ConfigError {
 ///
 /// This represents the type of provider (API format and default base URL).
 /// Users configure individual provider instances with credentials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash, skyzen::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
     /// Anthropic Claude models
@@ -149,6 +100,8 @@ pub enum ProviderType {
     Google,
     /// GitHub Copilot (OAuth, `OpenAI` format)
     Copilot,
+    /// ChatGPT subscription (OAuth, Codex Responses backend)
+    Chatgpt,
     /// `OpenRouter` (aggregator, `OpenAI` format)
     OpenRouter,
     /// `DeepSeek` (`OpenAI` format)
@@ -180,7 +133,12 @@ impl ProviderType {
             Self::XAI => Some(aither_models::Provider::XAI),
             Self::Groq => Some(aither_models::Provider::Groq),
             Self::Together => Some(aither_models::Provider::Together),
-            Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom | Self::Copilot => None,
+            Self::OpenRouter
+            | Self::Ollama
+            | Self::LMStudio
+            | Self::Custom
+            | Self::Copilot
+            | Self::Chatgpt => None,
         }
     }
 
@@ -192,6 +150,7 @@ impl ProviderType {
                     | aither_models::Provider::Anthropic
                     | aither_models::Provider::Copilot
             ),
+            Self::Chatgpt => matches!(provider, aither_models::Provider::OpenAI),
             _ => self
                 .catalog_provider()
                 .is_some_and(|expected| expected == *provider),
@@ -217,6 +176,7 @@ impl ProviderType {
         Self::OpenAI,
         Self::Google,
         Self::Copilot,
+        Self::Chatgpt,
         Self::OpenRouter,
         Self::DeepSeek,
         Self::Ollama,
@@ -236,6 +196,7 @@ impl ProviderType {
             Self::OpenAI => "OpenAI (GPT)",
             Self::Google => "Google (Gemini)",
             Self::Copilot => "GitHub Copilot",
+            Self::Chatgpt => "ChatGPT (subscription)",
             Self::OpenRouter => "OpenRouter",
             Self::DeepSeek => "DeepSeek",
             Self::Ollama => "Ollama (Local)",
@@ -256,6 +217,7 @@ impl ProviderType {
             Self::OpenAI => "openai",
             Self::Google => "google",
             Self::Copilot => "copilot",
+            Self::Chatgpt => "chatgpt",
             Self::OpenRouter => "openrouter",
             Self::DeepSeek => "deepseek",
             Self::Ollama => "ollama",
@@ -286,6 +248,7 @@ impl ProviderType {
             Self::OpenAI => Some("https://api.openai.com/v1"),
             Self::Google => Some("https://generativelanguage.googleapis.com/v1beta"),
             Self::Copilot => Some("https://api.githubcopilot.com"),
+            Self::Chatgpt => Some("https://chatgpt.com/backend-api/codex"),
             Self::OpenRouter => Some("https://openrouter.ai/api/v1"),
             Self::DeepSeek => Some("https://api.deepseek.com/v1"),
             Self::Ollama => Some("http://localhost:11434/v1"),
@@ -306,6 +269,7 @@ impl ProviderType {
             Self::OpenAI => "openai",
             Self::Google => "google",
             Self::Copilot => "copilot",
+            Self::Chatgpt => "chatgpt",
             Self::DeepSeek => "deepseek",
             Self::Mistral => "mistral",
             Self::XAI => "xai",
@@ -321,7 +285,7 @@ impl ProviderType {
     pub const fn requires_api_key(self) -> bool {
         !matches!(
             self,
-            Self::Ollama | Self::LMStudio | Self::Copilot | Self::Custom
+            Self::Ollama | Self::LMStudio | Self::Copilot | Self::Chatgpt | Self::Custom
         )
     }
 
@@ -334,7 +298,7 @@ impl ProviderType {
     /// Whether this provider type uses OAuth authentication.
     #[must_use]
     pub const fn uses_oauth(self) -> bool {
-        matches!(self, Self::Copilot)
+        matches!(self, Self::Copilot | Self::Chatgpt)
     }
 
     /// Parse provider type from an ID string.
@@ -346,6 +310,7 @@ impl ProviderType {
             "openai" | "gpt" => Self::OpenAI,
             "google" | "gemini" => Self::Google,
             "copilot" | "github" => Self::Copilot,
+            "chatgpt" | "codex" => Self::Chatgpt,
             "openrouter" => Self::OpenRouter,
             "deepseek" => Self::DeepSeek,
             "ollama" => Self::Ollama,
@@ -366,11 +331,10 @@ impl ProviderType {
     /// by any native provider.
     #[must_use]
     pub fn can_serve_model(self, model_id: &str) -> bool {
-        if self == Self::OpenRouter
-            || self == Self::Ollama
-            || self == Self::LMStudio
-            || self == Self::Custom
-        {
+        if matches!(
+            self,
+            Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom | Self::Chatgpt
+        ) {
             return true;
         }
 
@@ -394,48 +358,29 @@ pub enum ApiFormat {
     Gemini,
 }
 
-/// Model tier preference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelTier {
-    /// Flagship models - highest capability
-    Advanced,
-    /// Balanced models - good capability/cost ratio
-    #[default]
-    Balanced,
-    /// Fast models - optimized for speed
-    Fast,
-    /// Image generation models
-    ImageGeneration,
+/// Provider-native hosted tool toggles.
+///
+/// These enable server-side tools the provider executes instead of the
+/// harness. When a hosted equivalent is active for the resolved provider, the
+/// matching `websearch` / `webfetch` terminal command is not registered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NativeToolsConfig {
+    /// Hosted web search (`OpenAI` `web_search`, Claude `web_search`, Gemini
+    /// `google_search`). Only takes effect when the model reports the
+    /// `web_search` ability.
+    #[serde(default)]
+    pub web_search: bool,
+    /// Hosted URL fetch (Claude `web_fetch`, Gemini `url_context`). `OpenAI`
+    /// has no standalone fetch tool, so `webfetch` stays registered there.
+    #[serde(default)]
+    pub web_fetch: bool,
 }
 
-impl ModelTier {
-    /// All tiers for iteration.
-    pub const ALL: &'static [Self] = &[
-        Self::Advanced,
-        Self::Balanced,
-        Self::Fast,
-        Self::ImageGeneration,
-    ];
-
+impl NativeToolsConfig {
+    /// Returns true when no hosted tools are enabled.
     #[must_use]
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::Advanced => "Advanced (Flagship)",
-            Self::Balanced => "Balanced",
-            Self::Fast => "Fast",
-            Self::ImageGeneration => "Image Generation",
-        }
-    }
-
-    #[must_use]
-    pub const fn short_name(self) -> &'static str {
-        match self {
-            Self::Advanced => "advanced",
-            Self::Balanced => "balanced",
-            Self::Fast => "fast",
-            Self::ImageGeneration => "image",
-        }
+    pub const fn is_empty(&self) -> bool {
+        !self.web_search && !self.web_fetch
     }
 }
 
@@ -452,6 +397,9 @@ pub struct ProviderInstance {
     /// API key (not needed for Ollama/Copilot)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Provider-native hosted tool toggles.
+    #[serde(default, skip_serializing_if = "NativeToolsConfig::is_empty")]
+    pub native_tools: NativeToolsConfig,
     /// Base URL override (required for Custom, optional for others)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -472,6 +420,7 @@ impl Default for ProviderInstance {
         Self {
             provider_type: None,
             api_key: None,
+            native_tools: NativeToolsConfig::default(),
             base_url: None,
             display_name: None,
             enabled: true,
@@ -679,7 +628,7 @@ impl ModelsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
 pub struct SshServerConfig {
     pub name: String,
     pub target: String,
@@ -741,7 +690,7 @@ fn default_ui_theme() -> String {
 /// manages. The runtime may be provisioned locally by May or exposed through a
 /// remote CDP endpoint. Agents use the May-managed `browser` command and must
 /// not install or manage browser binaries themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserBackendKind {
     Managed,
@@ -1123,7 +1072,7 @@ impl MayConfig {
     #[must_use]
     pub fn available_models(&self) -> Vec<AvailableModel> {
         let mut models = Vec::new();
-        let chat_price_breakpoints = chat_price_breakpoints();
+        let registry = aither_models::ModelRegistry::bundled();
 
         for (id, instance) in &self.provider {
             if !instance.is_valid(id) {
@@ -1142,7 +1091,7 @@ impl MayConfig {
                         selector: ModelSelector::new(id, info.id()),
                         id: info.id().to_string(),
                         provider_id: id.clone(),
-                        tier: Some(infer_model_tier(info, chat_price_breakpoints)),
+                        tier: Some(registry.tier_of(info)),
                     });
                 }
                 continue;
@@ -1167,7 +1116,7 @@ impl MayConfig {
                     selector: ModelSelector::new(id, info.id()),
                     id: info.id().to_string(),
                     provider_id: id.clone(),
-                    tier: Some(infer_model_tier(info, chat_price_breakpoints)),
+                    tier: Some(registry.tier_of(info)),
                 });
             }
         }

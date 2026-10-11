@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aither_sandbox::{BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec};
+use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
 use crate::agent::AgentEnvironment;
 use crate::container::ContainerRuntime;
@@ -87,7 +87,7 @@ pub async fn resolve_agent_environment_for_session(
         .await
         .map_err(ResolveAgentEnvironmentError::StartContainer)?;
 
-    let container_exec = ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
+    let container_exec = AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
         container_manager.runtime().client.clone(),
     ))));
 
@@ -95,6 +95,6 @@ pub async fn resolve_agent_environment_for_session(
         container_id,
         container_ipc_host: container_manager.runtime().host_gateway().to_string(),
         container_exec,
-        browser_backend: None,
+        browser_cdp_endpoint: None,
     })
 }

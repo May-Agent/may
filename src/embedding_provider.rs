@@ -233,7 +233,9 @@ pub async fn resolve_embedding_model(
 
 fn embedding_support(provider_type: ProviderType) -> EmbeddingSupport {
     match provider_type {
-        ProviderType::Anthropic | ProviderType::Copilot => EmbeddingSupport::Unsupported,
+        ProviderType::Anthropic | ProviderType::Copilot | ProviderType::Chatgpt => {
+            EmbeddingSupport::Unsupported
+        }
         ProviderType::OpenAI | ProviderType::Google => EmbeddingSupport::Trusted,
         ProviderType::OpenRouter
         | ProviderType::DeepSeek
@@ -291,7 +293,7 @@ fn instantiate_embedding_provider(
             }
             Ok(CloudEmbedder::from(client))
         }
-        ProviderType::Anthropic | ProviderType::Copilot => {
+        ProviderType::Anthropic | ProviderType::Copilot | ProviderType::Chatgpt => {
             Err(EmbeddingProviderError::NoSupportingProvider {
                 model_id: embedding_model.to_string(),
             })
