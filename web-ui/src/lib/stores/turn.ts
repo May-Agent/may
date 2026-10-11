@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { ApiMessage, ChatRequestPayload, ChatStreamEvent } from '../types';
-import { openChatStream } from '../api/chat';
+import { openChatStream, stopSession } from '../api/chat';
 import {
   applyEvent,
   emptyTurn,
@@ -48,11 +48,13 @@ interface TurnSliceState {
   last: TurnState | null;
   /** Aborts the current stream. */
   abort: (() => void) | null;
+  /** Keeps the composer locked until the backend has fully settled a stop request. */
+  stopping: boolean;
   /** Payload of the most recent send — used to retry after an error. */
   lastPayload: ChatRequestPayload | null;
 
   send: (payload: ChatRequestPayload) => Promise<void>;
-  cancel: () => void;
+  cancel: () => Promise<void>;
   retry: () => Promise<void>;
   dismissError: () => void;
 }
@@ -61,16 +63,18 @@ export const useTurnStore = create<TurnSliceState>((set, get) => ({
   active: null,
   last: null,
   abort: null,
+  stopping: false,
   lastPayload: null,
 
   async send(payload) {
-    get().cancel();
+    await get().cancel();
 
     // Seed a placeholder turn so the UI paints immediately.
     set({
       active: emptyTurn('', payload.sessionId, ''),
       last: null,
       abort: null,
+      stopping: false,
       lastPayload: payload,
     });
 
@@ -89,6 +93,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => ({
           },
           status: 'done',
         },
+        stopping: false,
       });
       return;
     }
@@ -109,6 +114,14 @@ export const useTurnStore = create<TurnSliceState>((set, get) => ({
         }
       }
     } catch (err) {
+      if (get().stopping) {
+        set((prev) => ({
+          active: null,
+          last: prev.active ? { ...prev.active, status: 'done' } : prev.last,
+          abort: null,
+        }));
+        return;
+      }
       set((prev) => {
         const base = prev.active ?? emptyTurn('', payload.sessionId, '');
         return {
@@ -123,6 +136,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => ({
             status: 'done',
           },
           abort: null,
+          stopping: false,
         };
       });
       return;
@@ -153,10 +167,30 @@ export const useTurnStore = create<TurnSliceState>((set, get) => ({
     }
   },
 
-  cancel() {
-    const { abort } = get();
-    if (abort) abort();
-    set({ abort: null });
+  async cancel() {
+    const { active, stopping } = get();
+    if (!active || stopping) return;
+
+    set({ stopping: true });
+    try {
+      await stopSession(active.sessionId);
+      get().abort?.();
+      set({ abort: null, stopping: false });
+    } catch (err) {
+      set((prev) => ({
+        active: prev.active
+          ? {
+              ...prev.active,
+              error: {
+                code: 'internal_error',
+                message: err instanceof Error ? err.message : String(err),
+                retryable: true,
+              },
+            }
+          : null,
+        stopping: false,
+      }));
+    }
   },
 
   async retry() {
