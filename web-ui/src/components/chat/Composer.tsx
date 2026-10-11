@@ -11,7 +11,7 @@ import { ThinkingPicker } from './ThinkingPicker';
 interface ComposerProps {
   disabled?: boolean;
   streaming?: boolean;
-  onSend: (text: string, attachments: ApiAttachment[], deliveryMode: 'immediate' | 'queue') => void;
+  onSend: (text: string, attachments: ApiAttachment[], deliveryMode: 'steer' | 'queue') => void;
   onCancel: () => void;
   sessionId: string;
   currentModel: string;
@@ -61,7 +61,7 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState('');
   const [attachments, setAttachments] = useState<ApiAttachment[]>([]);
-  const [deliveryMode, setDeliveryMode] = useState<'immediate' | 'queue'>('immediate');
+  const [deliveryMode, setDeliveryMode] = useState<'steer' | 'queue'>('steer');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { t } = useTranslation();
@@ -80,7 +80,7 @@ export function Composer({
     onSend(trimmed, attachments, deliveryMode);
     setValue('');
     setAttachments([]);
-    setDeliveryMode('immediate');
+    setDeliveryMode('steer');
   }, [value, attachments, deliveryMode, disabled, onSend]);
 
   const addFiles = async (files: FileList | File[]) => {
@@ -188,7 +188,7 @@ export function Composer({
                   variant={deliveryMode === 'queue' ? 'secondary' : 'ghost'}
                   type="button"
                   onClick={() =>
-                    setDeliveryMode((m) => (m === 'queue' ? 'immediate' : 'queue'))
+                    setDeliveryMode((m) => (m === 'queue' ? 'steer' : 'queue'))
                   }
                   aria-label={t('composer.queued')}
                 >

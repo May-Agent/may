@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MapPin } from 'lucide-react';
 import { toast } from 'sonner';
@@ -54,9 +54,10 @@ export function NewProfileDialog({ open, onOpenChange }: NewProfileDialogProps) 
   const [draft, setDraft] = useState<DraftState>(EMPTY_DRAFT);
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    if (!open) setDraft(EMPTY_DRAFT);
-  }, [open]);
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) setDraft(EMPTY_DRAFT);
+    onOpenChange(nextOpen);
+  };
 
   const set = <K extends keyof DraftState>(key: K, value: DraftState[K]) =>
     setDraft((prev) => ({ ...prev, [key]: value }));
@@ -78,7 +79,7 @@ export function NewProfileDialog({ open, onOpenChange }: NewProfileDialogProps) 
         locationAware: draft.locationAware,
       });
       navigate(profilePath(created.id));
-      onOpenChange(false);
+      handleOpenChange(false);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
@@ -87,7 +88,7 @@ export function NewProfileDialog({ open, onOpenChange }: NewProfileDialogProps) 
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle>{t('profile.newDialog.title')}</DialogTitle>
@@ -164,7 +165,7 @@ export function NewProfileDialog({ open, onOpenChange }: NewProfileDialogProps) 
           <Button
             size="sm"
             variant="ghost"
-            onClick={() => onOpenChange(false)}
+            onClick={() => handleOpenChange(false)}
             disabled={busy}
           >
             {t('profile.newDialog.cancel')}

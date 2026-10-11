@@ -12,10 +12,17 @@ import {
 } from 'lucide-react';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
-import { artifactPreviewUrl, listArtifacts, openArtifactStream } from '@/lib/api/artifacts';
+import {
+  artifactPreviewUrl,
+  artifactRuntimePreviewUrl,
+  listArtifacts,
+  openArtifactStream,
+} from '@/lib/api/artifacts';
 import { useTranslation } from '@/lib/i18n';
 import type { ArtifactEntry } from '@/lib/types';
 import { cn } from '@/lib/utils';
+import { useArtifactValidation } from '@/lib/useArtifactValidation';
+import { ArtifactValidationStatus } from './ArtifactValidationStatus';
 
 interface ArtifactsDrawerProps {
   sessionId: string;
@@ -167,19 +174,7 @@ function ArtifactPreview({ sessionId, entry }: { sessionId: string; entry: Artif
     );
   }
   if (kind === 'html') {
-    return (
-      <div className="flex h-full flex-col">
-        <iframe
-          src={url}
-          title={entry.name}
-          sandbox="allow-same-origin"
-          className="h-full w-full flex-1 border-0 bg-background"
-        />
-        <div className="border-t border-border p-3">
-          <PreviewActions url={url} name={entry.name} />
-        </div>
-      </div>
-    );
+    return <HtmlArtifactPreview sessionId={sessionId} entry={entry} downloadUrl={url} />;
   }
   if (kind === 'text' || kind === 'markdown' || kind === 'code') {
     return <TextPreview sessionId={sessionId} entry={entry} url={url} kind={kind} />;
@@ -190,6 +185,43 @@ function ArtifactPreview({ sessionId, entry }: { sessionId: string; entry: Artif
       <File className="size-8 opacity-40" />
       <span>Preview isn’t available for this file type.</span>
       <PreviewActions url={url} name={entry.name} />
+    </div>
+  );
+}
+
+function HtmlArtifactPreview({
+  sessionId,
+  entry,
+  downloadUrl,
+}: {
+  sessionId: string;
+  entry: ArtifactEntry;
+  downloadUrl: string;
+}) {
+  const artifactType = 'html';
+  const runtimeUrl = artifactRuntimePreviewUrl(sessionId, entry.path, artifactType);
+  const { diagnostics, iframeRef, repairScheduled } = useArtifactValidation({
+    sessionId,
+    path: entry.path,
+    artifactType,
+  });
+  return (
+    <div className="flex h-full flex-col">
+      <iframe
+        ref={iframeRef}
+        src={runtimeUrl}
+        title={entry.name}
+        sandbox="allow-scripts"
+        className="h-full w-full flex-1 border-0 bg-background"
+      />
+      <ArtifactValidationStatus
+        diagnostics={diagnostics}
+        repairScheduled={repairScheduled}
+        pendingLabel="Waiting for artifact runtime validation…"
+      />
+      <div className="border-t border-border p-3">
+        <PreviewActions url={downloadUrl} name={entry.name} />
+      </div>
     </div>
   );
 }

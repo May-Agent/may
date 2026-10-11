@@ -39,6 +39,7 @@ export function AssistantTurn({ turn, reasoningEnabled = false }: AssistantTurnP
               key={`t-${idx}-${segment.seq}`}
               text={segment.text}
               streaming={streaming && isTail}
+              sessionId={turn.sessionId}
             />
           );
         }

@@ -27,6 +27,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const active = useSessionsStore((s) => s.active);
   const appendMessage = useSessionsStore((s) => s.appendMessage);
   const activeTurn = useTurnStore((s) => s.active);
+  const stopping = useTurnStore((s) => s.stopping);
   const lastTurn = useTurnStore((s) => s.last);
   const send = useTurnStore((s) => s.send);
   const cancel = useTurnStore((s) => s.cancel);
@@ -83,7 +84,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     );
   }
 
-  const streaming = activeTurn !== null;
+  const streaming = activeTurn !== null || stopping;
   const configUsable = !configLoaded || isConfigUsable(config);
   const reasoningEnabled =
     typeof active.reasoningEffort === 'string' &&
@@ -95,7 +96,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const handleSend = async (
     content: string,
     attachments: ApiAttachment[],
-    deliveryMode: 'immediate' | 'queue',
+    deliveryMode: 'steer' | 'queue',
   ) => {
     const userMessage = {
       id: `local-${Date.now()}`,
@@ -108,12 +109,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // Sending a new message is an explicit user intent to follow the tail.
     stickyBottomRef.current = true;
 
-    if (deliveryMode === 'queue' && streaming) {
+    if (streaming) {
       await enqueueMessage({
         sessionId,
         content,
         attachments,
-        deliveryMode: 'queue',
+        deliveryMode,
       });
       return;
     }
@@ -150,7 +151,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 />
               );
             }
-            return <PersistedAssistant key={msg.id} message={msg} />;
+            return <PersistedAssistant key={msg.id} message={msg} sessionId={active.id} />;
           })}
           {activeTurn && (
             <AssistantTurn turn={activeTurn} reasoningEnabled={reasoningEnabled} />
@@ -196,7 +197,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             disabled={!configUsable}
             streaming={streaming}
             onSend={handleSend}
-            onCancel={cancel}
+            onCancel={() => void cancel()}
             sessionId={active.id}
             currentModel={active.model}
             currentReasoningEffort={active.reasoningEffort}
