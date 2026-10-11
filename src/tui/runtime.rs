@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aither_core::llm::model::ReasoningEffort;
+use aither_core::llm::{Attachment as LlmAttachment, model::ReasoningEffort};
 use async_channel::Sender;
 use base64::Engine;
 use executor_core::{DefaultExecutor, spawn};
@@ -57,6 +57,8 @@ pub enum TuiRuntimeError {
     Agent(#[from] aither_agent::AgentError),
     #[error("Failed to convert attachment path to URL: {path}")]
     AttachmentPathToUrl { path: std::path::PathBuf },
+    #[error("Unable to determine attachment MIME type: {path}")]
+    UnknownAttachmentMediaType { path: std::path::PathBuf },
     #[error("Failed to serialize paste XML: {0}")]
     SerializePasteXml(#[source] quick_xml::SeError),
     #[error("invalid data URL")]
@@ -1058,7 +1060,7 @@ impl SelectedModel {
 
 fn prepare_message_content(
     msg: &PendingMessage,
-) -> Result<(String, Vec<url::Url>), TuiRuntimeError> {
+) -> Result<(String, Vec<LlmAttachment>), TuiRuntimeError> {
     let mut parts = vec![msg.content.clone()];
     let mut attachment_urls = Vec::new();
 
@@ -1070,7 +1072,12 @@ fn prepare_message_content(
                         path: path.to_path_buf(),
                     }
                 })?;
-                attachment_urls.push(url);
+                let media_type = mime_guess::from_path(path).first().ok_or_else(|| {
+                    TuiRuntimeError::UnknownAttachmentMediaType {
+                        path: path.to_path_buf(),
+                    }
+                })?;
+                attachment_urls.push(LlmAttachment::new(url, media_type));
             }
             Attachment::FileReference { path } => {
                 parts.push(format!("\n[File reference: {}]", path.display()));

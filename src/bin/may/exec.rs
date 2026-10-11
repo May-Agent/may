@@ -51,7 +51,7 @@ pub enum ExecError {
     #[error("failed to load May config: {0}")]
     LoadConfig(may_agent::config::ConfigError),
     #[error("failed to compile network policy: {0}")]
-    CompileNetworkPolicy(String),
+    CompileNetworkPolicy(aither_sandbox::NetworkPolicyError),
     #[error("failed to create terminal tool: {0}")]
     CreateTerminalTool(aither_sandbox::TerminalError),
     #[error("failed to initialize tool dispatch runtime: {0}")]
@@ -336,7 +336,17 @@ async fn build_exec_terminal_tool(
             executor_core::DefaultExecutor,
         )
         .await
-        .map_err(ExecError::CreateTerminalTool)?;
+        .map_err(ExecError::CreateTerminalTool)?
+        .with_network_audit_log(
+            aither_sandbox::open_network_audit_log(
+                context
+                    .may_dir
+                    .join(may_agent::config::NETWORK_AUDIT_LOG_SUBDIR),
+                may_agent::config::NETWORK_AUDIT_MAX_FILES,
+            )
+            .await
+            .map_err(ExecError::CreateTerminalTool)?,
+        );
 
     let terminal_tool = match environment {
         may_agent::AgentEnvironment::Container {
@@ -402,6 +412,9 @@ where
         &mut builder,
         SharedTerminalCommandConfig {
             llm,
+            ask_flagship: None,
+            ask_balanced: None,
+            ask_fast: None,
             session_id: context.session_id.as_str().to_string(),
             may_dir: context.may_dir.clone(),
             sandbox_dir: context.sandbox_dir.clone(),
@@ -419,6 +432,9 @@ where
             register_subagents_broker: None,
             workspace_request_broker: None,
             terminal_tool_factory: Some(terminal_tool_factory),
+            // exec runs scripts without a model turn, so no provider-hosted
+            // web tools exist here and the commands must stay registered.
+            request_parameters: aither_core::llm::model::Parameters::default(),
         },
     )
     .await
