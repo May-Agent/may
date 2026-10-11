@@ -91,9 +91,12 @@ impl App {
                         .collect();
                     state.edit_mode = ConfigEditMode::List { items, selected: 0 };
                 } else if let Some(id) = state.provider_ids.get(state.selected).cloned() {
-                    // For Copilot, start OAuth flow
+                    // OAuth providers restart their login flow on Enter.
                     if id == "copilot" {
                         return Ok(Some(SendAction::StartCopilotAuth));
+                    }
+                    if id == "chatgpt" {
+                        return Ok(Some(SendAction::StartChatgptAuth));
                     }
                     // Check if this is a custom provider (has base_url)
                     let instance = self.config.provider.get(&id);
@@ -180,6 +183,11 @@ impl App {
                         if *provider_type == ProviderType::Copilot {
                             state.edit_mode = ConfigEditMode::None;
                             return Ok(Some(SendAction::StartCopilotAuth));
+                        }
+                        // For ChatGPT, start subscription OAuth
+                        if *provider_type == ProviderType::Chatgpt {
+                            state.edit_mode = ConfigEditMode::None;
+                            return Ok(Some(SendAction::StartChatgptAuth));
                         }
                         // For Custom provider, need name + base_url + api_key
                         if *provider_type == ProviderType::Custom {

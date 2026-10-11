@@ -26,6 +26,8 @@ pub enum AppMode {
     TierModelPicker,
     /// GitHub Copilot OAuth authentication
     CopilotAuth,
+    /// ChatGPT subscription OAuth authentication
+    ChatgptAuth,
     /// Permission approval dialog for elevated terminal modes.
     PermissionConfirm(PermissionConfirmState),
     /// Workspace access confirmation dialog
@@ -163,6 +165,25 @@ pub enum CopilotAuthStatus {
     /// Requesting device code from GitHub
     RequestingCode,
     /// Waiting for user to authorize in browser
+    WaitingForUser {
+        user_code: String,
+        verification_uri: String,
+    },
+    /// Successfully authenticated
+    Success,
+    /// Authentication failed
+    Failed(String),
+}
+
+/// Status of ChatGPT OAuth authentication flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatgptAuthStatus {
+    /// Talking to the OpenAI auth service (requesting a device code).
+    Working,
+    /// Browser flow: waiting for the user to authorize; the loopback listener
+    /// on localhost:1455 will receive the callback.
+    WaitingForCallback { url: String },
+    /// Device flow (SSH/headless): user authorizes on the verification page.
     WaitingForUser {
         user_code: String,
         verification_uri: String,
@@ -451,6 +472,7 @@ pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'stat
         ProviderType::Mistral => &["MISTRAL_API_KEY"][..],
         ProviderType::XAI => &["XAI_API_KEY", "GROK_API_KEY"][..],
         ProviderType::Copilot
+        | ProviderType::Chatgpt
         | ProviderType::Ollama
         | ProviderType::LMStudio
         | ProviderType::Custom => return None,

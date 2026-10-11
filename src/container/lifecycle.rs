@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use aither_sandbox::{ContainerLaunchSpec, MountAccess};
 use arc_swap::ArcSwap;
-use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum};
+use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
     StopContainerOptionsBuilder,
@@ -257,7 +257,7 @@ impl ContainerManager {
             Mount {
                 target: Some("/workspace".to_string()),
                 source: Some(spec.workspace.display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
+                typ: Some(MountType::BIND),
                 read_only: Some(false),
                 ..Default::default()
             },
@@ -265,7 +265,7 @@ impl ContainerManager {
             Mount {
                 target: Some("/root/.may/MEMORY.md".to_string()),
                 source: Some(shared_paths.memory_file.display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
+                typ: Some(MountType::BIND),
                 read_only: Some(false),
                 ..Default::default()
             },
@@ -273,14 +273,14 @@ impl ContainerManager {
             Mount {
                 target: Some("/root/.may/skills".to_string()),
                 source: Some(spec.workspace.join("skills").display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
+                typ: Some(MountType::BIND),
                 read_only: Some(false),
                 ..Default::default()
             },
             Mount {
                 target: Some("/root/.may/subagents".to_string()),
                 source: Some(spec.workspace.join("subagents").display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
+                typ: Some(MountType::BIND),
                 read_only: Some(false),
                 ..Default::default()
             },
@@ -290,7 +290,7 @@ impl ContainerManager {
             mounts.push(Mount {
                 target: Some(mount.container_path.display().to_string()),
                 source: Some(mount.host_path.display().to_string()),
-                typ: Some(MountTypeEnum::BIND),
+                typ: Some(MountType::BIND),
                 read_only: Some(mount.access == MountAccess::ReadOnly),
                 ..Default::default()
             });

@@ -598,6 +598,9 @@ where
                     Some(SendAction::StartCopilotAuth) => {
                         run_copilot_auth(app, events, terminal).await?;
                     }
+                    Some(SendAction::StartChatgptAuth) => {
+                        run_chatgpt_auth(app, events, terminal).await?;
+                    }
                     Some(SendAction::SwitchModel(model)) => {
                         if let Err(e) = runtime_deps.switch_model(app, worker, &model).await {
                             let err_msg = format!("Failed to switch model: {e}");
@@ -620,6 +623,17 @@ where
                             if let Err(e) = app.config.clone().save().await {
                                 tracing::warn!("Failed to save config: {}", e);
                             }
+                        }
+                    }
+                    Some(SendAction::OpenChatgptAuthUrl { url, code }) => {
+                        if !code.is_empty()
+                            && let Ok(mut clipboard) = arboard::Clipboard::new()
+                            && let Err(e) = clipboard.set_text(&code)
+                        {
+                            tracing::warn!("Failed to copy code to clipboard: {}", e);
+                        }
+                        if let Err(e) = open::that(&url) {
+                            tracing::warn!("Failed to open URL in browser: {}", e);
                         }
                     }
                     Some(SendAction::OpenCopilotAuthUrl { url, code }) => {
@@ -846,7 +860,8 @@ where
         Ok(dc) => dc,
         Err(e) => {
             app.copilot_auth_failed(e.to_string());
-            wait_for_auth_dismiss(app, events, terminal).await?;
+            wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::CopilotAuth)
+                .await?;
             return Ok(());
         }
     };
@@ -901,7 +916,13 @@ where
             Ok(token) => {
                 if let Err(e) = save_copilot_token(&token).await {
                     app.copilot_auth_failed(format!("Failed to save token: {e}"));
-                    wait_for_auth_dismiss(app, events, terminal).await?;
+                    wait_for_auth_dismiss(
+                        app,
+                        events,
+                        terminal,
+                        may_agent::tui::AppMode::CopilotAuth,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 let instance = may_agent::config::ProviderInstance::new(
@@ -913,7 +934,8 @@ where
                     tracing::error!("Failed to save config: {}", e);
                 }
                 app.copilot_auth_success();
-                wait_for_auth_dismiss(app, events, terminal).await?;
+                wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::CopilotAuth)
+                    .await?;
                 return Ok(());
             }
             Err(aither_copilot::CopilotError::AuthorizationPending) => {
@@ -922,11 +944,208 @@ where
             }
             Err(e) => {
                 app.copilot_auth_failed(e.to_string());
-                wait_for_auth_dismiss(app, events, terminal).await?;
+                wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::CopilotAuth)
+                    .await?;
                 return Ok(());
             }
         }
     }
+}
+
+/// Run the ChatGPT subscription OAuth flow.
+///
+/// Uses the PKCE browser loopback on localhost:1455. Over SSH (where the
+/// redirect cannot reach this machine) or when the listener fails to bind,
+/// falls back to OpenAI's device-authorization flow.
+async fn run_chatgpt_auth<B: Backend>(
+    app: &mut App,
+    events: &mut EventHandler,
+    terminal: &mut Terminal<B>,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    use aither_codex::auth;
+
+    app.start_chatgpt_auth();
+    terminal.draw(|frame| ui::render(frame, app))?;
+
+    let over_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    if over_ssh {
+        return run_chatgpt_device_auth(app, events, terminal).await;
+    }
+
+    let pkce = auth::Pkce::generate();
+    let url = pkce.authorize_url();
+    app.set_chatgpt_auth_url(url.clone());
+    terminal.draw(|frame| ui::render(frame, app))?;
+    if let Err(e) = open::that(&url) {
+        tracing::warn!("Failed to open browser: {e}");
+    }
+
+    let listener = auth::listen_for_callback(pkce.state());
+    tokio::pin!(listener);
+
+    let code = loop {
+        tokio::select! {
+            result = &mut listener => match result {
+                Ok(code) => break code,
+                Err(e) => {
+                    tracing::warn!(
+                        "OAuth loopback listener failed, falling back to device flow: {e}"
+                    );
+                    app.start_chatgpt_auth();
+                    return run_chatgpt_device_auth(app, events, terminal).await;
+                }
+            },
+            event = events.next() => match event {
+                Some(event) => {
+                    if let Some(action) = app.handle_event(event)? {
+                        match action {
+                            SendAction::Quit => return Ok(()),
+                            SendAction::OpenChatgptAuthUrl { url, .. } => {
+                                if let Err(e) = open::that(&url) {
+                                    tracing::warn!("Failed to open URL in browser: {e}");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !matches!(app.mode, may_agent::tui::AppMode::ChatgptAuth) {
+                        return Ok(());
+                    }
+                    terminal.draw(|frame| ui::render(frame, app))?;
+                }
+                None => return Ok(()),
+            }
+        }
+    };
+
+    let credentials = match auth::exchange_code(&code, pkce.verifier()).await {
+        Ok(credentials) => credentials,
+        Err(e) => {
+            app.chatgpt_auth_failed(e.to_string());
+            wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::ChatgptAuth)
+                .await?;
+            return Ok(());
+        }
+    };
+    finish_chatgpt_auth(app, events, terminal, credentials).await
+}
+
+/// Device-authorization variant of the ChatGPT OAuth flow.
+async fn run_chatgpt_device_auth<B: Backend>(
+    app: &mut App,
+    events: &mut EventHandler,
+    terminal: &mut Terminal<B>,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    use aither_codex::auth;
+
+    let device = match auth::request_device_code().await {
+        Ok(device) => device,
+        Err(e) => {
+            app.chatgpt_auth_failed(e.to_string());
+            wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::ChatgptAuth)
+                .await?;
+            return Ok(());
+        }
+    };
+    app.set_chatgpt_device_code(
+        device.user_code.clone(),
+        aither_codex::constant::DEVICE_VERIFICATION_URL.to_string(),
+    );
+    terminal.draw(|frame| ui::render(frame, app))?;
+
+    let poll_interval = std::time::Duration::from_secs(
+        device
+            .interval
+            .as_deref()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(5)
+            .max(3),
+    );
+
+    let (code, verifier) = loop {
+        let deadline = tokio::time::Instant::now() + poll_interval;
+
+        loop {
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if timeout.is_zero() {
+                break;
+            }
+            let event_timeout = timeout.min(std::time::Duration::from_millis(100));
+            match tokio::time::timeout(event_timeout, events.next()).await {
+                Ok(Some(event)) => {
+                    if let Some(action) = app.handle_event(event)?
+                        && let SendAction::Quit = action
+                    {
+                        return Ok(());
+                    }
+                    if !matches!(app.mode, may_agent::tui::AppMode::ChatgptAuth) {
+                        return Ok(());
+                    }
+                    terminal.draw(|frame| ui::render(frame, app))?;
+                }
+                Ok(None) => return Ok(()),
+                Err(_) => {}
+            }
+        }
+
+        match auth::poll_device_code(&device.device_auth_id, &device.user_code).await {
+            Ok(result) => break result,
+            Err(aither_codex::CodexError::AuthorizationPending) => {
+                terminal.draw(|frame| ui::render(frame, app))?;
+            }
+            Err(e) => {
+                app.chatgpt_auth_failed(e.to_string());
+                wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::ChatgptAuth)
+                    .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    let credentials = match auth::exchange_code(&code, &verifier).await {
+        Ok(credentials) => credentials,
+        Err(e) => {
+            app.chatgpt_auth_failed(e.to_string());
+            wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::ChatgptAuth)
+                .await?;
+            return Ok(());
+        }
+    };
+    finish_chatgpt_auth(app, events, terminal, credentials).await
+}
+
+/// Persist credentials and register the `chatgpt` provider after OAuth success.
+async fn finish_chatgpt_auth<B: Backend>(
+    app: &mut App,
+    events: &mut EventHandler,
+    terminal: &mut Terminal<B>,
+    credentials: aither_codex::auth::CodexCredentials,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    if let Err(e) = may_agent::chatgpt::save_credentials(&credentials).await {
+        app.chatgpt_auth_failed(format!("Failed to save credentials: {e}"));
+        wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::ChatgptAuth).await?;
+        return Ok(());
+    }
+    let instance =
+        may_agent::config::ProviderInstance::new(may_agent::config::ProviderType::Chatgpt);
+    app.config.upsert_provider("chatgpt", instance);
+    app.config_state.load_providers(&app.config);
+    if let Err(e) = app.config.clone().save().await {
+        tracing::error!("Failed to save config: {}", e);
+    }
+    app.chatgpt_auth_success();
+    wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::ChatgptAuth).await?;
+    Ok(())
 }
 
 /// Wait for the user to dismiss the auth result screen.
@@ -934,6 +1153,7 @@ async fn wait_for_auth_dismiss<B: Backend>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
+    auth_mode: may_agent::tui::AppMode,
 ) -> anyhow::Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -943,7 +1163,7 @@ where
     loop {
         if let Some(event) = events.next().await {
             app.handle_event(event)?;
-            if !matches!(app.mode, may_agent::tui::AppMode::CopilotAuth) {
+            if app.mode != auth_mode {
                 break;
             }
         }

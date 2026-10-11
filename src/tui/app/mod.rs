@@ -42,7 +42,7 @@ pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
 pub use aither_agent::{AgentError, AgentEvent};
 
 use super::state::{
-    ActiveTextInput, AppMode, ConfigEditMode, ConfigSection, ConfigState, CopilotAuthStatus,
+    ActiveTextInput, AppMode, ChatgptAuthStatus, ConfigEditMode, ConfigState, CopilotAuthStatus,
     McpAddMode, PasteFilter, SelectionPoint, SkillAddMode, SshAddMode, TextSelection,
     detect_api_key_from_env,
 };
@@ -120,6 +120,8 @@ pub struct App {
     pub thinking_start: Option<std::time::Instant>,
     /// Copilot OAuth authentication status
     pub copilot_auth_status: Option<CopilotAuthStatus>,
+    /// ChatGPT OAuth authentication status
+    pub chatgpt_auth_status: Option<ChatgptAuthStatus>,
     /// Tier being edited in `TierModelPicker` mode
     pub tier_picker_tier: Option<ModelTier>,
     /// All available models for tier picker
@@ -320,6 +322,7 @@ impl App {
             quit_pending: false,
             thinking_start: None,
             copilot_auth_status: None,
+            chatgpt_auth_status: None,
             tier_picker_tier: None,
             tier_picker_models: Vec::new(),
             tier_picker_filtered: Vec::new(),
@@ -806,6 +809,7 @@ impl App {
             AppMode::ModelSelect => self.handle_model_select_key(code),
             AppMode::TierModelPicker => self.handle_tier_model_picker_key(code),
             AppMode::CopilotAuth => super::reducer::manage::handle_copilot_auth_key(self, code),
+            AppMode::ChatgptAuth => super::reducer::manage::handle_chatgpt_auth_key(self, code),
             AppMode::PermissionConfirm(_) => {
                 super::reducer::manage::handle_permission_confirm_key(self, code)
             }
@@ -972,6 +976,35 @@ impl App {
         self.copilot_auth_status = Some(CopilotAuthStatus::Failed(error));
     }
 
+    /// Start the ChatGPT OAuth flow (initial "working" state).
+    pub fn start_chatgpt_auth(&mut self) {
+        self.mode = AppMode::ChatgptAuth;
+        self.chatgpt_auth_status = Some(ChatgptAuthStatus::Working);
+    }
+
+    /// Show the browser loopback authorization URL.
+    pub fn set_chatgpt_auth_url(&mut self, url: String) {
+        self.chatgpt_auth_status = Some(ChatgptAuthStatus::WaitingForCallback { url });
+    }
+
+    /// Switch the ChatGPT auth screen to the device-flow variant.
+    pub fn set_chatgpt_device_code(&mut self, user_code: String, verification_uri: String) {
+        self.chatgpt_auth_status = Some(ChatgptAuthStatus::WaitingForUser {
+            user_code,
+            verification_uri,
+        });
+    }
+
+    /// Mark ChatGPT auth as successful.
+    pub fn chatgpt_auth_success(&mut self) {
+        self.chatgpt_auth_status = Some(ChatgptAuthStatus::Success);
+    }
+
+    /// Mark ChatGPT auth as failed.
+    pub fn chatgpt_auth_failed(&mut self, error: String) {
+        self.chatgpt_auth_status = Some(ChatgptAuthStatus::Failed(error));
+    }
+
     /// Handle key in chat mode (unified input + navigation).
     fn handle_chat_key(
         &mut self,
@@ -1065,7 +1098,16 @@ impl App {
                     self.cursor = self.input_char_count;
                 }
             }
-            // PageUp/PageDown: native terminal scroll handles this now
+            // Mouse capture + alternate screen swallow native terminal
+            // scrolling, so chat scrolling must be handled here.
+            KeyCode::PageUp => {
+                let page = self.chat_scroll_page();
+                self.scroll_chat_up(page);
+            }
+            KeyCode::PageDown => {
+                let page = self.chat_scroll_page();
+                self.scroll_chat_down(page);
+            }
             KeyCode::Home => {
                 self.cursor = 0;
             }
@@ -1112,33 +1154,60 @@ impl App {
         Ok(None)
     }
 
+    /// Largest scroll offset that still shows a full view of content.
+    fn max_chat_scroll(&self) -> usize {
+        self.content_height
+            .get()
+            .saturating_sub(self.view_height.get())
+    }
+
+    /// Scroll the chat view up by `lines`, leaving follow-bottom mode.
+    ///
+    /// When the content already fits the view there is nothing to scroll, so
+    /// follow-bottom mode is preserved and new content keeps the view pinned
+    /// to the bottom.
+    pub(super) fn scroll_chat_up(&mut self, lines: usize) {
+        let max_scroll = self.max_chat_scroll();
+        if max_scroll == 0 {
+            return;
+        }
+        let base = if self.scroll == usize::MAX {
+            max_scroll
+        } else {
+            self.scroll
+        };
+        self.scroll = base.saturating_sub(lines);
+    }
+
+    /// Scroll the chat view down by `lines`, re-entering follow-bottom mode
+    /// when the bottom is reached.
+    pub(super) fn scroll_chat_down(&mut self, lines: usize) {
+        if self.scroll == usize::MAX {
+            return;
+        }
+        let next = self.scroll.saturating_add(lines);
+        self.scroll = if next >= self.max_chat_scroll() {
+            usize::MAX
+        } else {
+            next
+        };
+    }
+
+    /// Lines to move for one page of keyboard scrolling.
+    fn chat_scroll_page(&self) -> usize {
+        self.view_height.get().saturating_sub(1).max(1)
+    }
+
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
         if !matches!(self.mode, AppMode::Chat) {
             return Ok(None);
         }
 
-        const SCROLL_STEP_LINES: usize = 1;
+        const SCROLL_STEP_LINES: usize = 3;
 
         match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                if self.scroll == usize::MAX {
-                    let content_h = self.content_height.get();
-                    let view_h = self.view_height.get();
-                    let max_scroll = content_h.saturating_sub(view_h);
-                    self.scroll = max_scroll.saturating_sub(SCROLL_STEP_LINES);
-                } else {
-                    self.scroll = self.scroll.saturating_sub(SCROLL_STEP_LINES);
-                }
-            }
-            MouseEventKind::ScrollDown => {
-                if self.scroll != usize::MAX {
-                    let content_h = self.content_height.get();
-                    let view_h = self.view_height.get();
-                    let max_scroll = content_h.saturating_sub(view_h);
-                    let next = self.scroll.saturating_add(SCROLL_STEP_LINES);
-                    self.scroll = if next > max_scroll { usize::MAX } else { next };
-                }
-            }
+            MouseEventKind::ScrollUp => self.scroll_chat_up(SCROLL_STEP_LINES),
+            MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
                 self.selection = self.mouse_to_selection_point(mouse).map(|p| TextSelection {
                     anchor: p,
@@ -1711,6 +1780,14 @@ pub enum SendAction {
     /// Open Copilot auth URL in browser and copy code to clipboard.
     OpenCopilotAuthUrl {
         url: String,
+        code: String,
+    },
+    /// Start ChatGPT subscription OAuth authentication.
+    StartChatgptAuth,
+    /// Open the ChatGPT authorization URL in a browser.
+    OpenChatgptAuthUrl {
+        url: String,
+        /// Device-flow user code to copy to the clipboard (empty for browser flow).
         code: String,
     },
     /// Switch to a different model for this session.
