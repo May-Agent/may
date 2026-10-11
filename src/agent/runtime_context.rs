@@ -744,6 +744,20 @@ mod tests {
         tokio_test::block_on(crate::db::ChatDb::open(&db_path)).expect("test db should open")
     }
 
+    /// Durable system alerts pushed with `Context::push_alert`.
+    ///
+    /// Alerts enter the conversation stream as `system` messages rather than
+    /// as ephemeral reminders, which are dropped by every request's reminder
+    /// repopulation pass.
+    fn system_alerts(context: &aither_agent::Context) -> Vec<String> {
+        context
+            .conversation_messages()
+            .into_iter()
+            .filter(|message| message.role() == aither_core::llm::Role::System)
+            .map(|message| message.content().to_string())
+            .collect()
+    }
+
     #[test]
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
         let db = test_db();
@@ -788,14 +802,14 @@ mod tests {
             context.staged_system_update(tag::MEMORY),
             Some(build_memory_context_content("after").as_str())
         );
-        let reminders = context.reminders();
-        assert_eq!(reminders.len(), 1);
-        assert!(reminders[0].contains("MEMORY.md changed"));
-        assert!(reminders[0].contains("+after"));
+        let alerts = system_alerts(&context);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("MEMORY.md changed"));
+        assert!(alerts[0].contains("+after"));
 
         // Repeated reconciles with the same staged content stay quiet.
         runtime_context.reconcile(&mut context);
-        assert_eq!(context.reminders().len(), 1);
+        assert_eq!(system_alerts(&context).len(), 1);
 
         // Reassembly folds the staged update in and clears the alert.
         let report = context.reassemble();
@@ -805,7 +819,7 @@ mod tests {
             .get(tag::MEMORY)
             .expect("memory block should be present");
         assert_eq!(memory, &build_memory_context_content("after"));
-        assert!(context.reminders().is_empty());
+        assert!(system_alerts(&context).is_empty());
     }
 
     #[test]
