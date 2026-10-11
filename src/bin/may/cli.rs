@@ -13,6 +13,7 @@ use may_agent::browser_service::{BrowserReadDetail, BrowserReadFormat, BrowserSc
 pub enum CliMode {
     Tui,
     Ui(Vec<String>),
+    Rest(Vec<String>),
     Exec(ExecArgs),
     Browser(BrowserCliArgs),
     OneShot(OneShotArgs),
@@ -68,7 +69,7 @@ pub enum BrowserCliCommand {
 
 impl OneShotArgs {
     pub fn help_text() -> &'static str {
-        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may ui [args...]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
+        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may ui [args...]\n       may rest [args...]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
     }
 }
 
@@ -80,9 +81,17 @@ impl UiArgs {
     }
 }
 
+pub struct RestArgs;
+
+impl RestArgs {
+    pub fn help_text() -> &'static str {
+        "Usage: may rest [--host <addr>] [--port <port>]\n\nRun the May REST API server without the embedded web UI."
+    }
+}
+
 impl ExecArgs {
     pub fn help_text() -> &'static str {
-        "Usage: may exec --session <id> [--ssh-server <id>] [--timeout <sec>] [--max-lines <n>] [--raw] [--] <command...>\n\nExec runs a terminal command in the session home environment. Remote profile sessions execute over SSH automatically, and container profile sessions execute inside the configured container environment."
+        "Usage: may exec --session <id> [--ssh-server <id>] [--timeout <sec>] [--max-lines <n>] [--raw] [--] <command...>\n\nExec runs a terminal command in the session home environment. Use --ssh-server to target an attached SSH environment, and container profile sessions execute inside the configured container environment."
     }
 }
 
@@ -99,6 +108,10 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
         Some("ui") => match args.get(2).map(String::as_str) {
             Some("--help" | "-h") => CliMode::Help(UiArgs::help_text()),
             _ => CliMode::Ui(args[2..].to_vec()),
+        },
+        Some("rest") => match args.get(2).map(String::as_str) {
+            Some("--help" | "-h") => CliMode::Help(RestArgs::help_text()),
+            _ => CliMode::Rest(args[2..].to_vec()),
         },
         Some("browser") => match args.get(2).map(String::as_str) {
             Some("--help" | "-h") => CliMode::Help(BrowserCliArgs::help_text()),
@@ -410,6 +423,14 @@ mod tests {
         assert_eq!(
             parse_cli_mode(&args(&["may", "ui", "--host", "127.0.0.1"])),
             CliMode::Ui(vec!["--host".to_string(), "127.0.0.1".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_detects_rest_subcommand() {
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "rest", "--port", "8787"])),
+            CliMode::Rest(vec!["--port".to_string(), "8787".to_string()])
         );
     }
 

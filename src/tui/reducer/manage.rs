@@ -2,7 +2,9 @@ use crossterm::event::KeyCode;
 
 use crate::tui::app::{App, SendAction};
 use crate::tui::error::AppResult;
-use crate::tui::state::{CopilotAuthStatus, McpAddMode, SkillAddMode, SshAddMode};
+use crate::tui::state::{
+    ChatgptAuthStatus, CopilotAuthStatus, McpAddMode, SkillAddMode, SshAddMode,
+};
 
 pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
     match code {
@@ -29,6 +31,39 @@ pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option
                 app.mode = crate::tui::state::AppMode::Config;
             }
         }
+        _ => {}
+    }
+    Ok(None)
+}
+
+pub fn handle_chatgpt_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+    match code {
+        KeyCode::Esc => {
+            app.chatgpt_auth_status = None;
+            app.mode = crate::tui::state::AppMode::Config;
+        }
+        KeyCode::Enter => match &app.chatgpt_auth_status {
+            Some(ChatgptAuthStatus::WaitingForCallback { url }) => {
+                return Ok(Some(SendAction::OpenChatgptAuthUrl {
+                    url: url.clone(),
+                    code: String::new(),
+                }));
+            }
+            Some(ChatgptAuthStatus::WaitingForUser {
+                user_code,
+                verification_uri,
+            }) => {
+                return Ok(Some(SendAction::OpenChatgptAuthUrl {
+                    url: verification_uri.clone(),
+                    code: user_code.clone(),
+                }));
+            }
+            Some(ChatgptAuthStatus::Success | ChatgptAuthStatus::Failed(_)) => {
+                app.chatgpt_auth_status = None;
+                app.mode = crate::tui::state::AppMode::Config;
+            }
+            Some(ChatgptAuthStatus::Working) | None => {}
+        },
         _ => {}
     }
     Ok(None)

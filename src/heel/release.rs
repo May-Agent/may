@@ -100,7 +100,12 @@ struct GithubAsset {
 struct ManagedHeelState {
     release_tag: String,
     asset_name: String,
+    #[serde(default)]
+    last_checked_at: Option<String>,
 }
+
+/// How often to re-check the GitHub API for a new heel release (24 hours).
+const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 pub(crate) fn current_host_heel_asset() -> Result<ManagedHeelAsset, ManagedHeelError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -156,7 +161,46 @@ pub(crate) async fn ensure_managed_heel_binary(
 
     let binary_path = binary_dir.join(asset.local_binary_name());
     let state_path = install_root.join(HEEL_RELEASE_STATE_FILE);
-    let release = fetch_latest_release().await?;
+
+    // Fast path: if binary exists and was checked recently, skip the network call.
+    if binary_path.exists() {
+        if let Ok(Some(state)) = read_state(&state_path).await {
+            if let Some(ref checked_at) = state.last_checked_at {
+                if let Ok(ts) = checked_at.parse::<jiff::Timestamp>() {
+                    let elapsed = jiff::Timestamp::now().duration_since(ts);
+                    if elapsed
+                        < CHECK_INTERVAL
+                            .try_into()
+                            .unwrap_or(jiff::SignedDuration::ZERO)
+                    {
+                        tracing::debug!(
+                            binary = %binary_path.display(),
+                            "skipping heel update check (checked recently)"
+                        );
+                        return Ok(binary_path);
+                    }
+                }
+            }
+        }
+    }
+
+    // The release lookup is an update check, not a correctness requirement:
+    // when it fails (network down, GitHub rate limit) and a usable binary is
+    // already installed, keep serving the installed binary.
+    let release = match fetch_latest_release().await {
+        Ok(release) => release,
+        Err(error) => {
+            if binary_present_and_nonempty(&binary_path).await? {
+                tracing::warn!(
+                    error = %error,
+                    binary = %binary_path.display(),
+                    "heel release check failed; using existing managed binary"
+                );
+                return Ok(binary_path);
+            }
+            return Err(error);
+        }
+    };
     let release_asset = release
         .assets
         .iter()
@@ -175,6 +219,16 @@ pub(crate) async fn ensure_managed_heel_binary(
     )
     .await?
     {
+        // Binary is up-to-date — just refresh the check timestamp
+        let _ = write_state(
+            &state_path,
+            &ManagedHeelState {
+                release_tag: release.tag_name,
+                asset_name: asset.release_asset_name().to_string(),
+                last_checked_at: Some(jiff::Timestamp::now().to_string()),
+            },
+        )
+        .await;
         return Ok(binary_path);
     }
 
@@ -191,6 +245,7 @@ pub(crate) async fn ensure_managed_heel_binary(
         &ManagedHeelState {
             release_tag: release.tag_name,
             asset_name: release_asset.name,
+            last_checked_at: Some(jiff::Timestamp::now().to_string()),
         },
     )
     .await?;
@@ -200,11 +255,18 @@ pub(crate) async fn ensure_managed_heel_binary(
 
 async fn fetch_latest_release() -> Result<GithubRelease, ManagedHeelError> {
     let mut backend = zenwave::client();
-    backend
+    let mut request = backend
         .get(HEEL_RELEASE_API_URL)
         .map_err(ManagedHeelError::MetadataRequest)?
         .header("User-Agent", USER_AGENT)
-        .map_err(ManagedHeelError::MetadataRequest)?
+        .map_err(ManagedHeelError::MetadataRequest)?;
+    // An authenticated request has a far higher GitHub API rate limit.
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        request = request
+            .header("Authorization", &format!("Bearer {token}"))
+            .map_err(ManagedHeelError::MetadataRequest)?;
+    }
+    request
         .json::<GithubRelease>()
         .await
         .map_err(ManagedHeelError::MetadataDecode)
@@ -243,6 +305,16 @@ async fn binary_is_current(
     release_tag: &str,
     asset_name: &str,
 ) -> Result<bool, ManagedHeelError> {
+    if !binary_present_and_nonempty(binary_path).await? {
+        return Ok(false);
+    }
+    let Some(state) = read_state(state_path).await? else {
+        return Ok(false);
+    };
+    Ok(state.release_tag == release_tag && state.asset_name == asset_name)
+}
+
+async fn binary_present_and_nonempty(binary_path: &Path) -> Result<bool, ManagedHeelError> {
     if !try_exists(binary_path, "check managed heel binary presence").await? {
         return Ok(false);
     }
@@ -254,13 +326,7 @@ async fn binary_is_current(
                 path: binary_path.to_path_buf(),
                 source,
             })?;
-    if !metadata.is_file() || metadata.len() == 0 {
-        return Ok(false);
-    }
-    let Some(state) = read_state(state_path).await? else {
-        return Ok(false);
-    };
-    Ok(state.release_tag == release_tag && state.asset_name == asset_name)
+    Ok(metadata.is_file() && metadata.len() > 0)
 }
 
 async fn read_state(path: &Path) -> Result<Option<ManagedHeelState>, ManagedHeelError> {
@@ -397,6 +463,7 @@ mod tests {
         let state = ManagedHeelState {
             release_tag: "v1.2.3".to_string(),
             asset_name: "heel-x86_64-unknown-linux-gnu".to_string(),
+            last_checked_at: Some("2026-04-13T00:00:00Z".to_string()),
         };
 
         futures_lite::future::block_on(async {

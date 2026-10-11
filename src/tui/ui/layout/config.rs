@@ -2,8 +2,8 @@
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
@@ -308,10 +308,34 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
 
     let tier_names = ["Advanced", "Balanced", "Fast", "Image Generation"];
     let tier_values: Vec<String> = vec![
-        config.models.advanced.join(", "),
-        config.models.balanced.join(", "),
-        config.models.fast.join(", "),
-        config.models.image_generation.join(", "),
+        config
+            .models
+            .advanced
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        config
+            .models
+            .balanced
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        config
+            .models
+            .fast
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        config
+            .models
+            .image_generation
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
     ];
 
     let mut items: Vec<ListItem> = tier_names
@@ -353,22 +377,15 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Render preferences section content.
 pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &App) {
-    use crate::config::LoadBalanceStrategy;
-
     let state = &app.config_state;
     let config = &app.config;
 
-    let pref_names = ["Max iterations", "Load balance", "Warn on model change"];
+    let pref_names = ["Max iterations", "Warn on model change"];
     let pref_values: Vec<String> = vec![
         if config.max_iterations == 0 {
             "unlimited".to_string()
         } else {
             config.max_iterations.to_string()
-        },
-        match config.preferences.load_balance_strategy {
-            LoadBalanceStrategy::RoundRobin => "Round Robin".to_string(),
-            LoadBalanceStrategy::FailoverOnly => "Failover Only".to_string(),
-            LoadBalanceStrategy::Random => "Random".to_string(),
         },
         config.preferences.warn_on_model_change.to_string(),
     ];

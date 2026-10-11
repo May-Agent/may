@@ -23,7 +23,7 @@ use super::state::UiServerState;
 
 // ── Response type ──────────────────────────────────────────
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ScheduledTaskResponse {
     pub id: String,
@@ -76,7 +76,7 @@ impl ScheduledTaskResponse {
 
 // ── Request types ──────────────────────────────────────────
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CreateTaskRequest {
     pub profile_id: String,
@@ -92,7 +92,7 @@ pub(super) struct CreateTaskRequest {
     pub needs_network: bool,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct UpdateTaskRequest {
     #[serde(default)]

@@ -1,8 +1,0 @@
-Environment: remote (SSH target managed by this profile)
-Operating system hint: {{ operating_system }}
-Sandbox root: {{ sandbox }}
-Current working directory: {{ cwd }}
-SSH server id: {{ ssh_server_id }}
-SSH target: {{ ssh_target }}
-
-This profile's home environment is the bound SSH target, so unqualified terminal commands default to that remote machine. Treat the remote host as real infrastructure: inspect before mutating, and ask for approval before privileged or potentially destructive changes. Remote shell, filesystem layout, and operating system details are not guaranteed—detect them on-host before using shell-specific or OS-specific commands.

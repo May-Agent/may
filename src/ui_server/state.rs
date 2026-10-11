@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::time::Instant as TokioInstant;
 
@@ -21,9 +22,10 @@ use crate::live_response::LiveResponseRegistry;
 use crate::mcp::{MayMcpServerConfig, McpManager, McpServerInfo};
 use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
+use crate::ui_server::types::BrowserLifecycleEvent;
 use crate::workspace_request::RequestWorkspaceArgs;
 
-#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerPrepareStage {
     Checking,
@@ -32,7 +34,7 @@ pub enum ContainerPrepareStage {
     Failed,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 pub struct ContainerPrepareStatus {
     pub(crate) profile_id: String,
     pub(crate) stage: ContainerPrepareStage,
@@ -40,7 +42,7 @@ pub struct ContainerPrepareStatus {
     pub(crate) recent_logs: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 pub struct ContainerPrepareStatusesPayload {
     pub(crate) statuses: Vec<ContainerPrepareStatus>,
 }
@@ -311,7 +313,18 @@ impl std::fmt::Debug for McpService {
 impl McpService {
     pub(crate) fn spawn(mut manager: McpManager) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let has_servers = manager.has_servers();
         tokio::spawn(async move {
+            // Eagerly start connection but don't block the command loop.
+            // The first few commands may see unconnected servers.
+            if has_servers {
+                let results = manager.connect_all().await;
+                for (name, result) in results {
+                    if let Err(e) = result {
+                        tracing::warn!(server = %name, error = %e, "background MCP server connection failed");
+                    }
+                }
+            }
             while let Some(command) = rx.recv().await {
                 match command {
                     McpCommand::ServerInfo { reply } => {
@@ -408,6 +421,9 @@ pub struct UiServerState {
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
     pub(crate) browser_manager: ArcSwapOption<crate::container::browser::BrowserManager>,
     pub(crate) browser_owner_session_id: ArcSwapOption<String>,
+    /// Sequential lifecycle facts emitted by the browser actor, fanned out
+    /// to every active SSE client subscribed to `browser_lifecycle`.
+    pub(crate) browser_lifecycle_tx: broadcast::Sender<BrowserLifecycleEvent>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
@@ -461,9 +477,13 @@ impl UiServerState {
     ) {
         self.browser_manager.store(browser_manager);
     }
+
+    pub(crate) fn browser_lifecycle_subscribe(&self) -> broadcast::Receiver<BrowserLifecycleEvent> {
+        self.browser_lifecycle_tx.subscribe()
+    }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum UiAnswerInput {
     Selected { values: Vec<String> },
@@ -507,14 +527,14 @@ impl TryFrom<UiAnswerInput> for AnswerValue {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiQuestionAnswer {
     pub(crate) section: String,
     pub(crate) answer: UiAnswerInput,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AskUserRespondRequest {
     pub(crate) id: String,

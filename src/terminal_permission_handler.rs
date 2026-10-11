@@ -131,10 +131,18 @@ impl PermissionHandler for TerminalPermissionHandler {
                 port,
                 mode = %policy.mode().as_str(),
                 allowed_by_policy,
-                "recorded outbound domain under network audit policy"
+                "network policy evaluation for outbound domain"
             );
-            self.append_network_audit_log(domain, port, true, Some(policy.mode().as_str()))
-                .await;
+            self.append_network_audit_log(
+                domain,
+                port,
+                allowed_by_policy,
+                Some(policy.mode().as_str()),
+            )
+            .await;
+            if !allowed_by_policy {
+                return false;
+            }
         }
 
         let allowed = match &self.approver {

@@ -1,213 +1,239 @@
-import type { ChangeEvent, ClipboardEvent, RefObject } from 'react';
-import { File, Image as ImageIcon, Monitor, Plus, Send, Square, X } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowUp, Paperclip, Square, X, Zap, ListOrdered } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Textarea } from '@/components/ui/textarea';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
-import { AttachmentCard } from './AttachmentCard';
-import { AttachmentPreview } from './AttachmentPreview';
-import { ModelSelector } from './ModelSelector';
-import { ReasoningEffortSelector } from './ReasoningEffortSelector';
-import { ContextInspector } from './ContextInspectorDialog';
-import type { Attachment } from '@/types';
+import { cn } from '@/lib/utils';
+import { useTranslation } from '@/lib/i18n';
+import type { ApiAttachment, AttachmentKind } from '@/lib/types';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { ModelPicker } from './ModelPicker';
+import { ThinkingPicker } from './ThinkingPicker';
 
 interface ComposerProps {
-  inputValue: string;
-  onInputChange: (value: string) => void;
-  placeholder: string;
-  attachments: Attachment[];
-  onRemoveAttachment: (id: string) => void;
-  onPaste: (event: ClipboardEvent) => void;
-  onFileSelect: (event: ChangeEvent<HTMLInputElement>) => void;
-  fileInputRef: RefObject<HTMLInputElement | null>;
-  composerInputRef: RefObject<HTMLTextAreaElement | null>;
-  isNewChat: boolean;
-  canSend: boolean;
-  onSend: () => void;
-  onScreenshot: () => void;
+  disabled?: boolean;
+  streaming?: boolean;
+  onSend: (text: string, attachments: ApiAttachment[], deliveryMode: 'steer' | 'queue') => void;
+  onCancel: () => void;
+  sessionId: string;
+  currentModel: string;
+  currentReasoningEffort: string | null | undefined;
+}
 
-  currentModelId: string;
-  onModelChange: (id: string) => void;
-  isModelUpdating: boolean;
-  isSending: boolean;
-  currentModelSupportsReasoning: boolean;
-  currentReasoningEffort: string | undefined;
-  onReasoningEffortChange: (effort: string | undefined) => void;
+function detectKind(mime: string): AttachmentKind {
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('text/') || mime === 'application/json') return 'text';
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('application/')) return 'document';
+  return 'file';
+}
 
-  showTokenUsage: boolean;
-  currentSessionId: string | null;
-  promptTokens?: number;
-  contextUsedTokens?: number;
-  contextWindow?: number;
-  contextUsagePercent: number | null;
-  contextUsageTitle: string;
-
-  showStopButton: boolean;
-  showSendButton: boolean;
-  onStop: () => void;
+async function fileToAttachment(file: File): Promise<ApiAttachment> {
+  const kind = detectKind(file.type || '');
+  const reader = new FileReader();
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => resolve(reader.result as string);
+    reader.readAsDataURL(file);
+  });
+  let textContent: string | null = null;
+  if (kind === 'text' && file.size < 256 * 1024) {
+    textContent = await file.text();
+  }
+  return {
+    id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    name: file.name,
+    type: kind,
+    url: dataUrl,
+    uploadDataUrl: dataUrl,
+    textContent,
+  };
 }
 
 export function Composer({
-  inputValue,
-  onInputChange,
-  placeholder,
-  attachments,
-  onRemoveAttachment,
-  onPaste,
-  onFileSelect,
-  fileInputRef,
-  composerInputRef,
-  isNewChat,
-  canSend,
+  disabled,
+  streaming,
   onSend,
-  onScreenshot,
-  currentModelId,
-  onModelChange,
-  isModelUpdating,
-  isSending,
-  currentModelSupportsReasoning,
+  onCancel,
+  sessionId,
+  currentModel,
   currentReasoningEffort,
-  onReasoningEffortChange,
-  showTokenUsage,
-  currentSessionId,
-  promptTokens,
-  contextUsedTokens,
-  contextWindow,
-  contextUsagePercent,
-  contextUsageTitle,
-  showStopButton,
-  showSendButton,
-  onStop,
 }: ComposerProps) {
+  const [value, setValue] = useState('');
+  const [attachments, setAttachments] = useState<ApiAttachment[]>([]);
+  const [deliveryMode, setDeliveryMode] = useState<'steer' | 'queue'>('steer');
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { t } = useTranslation();
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = '0px';
+    el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
+  }, [value]);
+
+  const send = useCallback(() => {
+    const trimmed = value.trim();
+    if (!trimmed && attachments.length === 0) return;
+    if (disabled) return;
+    onSend(trimmed, attachments, deliveryMode);
+    setValue('');
+    setAttachments([]);
+    setDeliveryMode('steer');
+  }, [value, attachments, deliveryMode, disabled, onSend]);
+
+  const addFiles = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    const mapped = await Promise.all(list.map(fileToAttachment));
+    setAttachments((prev) => [...prev, ...mapped]);
+  };
+
+  const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData.items;
+    const files: File[] = [];
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length > 0) {
+      e.preventDefault();
+      await addFiles(files);
+    }
+  };
+
+  const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+    if (e.dataTransfer.files.length === 0) return;
+    e.preventDefault();
+    await addFiles(e.dataTransfer.files);
+  };
+
   return (
-    <div className="relative rounded-2xl border border-border/50 bg-background/60 backdrop-blur-xl">
+    <div
+      className="rounded-2xl border border-border/60 bg-background/70 shadow-lg backdrop-blur-xl backdrop-saturate-150"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={handleDrop}
+    >
       {attachments.length > 0 && (
-        <div className="flex gap-2 p-3 pb-0 overflow-x-auto">
-          {attachments.map((att) => (
-            <div key={att.id} className="relative group flex-shrink-0">
-              <AttachmentPreview attachment={att}>
-                <AttachmentCard attachment={att} variant="composer" />
-              </AttachmentPreview>
+        <div className="flex flex-wrap gap-1.5 border-b border-border px-3 py-2">
+          {attachments.map((a) => (
+            <span
+              key={a.id}
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1 text-xs"
+            >
+              <Paperclip className="size-3" />
+              <span className="max-w-[160px] truncate">{a.name}</span>
               <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRemoveAttachment(att.id);
-                }}
-                className="absolute -top-1 -right-1 bg-destructive text-destructive-foreground rounded-full p-0.5 shadow-sm opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                type="button"
+                onClick={() =>
+                  setAttachments((prev) => prev.filter((x) => x.id !== a.id))
+                }
+                className="text-muted-foreground hover:text-foreground"
+                aria-label={t('common.remove')}
               >
-                <X className="h-3 w-3" />
+                <X className="size-3" />
               </button>
-            </div>
+            </span>
           ))}
         </div>
       )}
-
-      <Textarea
-        ref={composerInputRef}
-        value={inputValue}
-        onChange={(e) => onInputChange(e.target.value)}
-        onPaste={onPaste}
+      <textarea
+        ref={textareaRef}
+        className="block w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm outline-none placeholder:text-muted-foreground min-h-[48px] max-h-[240px] scrollbar-thin"
+        placeholder={streaming ? t('composer.placeholderBusy') : t('composer.placeholder')}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onPaste={handlePaste}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && !e.shiftKey) {
+          if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
             e.preventDefault();
-            if (!canSend) return;
-            onSend();
+            send();
           }
         }}
-        placeholder={placeholder}
-        className="min-h-[60px] max-h-[200px] w-full resize-none border-0 bg-transparent px-3 py-4 text-base shadow-none focus-visible:ring-0"
-        rows={1}
-        autoFocus={isNewChat}
       />
-
-      <div className="flex items-center justify-between p-2 pl-3">
-        <div className="flex items-center gap-2">
+      <div className="flex items-center justify-between px-2 pb-2">
+        <div className="flex items-center gap-0.5">
           <input
+            ref={fileInputRef}
             type="file"
             multiple
             className="hidden"
-            ref={fileInputRef}
-            onChange={onFileSelect}
+            onChange={async (e) => {
+              if (!e.target.files) return;
+              await addFiles(e.target.files);
+              e.target.value = '';
+            }}
           />
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
+          <Tooltip>
+            <TooltipTrigger asChild>
               <Button
-                variant="ghost"
                 size="icon"
-                className="h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground"
+                variant="ghost"
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                aria-label={t('composer.attach')}
               >
-                <Plus className="h-5 w-5" />
+                <Paperclip className="size-4" />
               </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="w-48">
-              <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
-                <File className="mr-2 h-4 w-4" />
-                Upload File
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
-                <ImageIcon className="mr-2 h-4 w-4" />
-                Upload Photo
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={onScreenshot}>
-                <Monitor className="mr-2 h-4 w-4" />
-                Take Screenshot
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-        <div className="flex items-center gap-2">
-          <ModelSelector
-            currentModelId={currentModelId}
-            onModelChange={onModelChange}
-            disabled={isModelUpdating || isSending}
-            isUpdating={isModelUpdating}
+            </TooltipTrigger>
+            <TooltipContent>{t('composer.attach')}</TooltipContent>
+          </Tooltip>
+          {streaming && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  size="icon"
+                  variant={deliveryMode === 'queue' ? 'secondary' : 'ghost'}
+                  type="button"
+                  onClick={() =>
+                    setDeliveryMode((m) => (m === 'queue' ? 'steer' : 'queue'))
+                  }
+                  aria-label={t('composer.queued')}
+                >
+                  {deliveryMode === 'queue' ? (
+                    <ListOrdered className="size-4" />
+                  ) : (
+                    <Zap className="size-4" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {deliveryMode === 'queue' ? t('composer.queueHint') : t('composer.immediateHint')}
+              </TooltipContent>
+            </Tooltip>
+          )}
+          <div className="ml-1 h-5 w-px bg-border/60" />
+          <ModelPicker
+            sessionId={sessionId}
+            currentModel={currentModel}
+            disabled={disabled}
           />
-          {currentModelSupportsReasoning && (
-            <ReasoningEffortSelector
-              value={currentReasoningEffort}
-              onChange={onReasoningEffortChange}
-              disabled={isModelUpdating || isSending}
-            />
-          )}
-          {showTokenUsage && (
-            <ContextInspector
-              currentSessionId={currentSessionId}
-              promptTokens={promptTokens}
-              contextUsedTokens={contextUsedTokens}
-              contextWindow={contextWindow}
-              contextUsagePercent={contextUsagePercent}
-              contextUsageTitle={contextUsageTitle}
-            />
-          )}
-          {showStopButton && (
-            <Button
-              onClick={onStop}
-              size="icon"
-              variant="ghost"
-              className="h-8 w-8 rounded-lg text-destructive hover:bg-destructive/10 hover:text-destructive"
-            >
-              <Square className="h-3.5 w-3.5 fill-current" />
-            </Button>
-          )}
-          {showSendButton && (
-            <Button
-              onClick={onSend}
-              disabled={!canSend}
-              size="icon"
-              className={
-                canSend
-                  ? 'h-8 w-8 rounded-lg bg-primary text-primary-foreground'
-                  : 'h-8 w-8 rounded-lg bg-muted text-muted-foreground'
-              }
-            >
-              <Send className="h-4 w-4" />
-            </Button>
-          )}
+          <ThinkingPicker
+            sessionId={sessionId}
+            current={currentReasoningEffort}
+            disabled={disabled}
+          />
         </div>
+        {streaming ? (
+          <Button size="icon" variant="outline" onClick={onCancel} aria-label={t('composer.stop')}>
+            <Square className="size-3.5 fill-current" />
+          </Button>
+        ) : (
+          <Button
+            size="icon"
+            onClick={send}
+            disabled={disabled || (value.trim().length === 0 && attachments.length === 0)}
+            aria-label={t('composer.send')}
+            className={cn(
+              'transition-opacity',
+              value.trim().length === 0 && attachments.length === 0 && 'opacity-50',
+            )}
+          >
+            <ArrowUp className="size-4" />
+          </Button>
+        )}
       </div>
     </div>
   );

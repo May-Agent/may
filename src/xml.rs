@@ -29,7 +29,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// validator — it only guarantees that the payload is non-empty so
 /// callers can fail fast when a runtime assembler produces nothing
 /// worth inserting into context.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, JsonSchema, skyzen::ToSchema)]
 #[schemars(with = "String")]
 pub struct XmlBlock(String);
 

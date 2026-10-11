@@ -10,11 +10,11 @@
 //!   (the section key), type, and credentials. Providers don't select models - they
 //!   just provide access.
 //!
-//! - **Models**: User preferences for which models to use per tier. Each tier (advanced,
-//!   balanced, fast, `image_generation`) can have multiple models in priority order.
-//!   The system will try providers in order and failover to the next model if all fail.
+//! - **Models**: User preferences for which explicit provider/model selectors to use per tier.
+//!   Each selector is stored as `<provider_id>::<model_id>`. Each tier (advanced, balanced,
+//!   fast, `image_generation`) can have multiple selectors in priority order.
 //!
-//! - **Preferences**: Global settings like load balancing strategy and warnings.
+//! - **Preferences**: Global settings like warnings and network policy.
 //!
 //! # Example config
 //!
@@ -35,14 +35,13 @@
 //! base_url = "http://192.168.1.100:11434/v1"
 //!
 //! [models]
-//! advanced = ["claude-opus-4", "gpt-4.5"]
-//! balanced = ["claude-sonnet-4", "gemini-2.5-flash"]
-//! fast = ["claude-haiku-4", "gpt-4o-mini"]
-//! image_generation = ["dall-e-3"]
+//! advanced = ["anthropic::claude-opus-4", "openai::gpt-4.5"]
+//! balanced = ["anthropic::claude-sonnet-4", "google::gemini-2.5-flash"]
+//! fast = ["anthropic::claude-haiku-4", "openai::gpt-4o-mini"]
+//! image_generation = ["openai::gpt-image-1"]
 //! default_tier = "balanced"
 //!
 //! [preferences]
-//! load_balance_strategy = "round_robin"
 //! warn_on_model_change = true
 //! ```
 
@@ -50,119 +49,20 @@ use async_fs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::model_selector::ModelSelector;
 use crate::network_policy::NetworkPolicyConfig;
 
-/// Infer model tier from aither-models metadata.
-///
-/// Uses model mode, pricing percentiles, and context window as signals.
-#[must_use]
-pub fn get_model_tier(model_id: &str) -> ModelTier {
-    let chat_price_breakpoints = chat_price_breakpoints();
-    aither_models::lookup(model_id).map_or(ModelTier::Balanced, |info| {
-        infer_model_tier(info, chat_price_breakpoints)
-    })
-}
+pub use aither_models::{ModelTier, tier as get_model_tier};
 
-fn chat_price_breakpoints() -> Option<(f64, f64)> {
-    let mut prices = aither_models::models_by_mode(aither_models::ModelMode::Chat)
-        .map(|info| info.pricing().output_per_token())
-        .filter(|price| price.is_finite() && *price > 0.0)
-        .collect::<Vec<_>>();
-    if prices.len() < 3 {
-        return None;
-    }
+/// Directory under `~/.may` where rolling network audit logs are stored.
+pub const NETWORK_AUDIT_LOG_SUBDIR: &str = "logs/network";
 
-    prices.sort_by(f64::total_cmp);
-    let low_index = prices.len() / 3;
-    let high_index = (prices.len() * 2) / 3;
-    Some((prices[low_index], prices[high_index]))
-}
-
-fn infer_model_tier(
-    info: &aither_models::ModelEntry,
-    chat_price_breakpoints: Option<(f64, f64)>,
-) -> ModelTier {
-    match info.mode() {
-        aither_models::ModelMode::ImageGeneration => return ModelTier::ImageGeneration,
-        aither_models::ModelMode::Chat => {}
-        _ => return ModelTier::Balanced,
-    }
-
-    let output_price = info.pricing().output_per_token();
-    if let Some((fast_ceiling, advanced_floor)) = chat_price_breakpoints
-        && output_price.is_finite()
-        && output_price > 0.0
-    {
-        if output_price <= fast_ceiling {
-            return ModelTier::Fast;
-        }
-        if output_price >= advanced_floor {
-            return ModelTier::Advanced;
-        }
-        return ModelTier::Balanced;
-    }
-
-    match info.max_input_tokens() {
-        Some(tokens) if tokens <= 32_768 => ModelTier::Fast,
-        Some(tokens) if tokens >= 200_000 => ModelTier::Advanced,
-        _ => ModelTier::Balanced,
-    }
-}
+/// Number of rotated daily network audit log files retained.
+pub const NETWORK_AUDIT_MAX_FILES: usize = 14;
 
 fn normalize_base_url(url: &str) -> &str {
     url.trim_end_matches('/')
-}
-
-/// Normalize a model ID for relaxed comparison by stripping trailing date and
-/// `-preview` suffixes.  Examples:
-///   `claude-3-5-sonnet-20241022` → `claude-3-5-sonnet`
-///   `o3-2025-04-16`              → `o3`
-///   `gpt-4o-2024-08-06-preview`  → `gpt-4o`
-pub fn normalize_model_id_for_relaxed_match(model_id: &str) -> String {
-    static SUFFIX_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"-(?:\d{8}|\d{4}-\d{2}-\d{2}|preview)$")
-            .expect("model suffix regex must be valid")
-    });
-
-    let mut current = model_id.trim().to_ascii_lowercase();
-    loop {
-        let Some(m) = SUFFIX_RE.find(&current) else {
-            break;
-        };
-        current.truncate(m.start());
-    }
-    current
-}
-
-/// Model ID matching mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    /// Only exact (case-insensitive) matches.
-    Strict,
-    /// Normalized relaxed matching (strips dates, versions, etc.).
-    Relaxed,
-}
-
-impl MatchMode {
-    /// Create from a `strict_model_matching` preference flag.
-    #[must_use]
-    pub const fn from_strict_flag(strict: bool) -> Self {
-        if strict { Self::Strict } else { Self::Relaxed }
-    }
-}
-
-#[must_use]
-pub fn model_ids_match(candidate: &str, requested: &str, mode: MatchMode) -> bool {
-    if candidate.eq_ignore_ascii_case(requested) {
-        return true;
-    }
-    if mode == MatchMode::Strict {
-        return false;
-    }
-    normalize_model_id_for_relaxed_match(candidate)
-        == normalize_model_id_for_relaxed_match(requested)
 }
 
 /// Configuration error.
@@ -188,7 +88,9 @@ pub enum ConfigError {
 ///
 /// This represents the type of provider (API format and default base URL).
 /// Users configure individual provider instances with credentials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
     /// Anthropic Claude models
@@ -200,6 +102,8 @@ pub enum ProviderType {
     Google,
     /// GitHub Copilot (OAuth, `OpenAI` format)
     Copilot,
+    /// ChatGPT subscription (OAuth, Codex Responses backend)
+    Chatgpt,
     /// `OpenRouter` (aggregator, `OpenAI` format)
     OpenRouter,
     /// `DeepSeek` (`OpenAI` format)
@@ -231,7 +135,12 @@ impl ProviderType {
             Self::XAI => Some(aither_models::Provider::XAI),
             Self::Groq => Some(aither_models::Provider::Groq),
             Self::Together => Some(aither_models::Provider::Together),
-            Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom | Self::Copilot => None,
+            Self::OpenRouter
+            | Self::Ollama
+            | Self::LMStudio
+            | Self::Custom
+            | Self::Copilot
+            | Self::Chatgpt => None,
         }
     }
 
@@ -243,6 +152,7 @@ impl ProviderType {
                     | aither_models::Provider::Anthropic
                     | aither_models::Provider::Copilot
             ),
+            Self::Chatgpt => matches!(provider, aither_models::Provider::OpenAI),
             _ => self
                 .catalog_provider()
                 .is_some_and(|expected| expected == *provider),
@@ -268,6 +178,7 @@ impl ProviderType {
         Self::OpenAI,
         Self::Google,
         Self::Copilot,
+        Self::Chatgpt,
         Self::OpenRouter,
         Self::DeepSeek,
         Self::Ollama,
@@ -287,6 +198,7 @@ impl ProviderType {
             Self::OpenAI => "OpenAI (GPT)",
             Self::Google => "Google (Gemini)",
             Self::Copilot => "GitHub Copilot",
+            Self::Chatgpt => "ChatGPT (subscription)",
             Self::OpenRouter => "OpenRouter",
             Self::DeepSeek => "DeepSeek",
             Self::Ollama => "Ollama (Local)",
@@ -307,6 +219,7 @@ impl ProviderType {
             Self::OpenAI => "openai",
             Self::Google => "google",
             Self::Copilot => "copilot",
+            Self::Chatgpt => "chatgpt",
             Self::OpenRouter => "openrouter",
             Self::DeepSeek => "deepseek",
             Self::Ollama => "ollama",
@@ -337,6 +250,7 @@ impl ProviderType {
             Self::OpenAI => Some("https://api.openai.com/v1"),
             Self::Google => Some("https://generativelanguage.googleapis.com/v1beta"),
             Self::Copilot => Some("https://api.githubcopilot.com"),
+            Self::Chatgpt => Some("https://chatgpt.com/backend-api/codex"),
             Self::OpenRouter => Some("https://openrouter.ai/api/v1"),
             Self::DeepSeek => Some("https://api.deepseek.com/v1"),
             Self::Ollama => Some("http://localhost:11434/v1"),
@@ -357,6 +271,7 @@ impl ProviderType {
             Self::OpenAI => "openai",
             Self::Google => "google",
             Self::Copilot => "copilot",
+            Self::Chatgpt => "chatgpt",
             Self::DeepSeek => "deepseek",
             Self::Mistral => "mistral",
             Self::XAI => "xai",
@@ -372,7 +287,7 @@ impl ProviderType {
     pub const fn requires_api_key(self) -> bool {
         !matches!(
             self,
-            Self::Ollama | Self::LMStudio | Self::Copilot | Self::Custom
+            Self::Ollama | Self::LMStudio | Self::Copilot | Self::Chatgpt | Self::Custom
         )
     }
 
@@ -385,7 +300,7 @@ impl ProviderType {
     /// Whether this provider type uses OAuth authentication.
     #[must_use]
     pub const fn uses_oauth(self) -> bool {
-        matches!(self, Self::Copilot)
+        matches!(self, Self::Copilot | Self::Chatgpt)
     }
 
     /// Parse provider type from an ID string.
@@ -397,6 +312,7 @@ impl ProviderType {
             "openai" | "gpt" => Self::OpenAI,
             "google" | "gemini" => Self::Google,
             "copilot" | "github" => Self::Copilot,
+            "chatgpt" | "codex" => Self::Chatgpt,
             "openrouter" => Self::OpenRouter,
             "deepseek" => Self::DeepSeek,
             "ollama" => Self::Ollama,
@@ -417,11 +333,10 @@ impl ProviderType {
     /// by any native provider.
     #[must_use]
     pub fn can_serve_model(self, model_id: &str) -> bool {
-        if self == Self::OpenRouter
-            || self == Self::Ollama
-            || self == Self::LMStudio
-            || self == Self::Custom
-        {
+        if matches!(
+            self,
+            Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom | Self::Chatgpt
+        ) {
             return true;
         }
 
@@ -445,48 +360,29 @@ pub enum ApiFormat {
     Gemini,
 }
 
-/// Model tier preference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelTier {
-    /// Flagship models - highest capability
-    Advanced,
-    /// Balanced models - good capability/cost ratio
-    #[default]
-    Balanced,
-    /// Fast models - optimized for speed
-    Fast,
-    /// Image generation models
-    ImageGeneration,
+/// Provider-native hosted tool toggles.
+///
+/// These enable server-side tools the provider executes instead of the
+/// harness. When a hosted equivalent is active for the resolved provider, the
+/// matching `websearch` / `webfetch` terminal command is not registered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NativeToolsConfig {
+    /// Hosted web search (`OpenAI` `web_search`, Claude `web_search`, Gemini
+    /// `google_search`). Only takes effect when the model reports the
+    /// `web_search` ability.
+    #[serde(default)]
+    pub web_search: bool,
+    /// Hosted URL fetch (Claude `web_fetch`, Gemini `url_context`). `OpenAI`
+    /// has no standalone fetch tool, so `webfetch` stays registered there.
+    #[serde(default)]
+    pub web_fetch: bool,
 }
 
-impl ModelTier {
-    /// All tiers for iteration.
-    pub const ALL: &'static [Self] = &[
-        Self::Advanced,
-        Self::Balanced,
-        Self::Fast,
-        Self::ImageGeneration,
-    ];
-
+impl NativeToolsConfig {
+    /// Returns true when no hosted tools are enabled.
     #[must_use]
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::Advanced => "Advanced (Flagship)",
-            Self::Balanced => "Balanced",
-            Self::Fast => "Fast",
-            Self::ImageGeneration => "Image Generation",
-        }
-    }
-
-    #[must_use]
-    pub const fn short_name(self) -> &'static str {
-        match self {
-            Self::Advanced => "advanced",
-            Self::Balanced => "balanced",
-            Self::Fast => "fast",
-            Self::ImageGeneration => "image",
-        }
+    pub const fn is_empty(&self) -> bool {
+        !self.web_search && !self.web_fetch
     }
 }
 
@@ -503,6 +399,9 @@ pub struct ProviderInstance {
     /// API key (not needed for Ollama/Copilot)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Provider-native hosted tool toggles.
+    #[serde(default, skip_serializing_if = "NativeToolsConfig::is_empty")]
+    pub native_tools: NativeToolsConfig,
     /// Base URL override (required for Custom, optional for others)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -523,6 +422,7 @@ impl Default for ProviderInstance {
         Self {
             provider_type: None,
             api_key: None,
+            native_tools: NativeToolsConfig::default(),
             base_url: None,
             display_name: None,
             enabled: true,
@@ -650,64 +550,35 @@ impl ProviderInstance {
     }
 }
 
-/// Load balancing strategy for distributing requests across providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadBalanceStrategy {
-    /// Distribute requests evenly across providers (default)
-    #[default]
-    RoundRobin,
-    /// Only use secondary providers when primary fails
-    FailoverOnly,
-    /// Random selection among available providers
-    Random,
-}
-
-impl LoadBalanceStrategy {
-    #[must_use]
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::RoundRobin => "Round Robin (Even Distribution)",
-            Self::FailoverOnly => "Failover Only",
-            Self::Random => "Random",
-        }
-    }
-}
-
 /// Model preferences per tier.
 ///
-/// Each tier has a list of models in priority order.
-/// The system tries providers for the first model, then fails over to the next.
+/// Each tier has a list of explicit provider/model selectors in priority order.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelsConfig {
     /// Advanced/flagship models in priority order
     #[serde(default)]
-    pub advanced: Vec<String>,
+    pub advanced: Vec<ModelSelector>,
     /// Balanced models in priority order
     #[serde(default)]
-    pub balanced: Vec<String>,
+    pub balanced: Vec<ModelSelector>,
     /// Fast models in priority order
     #[serde(default)]
-    pub fast: Vec<String>,
+    pub fast: Vec<ModelSelector>,
     /// Image generation models in priority order
     #[serde(default)]
-    pub image_generation: Vec<String>,
+    pub image_generation: Vec<ModelSelector>,
     /// Global embedding model used for semantic search/indexing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_model: Option<String>,
+    pub embedding_model: Option<ModelSelector>,
     /// Optional explicit embedding dimensions for providers that require it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_dimensions: Option<usize>,
-    /// Model to provider mapping (`model_id` -> `provider_id`).
-    /// Populated when models are added via the tier picker.
-    #[serde(default)]
-    pub model_providers: HashMap<String, String>,
 }
 
 impl ModelsConfig {
     /// Get models for a tier.
     #[must_use]
-    pub fn models_for_tier(&self, tier: ModelTier) -> &[String] {
+    pub fn models_for_tier(&self, tier: ModelTier) -> &[ModelSelector] {
         match tier {
             ModelTier::Advanced => &self.advanced,
             ModelTier::Balanced => &self.balanced,
@@ -717,7 +588,7 @@ impl ModelsConfig {
     }
 
     /// Get mutable models for a tier.
-    pub const fn models_for_tier_mut(&mut self, tier: ModelTier) -> &mut Vec<String> {
+    pub const fn models_for_tier_mut(&mut self, tier: ModelTier) -> &mut Vec<ModelSelector> {
         match tier {
             ModelTier::Advanced => &mut self.advanced,
             ModelTier::Balanced => &mut self.balanced,
@@ -741,45 +612,25 @@ impl ModelsConfig {
         !self.has_any_models()
     }
 
-    /// Add a model to a tier (avoids duplicates).
-    /// Also stores the provider mapping for direct provider lookup during model switching.
+    /// Add a selector to a tier (avoids duplicates).
     pub fn add_model(&mut self, tier: ModelTier, model_id: &str, provider_id: &str) {
+        self.add_selector(tier, ModelSelector::new(provider_id, model_id));
+    }
+
+    pub fn add_selector(&mut self, tier: ModelTier, selector: ModelSelector) {
         let list = self.models_for_tier_mut(tier);
-        if !list.contains(&model_id.to_string()) {
-            list.push(model_id.to_string());
+        if !list.contains(&selector) {
+            list.push(selector);
         }
-        // Store the provider mapping
-        self.model_providers
-            .insert(model_id.to_string(), provider_id.to_string());
-    }
-
-    /// Get the provider ID for a model (if known).
-    #[must_use]
-    pub fn provider_for_model(&self, model_id: &str, strict: bool) -> Option<&str> {
-        if let Some(provider) = self.model_providers.get(model_id) {
-            return Some(provider.as_str());
-        }
-
-        if strict {
-            return None;
-        }
-
-        self.model_providers
-            .iter()
-            .find(|(saved, _)| model_ids_match(saved, model_id, MatchMode::Relaxed))
-            .map(|(_, provider)| provider.as_str())
     }
 
     #[must_use]
-    pub fn embedding_model(&self) -> Option<&str> {
-        self.embedding_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+    pub const fn embedding_model(&self) -> Option<&ModelSelector> {
+        self.embedding_model.as_ref()
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
 pub struct SshServerConfig {
     pub name: String,
     pub target: String,
@@ -788,18 +639,12 @@ pub struct SshServerConfig {
 /// Global preferences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preferences {
-    /// Load balancing strategy
-    #[serde(default)]
-    pub load_balance_strategy: LoadBalanceStrategy,
     /// Warn user when changing model mid-conversation
     #[serde(default = "default_true")]
     pub warn_on_model_change: bool,
     /// Show token/context usage in chat UI.
     #[serde(default = "default_true")]
     pub show_token_usage: bool,
-    /// Strict model matching (no relaxed fallback aliases).
-    #[serde(default)]
-    pub strict_model_matching: bool,
     /// Global network restriction settings.
     #[serde(default)]
     pub network_policy: NetworkPolicyConfig,
@@ -808,10 +653,8 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            load_balance_strategy: LoadBalanceStrategy::RoundRobin,
             warn_on_model_change: true,
             show_token_usage: true,
-            strict_model_matching: false,
             network_policy: NetworkPolicyConfig::default(),
         }
     }
@@ -849,7 +692,7 @@ fn default_ui_theme() -> String {
 /// manages. The runtime may be provisioned locally by May or exposed through a
 /// remote CDP endpoint. Agents use the May-managed `browser` command and must
 /// not install or manage browser binaries themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserBackendKind {
     Managed,
@@ -876,24 +719,89 @@ pub struct BrowserConfig {
     /// CDP endpoint for a remotely managed browser runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cdp_endpoint: Option<String>,
-    /// JPEG quality for screencast frames (1-100). Lower = less bandwidth.
-    #[serde(default = "default_screencast_quality")]
-    pub screencast_quality: u32,
+    /// JPEG quality for raw screencast frames (1-100). Trades CPU for
+    /// fidelity at the *first* lossy stage of the pipeline.
+    #[serde(default = "default_screencast_jpeg_quality")]
+    pub screencast_jpeg_quality: u32,
+    /// Initial H.264 target bitrate in kilobits per second. The encoder
+    /// thread starts here; the adaptive ABR loop may lower it on RTCP
+    /// REMB drops and ramp back up on recovery.
+    #[serde(default = "default_encoder_initial_bitrate_kbps")]
+    pub encoder_initial_bitrate_kbps: u32,
     /// Max width for screencast frames in pixels. Lower = less bandwidth.
+    /// Updated by the viewport-resize command when the panel is resized.
     #[serde(default = "default_screencast_max_width")]
     pub screencast_max_width: u32,
+    /// Max height for screencast frames in pixels. Independent of width
+    /// so the screencast can match the rendered viewport instead of being
+    /// clipped to a hardcoded aspect ratio.
+    #[serde(default = "default_screencast_max_height")]
+    pub screencast_max_height: u32,
+    /// Encode every Nth screencast frame. 1 = every frame (max fps).
+    /// 2 caps to ~15 fps which is plenty for screen content and halves
+    /// outbound bitrate for free.
+    #[serde(default = "default_every_nth_frame")]
+    pub every_nth_frame: u32,
+    /// Disable common automation fingerprints surfaced to target sites:
+    /// the AutomationControlled blink feature, navigator.webdriver,
+    /// chrome.runtime stub, plugin/language emptiness, and WebGL
+    /// vendor/renderer overrides. Default on; turn off to debug a site
+    /// that misbehaves under the stealth shim.
+    #[serde(default = "default_stealth_enabled")]
+    pub stealth_enabled: bool,
+    /// Optional source for seeding the managed browser's profile from a
+    /// real system Chrome profile. The first time the managed profile
+    /// directory is empty, May copies from this path so cookies and
+    /// logged-in state carry over; subsequent runs use the may-managed
+    /// copy and never touch the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_profile: Option<SystemProfileConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemProfileConfig {
+    /// Absolute path to a Chromium-family user-data-dir/profile-dir to
+    /// seed from on first launch.
+    pub path: PathBuf,
+    /// When true (default) the source profile is copied into May's home
+    /// dir and never written to again. Setting this to false lets May
+    /// use the source profile in-place — only safe when no other
+    /// browser instance is running against it.
+    #[serde(default = "default_system_profile_copy")]
+    pub copy_on_first_use: bool,
+}
+
+const fn default_system_profile_copy() -> bool {
+    true
 }
 
 const fn default_browser_port() -> u16 {
     39222
 }
 
-const fn default_screencast_quality() -> u32 {
-    60
+const fn default_screencast_jpeg_quality() -> u32 {
+    80
+}
+
+const fn default_encoder_initial_bitrate_kbps() -> u32 {
+    4000
 }
 
 const fn default_screencast_max_width() -> u32 {
-    1280
+    1920
+}
+
+const fn default_screencast_max_height() -> u32 {
+    1200
+}
+
+const fn default_every_nth_frame() -> u32 {
+    2
+}
+
+const fn default_stealth_enabled() -> bool {
+    true
 }
 
 impl Default for BrowserConfig {
@@ -903,8 +811,13 @@ impl Default for BrowserConfig {
             backend: BrowserBackendKind::Managed,
             port: default_browser_port(),
             remote_cdp_endpoint: None,
-            screencast_quality: default_screencast_quality(),
+            screencast_jpeg_quality: default_screencast_jpeg_quality(),
+            encoder_initial_bitrate_kbps: default_encoder_initial_bitrate_kbps(),
             screencast_max_width: default_screencast_max_width(),
+            screencast_max_height: default_screencast_max_height(),
+            every_nth_frame: default_every_nth_frame(),
+            stealth_enabled: default_stealth_enabled(),
+            system_profile: None,
         }
     }
 }
@@ -1009,7 +922,7 @@ pub struct MayConfig {
     pub remote_access: RemoteAccessConfig,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_model: Option<String>,
+    pub last_model: Option<ModelSelector>,
     /// Preconfigured SSH targets available to the agent.
     #[serde(default)]
     pub ssh_servers: Vec<SshServerConfig>,
@@ -1120,16 +1033,6 @@ impl MayConfig {
         self.provider.remove(id);
     }
 
-    /// Get all valid provider IDs that can serve a model.
-    #[must_use]
-    pub fn providers_for_model(&self, model_id: &str) -> Vec<&str> {
-        self.provider
-            .iter()
-            .filter(|(id, p)| p.can_serve_model(id, model_id))
-            .map(|(id, _)| id.as_str())
-            .collect()
-    }
-
     /// Get all provider IDs.
     pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
         self.provider.keys().map(std::string::String::as_str)
@@ -1159,17 +1062,8 @@ impl MayConfig {
 
     /// Get the first available model for a tier.
     #[must_use]
-    pub fn default_model_for_tier(&self, tier: ModelTier) -> Option<&str> {
-        self.models
-            .models_for_tier(tier)
-            .first()
-            .map(std::string::String::as_str)
-    }
-
-    /// Create a provider resolver for runtime model selection.
-    #[must_use]
-    pub fn create_resolver(&self) -> ProviderResolver {
-        ProviderResolver::new(self)
+    pub fn default_model_for_tier(&self, tier: ModelTier) -> Option<&ModelSelector> {
+        self.models.models_for_tier(tier).first()
     }
 
     /// Get all available models from configured providers.
@@ -1180,8 +1074,7 @@ impl MayConfig {
     #[must_use]
     pub fn available_models(&self) -> Vec<AvailableModel> {
         let mut models = Vec::new();
-        let mut has_any_model_provider = false;
-        let chat_price_breakpoints = chat_price_breakpoints();
+        let registry = aither_models::ModelRegistry::bundled();
 
         for (id, instance) in &self.provider {
             if !instance.is_valid(id) {
@@ -1192,7 +1085,17 @@ impl MayConfig {
 
             // Providers that can serve arbitrary models (proxies/aggregators)
             if instance.is_generic_model_proxy(id) {
-                has_any_model_provider = true;
+                for info in aither_models::all_models() {
+                    if info.is_deprecated() {
+                        continue;
+                    }
+                    models.push(AvailableModel {
+                        selector: ModelSelector::new(id, info.id()),
+                        id: info.id().to_string(),
+                        provider_id: id.clone(),
+                        tier: Some(registry.tier_of(info)),
+                    });
+                }
                 continue;
             }
 
@@ -1212,34 +1115,16 @@ impl MayConfig {
                     continue;
                 }
                 models.push(AvailableModel {
+                    selector: ModelSelector::new(id, info.id()),
                     id: info.id().to_string(),
                     provider_id: id.clone(),
-                    tier: Some(infer_model_tier(info, chat_price_breakpoints)),
+                    tier: Some(registry.tier_of(info)),
                 });
             }
         }
 
-        // If we have an "any model" provider (OpenRouter, Ollama, custom),
-        // include ALL known models since they can potentially serve them
-        if has_any_model_provider {
-            for info in aither_models::all_models() {
-                if info.is_deprecated() {
-                    continue;
-                }
-                // Skip if we already have this model from a direct provider
-                if models.iter().any(|m| m.id == info.id()) {
-                    continue;
-                }
-                models.push(AvailableModel {
-                    id: info.id().to_string(),
-                    provider_id: String::new(), // Multiple providers could serve this
-                    tier: Some(infer_model_tier(info, chat_price_breakpoints)),
-                });
-            }
-        }
-
-        // Sort by model ID
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.sort_by(|a, b| a.provider_id.cmp(&b.provider_id).then(a.id.cmp(&b.id)));
+        models.dedup_by(|a, b| a.selector == b.selector);
         models
     }
 }
@@ -1255,157 +1140,14 @@ fn reject_legacy_config_sections(content: &str) -> Result<(), ConfigError> {
 /// An available model from a configured provider.
 #[derive(Debug, Clone)]
 pub struct AvailableModel {
+    /// Explicit provider/model selector.
+    pub selector: ModelSelector,
     /// Model ID
     pub id: String,
     /// Provider ID that can serve this model
     pub provider_id: String,
     /// Suggested tier for this model
     pub tier: Option<ModelTier>,
-}
-
-/// Runtime resolver for selecting providers for models.
-///
-/// Handles load balancing and failover across providers.
-pub struct ProviderResolver {
-    /// Provider instances (cloned from config), keyed by ID
-    providers: HashMap<String, ProviderInstance>,
-    /// Models config
-    models: ModelsConfig,
-    /// Load balance strategy
-    strategy: LoadBalanceStrategy,
-    /// Round-robin counter per model
-    counters: HashMap<String, AtomicUsize>,
-    /// Temporarily failed providers (`model_id` -> `provider_ids`).
-    /// Uses `RefCell` because `ProviderResolver` is always thread-local (created per-request).
-    failed: std::cell::RefCell<HashMap<String, Vec<String>>>,
-}
-
-/// A selected provider with its ID.
-#[derive(Debug, Clone)]
-pub struct SelectedProvider<'a> {
-    /// The provider ID
-    pub id: &'a str,
-    /// The provider instance
-    pub instance: &'a ProviderInstance,
-}
-
-impl ProviderResolver {
-    /// Create a new resolver from config.
-    #[must_use]
-    pub fn new(config: &MayConfig) -> Self {
-        Self {
-            providers: config.provider.clone(),
-            models: config.models.clone(),
-            strategy: config.preferences.load_balance_strategy,
-            counters: HashMap::new(),
-            failed: std::cell::RefCell::new(HashMap::new()),
-        }
-    }
-
-    /// Get all provider IDs that can serve a model, excluding failed ones.
-    fn available_provider_ids(&self, model_id: &str) -> Vec<&str> {
-        let failed = self.failed.borrow();
-        let failed_ids = failed.get(model_id);
-
-        let mut explicit = Vec::new();
-        let mut generic = Vec::new();
-
-        for (id, p) in &self.providers {
-            if !p.can_serve_model(id, model_id) || failed_ids.is_some_and(|list| list.contains(id))
-            {
-                continue;
-            }
-
-            if p.is_generic_model_proxy(id) {
-                generic.push(id.as_str());
-            } else {
-                explicit.push(id.as_str());
-            }
-        }
-
-        // Prefer explicit provider-model matches first; keep generic aggregators as fallback.
-        explicit.sort_unstable();
-        generic.sort_unstable();
-        explicit.extend(generic);
-        explicit
-    }
-
-    /// Select the next provider for a model based on strategy.
-    pub fn select_provider(&self, model_id: &str) -> Option<SelectedProvider<'_>> {
-        let available = self.available_provider_ids(model_id);
-        if available.is_empty() {
-            return None;
-        }
-
-        let id = match self.strategy {
-            LoadBalanceStrategy::FailoverOnly => available.first().copied(),
-            LoadBalanceStrategy::Random => {
-                use std::collections::hash_map::RandomState;
-                use std::hash::{BuildHasher, Hasher};
-                let idx = RandomState::new().build_hasher().finish() as usize % available.len();
-                available.get(idx).copied()
-            }
-            LoadBalanceStrategy::RoundRobin => {
-                // Get or create counter for this model
-                let counter = self
-                    .counters
-                    .get(model_id)
-                    .map_or(0, |c| c.fetch_add(1, Ordering::Relaxed));
-                let idx = counter % available.len();
-                available.get(idx).copied()
-            }
-        }?;
-
-        self.providers
-            .get(id)
-            .map(|instance| SelectedProvider { id, instance })
-    }
-
-    /// Get a provider by ID.
-    pub fn get_provider(&self, id: &str) -> Option<&ProviderInstance> {
-        self.providers.get(id)
-    }
-
-    /// Mark a provider as failed for a model.
-    pub fn mark_failed(&self, model_id: &str, provider_id: &str) {
-        let mut failed = self.failed.borrow_mut();
-        failed
-            .entry(model_id.to_string())
-            .or_default()
-            .push(provider_id.to_string());
-    }
-
-    /// Clear failed status for a model (e.g., after some time).
-    pub fn clear_failed(&self, model_id: &str) {
-        let mut failed = self.failed.borrow_mut();
-        failed.remove(model_id);
-    }
-
-    /// Clear all failed status.
-    pub fn clear_all_failed(&self) {
-        let mut failed = self.failed.borrow_mut();
-        failed.clear();
-    }
-
-    /// Check if any providers are available for a model.
-    pub fn has_available_provider(&self, model_id: &str) -> bool {
-        !self.available_provider_ids(model_id).is_empty()
-    }
-
-    /// Get the next model in a tier after the current one fails.
-    pub fn next_model_in_tier(&self, tier: ModelTier, current_model: &str) -> Option<&str> {
-        let models = self.models.models_for_tier(tier);
-        let current_idx = models.iter().position(|m| m == current_model)?;
-        models.get(current_idx + 1).map(std::string::String::as_str)
-    }
-
-    /// Get the first model in a tier.
-    pub fn first_model_in_tier(&self, tier: ModelTier) -> Option<&str> {
-        self.models
-            .models_for_tier(tier)
-            .first()
-            .map(std::string::String::as_str)
-    }
 }
 
 #[cfg(test)]
@@ -1433,6 +1175,10 @@ mod tests {
         assert_eq!(anthropic.api_key.as_deref(), Some("sk-ant-test"));
 
         assert_eq!(config.models.balanced.len(), 2);
+        assert_eq!(
+            config.models.balanced[0].to_string(),
+            "anthropic::claude-sonnet-4"
+        );
         assert!(config.is_configured());
     }
 
@@ -1537,7 +1283,7 @@ mod tests {
 
     #[test]
     fn test_provider_can_serve_model() {
-        let anthropic_model = "claude-sonnet-4-20250514";
+        let anthropic_model = "claude-sonnet-4-5-20250929";
 
         // OpenAI can serve GPT models even when catalog canonical IDs collide across providers.
         assert!(ProviderType::OpenAI.can_serve_model("gpt-4o"));
@@ -1576,66 +1322,17 @@ mod tests {
     }
 
     #[test]
-    fn test_providers_for_model() {
-        let anthropic_model = "claude-sonnet-4-20250514";
-        let mut config = MayConfig::default();
-        config.upsert_provider("anthropic", ProviderInstance::default().with_api_key("key"));
-        config.upsert_provider(
-            "openrouter",
-            ProviderInstance::default().with_api_key("key"),
-        );
-        config.models.balanced = vec![anthropic_model.to_string()];
-
-        let providers = config.providers_for_model(anthropic_model);
-        assert_eq!(providers.len(), 2); // Both can serve it
-    }
-
-    #[test]
-    fn test_resolver_failover() {
-        let anthropic_model = "claude-sonnet-4-20250514";
-        let mut config = MayConfig::default();
-        config.upsert_provider(
-            "anthropic",
-            ProviderInstance::default().with_api_key("key1"),
-        );
-        config.upsert_provider(
-            "openrouter",
-            ProviderInstance::default().with_api_key("key2"),
-        );
-        config.models.balanced = vec![anthropic_model.to_string()];
-        config.preferences.load_balance_strategy = LoadBalanceStrategy::FailoverOnly;
-
-        let resolver = config.create_resolver();
-
-        // First selection should pick one of the providers
-        let first = resolver.select_provider(anthropic_model);
-        assert!(first.is_some());
-        let first_id = first.unwrap().id;
-
-        // Mark first as failed
-        resolver.mark_failed(anthropic_model, first_id);
-
-        // Now should select the other provider
-        let second = resolver.select_provider(anthropic_model);
-        assert!(second.is_some());
-        assert_ne!(second.unwrap().id, first_id);
-
-        // Clear failures
-        resolver.clear_failed(anthropic_model);
-        assert!(resolver.select_provider(anthropic_model).is_some());
-    }
-
-    #[test]
     fn test_serialize_config() {
         let mut config = MayConfig::default();
         config.upsert_provider(
             "anthropic",
             ProviderInstance::default().with_api_key("test-key"),
         );
-        config.models.balanced = vec!["claude-sonnet-4".to_string()];
+        config.models.balanced = vec![ModelSelector::new("anthropic", "claude-sonnet-4")];
 
         let toml = toml::to_string_pretty(&config).unwrap();
         assert!(toml.contains("[provider.anthropic]"));
         assert!(toml.contains("[models]"));
+        assert!(toml.contains("anthropic::claude-sonnet-4"));
     }
 }

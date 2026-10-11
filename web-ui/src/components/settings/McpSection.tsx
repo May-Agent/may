@@ -1,391 +1,225 @@
-import { useState } from "react";
+import { useEffect, useState } from 'react';
+import { useForm, useWatch } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+import { Plus, Trash2, RotateCw } from 'lucide-react';
+import { toast } from 'sonner';
+import { Button } from '@/components/ui/button';
+import { SectionHeader } from './SectionHeader';
+import { useTranslation } from '@/lib/i18n';
 import {
-  Globe,
-  PlugZap,
-  Plus,
-  RotateCcw,
-  TerminalSquare,
-  Trash2,
-} from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { useStore } from "@/lib/store";
-import type { McpServerCreateRequest, McpServerInfo } from "@/lib/api";
+  addMcpServer,
+  listMcpServers,
+  reconnectMcpServer,
+  removeMcpServer,
+  type McpServerInfo,
+} from '@/lib/api/mcp';
 
-type DraftSourceKind = McpServerCreateRequest["kind"];
-
-interface DraftArg {
-  id: string;
-  value: string;
-}
-
-interface DraftEnvVar {
-  id: string;
-  key: string;
-  value: string;
-}
-
-function nextDraftId(): string {
-  const randomUuid = globalThis.crypto?.randomUUID;
-  if (typeof randomUuid === "function") {
-    return randomUuid.call(globalThis.crypto);
-  }
-  return [Date.now().toString(36), Math.random().toString(36).slice(2)].join(
-    "-",
-  );
-}
-
-function createDraftArg(value = ""): DraftArg {
-  return { id: nextDraftId(), value };
-}
-
-function createDraftEnvVar(): DraftEnvVar {
-  return { id: nextDraftId(), key: "", value: "" };
-}
-
-function resetProcessDraft() {
-  return {
-    command: "",
-    args: [] as DraftArg[],
-    env: [] as DraftEnvVar[],
-  };
-}
-
-function mcpSourceLabel(source: McpServerInfo["source"]): string {
-  switch (source.kind) {
-    case "url":
-      return source.url;
-    case "process":
-      return [source.command, ...source.args].join(" ").trim();
-    case "unknown":
-      return "Unknown";
-  }
-}
-
-function mcpStatusLabel(status: McpServerInfo["status"]): string {
-  switch (status.state) {
-    case "disconnected":
-      return "Disconnected";
-    case "connecting":
-      return "Connecting...";
-    case "connected":
-      return `Connected (${status.toolCount} tools)`;
-    case "error":
-      return `Error: ${status.message}`;
-  }
-}
-
-function ProcessArgsEditor({
-  args,
-  onChange,
-}: {
-  args: DraftArg[];
-  onChange: (value: DraftArg[]) => void;
-}) {
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <div className="text-xs uppercase tracking-wide text-muted-foreground">
-          Arguments
-        </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => onChange([...args, createDraftArg()])}
-        >
-          <Plus className="mr-2 h-4 w-4" />
-          Add Arg
-        </Button>
-      </div>
-      {args.length === 0 ? (
-        <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
-          No arguments. Each row becomes one exact argv entry.
-        </div>
-      ) : (
-        <div className="space-y-2">
-          {args.map((arg) => (
-            <div key={arg.id} className="flex items-center gap-2">
-              <Input
-                value={arg.value}
-                onChange={(event) =>
-                  onChange(
-                    args.map((entry) =>
-                      entry.id === arg.id
-                        ? { ...entry, value: event.target.value }
-                        : entry,
-                    ),
-                  )
-                }
-                placeholder="argv item"
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                onClick={() =>
-                  onChange(args.filter((entry) => entry.id !== arg.id))
-                }
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ProcessEnvEditor({
-  env,
-  onChange,
-}: {
-  env: DraftEnvVar[];
-  onChange: (value: DraftEnvVar[]) => void;
-}) {
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <div className="text-xs uppercase tracking-wide text-muted-foreground">
-          Environment
-        </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => onChange([...env, createDraftEnvVar()])}
-        >
-          <Plus className="mr-2 h-4 w-4" />
-          Add Variable
-        </Button>
-      </div>
-      {env.length === 0 ? (
-        <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
-          No environment variables.
-        </div>
-      ) : (
-        <div className="space-y-2">
-          {env.map((entry) => (
-            <div
-              key={entry.id}
-              className="grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_40px]"
-            >
-              <Input
-                value={entry.key}
-                onChange={(event) =>
-                  onChange(
-                    env.map((candidate) =>
-                      candidate.id === entry.id
-                        ? { ...candidate, key: event.target.value }
-                        : candidate,
-                    ),
-                  )
-                }
-                placeholder="KEY"
-              />
-              <Input
-                value={entry.value}
-                onChange={(event) =>
-                  onChange(
-                    env.map((candidate) =>
-                      candidate.id === entry.id
-                        ? { ...candidate, value: event.target.value }
-                        : candidate,
-                    ),
-                  )
-                }
-                placeholder="value"
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                onClick={() =>
-                  onChange(env.filter((candidate) => candidate.id !== entry.id))
-                }
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
+const schema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('process'),
+    name: z.string().trim().min(1),
+    command: z.string().trim().min(1),
+    args: z.string().trim(),
+  }),
+  z.object({
+    kind: z.literal('url'),
+    name: z.string().trim().min(1),
+    url: z.string().trim().url(),
+  }),
+]);
+type FormValues = z.infer<typeof schema>;
 
 export function McpSection() {
-  const { mcpServers, addMcpServer, removeMcpServer, reconnectMcpServer } =
-    useStore();
-  const [sourceKind, setSourceKind] = useState<DraftSourceKind>("process");
-  const [mcpName, setMcpName] = useState("");
-  const [mcpUrl, setMcpUrl] = useState("");
-  const [processDraft, setProcessDraft] = useState(resetProcessDraft);
+  const { t } = useTranslation();
+  const [items, setItems] = useState<McpServerInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
 
-  const trimmedName = mcpName.trim();
-  const trimmedCommand = processDraft.command.trim();
-  const trimmedUrl = mcpUrl.trim();
-  const canSubmit =
-    trimmedName.length > 0 &&
-    (sourceKind === "process"
-      ? trimmedCommand.length > 0
-      : trimmedUrl.length > 0);
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { kind: 'process', name: '', command: '', args: '' } as FormValues,
+  });
+  const kind = useWatch({ control: form.control, name: 'kind' });
 
-  async function handleAddServer() {
-    if (!canSubmit) {
-      return;
+  const refresh = async () => {
+    setLoading(true);
+    try {
+      setItems(await listMcpServers());
+    } finally {
+      setLoading(false);
     }
+  };
 
-    if (sourceKind === "process") {
-      const args = processDraft.args
-        .map((entry) => entry.value.trim())
-        .filter((value) => value.length > 0);
-      const env = Object.fromEntries(
-        processDraft.env
-          .map((entry) => [entry.key.trim(), entry.value] as const)
-          .filter(([key]) => key.length > 0),
-      );
-
-      await addMcpServer({
-        kind: "process",
-        name: trimmedName,
-        command: trimmedCommand,
-        args,
-        env,
+  useEffect(() => {
+    let cancelled = false;
+    void listMcpServers()
+      .then((servers) => {
+        if (!cancelled) setItems(servers);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
       });
-    } else {
-      await addMcpServer({
-        kind: "url",
-        name: trimmedName,
-        url: trimmedUrl,
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onSubmit = form.handleSubmit(async (values) => {
+    try {
+      if (values.kind === 'process') {
+        await addMcpServer({
+          kind: 'process',
+          name: values.name,
+          command: values.command,
+          args: values.args ? values.args.split(/\s+/).filter(Boolean) : [],
+        });
+      } else {
+        await addMcpServer({ kind: 'url', name: values.name, url: values.url });
+      }
+      form.reset({ kind: values.kind, name: '', command: '', args: '', url: '' } as FormValues);
+      await refresh();
+    } catch (err) {
+      toast.error(t('errors.generic'), {
+        description: err instanceof Error ? err.message : undefined,
       });
     }
+  });
 
-    setMcpName("");
-    setMcpUrl("");
-    setProcessDraft(resetProcessDraft());
-    setSourceKind("process");
-  }
+  const handleRemove = async (n: string) => {
+    setBusy(true);
+    try {
+      await removeMcpServer(n);
+      await refresh();
+    } catch (err) {
+      toast.error(t('errors.generic'), {
+        description: err instanceof Error ? err.message : undefined,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleReconnect = async (n: string) => {
+    setBusy(true);
+    try {
+      await reconnectMcpServer(n);
+      await refresh();
+    } catch (err) {
+      toast.error(t('errors.generic'), {
+        description: err instanceof Error ? err.message : undefined,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setKind = (k: 'process' | 'url') => {
+    form.reset({ kind: k, name: '', command: '', args: '', url: '' } as FormValues);
+  };
+
+  const submitting = form.formState.isSubmitting;
 
   return (
-    <section className="space-y-4">
-      <div className="flex items-center gap-2 text-sm font-medium uppercase tracking-wide text-muted-foreground">
-        <PlugZap className="h-4 w-4" />
-        MCP Servers
-      </div>
+    <section>
+      <SectionHeader title={t('settings.mcp.title')} description={t('settings.mcp.description')} />
 
-      <div className="space-y-4 rounded-xl border bg-muted/20 p-4">
-        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_220px]">
-          <Input
-            value={mcpName}
-            onChange={(event) => setMcpName(event.target.value)}
-            placeholder="server name"
-          />
-          <Select
-            value={sourceKind}
-            onValueChange={(value: DraftSourceKind) => setSourceKind(value)}
+      <form onSubmit={onSubmit} className="mb-4 rounded-md border border-border p-3">
+        <div className="mb-2 flex gap-1.5">
+          <Button
+            size="sm"
+            type="button"
+            variant={kind === 'process' ? 'default' : 'outline'}
+            onClick={() => setKind('process')}
           >
-            <SelectTrigger>
-              <SelectValue placeholder="Source kind" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="process">Process command</SelectItem>
-              <SelectItem value="url">HTTP endpoint</SelectItem>
-            </SelectContent>
-          </Select>
+            {t('settings.mcp.process')}
+          </Button>
+          <Button
+            size="sm"
+            type="button"
+            variant={kind === 'url' ? 'default' : 'outline'}
+            onClick={() => setKind('url')}
+          >
+            {t('settings.mcp.url')}
+          </Button>
         </div>
-
-        {sourceKind === "process" ? (
-          <div className="space-y-4">
-            <div className="grid gap-2">
-              <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
-                <TerminalSquare className="h-4 w-4" />
-                Process Source
-              </div>
-              <Input
-                value={processDraft.command}
-                onChange={(event) =>
-                  setProcessDraft((current) => ({
-                    ...current,
-                    command: event.target.value,
-                  }))
-                }
+        <div className="grid gap-2">
+          <input
+            {...form.register('name')}
+            placeholder="name"
+            className="rounded-md border border-border bg-background px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-ring"
+          />
+          {kind === 'process' ? (
+            <>
+              <input
+                {...form.register('command')}
                 placeholder="command"
+                className="rounded-md border border-border bg-background px-3 py-1.5 text-sm font-mono outline-none focus:ring-2 focus:ring-ring"
               />
-            </div>
-            <ProcessArgsEditor
-              args={processDraft.args}
-              onChange={(args) =>
-                setProcessDraft((current) => ({ ...current, args }))
-              }
+              <input
+                {...form.register('args')}
+                placeholder="args (space-separated)"
+                className="rounded-md border border-border bg-background px-3 py-1.5 text-sm font-mono outline-none focus:ring-2 focus:ring-ring"
+              />
+            </>
+          ) : (
+            <input
+              {...form.register('url')}
+              placeholder="https://…"
+              className="rounded-md border border-border bg-background px-3 py-1.5 text-sm font-mono outline-none focus:ring-2 focus:ring-ring"
             />
-            <ProcessEnvEditor
-              env={processDraft.env}
-              onChange={(env) =>
-                setProcessDraft((current) => ({ ...current, env }))
-              }
-            />
-          </div>
-        ) : (
-          <div className="space-y-2">
-            <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
-              <Globe className="h-4 w-4" />
-              URL Source
-            </div>
-            <Input
-              value={mcpUrl}
-              onChange={(event) => setMcpUrl(event.target.value)}
-              placeholder="https://example.com/mcp"
-            />
-          </div>
-        )}
+          )}
+          <Button type="submit" disabled={submitting}>
+            <Plus className="size-4" />
+            {t('settings.mcp.add')}
+          </Button>
+        </div>
+      </form>
 
-        <Button onClick={() => void handleAddServer()} disabled={!canSubmit}>
-          <Plus className="mr-2 h-4 w-4" />
-          Add MCP Server
-        </Button>
-      </div>
-
-      <div className="space-y-2">
-        {mcpServers.map((server) => (
-          <div
-            key={server.name}
-            className="flex items-center justify-between rounded-lg border px-3 py-3"
-          >
-            <div className="space-y-1">
-              <div className="font-medium">{server.name}</div>
-              <div className="text-xs text-muted-foreground">
-                {mcpSourceLabel(server.source)}
+      {loading ? (
+        <div className="py-6 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
+      ) : items.length === 0 ? (
+        <div className="py-6 text-center text-sm text-muted-foreground">{t('settings.mcp.empty')}</div>
+      ) : (
+        <ul className="space-y-1">
+          {items.map((s) => (
+            <li
+              key={s.name}
+              className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm"
+            >
+              <div className="min-w-0">
+                <div className="truncate font-medium">{s.name}</div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {s.kind === 'process'
+                    ? `${s.command ?? ''} ${(s.args ?? []).join(' ')}`
+                    : s.url ?? ''}
+                  {s.status ? ` · ${s.status}` : ''}
+                </div>
               </div>
-              <div className="text-xs">{mcpStatusLabel(server.status)}</div>
-            </div>
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={() => reconnectMcpServer(server.name)}
-              >
-                <RotateCcw className="h-4 w-4" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => removeMcpServer(server.name)}
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-        ))}
-      </div>
+              <div className="flex gap-1">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => handleReconnect(s.name)}
+                  aria-label={t('settings.mcp.reconnect')}
+                >
+                  <RotateCw className="size-4" />
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => handleRemove(s.name)}
+                  aria-label={t('common.remove')}
+                >
+                  <Trash2 className="size-4" />
+                </Button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }

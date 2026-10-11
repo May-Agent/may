@@ -20,6 +20,7 @@ mod state;
 mod tasks;
 mod terminal_parsing;
 mod title_generation;
+mod tool_summary;
 mod types;
 
 use std::net::SocketAddr;
@@ -53,7 +54,39 @@ use types::{
 static WEB_UI_DIST: include_dir::Dir<'static> =
     skyzen::embed_dir!("$CARGO_MANIFEST_DIR/web-ui/dist");
 
-pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
+/// HTTP server mode selected by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiServerMode {
+    /// Serve the REST API plus the embedded web UI.
+    Ui,
+    /// Serve the REST API only.
+    Rest,
+}
+
+impl UiServerMode {
+    fn ensure_supported(self) -> anyhow::Result<()> {
+        match self {
+            Self::Rest => Ok(()),
+            Self::Ui => {
+                #[cfg(feature = "ui")]
+                {
+                    Ok(())
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    Err(anyhow!(
+                        "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Run the May HTTP server in either embedded-UI or REST-only mode.
+pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<()> {
+    mode.ensure_supported()?;
+
     let host = helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
     let port = helpers::parse_arg_value(args, "--port")
         .and_then(|v| v.parse::<u16>().ok())
@@ -63,21 +96,14 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("Invalid host/port: {host}:{port}"))?;
 
-    // SAFETY: Called before any other threads are spawned. The skyzen framework
-    // reads SKYZEN_ADDRESS at startup to discover the server's listen address.
-    unsafe {
-        std::env::set_var("SKYZEN_ADDRESS", addr.to_string());
-    }
-
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
 
-    let mut mcp_manager = McpManager::load()
+    let mcp_manager = McpManager::load()
         .await
         .context("failed to load MCP config")?;
-    if mcp_manager.has_servers() {
-        let _ = mcp_manager.connect_all().await;
-    }
+    // Note: MCP connection is deferred until the service is spawned.
+    // The McpService handles connection internally, avoiding startup blocking.
 
     let (tool_dispatchers, tool_queues) = tool_dispatch_channels();
 
@@ -100,6 +126,11 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         }
     };
 
+    // Capacity must be high enough that a slow SSE client cannot block the
+    // browser actor's hot path; lifecycle events are small and high-volume
+    // during Chrome boot / page navigations.
+    let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(256);
+
     // Initialize the May-managed browser runtime only when the feature is enabled.
     let browser_manager = if config.browser.enabled {
         tracing::info!(backend = ?config.browser.backend, "Browser integration enabled");
@@ -107,6 +138,9 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
             Ok(_) => match crate::container::browser::BrowserManager::new(
                 config.browser.clone(),
                 may_dir.clone(),
+                crate::container::browser::BrowserLifecyclePublisher::new(
+                    browser_lifecycle_tx.clone(),
+                ),
             ) {
                 Ok(manager) => Some(Arc::new(manager)),
                 Err(error) => {
@@ -185,7 +219,6 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
             .context("failed to load task runtime state")?
             .with_notifier(notification_service.clone())
             .with_ui_event_bus(ui_event_bus.clone())
-            .with_ssh_servers(config.ssh_servers.clone())
             .with_network_policy(config.preferences.network_policy.clone())
             .map_err(|error| anyhow!(error))?;
     if let Some(ref manager) = container_manager {
@@ -211,6 +244,7 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
         container_manager,
         browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
         browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
+        browser_lifecycle_tx,
         remote_access_manager,
         notification_service: notification_service.clone(),
         memory_processor,
@@ -243,29 +277,40 @@ pub async fn run_ui_server(args: &[String]) -> anyhow::Result<()> {
     let state_for_server = state.clone();
     tokio::task::spawn_blocking(move || {
         native::init_logging();
-        native::launch(move || {
-            let state = state_for_server;
-            async move { build_router(state) }
-        });
+        native::launch(
+            native::LaunchOptions {
+                listen: Some(native::ListenOverride {
+                    addr,
+                    explicit: true,
+                }),
+                ..Default::default()
+            },
+            move || {
+                let state = state_for_server;
+                async move { (build_router(state, mode), ()) }
+            },
+            || async {},
+        );
     })
     .await
-    .context("UI server task failed")?;
+    .context("HTTP server task failed")?;
 
     Ok(())
 }
 
 fn api_routes() -> Route {
     use artifacts::{
-        get_artifact_preview, get_output_preview, get_session_runtime, get_slidev_static_asset,
-        list_session_artifacts, map_container_local_url, prepare_slidev_preview,
+        get_artifact_preview, get_artifact_runtime_bridge, get_artifact_runtime_preview,
+        get_output_preview, get_session_runtime, get_slidev_static_asset, list_session_artifacts,
+        map_container_local_url, prepare_slidev_preview, report_artifact_diagnostics,
         stream_session_artifacts,
     };
     use bootstrap::get_bootstrap;
     use browser::{
-        browser_offer, browser_start, browser_status, browser_stop, browser_takeover_start,
-        browser_takeover_stop,
+        browser_offer, browser_resize_viewport, browser_start, browser_status, browser_stop,
+        browser_takeover_start, browser_takeover_stop,
     };
-    use chat::{chat, chat_stream, enqueue_chat, remove_pending_message, stop_session_run};
+    use chat::{chat_stream, enqueue_chat, remove_pending_message, stop_session_run};
     use config::{
         add_mcp_server, add_ssh_server, copilot_logout, copilot_start, copilot_status,
         copilot_stream, delete_skill, get_memory, get_ui_config, install_skill, list_mcp_servers,
@@ -282,8 +327,9 @@ fn api_routes() -> Route {
     };
     use profiles::{
         archive_session, create_folder, create_profile, delete_folder, delete_profile,
-        get_profile_sessions, list_profiles, move_to_folder, pin_session, unarchive_session,
-        unpin_session, update_folder, update_profile,
+        get_profile_remote_servers, get_profile_sessions, list_profiles, move_to_folder,
+        pin_session, set_profile_remote_servers, unarchive_session, unpin_session, update_folder,
+        update_profile,
     };
     use remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
     use sessions::{
@@ -299,6 +345,7 @@ fn api_routes() -> Route {
     Route::new((
         Route::new((
             "/health".at(health),
+            "/artifact-runtime.js".at(get_artifact_runtime_bridge),
             "/bootstrap".at(get_bootstrap),
             "/models".route(Route::new((
                 "".at(models),
@@ -332,7 +379,9 @@ fn api_routes() -> Route {
                         "/artifacts/local-url-map".post(map_container_local_url),
                     )),
                     Route::new((
+                        "/artifacts/runtime/preview".at(get_artifact_runtime_preview),
                         "/artifacts/stream".at(stream_session_artifacts),
+                        "/artifacts/diagnostics".post(report_artifact_diagnostics),
                         "/pin".post(pin_session),
                         "/unpin".post(unpin_session),
                         "/archive".post(archive_session),
@@ -348,6 +397,8 @@ fn api_routes() -> Route {
                 "/{id}".delete(delete_profile),
                 "/{id}/sessions".at(get_profile_sessions),
                 "/{id}/folders".post(create_folder),
+                "/{id}/remotes".at(get_profile_remote_servers),
+                "/{id}/remotes".put(set_profile_remote_servers),
             ))),
         )),
         Route::new((
@@ -356,7 +407,6 @@ fn api_routes() -> Route {
                 "/{id}".delete(delete_folder),
             ))),
             "/chat".route(Route::new((
-                "".post(chat),
                 "/stream".post(chat_stream),
                 "/enqueue".post(enqueue_chat),
             ))),
@@ -407,6 +457,7 @@ fn api_routes() -> Route {
                 "/start".post(browser_start),
                 "/stop".post(browser_stop),
                 "/offer".post(browser_offer),
+                "/viewport".post(browser_resize_viewport),
                 "/takeover/start".post(browser_takeover_start),
                 "/takeover/stop".post(browser_takeover_stop),
             ))),
@@ -430,19 +481,58 @@ fn api_routes() -> Route {
     ))
 }
 
-fn build_router(state: Arc<UiServerState>) -> Router {
+fn build_router(state: Arc<UiServerState>, mode: UiServerMode) -> Router {
     let api = "/api".route(api_routes());
 
-    #[cfg(feature = "ui")]
-    {
-        return Route::new((api, EmbeddedStaticDir::new("/", &WEB_UI_DIST)))
-            .middleware(State(state))
-            .build();
+    match mode {
+        UiServerMode::Rest => Route::new((api,)).middleware(State(state)).build(),
+        UiServerMode::Ui => {
+            #[cfg(feature = "ui")]
+            {
+                Route::new((api, EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa()))
+                    .middleware(State(state))
+                    .build()
+            }
+
+            #[cfg(not(feature = "ui"))]
+            {
+                panic!(
+                    "`may ui` should fail before router construction when the `ui` feature is disabled"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UiServerMode;
+
+    #[test]
+    fn rest_mode_is_always_supported() {
+        UiServerMode::Rest
+            .ensure_supported()
+            .expect("rest mode should always be available");
     }
 
     #[cfg(not(feature = "ui"))]
-    {
-        Route::new((api,)).middleware(State(state)).build()
+    #[test]
+    fn ui_mode_requires_ui_feature() {
+        let error = UiServerMode::Ui
+            .ensure_supported()
+            .expect_err("ui mode should fail without the ui feature");
+        assert_eq!(
+            error.to_string(),
+            "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn ui_mode_is_supported_with_ui_feature() {
+        UiServerMode::Ui
+            .ensure_supported()
+            .expect("ui mode should work when the ui feature is enabled");
     }
 }
 
@@ -500,14 +590,17 @@ fn build_models_response(
     let mut model_map = std::collections::HashMap::<String, ModelInfoItem>::new();
 
     for item in fetched {
+        let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
         let new_entry = ModelInfoItem {
-            id: item.id.clone(),
+            id: selector.clone(),
+            model_id: item.id.clone(),
+            provider_id: item.provider_id.clone(),
             nickname: item.nickname,
             context_window: item.context_window,
             abilities: item.abilities,
         };
         model_map
-            .entry(item.id)
+            .entry(selector)
             .and_modify(|existing| {
                 // Prefer the entry with more abilities (richer metadata).
                 if new_entry.abilities.len() > existing.abilities.len() {
@@ -518,10 +611,11 @@ fn build_models_response(
     }
 
     for tier in crate::config::ModelTier::ALL {
-        for model in config.models.models_for_tier(*tier) {
-            model_map.entry(model.clone()).or_insert_with(|| {
+        for selector in config.models.models_for_tier(*tier) {
+            let selector_key = selector.to_string();
+            model_map.entry(selector_key.clone()).or_insert_with(|| {
                 let static_info = if include_static_metadata {
-                    lookup_model_info(model)
+                    lookup_model_info(selector.model_id())
                 } else {
                     None
                 };
@@ -535,10 +629,12 @@ fn build_models_response(
                             .collect::<Vec<_>>(),
                     )
                 } else {
-                    (model.clone(), None, Vec::new())
+                    (selector.model_id().to_string(), None, Vec::new())
                 };
                 ModelInfoItem {
-                    id: model.clone(),
+                    id: selector_key,
+                    model_id: selector.model_id().to_string(),
+                    provider_id: selector.provider_id().to_string(),
                     nickname,
                     context_window,
                     abilities,
@@ -552,14 +648,18 @@ fn build_models_response(
     // returning "OpenAI model" or "github") without needing a hardcoded blocklist.
     if include_static_metadata {
         for item in model_map.values_mut() {
-            if let Some(info) = lookup_model_info(&item.id) {
+            if let Some(info) = lookup_model_info(&item.model_id) {
                 item.nickname = info.id().to_string();
             }
         }
     }
 
     let mut details = model_map.into_values().collect::<Vec<_>>();
-    details.sort_by(|a, b| a.id.cmp(&b.id));
+    details.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then(a.model_id.cmp(&b.model_id))
+    });
     let models_list = details.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
     ModelsResponse {
         models: models_list,
@@ -593,11 +693,14 @@ fn build_provider_models_response(
         std::collections::HashMap::new();
 
     for item in fetched {
+        let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
         grouped
-            .entry(item.provider_id)
+            .entry(item.provider_id.clone())
             .or_default()
             .push(ModelInfoItem {
-                id: item.id,
+                id: selector,
+                model_id: item.id,
+                provider_id: item.provider_id,
                 nickname: item.nickname,
                 context_window: item.context_window,
                 abilities: item.abilities,
@@ -607,7 +710,7 @@ fn build_provider_models_response(
     let mut providers = grouped
         .into_iter()
         .map(|(provider_id, mut details)| {
-            details.sort_by(|a, b| a.id.cmp(&b.id));
+            details.sort_by(|a, b| a.model_id.cmp(&b.model_id));
             details.dedup_by(|a, b| a.id == b.id);
             let models_list = details.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
             ProviderModelsItem {

@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::config::MayConfig;
 use super::release::{ManagedHeelError, current_host_heel_asset, ensure_managed_heel_binary};
+use crate::config::MayConfig;
 
 #[derive(Debug, thiserror::Error)]
 enum HeelBinaryConfigurationError {
@@ -12,17 +12,20 @@ enum HeelBinaryConfigurationError {
 }
 
 pub async fn configure_heel_binary() {
-    if std::env::var_os("HEEL_BIN").is_some() {
+    if let Some(path) = std::env::var_os("HEEL_BIN") {
+        assert_heel_executes(&PathBuf::from(path), "HEEL_BIN environment variable").await;
         return;
     }
 
     let binary_name = heel_binary_name();
-    if search_path_for_binary(&binary_name).is_some() {
+    if let Some(path) = search_path_for_binary(&binary_name) {
+        assert_heel_executes(&path, "PATH lookup").await;
         return;
     }
 
     match resolve_heel_binary().await {
         Ok(path) => {
+            assert_heel_executes(&path, "managed download").await;
             // SAFETY: this runs during process startup before May creates background tasks.
             unsafe { std::env::set_var("HEEL_BIN", &path) };
             tracing::info!(heel_bin = %path.display(), "configured HEEL_BIN for May runtime");
@@ -30,6 +33,34 @@ pub async fn configure_heel_binary() {
         Err(error) => {
             tracing::warn!(error = %error, "failed to preconfigure HEEL_BIN");
         }
+    }
+}
+
+/// Verify the heel binary actually runs on this host.
+///
+/// A present-but-unrunnable binary (wrong architecture, wrong OS, truncated
+/// download) would otherwise surface as confusing exec failures on every
+/// sandboxed command, so fail loudly at startup instead.
+async fn assert_heel_executes(path: &Path, source: &str) {
+    let command_path = path.to_path_buf();
+    let output = blocking::unblock(move || {
+        std::process::Command::new(&command_path)
+            .arg("--version")
+            .output()
+    })
+    .await;
+
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => panic!(
+            "heel binary at {} (from {source}) failed to report its version: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => panic!(
+            "heel binary at {} (from {source}) cannot execute on this host: {error}",
+            path.display()
+        ),
     }
 }
 

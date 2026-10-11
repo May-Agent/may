@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use aither_core::llm::Tool;
 use aither_sandbox::{
-    BollardContainerExec, Configured, ContainerExecHandle, ContainerLaunchSpec,
-    ContainerShellRuntime, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, SshServer, TerminalArgs, TerminalExecutionMode, TerminalMode,
-    TerminalResult, TerminalTool, ToolRegistryBuilder, permission::PermissionError,
+    AnyContainerExec, BollardContainerExec, Configured, ContainerLaunchSpec, ContainerShellRuntime,
+    OutputFormat, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, TerminalArgs,
+    TerminalExecutionMode, TerminalMode, TerminalResult, TerminalTool, ToolRegistryBuilder,
+    permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -23,11 +23,10 @@ use serde::Serialize;
 use shell_escape::escape as shell_escape;
 
 use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKind};
-use crate::config::SshServerConfig;
 use crate::container::lifecycle::ContainerManager;
 use crate::db::entity::{profiles, scheduled_tasks};
 use crate::db::{ChatDb, NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
-use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig};
+use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError};
 use crate::notification::{NotificationPayload, NotificationService};
 use crate::profile::ProfileEnvironment;
 use crate::task_trigger::{
@@ -44,7 +43,6 @@ pub struct TaskRuntime {
     ui_event_bus: Option<UiEventBus>,
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
-    ssh_servers: Arc<ArcSwap<Vec<SshServerConfig>>>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
 }
@@ -73,7 +71,9 @@ struct TaskCatalog {
     tasks: Vec<scheduled_tasks::Model>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRunStatus {
     Running,
@@ -374,7 +374,6 @@ impl TaskRuntime {
             ui_event_bus: None,
             may_dir,
             container_manager: None,
-            ssh_servers: Arc::new(ArcSwap::from_pointee(Vec::new())),
             network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
         };
@@ -402,22 +401,18 @@ impl TaskRuntime {
         self
     }
 
-    #[must_use]
-    pub fn with_ssh_servers(self, ssh_servers: Vec<SshServerConfig>) -> Self {
-        self.set_ssh_servers(ssh_servers);
-        self
-    }
-
-    pub fn set_ssh_servers(&self, ssh_servers: Vec<SshServerConfig>) {
-        self.ssh_servers.store(Arc::new(ssh_servers));
-    }
-
-    pub fn with_network_policy(self, network_policy: NetworkPolicyConfig) -> Result<Self, String> {
+    pub fn with_network_policy(
+        self,
+        network_policy: NetworkPolicyConfig,
+    ) -> Result<Self, NetworkPolicyError> {
         self.set_network_policy(network_policy)?;
         Ok(self)
     }
 
-    pub fn set_network_policy(&self, network_policy: NetworkPolicyConfig) -> Result<(), String> {
+    pub fn set_network_policy(
+        &self,
+        network_policy: NetworkPolicyConfig,
+    ) -> Result<(), NetworkPolicyError> {
         let compiled = network_policy.compile()?;
         self.network_policy.store(Arc::new(compiled));
         Ok(())
@@ -482,7 +477,6 @@ impl TaskRuntime {
         let actual_runtime = match profile_info.environment.kind() {
             ProfileEnvironment::Local => TaskRuntimeKind::Local,
             ProfileEnvironment::Container { .. } => TaskRuntimeKind::Container,
-            ProfileEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
         };
         if runtime_kind != actual_runtime {
             return Err(format!(
@@ -550,7 +544,7 @@ impl TaskRuntime {
 
         for task in &tasks.tasks {
             let trigger = stored_task_trigger(task)?;
-            let is_due = self.is_due(task, &trigger, now)?;
+            let is_due = Self::is_due(task, &trigger, now)?;
 
             if is_due {
                 let PersistedTaskTrigger::Time { trigger_type } = trigger else {
@@ -635,7 +629,6 @@ impl TaskRuntime {
     }
 
     fn is_due(
-        &self,
         task: &scheduled_tasks::Model,
         trigger: &PersistedTaskTrigger,
         now: jiff::Timestamp,
@@ -643,17 +636,16 @@ impl TaskRuntime {
         match trigger {
             PersistedTaskTrigger::Time {
                 trigger_type: TimeTriggerType::Cron,
-            } => self.is_cron_due(task, now),
+            } => Self::is_cron_due(task, now),
             PersistedTaskTrigger::Time {
                 trigger_type: TimeTriggerType::Once,
-            } => self.is_once_due(task, now),
+            } => Self::is_once_due(task, now),
             PersistedTaskTrigger::Event { .. } | PersistedTaskTrigger::Webhook { .. } => Ok(false),
         }
     }
 
     /// Check if a cron task is due.
     fn is_cron_due(
-        &self,
         task: &scheduled_tasks::Model,
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
@@ -700,7 +692,6 @@ impl TaskRuntime {
 
     /// Check if a one-time task is due.
     fn is_once_due(
-        &self,
         task: &scheduled_tasks::Model,
         now: jiff::Timestamp,
     ) -> Result<bool, crate::db::ChatDbError> {
@@ -760,7 +751,6 @@ impl TaskRuntime {
         match profile_info.environment.kind() {
             ProfileEnvironment::Local => self.validate_local(&profile.id, &script).await,
             ProfileEnvironment::Container { .. } => self.validate_container(profile, &script).await,
-            ProfileEnvironment::Remote { .. } => self.validate_remote(profile, &script).await,
         }
     }
 
@@ -902,10 +892,6 @@ impl TaskRuntime {
                 self.execute_container(task, &profile, materialized.command.clone())
                     .await
             }
-            ProfileEnvironment::Remote { .. } => {
-                self.execute_remote(&profile, materialized.command.clone())
-                    .await
-            }
         };
 
         self.cleanup_materialized_execution(materialized.cleanup_paths)
@@ -1012,7 +998,10 @@ impl TaskRuntime {
                 let working_dir = canonical
                     .parent()
                     .ok_or_else(|| {
-                        format!("script_path {} has no parent directory", canonical.display())
+                        format!(
+                            "script_path {} has no parent directory",
+                            canonical.display()
+                        )
                     })?
                     .to_path_buf();
                 Ok(TaskScript {
@@ -1088,6 +1077,12 @@ impl TaskRuntime {
         let registry =
             Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
+        let network_audit = aither_sandbox::open_network_audit_log(
+            self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
+            crate::config::NETWORK_AUDIT_MAX_FILES,
+        )
+        .await
+        .map_err(|error| init_terminal_tool_error("failed to open network audit log: ", &error))?;
         TerminalTool::new_exact(
             &script.host_working_dir,
             SchedulerPermissionHandler {
@@ -1105,89 +1100,12 @@ impl TaskRuntime {
             init_terminal_tool_error("failed to initialize local terminal tool: ", &error)
         })
         .map(|tool| {
-            tool.with_shell_sessions(shell_sessions)
+            tool.with_network_audit_log(network_audit)
+                .with_shell_sessions(shell_sessions)
                 .with_writable_paths([script.host_working_dir.clone()])
                 .with_readable_paths([script.host_working_dir.clone()])
                 .with_registry(registry)
         })
-    }
-
-    fn resolve_remote_server(&self, profile: &profiles::Model) -> Result<SshServerConfig, String> {
-        let configured_servers = self.ssh_servers.load();
-        crate::profile::remote::resolve_remote_profile_server(profile, configured_servers.as_slice())
-    }
-
-    async fn remote_terminal_tool(
-        &self,
-        profile: &profiles::Model,
-        working_dir: &std::path::Path,
-    ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
-        let ssh_server = self.resolve_remote_server(profile)?;
-        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: false,
-            container: false,
-            ssh: true,
-        })
-        .with_ssh_servers(vec![SshServer {
-            name: ssh_server.name,
-            target: ssh_server.target,
-        }])
-        .map_err(|error| prefixed_error("failed to configure remote ssh server: ", &error))?;
-        let registry = Arc::new(ToolRegistryBuilder::new().build(working_dir.join("outputs")));
-        let network_policy = self.network_policy.load().as_ref().clone();
-        TerminalTool::new_exact(
-            working_dir,
-            SchedulerPermissionHandler {
-                db: self.db.clone(),
-                ui_event_bus: self.ui_event_bus.clone(),
-                profile_id: profile.id.clone(),
-                source: NetworkAccessSource::TaskRemote,
-                allow_network: true,
-                network_policy,
-            },
-            DefaultExecutor,
-        )
-        .await
-        .map_err(|error| {
-            init_terminal_tool_error("failed to initialize remote terminal tool: ", &error)
-        })
-        .map(|tool| {
-            tool.with_shell_sessions(shell_sessions)
-                .with_writable_paths([working_dir.to_path_buf()])
-                .with_readable_paths([working_dir.to_path_buf()])
-                .with_registry(registry)
-        })
-    }
-
-    async fn execute_remote(
-        &self,
-        profile: &profiles::Model,
-        command: String,
-    ) -> Result<String, String> {
-        let working_dir = self.may_dir.join("tasks").join("remote").join(&profile.id);
-        tokio::fs::create_dir_all(working_dir.join("outputs"))
-            .await
-            .map_err(|error| workspace_prepare_error(&working_dir, &error))?;
-        let terminal_tool = self.remote_terminal_tool(profile, &working_dir).await?;
-        run_terminal_command(&terminal_tool, TerminalExecutionMode::Ssh, None, command).await
-    }
-
-    async fn validate_remote(
-        &self,
-        profile: &profiles::Model,
-        script: &TaskScript,
-    ) -> Result<(), String> {
-        let terminal_tool = self
-            .remote_terminal_tool(profile, script.host_working_dir.as_path())
-            .await?;
-        run_terminal_command(
-            &terminal_tool,
-            TerminalExecutionMode::Ssh,
-            None,
-            build_validation_command(script),
-        )
-        .await
-        .map(|_| ())
     }
 
     async fn execute_container(
@@ -1262,12 +1180,12 @@ impl TaskRuntime {
             .ensure_running(&launch_spec)
             .await
             .map_err(|error| prefixed_error("failed to start container: ", &error))?;
-        container_manager.touch_activity(&container_id).await;
+        container_manager.touch_activity(&container_id);
 
         let container_runtime = ContainerShellRuntime::new(
             container_id.clone(),
             container_manager.runtime().host_gateway().to_string(),
-            ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
+            AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
                 container_manager.runtime().client.clone(),
             )))),
         );
@@ -1311,7 +1229,7 @@ impl TaskRuntime {
             command,
         )
         .await;
-        container_manager.touch_activity(&container_id).await;
+        container_manager.touch_activity(&container_id);
         result
     }
 
@@ -1395,12 +1313,12 @@ impl TaskRuntime {
             .ensure_running(&launch_spec)
             .await
             .map_err(|error| prefixed_error("failed to start container: ", &error))?;
-        container_manager.touch_activity(&container_id).await;
+        container_manager.touch_activity(&container_id);
 
         let container_runtime = ContainerShellRuntime::new(
             container_id.clone(),
             container_manager.runtime().host_gateway().to_string(),
-            ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
+            AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
                 container_manager.runtime().client.clone(),
             )))),
         );
@@ -1443,7 +1361,7 @@ impl TaskRuntime {
         )
         .await
         .map(|_| ());
-        container_manager.touch_activity(&container_id).await;
+        container_manager.touch_activity(&container_id);
         result
     }
 }
@@ -1484,17 +1402,20 @@ async fn run_terminal_command(
     script: String,
 ) -> Result<String, String> {
     let output = terminal_tool
-        .call(TerminalArgs {
-            description: "run the scheduled task script".to_string(),
-            script,
-            mode,
-            ssh_server_id,
-            expect: OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            timeout: 300,
-            max_lines: 800,
-            raw: false,
-        })
+        .call(
+            TerminalArgs {
+                description: "run the scheduled task script".to_string(),
+                script,
+                mode,
+                ssh_server_id,
+                expect: OutputFormat::Text,
+                resolution: aither_sandbox::MediaResolution::Auto,
+                timeout: 300,
+                max_lines: 800,
+                raw: false,
+            },
+            aither_core::llm::ToolContext::new(),
+        )
         .await
         .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
 

@@ -1,598 +1,142 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
- 
+
 @layer base {
   :root {
     --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
- 
+    --foreground: 224 22% 12%;
+
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
- 
+    --card-foreground: 224 22% 12%;
+
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
- 
-    --primary: 222.2 47.4% 11.2%;
+    --popover-foreground: 224 22% 12%;
+
+    --primary: 224 72% 48%;
     --primary-foreground: 210 40% 98%;
- 
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
- 
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
- 
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
- 
-    --destructive: 0 84.2% 60.2%;
+
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 224 22% 12%;
+
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+
+    --accent: 220 14% 94%;
+    --accent-foreground: 224 22% 12%;
+
+    --destructive: 0 72% 51%;
     --destructive-foreground: 210 40% 98%;
- 
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
 
-    --activity-bg: 255 255 255 / 0.92;
-    --activity-border: 203 213 225 / 0.88;
-    --activity-divider: 226 232 240 / 0.92;
-    --activity-icon-bg: 15 23 42 / 0.05;
-    --activity-icon-fg: 51 65 85 / 0.88;
-    --activity-meta: 100 116 139 / 0.92;
-    --activity-action: 51 65 85 / 0.88;
-    --activity-action-hover: 15 23 42 / 0.96;
-    --timeline-sweep-muted: 100 116 139 / 0.62;
-    --timeline-sweep-bright: 15 23 42 / 0.96;
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 224 72% 48%;
 
-    --terminal-bg: 250 250 250;
-    --terminal-fg: 24 24 27;
-    --terminal-prompt: 100 116 139;
-    --terminal-stderr: 220 38 38;
-    --terminal-success: 22 163 74;
-
-    --artifacts-shell-bg:
-      radial-gradient(circle at 100% 0%, rgba(8, 145, 178, 0.12), rgba(8, 145, 178, 0) 44%),
-      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.96)),
-      rgba(248, 250, 252, 0.94);
-    --artifacts-shell-overlay: linear-gradient(180deg, rgba(14, 116, 144, 0.05), rgba(14, 116, 144, 0));
-    --artifacts-topbar-bg:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(248, 250, 252, 0.86)),
-      rgba(248, 250, 252, 0.84);
-    --artifacts-action-border: rgba(148, 163, 184, 0.26);
-    --artifacts-action-bg:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(241, 245, 249, 0.72)),
-      rgba(241, 245, 249, 0.68);
-    --artifacts-action-hover:
-      linear-gradient(180deg, rgba(240, 249, 255, 0.96), rgba(224, 242, 254, 0.82)),
-      rgba(224, 242, 254, 0.78);
-    --artifacts-history-bg:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(248, 250, 252, 0.84)),
-      rgba(248, 250, 252, 0.82);
-    --artifacts-preview-bar-bg:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(241, 245, 249, 0.78)),
-      rgba(241, 245, 249, 0.74);
-    --artifacts-preview-path: rgba(71, 85, 105, 0.84);
-    --artifacts-history-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.72),
-      0 8px 18px rgba(148, 163, 184, 0.12);
-
-    --slidev-shell-border: rgba(148, 163, 184, 0.42);
-    --slidev-shell-bg:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(241, 245, 249, 0.9)),
-      rgba(241, 245, 249, 0.88);
-    --slidev-shell-highlight: linear-gradient(180deg, rgba(6, 182, 212, 0.08), rgba(6, 182, 212, 0));
-    --slidev-shell-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.72),
-      0 16px 30px rgba(148, 163, 184, 0.14);
-    --slidev-toolbar-border: rgba(148, 163, 184, 0.3);
-    --slidev-toolbar-bg:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(241, 245, 249, 0.8)),
-      rgba(241, 245, 249, 0.76);
-    --slidev-toolbar-title: rgba(15, 23, 42, 0.9);
-    --slidev-live-color: rgba(8, 145, 178, 0.94);
-    --slidev-live-border: rgba(8, 145, 178, 0.3);
-    --slidev-live-bg: rgba(236, 254, 255, 0.9);
-    --slidev-live-dot: rgba(8, 145, 178, 0.92);
-    --slidev-open-border: rgba(148, 163, 184, 0.4);
-    --slidev-open-bg: rgba(255, 255, 255, 0.78);
-    --slidev-open-hover-border: rgba(8, 145, 178, 0.45);
-    --slidev-open-hover-bg: rgba(236, 254, 255, 0.88);
-    --slidev-viewport-bg:
-      radial-gradient(circle at 50% 0%, rgba(34, 211, 238, 0.12), rgba(34, 211, 238, 0) 45%),
-      linear-gradient(180deg, rgba(226, 232, 240, 0.48), rgba(226, 232, 240, 0.32)),
-      rgba(226, 232, 240, 0.28);
-    --slidev-stage-border: rgba(148, 163, 184, 0.44);
-    --slidev-stage-bg: #f8fafc;
-    --slidev-stage-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.78),
-      0 14px 28px rgba(148, 163, 184, 0.16),
-      0 0 0 1px rgba(34, 211, 238, 0.12);
- 
-    --radius: 0.5rem;
+    --radius: 0.75rem;
   }
- 
+
   .dark {
-    --background: 222.2 84% 4.9%;
+    --background: 224 22% 6%;
     --foreground: 210 40% 98%;
- 
-    --card: 222.2 84% 4.9%;
+
+    --card: 224 22% 8%;
     --card-foreground: 210 40% 98%;
- 
-    --popover: 222.2 84% 4.9%;
+
+    --popover: 224 22% 8%;
     --popover-foreground: 210 40% 98%;
- 
+
     --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 11.2%;
- 
-    --secondary: 217.2 32.6% 17.5%;
+    --primary-foreground: 224 22% 12%;
+
+    --secondary: 224 22% 14%;
     --secondary-foreground: 210 40% 98%;
- 
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
- 
-    --accent: 217.2 32.6% 17.5%;
+
+    --muted: 224 22% 14%;
+    --muted-foreground: 220 9% 62%;
+
+    --accent: 224 22% 18%;
     --accent-foreground: 210 40% 98%;
- 
-    --destructive: 0 62.8% 30.6%;
+
+    --destructive: 0 62% 40%;
     --destructive-foreground: 210 40% 98%;
- 
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 212.7 26.8% 83.9%;
 
-    --activity-bg: 24 24 27 / 0.78;
-    --activity-border: 82 82 91 / 0.42;
-    --activity-divider: 82 82 91 / 0.28;
-    --activity-icon-bg: 255 255 255 / 0.05;
-    --activity-icon-fg: 228 228 231 / 0.82;
-    --activity-meta: 161 161 170 / 0.88;
-    --activity-action: 212 212 216 / 0.88;
-    --activity-action-hover: 250 250 250 / 0.96;
-    --timeline-sweep-muted: 161 161 170 / 0.62;
-    --timeline-sweep-bright: 244 244 245 / 0.96;
-
-    --terminal-bg: 9 9 11;
-    --terminal-fg: 244 244 245;
-    --terminal-prompt: 113 113 122;
-    --terminal-stderr: 248 113 113;
-    --terminal-success: 74 222 128;
-
-    --artifacts-shell-bg:
-      radial-gradient(circle at 100% 0%, rgba(34, 211, 238, 0.08), rgba(34, 211, 238, 0) 46%),
-      linear-gradient(180deg, rgba(9, 15, 28, 0.96), rgba(6, 11, 22, 0.94)),
-      rgba(6, 11, 22, 0.92);
-    --artifacts-shell-overlay: linear-gradient(180deg, rgba(103, 232, 249, 0.05), rgba(103, 232, 249, 0));
-    --artifacts-topbar-bg:
-      linear-gradient(180deg, rgba(33, 45, 64, 0.56), rgba(18, 29, 46, 0.44)),
-      rgba(18, 29, 46, 0.42);
-    --artifacts-action-border: rgba(97, 115, 143, 0.34);
-    --artifacts-action-bg:
-      linear-gradient(180deg, rgba(49, 63, 84, 0.42), rgba(23, 35, 53, 0.3)),
-      rgba(23, 35, 53, 0.28);
-    --artifacts-action-hover:
-      linear-gradient(180deg, rgba(39, 55, 78, 0.76), rgba(20, 32, 49, 0.64)),
-      rgba(23, 35, 53, 0.58);
-    --artifacts-history-bg:
-      linear-gradient(180deg, rgba(17, 26, 40, 0.72), rgba(11, 17, 30, 0.66)),
-      rgba(11, 17, 30, 0.64);
-    --artifacts-preview-bar-bg:
-      linear-gradient(180deg, rgba(34, 46, 65, 0.38), rgba(17, 29, 46, 0.32)),
-      rgba(17, 29, 46, 0.3);
-    --artifacts-preview-path: rgba(175, 192, 216, 0.8);
-    --artifacts-history-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.04),
-      0 6px 14px rgba(2, 6, 23, 0.15);
-
-    --slidev-shell-border: rgba(85, 102, 128, 0.58);
-    --slidev-shell-bg:
-      linear-gradient(180deg, rgba(11, 19, 33, 0.95), rgba(7, 12, 23, 0.94)),
-      rgba(7, 12, 23, 0.92);
-    --slidev-shell-highlight: linear-gradient(180deg, rgba(103, 232, 249, 0.08), rgba(103, 232, 249, 0));
-    --slidev-shell-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.08),
-      0 16px 30px rgba(2, 6, 23, 0.34);
-    --slidev-toolbar-border: rgba(85, 102, 128, 0.4);
-    --slidev-toolbar-bg:
-      linear-gradient(180deg, rgba(35, 49, 69, 0.62), rgba(18, 32, 50, 0.5)),
-      rgba(18, 32, 50, 0.48);
-    --slidev-toolbar-title: rgba(241, 245, 249, 0.94);
-    --slidev-live-color: rgba(224, 242, 254, 0.96);
-    --slidev-live-border: rgba(34, 211, 238, 0.48);
-    --slidev-live-bg: rgba(9, 43, 62, 0.4);
-    --slidev-live-dot: rgba(125, 211, 252, 0.95);
-    --slidev-open-border: rgba(97, 115, 143, 0.56);
-    --slidev-open-bg: rgba(35, 49, 71, 0.62);
-    --slidev-open-hover-border: rgba(103, 232, 249, 0.68);
-    --slidev-open-hover-bg: rgba(11, 47, 70, 0.64);
-    --slidev-viewport-bg:
-      radial-gradient(circle at 50% 0%, rgba(34, 211, 238, 0.12), rgba(34, 211, 238, 0) 45%),
-      linear-gradient(180deg, rgba(3, 12, 27, 0.84), rgba(2, 9, 24, 0.8)),
-      rgba(2, 9, 24, 0.78);
-    --slidev-stage-border: rgba(85, 102, 128, 0.64);
-    --slidev-stage-bg: #040b19;
-    --slidev-stage-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.08),
-      0 14px 28px rgba(2, 6, 23, 0.34),
-      0 0 0 1px rgba(34, 211, 238, 0.14);
+    --border: 224 22% 18%;
+    --input: 224 22% 18%;
+    --ring: 210 40% 80%;
   }
-}
- 
-@layer base {
+
   * {
     @apply border-border;
   }
+
   html,
   body,
   #root {
-    width: 100%;
-    min-height: 100%;
-    height: 100%;
-    margin: 0;
+    @apply h-full;
   }
+
   body {
-    @apply bg-background text-foreground;
+    @apply bg-background text-foreground font-sans;
+    font-feature-settings: 'rlig' 1, 'calt' 1, 'ss01' 1;
   }
 }
 
 @layer utilities {
-  .scrollbar-none {
-    -ms-overflow-style: none;
-    scrollbar-width: none;
-  }
-  .scrollbar-none::-webkit-scrollbar {
-    display: none;
-  }
-}
-
-@keyframes terminalLiveBlink {
-  0% {
-    opacity: 0.95;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.38;
-    transform: scale(0.78);
-  }
-  100% {
-    opacity: 0.95;
-    transform: scale(1);
-  }
-}
-
-@keyframes timelineSweep {
-  0% {
-    background-position: -40% 50%;
-  }
-  100% {
-    background-position: 130% 50%;
-  }
-}
-
-@keyframes scanLine {
-  0% {
-    background-position: -60% 50%;
-  }
-  100% {
-    background-position: 160% 50%;
-  }
-}
-
-.scanning-label {
-  color: transparent;
-  background-image: linear-gradient(
-    90deg,
-    rgb(var(--timeline-sweep-muted)) 0%,
-    rgb(var(--timeline-sweep-muted)) 34%,
-    rgb(var(--timeline-sweep-bright)) 50%,
-    rgb(var(--timeline-sweep-muted)) 66%,
-    rgb(var(--timeline-sweep-muted)) 100%
-  );
-  background-size: 260% 100%;
-  background-position: -60% 50%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  animation: scanLine 2.4s ease-in-out infinite;
-  font-feature-settings: "ss01";
-}
-
-.terminal-panel {
-  background: rgb(var(--terminal-bg));
-  color: rgb(var(--terminal-fg));
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-}
-
-.terminal-prompt {
-  color: rgb(var(--terminal-prompt));
-}
-
-.terminal-stderr {
-  color: rgb(var(--terminal-stderr));
-}
-
-.activity-rail {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  overflow: hidden;
-  border: 1px solid rgb(var(--activity-border));
-  border-radius: 18px;
-  background: rgb(var(--activity-bg));
-  backdrop-filter: blur(18px);
-  box-shadow: 0 12px 28px -24px rgba(15, 23, 42, 0.32);
-}
-
-.activity-row {
-  position: relative;
-  background: transparent;
-}
-
-.activity-row + .activity-row {
-  border-top: 1px solid rgb(var(--activity-divider));
-}
-
-.activity-row--attention::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: rgb(251 191 36);
-}
-
-.activity-icon {
-  display: inline-flex;
-  height: 1.5rem;
-  width: 1.5rem;
-  min-width: 1.5rem;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  background: rgb(var(--activity-icon-bg));
-  color: rgb(var(--activity-icon-fg));
-}
-
-.session-activity-island {
-  overflow: hidden;
-  border: 1px solid rgb(var(--activity-border));
-  border-radius: 18px;
-  background: linear-gradient(180deg, rgb(var(--activity-bg)), rgb(var(--activity-bg)));
-  backdrop-filter: blur(18px);
-  box-shadow: 0 12px 28px -24px rgba(15, 23, 42, 0.32);
-}
-
-.session-activity-item {
-  position: relative;
-  padding: 10px 12px;
-}
-
-.session-activity-item + .session-activity-item {
-  border-top: 1px solid rgb(var(--activity-divider));
-}
-
-.session-activity-item--running::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background-image: linear-gradient(
-    90deg,
-    rgba(255, 255, 255, 0) 0%,
-    rgb(var(--timeline-sweep-bright)) 48%,
-    rgba(255, 255, 255, 0) 100%
-  );
-  background-size: 220% 100%;
-  animation: timelineSweep 2.2s linear infinite;
-}
-
-.session-activity-icon {
-  display: inline-flex;
-  height: 1.5rem;
-  width: 1.5rem;
-  min-width: 1.5rem;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  background: rgb(var(--activity-icon-bg));
-  color: rgb(var(--activity-icon-fg));
-}
-
-.session-activity-meta {
-  display: inline-flex;
-  align-items: center;
-  border-radius: 999px;
-  color: rgb(var(--activity-meta));
-}
-
-.session-activity-action {
-  border: 0;
-  padding: 0;
-  background: transparent;
-  font-size: 11px;
-  font-weight: 500;
-  color: rgb(var(--activity-action));
-}
-
-.session-activity-action:hover {
-  color: rgb(var(--activity-action-hover));
-}
-
-.timeline-running-label {
-  color: transparent;
-  background-image: linear-gradient(
-    90deg,
-    rgb(var(--timeline-sweep-muted)) 0%,
-    rgb(var(--timeline-sweep-muted)) 34%,
-    rgb(var(--timeline-sweep-bright)) 48%,
-    rgb(var(--timeline-sweep-muted)) 60%,
-    rgb(var(--timeline-sweep-muted)) 100%
-  );
-  background-size: 220% 100%;
-  background-position: -40% 50%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  animation: timelineSweep 2.6s linear infinite;
-}
-
-.artifacts-shell {
-  position: relative;
-  background: var(--artifacts-shell-bg);
-}
-
-.artifacts-shell::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: var(--artifacts-shell-overlay);
-  opacity: 0.85;
-}
-
-.artifacts-topbar {
-  position: relative;
-  background: var(--artifacts-topbar-bg);
-}
-
-.artifacts-topbar-action {
-  border: 1px solid var(--artifacts-action-border);
-  background: var(--artifacts-action-bg);
-}
-
-.artifacts-topbar-action:hover {
-  background: var(--artifacts-action-hover);
-}
-
-.artifacts-history-panel {
-  background: var(--artifacts-history-bg);
-}
-
-.artifacts-history-item {
-  box-shadow: var(--artifacts-history-shadow);
-}
-
-.artifacts-preview-bar {
-  background: var(--artifacts-preview-bar-bg);
-}
-
-.artifacts-preview-path {
-  color: var(--artifacts-preview-path);
-}
-
-.slidev-shell {
-  position: relative;
-  overflow: hidden;
-  border: 1px solid var(--slidev-shell-border);
-  background: var(--slidev-shell-bg);
-  box-shadow: var(--slidev-shell-shadow);
-}
-
-.slidev-shell::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: var(--slidev-shell-highlight);
-}
-
-.slidev-toolbar {
-  border-color: var(--slidev-toolbar-border);
-  background: var(--slidev-toolbar-bg);
-}
-
-.slidev-toolbar-title {
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  font-size: 10.5px;
-  font-weight: 720;
-  color: var(--slidev-toolbar-title);
-}
-
-.slidev-toolbar-live {
-  color: var(--slidev-live-color);
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  border: 1px solid var(--slidev-live-border);
-  border-radius: 999px;
-  padding: 2px 9px;
-  background: var(--slidev-live-bg);
-}
-
-.slidev-toolbar-live::before {
-  content: "";
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--slidev-live-dot);
-  animation: terminalLiveBlink 1.3s ease-in-out infinite;
-}
-
-.slidev-toolbar-open {
-  border-color: var(--slidev-open-border);
-  background: var(--slidev-open-bg);
-}
-
-.slidev-toolbar-open:hover {
-  border-color: var(--slidev-open-hover-border);
-  background: var(--slidev-open-hover-bg);
-}
-
-.slidev-viewport {
-  position: relative;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  min-height: clamp(420px, 56vh, 880px);
-  padding: 0.75rem;
-  background: var(--slidev-viewport-bg);
-}
-
-.slidev-viewport::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background-image: radial-gradient(rgba(148, 163, 184, 0.12) 0.8px, transparent 0.8px);
-  background-size: 22px 22px;
-  opacity: 0.08;
-}
-
-.slidev-stage {
-  position: relative;
-  width: 100%;
-  max-width: 1360px;
-  aspect-ratio: 16 / 9;
-  border: 1px solid var(--slidev-stage-border);
-  border-radius: 12px;
-  background: var(--slidev-stage-bg);
-  box-shadow: var(--slidev-stage-shadow);
-  overflow: hidden;
-}
-
-.slidev-frame {
-  display: block;
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  border: 0;
-  border-radius: 0;
-  background: var(--slidev-stage-bg);
-}
-
-@media (max-width: 1024px) {
-  .slidev-shell {
-    min-height: 320px;
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.4) transparent;
   }
 
-  .slidev-viewport {
-    min-height: 280px;
-    padding: 0.5rem;
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
   }
 
-  .slidev-stage {
-    border-radius: 10px;
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--muted-foreground) / 0.4);
+    border-radius: 3px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .shimmer-text {
+    background: linear-gradient(
+      90deg,
+      hsl(var(--muted-foreground) / 0.35) 0%,
+      hsl(var(--foreground)) 40%,
+      hsl(var(--muted-foreground) / 0.35) 80%
+    );
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: shimmer 1.8s linear infinite;
+  }
+
+  @keyframes shimmer {
+    0% {
+      background-position: 200% 0;
+    }
+    100% {
+      background-position: -200% 0;
+    }
+  }
+
+  .timeline-pulse {
+    animation: timeline-pulse 1.6s ease-in-out infinite;
+  }
+
+  @keyframes timeline-pulse {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 0.7;
+    }
+    50% {
+      transform: scale(1.15);
+      opacity: 1;
+    }
   }
 }

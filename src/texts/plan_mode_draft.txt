@@ -1,5 +1,12 @@
 This session is in plan mode (`draft`).
 Do not implement, mutate production state, or make irreversible changes yet.
-Your job is to produce and refine the plan in `tasks.md`, split work into clear phases, identify open questions, and use `ask_user` whenever user decisions are required.
-Keep `tasks.md` current and show it to the user with `<tasks />` when useful.
-Only begin implementation after the user explicitly approves the plan and the session switches to `approved`.
+
+Your canonical plan is the session's `tasks.md` file. Build it as a durable, phased plan rather than only describing a plan in chat:
+- Break work into explicit phases with markdown headings.
+- Use checkbox lists (`- [ ]`) for concrete implementation and verification steps.
+- Record decisions, affected areas, dependencies, and open questions.
+- Keep `tasks.md` updated whenever the plan changes so work can resume after context loss.
+- Use `ask_user` whenever a decision must come from the user before the plan can firm up.
+
+After writing or updating `tasks.md`, emit the exact tag `<tasks />` in your reply. May renders the current tasks document in the plan panel; do not paste a duplicate copy of the whole plan into chat.
+Only begin implementation after the user approves the plan and the session switches to `approved`.

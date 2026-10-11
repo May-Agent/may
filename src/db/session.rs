@@ -14,13 +14,13 @@ use crate::PermissionHistoryMode;
 use crate::scheduler::TaskRunStatus;
 use crate::session::{
     BrowserInteractionState, PendingUserMessage, PersistedAskUserRequest,
-    PersistedPermissionRequest, PersistedWorkspaceRequest, SessionInteractionState, SessionPlanState,
-    SessionRuntimeState, SessionRuntimeSummary, TerminalRuntimeState,
+    PersistedPermissionRequest, PersistedWorkspaceRequest, SessionInteractionState,
+    SessionPlanState, SessionRuntimeState, SessionRuntimeSummary, TerminalRuntimeState,
 };
 use crate::xml::XmlBlock;
 
 use super::common::{
-    BoolValueRow, I32ValueRow, I64ValueRow, PendingAskUserLookup, PendingAskUserQuestionOptionRow,
+    BoolValueRow, I64ValueRow, PendingAskUserLookup, PendingAskUserQuestionOptionRow,
     PendingAskUserQuestionRow, PendingAskUserRequestRow, PendingMessageAttachmentRow,
     PendingMessageEntryRow, PendingPermissionLookup, PendingWorkspaceLookup, SessionIdRow,
     db_custom_error, overflow_error, parse_attachment_kind, parse_pending_user_message_mode,
@@ -28,13 +28,12 @@ use super::common::{
     session_not_found_db_error, storage_error,
 };
 use super::entity::{
-    profile_memory_jobs, session_pending_permissions, session_pending_workspace, session_plans,
-    session_run_leases, session_runtimes, sessions,
+    session_pending_permissions, session_pending_workspace, session_plans, session_run_leases,
+    session_runtimes, sessions,
 };
 use super::{ChatDb, ChatDbError, query};
 
 impl ChatDb {
-
     /// Create a new session.
     pub async fn create_session(
         &self,
@@ -56,7 +55,7 @@ impl ChatDb {
         let now = jiff::Timestamp::now().to_string();
         query!(
             self.db,
-            "INSERT INTO sessions (id, title, model, preview, message_count, profile_id, pinned, archived, folder_id, pin_sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id, title, model, preview, message_count, profile_id, pinned, archived, folder_id, pin_sort_order, created_at, updated_at, reasoning_effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             id,
             title,
             model,
@@ -68,7 +67,8 @@ impl ChatDb {
             Option::<String>::None,
             Option::<i32>::None,
             now.clone(),
-            now
+            now,
+            Option::<String>::None
         )
         .execute()
         .await?;
@@ -202,12 +202,14 @@ impl ChatDb {
                 queued_messages.push(message);
             }
         }
-        steer_messages.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        // The newest steer message (last by id) becomes pending_immediate.
+        // Older steers overflow into the front of the queue.
         let pending_immediate = if steer_messages.is_empty() {
             None
         } else {
-            Some(steer_messages.remove(0))
+            Some(steer_messages.pop().expect("non-empty"))
         };
+        // Insert remaining steers at the front of the queue, preserving their order
         queued_messages.splice(0..0, steer_messages);
 
         let mut summary = SessionRuntimeSummary {
@@ -245,6 +247,10 @@ impl ChatDb {
                     input_notice: runtime_row
                         .as_ref()
                         .and_then(|row| row.terminal_input_notice.clone()),
+                    background_reason: runtime_row
+                        .as_ref()
+                        .and_then(|row| row.terminal_background_reason.as_deref())
+                        .and_then(|raw| serde_json::from_str(raw).ok()),
                 },
             },
             pending_immediate,
@@ -394,9 +400,17 @@ impl ChatDb {
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         let mut tx = self.db.begin().await?;
+        let background_reason_json = summary
+            .interactions
+            .terminal
+            .background_reason
+            .as_ref()
+            .map(|reason| {
+                serde_json::to_string(reason).expect("BackgroundReason must serialize to JSON")
+            });
         query!(
             tx,
-            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, browser_takeover_active = excluded.browser_takeover_active, browser_takeover_alert_pending = excluded.browser_takeover_alert_pending, terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, updated_at = excluded.updated_at",
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, terminal_background_reason, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, browser_takeover_active = excluded.browser_takeover_active, browser_takeover_alert_pending = excluded.browser_takeover_alert_pending, terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, terminal_background_reason = excluded.terminal_background_reason, updated_at = excluded.updated_at",
             session_id,
             summary.state.as_str(),
             summary.interactions.browser.takeover_active,
@@ -405,6 +419,7 @@ impl ChatDb {
             summary.interactions.terminal.output_file.as_deref(),
             summary.interactions.terminal.output_preview.as_deref(),
             summary.interactions.terminal.input_notice.as_deref(),
+            background_reason_json.as_deref(),
             now.as_str()
         )
         .execute()
@@ -605,20 +620,62 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Set the base runtime state for a session, preserving persisted pending payloads.
+    /// Set the base runtime state for a session with a direct SQL update.
     pub async fn set_session_runtime_state(
         &self,
         session_id: &str,
         state: SessionRuntimeState,
     ) -> Result<(), ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        summary.state = state;
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, updated_at) VALUES (?, ?, 0, 0, ?) ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+            session_id,
+            state.as_str(),
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically transition Running → Idle only if currently Running.
+    pub async fn clear_running_if_idle(&self, session_id: &str) -> Result<bool, ChatDbError> {
+        let result = query!(
+            self.db,
+            "UPDATE session_runtimes SET state = 'idle', updated_at = ? WHERE session_id = ? AND state = 'running'",
+            jiff::Timestamp::now().to_string(),
+            session_id
+        )
+        .execute()
+        .await?;
+        Ok(result.rows_written > 0)
+    }
+
+    /// Set only the terminal interaction fields via direct SQL update.
+    pub async fn set_terminal_interaction(
+        &self,
+        session_id: &str,
+        terminal: &TerminalRuntimeState,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        let background_reason_json = terminal.background_reason.as_ref().map(|reason| {
+            serde_json::to_string(reason).expect("BackgroundReason must serialize to JSON")
+        });
+        query!(
+            self.db,
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, terminal_background_reason, updated_at) VALUES (?, 'idle', 0, 0, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, terminal_background_reason = excluded.terminal_background_reason, updated_at = excluded.updated_at",
+            session_id,
+            terminal.task_id.as_deref(),
+            terminal.output_file.as_deref(),
+            terminal.output_preview.as_deref(),
+            terminal.input_notice.as_deref(),
+            background_reason_json.as_deref(),
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        Ok(())
     }
 
     pub async fn set_session_plan_state(
@@ -626,74 +683,137 @@ impl ChatDb {
         session_id: &str,
         plan_state: SessionPlanState,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        summary.plan_state = plan_state;
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_plans (session_id, plan_state, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET plan_state = excluded.plan_state, updated_at = excluded.updated_at",
+            session_id,
+            plan_state.as_str(),
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
-    /// Enqueue a pending-immediate message while preserving older steer messages.
+    /// Enqueue a pending-immediate (steer) message. Existing steer messages
+    /// remain in the DB with their original delivery_mode — the
+    /// `build_session_runtime_summary` method sorts steer messages by recency
+    /// and only promotes the newest one to `pending_immediate`, keeping older
+    /// steers as overflow in the queue.
     pub async fn set_pending_immediate_message(
         &self,
         session_id: &str,
         message: PendingUserMessage,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        if let Some(previous) = summary.pending_immediate.take() {
-            summary.push_overflow_steer(previous);
-        }
-        summary.pending_immediate = Some(message);
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+        let mut tx = self.db.begin().await?;
+        self.insert_pending_message_in_tx(&mut tx, session_id, &message)
+            .await?;
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
-    /// Append a queued message to the server-owned queue.
+    /// Append a queued message via direct SQL insert.
     pub async fn push_queued_message(
         &self,
         session_id: &str,
         message: PendingUserMessage,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        summary.queued_messages.push(message);
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+        let mut tx = self.db.begin().await?;
+        self.insert_pending_message_in_tx(&mut tx, session_id, &message)
+            .await?;
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
-    /// Remove and return the next dispatchable pending message.
+    /// Insert a pending message and its attachments within an existing transaction.
+    async fn insert_pending_message_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
+        session_id: &str,
+        message: &PendingUserMessage,
+    ) -> Result<(), ChatDbError> {
+        query!(
+            tx,
+            "INSERT INTO session_pending_message_entries (session_id, delivery_mode, content, hidden_context_xml, created_at) VALUES (?, ?, ?, ?, ?)",
+            session_id,
+            message.delivery_mode.as_str(),
+            message.content.as_str(),
+            message.hidden_context_xml.clone().map(XmlBlock::into_inner),
+            message.created_at.as_str()
+        )
+        .execute()
+        .await?;
+        let message_id = query!(tx, "SELECT last_insert_rowid() AS value")
+            .fetch_one::<I64ValueRow>()
+            .await?
+            .value;
+        for (ordinal, attachment) in message.attachments.iter().enumerate() {
+            query!(
+                tx,
+                "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                message_id,
+                i64::try_from(ordinal).map_err(|error| overflow_error("pending attachment ordinal", &error))?,
+                attachment.id.as_str(),
+                attachment.name.as_str(),
+                attachment.attachment_type.as_str(),
+                attachment.url.as_str(),
+                attachment.upload_data_url.as_deref(),
+                attachment.text_content.as_deref()
+            )
+            .execute()
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Atomically dequeue the next pending message.
+    /// Priority: newest steer first, then oldest queued.
     pub async fn take_next_pending_message(
         &self,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        let next = if summary.pending_immediate.is_some() {
-            summary.pending_immediate.take()
-        } else if !summary.queued_messages.is_empty() {
-            Some(summary.queued_messages.remove(0))
-        } else {
-            None
+        let mut tx = self.db.begin().await?;
+        // Steer messages first (newest steer = highest priority), then queue (oldest first).
+        // Two-level sort: steer before queue, then newest steer or oldest queue.
+        let row = query!(
+            tx,
+            "SELECT * FROM session_pending_message_entries WHERE session_id = ? ORDER BY CASE delivery_mode WHEN 'steer' THEN 0 ELSE 1 END, CASE delivery_mode WHEN 'steer' THEN -id ELSE id END LIMIT 1",
+            session_id
+        )
+        .fetch_optional::<PendingMessageEntryRow>()
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
         };
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(next)
+        let row_id = row.id;
+        let attachment_rows = query!(
+            tx,
+            "SELECT * FROM session_pending_message_attachments WHERE message_id = ? ORDER BY ordinal ASC",
+            row_id
+        )
+        .fetch_all::<PendingMessageAttachmentRow>()
+        .await?;
+        // Delete atomically
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
+            row_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_entries WHERE id = ?",
+            row_id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        Ok(Some(Self::pending_user_message_from_parts(
+            row,
+            attachment_rows,
+        )?))
     }
 
     /// Remove and return the next pending message only when follow-up execution is allowed.
@@ -701,174 +821,297 @@ impl ChatDb {
         &self,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let summary = self.load_session_runtime_summary(&session.id).await?;
+        // Check dispatchability atomically by reading the runtime state
+        let summary = self.load_session_runtime_summary(session_id).await?;
         if !summary.can_dispatch_follow_up() {
             return Ok(None);
         }
         self.take_next_pending_message(session_id).await
     }
 
-    /// Remove a persisted pending-immediate message, if present.
+    /// Remove all steer (pending-immediate) messages for a session.
     pub async fn clear_pending_immediate_message(
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        summary.pending_immediate = None;
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_attachments WHERE message_id IN (SELECT id FROM session_pending_message_entries WHERE session_id = ? AND delivery_mode = 'steer')",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_entries WHERE session_id = ? AND delivery_mode = 'steer'",
+            session_id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
-    /// Remove a queued message by its position.
+    /// Remove a queued message by its position in the queue.
     pub async fn remove_queued_message_at(
         &self,
         session_id: &str,
         index: usize,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        if index >= summary.queued_messages.len() {
-            return Err(row_not_found(format!(
+        // Find the row ID for the message at this index position
+        // Queue messages are non-steer, ordered by creation time
+        let rows = query!(
+            self.db,
+            "SELECT id FROM session_pending_message_entries WHERE session_id = ? AND delivery_mode != 'steer' ORDER BY created_at ASC",
+            session_id
+        )
+        .fetch_all::<I64ValueRow>()
+        .await?;
+        let row = rows.get(index).ok_or_else(|| {
+            row_not_found(format!(
                 "Queued message index {index} out of range for session {session_id}"
-            )));
-        }
-        summary.queued_messages.remove(index);
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+            ))
+        })?;
+        let row_id = row.value;
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
+            row_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_entries WHERE id = ?",
+            row_id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
-    /// Persist a waiting-permission request for refresh-safe recovery.
+    /// Persist or clear a waiting-permission request via direct SQL.
     pub async fn set_waiting_permission(
         &self,
         session_id: &str,
         request: Option<PersistedPermissionRequest>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        summary.waiting_permission = request;
-        if summary.waiting_permission.is_none() {
-            summary.state = SessionRuntimeState::Running;
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_permissions WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        if let Some(request) = &request {
+            query!(
+                tx,
+                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at) VALUES (?, ?, ?, ?, ?)",
+                request.id.as_str(),
+                session_id,
+                request.request.mode.as_str(),
+                request.request.script.as_str(),
+                now.as_str()
+            )
+            .execute()
+            .await?;
         }
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
-    /// Persist a waiting workspace request for refresh-safe recovery.
+    /// Clear a single waiting-permission row by its `request_id`.
+    ///
+    /// Use this when responding to a specific permission prompt so a fresh row
+    /// inserted by the resumed agent for the *next* permission isn't wiped by a
+    /// session-wide delete.
+    pub async fn clear_waiting_permission_request(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        query!(
+            self.db,
+            "DELETE FROM session_pending_permissions WHERE request_id = ?",
+            request_id
+        )
+        .execute()
+        .await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
+    /// Persist or clear a waiting workspace request via direct SQL.
     pub async fn set_waiting_workspace(
         &self,
         session_id: &str,
         request: Option<PersistedWorkspaceRequest>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        summary.waiting_workspace = request;
-        if summary.waiting_workspace.is_none() {
-            summary.state = SessionRuntimeState::Running;
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_workspace WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        if let Some(request) = &request {
+            query!(
+                tx,
+                "INSERT INTO session_pending_workspace (request_id, session_id, path, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+                request.id.as_str(),
+                session_id,
+                request.request.path.as_str(),
+                request.request.reason.as_str(),
+                now.as_str()
+            )
+            .execute()
+            .await?;
         }
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
-    /// Persist a waiting ask-user request for refresh-safe recovery.
+    /// Persist or clear a waiting ask-user request via direct SQL.
     pub async fn set_waiting_ask_user(
         &self,
         session_id: &str,
         request: Option<PersistedAskUserRequest>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        summary.waiting_ask_user = request;
-        if summary.waiting_ask_user.is_none() {
-            summary.state = SessionRuntimeState::Running;
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        // Clear existing
+        query!(
+            tx,
+            "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_ask_user_requests_v2 WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        // Insert new if present
+        if let Some(request) = &request {
+            query!(
+                tx,
+                "INSERT INTO session_pending_ask_user_requests_v2 (request_id, session_id, created_at) VALUES (?, ?, ?)",
+                request.id.as_str(),
+                session_id,
+                now.as_str()
+            )
+            .execute()
+            .await?;
+            for (question_ordinal, question) in request.questions.iter().enumerate() {
+                let question_ordinal = i64::try_from(question_ordinal)
+                    .map_err(|error| overflow_error("ask-user question ordinal", &error))?;
+                query!(
+                    tx,
+                    "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select) VALUES (?, ?, ?, ?, ?)",
+                    request.id.as_str(),
+                    question_ordinal,
+                    question.section.as_str(),
+                    question.question.as_str(),
+                    question.multi_select
+                )
+                .execute()
+                .await?;
+                for (option_ordinal, option) in question.option.iter().enumerate() {
+                    query!(
+                        tx,
+                        "INSERT INTO session_pending_ask_user_question_options_v2 (request_id, question_ordinal, option_ordinal, value) VALUES (?, ?, ?, ?)",
+                        request.id.as_str(),
+                        question_ordinal,
+                        i64::try_from(option_ordinal).map_err(|error| overflow_error("ask-user option ordinal", &error))?,
+                        option.as_str()
+                    )
+                    .execute()
+                    .await?;
+                }
+            }
         }
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
+    /// Set browser takeover to this session. Clears takeover from OTHER sessions only.
     pub async fn set_browser_takeover_owner(
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        // Clear takeover from OTHER sessions (scoped — not global!)
         query!(
-            self.db,
-            "UPDATE session_runtimes SET browser_takeover_active = 0"
+            tx,
+            "UPDATE session_runtimes SET browser_takeover_active = 0, updated_at = ? WHERE session_id != ? AND browser_takeover_active = 1",
+            now.as_str(),
+            session_id
         )
         .execute()
         .await?;
-
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        summary.interactions.browser.takeover_active = true;
-        summary.interactions.browser.takeover_alert_pending = false;
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+        // Set takeover on this session
+        query!(
+            tx,
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, updated_at) VALUES (?, 'running', 1, 0, ?) ON CONFLICT(session_id) DO UPDATE SET browser_takeover_active = 1, browser_takeover_alert_pending = 0, updated_at = excluded.updated_at",
+            session_id,
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
+    /// Clear browser takeover and set alert pending via direct SQL.
     pub async fn clear_browser_takeover_owner(
         &self,
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        if !summary.interactions.browser.takeover_active {
-            return Ok(summary);
-        }
-        summary.interactions.browser.takeover_active = false;
-        summary.interactions.browser.takeover_alert_pending = true;
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(summary)
+        let now = jiff::Timestamp::now().to_string();
+        // Atomic conditional update: only set alert_pending if takeover was active
+        query!(
+            self.db,
+            "UPDATE session_runtimes SET browser_takeover_active = 0, browser_takeover_alert_pending = 1, updated_at = ? WHERE session_id = ? AND browser_takeover_active = 1",
+            now.as_str(),
+            session_id
+        )
+        .execute()
+        .await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
+    /// Atomically consume the browser takeover alert pending flag.
     pub async fn take_browser_takeover_alert_pending(
         &self,
         session_id: &str,
     ) -> Result<bool, ChatDbError> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| session_not_found_db_error(session_id))?;
-        let mut summary = self.load_session_runtime_summary(&session.id).await?;
-        let pending = summary.interactions.browser.takeover_alert_pending;
-        if !pending {
-            return Ok(false);
-        }
-        summary.interactions.browser.takeover_alert_pending = false;
-        summary.normalize_state();
-        self.write_session_runtime(session_id, &summary).await?;
-        Ok(true)
+        let now = jiff::Timestamp::now().to_string();
+        let result = query!(
+            self.db,
+            "UPDATE session_runtimes SET browser_takeover_alert_pending = 0, updated_at = ? WHERE session_id = ? AND browser_takeover_alert_pending = 1",
+            now.as_str(),
+            session_id
+        )
+        .execute()
+        .await?;
+        Ok(result.rows_written > 0)
     }
 
     pub async fn session_has_browser_takeover(
@@ -960,12 +1203,16 @@ impl ChatDb {
         .is_some())
     }
 
-    /// Update session metadata (title and/or model).
+    /// Update session metadata (title, model, and/or reasoning effort).
+    ///
+    /// `reasoning_effort` uses a tri-state patch: `None` leaves the column
+    /// untouched, `Some(None)` clears it to NULL, `Some(Some(value))` sets it.
     pub async fn update_session(
         &self,
         id: &str,
         title: Option<&str>,
         model: Option<&str>,
+        reasoning_effort: Option<Option<&str>>,
     ) -> Result<(), ChatDbError> {
         let mut existing = self
             .get_session(id)
@@ -977,10 +1224,13 @@ impl ChatDb {
         if let Some(model) = model {
             existing.model = Some(model.to_string());
         }
+        if let Some(effort_patch) = reasoning_effort {
+            existing.reasoning_effort = effort_patch.map(ToString::to_string);
+        }
         existing.updated_at = jiff::Timestamp::now().to_string();
         query!(
             self.db,
-            "UPDATE sessions SET title = ?, model = ?, preview = ?, message_count = ?, profile_id = ?, pinned = ?, archived = ?, folder_id = ?, pin_sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE sessions SET title = ?, model = ?, preview = ?, message_count = ?, profile_id = ?, pinned = ?, archived = ?, folder_id = ?, pin_sort_order = ?, created_at = ?, updated_at = ?, reasoning_effort = ? WHERE id = ?",
             existing.title.as_deref(),
             existing.model.as_deref(),
             existing.preview.as_deref(),
@@ -992,6 +1242,7 @@ impl ChatDb {
             existing.pin_sort_order,
             existing.created_at.as_str(),
             existing.updated_at.as_str(),
+            existing.reasoning_effort.as_deref(),
             id
         )
         .execute()

@@ -4,7 +4,6 @@ use super::entity::{profile_memories, profile_memory_jobs, push_subscriptions};
 use super::{ChatDb, ChatDbError, query};
 
 impl ChatDb {
-
     /// Store a push subscription from a browser.
     pub async fn add_push_subscription(
         &self,
@@ -144,14 +143,23 @@ impl ChatDb {
         Ok(())
     }
 
-    /// List profile memory jobs still marked dirty.
-    pub async fn list_dirty_profile_memory_jobs(
+    /// List dirty profile-memory jobs due for refresh.
+    ///
+    /// Previously processed profiles become due once `last_processed_at` is at
+    /// or before `refresh_cutoff`. New profiles get a short batching grace and
+    /// become due once their dirty `updated_at` is at or before
+    /// `initial_cutoff`.
+    pub async fn list_due_profile_memory_jobs(
         &self,
+        refresh_cutoff: &str,
+        initial_cutoff: &str,
     ) -> Result<Vec<profile_memory_jobs::Model>, ChatDbError> {
         Ok(query!(
             self.db,
-            "SELECT * FROM profile_memory_jobs WHERE dirty = ? ORDER BY updated_at ASC",
-            true
+            "SELECT * FROM profile_memory_jobs WHERE dirty = ? AND ((last_processed_at IS NULL AND updated_at <= ?) OR last_processed_at <= ?) ORDER BY COALESCE(last_processed_at, updated_at) ASC",
+            true,
+            initial_cutoff,
+            refresh_cutoff
         )
         .fetch_all::<profile_memory_jobs::Model>()
         .await?)
@@ -172,6 +180,73 @@ impl ChatDb {
             now,
             profile_id,
             expected_updated_at
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    // ── Session Tasks (DB-backed plan/todo) ──────────────────
+
+    /// Get the tasks content for a session.
+    pub async fn get_session_tasks(&self, session_id: &str) -> Result<Option<String>, ChatDbError> {
+        #[derive(serde::Deserialize, skyzen::FromRow)]
+        struct Row {
+            content: String,
+        }
+        Ok(query!(
+            self.db,
+            "SELECT content FROM session_tasks WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<Row>()
+        .await?
+        .map(|r| r.content))
+    }
+
+    /// Upsert the tasks content for a session.
+    pub async fn set_session_tasks(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_tasks (session_id, content, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+            session_id,
+            content,
+            now
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    // ── Global Memory (DB-backed MEMORY.md replacement) ──────
+
+    /// Get the global memory content.
+    pub async fn get_global_memory(&self) -> Result<Option<String>, ChatDbError> {
+        #[derive(serde::Deserialize, skyzen::FromRow)]
+        struct Row {
+            content: String,
+        }
+        Ok(
+            query!(self.db, "SELECT content FROM global_memory WHERE id = 1")
+                .fetch_optional::<Row>()
+                .await?
+                .map(|r| r.content),
+        )
+    }
+
+    /// Upsert the global memory content.
+    pub async fn set_global_memory(&self, content: &str) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO global_memory (id, content, updated_at) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+            content,
+            now
         )
         .execute()
         .await?;

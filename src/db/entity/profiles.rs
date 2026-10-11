@@ -1,6 +1,6 @@
 //! Profile row model for the chat history database.
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
     pub id: String,
     /// Well-known identifier: "daily", "work", "local", or None for custom profiles.
@@ -16,7 +16,7 @@ pub struct Model {
     pub container_id: Option<String>,
     /// Persona overlay text injected into the agent system prompt.
     pub persona: Option<String>,
-    /// Structured SSH server binding for remote profiles.
+    /// Legacy SSH server binding migrated into `profile_remote_servers`.
     pub remote_ssh_server_id: Option<String>,
     /// Structured Dockerfile override for container profiles.
     pub container_dockerfile: Option<String>,

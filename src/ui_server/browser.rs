@@ -16,7 +16,7 @@ use super::state::UiServerState;
 use super::types::BrowserTakeoverResponse;
 use crate::ui_event_bus::UiEventTopics;
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BrowserStatus {
     enabled: bool,
@@ -26,22 +26,45 @@ pub(super) struct BrowserStatus {
     takeover_session_id: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct WebRtcOfferRequest {
     sdp: String,
+    /// Session that initiated the offer. Required so the actor's takeover
+    /// gate can match DataChannel input messages against the current
+    /// owner; rejected as 400 if missing or empty.
+    session_id: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct WebRtcAnswerResponse {
     sdp: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BrowserTakeoverRequest {
     session_id: String,
+}
+
+#[derive(serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BrowserResizeViewportRequest {
+    width: u32,
+    height: u32,
+    #[serde(default = "default_dpr")]
+    device_scale_factor: f64,
+}
+
+fn default_dpr() -> f64 {
+    1.0
+}
+
+#[derive(serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BrowserResizeViewportResponse {
+    ok: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,7 +89,7 @@ pub(super) async fn ensure_browser_runtime_started(
     let browser_manager = state
         .browser_manager()
         .ok_or(EnsureBrowserRuntimeError::Unavailable)?;
-    if browser_manager.is_running().await {
+    if browser_manager.is_running() {
         return Ok(browser_manager);
     }
 
@@ -102,7 +125,7 @@ pub(super) async fn browser_status(
             takeover_session_id,
         }));
     };
-    let running = bm.is_running().await;
+    let running = bm.is_running();
     Ok(Json(BrowserStatus {
         enabled,
         running,
@@ -233,11 +256,47 @@ async fn run_browser_offer(
             .set_status(StatusCode::NOT_FOUND));
     };
 
-    let answer_sdp = bm.handle_offer(req.sdp).await.map_err(|error| {
-        skyzen::Error::msg(error_chain_text(&error)).set_status(StatusCode::INTERNAL_SERVER_ERROR)
-    })?;
+    let session_id = req.session_id.trim();
+    if session_id.is_empty() {
+        return Err(
+            skyzen::Error::msg("sessionId is required for browser offer")
+                .set_status(StatusCode::BAD_REQUEST),
+        );
+    }
+
+    let answer_sdp = bm
+        .handle_offer(session_id.to_string(), req.sdp)
+        .await
+        .map_err(|error| {
+            skyzen::Error::msg(error_chain_text(&error))
+                .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
 
     Ok(WebRtcAnswerResponse { sdp: answer_sdp })
+}
+
+/// Resize the rendered viewport to follow the panel size on the client.
+pub(super) async fn browser_resize_viewport(
+    State(state): State<Arc<UiServerState>>,
+    Json(req): Json<BrowserResizeViewportRequest>,
+) -> SkyResult<Json<BrowserResizeViewportResponse>> {
+    let Some(bm) = state.browser_manager() else {
+        return Err(skyzen::Error::msg("Browser automation is not enabled")
+            .set_status(StatusCode::NOT_FOUND));
+    };
+    if req.width == 0 || req.height == 0 {
+        return Err(
+            skyzen::Error::msg("width and height must be positive integers")
+                .set_status(StatusCode::BAD_REQUEST),
+        );
+    }
+    bm.resize_viewport(req.width, req.height, req.device_scale_factor)
+        .await
+        .map_err(|error| {
+            skyzen::Error::msg(error_chain_text(&error))
+                .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+    Ok(Json(BrowserResizeViewportResponse { ok: true }))
 }
 
 /// Mark that user has taken over browser control for a session.
@@ -260,6 +319,13 @@ pub(super) async fn browser_takeover_start(
         .map_err(|error| {
             skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
+    // Interrupt an in-flight model request immediately. The chat loop checks
+    // the persisted takeover owner after cancellation and records the run as a
+    // takeover pause rather than an ordinary user cancellation.
+    state.run_cancellation_registry.cancel(session_id.as_str());
+    if let Some(bm) = state.browser_manager() {
+        bm.set_takeover(Some(session_id.clone()));
+    }
     state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
     Ok(Json(BrowserTakeoverResponse {
         ok: true,
@@ -287,6 +353,9 @@ pub(super) async fn browser_takeover_stop(
         .map_err(|error| {
             skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
+    if let Some(bm) = state.browser_manager() {
+        bm.set_takeover(None);
+    }
     if runtime.can_dispatch_follow_up() {
         spawn_follow_up_runs(state.clone(), session_id.clone());
     }
