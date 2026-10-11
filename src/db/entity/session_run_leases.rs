@@ -1,6 +1,6 @@
 //! Durable session run lease row model for active agent execution.
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
     pub session_id: String,
     pub active: bool,

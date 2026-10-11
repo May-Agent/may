@@ -1,476 +1,144 @@
-import { createElement, useCallback, useEffect, useRef, useState } from 'react';
-import { Boxes, Plus, Trash2, ExternalLink } from 'lucide-react';
-import * as api from '@/lib/api';
+import { useEffect, useState } from 'react';
+import { Eye, EyeOff, Save } from 'lucide-react';
+import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import type { UiProviderConfig, ProviderModelsItem } from '@/lib/api';
+import { SectionHeader } from './SectionHeader';
+import { useTranslation } from '@/lib/i18n';
 import {
-  PROVIDER_TYPES,
-  PROVIDER_TYPE_LABEL,
-  providerIcon,
-  type ConfigSectionProps,
-} from './constants';
+  getConfig,
+  setFullConfig,
+  type UiConfigResponse,
+  type UiProviderConfig,
+} from '@/lib/api/config';
 
-type CopilotAuthState = {
-  authenticated: boolean;
-  loading: boolean;
-  authorizing: boolean;
-  userCode?: string;
-  verificationUri?: string;
-  message?: string;
-};
-
-function describeCopilotAuthStatus(status: api.CopilotAuthEvent['status']): string {
-  switch (status) {
-    case 'pending':
-      return 'Waiting for authorization...';
-    case 'success':
-      return 'Copilot connected';
-    case 'expired':
-      return 'Device code expired. Please restart authentication.';
-    case 'denied':
-      return 'Authorization denied by user.';
-    case 'error':
-      return 'Copilot authorization failed';
-  }
-}
-
-export function ProvidersSection({ configDraft, setDraft }: ConfigSectionProps) {
-  const [newProviderType, setNewProviderType] = useState<UiProviderConfig['providerType']>('openai');
-  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
-  const [providerModels, setProviderModels] = useState<Record<string, api.ModelDetailsItem[]>>({});
-  const [copilotAuth, setCopilotAuth] = useState<CopilotAuthState>({
-    authenticated: false,
-    loading: false,
-    authorizing: false,
-  });
-  const copilotAuthStreamRef = useRef<(() => void) | null>(null);
-
-  const closeCopilotAuthStream = useCallback(() => {
-    copilotAuthStreamRef.current?.();
-    copilotAuthStreamRef.current = null;
-  }, []);
-
-  const fetchProviderModelsWithRetry = useCallback(async (): Promise<ProviderModelsItem[]> => {
-    const maxAttempts = 4;
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const rows = await api.fetchModelsByProvider() as ProviderModelsItem[];
-      if (rows.length > 0 || attempt === maxAttempts - 1) {
-        return rows;
-      }
-      await new Promise<void>((resolve) => {
-        window.setTimeout(resolve, 200);
-      });
-    }
-    return [];
-  }, []);
+export function ProvidersSection() {
+  const { t } = useTranslation();
+  const [cfg, setCfg] = useState<UiConfigResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [revealed, setRevealed] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    if (!configDraft?.providers.length) {
-      setSelectedProviderId(null);
-      return;
-    }
-    if (!selectedProviderId || !configDraft.providers.some((p) => p.id === selectedProviderId)) {
-      setSelectedProviderId(configDraft.providers[0]?.id ?? null);
-    }
-  }, [configDraft, selectedProviderId]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const loadStatus = async () => {
+    (async () => {
+      setLoading(true);
       try {
-        const status = await api.fetchCopilotStatus();
-        if (!cancelled) {
-          setCopilotAuth((s) => ({ ...s, authenticated: status.authenticated }));
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setCopilotAuth((s) => ({
-            ...s,
-            message: error instanceof Error ? error.message : String(error),
-          }));
-        }
+        setCfg(await getConfig());
+      } finally {
+        setLoading(false);
       }
-    };
-    void loadStatus();
-    return () => { cancelled = true; };
+    })();
   }, []);
 
-  useEffect(() => closeCopilotAuthStream, [closeCopilotAuthStream]);
+  const updateProvider = (id: string, patch: Partial<UiProviderConfig>) => {
+    if (!cfg) return;
+    setCfg({
+      ...cfg,
+      fullConfig: {
+        ...cfg.fullConfig,
+        providers: cfg.fullConfig.providers.map((p) =>
+          p.id === id ? { ...p, ...patch } : p,
+        ),
+      },
+    });
+  };
 
-  useEffect(() => {
-    let cancelled = false;
-    const loadProviderModels = async () => {
-      try {
-        const rows = await fetchProviderModelsWithRetry();
-        if (cancelled) return;
-        const grouped: Record<string, api.ModelDetailsItem[]> = {};
-        for (const row of rows as ProviderModelsItem[]) {
-          grouped[row.providerId] =
-            row.details && row.details.length > 0
-              ? row.details
-              : row.models.map((id) => ({ id, nickname: id, abilities: [] }));
-        }
-        setProviderModels(grouped);
-      } catch {
-        // silently ignore; models will show "No models fetched yet"
-      }
-    };
-    void loadProviderModels();
-    return () => { cancelled = true; };
-  }, [configDraft?.providers.length, fetchProviderModelsWithRetry]);
+  const toggleReveal = (id: string) => {
+    setRevealed((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
-  const startCopilotOAuth = async () => {
-    closeCopilotAuthStream();
-    setCopilotAuth((s) => ({
-      ...s,
-      loading: true,
-      authorizing: false,
-      authenticated: false,
-      message: undefined,
-    }));
+  const save = async () => {
+    if (!cfg) return;
+    setBusy(true);
     try {
-      const start = await api.startCopilotAuth();
-      const stopCopilotAuthStream = api.subscribeCopilotAuth({
-        deviceCode: start.deviceCode,
-        interval: start.interval,
-        onEvent: (event) => {
-          if (event.status !== 'pending') {
-            copilotAuthStreamRef.current = null;
-          }
-          setCopilotAuth((s) => ({
-            ...s,
-            authenticated: event.status === 'success',
-            loading: false,
-            authorizing: event.status === 'pending',
-            userCode: event.status === 'pending' ? s.userCode : undefined,
-            verificationUri: event.status === 'pending' ? s.verificationUri : undefined,
-            message: event.message ?? describeCopilotAuthStatus(event.status),
-          }));
-        },
-        onError: () => {
-          copilotAuthStreamRef.current = null;
-          setCopilotAuth((s) => ({
-            ...s,
-            authenticated: false,
-            loading: false,
-            authorizing: false,
-            message: 'Copilot authorization stream failed',
-          }));
-        },
+      await setFullConfig(cfg.fullConfig);
+      toast.success(t('common.save'));
+    } catch (err) {
+      toast.error(t('errors.generic'), {
+        description: err instanceof Error ? err.message : undefined,
       });
-      copilotAuthStreamRef.current = () => {
-        stopCopilotAuthStream();
-        copilotAuthStreamRef.current = null;
-      };
-      setCopilotAuth((s) => ({
-        ...s,
-        loading: false,
-        authorizing: true,
-        userCode: start.userCode,
-        verificationUri: start.verificationUri,
-        message: 'Waiting for authorization...',
-      }));
-      window.open(start.verificationUri, '_blank', 'noopener,noreferrer');
-    } catch (e) {
-      setCopilotAuth((s) => ({
-        ...s,
-        loading: false,
-        authorizing: false,
-        message: (e as Error).message,
-      }));
+    } finally {
+      setBusy(false);
     }
   };
 
-  if (!configDraft) {
-    return <div className="text-sm text-muted-foreground">Loading provider config...</div>;
-  }
-
-  const selectedProvider = configDraft.providers.find((p) => p.id === selectedProviderId) ?? null;
-  const selectedProviderModels = selectedProvider ? providerModels[selectedProvider.id] ?? [] : [];
+  const providers = cfg?.fullConfig.providers ?? [];
 
   return (
-    <section className="space-y-4">
-      <div className="flex items-center gap-2 text-sm font-medium uppercase text-muted-foreground tracking-wide">
-        <Boxes className="h-4 w-4" /> Providers
-      </div>
-
-      <div className="grid gap-4 md:grid-cols-[280px_1fr]">
-        <div className="rounded border bg-muted/20 p-2 space-y-2">
-          <div className="flex items-center gap-2">
-            <Select value={newProviderType} onValueChange={(v) => setNewProviderType(v as UiProviderConfig['providerType'])}>
-              <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {PROVIDER_TYPES.map((p) => (
-                  <SelectItem key={p} value={p}>{p}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button
-              size="icon"
-              variant="outline"
-              className="h-8 w-8"
-              onClick={() => {
-                const baseId = newProviderType;
-                let id: string = baseId;
-                let n = 2;
-                while (configDraft.providers.some((p) => p.id === id)) {
-                  id = `${baseId}-${n++}`;
-                }
-                setSelectedProviderId(id);
-                setDraft((prev) => ({
-                  ...prev,
-                  providers: [
-                    ...prev.providers,
-                    {
-                      id,
-                      providerType: newProviderType,
-                      apiKey: null,
-                      baseUrl: null,
-                      displayName: null,
-                      enabled: true,
-                    },
-                  ].sort((a, b) => a.id.localeCompare(b.id)),
-                }));
-              }}
-            >
-              <Plus className="h-4 w-4" />
-            </Button>
-          </div>
-
-          <div className="max-h-[560px] overflow-auto space-y-1">
-            {configDraft.providers.map((provider) => {
-              const active = provider.id === selectedProviderId;
-              const count = providerModels[provider.id]?.length ?? 0;
-              return (
-                <button
-                  key={provider.id}
-                  type="button"
-                  onClick={() => setSelectedProviderId(provider.id)}
-                  className={`w-full text-left rounded px-2 py-1.5 border transition ${
-                    active ? 'bg-secondary border-border' : 'border-transparent hover:bg-muted/50'
-                  }`}
-                >
-                  <div className="flex items-center gap-2">
-                    {createElement(providerIcon(provider), { className: 'h-3.5 w-3.5' })}
-                    <div className="text-sm font-medium truncate">{provider.displayName || provider.id}</div>
-                  </div>
-                  <div className="text-[11px] text-muted-foreground">{PROVIDER_TYPE_LABEL[provider.providerType]} · {count} models</div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        <div className="rounded border p-4 space-y-4">
-          {!selectedProvider ? (
-            <div className="text-sm text-muted-foreground">Select a provider to edit.</div>
-          ) : (
-            <ProviderDetail
-              provider={selectedProvider}
-              providerModels={selectedProviderModels}
-              copilotAuth={copilotAuth}
-              onStartCopilotOAuth={startCopilotOAuth}
-              onLogoutCopilot={async () => {
-                closeCopilotAuthStream();
-                await api.logoutCopilot();
-                setCopilotAuth({
-                  authenticated: false,
-                  loading: false,
-                  authorizing: false,
-                  message: 'Signed out',
-                });
-              }}
-              setDraft={setDraft}
-              setSelectedProviderId={setSelectedProviderId}
-            />
-          )}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function ProviderDetail({
-  provider,
-  providerModels,
-  copilotAuth,
-  onStartCopilotOAuth,
-  onLogoutCopilot,
-  setDraft,
-  setSelectedProviderId,
-}: {
-  provider: UiProviderConfig;
-  providerModels: api.ModelDetailsItem[];
-  copilotAuth: CopilotAuthState;
-  onStartCopilotOAuth: () => Promise<void>;
-  onLogoutCopilot: () => Promise<void>;
-  setDraft: ConfigSectionProps['setDraft'];
-  setSelectedProviderId: React.Dispatch<React.SetStateAction<string | null>>;
-}) {
-  const isCopilot = provider.providerType === 'copilot' || provider.id === 'copilot';
-
-  return (
-    <>
-      <div className="flex items-center justify-between gap-2">
-        <div>
-          <div className="font-medium flex items-center gap-2">{createElement(providerIcon(provider), { className: 'h-4 w-4' })}{provider.id}</div>
-          <div className="text-xs text-muted-foreground">{PROVIDER_TYPE_LABEL[provider.providerType]}</div>
-        </div>
-        <div className="flex items-center gap-2">
-          <Label className="text-xs text-muted-foreground">Enabled</Label>
-          <input
-            type="checkbox"
-            checked={provider.enabled}
-            onChange={(e) =>
-              setDraft((prev) => ({
-                ...prev,
-                providers: prev.providers.map((p) =>
-                  p.id === provider.id ? { ...p, enabled: e.target.checked } : p,
-                ),
-              }))
-            }
-          />
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => {
-              setDraft((prev) => ({
-                ...prev,
-                providers: prev.providers.filter((p) => p.id !== provider.id),
-              }));
-              setSelectedProviderId((prev) => (prev === provider.id ? null : prev));
-            }}
-          >
-            <Trash2 className="h-4 w-4" />
+    <section>
+      <SectionHeader
+        title={t('settings.providers.title')}
+        description={t('settings.providers.description')}
+        action={
+          <Button disabled={busy || !cfg} onClick={save}>
+            <Save className="size-4" />
+            {t('common.save')}
           </Button>
-        </div>
-      </div>
+        }
+      />
 
-      <div className="grid gap-3 md:grid-cols-2">
-        <div className="space-y-1">
-          <Label>Type</Label>
-          <Select
-            value={provider.providerType}
-            onValueChange={(v) =>
-              setDraft((prev) => ({
-                ...prev,
-                providers: prev.providers.map((p) =>
-                  p.id === provider.id ? { ...p, providerType: v as UiProviderConfig['providerType'] } : p,
-                ),
-              }))
-            }
-          >
-            <SelectTrigger><SelectValue /></SelectTrigger>
-            <SelectContent>
-              {PROVIDER_TYPES.map((p) => (
-                <SelectItem key={p} value={p}>{p}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="space-y-1">
-          <Label>Display Name</Label>
-          <Input
-            value={provider.displayName ?? ''}
-            onChange={(e) =>
-              setDraft((prev) => ({
-                ...prev,
-                providers: prev.providers.map((p) =>
-                  p.id === provider.id ? { ...p, displayName: e.target.value || null } : p,
-                ),
-              }))
-            }
-            placeholder="optional"
-          />
-        </div>
-      </div>
-
-      <div className="rounded border bg-muted/10 p-3 space-y-2">
-        <div className="text-xs text-muted-foreground">Available models ({providerModels.length})</div>
-        <div className="max-h-44 overflow-auto rounded border p-2 text-xs space-y-1">
-          {providerModels.length > 0 ? (
-            providerModels.map((m) => (
-              <div key={m.id} className="rounded border bg-background/70 px-2 py-1">
-                <div className="font-mono">{m.id}</div>
-                <div className="text-muted-foreground">{m.nickname}</div>
-              </div>
-            ))
-          ) : (
-            'No models fetched yet'
-          )}
-        </div>
-      </div>
-
-      {isCopilot ? (
-        <div className="rounded border bg-muted/20 p-3 space-y-2">
-          <div className="text-sm font-medium">GitHub Copilot OAuth</div>
-          <div className="text-xs text-muted-foreground">
-            {copilotAuth.authenticated
-              ? 'Connected'
-              : copilotAuth.authorizing
-                ? 'Waiting for authorization...'
-                : 'Not connected'}
-          </div>
-          {copilotAuth.userCode && copilotAuth.verificationUri && (
-            <div className="text-xs">
-              Code: <span className="font-mono">{copilotAuth.userCode}</span>{' '}
-              <a className="underline" href={copilotAuth.verificationUri} target="_blank" rel="noreferrer">
-                Open
-              </a>
-            </div>
-          )}
-          {copilotAuth.message && <div className="text-xs text-muted-foreground">{copilotAuth.message}</div>}
-          <div className="flex gap-2">
-            <Button size="sm" onClick={() => void onStartCopilotOAuth()} disabled={copilotAuth.loading || copilotAuth.authorizing}>
-              <ExternalLink className="h-3 w-3 mr-1" /> Sign in
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => void onLogoutCopilot()}
-            >
-              Sign out
-            </Button>
-          </div>
-        </div>
+      {loading ? (
+        <div className="py-6 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
+      ) : providers.length === 0 ? (
+        <div className="py-6 text-center text-sm text-muted-foreground">{t('common.empty')}</div>
       ) : (
-        <div className="grid gap-3 md:grid-cols-2">
-          <div className="space-y-1">
-            <Label>API Key</Label>
-            <Input
-              type="password"
-              value={provider.apiKey ?? ''}
-              onChange={(e) =>
-                setDraft((prev) => ({
-                  ...prev,
-                  providers: prev.providers.map((p) =>
-                    p.id === provider.id ? { ...p, apiKey: e.target.value || null } : p,
-                  ),
-                }))
-              }
-              placeholder="optional for some providers"
-            />
-          </div>
-          <div className="space-y-1">
-            <Label>Base URL</Label>
-            <Input
-              value={provider.baseUrl ?? ''}
-              onChange={(e) =>
-                setDraft((prev) => ({
-                  ...prev,
-                  providers: prev.providers.map((p) =>
-                    p.id === provider.id ? { ...p, baseUrl: e.target.value || null } : p,
-                  ),
-                }))
-              }
-              placeholder="optional/custom provider"
-            />
-          </div>
-        </div>
+        <ul className="space-y-3">
+          {providers.map((p) => {
+            const shown = revealed.has(p.id);
+            return (
+              <li key={p.id} className="rounded-md border border-border p-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-medium">{p.displayName ?? p.id}</div>
+                    <div className="text-xs text-muted-foreground">{p.providerType}</div>
+                  </div>
+                  <label className="flex cursor-pointer items-center gap-1.5 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={p.enabled}
+                      onChange={(e) => updateProvider(p.id, { enabled: e.target.checked })}
+                    />
+                    {p.enabled ? t('common.enabled') : t('common.disabled')}
+                  </label>
+                </div>
+                <div className="grid gap-2">
+                  <div>
+                    <label className="text-xs text-muted-foreground">{t('settings.providers.apiKey')}</label>
+                    <div className="relative">
+                      <input
+                        type={shown ? 'text' : 'password'}
+                        value={p.apiKey ?? ''}
+                        onChange={(e) => updateProvider(p.id, { apiKey: e.target.value })}
+                        className="w-full rounded-md border border-border bg-background px-3 py-1.5 pr-9 text-sm font-mono outline-none focus:ring-2 focus:ring-ring"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => toggleReveal(p.id)}
+                        className="absolute inset-y-0 right-1.5 flex items-center text-muted-foreground hover:text-foreground"
+                        aria-label={shown ? 'hide' : 'show'}
+                      >
+                        {shown ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-xs text-muted-foreground">{t('settings.providers.baseUrl')}</label>
+                    <input
+                      value={p.baseUrl ?? ''}
+                      onChange={(e) => updateProvider(p.id, { baseUrl: e.target.value })}
+                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm font-mono outline-none focus:ring-2 focus:ring-ring"
+                    />
+                  </div>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
       )}
-    </>
+    </section>
   );
 }

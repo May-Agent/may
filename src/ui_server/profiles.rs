@@ -19,7 +19,7 @@ use super::types::ApiErrorCode;
 
 // ── Request / Response types ────────────────────────────────
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CreateProfileRequest {
     pub name: String,
@@ -80,14 +80,6 @@ pub(super) async fn ensure_profile_environment_ready(
         .ok_or_else(|| bad_request_error("Profile not found"))?;
     let environment = ProfileEnvironmentKind::from_str(profile.environment.as_str())
         .map_err(map_profile_error)?;
-
-    if environment == ProfileEnvironmentKind::Remote {
-        let config = state.config_snapshot();
-        crate::profile::remote::resolve_remote_profile_server(&profile, &config.ssh_servers)
-            .map_err(bad_request_error)?;
-        state.clear_container_prepare_status(profile_id);
-        return Ok(());
-    }
 
     if environment != ProfileEnvironmentKind::Container {
         state.clear_container_prepare_status(profile_id);
@@ -248,7 +240,7 @@ pub(super) async fn ensure_profile_environment_ready(
     prepare_result
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct UpdateProfileRequest {
     #[serde(default)]
@@ -269,13 +261,13 @@ pub(super) struct UpdateProfileRequest {
     pub location_aware: Option<bool>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CreateFolderRequest {
     pub name: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct UpdateFolderRequest {
     #[serde(default)]
@@ -284,10 +276,16 @@ pub(super) struct UpdateFolderRequest {
     pub sort_order: Option<i32>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct MoveToFolderRequest {
     pub folder_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SetProfileRemoteServersRequest {
+    pub server_names: Vec<String>,
 }
 
 // ── Profile endpoints ───────────────────────────────────────
@@ -392,6 +390,54 @@ pub(super) async fn delete_profile(
     Ok(Json(super::types::API_OK))
 }
 
+pub(super) async fn get_profile_remote_servers(
+    params: Params,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<Vec<String>>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let names = db
+        .list_profile_remote_servers(&id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(names))
+}
+
+pub(super) async fn set_profile_remote_servers(
+    params: Params,
+    Json(req): Json<SetProfileRemoteServersRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<skyzen::Response> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+
+    if db.get_profile(&id).await.map_err(internal_error)?.is_none() {
+        return Err(bad_request_error("Profile not found"));
+    }
+
+    let configured: std::collections::HashSet<String> = state
+        .config_snapshot()
+        .ssh_servers
+        .iter()
+        .map(|server| server.name.clone())
+        .collect();
+    for name in &req.server_names {
+        if !configured.contains(name) {
+            return Ok(typed_error_response(
+                skyzen::StatusCode::BAD_REQUEST,
+                ApiErrorCode::UnknownSshServer,
+                format!("unknown ssh server: {name}"),
+            ));
+        }
+    }
+
+    db.set_profile_remote_servers(&id, &req.server_names)
+        .await
+        .map_err(internal_error)?;
+
+    json_ok_response(&super::types::API_OK)
+}
+
 pub(super) async fn get_profile_sessions(
     params: Params,
     Query(query): Query<ProfileSessionsQuery>,
@@ -421,7 +467,7 @@ pub(super) async fn get_profile_sessions(
     json_ok_response(&result)
 }
 
-#[derive(Debug, serde::Deserialize, Default)]
+#[derive(Debug, serde::Deserialize, Default, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ProfileSessionsQuery {
     #[serde(default)]
@@ -430,7 +476,7 @@ pub(super) struct ProfileSessionsQuery {
 
 // ── Folder endpoints ────────────────────────────────────────
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct FolderResponse {
     id: String,

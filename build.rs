@@ -1,3 +1,6 @@
+//! Build script: builds the web UI bundle with `bun` when the `ui` feature is
+//! enabled so its `dist/` assets can be embedded in the binary.
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;

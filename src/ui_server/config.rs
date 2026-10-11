@@ -11,6 +11,7 @@ use tokio::time::MissedTickBehavior;
 use crate::config::{MayConfig, ProviderInstance, SshServerConfig};
 use crate::copilot::{clear_copilot_credentials, has_copilot_token, save_copilot_token};
 use crate::mcp::MayMcpServerConfig;
+use crate::model_selector::ModelSelector;
 use crate::session::MayHomePaths;
 use crate::skill::SkillManager;
 use crate::ui_event_bus::UiEventTopics;
@@ -28,13 +29,13 @@ use super::types::{
     UiRemoteAccessConfig,
 };
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SkillScopeQuery {
     profile_id: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CopilotAuthStreamQuery {
     device_code: String,
@@ -44,6 +45,17 @@ pub(super) struct CopilotAuthStreamQuery {
 fn scoped_skill_manager(state: &UiServerState, profile_id: &str) -> SkillManager {
     let home_paths = MayHomePaths::new(state.may_dir.clone());
     SkillManager::from_profile_home(&home_paths.profile_home(profile_id))
+}
+
+fn parse_selector_list(values: &[String]) -> Vec<ModelSelector> {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .parse::<ModelSelector>()
+                .expect("ui config save must receive valid model selectors")
+        })
+        .collect()
 }
 
 pub(super) async fn list_skills_for_profile(
@@ -92,19 +104,35 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
     UiFullConfig {
         providers,
         models: UiModelsConfig {
-            advanced: config.models.advanced.clone(),
-            balanced: config.models.balanced.clone(),
-            fast: config.models.fast.clone(),
-            image_generation: config.models.image_generation.clone(),
-            embedding_model: config.models.embedding_model.clone(),
+            advanced: config
+                .models
+                .advanced
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            balanced: config
+                .models
+                .balanced
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            fast: config.models.fast.iter().map(ToString::to_string).collect(),
+            image_generation: config
+                .models
+                .image_generation
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            embedding_model: config
+                .models
+                .embedding_model
+                .as_ref()
+                .map(ToString::to_string),
             embedding_dimensions: config.models.embedding_dimensions,
-            model_providers: config.models.model_providers.clone(),
         },
         preferences: UiPreferencesConfig {
-            load_balance_strategy: config.preferences.load_balance_strategy,
             warn_on_model_change: config.preferences.warn_on_model_change,
             show_token_usage: config.preferences.show_token_usage,
-            strict_model_matching: config.preferences.strict_model_matching,
             network_policy_mode: config.preferences.network_policy.mode,
             network_policy_hosts: config.preferences.network_policy.hosts.clone(),
         },
@@ -112,15 +140,25 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             font: config.appearance.font.clone(),
             theme: config.appearance.theme.clone(),
         },
-        last_model: config.last_model.clone(),
+        last_model: config.last_model.as_ref().map(ToString::to_string),
         max_iterations: config.max_iterations,
         browser: UiBrowserConfig {
             enabled: config.browser.enabled,
             backend: config.browser.backend,
             port: config.browser.port,
             remote_cdp_endpoint: config.browser.remote_cdp_endpoint.clone(),
-            screencast_quality: config.browser.screencast_quality,
+            screencast_jpeg_quality: config.browser.screencast_jpeg_quality,
+            encoder_initial_bitrate_kbps: config.browser.encoder_initial_bitrate_kbps,
             screencast_max_width: config.browser.screencast_max_width,
+            screencast_max_height: config.browser.screencast_max_height,
+            every_nth_frame: config.browser.every_nth_frame,
+            stealth_enabled: config.browser.stealth_enabled,
+            system_profile: config.browser.system_profile.as_ref().map(|sp| {
+                crate::ui_server::types::UiSystemProfileConfig {
+                    path: sp.path.display().to_string(),
+                    copy_on_first_use: sp.copy_on_first_use,
+                }
+            }),
         },
         remote_access: UiRemoteAccessConfig::from(&config.remote_access),
     }
@@ -156,8 +194,18 @@ async fn run_save_full_config(
                 .remote_cdp_endpoint
                 .clone()
                 .filter(|value| !value.trim().is_empty()),
-            screencast_quality: req.browser.screencast_quality,
+            screencast_jpeg_quality: req.browser.screencast_jpeg_quality,
+            encoder_initial_bitrate_kbps: req.browser.encoder_initial_bitrate_kbps,
             screencast_max_width: req.browser.screencast_max_width,
+            screencast_max_height: req.browser.screencast_max_height,
+            every_nth_frame: req.browser.every_nth_frame,
+            stealth_enabled: req.browser.stealth_enabled,
+            system_profile: req.browser.system_profile.as_ref().map(|sp| {
+                crate::config::SystemProfileConfig {
+                    path: std::path::PathBuf::from(&sp.path),
+                    copy_on_first_use: sp.copy_on_first_use,
+                }
+            }),
         };
         next_browser_config.validate().map_err(bad_request_error)?;
         crate::container::browser::prepare_browser_runtime(&next_browser_config, &state.may_dir)
@@ -167,6 +215,9 @@ async fn run_save_full_config(
             crate::container::browser::BrowserManager::new(
                 next_browser_config,
                 state.may_dir.clone(),
+                crate::container::browser::BrowserLifecyclePublisher::new(
+                    state.browser_lifecycle_tx.clone(),
+                ),
             )
             .map_err(internal_error)?,
         ))
@@ -186,21 +237,23 @@ async fn run_save_full_config(
         }
 
         config.provider = provider_map;
-        config.models.advanced = req.models.advanced.clone();
-        config.models.balanced = req.models.balanced.clone();
-        config.models.fast = req.models.fast.clone();
-        config.models.image_generation = req.models.image_generation.clone();
+        config.models.advanced = parse_selector_list(&req.models.advanced);
+        config.models.balanced = parse_selector_list(&req.models.balanced);
+        config.models.fast = parse_selector_list(&req.models.fast);
+        config.models.image_generation = parse_selector_list(&req.models.image_generation);
         config.models.embedding_model = req
             .models
             .embedding_model
             .clone()
-            .filter(|value| !value.trim().is_empty());
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .parse::<ModelSelector>()
+                    .expect("ui config save must receive valid model selectors")
+            });
         config.models.embedding_dimensions = req.models.embedding_dimensions;
-        config.models.model_providers = req.models.model_providers.clone();
-        config.preferences.load_balance_strategy = req.preferences.load_balance_strategy;
         config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
         config.preferences.show_token_usage = req.preferences.show_token_usage;
-        config.preferences.strict_model_matching = req.preferences.strict_model_matching;
         config.preferences.network_policy.mode = req.preferences.network_policy_mode;
         config.preferences.network_policy.hosts = req
             .preferences
@@ -211,7 +264,11 @@ async fn run_save_full_config(
             .collect();
         config.appearance.font = req.appearance.font.clone();
         config.appearance.theme = req.appearance.theme;
-        config.last_model = req.last_model.clone();
+        config.last_model = req.last_model.clone().map(|value| {
+            value
+                .parse::<ModelSelector>()
+                .expect("ui config save must receive valid model selectors")
+        });
         config.max_iterations = req.max_iterations;
         config.browser.enabled = req.browser.enabled;
         config.browser.backend = req.browser.backend;
@@ -221,8 +278,20 @@ async fn run_save_full_config(
             .remote_cdp_endpoint
             .clone()
             .filter(|value| !value.trim().is_empty());
-        config.browser.screencast_quality = req.browser.screencast_quality;
+        config.browser.screencast_jpeg_quality = req.browser.screencast_jpeg_quality;
+        config.browser.encoder_initial_bitrate_kbps = req.browser.encoder_initial_bitrate_kbps;
         config.browser.screencast_max_width = req.browser.screencast_max_width;
+        config.browser.screencast_max_height = req.browser.screencast_max_height;
+        config.browser.every_nth_frame = req.browser.every_nth_frame;
+        config.browser.stealth_enabled = req.browser.stealth_enabled;
+        config.browser.system_profile =
+            req.browser
+                .system_profile
+                .as_ref()
+                .map(|sp| crate::config::SystemProfileConfig {
+                    path: std::path::PathBuf::from(&sp.path),
+                    copy_on_first_use: sp.copy_on_first_use,
+                });
         config.remote_access.enabled = req.remote_access.enabled;
         config.remote_access.cloudflared_binary = req.remote_access.cloudflared_binary.clone();
         config.remote_access.tunnel_token = req
@@ -244,7 +313,6 @@ async fn run_save_full_config(
         .compile()
         .map_err(bad_request_error)?;
 
-    let ssh_servers = updated.ssh_servers.clone();
     updated.save().await.map_err(internal_error)?;
     if let Some(previous_browser_manager) = previous_browser_manager {
         previous_browser_manager
@@ -253,7 +321,6 @@ async fn run_save_full_config(
             .map_err(internal_error)?;
     }
     state.set_browser_manager(next_browser_manager);
-    state.task_runtime.set_ssh_servers(ssh_servers);
     state
         .task_runtime
         .set_network_policy(state.config_snapshot().preferences.network_policy.clone())
@@ -283,10 +350,12 @@ pub(super) async fn set_last_model(
 pub(super) async fn get_memory(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<MemoryPayload>> {
-    let memory_path = MayHomePaths::new(state.may_dir.clone()).memory_file();
-    let content = async_fs::read_to_string(memory_path)
+    let content = state
+        .db()
+        .get_global_memory()
         .await
-        .map_err(internal_error)?;
+        .map_err(internal_error)?
+        .unwrap_or_default();
     Ok(Json(MemoryPayload { content }))
 }
 
@@ -299,8 +368,9 @@ pub(super) async fn save_memory(
             "memory updates require explicit user request confirmation",
         ));
     }
-    let memory_path = MayHomePaths::new(state.may_dir.clone()).memory_file();
-    async_fs::write(memory_path, payload.content)
+    state
+        .db()
+        .set_global_memory(&payload.content)
         .await
         .map_err(internal_error)?;
     Ok(Json(ApiHealth { ok: true }))
@@ -318,9 +388,7 @@ pub(super) async fn add_ssh_server(
             target: req.target,
         });
     });
-    let ssh_servers = updated.ssh_servers.clone();
     updated.save().await.map_err(internal_error)?;
-    state.task_runtime.set_ssh_servers(ssh_servers);
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }
@@ -333,9 +401,12 @@ pub(super) async fn remove_ssh_server(
     let updated = state.update_config(|config| {
         let _ = config.remove_ssh_server(name);
     });
-    let ssh_servers = updated.ssh_servers.clone();
     updated.save().await.map_err(internal_error)?;
-    state.task_runtime.set_ssh_servers(ssh_servers);
+    state
+        .db()
+        .remove_profile_attachments_for_server(name)
+        .await
+        .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(Json(ApiHealth { ok: true }))
 }

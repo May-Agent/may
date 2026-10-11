@@ -128,15 +128,22 @@ impl NotificationService {
     pub async fn redeliver_pending(&self) -> Result<(), NotificationServiceError> {
         let pending = self.db.list_pending_notification_mailbox_entries().await?;
         for item in pending {
+            // CAS claim: pending → delivering. If another process already claimed it, skip.
+            let claimed = self.db.claim_pending_notification(&item.id).await?;
+            if !claimed {
+                tracing::debug!(
+                    notification_id = %item.id,
+                    "skipping redelivery — already claimed by another process"
+                );
+                continue;
+            }
+
             let payload = NotificationPayload {
                 notification_id: Some(item.id.clone()),
                 title: item.title,
                 body: item.body,
                 session_id: item.session_id,
-                callback_context_xml: item
-                    .callback_context_xml
-                    .map(XmlBlock::parse)
-                    .transpose()?,
+                callback_context_xml: item.callback_context_xml.map(XmlBlock::parse).transpose()?,
                 callback_message: item.callback_message,
             };
             let send_result = self.manager.send_payload(payload).await;
@@ -170,15 +177,10 @@ impl NotificationService {
                         .publish(UiEventTopics::NOTIFICATION_MAILBOX);
                 }
                 Err(error) => {
+                    // Release claim back to pending so it can be retried
                     let error_text = error.to_string();
                     self.db
-                        .update_notification_mailbox_delivery(
-                            &item.id,
-                            MAILBOX_STATUS_FAILED,
-                            0,
-                            Some(error_text.as_str()),
-                            None,
-                        )
+                        .release_notification_claim(&item.id, &error_text)
                         .await?;
                     self.ui_event_bus
                         .publish(UiEventTopics::NOTIFICATION_MAILBOX);

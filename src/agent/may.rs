@@ -1,47 +1,46 @@
 //! May agent wrapper around aither-agent.
 
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use aither_agent::{
-    Agent, AgentError, AgentEvent, AgentKind, BrowserBackend, CompactResult, HCons,
-    TerminalAgentBuilder,
+    Agent, AgentError, AgentEvent, AgentKind, CompactResult, HCons, TerminalAgentBuilder,
 };
 use aither_cloud::CloudProvider;
 use aither_core::llm::{
-    LLMRequest, Message as LlmMessage,
-    model::{Parameters, Profile as ModelProfile, ReasoningEffort},
+    Attachment as LlmAttachment, Message as LlmMessage,
+    model::{Parameters, ReasoningEffort},
 };
 use aither_sandbox::{
-    ContainerExecHandle, ContainerShellRuntime, ShellRuntimeAvailability, SshServer, TerminalTool,
+    AnyContainerExec, ContainerShellRuntime, ShellRuntimeAvailability, SshServer, TerminalTool,
 };
 use executor_core::DefaultExecutor;
-use futures_lite::{Stream, StreamExt};
+use futures_lite::Stream;
 
 use super::hooks::{ContextSnapshotHook, PendingSteerHook};
-use super::imagine::{ImageGeneratorConfig, ImagineTool, resolve_image_generator_config};
+use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::permission::PermissionApprover;
 use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
 use super::runtime_context::{
     RuntimeSystemContext, build_base_system_prompt, build_browser_context,
-    build_container_environment_context, build_location_context, build_macos_host_automation_context,
-    build_memory_context_content, build_native_voice_context, build_network_restrictions_context,
-    build_plan_mode_context, build_remote_environment_context, build_terminal_runtime_context,
-    build_workspace_context, build_workspace_workdirs_context, global_memory_file_path, tag,
+    build_container_environment_context, build_location_context,
+    build_macos_host_automation_context, build_memory_context_content, build_native_voice_context,
+    build_network_restrictions_context, build_plan_mode_context, build_terminal_runtime_context,
+    build_workspace_context, build_workspace_workdirs_context, tag,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
-use crate::ask_user::{AskUserBroker, AskUserTool};
-use crate::config::MayConfig;
+use crate::ask_user::AskUserBroker;
+use crate::config::{MayConfig, NativeToolsConfig, ProviderType};
 use crate::embedding_provider::EmbeddingModelResolution;
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::session::{SessionId, SessionPaths, SessionPlanState};
-use crate::terminal_commands::{SharedTerminalCommandConfig, register_shared_terminal_commands};
+use crate::terminal_commands::{
+    ImagineCommandConfig, SharedTerminalCommandConfig, register_shared_terminal_commands,
+};
 use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::workspace::Workspace as MayWorkspace;
 use crate::workspace_request::WorkspaceRequestBroker;
-
-const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
 
 /// May agent error.
 #[derive(Debug, thiserror::Error)]
@@ -60,23 +59,24 @@ pub enum MayAgentError {
     MissingApiKey(String),
     #[error("Copilot token error: {0}")]
     CopilotToken(#[from] crate::copilot::CopilotTokenError),
+    #[error("ChatGPT auth error: {0}")]
+    ChatgptAuth(#[from] crate::chatgpt::ChatgptAuthError),
     #[error("Workspace config error: {0}")]
     Workspace(#[from] crate::workspace::WorkspaceConfigError),
     #[error("MCP error: {0}")]
     Mcp(#[from] crate::mcp::McpConnectionLoadError),
 }
 
-
-
 /// Execution environment for a `MayAgent`.
+///
+/// Only `Local` and `Container` are valid home environments. SSH servers
+/// attached to the profile are surfaced through `MayAgentConfig::ssh_servers`
+/// and reached per-command via the `terminal` tool's `mode: "ssh"` +
+/// `ssh_server_id: <name>` parameters. There is no remote-home variant: remote
+/// is a per-invocation routing choice, not a session-level environment.
 pub enum AgentEnvironment {
     /// Native macOS sandbox via heel.
     Local,
-    /// Local home environment with one designated remote SSH target.
-    Remote {
-        /// The configured SSH target bound to this profile.
-        ssh_server: crate::config::SshServerConfig,
-    },
     /// Docker container-based isolation.
     Container {
         /// Container ID from Docker.
@@ -84,9 +84,9 @@ pub enum AgentEnvironment {
         /// Hostname reachable from the container for IPC back to the host.
         container_ipc_host: String,
         /// Executor for running commands inside the container.
-        container_exec: ContainerExecHandle,
-        /// Optional browser backend that can provide a CDP endpoint.
-        browser_backend: Option<Arc<dyn BrowserBackend>>,
+        container_exec: AnyContainerExec,
+        /// Resolved browser CDP endpoint reachable from inside the container.
+        browser_cdp_endpoint: Option<String>,
     },
 }
 
@@ -100,11 +100,13 @@ pub struct MayAgentConfig {
     pub provider_id: String,
     /// Optional embedding provider used for semantic retrieval tools.
     pub search_embedder: EmbeddingModelResolution,
+    /// Tier-resolved models for the `ask` terminal command.
+    pub ask_models: super::provider::AskTierModels,
     /// Session sandbox directory (`TerminalTool` creates working dir inside).
     pub sandbox_dir: PathBuf,
     /// May directory (~/.may/).
     pub may_dir: PathBuf,
-    /// Current working directory (where May was launched).
+    /// Host directory where May was launched (read-only in local environments).
     pub cwd: PathBuf,
     /// Session ID.
     pub session_id: SessionId,
@@ -150,10 +152,9 @@ pub struct MayAgentConfig {
     pub model_context_window: Option<u32>,
     /// Request-level parameters applied to each LLM call for this agent.
     pub request_parameters: Parameters,
+    /// Database handle for runtime memory/state lookups.
+    pub db: crate::db::ChatDb,
 }
-
-
-
 
 /// The May agent.
 pub struct MayAgent {
@@ -177,6 +178,13 @@ impl MayAgent {
 
         let executor = DefaultExecutor;
 
+        let network_audit = aither_sandbox::open_network_audit_log(
+            config.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
+            crate::config::NETWORK_AUDIT_MAX_FILES,
+        )
+        .await
+        .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
+
         // Create the terminal command tool in the sandbox dir.
         let terminal_tool: TerminalTool<TerminalPermissionHandler, DefaultExecutor> =
             TerminalTool::new_exact(
@@ -189,7 +197,8 @@ impl MayAgent {
                 executor,
             )
             .await
-            .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
+            .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+            .with_network_audit_log(network_audit);
 
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
@@ -200,31 +209,33 @@ impl MayAgent {
             session_paths.workspace_config(),
         )?;
 
-        let ssh_servers: Vec<SshServer> = match &config.environment {
-            AgentEnvironment::Local | AgentEnvironment::Container { .. } => config
-                .ssh_servers
-                .iter()
-                .map(|s| SshServer {
-                    name: s.name.clone(),
-                    target: s.target.clone(),
-                })
-                .collect(),
-            AgentEnvironment::Remote { ssh_server } => vec![SshServer {
-                name: ssh_server.name.clone(),
-                target: ssh_server.target.clone(),
-            }],
-        };
+        let ssh_servers: Vec<SshServer> = config
+            .ssh_servers
+            .iter()
+            .map(|s| SshServer {
+                name: s.name.clone(),
+                target: s.target.clone(),
+            })
+            .collect();
         let ssh_enabled = !ssh_servers.is_empty();
 
-        // Read global memory from ~/.may/MEMORY.md.
-        let memory_path = global_memory_file_path(&config.may_dir);
-        let memory_content = async_fs::read_to_string(&memory_path).await?;
+        // Read global memory from the database.
+        let memory_content = config
+            .db
+            .get_global_memory()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(error = %error, "failed to load global memory from DB");
+                None
+            })
+            .unwrap_or_default();
         let mut runtime_system_context =
-            RuntimeSystemContext::new(memory_path.clone(), memory_content.clone());
+            RuntimeSystemContext::new(config.db.clone(), memory_content.clone());
         let terminal_runtime = build_terminal_runtime_context(
             &config,
             &session_paths,
             aither_models::lookup(config.model_id.as_str()),
+            config.ssh_servers.clone(),
         );
         runtime_system_context =
             runtime_system_context.with_terminal_runtime(terminal_runtime.clone());
@@ -233,14 +244,17 @@ impl MayAgent {
 
         // Clone LLM for terminal IPC commands before moving it into the builder.
         let terminal_command_llm = llm.clone();
+        let wrap_ask_model = |model: Option<CloudProvider>| {
+            model.map(|model| {
+                RequestParameterizedModel::new(model, config.request_parameters.clone())
+            })
+        };
+        let ask_flagship = wrap_ask_model(config.ask_models.flagship.clone());
+        let ask_balanced = wrap_ask_model(config.ask_models.balanced.clone());
+        let ask_fast = wrap_ask_model(config.ask_models.fast.clone());
 
-        // Create tools
         let ssh_authorizer_broker = config.ask_user_broker.clone();
-        let ask_user = AskUserTool::new(
-            config.session_id.as_str().to_string(),
-            config.ask_user_broker,
-        );
-        let imagine = ImagineTool {
+        let imagine_config = ImagineCommandConfig {
             generator: config.image_generator,
             artifacts_dir: session_paths.artifacts_dir(),
         };
@@ -261,14 +275,16 @@ impl MayAgent {
             (home.skills_dir(), home.subagents_dir())
         };
 
-        // Shell runtime depends on the environment
+        // Shell runtime depends on the home environment. SSH remains a
+        // per-command routing capability on top of Local (it cannot be the
+        // session-level runtime here).
         let availability = match &config.environment {
             AgentEnvironment::Container { .. } => ShellRuntimeAvailability {
                 local: false,
                 container: true,
-                ssh: false,
+                ssh: ssh_enabled,
             },
-            AgentEnvironment::Remote { .. } | AgentEnvironment::Local => ShellRuntimeAvailability {
+            AgentEnvironment::Local => ShellRuntimeAvailability {
                 local: true,
                 container: false,
                 ssh: ssh_enabled,
@@ -284,8 +300,6 @@ impl MayAgent {
             config.max_iterations
         };
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
-            .tool(ask_user)
-            .tool(imagine)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook);
         let terminal_command_factory = builder.terminal_tool_factory();
@@ -293,13 +307,17 @@ impl MayAgent {
             builder.tool_registry_mut(),
             SharedTerminalCommandConfig {
                 llm: terminal_command_llm,
+                ask_flagship,
+                ask_balanced,
+                ask_fast,
                 session_id: config.session_id.as_str().to_string(),
                 may_dir: config.may_dir.clone(),
                 sandbox_dir: config.sandbox_dir.clone(),
                 search_embedder: config.search_embedder.clone(),
+                ask_user_broker: Some(config.ask_user_broker),
+                imagine: Some(imagine_config),
                 task_runtime: match &config.environment {
                     AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
-                    AgentEnvironment::Remote { .. } => TaskRuntimeKind::Remote,
                     AgentEnvironment::Local => TaskRuntimeKind::Local,
                 },
                 task_broker: config.task_broker.clone(),
@@ -307,6 +325,7 @@ impl MayAgent {
                 browser_broker: config.browser_broker.clone(),
                 register_skills_broker: config.register_skills_broker.clone(),
                 register_subagents_broker: config.register_subagents_broker.clone(),
+                request_parameters: config.request_parameters.clone(),
                 workspace_request_broker: (!is_container)
                     .then_some(config.workspace_request_broker.clone()),
                 terminal_tool_factory: Some(terminal_command_factory),
@@ -384,7 +403,7 @@ impl MayAgent {
             || matches!(
                 config.environment,
                 AgentEnvironment::Container {
-                    browser_backend: Some(_),
+                    browser_cdp_endpoint: Some(_),
                     ..
                 }
             );
@@ -396,9 +415,9 @@ impl MayAgent {
                 container_id,
                 container_ipc_host,
                 container_exec,
-                browser_backend,
+                browser_cdp_endpoint: cdp_endpoint,
             } => {
-                let container_context = build_container_environment_context(&config.cwd);
+                let container_context = build_container_environment_context(session_paths.root());
                 runtime_system_context =
                     runtime_system_context.with_container_environment(container_context.clone());
                 builder =
@@ -408,14 +427,7 @@ impl MayAgent {
                     container_ipc_host,
                     container_exec,
                 ));
-                if let Some(browser_backend) = browser_backend {
-                    let endpoint = browser_backend.cdp_endpoint().await.map_err(|error| {
-                        MayAgentError::Sandbox(format!(
-                            "failed to resolve browser CDP endpoint from backend: {error}"
-                        ))
-                    })?;
-                    browser_cdp_endpoint = Some(endpoint);
-                }
+                browser_cdp_endpoint = cdp_endpoint;
             }
             AgentEnvironment::Local => {
                 let workspace_context = build_workspace_context(&workspace);
@@ -423,8 +435,8 @@ impl MayAgent {
                     runtime_system_context.with_workspace(workspace_context.clone());
                 builder = builder.system_text(tag::WORKSPACE, workspace_context);
                 if let Some(workdirs_context) = build_workspace_workdirs_context(&workspace) {
-                    runtime_system_context = runtime_system_context
-                        .with_workspace_workdirs(workdirs_context.clone());
+                    runtime_system_context =
+                        runtime_system_context.with_workspace_workdirs(workdirs_context.clone());
                     builder = builder.system_text(tag::WORKSPACE_WORKDIRS, workdirs_context);
                 }
                 if let Some(macos_hint) = build_macos_host_automation_context() {
@@ -432,12 +444,6 @@ impl MayAgent {
                         runtime_system_context.with_platform(macos_hint.clone());
                     builder = builder.system_text(tag::PLATFORM, macos_hint);
                 }
-            }
-            AgentEnvironment::Remote { ssh_server } => {
-                let remote_context = build_remote_environment_context(&workspace, &ssh_server);
-                runtime_system_context =
-                    runtime_system_context.with_remote_environment(remote_context.clone());
-                builder = builder.system_text(tag::REMOTE_ENVIRONMENT_CONTEXT, remote_context);
             }
         }
 
@@ -461,78 +467,6 @@ impl MayAgent {
         })
     }
 
-    /// Create a `MayAgent` from config file and session.
-    pub async fn from_config(
-        may_config: &MayConfig,
-        sandbox_dir: PathBuf,
-        may_dir: PathBuf,
-        cwd: PathBuf,
-        session_id: SessionId,
-        workspace_request_broker: WorkspaceRequestBroker,
-        ask_user_broker: AskUserBroker,
-    ) -> Result<Self, MayAgentError> {
-        // Get model: persisted default first, otherwise first Advanced model
-        let model = may_config
-            .last_model
-            .as_deref()
-            .or_else(|| may_config.models.advanced.first().map(String::as_str))
-            .ok_or_else(|| MayAgentError::MissingApiKey(ERR_NO_MODELS.trim().to_string()))?;
-
-        Self::from_config_with_model(
-            may_config,
-            sandbox_dir,
-            may_dir,
-            cwd,
-            session_id,
-            workspace_request_broker,
-            ask_user_broker,
-            model,
-        )
-        .await
-    }
-
-    /// Create a `MayAgent` from config file with a specific model.
-    ///
-    /// Provider selection uses an ordered candidate list:
-    /// model-mapped provider first (if configured), then explicit providers,
-    /// then generic proxy providers as fallback.
-    pub async fn from_config_with_model(
-        may_config: &MayConfig,
-        sandbox_dir: PathBuf,
-        may_dir: PathBuf,
-        cwd: PathBuf,
-        session_id: SessionId,
-        workspace_request_broker: WorkspaceRequestBroker,
-        ask_user_broker: AskUserBroker,
-        model: &str,
-    ) -> Result<Self, MayAgentError> {
-        Self::from_config_with_model_and_permissions(
-            may_config,
-            sandbox_dir,
-            may_dir,
-            cwd,
-            session_id,
-            workspace_request_broker,
-            ask_user_broker,
-            model,
-            None,
-            None,
-            None,
-            None,
-            None,
-            SessionPlanState::Disabled,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            AgentEnvironment::Local,
-            0,
-        )
-        .await
-    }
-
     pub async fn from_config_with_model_and_permissions(
         may_config: &MayConfig,
         sandbox_dir: PathBuf,
@@ -541,6 +475,7 @@ impl MayAgent {
         session_id: SessionId,
         workspace_request_broker: WorkspaceRequestBroker,
         ask_user_broker: AskUserBroker,
+        db: crate::db::ChatDb,
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         profile_id: Option<String>,
@@ -562,17 +497,65 @@ impl MayAgent {
         let provider_id = resolved_provider.provider_id;
         let llm = resolved_provider.llm;
         let model_info = aither_models::lookup(model);
-        let request_parameters = if let Some(reasoning_effort) = reasoning_effort {
-            Parameters::default().reasoning_effort(reasoning_effort)
-        } else {
-            Parameters::default()
-        };
+        let mut request_parameters = Parameters::default();
+        if let Some(reasoning_effort) = reasoning_effort {
+            request_parameters = request_parameters.reasoning_effort(reasoning_effort);
+        }
 
+        // Enable provider-hosted web tools only for the resolved provider type:
+        // each provider crate reads its own `native_tools` section, and the
+        // portable `websearch` flag reaches OpenAI/Gemini only.
+        let provider_instance = may_config.provider.get(&provider_id);
+        let native = provider_instance.map_or_else(NativeToolsConfig::default, |instance| {
+            instance.native_tools.clone()
+        });
+        let provider_type = provider_instance.map(|instance| instance.resolve_type(&provider_id));
+        let model_has_web_search = model_info
+            .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::WebSearch));
+        match provider_type {
+            Some(ProviderType::Anthropic) => {
+                request_parameters.native_tools.claude.web_search =
+                    native.web_search && model_has_web_search;
+                request_parameters.native_tools.claude.web_fetch = native.web_fetch;
+            }
+            Some(ProviderType::Google) => {
+                request_parameters.websearch = native.web_search && model_has_web_search;
+                request_parameters.native_tools.gemini.url_context = native.web_fetch;
+            }
+            Some(ProviderType::OpenAI) => {
+                request_parameters.websearch = native.web_search && model_has_web_search;
+            }
+            Some(ProviderType::Chatgpt) => {
+                // Hosted search is included in the subscription (no per-call
+                // billing), so default it on unless native_tools was configured
+                // explicitly. The backend's own catalog decides support — the
+                // aither-models db has no entries for codex slugs, so the
+                // Ability::WebSearch gate would always read false here.
+                request_parameters.websearch = native.web_search || native.is_empty();
+            }
+            _ => {}
+        }
+
+        let ssh_servers = crate::profile::resolve_attached_ssh_servers(
+            &db,
+            profile_id.as_deref(),
+            &may_config.ssh_servers,
+        )
+        .await
+        .map_err(|error| {
+            MayAgentError::Sandbox(format!(
+                "failed to load SSH attachments for profile {profile_id:?}: {error}"
+            ))
+        })?;
+
+        let ask_models =
+            super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await;
         let config = MayAgentConfig {
             llm,
             model_id: model.to_string(),
             provider_id,
             search_embedder: resolved_provider.search_embedder,
+            ask_models,
             sandbox_dir,
             may_dir,
             cwd,
@@ -582,7 +565,7 @@ impl MayAgent {
             workspace_request_broker,
             ask_user_broker,
             image_generator: resolve_image_generator_config(may_config),
-            ssh_servers: may_config.ssh_servers.clone(),
+            ssh_servers,
             permission_approver,
             environment,
             profile_persona,
@@ -592,7 +575,7 @@ impl MayAgent {
                 .preferences
                 .network_policy
                 .compile()
-                .map_err(MayAgentError::Sandbox)?,
+                .map_err(|error| MayAgentError::Sandbox(error.to_string()))?,
             location,
             task_broker,
             notify_broker,
@@ -603,6 +586,7 @@ impl MayAgent {
                 .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::Audio)),
             model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),
             request_parameters,
+            db,
         };
 
         Self::new(config).await
@@ -612,9 +596,8 @@ impl MayAgent {
     pub fn run(
         &mut self,
         prompt: &str,
-        attachments: impl IntoIterator<Item = url::Url>,
+        attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
-        self.inner.clear_transient_system_messages();
         self.inner.run(prompt, attachments)
     }
 
@@ -623,9 +606,8 @@ impl MayAgent {
         &mut self,
         prompt: &str,
         hidden_context: Option<&str>,
-        attachments: impl IntoIterator<Item = url::Url>,
+        attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
-        self.inner.clear_transient_system_messages();
         if let Some(hidden_context) = hidden_context
             .map(str::trim)
             .filter(|text| !text.is_empty())
@@ -638,7 +620,6 @@ impl MayAgent {
     /// One-shot query.
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
         self.sync_runtime_context().await;
-        self.inner.clear_transient_system_messages();
         self.inner.query(prompt).await
     }
 
@@ -646,34 +627,44 @@ impl MayAgent {
     pub async fn preview_request_messages(
         &mut self,
         prompt: &str,
-        attachments: impl IntoIterator<Item = url::Url>,
+        attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> Vec<LlmMessage> {
         self.sync_runtime_context().await;
-        self.inner.clear_transient_system_messages();
         self.inner
             .preview_request_messages(prompt, attachments)
             .await
     }
 
     /// Preview the exact request message sequence for the next turn with hidden context.
+    ///
+    /// Mirrors [`run_with_hidden_context`](Self::run_with_hidden_context): the
+    /// hidden context is pushed as a regular system message at the conversation
+    /// tail, the preview is built, then the checkpointed state is restored.
     pub async fn preview_request_messages_with_hidden_context(
         &mut self,
         prompt: &str,
         hidden_context: Option<&str>,
-        attachments: impl IntoIterator<Item = url::Url>,
+        attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> Vec<LlmMessage> {
         self.sync_runtime_context().await;
-        let messages = hidden_context
+        let checkpoint = self
+            .inner
+            .export_checkpoint()
+            .await
+            .expect("checkpoint export for preview must succeed");
+        if let Some(hidden_context) = hidden_context
             .map(str::trim)
             .filter(|text| !text.is_empty())
-            .map(|text| vec![text.to_string()])
-            .unwrap_or_default();
-        self.inner.set_transient_system_messages(messages);
+        {
+            self.inner.push_message(LlmMessage::system(hidden_context));
+        }
         let preview = self
             .inner
             .preview_request_messages(prompt, attachments)
             .await;
-        self.inner.clear_transient_system_messages();
+        if let Err(error) = self.inner.restore_checkpoint(checkpoint) {
+            tracing::warn!(%error, "failed to restore checkpoint after preview");
+        }
         preview
     }
 
@@ -699,6 +690,11 @@ impl MayAgent {
     #[must_use]
     pub const fn model_context_window(&self) -> Option<u32> {
         self.model_context_window
+    }
+
+    /// Stop every terminal task that is still running for this agent.
+    pub async fn kill_running_terminal_jobs(&self) -> usize {
+        self.inner.kill_running_terminal_jobs().await
     }
 
     pub(crate) async fn export_checkpoint(
@@ -734,7 +730,7 @@ impl MayAgent {
     }
 
     pub(crate) async fn sync_runtime_context(&mut self) {
-        self.runtime_system_context.sync_memory_file().await;
+        self.runtime_system_context.sync_memory_content().await;
         self.runtime_system_context
             .reconcile(self.inner.context_mut());
     }
@@ -751,19 +747,17 @@ pub async fn generate_session_title(
     use futures_lite::StreamExt;
 
     // Get a fast model
-    let model = config
+    let selector = config
         .default_model_for_tier(crate::config::ModelTier::Fast)
-        .or(config.last_model.as_deref())?;
-
-    // Find a provider for this model
-    let resolver = config.create_resolver();
-    let selected = resolver.select_provider(model)?;
+        .or(config.last_model.as_ref())?;
+    let provider_id = selector.provider_id();
+    let provider = config.get_provider(provider_id)?;
 
     // Build the cloud provider
     let llm = super::provider::build_cloud_provider_from_instance(
-        selected.id,
-        selected.instance,
-        model,
+        provider_id,
+        provider,
+        selector.model_id(),
     )
     .await
     .ok()?;
@@ -804,4 +798,3 @@ fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
         .nth(max_chars)
         .map_or(input, |(idx, _)| &input[..idx])
 }
-

@@ -1,6 +1,6 @@
 //! Persisted plan-mode row model for sessions.
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
     pub session_id: String,
     pub plan_state: String,

@@ -13,8 +13,6 @@
 //! only the [`tag::WORKSPACE_WORKDIRS`] block while the rest of the
 //! workspace prefix stays cached.
 
-use std::path::PathBuf;
-
 use aither_agent::SubagentDefinition;
 use aither_core::llm::model::Ability;
 use askama::Template;
@@ -42,7 +40,6 @@ pub(crate) mod tag {
     pub const TERMINAL_RUNTIME_CONTEXT: &str = "terminal_runtime_context";
     pub const WORKSPACE: &str = "workspace";
     pub const WORKSPACE_WORKDIRS: &str = "workspace_workdirs";
-    pub const REMOTE_ENVIRONMENT_CONTEXT: &str = "remote_environment_context";
     pub const CONTAINER_ENVIRONMENT_CONTEXT: &str = "container_environment_context";
     pub const BROWSER: &str = "browser";
     pub const PROFILE_PERSONA: &str = "profile_persona";
@@ -63,12 +60,11 @@ pub(crate) mod tag {
 /// additional templating cost and no XML wrapping.
 #[derive(Clone)]
 pub(crate) struct RuntimeSystemContext {
-    memory_path: PathBuf,
+    memory_db: crate::db::ChatDb,
     last_memory_content: String,
     terminal_runtime: Option<String>,
     workspace: Option<String>,
     workspace_workdirs: Option<String>,
-    remote_environment: Option<String>,
     container_environment: Option<String>,
     browser: Option<String>,
     profile_persona: Option<String>,
@@ -81,14 +77,13 @@ pub(crate) struct RuntimeSystemContext {
 }
 
 impl RuntimeSystemContext {
-    pub(crate) const fn new(memory_path: PathBuf, memory_content: String) -> Self {
+    pub(crate) fn new(memory_db: crate::db::ChatDb, memory_content: String) -> Self {
         Self {
-            memory_path,
+            memory_db,
             last_memory_content: memory_content,
             terminal_runtime: None,
             workspace: None,
             workspace_workdirs: None,
-            remote_environment: None,
             container_environment: None,
             browser: None,
             profile_persona: None,
@@ -113,11 +108,6 @@ impl RuntimeSystemContext {
 
     pub(crate) fn with_workspace_workdirs(mut self, workdirs: String) -> Self {
         self.workspace_workdirs = Some(workdirs);
-        self
-    }
-
-    pub(crate) fn with_remote_environment(mut self, remote_environment: String) -> Self {
-        self.remote_environment = Some(remote_environment);
         self
     }
 
@@ -167,10 +157,9 @@ impl RuntimeSystemContext {
     }
 
     pub(crate) fn reconcile(&mut self, context: &mut aither_agent::Context) {
-        reconcile_text_block(
+        reconcile_memory_block(
             context,
-            tag::MEMORY,
-            Some(build_memory_context_content(&self.last_memory_content)),
+            build_memory_context_content(&self.last_memory_content),
         );
         reconcile_text_block(
             context,
@@ -182,11 +171,6 @@ impl RuntimeSystemContext {
             context,
             tag::WORKSPACE_WORKDIRS,
             self.workspace_workdirs.clone(),
-        );
-        reconcile_text_block(
-            context,
-            tag::REMOTE_ENVIRONMENT_CONTEXT,
-            self.remote_environment.clone(),
         );
         reconcile_text_block(
             context,
@@ -215,16 +199,14 @@ impl RuntimeSystemContext {
         reconcile_text_block(context, tag::PLATFORM, self.platform.clone());
     }
 
-    pub(crate) async fn sync_memory_file(&mut self) {
-        let memory_content = async_fs::read_to_string(&self.memory_path)
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to read memory file at {}: {error}",
-                    self.memory_path.display()
-                )
-            });
-        self.last_memory_content = memory_content;
+    pub(crate) async fn sync_memory_content(&mut self) {
+        match self.memory_db.get_global_memory().await {
+            Ok(Some(content)) => self.last_memory_content = content,
+            Ok(None) => self.last_memory_content = String::new(),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to read global memory from DB");
+            }
+        }
     }
 }
 
@@ -236,6 +218,48 @@ fn reconcile_text_block(
     match value {
         Some(content) => context.insert_system_text(tag, content),
         None => context.remove_system_named(tag),
+    }
+}
+
+/// Reminder surfaced to the model when MEMORY.md changed mid-session.
+#[derive(serde::Serialize)]
+struct MemoryUpdate {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+/// Reconciles the MEMORY block without invalidating the KV-cache prefix.
+///
+/// Mid-session memory changes are staged into the context (applied on the
+/// next reassembly, when the cache is invalidated anyway) and surfaced to
+/// the model as an appended diff alert instead of a block rewrite.
+fn reconcile_memory_block(context: &mut aither_agent::Context, desired: String) {
+    if !context.has_system_block(tag::MEMORY) {
+        context.insert_system_text(tag::MEMORY, desired);
+        return;
+    }
+    if context.staged_system_update(tag::MEMORY) == Some(desired.as_str()) {
+        return;
+    }
+    let current = context
+        .system_blocks()
+        .get(tag::MEMORY)
+        .cloned()
+        .unwrap_or_default();
+    if context.stage_system_text(tag::MEMORY, desired.clone()) {
+        let diff = similar::TextDiff::from_lines(&current, &desired)
+            .unified_diff()
+            .context_radius(2)
+            .to_string();
+        // Reminders are cleared on every request's populate pass, so a
+        // reminder inserted here would be dropped before ever reaching the
+        // model. A durable alert survives until reassembly folds the staged
+        // memory block in.
+        context.push_alert(&MemoryUpdate {
+            content: format!(
+                "MEMORY.md changed since this conversation started. The memory block above is the previous version; apply this diff mentally (the context will fold it in later):\n{diff}"
+            ),
+        });
     }
 }
 
@@ -264,6 +288,7 @@ struct TerminalRuntimeContextTemplate {
     model_id: String,
     home_environment_kind: String,
     operating_system: String,
+    shell_dialect: &'static str,
     home_directory: String,
     session_directory: String,
     current_working_directory: String,
@@ -272,6 +297,7 @@ struct TerminalRuntimeContextTemplate {
     command_rules: Vec<String>,
     environment_rules: Vec<String>,
     modality_support: Vec<String>,
+    attached_remote_servers: Vec<crate::config::SshServerConfig>,
 }
 
 #[derive(Clone, Template)]
@@ -304,16 +330,6 @@ impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
                 .unwrap_or_else(|| "User-approved directory".to_string()),
         }
     }
-}
-
-#[derive(Clone, Template)]
-#[template(path = "remote_environment_context.txt", escape = "none")]
-struct RemoteEnvironmentContextTemplate {
-    operating_system: String,
-    sandbox: String,
-    cwd: String,
-    ssh_server_id: String,
-    ssh_target: String,
 }
 
 #[derive(Clone, Template)]
@@ -372,6 +388,7 @@ pub(crate) fn build_terminal_runtime_context(
     config: &MayAgentConfig,
     session_paths: &SessionPaths,
     model_info: Option<&aither_models::ModelEntry>,
+    attached_remote_servers: Vec<crate::config::SshServerConfig>,
 ) -> String {
     let mut modality_support = Vec::new();
     if let Some(info) = model_info {
@@ -407,9 +424,10 @@ pub(crate) fn build_terminal_runtime_context(
         model_id: config.model_id.clone(),
         home_environment_kind: home_environment_kind_label(&config.environment).to_string(),
         operating_system: operating_system_hint(&config.environment).to_string(),
+        shell_dialect: "POSIX sh",
         home_directory: session_paths.home_root().display().to_string(),
         session_directory: session_paths.root().display().to_string(),
-        current_working_directory: config.cwd.display().to_string(),
+        current_working_directory: session_paths.root().display().to_string(),
         home_layout: vec![
             "/sessions - per-session sandboxes under this home environment".to_string(),
             "/skills - profile/home-scoped skills, exposed read-only inside the session"
@@ -432,11 +450,11 @@ pub(crate) fn build_terminal_runtime_context(
         command_rules: vec![
             "The only native execution tool is `terminal`. `terminal_kill`, `terminal_input`, and `terminal_read` manage background terminal jobs. Higher-level capabilities are terminal CLI commands exposed through the IPC bridge rather than extra native tools; rely on runtime tool descriptions and command `--help` output instead of assuming a static command list.".to_string(),
             "Issue at most one tool call per assistant turn. If you need multiple operations or parallel work, compose them inside one terminal command with shell control flow, pipelines, or background jobs instead of emitting multiple tool calls in the same response.".to_string(),
+            "Read a selected skill completely before acting on it. The terminal call that reads the skill must finish before any task command that depends on those instructions.".to_string(),
             "IPC-backed commands are only valid when executed inside this profile's home environment. If you get a system-reminder because you tried to call a non-existent direct tool, immediately retry through `terminal` with the corresponding CLI command.".to_string(),
             "Commands run in the current session home environment by default unless you explicitly target another environment. Treat the home environment as the place where profile-scoped state, IPC commands, and durable session directories live.".to_string(),
             "Every terminal command call must set timeout. timeout=0 means immediate background execution. timeout>0 runs in foreground until timeout and then promotes to a background task if still running.".to_string(),
             "Inline command results are previews, not guaranteed byte-for-byte raw output. May may clean, fold, summarize, or structurally compress large outputs before putting them in context.".to_string(),
-            "When exact fidelity matters, call `terminal` with raw=true. If output overflows, the complete result is persisted under session outputs/ and only a preview plus file reference is returned inline.".to_string(),
             "Treat context as memory and the filesystem as disk. After compaction, restart, or long runs, recover prior tool results from outputs/, data/, files/, artifacts/, or tasks.md instead of assuming the inline preview was complete.".to_string(),
             "For large saved outputs, use normal shell tools such as `head`, `tail`, `sed`, `rg`, `jq`, or the `ask` command against files to recall only the relevant slice.".to_string(),
             "Background tasks persist output to files. Use terminal_read for incremental reads, terminal_input for stdin when the process needs user input, and terminal_kill to stop them.".to_string(),
@@ -447,6 +465,7 @@ pub(crate) fn build_terminal_runtime_context(
         ],
         environment_rules: environment_runtime_rules(&config.environment),
         modality_support,
+        attached_remote_servers,
     };
     template
         .render()
@@ -491,25 +510,6 @@ pub(crate) fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Opti
             .render()
             .unwrap_or_else(|error| panic!("failed to render workspace workdirs context: {error}")),
     )
-}
-
-pub(crate) fn build_remote_environment_context(
-    workspace: &MayWorkspace,
-    ssh_server: &crate::config::SshServerConfig,
-) -> String {
-    let template = RemoteEnvironmentContextTemplate {
-        operating_system: operating_system_hint(&AgentEnvironment::Remote {
-            ssh_server: ssh_server.clone(),
-        })
-        .to_string(),
-        sandbox: workspace.sandbox.display().to_string(),
-        cwd: workspace.cwd.display().to_string(),
-        ssh_server_id: ssh_server.name.clone(),
-        ssh_target: ssh_server.target.clone(),
-    };
-    template
-        .render()
-        .unwrap_or_else(|error| panic!("failed to render remote environment context: {error}"))
 }
 
 pub(crate) fn build_container_environment_context(cwd: &std::path::Path) -> String {
@@ -593,7 +593,6 @@ async fn load_prompt_subagents(
 fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static str {
     match environment {
         AgentEnvironment::Local => "local",
-        AgentEnvironment::Remote { .. } => "remote",
         AgentEnvironment::Container { .. } => "container",
     }
 }
@@ -601,7 +600,6 @@ fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static str {
 fn operating_system_hint(environment: &AgentEnvironment) -> &'static str {
     match environment {
         AgentEnvironment::Local => host_operating_system_label(),
-        AgentEnvironment::Remote { .. } => "unknown until detected on the remote host",
         AgentEnvironment::Container { .. } => "linux (managed container runtime)",
     }
 }
@@ -621,14 +619,6 @@ fn environment_runtime_rules(environment: &AgentEnvironment) -> Vec<String> {
             "This home environment runs on the user's local machine. Default to the session sandbox and approved workspace roots for writes.".to_string(),
             "Outside approved writable paths, treat the host as read-mostly and request approval before side effects.".to_string(),
             "Host automation must respect the local operating system and user presence.".to_string(),
-        ],
-        AgentEnvironment::Remote { ssh_server } => vec![
-            format!(
-                "This home environment is the remote SSH target `{}` (`{}`).",
-                ssh_server.name, ssh_server.target
-            ),
-            "Treat the remote machine as real infrastructure and avoid assuming its shell, package manager, or OS family until you verify them on-host.".to_string(),
-            "Prefer explicit, auditable commands and ask for approval before privileged or destructive operations.".to_string(),
         ],
         AgentEnvironment::Container { .. } => vec![
             "This home environment runs inside a managed container. Prefer direct terminal usage and assume the filesystem is writable unless a command says otherwise.".to_string(),
@@ -695,7 +685,7 @@ pub(crate) fn build_macos_host_automation_context() -> Option<String> {
 }
 
 fn is_running_in_container() -> bool {
-    ContainerDetector::default().detect()
+    detect_container_signal().is_some()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -706,56 +696,37 @@ enum ContainerSignalKind {
     OverlayRootFs,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ContainerDetector;
-
-impl ContainerDetector {
-    fn detect(&self) -> bool {
-        self.detect_signal().is_some()
+fn detect_container_signal() -> Option<ContainerSignalKind> {
+    if std::env::var_os("container").is_some() {
+        return Some(ContainerSignalKind::EnvVar);
     }
 
-    fn detect_signal(&self) -> Option<ContainerSignalKind> {
-        if std::env::var_os("container").is_some() {
-            return Some(ContainerSignalKind::EnvVar);
-        }
-
-        if std::path::Path::new("/.dockerenv").exists() {
-            return Some(ContainerSignalKind::DockerEnvFile);
-        }
-
-        if std::path::Path::new("/run/.containerenv").exists() {
-            return Some(ContainerSignalKind::ContainerEnvFile);
-        }
-
-        self.proc_root_fs_type()
-            .filter(|fs_type| matches!(fs_type.as_str(), "overlay" | "aufs"))
-            .map(|_| ContainerSignalKind::OverlayRootFs)
+    if std::path::Path::new("/.dockerenv").exists() {
+        return Some(ContainerSignalKind::DockerEnvFile);
     }
 
-    fn proc_root_fs_type(&self) -> Option<String> {
-        let mountinfo = std::fs::read_to_string("/proc/1/mountinfo").ok()?;
-        for line in mountinfo.lines() {
-            let (left, right) = line.split_once(" - ")?;
-            let mut left_fields = left.split_whitespace();
-            let mount_point = left_fields.nth(4)?;
-            if mount_point != "/" {
-                continue;
-            }
-            let fs_type = right.split_whitespace().next()?;
-            return Some(fs_type.to_string());
-        }
-        None
+    if std::path::Path::new("/run/.containerenv").exists() {
+        return Some(ContainerSignalKind::ContainerEnvFile);
     }
+
+    proc_root_fs_type()
+        .filter(|fs_type| matches!(fs_type.as_str(), "overlay" | "aufs"))
+        .map(|_| ContainerSignalKind::OverlayRootFs)
 }
 
-pub(crate) fn global_memory_file_path(may_dir: &std::path::Path) -> PathBuf {
-    let upper = crate::session::MayHomePaths::new(may_dir.to_path_buf()).memory_file();
-    if !upper.exists() {
-        std::fs::write(&upper, "").unwrap_or_else(|e| {
-            panic!("failed to initialize MEMORY.md at {}: {e}", upper.display())
-        });
+fn proc_root_fs_type() -> Option<String> {
+    let mountinfo = std::fs::read_to_string("/proc/1/mountinfo").ok()?;
+    for line in mountinfo.lines() {
+        let (left, right) = line.split_once(" - ")?;
+        let mut left_fields = left.split_whitespace();
+        let mount_point = left_fields.nth(4)?;
+        if mount_point != "/" {
+            continue;
+        }
+        let fs_type = right.split_whitespace().next()?;
+        return Some(fs_type.to_string());
     }
-    upper
+    None
 }
 
 #[cfg(test)]
@@ -764,14 +735,33 @@ mod tests {
 
     use super::{RuntimeSystemContext, build_memory_context_content, tag};
 
+    fn test_db() -> crate::db::ChatDb {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("test.db");
+        // Leak the tempdir so the DB file persists for the test duration
+        let dir = Box::leak(Box::new(dir));
+        let _ = dir;
+        tokio_test::block_on(crate::db::ChatDb::open(&db_path)).expect("test db should open")
+    }
+
+    /// Durable system alerts pushed with `Context::push_alert`.
+    ///
+    /// Alerts enter the conversation stream as `system` messages rather than
+    /// as ephemeral reminders, which are dropped by every request's reminder
+    /// repopulation pass.
+    fn system_alerts(context: &aither_agent::Context) -> Vec<String> {
+        context
+            .conversation_messages()
+            .into_iter()
+            .filter(|message| message.role() == aither_core::llm::Role::System)
+            .map(|message| message.content().to_string())
+            .collect()
+    }
+
     #[test]
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
-        let dir = tempdir().expect("temp dir should be created");
-        let memory_path = dir.path().join("MEMORY.md");
-        std::fs::write(&memory_path, "remember this").expect("memory file should be written");
-
-        let mut runtime_context =
-            RuntimeSystemContext::new(memory_path, "remember this".to_string());
+        let db = test_db();
+        let mut runtime_context = RuntimeSystemContext::new(db, "remember this".to_string());
         let mut context = aither_agent::Context::default();
         context.insert_system_text(tag::PROFILE_PERSONA, "stale persona");
         context.insert_system_text(tag::WORKSPACE, "stale workspace");
@@ -789,38 +779,54 @@ mod tests {
     }
 
     #[test]
-    fn runtime_system_context_refreshes_memory_from_disk() {
-        let dir = tempdir().expect("temp dir should be created");
-        let memory_path = dir.path().join("MEMORY.md");
-        std::fs::write(&memory_path, "before").expect("memory file should be written");
+    fn runtime_system_context_stages_memory_updates_with_diff_alert() {
+        let db = test_db();
+        tokio_test::block_on(db.set_global_memory("before")).expect("write initial memory");
 
-        let mut runtime_context =
-            RuntimeSystemContext::new(memory_path.clone(), "before".to_string());
+        let mut runtime_context = RuntimeSystemContext::new(db.clone(), "before".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
 
-        std::fs::write(&memory_path, "after").expect("memory file should be updated");
-        tokio_test::block_on(runtime_context.sync_memory_file());
+        tokio_test::block_on(db.set_global_memory("after")).expect("update memory");
+        tokio_test::block_on(runtime_context.sync_memory_content());
         runtime_context.reconcile(&mut context);
 
+        // Cache-friendly: the live block still holds the old content; the
+        // change is staged and surfaced as an appended diff alert.
+        let memory = context
+            .system_blocks()
+            .get(tag::MEMORY)
+            .expect("memory block should be present");
+        assert_eq!(memory, &build_memory_context_content("before"));
+        assert_eq!(
+            context.staged_system_update(tag::MEMORY),
+            Some(build_memory_context_content("after").as_str())
+        );
+        let alerts = system_alerts(&context);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("MEMORY.md changed"));
+        assert!(alerts[0].contains("+after"));
+
+        // Repeated reconciles with the same staged content stay quiet.
+        runtime_context.reconcile(&mut context);
+        assert_eq!(system_alerts(&context).len(), 1);
+
+        // Reassembly folds the staged update in and clears the alert.
+        let report = context.reassemble();
+        assert_eq!(report.staged_updates_applied, 1);
         let memory = context
             .system_blocks()
             .get(tag::MEMORY)
             .expect("memory block should be present");
         assert_eq!(memory, &build_memory_context_content("after"));
+        assert!(system_alerts(&context).is_empty());
     }
 
     #[test]
     fn terminal_runtime_context_is_reconciled_as_system_block() {
-        let dir = tempdir().expect("temp dir should be created");
-        let memory_path = dir.path().join("MEMORY.md");
-        std::fs::write(&memory_path, "remember this").expect("memory file should be written");
-
-        let mut runtime_context =
-            RuntimeSystemContext::new(memory_path, "remember this".to_string())
-                .with_terminal_runtime(
-                    "Model: demo-model\nHome environment kind: local".to_string(),
-                );
+        let db = test_db();
+        let mut runtime_context = RuntimeSystemContext::new(db, "remember this".to_string())
+            .with_terminal_runtime("Model: demo-model\nHome environment kind: local".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
 
@@ -840,11 +846,8 @@ mod tests {
 
     #[test]
     fn workspace_and_workdirs_are_reconciled_independently() {
-        let dir = tempdir().expect("temp dir should be created");
-        let memory_path = dir.path().join("MEMORY.md");
-        std::fs::write(&memory_path, "").expect("memory file should be written");
-
-        let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new())
+        let db = test_db();
+        let mut runtime_context = RuntimeSystemContext::new(db, String::new())
             .with_workspace("Workspace: local".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);

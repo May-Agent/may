@@ -2,6 +2,51 @@
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Errors that can occur when replaying chat history into LLM messages.
+#[derive(Debug, Error)]
+pub enum HistoryReplayError {
+    #[error("tool history entry is missing tool_call_id (content preview: {preview})")]
+    MissingToolCallId { preview: String },
+    #[error("tool history entry is not a valid persisted tool event")]
+    InvalidToolEvent(#[source] serde_json::Error),
+    #[error("tool event id '{event_id}' does not match message tool_call_id '{message_id}'")]
+    ToolEventIdMismatch {
+        event_id: String,
+        message_id: String,
+    },
+    #[error("tool start '{tool_call_id}' contains invalid JSON arguments")]
+    InvalidToolArguments {
+        tool_call_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("tool result '{tool_call_id}' could not be rendered for the model")]
+    RenderToolResult {
+        tool_call_id: String,
+        #[source]
+        source: aither_core::Error,
+    },
+}
+
+/// Durable tool lifecycle record stored in chat history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "stage")]
+pub enum ToolEventRecord {
+    #[serde(rename = "start")]
+    Start {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(rename = "end")]
+    End {
+        id: String,
+        name: String,
+        result: aither_core::llm::ToolResult,
+    },
+}
 
 /// Session metadata stored in the chat history header.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -268,22 +313,78 @@ impl ChatHistory {
     ///
     /// Interaction metadata stays filtered, while hidden context is restored as
     /// system context and tool messages keep their original tool-call IDs.
-    #[must_use]
-    pub fn to_aither_messages(&self) -> Vec<aither_core::llm::Message> {
+    pub fn to_aither_messages(&self) -> Result<Vec<aither_core::llm::Message>, HistoryReplayError> {
         self.messages
             .iter()
             .filter_map(|m| {
                 use aither_core::llm::Message;
                 match m.role {
-                    MessageRole::User => Some(Message::user(&m.content)),
-                    MessageRole::Assistant => Some(Message::assistant(&m.content)),
-                    MessageRole::System => Some(Message::system(&m.content)),
-                    MessageRole::HiddenContext => Some(Message::system(&m.content)),
+                    MessageRole::User => Some(Ok(Message::user(&m.content))),
+                    MessageRole::Assistant => Some(Ok(Message::assistant(&m.content))),
+                    MessageRole::System => Some(Ok(Message::system(&m.content))),
+                    MessageRole::HiddenContext => Some(Ok(Message::system(&m.content))),
                     MessageRole::Tool => {
-                        let tool_call_id = m.tool_call_id.as_deref().unwrap_or_else(|| {
-                            panic!("tool history entry is missing tool_call_id: {}", m.content)
-                        });
-                        Some(Message::tool(tool_call_id, &m.content))
+                        let tool_call_id = match m.tool_call_id.as_deref() {
+                            Some(id) => id,
+                            None => {
+                                let preview: String = m.content.chars().take(100).collect();
+                                return Some(Err(HistoryReplayError::MissingToolCallId {
+                                    preview,
+                                }));
+                            }
+                        };
+                        let event = match serde_json::from_str::<ToolEventRecord>(&m.content) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                return Some(Err(HistoryReplayError::InvalidToolEvent(error)));
+                            }
+                        };
+                        match event {
+                            ToolEventRecord::Start {
+                                id,
+                                name,
+                                arguments,
+                            } => {
+                                if id != tool_call_id {
+                                    return Some(Err(HistoryReplayError::ToolEventIdMismatch {
+                                        event_id: id,
+                                        message_id: tool_call_id.to_string(),
+                                    }));
+                                }
+                                let arguments = match serde_json::from_str(&arguments) {
+                                    Ok(arguments) => arguments,
+                                    Err(source) => {
+                                        return Some(Err(
+                                            HistoryReplayError::InvalidToolArguments {
+                                                tool_call_id: id,
+                                                source,
+                                            },
+                                        ));
+                                    }
+                                };
+                                Some(Ok(Message::assistant_with_tool_calls(
+                                    "",
+                                    vec![aither_core::llm::ToolCall::new(id, name, arguments)],
+                                )))
+                            }
+                            ToolEventRecord::End { id, result, .. } => {
+                                if id != tool_call_id {
+                                    return Some(Err(HistoryReplayError::ToolEventIdMismatch {
+                                        event_id: id,
+                                        message_id: tool_call_id.to_string(),
+                                    }));
+                                }
+                                match result.render_for_model() {
+                                    Ok(content) => Some(Ok(Message::tool(id, content))),
+                                    Err(source) => {
+                                        Some(Err(HistoryReplayError::RenderToolResult {
+                                            tool_call_id: id,
+                                            source,
+                                        }))
+                                    }
+                                }
+                            }
+                        }
                     }
                     // Interaction messages are metadata, not LLM context
                     MessageRole::PermissionRequest
@@ -301,7 +402,7 @@ impl ChatHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_core::llm::Role;
+    use aither_core::llm::{Role, ToolResult};
 
     #[test]
     fn hidden_context_replays_as_system_message() {
@@ -312,24 +413,58 @@ mod tests {
         history.messages_mut().push(ChatMessage::user("hello"));
         history.messages_mut().push(ChatMessage::assistant("world"));
 
-        let messages = history.to_aither_messages();
+        let messages = history.to_aither_messages().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role(), Role::System);
         assert_eq!(messages[1].role(), Role::User);
         assert_eq!(messages[2].role(), Role::Assistant);
-        assert_eq!(messages[0].content(), "<system-reminder>notice</system-reminder>");
+        assert_eq!(
+            messages[0].content(),
+            "<system-reminder>notice</system-reminder>"
+        );
     }
 
     #[test]
-    fn tool_messages_preserve_tool_call_id_when_replayed() {
+    fn tool_lifecycle_replays_as_matching_assistant_call_and_result() {
+        let mut history = ChatHistory::new();
+        let start = serde_json::to_string(&ToolEventRecord::Start {
+            id: "call_123".to_string(),
+            name: "lookup".to_string(),
+            arguments: "{\"query\":\"rust\"}".to_string(),
+        })
+        .expect("serialize tool start");
+        let end = serde_json::to_string(&ToolEventRecord::End {
+            id: "call_123".to_string(),
+            name: "lookup".to_string(),
+            result: ToolResult::text("done"),
+        })
+        .expect("serialize tool end");
+        history
+            .messages_mut()
+            .push(ChatMessage::tool("call_123", start));
+        history
+            .messages_mut()
+            .push(ChatMessage::tool("call_123", end));
+
+        let messages = history.to_aither_messages().expect("replay tool lifecycle");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role(), Role::Assistant);
+        assert_eq!(messages[0].tool_calls()[0].id, "call_123");
+        assert_eq!(messages[0].tool_calls()[0].name, "lookup");
+        assert_eq!(messages[1].role(), Role::Tool);
+        assert_eq!(messages[1].tool_call_id(), Some("call_123"));
+        assert_eq!(messages[1].content(), "done");
+    }
+
+    #[test]
+    fn unstructured_legacy_tool_history_fails_fast() {
         let mut history = ChatHistory::new();
         history
             .messages_mut()
-            .push(ChatMessage::tool("call_123", "{\"ok\":true}"));
-
-        let messages = history.to_aither_messages();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role(), Role::Tool);
-        assert_eq!(messages[0].tool_call_id(), Some("call_123"));
+            .push(ChatMessage::tool("call_123", "plain legacy output"));
+        assert!(matches!(
+            history.to_aither_messages(),
+            Err(HistoryReplayError::InvalidToolEvent(_))
+        ));
     }
 }

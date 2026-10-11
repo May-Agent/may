@@ -5,6 +5,8 @@ edition = "2024"
 description = "May - A warm, boundaried AI assistant"
 license = "MIT"
 build = "build.rs"
+repository = "https://github.com/May-Agent/may"
+publish = false
 
 [[bin]]
 name = "may"
@@ -17,19 +19,20 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
 # Aither framework
-aither-core = { path = "../aither/core" }
-aither-agent = { path = "../aither/agent", features = ["mcp", "websearch", "webfetch", "skills"] }
-aither-sandbox = { path = "../aither/sandbox" }
-aither-cloud = { path = "../aither/cloud" }
-aither-rag = { path = "../aither/rag" }
-aither-copilot = { path = "../aither/copilot" }
-aither-models = { path = "../aither/models" }
-aither-mcp = { path = "../aither/mcp" }
-aither-browser = { path = "../aither/tools/browser" }
-aither-search = { path = "../aither/tools/search" }
+aither-core = { version = ">=0.4.1, <0.7", path = "../aither/core" }
+aither-agent = { version = ">=0.4.1, <0.7", path = "../aither/agent", features = ["mcp", "websearch", "webfetch", "skills"] }
+aither-sandbox = { version = ">=0.4.1, <0.7", path = "../aither/sandbox" }
+aither-cloud = { version = ">=0.4.1, <0.7", path = "../aither/cloud" }
+aither-rag = { version = ">=0.4.1, <0.7", path = "../aither/rag" }
+aither-copilot = { version = ">=0.4.1, <0.7", path = "../aither/copilot" }
+aither-codex = { version = ">=0.4.1, <0.7", path = "../aither/codex" }
+aither-models = { version = ">=0.4.1, <0.7", path = "../aither/models" }
+aither-mcp = { version = ">=0.4.1, <0.7", path = "../aither/mcp" }
+aither-browser = { version = ">=0.4.1, <0.7", path = "../aither/tools/browser" }
+aither-search = { version = ">=0.4.1, <0.7", path = "../aither/tools/search" }
 
 # Container runtime (Docker/OrbStack/Podman)
-bollard = "0.20"
+bollard = "0.21"
 tar = "0.4"
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -56,6 +59,8 @@ rmp-serde = "1.3"
 toml = "0.8"
 quick-xml = { version = "0.37", features = ["serialize"] }
 dashmap = "6"
+# Partial JSON repair for streaming tool-call argument projection.
+partial-json-fixer = "0.5"
 
 # Utils
 jiff = { version = "0.2", features = ["serde"] }
@@ -102,7 +107,7 @@ open = "5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # HTTP client for fetching images
-zenwave = { path = "../zenwave" }
+zenwave = "0.7"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -119,8 +124,9 @@ gstreamer-app = { version = "0.23", optional = true }
 gstreamer-video = { version = "0.23", optional = true }
 
 # Web server for `may ui`
-skyzen = { path = "../skyzen", features = ["hyper"] }
-skyzen-services = { path = "../skyzen/services", features = ["runtime-tokio-rustls", "sqlite"] }
+skyzen = { version = "0.4", features = ["hyper"] }
+utoipa = { version = "5.4", default-features = false, features = ["macros"] }
+skyzen-services = { version = "0.2", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
 
 # File picker
 nucleo = "0.5"
@@ -138,6 +144,7 @@ include_dir = "0.7"
 itertools = "0.14.0"
 tempfile = "3.24.0"
 git2 = "0.20.3"
+mime = "0.3"
 mime_guess = "2"
 rustls = { version = "0.23", features = ["ring"] }
 regex = "1.12"
@@ -152,6 +159,7 @@ lancedb = { version = "0.23.1", default-features = false }
 lance-index = "1.0.1"
 arrow-array = "56.2"
 arrow-schema = "56.2"
+similar = "3.1.1"
 
 [dev-dependencies]
 serial_test = "3"

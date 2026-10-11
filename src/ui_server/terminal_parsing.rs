@@ -2,22 +2,24 @@
 
 use aither_core::llm::ToolResult;
 use aither_sandbox::{OutputEntry, TerminalArgs, TerminalExecutionMode};
+use serde::Deserialize;
 
 use super::types::{
     ApiTerminalExecution, TERMINAL_TOOL_NAME, TerminalCommandMode, TerminalExecutionStatus,
     TerminalStateSnapshot, ToolEventRecord,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum TerminalTaskStatus {
     Running,
     Stopped,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) struct ParsedTerminalToolResult {
+    #[schema(value_type = serde_json::Value)]
     pub(super) stdout: OutputEntry,
     pub(super) exit_code: i32,
     #[serde(default)]
@@ -36,14 +38,21 @@ fn parse_terminal_mode(mode: TerminalExecutionMode) -> TerminalCommandMode {
 pub(super) fn parse_terminal_start(
     arguments: &str,
 ) -> (String, String, Option<TerminalCommandMode>) {
-    let parsed: TerminalArgs = serde_json::from_str(arguments).unwrap_or_else(|error| {
-        panic!("invalid terminal tool start payload: {error}; payload: {arguments}")
-    });
-    (
-        parsed.description,
-        parsed.script,
-        Some(parse_terminal_mode(parsed.mode)),
-    )
+    match serde_json::from_str::<TerminalArgs>(arguments) {
+        Ok(parsed) => (
+            parsed.description,
+            parsed.script,
+            Some(parse_terminal_mode(parsed.mode)),
+        ),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                payload = %arguments,
+                "terminal tool start payload did not satisfy TerminalArgs; surfacing as malformed call"
+            );
+            (String::new(), String::new(), None)
+        }
+    }
 }
 
 pub(super) fn parse_terminal_result_payload(
@@ -52,7 +61,9 @@ pub(super) fn parse_terminal_result_payload(
     let ToolResult::Json { value } = result else {
         return None;
     };
-    serde_json::from_value(value.clone()).ok()
+    // Deserialize from `&Value` directly — `serde_json::from_value` would
+    // deep-clone the whole tree (including full stdout) first.
+    ParsedTerminalToolResult::deserialize(value).ok()
 }
 
 /// Preserve terminal tool output as structured JSON when possible.
