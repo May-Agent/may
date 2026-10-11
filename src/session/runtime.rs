@@ -21,7 +21,7 @@ const fn session_runtime_state_is_idle(value: &SessionRuntimeState) -> bool {
 }
 
 /// Persisted runtime state for a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum SessionRuntimeState {
@@ -85,7 +85,7 @@ impl core::str::FromStr for SessionRuntimeState {
 }
 
 /// Persisted terminal-runtime metadata owned by the server runtime.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalRuntimeState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,6 +99,7 @@ pub struct TerminalRuntimeState {
     /// Why the command was promoted to the background (populated when the
     /// runtime state reflects a live terminal task).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
     pub background_reason: Option<aither_sandbox::BackgroundReason>,
 }
 
@@ -123,7 +124,7 @@ impl TerminalRuntimeState {
 }
 
 /// Persisted browser interaction state owned by the server runtime.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserInteractionState {
     #[serde(default, skip_serializing_if = "is_false")]
@@ -140,7 +141,7 @@ impl BrowserInteractionState {
 }
 
 /// Persisted interactive-resource state for a session.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInteractionState {
     #[serde(default, skip_serializing_if = "BrowserInteractionState::is_empty")]
@@ -162,7 +163,7 @@ impl SessionInteractionState {
 }
 
 /// Server-owned user message waiting to be processed.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingUserMessage {
     pub content: String,
@@ -177,7 +178,7 @@ pub struct PendingUserMessage {
 }
 
 /// Delivery mode for a pending user message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum PendingUserMessageMode {
@@ -217,7 +218,7 @@ impl core::str::FromStr for PendingUserMessageMode {
 }
 
 /// Persisted ask-user request visible after refresh.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedAskUserRequest {
     pub id: String,
@@ -225,7 +226,7 @@ pub struct PersistedAskUserRequest {
 }
 
 /// Persisted workspace request visible after refresh.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedWorkspaceRequest {
     pub id: String,
@@ -233,7 +234,7 @@ pub struct PersistedWorkspaceRequest {
 }
 
 /// Persisted runtime summary used by session lists and runtime endpoints.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSummary {
     #[serde(default, skip_serializing_if = "session_runtime_state_is_idle")]
@@ -276,7 +277,7 @@ impl Default for SessionRuntimeSummary {
 }
 
 /// Persisted permission request visible after refresh.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedPermissionRequest {
     pub id: String,
@@ -284,7 +285,7 @@ pub struct PersistedPermissionRequest {
 }
 
 /// Persisted workspace request payload visible after refresh.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedWorkspaceRequestPayload {
     pub path: String,
@@ -365,7 +366,7 @@ impl SessionRuntimeSummary {
 }
 
 /// Persisted attachment shape for pending user messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentKind {
     Image,
@@ -398,7 +399,7 @@ impl std::fmt::Display for AttachmentKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedAttachment {
     pub id: String,
@@ -413,7 +414,7 @@ pub struct PersistedAttachment {
 }
 
 /// Persisted ask-user question shape for refresh-safe UI recovery.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedAskUserQuestion {
     pub section: String,
@@ -423,7 +424,7 @@ pub struct PersistedAskUserQuestion {
 }
 
 /// Persisted permission request payload.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedPermissionRequestPayload {
     pub mode: PermissionRequestMode,

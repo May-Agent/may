@@ -16,14 +16,14 @@ use crate::db::ChatDb;
 use crate::db::entity::profiles;
 use crate::session::SessionSummary;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfilePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<ContainerProfilePreferences>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerProfilePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -32,7 +32,7 @@ pub struct ContainerProfilePreferences {
     pub mounts: Vec<ContainerMountPreference>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerMountPreference {
     pub host_path: String,
@@ -41,7 +41,7 @@ pub struct ContainerMountPreference {
     pub access: ContainerMountAccess,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerMountAccess {
     #[default]
@@ -72,7 +72,7 @@ impl core::str::FromStr for ContainerMountAccess {
 }
 
 /// A profile with its organized sessions.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 pub struct ProfileSessions {
     pub profile: ProfileInfo,
     pub pinned: Vec<PinnedItem>,
@@ -81,7 +81,7 @@ pub struct ProfileSessions {
 }
 
 /// Lightweight profile info (from DB model).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileInfo {
     pub id: String,
@@ -138,7 +138,7 @@ impl ProfileInfo {
 ///
 /// Every profile owns exactly one home environment, and all session sandboxes
 /// and IPC-based terminal commands are rooted in that environment.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(transparent)]
 pub struct HomeEnvironment(ProfileEnvironment);
 
@@ -177,7 +177,7 @@ impl AsRef<ProfileEnvironment> for HomeEnvironment {
 /// [`ProfileInfo::remote_attachments`]; agents reach them by invoking the
 /// `terminal` tool with `mode: "ssh"` and `ssh_server_id: <name>` rather than
 /// by treating the whole profile as remote.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProfileEnvironment {
     Local,
@@ -199,7 +199,7 @@ impl ProfileEnvironment {
 }
 
 /// An item in the pinned section: either a bare session or a folder.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PinnedItem {
     Session(SessionSummary),

@@ -1,6 +1,6 @@
 //! Web Push subscription row model for the chat history database.
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
     pub id: String,
     /// Push endpoint URL from the browser.

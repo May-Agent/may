@@ -19,7 +19,7 @@ use super::types::ApiErrorCode;
 
 // ── Request / Response types ────────────────────────────────
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CreateProfileRequest {
     pub name: String,
@@ -240,7 +240,7 @@ pub(super) async fn ensure_profile_environment_ready(
     prepare_result
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct UpdateProfileRequest {
     #[serde(default)]
@@ -261,13 +261,13 @@ pub(super) struct UpdateProfileRequest {
     pub location_aware: Option<bool>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CreateFolderRequest {
     pub name: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct UpdateFolderRequest {
     #[serde(default)]
@@ -276,13 +276,13 @@ pub(super) struct UpdateFolderRequest {
     pub sort_order: Option<i32>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct MoveToFolderRequest {
     pub folder_id: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SetProfileRemoteServersRequest {
     pub server_names: Vec<String>,
@@ -467,7 +467,7 @@ pub(super) async fn get_profile_sessions(
     json_ok_response(&result)
 }
 
-#[derive(Debug, serde::Deserialize, Default)]
+#[derive(Debug, serde::Deserialize, Default, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ProfileSessionsQuery {
     #[serde(default)]
@@ -476,7 +476,7 @@ pub(super) struct ProfileSessionsQuery {
 
 // ── Folder endpoints ────────────────────────────────────────
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct FolderResponse {
     id: String,

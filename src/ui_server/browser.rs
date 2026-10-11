@@ -16,7 +16,7 @@ use super::state::UiServerState;
 use super::types::BrowserTakeoverResponse;
 use crate::ui_event_bus::UiEventTopics;
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BrowserStatus {
     enabled: bool,
@@ -26,7 +26,7 @@ pub(super) struct BrowserStatus {
     takeover_session_id: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct WebRtcOfferRequest {
     sdp: String,
@@ -36,19 +36,19 @@ pub(super) struct WebRtcOfferRequest {
     session_id: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct WebRtcAnswerResponse {
     sdp: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BrowserTakeoverRequest {
     session_id: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BrowserResizeViewportRequest {
     width: u32,
@@ -61,7 +61,7 @@ fn default_dpr() -> f64 {
     1.0
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BrowserResizeViewportResponse {
     ok: bool,
@@ -319,6 +319,10 @@ pub(super) async fn browser_takeover_start(
         .map_err(|error| {
             skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
+    // Interrupt an in-flight model request immediately. The chat loop checks
+    // the persisted takeover owner after cancellation and records the run as a
+    // takeover pause rather than an ordinary user cancellation.
+    state.run_cancellation_registry.cancel(session_id.as_str());
     if let Some(bm) = state.browser_manager() {
         bm.set_takeover(Some(session_id.clone()));
     }

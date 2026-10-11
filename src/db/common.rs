@@ -96,7 +96,7 @@ pub struct NetworkAccessLogParams<'a> {
     pub reason: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccessSource {
     Chat,
@@ -146,7 +146,7 @@ impl core::str::FromStr for NetworkAccessSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccessMode {
     Network,
@@ -204,22 +204,22 @@ pub struct AssistantCacheUsageSummary {
     pub cache_write_tokens_total: u64,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PendingPermissionLookup {
     pub(crate) session_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PendingAskUserLookup {
     pub(crate) session_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PendingWorkspaceLookup {
     pub(crate) session_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingMessageEntryRow {
     pub(super) id: i64,
     pub(super) session_id: String,
@@ -229,7 +229,7 @@ pub(super) struct PendingMessageEntryRow {
     pub(super) created_at: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingMessageAttachmentRow {
     pub(super) message_id: i64,
     pub(super) ordinal: i64,
@@ -241,14 +241,14 @@ pub(super) struct PendingMessageAttachmentRow {
     pub(super) text_content: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingAskUserRequestRow {
     pub(super) request_id: String,
     pub(super) session_id: String,
     pub(super) created_at: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingAskUserQuestionRow {
     pub(super) request_id: String,
     pub(super) ordinal: i64,
@@ -257,7 +257,7 @@ pub(super) struct PendingAskUserQuestionRow {
     pub(super) multi_select: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingAskUserQuestionOptionRow {
     pub(super) request_id: String,
     pub(super) question_ordinal: i64,
@@ -265,7 +265,7 @@ pub(super) struct PendingAskUserQuestionOptionRow {
     pub(super) value: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ProfileMountRow {
     pub(super) profile_id: String,
     pub(super) ordinal: i64,
@@ -274,39 +274,39 @@ pub(super) struct ProfileMountRow {
     pub(super) access: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PermissionRequestMessageRow {
     pub(super) request_id: String,
     pub(super) mode: String,
     pub(super) script: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PermissionResponseMessageRow {
     pub(super) request_id: String,
     pub(super) approved: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct WorkspaceRequestMessageRow {
     pub(super) request_id: String,
     pub(super) path: String,
     pub(super) reason: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct WorkspaceResponseMessageRow {
     pub(super) request_id: String,
     pub(super) approved: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AskUserRequestMessageRow {
     pub(super) message_id: i32,
     pub(super) request_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AskUserRequestQuestionRow {
     pub(super) message_id: i32,
     pub(super) ordinal: i64,
@@ -315,7 +315,7 @@ pub(super) struct AskUserRequestQuestionRow {
     pub(super) multi_select: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AskUserRequestQuestionOptionRow {
     pub(super) message_id: i32,
     pub(super) question_ordinal: i64,
@@ -323,13 +323,13 @@ pub(super) struct AskUserRequestQuestionOptionRow {
     pub(super) value: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AskUserResponseMessageRow {
     pub(super) message_id: i32,
     pub(super) request_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AskUserResponseAnswerRow {
     pub(super) message_id: i32,
     pub(super) ordinal: i64,
@@ -338,7 +338,7 @@ pub(super) struct AskUserResponseAnswerRow {
     pub(super) custom_text: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AskUserResponseSelectedOptionRow {
     pub(super) message_id: i32,
     pub(super) answer_ordinal: i64,
@@ -346,7 +346,7 @@ pub(super) struct AskUserResponseSelectedOptionRow {
     pub(super) value: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugSnapshotHeaderRow {
     pub(super) session_id: String,
     pub(super) timestamp: String,
@@ -355,14 +355,14 @@ pub(super) struct ContextDebugSnapshotHeaderRow {
     pub(super) prompt: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugPromptAttachmentRow {
     pub(super) session_id: String,
     pub(super) ordinal: i64,
     pub(super) url: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugMessageRow {
     pub(super) session_id: String,
     pub(super) ordinal: i64,
@@ -371,7 +371,7 @@ pub(super) struct ContextDebugMessageRow {
     pub(super) tool_call_id: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugMessageAttachmentRow {
     pub(super) session_id: String,
     pub(super) message_ordinal: i64,
@@ -379,7 +379,7 @@ pub(super) struct ContextDebugMessageAttachmentRow {
     pub(super) url: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugMessageToolCallRow {
     pub(super) session_id: String,
     pub(super) message_ordinal: i64,
@@ -426,37 +426,37 @@ pub(super) struct DefaultProfile<'a> {
     pub(super) location_aware: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct SqliteTableInfoRow {
     pub(super) name: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct I32ValueRow {
     pub(super) value: i32,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct StringValueRow {
     pub(super) value: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct I64ValueRow {
     pub(super) value: i64,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct OptionalI64ValueRow {
     pub value: Option<i64>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct BoolValueRow {
     pub(super) value: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AssistantCacheUsageSummaryRow {
     pub(super) assistant_message_count: i64,
     pub(super) cache_hit_message_count: i64,
@@ -465,12 +465,12 @@ pub(super) struct AssistantCacheUsageSummaryRow {
     pub(super) cache_write_tokens_total: i64,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct SessionIdRow {
     pub(super) session_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct StoredSessionContextSnapshotRow {
     pub(super) checkpoint_blob: Vec<u8>,
     pub(super) last_message_db_id: Option<i64>,
@@ -519,7 +519,7 @@ pub struct UpdateScheduledTaskParams<'a> {
     pub script_inline: Option<Option<&'a str>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileEnvironmentKind {
     Local,

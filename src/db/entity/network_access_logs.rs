@@ -1,6 +1,6 @@
 //! Persisted network audit log row model.
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
     pub id: i32,
     pub session_id: Option<String>,

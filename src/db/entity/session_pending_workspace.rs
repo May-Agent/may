@@ -1,6 +1,6 @@
 //! Pending workspace request row model owned by the server runtime.
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
     pub request_id: String,
     pub session_id: String,
