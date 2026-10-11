@@ -123,14 +123,6 @@ pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
     models
 }
 
-/// Fetch models from a single provider.
-pub(crate) async fn fetch_models_for_provider_instance(
-    id: &str,
-    instance: &ProviderInstance,
-) -> Result<Vec<FetchedModel>, ModelFetchError> {
-    fetch_models_for_provider(id, instance).await
-}
-
 async fn fetch_models_for_provider(
     id: &str,
     instance: &ProviderInstance,

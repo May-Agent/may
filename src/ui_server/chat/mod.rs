@@ -25,10 +25,7 @@ use aither_sandbox::{
 };
 
 use crate::agent::MayAgent;
-use crate::agent::browser_tool::BrowserToolError;
 use crate::ask_user;
-use crate::browser_service::persist_browser_page_capture;
-use crate::notification::{NotificationPayload, NotificationService};
 use crate::prompt_mentions;
 use crate::session::{
     ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths, MessageRole, PendingUserMessage,
@@ -40,12 +37,9 @@ use crate::ui_event_bus::UiEventTopics;
 
 use super::attachments::build_prompt_and_attachments;
 use super::browser::ensure_browser_runtime_started;
-use super::error::{internal_error, json_ok_response, typed_error_response};
+use super::error::internal_error;
 use super::error_chain::error_chain_text;
-use super::helpers::{
-    RETRY_BACKOFF_MS, append_history_message, elapsed_ms_saturating, load_session_paths,
-    send_event, truncate_preview,
-};
+use super::helpers::{RETRY_BACKOFF_MS, elapsed_ms_saturating, send_event, truncate_preview};
 use super::model_resolution::resolve_default_model;
 use super::state::{UiServerState, UiToolQueues};
 use super::terminal_parsing::{
@@ -2161,47 +2155,10 @@ impl UiChatPreparationError {
             | Self::HistoryReplay(_) => ApiErrorCode::InternalError,
         }
     }
-
-    fn status(&self) -> skyzen::StatusCode {
-        match self {
-            Self::BrowserTakeoverActive => skyzen::StatusCode::CONFLICT,
-            Self::SessionNotFound(_) => skyzen::StatusCode::NOT_FOUND,
-            Self::MissingModelConfiguration
-            | Self::NoProviderAvailable { .. }
-            | Self::InvalidFileMentionPath(_)
-            | Self::MissingContainerProfileModel
-            | Self::ParseProfileEnvironment(_)
-            | Self::InvalidContainerImageTag(_)
-            | Self::InvalidContainerProfileConfiguration(_)
-            | Self::InvalidContainerMountConfiguration(_)
-            | Self::ResolveContainerRuntime(_)
-            | Self::EnsureContainerImage(_)
-            | Self::StartContainer(_)
-            | Self::LoadLocation(_) => skyzen::StatusCode::BAD_REQUEST,
-            Self::LoadSession(_)
-            | Self::LoadHistory(_)
-            | Self::LoadProfile(_)
-            | Self::LoadProfileMemories(_)
-            | Self::LoadRuntime(_)
-            | Self::LoadContextSnapshot(_)
-            | Self::BuildTakeoverAlert(_)
-            | Self::BuildSessionMentions(_)
-            | Self::BuildFileMentions(_)
-            | Self::UpdateSessionTitle(_)
-            | Self::AppendUserMessage(_)
-            | Self::PersistHiddenContext(_)
-            | Self::ReconcileContainerLayout(_)
-            | Self::BuildAgent(_)
-            | Self::RestoreCheckpoint(_)
-            | Self::BuildPrompt(_)
-            | Self::PersistContextDebugSnapshot(_)
-            | Self::HistoryReplay(_) => skyzen::StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ChatMarkupError {
+pub(super) enum ChatMarkupError {
     #[error("failed to serialize XML fragment: {0}")]
     Serialize(#[source] quick_xml::SeError),
     #[error("failed to parse XML fragment: {0}")]

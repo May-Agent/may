@@ -1,7 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use async_fs;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
@@ -14,7 +13,6 @@ use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::load_session_paths;
 use super::message_mapping::map_db_messages;
 use super::model_resolution::{
     persist_last_model, preferred_advanced_model, resolve_default_model,
@@ -250,42 +248,6 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
     }
 }
 
-fn sanitized_plan_archive_stem(content: &str) -> String {
-    let mut stem = String::new();
-    for ch in content.chars() {
-        if ch.is_ascii_alphanumeric() {
-            stem.push(ch.to_ascii_lowercase());
-        } else if (ch.is_ascii_whitespace() || ch == '-' || ch == '_') && !stem.ends_with('-') {
-            stem.push('-');
-        }
-        if stem.len() >= 48 {
-            break;
-        }
-    }
-    let trimmed = stem.trim_matches('-');
-    if trimmed.is_empty() {
-        return "tasks".to_string();
-    }
-    trimmed.to_string()
-}
-
-async fn archive_existing_tasks_if_replaced(
-    paths: &crate::session::SessionPaths,
-    previous_content: &str,
-    next_content: &str,
-) -> Result<(), std::io::Error> {
-    if previous_content.trim().is_empty() || previous_content == next_content {
-        return Ok(());
-    }
-    let archive_stem = sanitized_plan_archive_stem(previous_content);
-    let mut file_name = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
-    file_name.push('-');
-    file_name.push_str(archive_stem.as_str());
-    file_name.push_str("-tasks.md");
-    async_fs::create_dir_all(paths.data_dir()).await?;
-    async_fs::write(paths.data_dir().join(file_name), previous_content).await
-}
-
 /// Creates the durable DB row and session directory layout for a profile.
 ///
 /// Shared by the regular create-session endpoint and notification callbacks,
@@ -463,22 +425,4 @@ pub(super) async fn delete_all_sessions(
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
     Ok(Json(ApiHealth { ok: true }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sanitized_plan_archive_stem;
-
-    #[test]
-    fn sanitized_plan_archive_stem_normalizes_heading_like_text() {
-        assert_eq!(
-            sanitized_plan_archive_stem("## Terminal First Runtime Rewrite"),
-            "terminal-first-runtime-rewrite"
-        );
-    }
-
-    #[test]
-    fn sanitized_plan_archive_stem_falls_back_for_empty_text() {
-        assert_eq!(sanitized_plan_archive_stem("   ###   "), "tasks");
-    }
 }

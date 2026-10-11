@@ -20,7 +20,7 @@ use crate::session::{
 use crate::xml::XmlBlock;
 
 use super::common::{
-    BoolValueRow, I32ValueRow, I64ValueRow, PendingAskUserLookup, PendingAskUserQuestionOptionRow,
+    BoolValueRow, I64ValueRow, PendingAskUserLookup, PendingAskUserQuestionOptionRow,
     PendingAskUserQuestionRow, PendingAskUserRequestRow, PendingMessageAttachmentRow,
     PendingMessageEntryRow, PendingPermissionLookup, PendingWorkspaceLookup, SessionIdRow,
     db_custom_error, overflow_error, parse_attachment_kind, parse_pending_user_message_mode,
@@ -28,8 +28,8 @@ use super::common::{
     session_not_found_db_error, storage_error,
 };
 use super::entity::{
-    profile_memory_jobs, session_pending_permissions, session_pending_workspace, session_plans,
-    session_run_leases, session_runtimes, sessions,
+    session_pending_permissions, session_pending_workspace, session_plans, session_run_leases,
+    session_runtimes, sessions,
 };
 use super::{ChatDb, ChatDbError, query};
 

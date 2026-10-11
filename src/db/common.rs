@@ -9,7 +9,6 @@
 
 use skyzen_services::DbError as SkyDbError;
 
-use crate::ask_user::AnswerValue;
 use crate::profile::{ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences};
 use crate::session::{ChatMessageStats, SessionPlanState, SessionRuntimeState};
 
@@ -96,7 +95,9 @@ pub struct NetworkAccessLogParams<'a> {
     pub reason: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccessSource {
     Chat,
@@ -146,7 +147,9 @@ impl core::str::FromStr for NetworkAccessSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccessMode {
     Network,
@@ -222,7 +225,6 @@ pub struct PendingWorkspaceLookup {
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingMessageEntryRow {
     pub(super) id: i64,
-    pub(super) session_id: String,
     pub(super) delivery_mode: String,
     pub(super) content: String,
     pub(super) hidden_context_xml: Option<String>,
@@ -232,7 +234,6 @@ pub(super) struct PendingMessageEntryRow {
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingMessageAttachmentRow {
     pub(super) message_id: i64,
-    pub(super) ordinal: i64,
     pub(super) attachment_id: String,
     pub(super) name: String,
     pub(super) attachment_type: String,
@@ -244,13 +245,10 @@ pub(super) struct PendingMessageAttachmentRow {
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingAskUserRequestRow {
     pub(super) request_id: String,
-    pub(super) session_id: String,
-    pub(super) created_at: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingAskUserQuestionRow {
-    pub(super) request_id: String,
     pub(super) ordinal: i64,
     pub(super) section: String,
     pub(super) question: String,
@@ -259,16 +257,12 @@ pub(super) struct PendingAskUserQuestionRow {
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingAskUserQuestionOptionRow {
-    pub(super) request_id: String,
     pub(super) question_ordinal: i64,
-    pub(super) option_ordinal: i64,
     pub(super) value: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ProfileMountRow {
-    pub(super) profile_id: String,
-    pub(super) ordinal: i64,
     pub(super) host_path: String,
     pub(super) container_path: String,
     pub(super) access: String,
@@ -279,25 +273,6 @@ pub(super) struct PermissionRequestMessageRow {
     pub(super) request_id: String,
     pub(super) mode: String,
     pub(super) script: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
-pub(super) struct PermissionResponseMessageRow {
-    pub(super) request_id: String,
-    pub(super) approved: bool,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
-pub(super) struct WorkspaceRequestMessageRow {
-    pub(super) request_id: String,
-    pub(super) path: String,
-    pub(super) reason: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
-pub(super) struct WorkspaceResponseMessageRow {
-    pub(super) request_id: String,
-    pub(super) approved: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
@@ -319,30 +294,6 @@ pub(super) struct AskUserRequestQuestionRow {
 pub(super) struct AskUserRequestQuestionOptionRow {
     pub(super) message_id: i32,
     pub(super) question_ordinal: i64,
-    pub(super) option_ordinal: i64,
-    pub(super) value: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
-pub(super) struct AskUserResponseMessageRow {
-    pub(super) message_id: i32,
-    pub(super) request_id: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
-pub(super) struct AskUserResponseAnswerRow {
-    pub(super) message_id: i32,
-    pub(super) ordinal: i64,
-    pub(super) section: String,
-    pub(super) answer_kind: String,
-    pub(super) custom_text: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
-pub(super) struct AskUserResponseSelectedOptionRow {
-    pub(super) message_id: i32,
-    pub(super) answer_ordinal: i64,
-    pub(super) option_ordinal: i64,
     pub(super) value: String,
 }
 
@@ -357,14 +308,11 @@ pub(super) struct ContextDebugSnapshotHeaderRow {
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugPromptAttachmentRow {
-    pub(super) session_id: String,
-    pub(super) ordinal: i64,
     pub(super) url: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugMessageRow {
-    pub(super) session_id: String,
     pub(super) ordinal: i64,
     pub(super) role: String,
     pub(super) content: String,
@@ -373,17 +321,13 @@ pub(super) struct ContextDebugMessageRow {
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugMessageAttachmentRow {
-    pub(super) session_id: String,
     pub(super) message_ordinal: i64,
-    pub(super) attachment_ordinal: i64,
     pub(super) url: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugMessageToolCallRow {
-    pub(super) session_id: String,
     pub(super) message_ordinal: i64,
-    pub(super) tool_call_ordinal: i64,
     pub(super) name: String,
 }
 
@@ -519,7 +463,9 @@ pub struct UpdateScheduledTaskParams<'a> {
     pub script_inline: Option<Option<&'a str>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileEnvironmentKind {
     Local,
@@ -649,21 +595,6 @@ pub(super) fn parse_attachment_kind(
         "audio" => Ok(crate::session::AttachmentKind::Audio),
         "video" => Ok(crate::session::AttachmentKind::Video),
         other => Err(storage_error(format!("invalid attachment kind: {other}"))),
-    }
-}
-
-pub(super) fn parse_answer_value_kind(
-    kind: &str,
-    selected_values: Vec<String>,
-    custom_text: Option<String>,
-) -> Result<AnswerValue, ChatDbError> {
-    match kind {
-        "selected" => Ok(AnswerValue::Selected(selected_values)),
-        "custom" => Ok(AnswerValue::Custom(custom_text.unwrap_or_default())),
-        "skipped" => Ok(AnswerValue::Skipped),
-        other => Err(storage_error(format!(
-            "invalid ask-user answer kind: {other}"
-        ))),
     }
 }
 

@@ -8,7 +8,6 @@ use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use crate::xml::XmlBlock;
 
 const MAILBOX_STATUS_PENDING: &str = "pending";
-const MAILBOX_STATUS_DELIVERING: &str = "delivering";
 const MAILBOX_STATUS_DELIVERED: &str = "delivered";
 const MAILBOX_STATUS_FAILED: &str = "failed";
 

@@ -714,7 +714,7 @@ impl RuntimeDeps {
         if let Some(ctx) = title_gen.take()
             && !assistant_response.is_empty()
         {
-            self.spawn_title_generation(
+            Self::spawn_title_generation(
                 app.config.clone(),
                 app.session_manager.db().clone(),
                 app.session_manager.current().map(|s| s.id.clone()),
@@ -994,7 +994,6 @@ impl RuntimeDeps {
     }
 
     fn spawn_title_generation(
-        &self,
         config: MayConfig,
         db: crate::db::ChatDb,
         session_id: Option<SessionId>,

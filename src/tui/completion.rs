@@ -202,19 +202,19 @@ impl Completion {
 
         // Add files from workdir (higher priority - add first)
         if self.workdir.exists() {
-            self.add_files_to_matcher(&matcher, &self.workdir, true);
+            Self::add_files_to_matcher(&matcher, &self.workdir, true);
         }
 
         // Add files from sandbox
         if self.sandbox.exists() && self.sandbox != self.workdir {
-            self.add_files_to_matcher(&matcher, &self.sandbox, false);
+            Self::add_files_to_matcher(&matcher, &self.sandbox, false);
         }
 
         self.file_matcher = Some(matcher);
     }
 
     /// Add files from a directory to the matcher.
-    fn add_files_to_matcher(&self, matcher: &Nucleo<PathBuf>, dir: &Path, _is_workdir: bool) {
+    fn add_files_to_matcher(matcher: &Nucleo<PathBuf>, dir: &Path, _is_workdir: bool) {
         let injector = matcher.injector();
 
         let walker = WalkBuilder::new(dir)

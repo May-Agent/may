@@ -16,14 +16,18 @@ use crate::db::ChatDb;
 use crate::db::entity::profiles;
 use crate::session::SessionSummary;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfilePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<ContainerProfilePreferences>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerProfilePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,7 +45,17 @@ pub struct ContainerMountPreference {
     pub access: ContainerMountAccess,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerMountAccess {
     #[default]

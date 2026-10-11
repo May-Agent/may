@@ -10,7 +10,9 @@ use aither_core::llm::ToolResult;
 // ── Typed API Errors ────────────────────────────────────────
 
 /// Machine-readable error codes sent to the frontend, eliminating string-matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiErrorCode {
     BadRequest,
@@ -378,7 +380,9 @@ pub struct NetworkAccessLogsResponse {
     pub(crate) items: Vec<NetworkAccessLogEntryResponse>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteAccessState {
     Disabled,
@@ -611,7 +615,9 @@ pub struct ApiAttachment {
 /// This identifies the terminal command execution tool in the protocol.
 pub const TERMINAL_TOOL_NAME: &str = "terminal";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TerminalExecutionStatus {
     Running,
@@ -620,7 +626,9 @@ pub enum TerminalExecutionStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TerminalCommandMode {
     Default,

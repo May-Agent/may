@@ -8,7 +8,7 @@
 
 use crate::PermissionHistoryMode;
 use crate::ask_user::AnswerValue;
-use crate::session::{ChatMessage, ChatMessageStats, MessageRole, PersistedAskUserRequest};
+use crate::session::{ChatMessage, ChatMessageStats, MessageRole};
 
 use super::common::{
     AssistantCacheUsageSummary, AssistantCacheUsageSummaryRow, I64ValueRow, MessageStatsParams,
@@ -95,16 +95,6 @@ impl ChatDb {
         }
 
         Ok(model)
-    }
-
-    async fn append_structured_message(
-        &self,
-        session_id: &str,
-        role: MessageRole,
-        timestamp: Option<&str>,
-    ) -> Result<messages::Model, ChatDbError> {
-        self.append_message(session_id, role, "", timestamp, None, None)
-            .await
     }
 
     /// Insert a structured message row within an existing transaction.
