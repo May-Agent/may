@@ -189,7 +189,11 @@ impl Tool for TaskTool {
     type Arguments = TaskArgs;
     type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let broker = self.broker.as_ref().ok_or(TaskToolError::Unavailable)?;
         let request = TaskCreateRequest {
             session_id: self.session_id.clone(),

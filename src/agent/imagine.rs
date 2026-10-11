@@ -80,7 +80,11 @@ impl Tool for ImagineTool {
     type Arguments = ImagineArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         match self.generate_image(arguments).await {
             Ok(artifact_path) => Ok(ToolResult::text(artifact_path)),
             Err(error) => Ok(ToolResult::error(error.to_string())),
