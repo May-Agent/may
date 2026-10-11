@@ -4,7 +4,7 @@ use super::common::{
     ContextDebugMessageAttachmentRow, ContextDebugMessageRow, ContextDebugMessageToolCallRow,
     ContextDebugPromptAttachmentRow, ContextDebugSnapshot, ContextDebugSnapshotHeaderRow,
     ContextDebugSnapshotMessage, SessionContextSnapshotUpsert, StoredSessionContextSnapshot,
-    StoredSessionContextSnapshotRow, overflow_error, storage_error, to_i64_from_u64, to_usize,
+    StoredSessionContextSnapshotRow, overflow_error, storage_error,
 };
 use super::{ChatDb, ChatDbError, query};
 

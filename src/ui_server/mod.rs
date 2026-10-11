@@ -99,7 +99,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
 
-    let mut mcp_manager = McpManager::load()
+    let mcp_manager = McpManager::load()
         .await
         .context("failed to load MCP config")?;
     // Note: MCP connection is deferred until the service is spawned.

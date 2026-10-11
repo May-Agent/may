@@ -62,8 +62,6 @@ enum ImagineToolError {
     NonPositiveSize,
     #[error("{0}")]
     MissingApiKey(String),
-    #[error("failed to create image provider: {0}")]
-    BuildProvider(String),
     #[error("image generation failed: {0}")]
     Generate(String),
     #[error("failed to prepare artifacts directory: {0}")]

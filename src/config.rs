@@ -88,7 +88,9 @@ pub enum ConfigError {
 ///
 /// This represents the type of provider (API format and default base URL).
 /// Users configure individual provider instances with credentials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
     /// Anthropic Claude models
