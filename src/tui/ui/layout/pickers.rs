@@ -2,15 +2,14 @@
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
 use super::super::super::app::App;
-use super::{centered_rect, centered_rect_exact, display_width_prefix};
-use crate::SessionSummary;
+use super::{centered_rect, centered_rect_exact};
 
 /// Render session selection popup with profile sections.
 pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
@@ -352,7 +351,11 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render search match preview snippet below a selected session.
-pub(super) fn render_search_preview(lines: &mut Vec<Line<'_>>, summary: &crate::SessionSummary, search: &str) {
+pub(super) fn render_search_preview(
+    lines: &mut Vec<Line<'_>>,
+    summary: &crate::SessionSummary,
+    search: &str,
+) {
     let query = search.to_lowercase();
     let query_char_count = query.chars().count();
     let content_lower = summary.content_preview.to_lowercase();
@@ -438,7 +441,6 @@ pub(super) fn render_profile_select_popup(frame: &mut Frame, area: Rect, app: &A
         let env_indicator = match profile.environment.kind() {
             crate::profile::ProfileEnvironment::Local => "",
             crate::profile::ProfileEnvironment::Container { .. } => " [container]",
-            crate::profile::ProfileEnvironment::Remote { .. } => " [remote]",
         };
 
         let prefix = if selected { "> " } else { "  " };

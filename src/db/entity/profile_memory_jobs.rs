@@ -1,6 +1,6 @@
 //! Per-profile durable memory refresh job row model.
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
     pub profile_id: String,
     pub dirty: bool,

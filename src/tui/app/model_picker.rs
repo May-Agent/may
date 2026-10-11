@@ -176,18 +176,21 @@ impl App {
     pub(super) fn collect_all_models(&self) -> Vec<String> {
         let mut models = Vec::new();
         for m in &self.config.models.advanced {
-            if !models.contains(m) {
-                models.push(m.clone());
+            let selector = m.to_string();
+            if !models.contains(&selector) {
+                models.push(selector);
             }
         }
         for m in &self.config.models.balanced {
-            if !models.contains(m) {
-                models.push(m.clone());
+            let selector = m.to_string();
+            if !models.contains(&selector) {
+                models.push(selector);
             }
         }
         for m in &self.config.models.fast {
-            if !models.contains(m) {
-                models.push(m.clone());
+            let selector = m.to_string();
+            if !models.contains(&selector) {
+                models.push(selector);
             }
         }
         models

@@ -9,11 +9,7 @@
 
 use skyzen_services::DbError as SkyDbError;
 
-use crate::ask_user::AnswerValue;
-use crate::profile::{
-    ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences,
-    RemoteProfilePreferences,
-};
+use crate::profile::{ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences};
 use crate::session::{ChatMessageStats, SessionPlanState, SessionRuntimeState};
 
 use super::entity::profiles;
@@ -99,7 +95,9 @@ pub struct NetworkAccessLogParams<'a> {
     pub reason: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccessSource {
     Chat,
@@ -149,7 +147,9 @@ impl core::str::FromStr for NetworkAccessSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccessMode {
     Network,
@@ -207,35 +207,33 @@ pub struct AssistantCacheUsageSummary {
     pub cache_write_tokens_total: u64,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PendingPermissionLookup {
     pub(crate) session_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PendingAskUserLookup {
     pub(crate) session_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PendingWorkspaceLookup {
     pub(crate) session_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingMessageEntryRow {
     pub(super) id: i64,
-    pub(super) session_id: String,
     pub(super) delivery_mode: String,
     pub(super) content: String,
     pub(super) hidden_context_xml: Option<String>,
     pub(super) created_at: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingMessageAttachmentRow {
     pub(super) message_id: i64,
-    pub(super) ordinal: i64,
     pub(super) attachment_id: String,
     pub(super) name: String,
     pub(super) attachment_type: String,
@@ -244,72 +242,46 @@ pub(super) struct PendingMessageAttachmentRow {
     pub(super) text_content: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingAskUserRequestRow {
     pub(super) request_id: String,
-    pub(super) session_id: String,
-    pub(super) created_at: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingAskUserQuestionRow {
-    pub(super) request_id: String,
     pub(super) ordinal: i64,
     pub(super) section: String,
     pub(super) question: String,
     pub(super) multi_select: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PendingAskUserQuestionOptionRow {
-    pub(super) request_id: String,
     pub(super) question_ordinal: i64,
-    pub(super) option_ordinal: i64,
     pub(super) value: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ProfileMountRow {
-    pub(super) profile_id: String,
-    pub(super) ordinal: i64,
     pub(super) host_path: String,
     pub(super) container_path: String,
     pub(super) access: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct PermissionRequestMessageRow {
     pub(super) request_id: String,
     pub(super) mode: String,
     pub(super) script: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub(super) struct PermissionResponseMessageRow {
-    pub(super) request_id: String,
-    pub(super) approved: bool,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub(super) struct WorkspaceRequestMessageRow {
-    pub(super) request_id: String,
-    pub(super) path: String,
-    pub(super) reason: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub(super) struct WorkspaceResponseMessageRow {
-    pub(super) request_id: String,
-    pub(super) approved: bool,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AskUserRequestMessageRow {
     pub(super) message_id: i32,
     pub(super) request_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AskUserRequestQuestionRow {
     pub(super) message_id: i32,
     pub(super) ordinal: i64,
@@ -318,38 +290,14 @@ pub(super) struct AskUserRequestQuestionRow {
     pub(super) multi_select: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AskUserRequestQuestionOptionRow {
     pub(super) message_id: i32,
     pub(super) question_ordinal: i64,
-    pub(super) option_ordinal: i64,
     pub(super) value: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub(super) struct AskUserResponseMessageRow {
-    pub(super) message_id: i32,
-    pub(super) request_id: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub(super) struct AskUserResponseAnswerRow {
-    pub(super) message_id: i32,
-    pub(super) ordinal: i64,
-    pub(super) section: String,
-    pub(super) answer_kind: String,
-    pub(super) custom_text: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub(super) struct AskUserResponseSelectedOptionRow {
-    pub(super) message_id: i32,
-    pub(super) answer_ordinal: i64,
-    pub(super) option_ordinal: i64,
-    pub(super) value: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugSnapshotHeaderRow {
     pub(super) session_id: String,
     pub(super) timestamp: String,
@@ -358,35 +306,28 @@ pub(super) struct ContextDebugSnapshotHeaderRow {
     pub(super) prompt: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugPromptAttachmentRow {
-    pub(super) session_id: String,
-    pub(super) ordinal: i64,
     pub(super) url: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugMessageRow {
-    pub(super) session_id: String,
     pub(super) ordinal: i64,
     pub(super) role: String,
     pub(super) content: String,
     pub(super) tool_call_id: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugMessageAttachmentRow {
-    pub(super) session_id: String,
     pub(super) message_ordinal: i64,
-    pub(super) attachment_ordinal: i64,
     pub(super) url: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct ContextDebugMessageToolCallRow {
-    pub(super) session_id: String,
     pub(super) message_ordinal: i64,
-    pub(super) tool_call_ordinal: i64,
     pub(super) name: String,
 }
 
@@ -429,27 +370,37 @@ pub(super) struct DefaultProfile<'a> {
     pub(super) location_aware: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct SqliteTableInfoRow {
     pub(super) name: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct I32ValueRow {
     pub(super) value: i32,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub(super) struct StringValueRow {
+    pub(super) value: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct I64ValueRow {
     pub(super) value: i64,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub struct OptionalI64ValueRow {
+    pub value: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct BoolValueRow {
     pub(super) value: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AssistantCacheUsageSummaryRow {
     pub(super) assistant_message_count: i64,
     pub(super) cache_hit_message_count: i64,
@@ -458,29 +409,32 @@ pub(super) struct AssistantCacheUsageSummaryRow {
     pub(super) cache_write_tokens_total: i64,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct SessionIdRow {
     pub(super) session_id: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct StoredSessionContextSnapshotRow {
     pub(super) checkpoint_blob: Vec<u8>,
-    pub(super) history_message_count: i64,
+    pub(super) last_message_db_id: Option<i64>,
     pub(super) updated_at: String,
 }
 
 /// Parameters for upserting a persisted session context snapshot.
 pub struct SessionContextSnapshotUpsert {
     pub checkpoint: aither_agent::AgentCheckpoint,
-    pub history_message_count: usize,
+    /// The DB `messages.id` of the last message at snapshot time.
+    /// `None` means the snapshot was taken with an empty history.
+    pub last_message_db_id: Option<i64>,
 }
 
 /// Structured snapshot loaded from SQL-backed session context storage.
 #[derive(Debug, Clone)]
 pub struct StoredSessionContextSnapshot {
     pub checkpoint: aither_agent::AgentCheckpoint,
-    pub history_message_count: usize,
+    /// The DB `messages.id` of the last message at snapshot time.
+    pub last_message_db_id: Option<i64>,
     pub updated_at: String,
 }
 
@@ -509,12 +463,13 @@ pub struct UpdateScheduledTaskParams<'a> {
     pub script_inline: Option<Option<&'a str>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileEnvironmentKind {
     Local,
     Container,
-    Remote,
 }
 
 impl ProfileEnvironmentKind {
@@ -523,7 +478,6 @@ impl ProfileEnvironmentKind {
         match self {
             Self::Local => "local",
             Self::Container => "container",
-            Self::Remote => "remote",
         }
     }
 }
@@ -548,7 +502,10 @@ pub(super) fn parse_profile_environment(
     match value {
         "local" => Ok(ProfileEnvironmentKind::Local),
         "container" => Ok(ProfileEnvironmentKind::Container),
-        "remote" => Ok(ProfileEnvironmentKind::Remote),
+        "remote" => Err(ChatDbError::InvalidProfileEnvironment(
+            "remote is no longer a valid home environment; legacy rows should have been migrated to local"
+                .to_string(),
+        )),
         other => Err(ChatDbError::InvalidProfileEnvironment(other.to_string())),
     }
 }
@@ -593,9 +550,7 @@ pub(super) fn to_u64(value: i64, field: &str) -> Result<u64, ChatDbError> {
     u64::try_from(value).map_err(|error| conversion_error(field, &error))
 }
 
-pub(super) fn message_stats_params_from_chat_stats(
-    stats: &ChatMessageStats,
-) -> MessageStatsParams {
+pub(super) fn message_stats_params_from_chat_stats(stats: &ChatMessageStats) -> MessageStatsParams {
     MessageStatsParams {
         provider_id: stats.provider_id.clone(),
         prompt_tokens: stats.prompt_tokens,
@@ -643,21 +598,6 @@ pub(super) fn parse_attachment_kind(
     }
 }
 
-pub(super) fn parse_answer_value_kind(
-    kind: &str,
-    selected_values: Vec<String>,
-    custom_text: Option<String>,
-) -> Result<AnswerValue, ChatDbError> {
-    match kind {
-        "selected" => Ok(AnswerValue::Selected(selected_values)),
-        "custom" => Ok(AnswerValue::Custom(custom_text.unwrap_or_default())),
-        "skipped" => Ok(AnswerValue::Skipped),
-        other => Err(storage_error(format!(
-            "invalid ask-user answer kind: {other}"
-        ))),
-    }
-}
-
 pub(super) fn normalize_profile_preferences(
     environment: ProfileEnvironmentKind,
     preferences: Option<&ProfilePreferences>,
@@ -665,39 +605,17 @@ pub(super) fn normalize_profile_preferences(
     let mut preferences = preferences.cloned().unwrap_or_default();
     match environment {
         ProfileEnvironmentKind::Local => {
-            preferences.remote = None;
             preferences.container = None;
         }
-        ProfileEnvironmentKind::Remote => {
-            let remote = preferences.remote.ok_or_else(|| {
-                ChatDbError::InvalidProfileEnvironment(
-                    "remote profile requires preferences.remote.ssh_server_id".to_string(),
-                )
-            })?;
-            remote
-                .normalized_ssh_server_id()
-                .map_err(ChatDbError::InvalidProfileEnvironment)?;
-            preferences.remote = Some(remote);
-            preferences.container = None;
-        }
-        ProfileEnvironmentKind::Container => {
-            preferences.remote = None;
-        }
+        ProfileEnvironmentKind::Container => {}
     }
-    Ok((preferences.remote.is_some() || preferences.container.is_some()).then_some(preferences))
+    Ok(preferences.container.is_some().then_some(preferences))
 }
 
 pub(super) fn build_profile_preferences(
     model: &profiles::Model,
     mounts: Vec<ContainerMountPreference>,
 ) -> Option<ProfilePreferences> {
-    let remote =
-        model
-            .remote_ssh_server_id
-            .as_ref()
-            .map(|ssh_server_id| RemoteProfilePreferences {
-                ssh_server_id: ssh_server_id.clone(),
-            });
     let container = if model.container_dockerfile.is_some() || !mounts.is_empty() {
         Some(ContainerProfilePreferences {
             dockerfile: model.container_dockerfile.clone(),
@@ -706,5 +624,7 @@ pub(super) fn build_profile_preferences(
     } else {
         None
     };
-    (remote.is_some() || container.is_some()).then_some(ProfilePreferences { remote, container })
+    container
+        .is_some()
+        .then_some(ProfilePreferences { container })
 }

@@ -107,7 +107,11 @@ impl<K: RegisterKind> Tool for RegisterTool<K> {
     type Arguments = RegisterPathArgs;
     type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let broker = self.broker.as_ref().ok_or(RegisterToolError::Unavailable {
             tool_name: K::TOOL_NAME,
         })?;

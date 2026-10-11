@@ -4,8 +4,10 @@
 //! with session management, persistent chat history, and sandboxed execution.
 
 pub mod agent;
+pub mod auth_store;
 pub mod browser_service;
 pub mod bundle;
+pub mod chatgpt;
 pub mod config;
 pub mod container;
 pub mod copilot;
@@ -17,8 +19,9 @@ mod live_response;
 pub mod location;
 pub mod mcp;
 pub mod memory;
+pub mod model_selector;
 pub mod models;
-pub mod network_policy;
+pub use aither_sandbox::network_policy;
 pub mod notification;
 pub mod profile;
 pub mod prompt_mentions;
@@ -49,6 +52,7 @@ pub use config::MayConfig;
 pub use db::ChatDb;
 pub use heel::configure_heel_binary;
 pub use mcp::{MayMcpServerConfig, McpConfig, McpManager, McpServerInfo};
+pub use model_selector::{ModelSelector, ModelSelectorParseError};
 pub use profile::{HomeEnvironment, PinnedItem, ProfileEnvironment, ProfileInfo, ProfileSessions};
 pub use session::{
     ChatHistory, ChatMessage, MayHomePaths, MessageRole, ProfileHomePaths, Session, SessionId,

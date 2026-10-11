@@ -1,4 +1,5 @@
 mod tool_dispatch;
+mod turn_persister;
 
 use self::tool_dispatch::{
     handle_browser_request, handle_notify_request, handle_register_skills_request,
@@ -14,19 +15,17 @@ use skyzen::Result as SkyResult;
 use skyzen::responder::Sse;
 use skyzen::utils::{Json, State};
 
-use aither_agent::{BrowserBackend, StaticCdpBrowser};
-use aither_core::llm::{Message as LlmMessage, Role as LlmRole, ToolResult, Usage};
+use aither_core::llm::{
+    Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
+};
 use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{
-    BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec, Content, OutputEntry,
+    AnyContainerExec, BollardContainerExec, ContainerLaunchSpec, Content, OutputEntry,
     TERMINAL_STDIN_BLOCKED_NOTICE, TerminalResult,
 };
 
 use crate::agent::MayAgent;
-use crate::agent::browser_tool::BrowserToolError;
 use crate::ask_user;
-use crate::browser_service::persist_browser_page_capture;
-use crate::notification::{NotificationPayload, NotificationService};
 use crate::prompt_mentions;
 use crate::session::{
     ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths, MessageRole, PendingUserMessage,
@@ -38,12 +37,9 @@ use crate::ui_event_bus::UiEventTopics;
 
 use super::attachments::build_prompt_and_attachments;
 use super::browser::ensure_browser_runtime_started;
+use super::error::internal_error;
 use super::error_chain::error_chain_text;
-use super::error::{internal_error, json_ok_response, typed_error_response};
-use super::helpers::{
-    RETRY_BACKOFF_MS, append_history_message, elapsed_ms_saturating, load_session_paths,
-    send_event, truncate_preview,
-};
+use super::helpers::{RETRY_BACKOFF_MS, elapsed_ms_saturating, send_event, truncate_preview};
 use super::model_resolution::resolve_default_model;
 use super::state::{UiServerState, UiToolQueues};
 use super::terminal_parsing::{
@@ -51,10 +47,10 @@ use super::terminal_parsing::{
 };
 use super::title_generation;
 use super::types::{
-    ApiErrorCode, ApiMessage, ChatRequest, ChatResponse, PendingMessageKind,
-    RemovePendingMessageRequest, RequestLogEntry, RequestStats, SessionRuntimeResponse,
-    SseChunkEvent, SseDoneEvent, SseErrorEvent, SseStartEvent, SseTodoUpdateEvent, SseToolEndEvent,
-    SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
+    ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
+    RequestLogEntry, RequestStats, SessionRuntimeResponse, SseChunkEvent, SseDoneEvent,
+    SseErrorEvent, SsePingEvent, SseStartEvent, SseTodoUpdateEvent, SseToolDeltaEvent,
+    SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord, ToolVariant,
 };
 
 fn stopped_terminal_tool_result() -> ToolResult {
@@ -64,62 +60,223 @@ fn stopped_terminal_tool_result() -> ToolResult {
         exit_code: 130,
         task_id: None,
         status: Some("stopped".to_string()),
+        background_reason: None,
     })
     .expect("stopped terminal tool result must serialize")
+}
+
+fn persist_stopped_terminal_calls(
+    terminal_snapshot: &mut TerminalStateSnapshot,
+    turn_persister: &mut turn_persister::TurnPersister,
+) -> Result<(), crate::db::ChatDbError> {
+    let running_terminal_ids = terminal_snapshot
+        .running_by_call_id
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for call_id in running_terminal_ids {
+        let record = ToolEventRecord::End {
+            id: call_id.clone(),
+            name: "terminal".to_string(),
+            result: stopped_terminal_tool_result(),
+        };
+        let serialized = serde_json::to_string(&record)
+            .map_err(|error| crate::db::ChatDbError::Storage(error.to_string()))?;
+        turn_persister.push_tool_event(call_id, serialized);
+        update_terminal_snapshot_from_tool_event(terminal_snapshot, &record);
+    }
+    Ok(())
 }
 
 // ── ChatSink trait ──────────────────────────────────────────
 
 /// Abstraction over how chat events are delivered to the caller.
-/// `SseSink` streams events to the browser; `CollectSink` is a no-op
-/// (data is accumulated in the shared loop and returned as a result).
+///
+/// The stream protocol carries ordering metadata — `seq` (monotonic per
+/// turn, shared with pings) and `turn_id` (UUID-per-retry) — so the
+/// frontend can detect gaps and reconcile with history.
+///
+/// `SseSink` streams events to the browser with a running seq counter
+/// and a heartbeat task. `CollectSink` is a no-op used by internal
+/// follow-up dispatch when no client is attached.
 trait ChatSink {
     async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool;
     async fn on_text(&mut self, chunk: &str) -> bool;
     async fn on_reasoning(&mut self, chunk: &str) -> bool;
-    async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool;
+    async fn on_tool_delta(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments_fragment: &str,
+        summary: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool;
+    async fn on_tool_start(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        summary: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool;
     async fn on_tool_end(
         &mut self,
         id: &str,
         name: &str,
         arguments: Option<&str>,
         result: &ToolResult,
+        summary: crate::ui_server::tool_summary::ToolSummary,
     ) -> bool;
-    async fn on_todo_update(&mut self, event: &SseTodoUpdateEvent) -> bool;
-    async fn on_error(&mut self, message: &str) -> bool;
+    async fn on_todo_update(&mut self, checklist: &crate::todo_parser::TodoChecklist) -> bool;
+    async fn on_error(&mut self, code: ApiErrorCode, message: &str, retryable: bool) -> bool;
 }
 
-struct SseSink(skyzen::responder::sse::Sender);
+/// Shared seq counter — `AtomicU64` so the background heartbeat task
+/// can allocate its own `seq` values without racing the main loop.
+type SeqCounter = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+struct SseSink {
+    sender: skyzen::responder::sse::Sender,
+    seq: SeqCounter,
+    turn_id: String,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SseSink {
+    fn new(sender: skyzen::responder::sse::Sender) -> Self {
+        Self {
+            sender,
+            seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            turn_id: String::new(),
+            heartbeat: None,
+        }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn spawn_heartbeat(&mut self) {
+        if self.heartbeat.is_some() {
+            return;
+        }
+        let sender = self.sender.clone();
+        let seq = self.seq.clone();
+        let turn_id = self.turn_id.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the immediate first tick — we just sent the `start` event.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let event = SsePingEvent {
+                    seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    turn_id: turn_id.as_str(),
+                };
+                if !send_event(&sender, "ping", &event).await {
+                    break;
+                }
+            }
+        });
+        self.heartbeat = Some(handle);
+    }
+}
+
+impl Drop for SseSink {
+    fn drop(&mut self) {
+        if let Some(handle) = self.heartbeat.take() {
+            handle.abort();
+        }
+    }
+}
 
 impl ChatSink for SseSink {
     async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool {
+        self.turn_id.clear();
+        self.turn_id.push_str(assistant_id);
+        let event = SseStartEvent {
+            seq: self.next_seq(),
+            turn_id: &self.turn_id,
+            session_id,
+            assistant_id,
+        };
+        let ok = send_event(&self.sender, "start", &event).await;
+        if ok {
+            self.spawn_heartbeat();
+        }
+        ok
+    }
+
+    async fn on_text(&mut self, chunk: &str) -> bool {
+        let seq = self.next_seq();
         send_event(
-            &self.0,
-            "start",
-            &SseStartEvent {
-                session_id,
-                assistant_id,
+            &self.sender,
+            "text",
+            &SseChunkEvent {
+                seq,
+                turn_id: &self.turn_id,
+                chunk,
             },
         )
         .await
     }
 
-    async fn on_text(&mut self, chunk: &str) -> bool {
-        send_event(&self.0, "text", &SseChunkEvent { chunk }).await
-    }
-
     async fn on_reasoning(&mut self, chunk: &str) -> bool {
-        send_event(&self.0, "reasoning", &SseChunkEvent { chunk }).await
+        let seq = self.next_seq();
+        send_event(
+            &self.sender,
+            "reasoning",
+            &SseChunkEvent {
+                seq,
+                turn_id: &self.turn_id,
+                chunk,
+            },
+        )
+        .await
     }
 
-    async fn on_tool_start(&mut self, id: &str, name: &str, arguments: &str) -> bool {
+    async fn on_tool_delta(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments_fragment: &str,
+        summary: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
+        let seq = self.next_seq();
         send_event(
-            &self.0,
-            "tool_start",
-            &SseToolStartEvent {
+            &self.sender,
+            "tool_delta",
+            &SseToolDeltaEvent {
+                seq,
+                turn_id: &self.turn_id,
                 id,
                 name,
+                variant: ToolVariant::infer(name),
+                arguments_fragment,
+                summary,
+            },
+        )
+        .await
+    }
+
+    async fn on_tool_start(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        summary: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
+        let seq = self.next_seq();
+        send_event(
+            &self.sender,
+            "tool_start",
+            &SseToolStartEvent {
+                seq,
+                turn_id: &self.turn_id,
+                id,
+                name,
+                variant: ToolVariant::infer(name),
                 arguments,
+                summary,
             },
         )
         .await
@@ -131,30 +288,52 @@ impl ChatSink for SseSink {
         name: &str,
         arguments: Option<&str>,
         result: &ToolResult,
+        summary: crate::ui_server::tool_summary::ToolSummary,
     ) -> bool {
+        let seq = self.next_seq();
         send_event(
-            &self.0,
+            &self.sender,
             "tool_end",
             &SseToolEndEvent {
+                seq,
+                turn_id: &self.turn_id,
                 id,
                 name,
+                variant: ToolVariant::infer(name),
                 arguments,
                 result,
+                summary,
             },
         )
         .await
     }
 
-    async fn on_todo_update(&mut self, event: &SseTodoUpdateEvent) -> bool {
-        send_event(&self.0, "todo_update", event).await
+    async fn on_todo_update(&mut self, checklist: &crate::todo_parser::TodoChecklist) -> bool {
+        let seq = self.next_seq();
+        let event = SseTodoUpdateEvent::from_checklist(checklist, seq, self.turn_id.clone());
+        send_event(&self.sender, "todo_update", &event).await
     }
 
-    async fn on_error(&mut self, message: &str) -> bool {
-        send_event(&self.0, "error", &SseErrorEvent { message }).await
+    async fn on_error(&mut self, code: ApiErrorCode, message: &str, retryable: bool) -> bool {
+        let seq = self.next_seq();
+        send_event(
+            &self.sender,
+            "error",
+            &SseErrorEvent {
+                seq,
+                turn_id: &self.turn_id,
+                code,
+                message,
+                retryable,
+            },
+        )
+        .await
     }
 }
 
-/// No-op sink for non-streaming collect mode.
+/// No-op sink for internal follow-up runs where no client is attached.
+/// Events are still persisted via the main loop; the sink only suppresses
+/// network emission.
 struct CollectSink;
 
 impl ChatSink for CollectSink {
@@ -167,18 +346,224 @@ impl ChatSink for CollectSink {
     async fn on_reasoning(&mut self, _: &str) -> bool {
         true
     }
-    async fn on_tool_start(&mut self, _: &str, _: &str, _: &str) -> bool {
+    async fn on_tool_delta(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
         true
     }
-    async fn on_tool_end(&mut self, _: &str, _: &str, _: Option<&str>, _: &ToolResult) -> bool {
+    async fn on_tool_start(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
         true
     }
-    async fn on_todo_update(&mut self, _: &SseTodoUpdateEvent) -> bool {
+    async fn on_tool_end(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: &ToolResult,
+        _: crate::ui_server::tool_summary::ToolSummary,
+    ) -> bool {
         true
     }
-    async fn on_error(&mut self, _: &str) -> bool {
+    async fn on_todo_update(&mut self, _: &crate::todo_parser::TodoChecklist) -> bool {
         true
     }
+    async fn on_error(&mut self, _: ApiErrorCode, _: &str, _: bool) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PendingToolStream {
+    name: String,
+    buffered_arguments: String,
+    emitted_start_to_sink: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SinkToolEvent {
+    Start {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    Delta {
+        id: String,
+        name: String,
+        arguments_fragment: String,
+    },
+}
+
+/// Project the cumulative tool argument buffer into a structured summary.
+///
+/// We prefer the live `pending_tool_streams` buffer because it carries the
+/// authoritative cumulative state for delta-streamed tools. When that's
+/// missing (e.g. a `ToolCallStart`-only path that never went through
+/// deltas, or after the pending entry is reaped at tool end), `fallback`
+/// — typically the captured arguments string — fills in.
+fn project_tool_summary_for_sink(
+    pending_streams: &std::collections::HashMap<String, PendingToolStream>,
+    id: &str,
+    name: &str,
+    fallback: Option<&str>,
+) -> crate::ui_server::tool_summary::ToolSummary {
+    let raw = pending_streams
+        .get(id)
+        .map(|p| p.buffered_arguments.as_str())
+        .or(fallback)
+        .unwrap_or("");
+    crate::ui_server::tool_summary::project_tool_summary(raw, ToolVariant::infer(name))
+}
+
+fn normalize_tool_delta_for_sink(
+    pending_streams: &mut std::collections::HashMap<String, PendingToolStream>,
+    id: &str,
+    name: &str,
+    arguments_fragment: &str,
+) -> Option<SinkToolEvent> {
+    let pending = pending_streams.entry(id.to_string()).or_default();
+    if !name.is_empty() {
+        pending.name.clear();
+        pending.name.push_str(name);
+    }
+    let arguments_fragment =
+        merge_tool_arguments(&mut pending.buffered_arguments, arguments_fragment);
+
+    if pending.emitted_start_to_sink {
+        return Some(SinkToolEvent::Delta {
+            id: id.to_string(),
+            name: pending.name.clone(),
+            arguments_fragment,
+        });
+    }
+
+    pending.emitted_start_to_sink = true;
+    Some(SinkToolEvent::Start {
+        id: id.to_string(),
+        name: pending.name.clone(),
+        arguments: pending.buffered_arguments.clone(),
+    })
+}
+
+fn normalize_tool_start_for_sink(
+    pending_streams: &mut std::collections::HashMap<String, PendingToolStream>,
+    id: &str,
+    name: &str,
+    arguments: &str,
+) -> Option<SinkToolEvent> {
+    let pending = pending_streams.entry(id.to_string()).or_default();
+    let name_changed = !name.is_empty() && pending.name != name;
+    if !name.is_empty() {
+        pending.name.clear();
+        pending.name.push_str(name);
+    }
+
+    if pending.emitted_start_to_sink {
+        let arguments_fragment = merge_tool_arguments(&mut pending.buffered_arguments, arguments);
+        if arguments_fragment.is_empty() && !name_changed {
+            return None;
+        }
+        return Some(SinkToolEvent::Delta {
+            id: id.to_string(),
+            name: pending.name.clone(),
+            arguments_fragment,
+        });
+    }
+
+    pending.buffered_arguments.clear();
+    pending.buffered_arguments.push_str(arguments);
+    pending.emitted_start_to_sink = true;
+    Some(SinkToolEvent::Start {
+        id: id.to_string(),
+        name: pending.name.clone(),
+        arguments: arguments.to_string(),
+    })
+}
+
+fn merge_tool_arguments(buffered_arguments: &mut String, incoming: &str) -> String {
+    if incoming.is_empty() || incoming == buffered_arguments {
+        return String::new();
+    }
+
+    if incoming.starts_with(buffered_arguments.as_str()) {
+        let suffix = incoming[buffered_arguments.len()..].to_string();
+        buffered_arguments.push_str(suffix.as_str());
+        return suffix;
+    }
+
+    buffered_arguments.push_str(incoming);
+    incoming.to_string()
+}
+
+fn log_first_agent_event(
+    seen: &mut bool,
+    started_at: &Instant,
+    session_id: &str,
+    assistant_id: &str,
+    event_kind: &'static str,
+) {
+    if *seen {
+        return;
+    }
+    *seen = true;
+    tracing::info!(
+        session_id,
+        assistant_id,
+        event_kind,
+        elapsed_ms = elapsed_ms_saturating(started_at),
+        "chat stream first agent event"
+    );
+}
+
+fn log_first_visible_tool_event(
+    seen: &mut bool,
+    started_at: &Instant,
+    session_id: &str,
+    assistant_id: &str,
+    tool_id: &str,
+    tool_name: &str,
+    source: &'static str,
+) {
+    if *seen {
+        return;
+    }
+    *seen = true;
+    tracing::info!(
+        session_id,
+        assistant_id,
+        tool_id,
+        tool_name,
+        source,
+        elapsed_ms = elapsed_ms_saturating(started_at),
+        "chat stream first visible tool"
+    );
+}
+
+fn log_first_text_event(
+    seen: &mut bool,
+    started_at: &Instant,
+    session_id: &str,
+    assistant_id: &str,
+) {
+    if *seen {
+        return;
+    }
+    *seen = true;
+    tracing::info!(
+        session_id,
+        assistant_id,
+        elapsed_ms = elapsed_ms_saturating(started_at),
+        "chat stream first text"
+    );
 }
 
 /// Successful result from the shared agent loop.
@@ -368,7 +753,13 @@ async fn clear_running_state_if_needed(
     state
         .runtime_service
         .clear_running_if_needed(session_id)
-        .await
+        .await?;
+    // A chat turn persists its buffered messages before reaching this boundary.
+    // Refresh the profile snapshot only after the turn has settled so every UI
+    // client can invalidate its active-session history without racing the
+    // per-turn chat stream.
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+    Ok(())
 }
 
 async fn set_terminal_runtime_state(
@@ -464,6 +855,17 @@ pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String
     });
 }
 
+async fn spawn_follow_up_runs_if_dispatchable(
+    state: &Arc<UiServerState>,
+    session_id: &str,
+) -> Result<(), crate::db::ChatDbError> {
+    let runtime = state.runtime_service.get(session_id).await?;
+    if runtime.can_dispatch_follow_up() {
+        spawn_follow_up_runs(state.clone(), session_id.to_string());
+    }
+    Ok(())
+}
+
 pub(super) async fn resume_pending_follow_up_runs(
     state: Arc<UiServerState>,
 ) -> Result<(), crate::db::ChatDbError> {
@@ -474,7 +876,7 @@ pub(super) async fn resume_pending_follow_up_runs(
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, skyzen::ToSchema)]
 struct BrowserTakeoverAlertXml {
     #[serde(rename = "@type")]
     alert_type: String,
@@ -482,7 +884,7 @@ struct BrowserTakeoverAlertXml {
     instruction: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, skyzen::ToSchema)]
 struct ResumeWaitingTurnXml<'a> {
     #[serde(rename = "@type")]
     alert_type: &'a str,
@@ -491,7 +893,7 @@ struct ResumeWaitingTurnXml<'a> {
     instruction: &'a str,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ResumeRequestKind {
     Permission,
@@ -499,7 +901,7 @@ pub(super) enum ResumeRequestKind {
     Workspace,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ResumeResolution {
     Approved,
@@ -612,25 +1014,10 @@ async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) 
     state.notify_ui_events(UiEventTopics::REQUEST_LOGS);
 }
 
-pub(super) async fn chat(
-    Json(req): Json<ChatRequest>,
-    State(state): State<Arc<UiServerState>>,
-) -> SkyResult<skyzen::Response> {
-    let tokio_handle = state.tokio_handle.clone();
-    let result = tokio_handle
-        .spawn(async move { run_chat_collect(state, req).await })
-        .await
-        .map_err(|_| internal_error("chat task panicked before producing a response"))?;
-    match result {
-        Ok(response) => json_ok_response(&response),
-        Err(ChatCollectError::Preparation(error)) => Ok(typed_error_response(
-            error.status(),
-            error.api_code(),
-            error,
-        )),
-        Err(ChatCollectError::Sky(error)) => Err(error),
-    }
-}
+// NOTE: the public `POST /api/chat` non-streaming handler has been removed.
+// All client-facing chat interaction now flows through `POST /api/chat/stream`
+// so there is a single protocol path. `run_chat_collect_with_receiver` below is
+// kept for internal follow-up queue dispatch where no SSE client is attached.
 
 pub(super) async fn enqueue_chat(
     Json(req): Json<ChatRequest>,
@@ -692,8 +1079,10 @@ pub(super) async fn stop_session_run(
         .await
         .map_err(internal_error)?
     {
-        return Err(skyzen::Error::msg(format!("Session {session_id} not found"))
-            .set_status(skyzen::StatusCode::NOT_FOUND));
+        return Err(
+            skyzen::Error::msg(format!("Session {session_id} not found"))
+                .set_status(skyzen::StatusCode::NOT_FOUND),
+        );
     }
 
     let persisted_cancel = state
@@ -735,11 +1124,18 @@ pub(super) async fn chat_stream(
         if let Err(err) =
             stream_chat_events(state.clone(), req, sender.clone(), run_registration).await
         {
+            // Envelope-shaped error for an outer-level failure that bypassed
+            // the sink's own error pathway. `seq = 0` is reserved for events
+            // with no turn context (heartbeat analogue).
             send_event(
                 &sender,
                 "error",
                 &SseErrorEvent {
+                    seq: 0,
+                    turn_id: "",
+                    code: ApiErrorCode::InternalError,
                     message: &err.to_string(),
+                    retryable: false,
                 },
             )
             .await;
@@ -822,6 +1218,21 @@ async fn run_agent_loop(
     let mut turn_hidden_context_xml: Option<String> = None;
 
     loop {
+        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let assistant_id = format!("assistant-{assistant_uuid}");
+        let started_at = Instant::now();
+
+        if !sink.on_start(&req.session_id, &assistant_id).await {
+            return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
+        }
+        tracing::info!(
+            session_id = %req.session_id,
+            assistant_id = %assistant_id,
+            attempt,
+            elapsed_ms = elapsed_ms_saturating(&started_at),
+            "chat stream start sent"
+        );
+
         let PreparedAgent {
             session_id,
             mut agent,
@@ -843,10 +1254,21 @@ async fn run_agent_loop(
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _ = sink.on_error(&error.to_string()).await;
+                let _ = sink
+                    .on_error(error.api_code(), &error.to_string(), false)
+                    .await;
                 return Err(error.into());
             }
         };
+        tracing::info!(
+            session_id = %session_id,
+            assistant_id = %assistant_id,
+            model = %current_model,
+            provider_id = %provider_id,
+            attempt,
+            elapsed_ms = elapsed_ms_saturating(&started_at),
+            "chat agent prepared"
+        );
         if attempt == 0 {
             max_retries = provider_candidate_count.saturating_sub(1);
         }
@@ -857,9 +1279,6 @@ async fn run_agent_loop(
             lookup_model_info(&current_model).and_then(aither_models::ModelEntry::max_input_tokens)
         });
 
-        let assistant_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_id = format!("assistant-{assistant_uuid}");
-        let started_at = Instant::now();
         let mut usage = Usage::default();
         let mut segment_text = String::new(); // current text segment, flushed on tool calls
         let mut full_text = String::new(); // accumulated full assistant text
@@ -868,16 +1287,19 @@ async fn run_agent_loop(
         let mut saw_tool_activity = false;
         let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut pending_tool_streams: std::collections::HashMap<String, PendingToolStream> =
+            std::collections::HashMap::new();
         let mut last_todo_hash: Option<u64> = None;
-        let tasks_md_path = agent.sandbox_dir().join("tasks.md");
-
-        if !sink.on_start(&req.session_id, &assistant_id).await {
-            return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
-        }
+        let tasks_db = state.db();
+        let tasks_session_id = req.session_id.clone();
+        let mut turn_persister = turn_persister::TurnPersister::new(session_id.as_str());
 
         let mut terminal_error: Option<aither_agent::AgentError> = None;
         let mut cancellation_reason: Option<&'static str> = None;
         let mut browser_takeover_paused = false;
+        let mut first_agent_event_seen = false;
+        let mut first_visible_tool_seen = false;
+        let mut first_text_seen = false;
         {
             agent.sync_runtime_context().await;
             let mut stream = std::pin::pin!(agent.run_with_hidden_context(
@@ -904,6 +1326,13 @@ async fn run_agent_loop(
                 };
                 match event {
                     Ok(aither_agent::AgentEvent::Reasoning(text)) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "reasoning",
+                        );
                         reasoning_text.push_str(&text);
                         if !sink.on_reasoning(&text).await {
                             cancellation_reason =
@@ -912,6 +1341,19 @@ async fn run_agent_loop(
                         }
                     }
                     Ok(aither_agent::AgentEvent::Text(text)) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "text",
+                        );
+                        log_first_text_event(
+                            &mut first_text_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                        );
                         segment_text.push_str(&text);
                         full_text.push_str(&text);
                         if !sink.on_text(&text).await {
@@ -922,11 +1364,92 @@ async fn run_agent_loop(
                     Ok(aither_agent::AgentEvent::Usage(u)) => {
                         usage = u;
                     }
+                    Ok(aither_agent::AgentEvent::ToolCallDelta {
+                        id,
+                        name,
+                        arguments_fragment,
+                    }) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "tool_delta",
+                        );
+                        tracing::trace!(
+                            target: "may::chat::tool_delta",
+                            id = %id,
+                            name = %name,
+                            fragment = %arguments_fragment,
+                            "incoming ToolCallDelta from aither"
+                        );
+                        match normalize_tool_delta_for_sink(
+                            &mut pending_tool_streams,
+                            &id,
+                            &name,
+                            &arguments_fragment,
+                        ) {
+                            Some(SinkToolEvent::Start {
+                                id,
+                                name,
+                                arguments,
+                            }) => {
+                                log_first_visible_tool_event(
+                                    &mut first_visible_tool_seen,
+                                    &started_at,
+                                    session_id.as_str(),
+                                    assistant_id.as_str(),
+                                    id.as_str(),
+                                    name.as_str(),
+                                    "synthetic_start_from_delta",
+                                );
+                                let summary = project_tool_summary_for_sink(
+                                    &pending_tool_streams,
+                                    &id,
+                                    &name,
+                                    Some(arguments.as_str()),
+                                );
+                                if !sink.on_tool_start(&id, &name, &arguments, summary).await {
+                                    cancellation_reason =
+                                        Some("client disconnected during tool stream");
+                                    break;
+                                }
+                            }
+                            Some(SinkToolEvent::Delta {
+                                id,
+                                name,
+                                arguments_fragment,
+                            }) => {
+                                let summary = project_tool_summary_for_sink(
+                                    &pending_tool_streams,
+                                    &id,
+                                    &name,
+                                    None,
+                                );
+                                if !sink
+                                    .on_tool_delta(&id, &name, &arguments_fragment, summary)
+                                    .await
+                                {
+                                    cancellation_reason =
+                                        Some("client disconnected during tool stream");
+                                    break;
+                                }
+                            }
+                            None => {}
+                        }
+                    }
                     Ok(aither_agent::AgentEvent::ToolCallStart {
                         id,
                         name,
                         arguments,
                     }) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "tool_start",
+                        );
                         saw_tool_activity = true;
                         if matches!(
                             name.as_str(),
@@ -939,14 +1462,9 @@ async fn run_agent_loop(
                             )
                             .await?;
                         }
-                        // Flush accumulated text as a history message before the tool call.
+                        // Buffer accumulated text segment before the tool call.
                         if !segment_text.trim().is_empty() {
-                            append_history_message(
-                                state,
-                                &session_id,
-                                ChatMessage::assistant(segment_text.clone()),
-                            )
-                            .await?;
+                            turn_persister.push_assistant(segment_text.clone());
                             segment_text.clear();
                         }
 
@@ -955,22 +1473,51 @@ async fn run_agent_loop(
                             name: name.clone(),
                             arguments: arguments.clone(),
                         };
-                        if let Ok(serialized) = serde_json::to_string(&record) {
-                            append_history_message(
-                                state,
-                                &session_id,
-                                ChatMessage::tool(id.clone(), serialized),
-                            )
-                            .await?;
-                        }
+                        let serialized = serde_json::to_string(&record)
+                            .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
+                        turn_persister.push_tool_event(id.clone(), serialized);
                         update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                         tool_arguments_by_id.insert(id.clone(), arguments.clone());
-                        if !sink.on_tool_start(&id, &name, &arguments).await {
-                            cancellation_reason = Some("client disconnected during tool stream");
-                            break;
+                        if let Some(SinkToolEvent::Start {
+                            id,
+                            name,
+                            arguments,
+                        }) = normalize_tool_start_for_sink(
+                            &mut pending_tool_streams,
+                            &id,
+                            &name,
+                            &arguments,
+                        ) {
+                            log_first_visible_tool_event(
+                                &mut first_visible_tool_seen,
+                                &started_at,
+                                session_id.as_str(),
+                                assistant_id.as_str(),
+                                id.as_str(),
+                                name.as_str(),
+                                "canonical_start",
+                            );
+                            let summary = project_tool_summary_for_sink(
+                                &pending_tool_streams,
+                                &id,
+                                &name,
+                                Some(arguments.as_str()),
+                            );
+                            if !sink.on_tool_start(&id, &name, &arguments, summary).await {
+                                cancellation_reason =
+                                    Some("client disconnected during tool stream");
+                                break;
+                            }
                         }
                     }
                     Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
+                        log_first_agent_event(
+                            &mut first_agent_event_seen,
+                            &started_at,
+                            session_id.as_str(),
+                            assistant_id.as_str(),
+                            "tool_end",
+                        );
                         saw_tool_activity = true;
                         if name == "terminal" && result_waits_for_terminal_input(&result) {
                             set_session_runtime_state(
@@ -985,18 +1532,20 @@ async fn run_agent_loop(
                             name: name.clone(),
                             result: result.clone(),
                         };
-                        if let Ok(serialized) = serde_json::to_string(&record) {
-                            append_history_message(
-                                state,
-                                &session_id,
-                                ChatMessage::tool(id.clone(), serialized),
-                            )
-                            .await?;
-                        }
+                        let serialized = serde_json::to_string(&record)
+                            .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
+                        turn_persister.push_tool_event(id.clone(), serialized);
                         update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
                         let arguments = tool_arguments_by_id.remove(&id);
+                        let summary = project_tool_summary_for_sink(
+                            &pending_tool_streams,
+                            &id,
+                            &name,
+                            arguments.as_deref(),
+                        );
+                        pending_tool_streams.remove(&id);
                         if !sink
-                            .on_tool_end(&id, &name, arguments.as_deref(), &result)
+                            .on_tool_end(&id, &name, arguments.as_deref(), &result, summary)
                             .await
                         {
                             cancellation_reason = Some("client disconnected during tool stream");
@@ -1004,9 +1553,10 @@ async fn run_agent_loop(
                         }
 
                         // Check if tasks.md changed after tool execution.
-                        if let Some(event) =
-                            check_tasks_update(&tasks_md_path, &mut last_todo_hash).await
-                            && !sink.on_todo_update(&event).await
+                        if let Some(checklist) =
+                            check_tasks_update(&tasks_db, &tasks_session_id, &mut last_todo_hash)
+                                .await
+                            && !sink.on_todo_update(&checklist).await
                         {
                             cancellation_reason = Some("client disconnected during todo update");
                             break;
@@ -1016,6 +1566,7 @@ async fn run_agent_loop(
                         task_id,
                         output_preview,
                         output_file,
+                        reason,
                     }) => {
                         saw_tool_activity = true;
                         set_terminal_runtime_state(
@@ -1026,6 +1577,7 @@ async fn run_agent_loop(
                                 output_file: Some(output_file),
                                 output_preview: Some(output_preview),
                                 input_notice: None,
+                                background_reason: Some(reason),
                             },
                         )
                         .await?;
@@ -1075,6 +1627,15 @@ async fn run_agent_loop(
             }
         }
 
+        // Browser takeover may have cancelled the stream before another agent
+        // event arrived, so classify the terminal state once more after the
+        // loop. This turns the immediate cancellation into a resumable
+        // takeover pause and preserves the post-takeover system alert.
+        if !browser_takeover_paused && is_takeover_active_for_session(state, &session_id).await {
+            browser_takeover_paused = true;
+            cancellation_reason = None;
+        }
+
         let log_base = RequestLogEntry::new(
             session_id.as_str(),
             &current_model,
@@ -1087,24 +1648,20 @@ async fn run_agent_loop(
             const TAKEOVER_PAUSED_MESSAGE: &str =
                 "Browser takeover is active for this session; model execution paused";
 
+            persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
             if !segment_text.trim().is_empty() {
-                append_history_message(
-                    state,
-                    &session_id,
-                    ChatMessage::assistant(segment_text.clone()),
-                )
-                .await?;
+                turn_persister.push_assistant(segment_text.clone());
             }
-
-            clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
             let has_assistant_text = !full_text.trim().is_empty();
-            let has_terminal_output = !terminal_snapshot.executions.is_empty();
-            let has_tool_activity = has_terminal_output || saw_tool_activity;
+            let has_tool_activity = !terminal_snapshot.executions.is_empty() || saw_tool_activity;
             if !has_assistant_text && has_tool_activity {
-                append_history_message(state, &session_id, ChatMessage::assistant(String::new()))
-                    .await?;
+                turn_persister.push_assistant(String::new());
             }
+
+            // Flush the entire turn atomically
+            turn_persister.flush(&state.db()).await?;
+            clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
             record_request_log(
                 state,
@@ -1142,42 +1699,27 @@ async fn run_agent_loop(
                 log_base.failure(elapsed_ms_saturating(&started_at), &err_msg),
             )
             .await;
-            let _ = sink.on_error(&err_msg).await;
+            let _ = sink
+                .on_error(ApiErrorCode::InternalError, &err_msg, false)
+                .await;
             return Err(err.into());
         }
 
         if let Some(reason) = cancellation_reason {
             if reason == "run cancelled by user" {
-                let running_terminal_ids = terminal_snapshot
-                    .running_by_call_id
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for call_id in running_terminal_ids {
-                    let record = ToolEventRecord::End {
-                        id: call_id.clone(),
-                        name: "terminal".to_string(),
-                        result: stopped_terminal_tool_result(),
-                    };
-                    if let Ok(serialized) = serde_json::to_string(&record) {
-                        append_history_message(
-                            state,
-                            &session_id,
-                            ChatMessage::tool(call_id, serialized),
-                        )
-                        .await?;
-                    }
-                    update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
-                }
+                let killed = agent.kill_running_terminal_jobs().await;
+                tracing::info!(
+                    session_id = %session_id,
+                    killed,
+                    "stopped terminal jobs after user cancelled the run"
+                );
+                persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
             }
             if !segment_text.trim().is_empty() {
-                append_history_message(
-                    state,
-                    &session_id,
-                    ChatMessage::assistant(segment_text.clone()),
-                )
-                .await?;
+                turn_persister.push_assistant(segment_text.clone());
             }
+            // Flush the entire turn atomically before returning
+            turn_persister.flush(&state.db()).await?;
             record_request_log(
                 state,
                 log_base.failure(elapsed_ms_saturating(&started_at), reason),
@@ -1186,20 +1728,12 @@ async fn run_agent_loop(
             return Err(AgentLoopError::Cancelled(reason));
         }
 
-        // Flush remaining text segment to history.
+        // Buffer remaining text segment.
         if !segment_text.trim().is_empty() {
-            append_history_message(
-                state,
-                &session_id,
-                ChatMessage::assistant(segment_text.clone()),
-            )
-            .await?;
+            turn_persister.push_assistant(segment_text.clone());
         }
 
-        clear_terminal_runtime_state(state, session_id.as_str()).await?;
-
         let has_assistant_text = !full_text.trim().is_empty();
-
         let has_terminal_output = !terminal_snapshot.executions.is_empty();
         let has_tool_activity = has_terminal_output || saw_tool_activity;
         if !has_assistant_text && !has_tool_activity {
@@ -1209,13 +1743,16 @@ async fn run_agent_loop(
                 log_base.failure(elapsed_ms_saturating(&started_at), err),
             )
             .await;
-            let _ = sink.on_error(err).await;
+            let _ = sink.on_error(ApiErrorCode::InternalError, err, false).await;
             return Err(AgentLoopError::EmptyAssistantResponse);
         }
         if !has_assistant_text && has_tool_activity {
-            append_history_message(state, &session_id, ChatMessage::assistant(String::new()))
-                .await?;
+            turn_persister.push_assistant(String::new());
         }
+
+        // Flush the entire turn atomically
+        turn_persister.flush(&state.db()).await?;
+        clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
         let elapsed_ms = elapsed_ms_saturating(&started_at);
         persist_latest_assistant_stats(
@@ -1254,7 +1791,7 @@ async fn stream_chat_events(
     run_registration: SessionRunRegistration,
 ) -> Result<(), crate::db::ChatDbError> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
-    let mut sink = SseSink(sender.clone());
+    let mut sink = SseSink::new(sender.clone());
     let result = run_agent_loop(
         &state,
         &req,
@@ -1268,6 +1805,8 @@ async fn stream_chat_events(
     match result {
         Ok(result) => {
             let done_event = SseDoneEvent {
+                seq: sink.next_seq(),
+                turn_id: sink.turn_id.clone(),
                 session_id: response_session_id.clone(),
                 assistant: api_message_from_run_result(result),
             };
@@ -1279,12 +1818,15 @@ async fn stream_chat_events(
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
             let done_event = SseDoneEvent {
+                seq: sink.next_seq(),
+                turn_id: sink.turn_id.clone(),
                 session_id: response_session_id.clone(),
                 assistant: api_message_from_run_result(result),
             };
             send_event(&sender, "paused", &done_event).await;
             run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
+            spawn_follow_up_runs_if_dispatchable(&state, &response_session_id).await?;
             Ok(())
         }
         // Errors are already sent to the sink via on_error in run_agent_loop.
@@ -1296,42 +1838,17 @@ async fn stream_chat_events(
     }
 }
 
-async fn run_chat_collect_with_persistence(
-    state: Arc<UiServerState>,
-    req: ChatRequest,
-    persist_user_message: bool,
-    use_persisted_context_snapshot: bool,
-) -> Result<ChatResponse, ChatCollectError> {
-    let Some(run_registration) =
-        SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await
-    else {
-        return Err(ChatCollectError::Sky(active_session_conflict_error()));
-    };
-    let response = run_chat_collect_with_receiver(
-        state.clone(),
-        req.clone(),
-        persist_user_message,
-        use_persisted_context_snapshot,
-        run_registration.receiver(),
-    )
-    .await;
-    run_registration.close().await;
-    match response {
-        Ok(response) => {
-            spawn_follow_up_runs(state.clone(), req.session_id.clone());
-            Ok(response)
-        }
-        Err(error) => Err(error),
-    }
-}
-
+/// Drive a chat turn without an attached SSE client — used by the follow-up
+/// queue to dispatch server-side enqueued messages. All assistant text and
+/// tool events are still persisted by the main loop; the sink only
+/// suppresses network emission.
 async fn run_chat_collect_with_receiver(
     state: Arc<UiServerState>,
     req: ChatRequest,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
     cancel_rx: &async_channel::Receiver<()>,
-) -> Result<ChatResponse, ChatCollectError> {
+) -> Result<(), ChatCollectError> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running)
         .await
         .map_err(internal_error)
@@ -1346,46 +1863,22 @@ async fn run_chat_collect_with_receiver(
         use_persisted_context_snapshot,
     )
     .await;
-    match result {
-        Ok(result) => {
-            clear_running_state_if_needed(&state, &req.session_id)
-                .await
-                .map_err(internal_error)
-                .map_err(ChatCollectError::from)?;
-
-            Ok(ChatResponse {
-                session_id: req.session_id,
-                assistant: api_message_from_run_result(result),
-            })
-        }
-        Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
-            clear_running_state_if_needed(&state, &req.session_id)
-                .await
-                .map_err(internal_error)
-                .map_err(ChatCollectError::from)?;
-            Ok(ChatResponse {
-                session_id: req.session_id,
-                assistant: api_message_from_run_result(result),
-            })
-        }
-        Err(error) => {
-            clear_running_state_if_needed(&state, &req.session_id)
-                .await
-                .map_err(internal_error)
-                .map_err(ChatCollectError::from)?;
-            match error {
-                AgentLoopError::Preparation(error) => Err(ChatCollectError::Preparation(error)),
-                other => Err(ChatCollectError::Sky(internal_error(other))),
-            }
-        }
+    let takeover_paused = matches!(&result, Err(AgentLoopError::BrowserTakeoverPaused(_)));
+    clear_running_state_if_needed(&state, &req.session_id)
+        .await
+        .map_err(internal_error)
+        .map_err(ChatCollectError::from)?;
+    if takeover_paused {
+        spawn_follow_up_runs_if_dispatchable(&state, &req.session_id)
+            .await
+            .map_err(internal_error)
+            .map_err(ChatCollectError::from)?;
     }
-}
-
-async fn run_chat_collect(
-    state: Arc<UiServerState>,
-    req: ChatRequest,
-) -> Result<ChatResponse, ChatCollectError> {
-    run_chat_collect_with_persistence(state, req, true, true).await
+    match result {
+        Ok(_) | Err(AgentLoopError::BrowserTakeoverPaused(_)) => Ok(()),
+        Err(AgentLoopError::Preparation(error)) => Err(ChatCollectError::Preparation(error)),
+        Err(other) => Err(ChatCollectError::Sky(internal_error(other))),
+    }
 }
 
 async fn schedule_profile_memory_processing(state: &Arc<UiServerState>, profile_id: Option<&str>) {
@@ -1446,7 +1939,7 @@ fn map_context_debug_message(message: &LlmMessage) -> crate::db::ContextDebugSna
         attachments: message
             .attachments()
             .iter()
-            .map(url::Url::to_string)
+            .map(|attachment| attachment.url().to_string())
             .collect(),
         tool_call_id: message.tool_call_id().map(ToString::to_string),
         tool_call_names: message
@@ -1463,12 +1956,12 @@ async fn persist_context_debug_snapshot(
     model: &str,
     provider_id: &str,
     prompt: &str,
-    prompt_attachments: &[url::Url],
+    prompt_attachments: &[LlmAttachment],
     assembled_messages: &[LlmMessage],
 ) -> Result<(), crate::db::ChatDbError> {
     let prompt_attachments = prompt_attachments
         .iter()
-        .map(url::Url::to_string)
+        .map(|attachment| attachment.url().to_string())
         .collect::<Vec<_>>();
     let assembled_messages = assembled_messages
         .iter()
@@ -1530,6 +2023,7 @@ struct SessionContext {
     profile_environment: Option<crate::profile::ProfileEnvironment>,
     profile_id: Option<String>,
     plan_state: crate::session::SessionPlanState,
+    reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
 }
 
 struct PreparedAgent {
@@ -1540,7 +2034,7 @@ struct PreparedAgent {
     profile_id: Option<String>,
     hidden_context_xml: Option<String>,
     prompt: String,
-    attachments: Vec<url::Url>,
+    attachments: Vec<LlmAttachment>,
     provider_candidate_count: usize,
 }
 
@@ -1578,6 +2072,8 @@ enum UiChatPreparationError {
     LoadRuntime(#[source] crate::db::ChatDbError),
     #[error("failed to load session context snapshot: {0}")]
     LoadContextSnapshot(#[source] crate::db::ChatDbError),
+    #[error("failed to replay session history: {0}")]
+    HistoryReplay(#[source] crate::session::HistoryReplayError),
     #[error("failed to serialize browser takeover alert: {0}")]
     BuildTakeoverAlert(#[source] ChatMarkupError),
     #[error("failed to build session mentions: {0}")]
@@ -1608,18 +2104,12 @@ enum UiChatPreparationError {
     EnsureContainerImage(#[source] crate::container::ContainerError),
     #[error("container start failed: {0}")]
     StartContainer(#[source] crate::container::ContainerError),
-    #[error("remote profile model is missing")]
-    MissingRemoteProfileModel,
-    #[error("{0}")]
-    ResolveRemoteServer(String),
     #[error("location fetch failed: {0}")]
     LoadLocation(#[source] crate::location::LocationError),
     #[error("failed to create agent: {0}")]
     BuildAgent(#[from] crate::agent::MayAgentError),
     #[error("failed to restore agent checkpoint: {0}")]
     RestoreCheckpoint(#[source] aither_agent::AgentError),
-    #[error("failed to apply history delta after restored checkpoint: {0}")]
-    ApplyHistoryDelta(#[source] crate::session::HistoryDeltaError),
     #[error("failed to build prompt attachments: {0}")]
     BuildPrompt(skyzen::Error),
     #[error("failed to persist context debug snapshot: {0}")]
@@ -1635,8 +2125,6 @@ impl UiChatPreparationError {
             Self::NoProviderAvailable { .. } => ApiErrorCode::ProviderUnavailable,
             Self::InvalidFileMentionPath(_) => ApiErrorCode::BadRequest,
             Self::MissingContainerProfileModel
-            | Self::MissingRemoteProfileModel
-            | Self::ResolveRemoteServer(_)
             | Self::ParseProfileEnvironment(_)
             | Self::InvalidContainerImageTag(_)
             | Self::InvalidContainerProfileConfiguration(_)
@@ -1662,54 +2150,15 @@ impl UiChatPreparationError {
             | Self::ReconcileContainerLayout(_)
             | Self::BuildAgent(_)
             | Self::RestoreCheckpoint(_)
-            | Self::ApplyHistoryDelta(_)
             | Self::BuildPrompt(_)
-            | Self::PersistContextDebugSnapshot(_) => ApiErrorCode::InternalError,
-        }
-    }
-
-    fn status(&self) -> skyzen::StatusCode {
-        match self {
-            Self::BrowserTakeoverActive => skyzen::StatusCode::CONFLICT,
-            Self::SessionNotFound(_) => skyzen::StatusCode::NOT_FOUND,
-            Self::MissingModelConfiguration
-            | Self::NoProviderAvailable { .. }
-            | Self::InvalidFileMentionPath(_)
-            | Self::MissingContainerProfileModel
-            | Self::MissingRemoteProfileModel
-            | Self::ResolveRemoteServer(_)
-            | Self::ParseProfileEnvironment(_)
-            | Self::InvalidContainerImageTag(_)
-            | Self::InvalidContainerProfileConfiguration(_)
-            | Self::InvalidContainerMountConfiguration(_)
-            | Self::ResolveContainerRuntime(_)
-            | Self::EnsureContainerImage(_)
-            | Self::StartContainer(_)
-            | Self::LoadLocation(_) => skyzen::StatusCode::BAD_REQUEST,
-            Self::LoadSession(_)
-            | Self::LoadHistory(_)
-            | Self::LoadProfile(_)
-            | Self::LoadProfileMemories(_)
-            | Self::LoadRuntime(_)
-            | Self::LoadContextSnapshot(_)
-            | Self::BuildTakeoverAlert(_)
-            | Self::BuildSessionMentions(_)
-            | Self::BuildFileMentions(_)
-            | Self::UpdateSessionTitle(_)
-            | Self::AppendUserMessage(_)
-            | Self::PersistHiddenContext(_)
-            | Self::ReconcileContainerLayout(_)
-            | Self::BuildAgent(_)
-            | Self::RestoreCheckpoint(_)
-            | Self::ApplyHistoryDelta(_)
-            | Self::BuildPrompt(_)
-            | Self::PersistContextDebugSnapshot(_) => skyzen::StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::PersistContextDebugSnapshot(_)
+            | Self::HistoryReplay(_) => ApiErrorCode::InternalError,
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ChatMarkupError {
+pub(super) enum ChatMarkupError {
     #[error("failed to serialize XML fragment: {0}")]
     Serialize(#[source] quick_xml::SeError),
     #[error("failed to parse XML fragment: {0}")]
@@ -1835,7 +2284,9 @@ async fn resolve_session_context(
         .map_err(UiChatPreparationError::LoadRuntime)?
         .unwrap_or_default();
 
-    let history_messages = history.to_aither_messages();
+    let history_messages = history
+        .to_aither_messages()
+        .map_err(UiChatPreparationError::HistoryReplay)?;
     let context_snapshot = if use_persisted_context_snapshot {
         db.get_session_context_snapshot(session_id.as_str())
             .await
@@ -1925,7 +2376,7 @@ async fn resolve_session_context(
         let needs_title = session.title.is_none();
         if needs_title {
             let title = truncate_preview(&req.content);
-            db.update_session(session_id.as_str(), Some(title.as_str()), None)
+            db.update_session(session_id.as_str(), Some(title.as_str()), None, None)
                 .await
                 .map_err(UiChatPreparationError::UpdateSessionTitle)?;
             state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
@@ -1937,6 +2388,11 @@ async fn resolve_session_context(
 
     let sandbox_dir = SessionStore::new(MayHomePaths::new(state.may_dir.clone()))
         .sandbox_dir(session_id.as_str(), session.profile_id.as_deref());
+
+    let reasoning_effort = session
+        .reasoning_effort
+        .as_deref()
+        .and_then(parse_reasoning_effort_token);
 
     Ok(SessionContext {
         session_id,
@@ -1953,7 +2409,18 @@ async fn resolve_session_context(
         profile_environment,
         profile_id: session.profile_id,
         plan_state: runtime.plan_state,
+        reasoning_effort,
     })
+}
+
+fn parse_reasoning_effort_token(token: &str) -> Option<aither_core::llm::model::ReasoningEffort> {
+    use aither_core::llm::model::ReasoningEffort;
+    match token.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        _ => None,
+    }
 }
 
 fn session_paths_for_session(
@@ -2066,9 +2533,7 @@ async fn setup_agent_environment(
             let host_gateway = container_manager.runtime().host_gateway();
 
             let mut extra_env = Vec::new();
-            let browser_backend: Option<Arc<dyn BrowserBackend>> = if let Some(bm) =
-                state.browser_manager()
-            {
+            let browser_cdp_endpoint: Option<String> = if let Some(bm) = state.browser_manager() {
                 if let Err(error) = ensure_browser_runtime_started(state.as_ref()).await {
                     tracing::warn!(
                         error = %error_chain_text(&error),
@@ -2087,7 +2552,7 @@ async fn setup_agent_environment(
                         })
                     };
                     extra_env.push(format!("BROWSER_CDP_ENDPOINT={endpoint}"));
-                    Some(Arc::new(StaticCdpBrowser::new(endpoint)))
+                    Some(endpoint)
                 }
             } else {
                 None
@@ -2112,7 +2577,7 @@ async fn setup_agent_environment(
 
             let container_ipc_host = host_gateway.to_string();
             let container_exec =
-                ContainerExecHandle::new(std::sync::Arc::new(BollardContainerExec::new(
+                AnyContainerExec::new(std::sync::Arc::new(BollardContainerExec::new(
                     std::sync::Arc::new(container_manager.runtime().client.clone()),
                 )));
 
@@ -2120,19 +2585,8 @@ async fn setup_agent_environment(
                 container_id,
                 container_ipc_host,
                 container_exec,
-                browser_backend,
+                browser_cdp_endpoint,
             }
-        }
-        Some(crate::profile::ProfileEnvironment::Remote { .. }) => {
-            let profile = ctx
-                .profile_model
-                .as_ref()
-                .ok_or(UiChatPreparationError::MissingRemoteProfileModel)?;
-            let config = state.config_snapshot();
-            let ssh_server =
-                crate::profile::remote::resolve_remote_profile_server(profile, &config.ssh_servers)
-                    .map_err(UiChatPreparationError::ResolveRemoteServer)?;
-            crate::agent::AgentEnvironment::Remote { ssh_server }
         }
         _ => crate::agent::AgentEnvironment::Local,
     };
@@ -2234,8 +2688,9 @@ async fn prepare_agent_for_request(
         ctx.session_id.clone(),
         brokers.workspace,
         brokers.ask_user,
+        state.db(),
         &ctx.current_model,
-        None,
+        ctx.reasoning_effort,
         ctx.profile_id.clone(),
         Some(
             state
@@ -2258,16 +2713,41 @@ async fn prepare_agent_for_request(
     .map_err(UiChatPreparationError::BuildAgent)?;
 
     if let Some(snapshot) = ctx.context_snapshot.as_ref() {
-        agent
-            .restore_checkpoint(snapshot.checkpoint.clone())
-            .map_err(UiChatPreparationError::RestoreCheckpoint)?;
-        for message in crate::session::history_delta_since_snapshot(
+        // Try to restore from checkpoint with ID-based delta.
+        // If the snapshot anchor is stale, fall back to full history replay.
+        let db_messages = state
+            .db()
+            .get_messages(ctx.session_id.as_str())
+            .await
+            .map_err(UiChatPreparationError::LoadSession)?;
+        let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
+        match crate::session::history_delta_since_snapshot(
             &ctx.history_messages,
-            snapshot.history_message_count,
-        )
-        .map_err(UiChatPreparationError::ApplyHistoryDelta)?
-        {
-            agent.push_message(message);
+            &db_ids,
+            snapshot.last_message_db_id,
+        ) {
+            Some(delta) => {
+                agent
+                    .restore_checkpoint(snapshot.checkpoint.clone())
+                    .map_err(UiChatPreparationError::RestoreCheckpoint)?;
+                for message in delta {
+                    agent.push_message(message);
+                }
+            }
+            None => {
+                tracing::warn!(
+                    session_id = %ctx.session_id.as_str(),
+                    "context snapshot anchor is stale, falling back to full history replay"
+                );
+                // Delete the stale snapshot so future requests don't hit this path
+                let _ = state
+                    .db()
+                    .delete_session_context_snapshot(ctx.session_id.as_str())
+                    .await;
+                for message in &ctx.history_messages {
+                    agent.push_message(message.clone());
+                }
+            }
         }
     } else {
         for message in ctx.history_messages {
@@ -2312,14 +2792,16 @@ async fn prepare_agent_for_request(
     })
 }
 
-/// Read tasks.md and return an SSE event if its content changed since the last check.
+/// Read tasks.md and return the parsed checklist if its content changed since the last check.
+/// The sink is responsible for wrapping it in the SSE envelope with seq/turn_id.
 async fn check_tasks_update(
-    path: &std::path::Path,
+    db: &crate::db::ChatDb,
+    session_id: &str,
     last_hash: &mut Option<u64>,
-) -> Option<SseTodoUpdateEvent> {
+) -> Option<crate::todo_parser::TodoChecklist> {
     use std::hash::{Hash, Hasher};
 
-    let content = async_fs::read_to_string(path).await.ok()?;
+    let content = db.get_session_tasks(session_id).await.ok()??;
     let mut hasher = std::hash::DefaultHasher::new();
     content.hash(&mut hasher);
     let hash = hasher.finish();
@@ -2333,7 +2815,7 @@ async fn check_tasks_update(
     if checklist.is_empty() {
         return None;
     }
-    Some(SseTodoUpdateEvent::from(&checklist))
+    Some(checklist)
 }
 
 async fn is_takeover_active_for_session(state: &UiServerState, session_id: &SessionId) -> bool {
@@ -2364,43 +2846,49 @@ async fn take_over_alert_pending(state: &UiServerState, session_id: &SessionId) 
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use aither_core::llm::Message as LlmMessage;
+    use std::collections::HashMap;
 
     #[test]
-    fn history_delta_since_snapshot_returns_suffix_after_anchor() {
+    fn history_delta_since_snapshot_returns_suffix_after_anchor_id() {
         let history = vec![
             LlmMessage::system("memory"),
             LlmMessage::user("first"),
             LlmMessage::assistant("second"),
         ];
+        let db_ids = vec![10, 20, 30];
 
-        let delta = crate::session::history_delta_since_snapshot(&history, 2)
-            .expect("anchor must be valid");
+        let delta = crate::session::history_delta_since_snapshot(&history, &db_ids, Some(20))
+            .expect("anchor should be valid");
         assert_eq!(delta, vec![LlmMessage::assistant("second")]);
     }
 
     #[test]
-    fn history_delta_since_snapshot_rejects_out_of_bounds_anchor() {
+    fn history_delta_since_snapshot_returns_none_for_stale_anchor() {
         let history = vec![LlmMessage::user("only")];
-        let error = crate::session::history_delta_since_snapshot(&history, 2)
-            .expect_err("invalid anchor must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("persisted context snapshot anchor exceeds available history")
-        );
+        let db_ids = vec![10];
+        // Anchor 999 does not exist among message IDs
+        let result = crate::session::history_delta_since_snapshot(&history, &db_ids, Some(999));
+        assert!(result.is_none(), "stale anchor should return None");
     }
 
     #[test]
-    fn parse_persisted_context_snapshot_reads_history_message_count() {
+    fn history_delta_since_snapshot_empty_anchor_replays_all() {
+        let history = vec![LlmMessage::user("a"), LlmMessage::assistant("b")];
+        let db_ids = vec![1, 2];
+        let delta = crate::session::history_delta_since_snapshot(&history, &db_ids, None)
+            .expect("None anchor replays all");
+        assert_eq!(delta.len(), 2);
+    }
+
+    #[test]
+    fn parse_persisted_context_snapshot_reads_last_message_db_id() {
         let snapshot = crate::session::parse_persisted_context_snapshot(
             crate::db::StoredSessionContextSnapshot {
                 checkpoint: aither_agent::AgentCheckpoint {
                     context: aither_agent::ContextCheckpoint::new(None, Vec::new()),
-                    todo_items: Vec::new(),
                     tool_surface_hash: "abc123".to_string(),
                     context_window: aither_agent::ContextWindowSnapshot {
                         phase: aither_agent::ContextWindowPhase::Stable,
@@ -2419,12 +2907,248 @@ mod tests {
                     },
                     has_background_tasks: false,
                 },
-                history_message_count: 7,
+                last_message_db_id: Some(42),
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
             },
         );
 
-        assert_eq!(snapshot.history_message_count, 7);
+        assert_eq!(snapshot.last_message_db_id, Some(42));
         assert!(snapshot.checkpoint.context.is_empty());
+    }
+
+    /// aither's OpenAI adapter emits `ToolCallDelta` where `arguments_fragment`
+    /// is the CUMULATIVE argument string so far (see `aither/openai/src/client.rs`
+    /// line 1099–1104). `normalize_tool_delta_for_sink` MUST decompose these
+    /// cumulative snapshots into true incremental suffixes so the frontend can
+    /// concatenate them into valid JSON. A regression here would drop the
+    /// opening `{"` and break every tool summary.
+    #[test]
+    fn cumulative_tool_deltas_decompose_into_incremental_suffixes() {
+        let mut pending = HashMap::new();
+
+        // OutputItemAdded fires an initial empty delta — becomes Start(args="").
+        let e1 = super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "terminal", "");
+        assert_eq!(
+            e1,
+            Some(super::SinkToolEvent::Start {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments: String::new(),
+            })
+        );
+
+        // First real cumulative snapshot carries `{"description`.
+        let e2 = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"description",
+        );
+        assert_eq!(
+            e2,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "{\"description".to_string(),
+            })
+        );
+
+        // Next cumulative: previous prefix is extended — emit only the suffix.
+        let e3 = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"description\":\"Get",
+        );
+        assert_eq!(
+            e3,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "\":\"Get".to_string(),
+            })
+        );
+
+        // Re-sending the same cumulative string is a no-op (empty fragment).
+        let e4 = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"description\":\"Get",
+        );
+        assert_eq!(
+            e4,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn first_tool_delta_emits_synthetic_start_then_later_deltas_stream_normally() {
+        let mut pending = HashMap::new();
+
+        let first = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date",
+        );
+        assert_eq!(
+            first,
+            Some(super::SinkToolEvent::Start {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments: "{\"command\":\"date".to_string(),
+            })
+        );
+
+        let second = super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "", "\"}");
+        assert_eq!(
+            second,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "\"}".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn arguments_only_tool_delta_emits_placeholder_start_immediately() {
+        let mut pending = HashMap::new();
+
+        let first =
+            super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "", "{\"command\":\"date");
+        assert_eq!(
+            first,
+            Some(super::SinkToolEvent::Start {
+                id: "tool-1".to_string(),
+                name: String::new(),
+                arguments: "{\"command\":\"date".to_string(),
+            })
+        );
+
+        let named = super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "terminal", "\"}");
+        assert_eq!(
+            named,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "\"}".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn canonical_tool_start_updates_placeholder_name_after_synthetic_start() {
+        let mut pending = HashMap::new();
+        let first = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "",
+            "{\"command\":\"date\"}",
+        );
+        assert!(matches!(first, Some(super::SinkToolEvent::Start { .. })));
+
+        let canonical = super::normalize_tool_start_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date\"}",
+        );
+        assert_eq!(
+            canonical,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn accumulated_argument_snapshots_are_emitted_as_suffixes() {
+        let mut pending = HashMap::new();
+
+        let first = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"",
+        );
+        assert!(matches!(first, Some(super::SinkToolEvent::Start { .. })));
+
+        let second = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date",
+        );
+        assert_eq!(
+            second,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: "date".to_string(),
+            })
+        );
+
+        let duplicate = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date",
+        );
+        assert_eq!(
+            duplicate,
+            Some(super::SinkToolEvent::Delta {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments_fragment: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn canonical_tool_start_is_suppressed_after_synthetic_start() {
+        let mut pending = HashMap::new();
+        let first = super::normalize_tool_delta_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date\"}",
+        );
+        assert!(matches!(first, Some(super::SinkToolEvent::Start { .. })));
+
+        let canonical = super::normalize_tool_start_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date\"}",
+        );
+        assert_eq!(canonical, None);
+    }
+
+    #[test]
+    fn canonical_tool_start_emits_when_no_delta_arrived_first() {
+        let mut pending = HashMap::new();
+
+        let start = super::normalize_tool_start_for_sink(
+            &mut pending,
+            "tool-1",
+            "terminal",
+            "{\"command\":\"date\"}",
+        );
+        assert_eq!(
+            start,
+            Some(super::SinkToolEvent::Start {
+                id: "tool-1".to_string(),
+                name: "terminal".to_string(),
+                arguments: "{\"command\":\"date\"}".to_string(),
+            })
+        );
     }
 }

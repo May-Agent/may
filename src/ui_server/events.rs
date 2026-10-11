@@ -25,7 +25,7 @@ use super::types::{
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct EventsQuery {
     #[serde(default)]
@@ -77,6 +77,11 @@ pub(super) async fn stream_events(
     let (sender, sse) = Sse::channel();
     let state_cloned = state.clone();
     let mut topic_rx = state.ui_event_bus.subscribe();
+    // Lifecycle events are sequential transients, not snapshots, so they
+    // ride a dedicated broadcast — but stay inside the single SSE stream as
+    // a distinct event kind, per AGENTS.md.
+    let mut lifecycle_rx = state.browser_lifecycle_subscribe();
+    let lifecycle_subscribed = subscribed_topics.contains(UiEventTopics::BROWSER_LIFECYCLE);
 
     state.tokio_handle.spawn(async move {
         let mut signatures = EventSignatures::default();
@@ -134,6 +139,19 @@ pub(super) async fn stream_events(
                         &mut signatures,
                     ).await {
                         break;
+                    }
+                }
+                lifecycle = lifecycle_rx.recv(), if lifecycle_subscribed => {
+                    match lifecycle {
+                        Ok(event) => {
+                            if !send_event(&sender, "browser_lifecycle", &event).await {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "browser lifecycle stream lagged; dropping events");
+                        }
+                        Err(RecvError::Closed) => {}
                     }
                 }
                 _ = heartbeat.tick() => {
@@ -308,7 +326,7 @@ async fn emit_browser_status_if_changed(
     let enabled = state.config_snapshot().browser.enabled;
     let owner_session_id = state.browser_owner_session_id();
     let running = if let Some(manager) = browser_manager.as_ref() {
-        manager.is_running().await
+        manager.is_running()
     } else {
         false
     };

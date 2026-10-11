@@ -5,9 +5,7 @@ mod pickers;
 mod popups;
 
 use self::config::render_config_screen;
-use self::pickers::{
-    render_file_picker_popup, render_profile_select_popup, render_session_popup,
-};
+use self::pickers::{render_file_picker_popup, render_profile_select_popup, render_session_popup};
 use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
 
 use ratatui::{
@@ -20,10 +18,7 @@ use ratatui::Frame;
 
 use super::super::app::App;
 use super::super::completion::CompletionMode;
-use super::super::state::{
-    AppMode, AskUserState, ConfigEditMode, ConfigSection, CopilotAuthStatus, McpAddMode,
-    SkillAddMode, SshAddMode,
-};
+use super::super::state::{AppMode, AskUserState, ChatgptAuthStatus, CopilotAuthStatus};
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 use crate::workspace_request::WorkspaceRequest;
 
@@ -50,6 +45,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         AppMode::CopilotAuth => {
             render_copilot_auth_screen(frame, area, app);
+            return;
+        }
+        AppMode::ChatgptAuth => {
+            render_chatgpt_auth_screen(frame, area, app);
             return;
         }
         AppMode::PermissionConfirm(state) => {
@@ -293,7 +292,6 @@ pub(super) fn display_width_prefix(text: &str, char_count: usize) -> usize {
 /// Help text content.
 const HELP_TEXT: &str = include_str!("../help.txt");
 
-
 /// Render help popup.
 fn render_help_popup(frame: &mut Frame, area: Rect) {
     let popup_area = centered_rect(70, 80, area);
@@ -465,8 +463,6 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
         .title(title);
     frame.render_widget(block, popup_area);
 }
-
-/// Render unified configuration screen (full screen) with tabs.
 
 /// Render model select popup (anchored near input area).
 fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
@@ -661,6 +657,160 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Magenta))
                 .title(" GitHub Copilot Authentication ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+fn render_chatgpt_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Min(14),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
+
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Min(60),
+            Constraint::Percentage(10),
+        ])
+        .split(chunks[1]);
+
+    let content = match &app.chatgpt_auth_status {
+        Some(ChatgptAuthStatus::Working) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Contacting OpenAI...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+            ]
+        }
+        Some(ChatgptAuthStatus::WaitingForCallback { url }) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "1. Open this URL in your browser and authorize:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("   {url}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "2. The browser will redirect to localhost:1455 automatically.",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Waiting for authorization callback...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter: open browser | Esc: cancel]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(ChatgptAuthStatus::WaitingForUser {
+            user_code,
+            verification_uri,
+        }) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "1. Open your browser and visit:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    format!("   {verification_uri}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "2. Enter the code:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    format!("   {user_code}"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Waiting for authorization...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter: open browser & copy code | Esc: cancel]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(ChatgptAuthStatus::Success) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication successful!",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to continue]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(ChatgptAuthStatus::Failed(error)) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication failed:",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  {error}"),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to go back]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        None => {
+            vec![Line::from("")]
+        }
+    };
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" ChatGPT Authentication ")
                 .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);

@@ -37,7 +37,9 @@ impl TaskTriggerKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeTriggerType {
     Once,
@@ -94,7 +96,7 @@ pub struct TaskTriggerInput<'a> {
     pub event_name: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskTriggerRequest {
     Time {
@@ -307,7 +309,7 @@ pub enum TaskInvocation {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskTriggerResponse {
     Time {

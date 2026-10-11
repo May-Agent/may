@@ -337,8 +337,12 @@ async fn run_browser_service(
     let listener =
         tokio::net::UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
     let browser_manager = Arc::new(
-        may_agent::container::browser::BrowserManager::new(config.browser.clone(), may_dir.clone())
-            .map_err(|error| error.to_string())?,
+        may_agent::container::browser::BrowserManager::new(
+            config.browser.clone(),
+            may_dir.clone(),
+            may_agent::container::browser::BrowserLifecyclePublisher::noop(),
+        )
+        .map_err(|error| error.to_string())?,
     );
 
     loop {
@@ -353,14 +357,14 @@ async fn run_browser_service(
             BrowserServiceRequest::Status => (
                 BrowserServiceResponse::Ok {
                     payload: BrowserServiceStatus {
-                        running: browser_manager.is_running().await,
+                        running: browser_manager.is_running(),
                         cdp_endpoint: browser_manager.cdp_endpoint(),
                     },
                 },
                 false,
             ),
             BrowserServiceRequest::EnsureStarted => match async {
-                if !browser_manager.is_running().await {
+                if !browser_manager.is_running() {
                     may_agent::container::browser::prepare_browser_runtime(
                         &config.browser,
                         &may_dir,
@@ -385,7 +389,7 @@ async fn run_browser_service(
                 Err(message) => (BrowserServiceResponse::Error { message }, false),
             },
             BrowserServiceRequest::Stop => match async {
-                if browser_manager.is_running().await {
+                if browser_manager.is_running() {
                     browser_manager
                         .stop()
                         .await
@@ -399,7 +403,7 @@ async fn run_browser_service(
                 Err(message) => (BrowserServiceResponse::Error { message }, false),
             },
             BrowserServiceRequest::Read { url, options } => match async {
-                if !browser_manager.is_running().await {
+                if !browser_manager.is_running() {
                     may_agent::container::browser::prepare_browser_runtime(
                         &config.browser,
                         &may_dir,
@@ -416,7 +420,7 @@ async fn run_browser_service(
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok::<BrowserServiceResponse, String>(BrowserServiceResponse::ReadOk {
-                    payload: page,
+                    payload: Box::new(page),
                 })
             }
             .await

@@ -1,7 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use async_fs;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
@@ -14,7 +13,6 @@ use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error};
-use super::helpers::load_session_paths;
 use super::message_mapping::map_db_messages;
 use super::model_resolution::{
     persist_last_model, preferred_advanced_model, resolve_default_model,
@@ -31,8 +29,10 @@ fn session_not_found_error(session_id: &str) -> SkyError {
 }
 
 fn context_debug_not_found_error(session_id: &str) -> SkyError {
-    SkyError::msg(format!("No context debug snapshot for session {session_id}"))
-        .set_status(StatusCode::NOT_FOUND)
+    SkyError::msg(format!(
+        "No context debug snapshot for session {session_id}"
+    ))
+    .set_status(StatusCode::NOT_FOUND)
 }
 
 fn resolve_session_model(
@@ -84,15 +84,13 @@ pub(super) async fn get_session(
         .ok_or_else(|| session_not_found_error(&id))?;
 
     let mut summary = crate::session::SessionSummary::from_db_model(db_session);
-    summary.runtime = db
-        .get_session_runtime(&id)
-        .await
-        .map_err(internal_error)?
-        .unwrap_or_default();
 
+    // Fetch runtime and messages in parallel — they are independent queries
+    let (runtime_result, messages_result) =
+        tokio::join!(db.get_session_runtime(&id), db.get_messages(&id),);
+    summary.runtime = runtime_result.map_err(internal_error)?.unwrap_or_default();
     let model = resolve_session_model(&state, &id, summary.model.clone())?;
-
-    let db_messages = db.get_messages(&id).await.map_err(internal_error)?;
+    let db_messages = messages_result.map_err(internal_error)?;
     let messages = map_db_messages(&db_messages).map_err(internal_error)?;
 
     Ok(Json(ApiSession::from_summary(summary, model, messages)))
@@ -144,17 +142,17 @@ pub(super) async fn get_session_tasks(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let path = load_session_paths(&state, &id).await?.tasks_path();
+    let db = state.db();
     let runtime = state
         .runtime_service
         .get(&id)
         .await
         .map_err(internal_error)?;
-    let content = match async_fs::read_to_string(&path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(internal_error(error)),
-    };
+    let content = db
+        .get_session_tasks(&id)
+        .await
+        .map_err(internal_error)?
+        .unwrap_or_default();
     Ok(Json(SessionTasksPayload {
         content,
         plan_state: runtime.plan_state,
@@ -187,19 +185,8 @@ pub(super) async fn save_session_tasks(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let paths = load_session_paths(&state, &id).await?;
-    async_fs::create_dir_all(paths.root())
-        .await
-        .map_err(internal_error)?;
-    let previous_content = match async_fs::read_to_string(paths.tasks_path()).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(internal_error(error)),
-    };
-    archive_existing_tasks_if_replaced(&paths, &previous_content, &payload.content)
-        .await
-        .map_err(internal_error)?;
-    async_fs::write(paths.tasks_path(), payload.content)
+    let db = state.db();
+    db.set_session_tasks(&id, &payload.content)
         .await
         .map_err(internal_error)?;
     let runtime = state
@@ -207,10 +194,13 @@ pub(super) async fn save_session_tasks(
         .set_plan_state(&id, payload.plan_state)
         .await
         .map_err(internal_error)?;
+    let content = db
+        .get_session_tasks(&id)
+        .await
+        .map_err(internal_error)?
+        .unwrap_or_default();
     Ok(Json(SessionTasksPayload {
-        content: async_fs::read_to_string(paths.tasks_path())
-            .await
-            .map_err(internal_error)?,
+        content,
         plan_state: runtime.plan_state,
     }))
 }
@@ -238,7 +228,7 @@ fn map_context_window_message(message: &LlmMessage) -> ContextDebugMessage {
         attachments: message
             .attachments()
             .iter()
-            .map(url::Url::to_string)
+            .map(|attachment| attachment.url().to_string())
             .collect(),
         tool_call_id: message.tool_call_id().map(ToString::to_string),
         tool_call_names: message
@@ -258,61 +248,18 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
     }
 }
 
-fn sanitized_plan_archive_stem(content: &str) -> String {
-    let mut stem = String::new();
-    for ch in content.chars() {
-        if ch.is_ascii_alphanumeric() {
-            stem.push(ch.to_ascii_lowercase());
-        } else if (ch.is_ascii_whitespace() || ch == '-' || ch == '_') && !stem.ends_with('-') {
-            stem.push('-');
-        }
-        if stem.len() >= 48 {
-            break;
-        }
-    }
-    let trimmed = stem.trim_matches('-');
-    if trimmed.is_empty() {
-        return "tasks".to_string();
-    }
-    trimmed.to_string()
-}
-
-async fn archive_existing_tasks_if_replaced(
-    paths: &crate::session::SessionPaths,
-    previous_content: &str,
-    next_content: &str,
-) -> Result<(), std::io::Error> {
-    if previous_content.trim().is_empty() || previous_content == next_content {
-        return Ok(());
-    }
-    let archive_stem = sanitized_plan_archive_stem(previous_content);
-    let mut file_name = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
-    file_name.push('-');
-    file_name.push_str(archive_stem.as_str());
-    file_name.push_str("-tasks.md");
-    async_fs::create_dir_all(paths.data_dir()).await?;
-    async_fs::write(paths.data_dir().join(file_name), previous_content).await
-}
-
-pub(super) async fn create_session(
-    Json(req): Json<CreateSessionRequest>,
-    State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Json<ApiSession>> {
-    let requested_profile_id = req.profile_id.clone();
-    let model = {
-        let config = state.config_snapshot();
-        req.model
-            .or_else(|| config.last_model.clone())
-            .or_else(|| preferred_advanced_model(&config))
-            .ok_or_else(|| bad_request_error("No model configured"))?
-    };
-
-    let resolved_profile_id = requested_profile_id
-        .clone()
-        .or_else(|| Some(state.default_profile_id.clone()));
+/// Creates the durable DB row and session directory layout for a profile.
+///
+/// Shared by the regular create-session endpoint and notification callbacks,
+/// which open a fresh conversation in the originating profile.
+pub(super) async fn create_session_for_profile(
+    state: &Arc<UiServerState>,
+    profile_id: Option<&str>,
+    model: &str,
+) -> SkyResult<String> {
     let id = SessionId::new().to_string();
     let db = state.db();
-    let layout = match resolved_profile_id.as_deref() {
+    let layout = match profile_id {
         Some(profile_id) => {
             let profile = db
                 .get_profile(profile_id)
@@ -334,17 +281,32 @@ pub(super) async fn create_session(
     };
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     store
-        .create_session_dirs(&id, resolved_profile_id.as_deref(), layout)
+        .create_session_dirs(&id, profile_id, layout)
         .await
         .map_err(internal_error)?;
-    db.create_session_in_profile(
-        &id,
-        None,
-        Some(model.as_str()),
-        resolved_profile_id.as_deref(),
-    )
-    .await
-    .map_err(internal_error)?;
+    db.create_session_in_profile(&id, None, Some(model), profile_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(id)
+}
+
+pub(super) async fn create_session(
+    Json(req): Json<CreateSessionRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ApiSession>> {
+    let requested_profile_id = req.profile_id.clone();
+    let model = {
+        let config = state.config_snapshot();
+        req.model
+            .or_else(|| config.last_model.as_ref().map(ToString::to_string))
+            .or_else(|| preferred_advanced_model(&config))
+            .ok_or_else(|| bad_request_error("No model configured"))?
+    };
+
+    let resolved_profile_id = requested_profile_id
+        .clone()
+        .or_else(|| Some(state.default_profile_id.clone()));
+    let id = create_session_for_profile(&state, resolved_profile_id.as_deref(), &model).await?;
 
     persist_last_model(&state, &model)
         .await
@@ -370,8 +332,13 @@ pub(super) async fn update_session(
     let mut model_to_persist: Option<String> = None;
     let requested_title = req.title.clone();
     let requested_model = req.model.clone();
+    let requested_effort_patch = req.reasoning_effort.clone();
     let next_title = requested_title.clone().or_else(|| session.title.clone());
     let next_model = requested_model.clone().or_else(|| session.model.clone());
+    let next_effort = match requested_effort_patch.as_ref() {
+        Some(patch) => patch.clone(),
+        None => session.reasoning_effort.clone(),
+    };
 
     if let Some(model) = next_model.clone()
         && session.model.as_deref() != Some(model.as_str())
@@ -379,9 +346,18 @@ pub(super) async fn update_session(
         model_to_persist = Some(model);
     }
 
-    db.update_session(&id, requested_title.as_deref(), requested_model.as_deref())
-        .await
-        .map_err(internal_error)?;
+    let effort_patch_ref = requested_effort_patch
+        .as_ref()
+        .map(|inner| inner.as_deref());
+
+    db.update_session(
+        &id,
+        requested_title.as_deref(),
+        requested_model.as_deref(),
+        effort_patch_ref,
+    )
+    .await
+    .map_err(internal_error)?;
 
     if let Some(model) = model_to_persist {
         persist_last_model(&state, &model)
@@ -408,7 +384,7 @@ pub(super) async fn update_session(
         messages: Vec::new(),
         profile_id: session.profile_id,
         model,
-        reasoning_effort: None,
+        reasoning_effort: next_effort,
         runtime: runtime.into(),
     }))
 }
@@ -449,22 +425,4 @@ pub(super) async fn delete_all_sessions(
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
     Ok(Json(ApiHealth { ok: true }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sanitized_plan_archive_stem;
-
-    #[test]
-    fn sanitized_plan_archive_stem_normalizes_heading_like_text() {
-        assert_eq!(
-            sanitized_plan_archive_stem("## Terminal First Runtime Rewrite"),
-            "terminal-first-runtime-rewrite"
-        );
-    }
-
-    #[test]
-    fn sanitized_plan_archive_stem_falls_back_for_empty_text() {
-        assert_eq!(sanitized_plan_archive_stem("   ###   "), "tasks");
-    }
 }

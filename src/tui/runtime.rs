@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aither_core::llm::model::ReasoningEffort;
+use aither_core::llm::{Attachment as LlmAttachment, model::ReasoningEffort};
 use async_channel::Sender;
 use base64::Engine;
 use executor_core::{DefaultExecutor, spawn};
@@ -27,6 +27,8 @@ pub enum TuiRuntimeError {
     ResolveAgentEnvironment(#[from] crate::agent::ResolveAgentEnvironmentError),
     #[error("No active session")]
     NoActiveSession,
+    #[error("history replay failed: {0}")]
+    HistoryReplay(#[from] crate::session::HistoryReplayError),
     #[error("invalid pending message timestamp: {0}")]
     InvalidPendingMessageTimestamp(#[source] jiff::Error),
     #[error("persisted image attachment is missing content")]
@@ -53,10 +55,10 @@ pub enum TuiRuntimeError {
     MayAgent(#[from] crate::agent::MayAgentError),
     #[error("agent operation failed: {0}")]
     Agent(#[from] aither_agent::AgentError),
-    #[error("context snapshot history delta failed: {0}")]
-    HistoryDelta(#[from] crate::session::HistoryDeltaError),
     #[error("Failed to convert attachment path to URL: {path}")]
     AttachmentPathToUrl { path: std::path::PathBuf },
+    #[error("Unable to determine attachment MIME type: {path}")]
+    UnknownAttachmentMediaType { path: std::path::PathBuf },
     #[error("Failed to serialize paste XML: {0}")]
     SerializePasteXml(#[source] quick_xml::SeError),
     #[error("invalid data URL")]
@@ -555,7 +557,7 @@ impl RuntimeDeps {
         let model = self
             .oneshot_model
             .clone()
-            .or_else(|| app.config.last_model.clone());
+            .or_else(|| app.config.last_model.as_ref().map(ToString::to_string));
         let (sandbox_dir, session_id, messages) = {
             let session = app
                 .session_manager
@@ -712,7 +714,7 @@ impl RuntimeDeps {
         if let Some(ctx) = title_gen.take()
             && !assistant_response.is_empty()
         {
-            self.spawn_title_generation(
+            Self::spawn_title_generation(
                 app.config.clone(),
                 app.session_manager.db().clone(),
                 app.session_manager.current().map(|s| s.id.clone()),
@@ -736,6 +738,8 @@ impl RuntimeDeps {
             .session_manager
             .current()
             .map(|session| session.history.to_aither_messages())
+            .transpose()
+            .map_err(|e| TuiRuntimeError::HistoryReplay(e))?
             .unwrap_or_default();
         let may_dir = app.session_manager.may_dir().to_path_buf();
         let profile_model = if let Some(profile_id) = app
@@ -783,14 +787,16 @@ impl RuntimeDeps {
             }
             None => None,
         };
-        let profile_environment = match (profile_model.clone(), profile_preferences.clone()) {
-            (Some(profile), preferences) => Some(
-                crate::profile::ProfileInfo::from_db_parts(profile, preferences)?
+        let profile_environment = match profile_model.as_ref() {
+            Some(profile) => Some(
+                app.session_manager
+                    .db()
+                    .profile_info_from_model(profile.clone())
+                    .await?
                     .environment
                     .into_kind(),
             ),
-            (None, None) => None,
-            (None, Some(_)) => panic!("profile preferences cannot exist without a profile model"),
+            None => None,
         };
         let runtime = app
             .session_manager
@@ -816,6 +822,7 @@ impl RuntimeDeps {
             session_id,
             self.workspace_broker.clone(),
             self.ask_user_broker.clone(),
+            db.clone(),
             model,
             reasoning_effort,
             profile_model.as_ref().map(|profile| profile.id.clone()),
@@ -837,12 +844,29 @@ impl RuntimeDeps {
         if let Some(snapshot) =
             crate::session::load_persisted_context_snapshot(&db, &session_id_string).await?
         {
-            agent.restore_checkpoint(snapshot.checkpoint.clone())?;
-            for message in crate::session::history_delta_since_snapshot(
+            let db_messages = db.get_messages(&session_id_string).await?;
+            let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
+            match crate::session::history_delta_since_snapshot(
                 &history_messages,
-                snapshot.history_message_count,
-            )? {
-                agent.push_message(message);
+                &db_ids,
+                snapshot.last_message_db_id,
+            ) {
+                Some(delta) => {
+                    agent.restore_checkpoint(snapshot.checkpoint.clone())?;
+                    for message in delta {
+                        agent.push_message(message);
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        session_id = %session_id_string,
+                        "context snapshot anchor is stale, falling back to full history replay"
+                    );
+                    let _ = db.delete_session_context_snapshot(&session_id_string).await;
+                    for message in history_messages {
+                        agent.push_message(message);
+                    }
+                }
             }
         } else {
             for message in history_messages {
@@ -970,7 +994,6 @@ impl RuntimeDeps {
     }
 
     fn spawn_title_generation(
-        &self,
         config: MayConfig,
         db: crate::db::ChatDb,
         session_id: Option<SessionId>,
@@ -986,7 +1009,7 @@ impl RuntimeDeps {
             if let Some(title) =
                 generate_session_title(&config, &user_message, &assistant_response).await
                 && let Err(e) = db
-                    .update_session(session_id.as_str(), Some(&title), None)
+                    .update_session(session_id.as_str(), Some(&title), None, None)
                     .await
             {
                 tracing::warn!("Failed to update session title in DB: {}", e);
@@ -1018,15 +1041,15 @@ impl SelectedModel {
             return Self::new(model);
         }
 
-        if let Some(model) = config.last_model.as_deref() {
-            return Self::new(model);
+        if let Some(model) = config.last_model.as_ref().map(ToString::to_string) {
+            return Self::new(&model);
         }
 
         let model = config
             .default_model_for_tier(crate::config::ModelTier::Balanced)
             .ok_or(TuiRuntimeError::NoModelConfigured)?;
 
-        Self::new(model)
+        Self::new(&model.to_string())
     }
 
     fn as_str(&self) -> &str {
@@ -1036,7 +1059,7 @@ impl SelectedModel {
 
 fn prepare_message_content(
     msg: &PendingMessage,
-) -> Result<(String, Vec<url::Url>), TuiRuntimeError> {
+) -> Result<(String, Vec<LlmAttachment>), TuiRuntimeError> {
     let mut parts = vec![msg.content.clone()];
     let mut attachment_urls = Vec::new();
 
@@ -1048,7 +1071,12 @@ fn prepare_message_content(
                         path: path.to_path_buf(),
                     }
                 })?;
-                attachment_urls.push(url);
+                let media_type = mime_guess::from_path(path).first().ok_or_else(|| {
+                    TuiRuntimeError::UnknownAttachmentMediaType {
+                        path: path.to_path_buf(),
+                    }
+                })?;
+                attachment_urls.push(LlmAttachment::new(url, media_type));
             }
             Attachment::FileReference { path } => {
                 parts.push(format!("\n[File reference: {}]", path.display()));

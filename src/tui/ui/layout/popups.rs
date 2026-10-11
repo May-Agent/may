@@ -2,10 +2,10 @@
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use super::super::super::app::App;
@@ -499,4 +499,3 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 }
-

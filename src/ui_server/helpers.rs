@@ -8,12 +8,11 @@
 //! - [`super::attachments`] — attachment processing & uploads
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use serde::Serialize;
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
-use crate::session::{ChatMessage, MayHomePaths, SessionId, SessionPaths};
+use crate::session::{MayHomePaths, SessionPaths};
 
 use super::error::{bad_request_error, internal_error};
 use super::state::UiServerState;
@@ -30,18 +29,6 @@ pub(super) async fn send_event<T: Serialize>(
             .is_ok();
     }
     false
-}
-
-pub(super) async fn append_history_message(
-    state: &Arc<UiServerState>,
-    session_id: &SessionId,
-    message: ChatMessage,
-) -> Result<(), crate::db::ChatDbError> {
-    state
-        .db()
-        .append_chat_message(session_id.as_str(), &message)
-        .await?;
-    Ok(())
 }
 
 pub(super) async fn load_session_paths(

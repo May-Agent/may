@@ -1,6 +1,7 @@
 Model: {{ model_id }}
 Home environment kind: {{ home_environment_kind }}
 Operating system hint: {{ operating_system }}
+Terminal shell dialect: {{ shell_dialect }}
 Home environment directory: {{ home_directory }}
 Session directory: {{ session_directory }}
 Current working directory: {{ current_working_directory }}
@@ -19,4 +20,7 @@ Environment rules:
 {% endfor %}
 Modality support:
 {% for item in modality_support %}- {{ item }}
-{% endfor %}
+{% endfor %}{% if !attached_remote_servers.is_empty() %}
+Attached remote servers (reachable by calling the `terminal` tool with `mode: "ssh"` and `ssh_server_id: "<name>"`; IPC-backed commands still only run in the home environment):
+{% for server in attached_remote_servers %}- {{ server.name }} ({{ server.target }})
+{% endfor %}{% endif %}

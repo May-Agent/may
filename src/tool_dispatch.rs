@@ -13,7 +13,7 @@ use crate::browser_service::{
     BrowserServiceRequest, BrowserServiceResponse, BrowserServiceStatus,
     persist_browser_page_capture,
 };
-use crate::config::{BrowserConfig, SshServerConfig};
+use crate::config::BrowserConfig;
 use crate::network_policy::NetworkPolicyConfig;
 use crate::notification::{NotificationManager, NotificationService};
 use crate::scheduler::TaskRuntime;
@@ -27,7 +27,7 @@ pub enum ToolDispatchError {
     #[error("failed to load task runtime: {0}")]
     LoadTaskRuntime(crate::db::ChatDbError),
     #[error("failed to configure task runtime: {0}")]
-    ConfigureTaskRuntime(String),
+    ConfigureTaskRuntime(aither_sandbox::NetworkPolicyError),
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +45,6 @@ pub struct ToolDispatchConfig {
     pub cwd: PathBuf,
     pub db: ChatDb,
     pub browser_config: BrowserConfig,
-    pub ssh_servers: Vec<SshServerConfig>,
     pub network_policy: NetworkPolicyConfig,
     pub ask_user_broker: AskUserBroker,
 }
@@ -92,7 +91,6 @@ impl ToolDispatchers {
                 .map_err(ToolDispatchError::LoadTaskRuntime)?
                 .with_notifier(notification_service.clone())
                 .with_ui_event_bus(ui_event_bus)
-                .with_ssh_servers(config.ssh_servers.clone())
                 .with_network_policy(config.network_policy.clone())
                 .map_err(ToolDispatchError::ConfigureTaskRuntime)?,
         );
@@ -312,7 +310,7 @@ async fn handle_browser_request(
                             .await
                             .map_err(BrowserToolError::request_failed)?;
                     let page =
-                        persist_browser_page_capture(session_id.as_str(), &session_paths, payload)
+                        persist_browser_page_capture(session_id.as_str(), &session_paths, *payload)
                             .await
                             .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
                     Ok(BrowserResult {
@@ -373,7 +371,10 @@ async fn handle_register_skills_request(
                 .register_from_local_path(&source)
                 .await
                 .map_err(|error| {
-                    format!("failed to register skill from {}: {error}", source.display())
+                    format!(
+                        "failed to register skill from {}: {error}",
+                        source.display()
+                    )
                 })?;
             Ok(vec![info.dir_name])
         },
@@ -476,9 +477,9 @@ async fn resolve_registration_source_path(cwd: &Path, raw_path: &str) -> Result<
             candidate.display()
         )
     })?;
-    let project_root = tokio::fs::canonicalize(cwd).await.map_err(|error| {
-        format!("failed to resolve project root {}: {error}", cwd.display())
-    })?;
+    let project_root = tokio::fs::canonicalize(cwd)
+        .await
+        .map_err(|error| format!("failed to resolve project root {}: {error}", cwd.display()))?;
 
     if !canonical.starts_with(&project_root) {
         return Err(format!(

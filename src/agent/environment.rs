@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aither_sandbox::{BollardContainerExec, ContainerExecHandle, ContainerLaunchSpec};
+use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
 use crate::agent::AgentEnvironment;
 use crate::container::ContainerRuntime;
@@ -13,14 +13,8 @@ use crate::session::SessionId;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveAgentEnvironmentError {
-    #[error("remote profile model is missing")]
-    MissingRemoteProfileModel,
     #[error("container profile model is missing")]
     MissingContainerProfileModel,
-    #[error("failed to load config.toml for remote profile: {0}")]
-    LoadRemoteConfig(crate::config::ConfigError),
-    #[error("{0}")]
-    ResolveRemoteServer(String),
     #[error("no container runtime available for container profile: {0}")]
     DetectContainerRuntime(crate::container::ContainerError),
     #[error("invalid container profile image tag: {0}")]
@@ -45,18 +39,6 @@ pub async fn resolve_agent_environment_for_session(
 ) -> Result<AgentEnvironment, ResolveAgentEnvironmentError> {
     match profile_environment {
         Some(ProfileEnvironment::Container { .. }) => {}
-        Some(ProfileEnvironment::Remote { .. }) => {
-            let profile =
-                profile_model.ok_or(ResolveAgentEnvironmentError::MissingRemoteProfileModel)?;
-            let config_path = may_dir.join("config.toml");
-            let config = crate::config::MayConfig::load_from(&config_path)
-                .await
-                .map_err(ResolveAgentEnvironmentError::LoadRemoteConfig)?;
-            let ssh_server =
-                crate::profile::remote::resolve_remote_profile_server(profile, &config.ssh_servers)
-                    .map_err(ResolveAgentEnvironmentError::ResolveRemoteServer)?;
-            return Ok(AgentEnvironment::Remote { ssh_server });
-        }
         _ => return Ok(AgentEnvironment::Local),
     }
 
@@ -105,7 +87,7 @@ pub async fn resolve_agent_environment_for_session(
         .await
         .map_err(ResolveAgentEnvironmentError::StartContainer)?;
 
-    let container_exec = ContainerExecHandle::new(Arc::new(BollardContainerExec::new(Arc::new(
+    let container_exec = AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
         container_manager.runtime().client.clone(),
     ))));
 
@@ -113,6 +95,6 @@ pub async fn resolve_agent_environment_for_session(
         container_id,
         container_ipc_host: container_manager.runtime().host_gateway().to_string(),
         container_exec,
-        browser_backend: None,
+        browser_cdp_endpoint: None,
     })
 }

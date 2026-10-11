@@ -30,7 +30,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     }
 
     if let Some(model) = args.model.as_ref() {
-        app.config.last_model = Some(model.clone());
+        app.config.last_model = Some(
+            model
+                .parse::<may_agent::ModelSelector>()
+                .expect("oneshot model must be an explicit provider::model selector"),
+        );
     }
 
     let (workspace_broker, workspace_queue) = workspace_request::channel();
@@ -43,7 +47,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             cwd: app.cwd.clone(),
             db: app.session_manager.db().clone(),
             browser_config: app.config.browser.clone(),
-            ssh_servers: app.config.ssh_servers.clone(),
             network_policy: app.config.preferences.network_policy.clone(),
             ask_user_broker: ask_user_broker.clone(),
         },
@@ -453,6 +456,9 @@ fn render_oneshot_event(
             if !text.trim().is_empty() {
                 writeln!(stderr, "Thinking: {text}")?;
             }
+        }
+        Ok(AgentEvent::ToolCallDelta { .. }) => {
+            // UI progress — oneshot mode ignores deltas
         }
         Ok(AgentEvent::ToolCallStart { name, .. }) => {
             writeln!(stderr, "Tool: {name}")?;

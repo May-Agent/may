@@ -1,6 +1,8 @@
 //! Model fetching from provider APIs.
 
-use aither_cloud::{ClaudeProvider, CloudModelProvider, CopilotProvider, GeminiProvider};
+use aither_cloud::{
+    ClaudeProvider, CloudModelProvider, CodexProvider, CopilotProvider, GeminiProvider,
+};
 use aither_core::llm::{LanguageModelProvider, model::Ability};
 use aither_models::lookup as lookup_model_info;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -19,6 +21,10 @@ pub enum ModelFetchError {
     CopilotNotAuthenticated,
     #[error("Copilot auth error: {0}")]
     CopilotAuth(#[from] crate::copilot::CopilotTokenError),
+    #[error("ChatGPT not authenticated")]
+    ChatgptNotAuthenticated,
+    #[error("ChatGPT auth error: {0}")]
+    ChatgptAuth(#[from] crate::chatgpt::ChatgptAuthError),
 }
 
 /// Fetched model info.
@@ -117,14 +123,6 @@ pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
     models
 }
 
-/// Fetch models from a single provider.
-pub(crate) async fn fetch_models_for_provider_instance(
-    id: &str,
-    instance: &ProviderInstance,
-) -> Result<Vec<FetchedModel>, ModelFetchError> {
-    fetch_models_for_provider(id, instance).await
-}
-
 async fn fetch_models_for_provider(
     id: &str,
     instance: &ProviderInstance,
@@ -172,6 +170,22 @@ async fn fetch_models_for_provider(
                 .base_url(credentials.api_endpoint)
                 .into()
         }
+        ProviderType::Chatgpt => {
+            let mut credentials = crate::chatgpt::load_credentials()
+                .await?
+                .ok_or(ModelFetchError::ChatgptNotAuthenticated)?;
+            if credentials.is_expired(std::time::Duration::from_secs(60)) {
+                credentials = aither_codex::auth::refresh_tokens(&credentials.refresh_token)
+                    .await
+                    .map_err(crate::chatgpt::ChatgptAuthError::Codex)?;
+                crate::chatgpt::save_credentials(&credentials).await?;
+            }
+            let mut provider = CodexProvider::new(credentials);
+            if let Some(url) = base_url {
+                provider = provider.with_base_url(url);
+            }
+            provider.into()
+        }
         ProviderType::OpenAI
         | ProviderType::OpenRouter
         | ProviderType::DeepSeek
@@ -193,16 +207,11 @@ async fn fetch_models_for_provider(
         .map(|p| {
             let model_id = p.name;
             let provider_description = p.description.trim();
-            let nickname = aither_models::lookup(&model_id)
-                .map(|info| info.id().to_string())
-                .or_else(|| {
-                    if provider_description.is_empty() {
-                        None
-                    } else {
-                        Some(provider_description.to_string())
-                    }
-                })
-                .unwrap_or_else(|| model_id.clone());
+            let nickname = if provider_description.is_empty() {
+                model_id.clone()
+            } else {
+                provider_description.to_string()
+            };
 
             let mut abilities: Vec<String> =
                 p.abilities.into_iter().map(ability_to_label).collect();
@@ -271,7 +280,6 @@ async fn fetch_openai_compatible_models(
                 .description
                 .clone()
                 .filter(|value| !value.trim().is_empty())
-                .or_else(|| aither_models::lookup(&model_id).map(|info| info.id().to_string()))
                 .unwrap_or_else(|| model_id.clone());
 
             let abilities = aither_models::lookup(&model_id)

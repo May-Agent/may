@@ -1,7 +1,17 @@
 //! Session-scoped planning mode state.
 
 /// Persisted plan mode for a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    Default,
+    skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPlanState {
     #[default]

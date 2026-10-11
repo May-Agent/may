@@ -1,6 +1,6 @@
 //! Folder row model for grouping pinned sessions within a profile.
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
     pub id: String,
     /// Profile this folder belongs to.

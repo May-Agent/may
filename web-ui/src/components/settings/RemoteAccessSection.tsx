@@ -1,158 +1,198 @@
-import { Shield } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Play, Square, Copy, ChevronDown, ChevronRight, Cloud, AlertCircle, Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { useStore } from '@/lib/store';
-import type { ConfigSectionProps } from './constants';
+import { Badge } from '@/components/ui/badge';
+import { SectionHeader } from './SectionHeader';
+import { useTranslation } from '@/lib/i18n';
+import { useRuntimeStore } from '@/lib/stores/runtime';
+import {
+  getRemoteAccessStatus,
+  startRemoteAccess,
+  stopRemoteAccess,
+} from '@/lib/api/remoteAccess';
+import type { RemoteAccessState, RemoteAccessStatusResponse } from '@/lib/types';
+import { cn } from '@/lib/utils';
 
-export function RemoteAccessSection({ configDraft, setDraft }: ConfigSectionProps) {
-  const {
-    remoteAccessStatus,
-    refreshRemoteAccessStatus,
-    startRemoteAccess,
-    stopRemoteAccess,
-  } = useStore();
+const STATE_TONE: Record<RemoteAccessState, 'neutral' | 'positive' | 'warning' | 'danger'> = {
+  disabled: 'neutral',
+  starting: 'warning',
+  running: 'positive',
+  error: 'danger',
+};
 
-  if (!configDraft) {
-    return <div className="text-sm text-muted-foreground">Loading config...</div>;
-  }
+export function RemoteAccessSection() {
+  const { t } = useTranslation();
+  const liveStatus = useRuntimeStore((s) => s.remoteAccess);
+  const [fallback, setFallback] = useState<RemoteAccessStatusResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [logsOpen, setLogsOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await getRemoteAccessStatus();
+        if (!cancelled) setFallback(res);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const status = liveStatus ?? fallback;
+
+  const toggle = async () => {
+    if (!status) return;
+    setBusy(true);
+    try {
+      if (status.state === 'running' || status.state === 'starting') {
+        await stopRemoteAccess();
+      } else {
+        await startRemoteAccess();
+      }
+    } catch (err) {
+      toast.error(t('errors.generic'), {
+        description: err instanceof Error ? err.message : undefined,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyUrl = async () => {
+    if (!status?.publicUrl) return;
+    try {
+      await navigator.clipboard.writeText(status.publicUrl);
+      toast.success('Copied');
+    } catch {
+      toast.error(t('errors.generic'));
+    }
+  };
 
   return (
-    <section className="space-y-4">
-      <div className="flex items-center gap-2 text-sm font-medium uppercase tracking-wide text-muted-foreground">
-        <Shield className="h-4 w-4" /> Remote Access
-      </div>
+    <section>
+      <SectionHeader
+        title={t('settings.remote.title')}
+        description={t('settings.remote.description')}
+      />
 
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="space-y-1 md:col-span-2">
-          <Label className="text-sm">Enable remote access</Label>
-          <div className="flex items-center gap-3 pt-2">
-            <input
-              type="checkbox"
-              checked={configDraft.remoteAccess.enabled}
-              onChange={(event) =>
-                setDraft((prev) => ({
-                  ...prev,
-                  remoteAccess: {
-                    ...prev.remoteAccess,
-                    enabled: event.target.checked,
-                  },
-                }))
-              }
-            />
-            <span className="text-xs text-muted-foreground">
-              Runs a named Cloudflare tunnel through `cloudflared`. Quick tunnels are intentionally unsupported because the app depends on SSE.
-            </span>
-          </div>
-        </div>
-
-        <div className="space-y-1">
-          <Label>Cloudflared Binary</Label>
-          <Input
-            value={configDraft.remoteAccess.cloudflaredBinary}
-            onChange={(event) =>
-              setDraft((prev) => ({
-                ...prev,
-                remoteAccess: {
-                  ...prev.remoteAccess,
-                  cloudflaredBinary: event.target.value,
-                },
-              }))
-            }
-          />
-        </div>
-
-        <div className="space-y-1">
-          <Label>Public URL</Label>
-          <Input
-            value={configDraft.remoteAccess.publicUrl ?? ''}
-            onChange={(event) =>
-              setDraft((prev) => ({
-                ...prev,
-                remoteAccess: {
-                  ...prev.remoteAccess,
-                  publicUrl: event.target.value,
-                },
-              }))
-            }
-            placeholder="https://may.example.com"
-          />
-        </div>
-
-        <div className="space-y-1 md:col-span-2">
-          <Label>Tunnel Token</Label>
-          <Input
-            type="password"
-            value={configDraft.remoteAccess.tunnelToken ?? ''}
-            onChange={(event) =>
-              setDraft((prev) => ({
-                ...prev,
-                remoteAccess: {
-                  ...prev.remoteAccess,
-                  tunnelToken: event.target.value,
-                },
-              }))
-            }
-            placeholder="Cloudflare tunnel token"
-          />
-        </div>
-
-        <div className="space-y-1 md:col-span-2">
-          <Label className="text-sm">Allow local-environment exposure</Label>
-          <div className="flex items-center gap-3 pt-2">
-            <input
-              type="checkbox"
-              checked={configDraft.remoteAccess.allowLocalEnvironment}
-              onChange={(event) =>
-                setDraft((prev) => ({
-                  ...prev,
-                  remoteAccess: {
-                    ...prev.remoteAccess,
-                    allowLocalEnvironment: event.target.checked,
-                  },
-                }))
-              }
-            />
-            <span className="text-xs text-muted-foreground">
-              Disabled by default because local profiles target the user’s real machine.
-            </span>
-          </div>
-        </div>
-      </div>
-
-      <div className="rounded-xl border border-border/70 bg-card/70 p-4">
-        <div className="flex items-center justify-between gap-4">
-          <div className="space-y-1">
-            <div className="text-sm font-medium text-foreground">
-              Status: {remoteAccessStatus?.state ?? 'disabled'}
+      {loading || !status ? (
+        <div className="py-10 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
+      ) : (
+        <div className="space-y-4">
+          <div className="rounded-xl border border-border bg-card/30 p-5">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <div
+                  className={cn(
+                    'mt-0.5 flex size-9 items-center justify-center rounded-lg',
+                    status.state === 'running' && 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+                    status.state === 'starting' && 'bg-amber-500/10 text-amber-600 dark:text-amber-400',
+                    status.state === 'error' && 'bg-destructive/10 text-destructive',
+                    status.state === 'disabled' && 'bg-muted text-muted-foreground',
+                  )}
+                >
+                  {status.state === 'starting' ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : status.state === 'error' ? (
+                    <AlertCircle className="size-4" />
+                  ) : (
+                    <Cloud className="size-4" />
+                  )}
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium">{t('settings.remote.status')}</span>
+                    <Badge tone={STATE_TONE[status.state]}>
+                      {t(`settings.remote.states.${status.state}`)}
+                    </Badge>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {status.state === 'running'
+                      ? 'Tunnel is live. Share the URL below to reach this instance.'
+                      : status.state === 'starting'
+                      ? 'Setting up a secure tunnel…'
+                      : status.state === 'error'
+                      ? 'Something went wrong bringing the tunnel up.'
+                      : 'Start a tunnel to reach May from outside this machine.'}
+                  </p>
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant={status.state === 'running' ? 'outline' : 'default'}
+                disabled={busy || status.state === 'starting'}
+                onClick={toggle}
+              >
+                {status.state === 'running' ? (
+                  <>
+                    <Square className="size-3.5" /> {t('settings.remote.stop')}
+                  </>
+                ) : (
+                  <>
+                    <Play className="size-3.5" /> {t('settings.remote.start')}
+                  </>
+                )}
+              </Button>
             </div>
-            <div className="text-xs text-muted-foreground">
-              {remoteAccessStatus?.publicUrl ?? configDraft.remoteAccess.publicUrl ?? 'No public URL configured'}
+
+            {status.publicUrl && (
+              <div className="mt-4 flex items-center gap-2 rounded-md border border-border bg-background px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                    {t('settings.remote.url')}
+                  </div>
+                  <a
+                    href={status.publicUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block truncate font-mono text-xs text-primary hover:underline"
+                  >
+                    {status.publicUrl}
+                  </a>
+                </div>
+                <Button size="icon" variant="ghost" onClick={copyUrl} aria-label="Copy URL">
+                  <Copy className="size-3.5" />
+                </Button>
+              </div>
+            )}
+
+            {status.lastError && (
+              <div className="mt-4 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs">
+                <div className="mb-0.5 flex items-center gap-1 font-medium text-destructive">
+                  <AlertCircle className="size-3" />
+                  {t('settings.remote.lastError')}
+                </div>
+                <div className="font-mono text-destructive/80">{status.lastError}</div>
+              </div>
+            )}
+          </div>
+
+          {status.recentLogs.length > 0 && (
+            <div>
+              <button
+                type="button"
+                onClick={() => setLogsOpen((v) => !v)}
+                className="flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+              >
+                {logsOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+                {t('settings.remote.logs')}
+                <span className="text-muted-foreground/60">({status.recentLogs.length})</span>
+              </button>
+              {logsOpen && (
+                <pre className="mt-2 max-h-64 overflow-auto rounded-md border border-border bg-card/30 p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                  {status.recentLogs.join('\n')}
+                </pre>
+              )}
             </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button variant="outline" onClick={() => void refreshRemoteAccessStatus()}>
-              Refresh
-            </Button>
-            <Button onClick={() => void startRemoteAccess()}>
-              Start
-            </Button>
-            <Button variant="outline" onClick={() => void stopRemoteAccess()}>
-              Stop
-            </Button>
-          </div>
+          )}
         </div>
-        {remoteAccessStatus?.lastError ? (
-          <div className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            {remoteAccessStatus.lastError}
-          </div>
-        ) : null}
-        {remoteAccessStatus?.recentLogs?.length ? (
-          <pre className="mt-3 max-h-64 overflow-auto rounded-lg border border-border/60 bg-background/80 p-3 text-[11px] leading-relaxed text-muted-foreground">
-            {remoteAccessStatus.recentLogs.join('\n')}
-          </pre>
-        ) : null}
-      </div>
+      )}
     </section>
   );
 }

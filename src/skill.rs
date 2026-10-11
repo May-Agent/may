@@ -42,7 +42,7 @@ pub enum SkillError {
 }
 
 /// Origin of a skill.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
 #[serde(tag = "type")]
 pub enum SkillSource {
     /// Bundled with the application.

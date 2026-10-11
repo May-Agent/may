@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -6,6 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use askama::Template;
 use futures_lite::StreamExt;
 use notify::{
     Config as NotifyConfig, Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher,
@@ -17,6 +19,7 @@ use skyzen::utils::{Json, State};
 use skyzen::{Result as SkyResult, StatusCode};
 use tokio::process::Command;
 
+use super::chat::spawn_follow_up_runs;
 use super::error::{bad_request_error, internal_error};
 use super::helpers::{load_session_paths, parse_safe_relative_path, send_event};
 use super::local_url_mapper::{
@@ -26,13 +29,29 @@ use super::local_url_mapper::{
 use super::state::UiServerState;
 use super::types::SseHeartbeat;
 use super::types::{
-    ArtifactEntry, ArtifactPreviewQuery, ArtifactStreamPayload, IfNoneMatchHeader,
-    LocalUrlMapRequest, LocalUrlMapResponse, SessionArtifactsResponse, SessionRuntimeResponse,
-    SlidevPreviewResponse,
+    ArtifactDiagnosticsRequest, ArtifactDiagnosticsResponse, ArtifactEntry, ArtifactPreviewQuery,
+    ArtifactRuntimePreviewQuery, ArtifactStreamPayload, IfNoneMatchHeader, LocalUrlMapRequest,
+    LocalUrlMapResponse, SessionArtifactsResponse, SessionRuntimeResponse, SlidevPreviewResponse,
 };
 
 const PREVIEW_CACHE_CONTROL: &str = "private, no-cache";
 const SLIDEV_CACHE_CONTROL: &str = "private, max-age=0, must-revalidate";
+const ARTIFACT_RUNTIME_BRIDGE_SRC: &str = "/api/artifact-runtime.js";
+const ARTIFACT_RUNTIME_BRIDGE: &str = include_str!("../texts/artifact_runtime_bridge.js");
+const ARTIFACT_RUNTIME_BRIDGE_TEMPLATE: &str =
+    include_str!("../../templates/artifact_runtime_bridge.html");
+const SLIDEV_TOOLCHAIN_PACKAGE_JSON: &str =
+    include_str!("../../skills/slide/assets/template/package.json");
+const GENERIC_VALIDATION_PROFILE: &str = "generic";
+const SLIDEV_VALIDATION_PROFILE: &str = "slidev";
+
+#[derive(Template)]
+#[template(path = "artifact_runtime_bridge.html")]
+struct ArtifactRuntimeBridgeTemplate<'a> {
+    script_src: &'a str,
+    artifact_type: &'a str,
+    validation_profile: &'a str,
+}
 
 struct ResolvedSessionFile {
     canonical_path: PathBuf,
@@ -280,7 +299,16 @@ fn slidev_cache_key(path: &Path, meta: &std::fs::Metadata) -> String {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
-    format!("{base}-{}-{modified}", meta.len())
+    let mut bridge_hasher = std::hash::DefaultHasher::new();
+    ARTIFACT_RUNTIME_BRIDGE.hash(&mut bridge_hasher);
+    ARTIFACT_RUNTIME_BRIDGE_TEMPLATE.hash(&mut bridge_hasher);
+    ARTIFACT_RUNTIME_BRIDGE_SRC.hash(&mut bridge_hasher);
+    SLIDEV_VALIDATION_PROFILE.hash(&mut bridge_hasher);
+    format!(
+        "{base}-{}-{modified}-{:016x}",
+        meta.len(),
+        bridge_hasher.finish()
+    )
 }
 
 fn validate_slidev_cache_key(value: &str) -> Result<(), skyzen::Error> {
@@ -304,7 +332,131 @@ fn validate_slidev_cache_key(value: &str) -> Result<(), skyzen::Error> {
 const SLIDEV_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 const SLIDEV_DEP_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const SLIDEV_BUILD_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
+/// A live builder refreshes the lock file mtime at this cadence.
+const SLIDEV_BUILD_LOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// A lock whose mtime is older than this belongs to a crashed builder and is broken.
+const SLIDEV_BUILD_LOCK_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 const SLIDEV_MAX_AUTOINSTALL_ROUNDS: usize = 8;
+const MAX_ARTIFACT_DIAGNOSTICS: usize = 16;
+const MAX_ARTIFACT_DIAGNOSTIC_CHARS: usize = 2_000;
+const ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX: &str = " ... [truncated]";
+
+fn is_slidev_separator(line: &str) -> bool {
+    line.trim() == "---"
+}
+
+fn valid_slidev_frontmatter(lines: &[&str]) -> bool {
+    let source = lines.join("\n");
+    let Ok(serde_yml::Value::Mapping(mapping)) = serde_yml::from_str(&source) else {
+        return false;
+    };
+    !mapping.is_empty()
+        && mapping.keys().all(|key| {
+            let serde_yml::Value::String(key) = key else {
+                return false;
+            };
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
+        })
+}
+
+fn slide_has_visible_content(lines: &[&str]) -> bool {
+    let mut inside_style = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if inside_style {
+            if trimmed.contains("</style>") {
+                inside_style = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("<style") {
+            inside_style = !trimmed.contains("</style>");
+            continue;
+        }
+        if trimmed.is_empty()
+            || trimmed.starts_with("<!--")
+            || trimmed.starts_with("-->")
+            || trimmed.starts_with("<script")
+            || trimmed == "</script>"
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn slidev_source_diagnostics(source: &str) -> Vec<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return vec!["Slidev source is empty.".to_string()];
+    }
+
+    let mut cursor = 0usize;
+    if lines.first().is_some_and(|line| is_slidev_separator(line)) {
+        let Some(headmatter_end) = lines
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, line)| is_slidev_separator(line).then_some(index))
+        else {
+            return vec!["Slidev headmatter is not closed with `---`.".to_string()];
+        };
+        cursor = headmatter_end + 1;
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut slides = Vec::new();
+    let mut content_start = cursor;
+    while cursor < lines.len() {
+        if !is_slidev_separator(lines[cursor]) {
+            cursor += 1;
+            continue;
+        }
+
+        slides.push(&lines[content_start..cursor]);
+        let next_line = cursor + 1;
+        if next_line >= lines.len() || lines[next_line].trim().is_empty() {
+            content_start = next_line;
+            cursor = next_line;
+            continue;
+        }
+
+        let frontmatter_end = lines
+            .iter()
+            .enumerate()
+            .skip(next_line)
+            .find_map(|(index, line)| is_slidev_separator(line).then_some(index));
+        if let Some(frontmatter_end) = frontmatter_end
+            && valid_slidev_frontmatter(&lines[next_line..frontmatter_end])
+        {
+            content_start = frontmatter_end + 1;
+            cursor = content_start;
+            continue;
+        }
+
+        diagnostics.push(format!(
+            "Ambiguous Slidev separator at line {}: add a blank line after `---`, or provide a valid YAML frontmatter block closed by `---`.",
+            cursor + 1
+        ));
+        content_start = next_line;
+        cursor = next_line;
+    }
+    slides.push(&lines[content_start..]);
+
+    for (index, slide) in slides.into_iter().enumerate() {
+        if !slide_has_visible_content(slide) {
+            diagnostics.push(format!(
+                "Slide {} has no visible content after style and script blocks are removed.",
+                index + 1
+            ));
+        }
+    }
+    diagnostics
+}
 
 fn slidev_failure_detail(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -390,14 +542,73 @@ async fn ensure_slidev_toolchain_dir(toolchain_dir: &Path) -> Result<(), skyzen:
         .await
         .map_err(internal_error)?;
     let package_json = toolchain_dir.join("package.json");
-    if async_fs::metadata(&package_json).await.is_err() {
-        async_fs::write(
-            &package_json,
-            r#"{"name":"slidev-toolchain","private":true,"type":"module"}"#,
-        )
-        .await
-        .map_err(internal_error)?;
+    let needs_manifest = match async_fs::read_to_string(&package_json).await {
+        Ok(existing) => {
+            let manifest: serde_json::Value =
+                serde_json::from_str(existing.as_str()).map_err(internal_error)?;
+            !manifest
+                .get("dependencies")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|dependencies| dependencies.contains_key("@slidev/cli"))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => true,
+        Err(error) => return Err(internal_error(error)),
+    };
+    if needs_manifest {
+        async_fs::write(&package_json, SLIDEV_TOOLCHAIN_PACKAGE_JSON)
+            .await
+            .map_err(internal_error)?;
     }
+
+    let slidev_cli = toolchain_dir.join("node_modules/@slidev/cli/bin/slidev.mjs");
+    if async_fs::metadata(slidev_cli).await.is_err() {
+        install_slidev_toolchain(toolchain_dir).await?;
+    }
+    Ok(())
+}
+
+fn configure_internal_bun_command(command: &mut Command) {
+    for variable in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(variable);
+    }
+}
+
+async fn install_slidev_toolchain(toolchain_dir: &Path) -> Result<(), skyzen::Error> {
+    let mut command = Command::new("bun");
+    command
+        .arg("install")
+        .arg("--silent")
+        .arg("--no-progress")
+        .current_dir(toolchain_dir)
+        .env("CI", "1")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    configure_internal_bun_command(&mut command);
+
+    let output = tokio::time::timeout(SLIDEV_DEP_INSTALL_TIMEOUT, command.output())
+        .await
+        .map_err(|_| {
+            internal_error(format!(
+                "slidev toolchain install timed out after {}s",
+                SLIDEV_DEP_INSTALL_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(internal_error)?;
+
+    if !output.status.success() {
+        let detail = slidev_failure_detail(&output);
+        return Err(internal_error(format!(
+            "slidev toolchain install failed: {detail}"
+        )));
+    }
+
     Ok(())
 }
 
@@ -413,7 +624,11 @@ async fn install_slidev_dependency(
         .arg("--no-progress")
         .current_dir(toolchain_dir)
         .env("CI", "1")
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        // Reap the child when the timeout drops the output future; otherwise
+        // an orphaned bun keeps holding its global install lock.
+        .kill_on_drop(true);
+    configure_internal_bun_command(&mut command);
 
     let output = tokio::time::timeout(SLIDEV_DEP_INSTALL_TIMEOUT, command.output())
         .await
@@ -494,9 +709,9 @@ async fn build_slidev_with_autoinstall(
     let mut installed_packages = BTreeSet::new();
     let mut icon_rewrites = BTreeSet::new();
     for _ in 0..SLIDEV_MAX_AUTOINSTALL_ROUNDS {
-        let mut command = Command::new("bunx");
+        let mut command = Command::new("node");
         command
-            .arg("@slidev/cli")
+            .arg(toolchain_dir.join("node_modules/@slidev/cli/bin/slidev.mjs"))
             .arg("build")
             .arg(entry_path.as_os_str())
             .arg("--out")
@@ -505,7 +720,9 @@ async fn build_slidev_with_autoinstall(
             .arg(base_url)
             .current_dir(toolchain_dir)
             .env("CI", "1")
-            .stdin(Stdio::null());
+            .stdin(Stdio::null())
+            // Reap the child when the timeout drops the output future.
+            .kill_on_drop(true);
 
         let output = tokio::time::timeout(SLIDEV_BUILD_TIMEOUT, command.output())
             .await
@@ -606,6 +823,54 @@ async fn copy_directory_recursive(
     Ok(())
 }
 
+fn instrument_artifact_html(
+    html: &str,
+    artifact_type: &str,
+    validation_profile: &str,
+) -> Result<String, skyzen::Error> {
+    let bridge = ArtifactRuntimeBridgeTemplate {
+        script_src: ARTIFACT_RUNTIME_BRIDGE_SRC,
+        artifact_type,
+        validation_profile,
+    }
+    .render()
+    .map_err(internal_error)?;
+    let Some(bridge_tag) = bridge.strip_suffix("</head>") else {
+        return Err(internal_error(
+            "artifact runtime bridge template must end with a closing head tag",
+        ));
+    };
+    if html.contains(bridge_tag) {
+        return Ok(html.to_string());
+    }
+    if html.contains(ARTIFACT_RUNTIME_BRIDGE_SRC) {
+        return Err(internal_error(
+            "artifact HTML contains a mismatched runtime bridge",
+        ));
+    }
+    if !html.contains("</head>") {
+        return Err(internal_error(
+            "artifact HTML does not contain a closing head tag",
+        ));
+    }
+    Ok(html.replacen("</head>", bridge.as_str(), 1))
+}
+
+async fn ensure_slidev_runtime_bridge(index_file: &Path) -> Result<(), skyzen::Error> {
+    let index = async_fs::read_to_string(index_file)
+        .await
+        .map_err(internal_error)?;
+    let instrumented =
+        instrument_artifact_html(index.as_str(), "slidev", SLIDEV_VALIDATION_PROFILE)?;
+    if instrumented == index {
+        return Ok(());
+    }
+    async_fs::write(index_file, instrumented)
+        .await
+        .map_err(internal_error)?;
+    Ok(())
+}
+
 async fn ensure_slidev_source_root(
     toolchain_dir: &Path,
     cache_key: &str,
@@ -639,16 +904,59 @@ async fn ensure_slidev_source_root(
 #[derive(Debug)]
 struct SlidevBuildLock {
     path: PathBuf,
+    refresher: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SlidevBuildLock {
+    fn drop(&mut self) {
+        self.refresher.abort();
+    }
+}
+
+/// Whether the lock file's mtime shows no recent heartbeat from a live builder.
+async fn slidev_lock_is_stale(lock_path: &Path) -> bool {
+    let Ok(meta) = async_fs::metadata(lock_path).await else {
+        // Lock vanished between the failed create and this check; retry.
+        return true;
+    };
+    meta.modified()
+        .ok()
+        .and_then(|mtime| mtime.elapsed().ok())
+        .is_some_and(|age| age > SLIDEV_BUILD_LOCK_STALE_TIMEOUT)
+}
+
+/// Rewrites the lock file in place to bump its mtime; exits once the lock is gone.
+async fn refresh_slidev_lock(lock_path: PathBuf) {
+    use futures_lite::AsyncWriteExt;
+
+    loop {
+        tokio::time::sleep(SLIDEV_BUILD_LOCK_REFRESH_INTERVAL).await;
+        // `create(false)` semantics: never resurrect a lock another request broke.
+        let opened = async_fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .await;
+        let Ok(mut file) = opened else {
+            return;
+        };
+        if file.write_all(b"x").await.is_err() || file.flush().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn acquire_slidev_build_lock(
     lock_path: &Path,
     index_file: &Path,
+    diagnostics_file: &Path,
 ) -> Result<Option<SlidevBuildLock>, skyzen::Error> {
     let started_at = tokio::time::Instant::now();
 
     loop {
-        if async_fs::metadata(index_file).await.is_ok() {
+        if async_fs::metadata(index_file).await.is_ok()
+            || async_fs::metadata(diagnostics_file).await.is_ok()
+        {
             return Ok(None);
         }
 
@@ -659,11 +967,21 @@ async fn acquire_slidev_build_lock(
             .await
         {
             Ok(_) => {
+                let refresher = tokio::spawn(refresh_slidev_lock(lock_path.to_path_buf()));
                 return Ok(Some(SlidevBuildLock {
                     path: lock_path.to_path_buf(),
+                    refresher,
                 }));
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                if slidev_lock_is_stale(lock_path).await {
+                    tracing::warn!(
+                        path = %lock_path.display(),
+                        "breaking stale slidev build lock left by a crashed build"
+                    );
+                    let _ = async_fs::remove_file(lock_path).await;
+                    continue;
+                }
                 if started_at.elapsed() >= SLIDEV_BUILD_LOCK_WAIT_TIMEOUT {
                     return Err(internal_error(format!(
                         "slidev build lock wait timed out after {}s",
@@ -675,6 +993,29 @@ async fn acquire_slidev_build_lock(
             Err(error) => return Err(internal_error(error)),
         }
     }
+}
+
+async fn read_slidev_build_diagnostics(
+    diagnostics_file: &Path,
+) -> Result<Option<Vec<String>>, skyzen::Error> {
+    let bytes = match async_fs::read(diagnostics_file).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(internal_error(error)),
+    };
+    serde_json::from_slice(bytes.as_slice())
+        .map(Some)
+        .map_err(internal_error)
+}
+
+async fn write_slidev_build_diagnostics(
+    diagnostics_file: &Path,
+    diagnostics: &[String],
+) -> Result<(), skyzen::Error> {
+    let bytes = serde_json::to_vec(diagnostics).map_err(internal_error)?;
+    async_fs::write(diagnostics_file, bytes)
+        .await
+        .map_err(internal_error)
 }
 
 pub(super) async fn list_session_artifacts(
@@ -716,6 +1057,16 @@ pub(super) async fn prepare_slidev_preview(
         "artifact path traversal is not allowed",
     )
     .await?;
+    let source = async_fs::read_to_string(&resolved.canonical_path)
+        .await
+        .map_err(internal_error)?;
+    let diagnostics = slidev_source_diagnostics(source.as_str());
+    if !diagnostics.is_empty() {
+        return Ok(Json(SlidevPreviewResponse {
+            preview_url: None,
+            diagnostics,
+        }));
+    }
     let cache_key = slidev_cache_key(&raw_rel, &resolved.metadata);
     let cache_root = session_dir.join(".slidev-cache");
     async_fs::create_dir_all(&cache_root)
@@ -723,58 +1074,240 @@ pub(super) async fn prepare_slidev_preview(
         .map_err(internal_error)?;
     let cache_dir = cache_root.join(&cache_key);
     let index_file = cache_dir.join("index.html");
+    let diagnostics_file = cache_dir.join("diagnostics.json");
     let toolchain_dir = session_dir.join(".slidev-toolchain");
-    let lock_path = cache_root.join(format!("{cache_key}.lock"));
+    let lock_path = cache_root.join("build.lock");
+
+    let preview_url =
+        format!("/api/sessions/{session_id}/artifacts/slidev-static/{cache_key}/index.html");
+
+    if let Some(diagnostics) = read_slidev_build_diagnostics(&diagnostics_file).await? {
+        return Ok(Json(SlidevPreviewResponse {
+            preview_url: None,
+            diagnostics,
+        }));
+    }
 
     if async_fs::metadata(&index_file).await.is_err() {
-        let Some(lock) =
-            acquire_slidev_build_lock(lock_path.as_path(), index_file.as_path()).await?
-        else {
-            // Another request completed the build while we waited for lock acquisition.
-            return Ok(Json(SlidevPreviewResponse {
-                preview_url: format!(
-                    "/api/sessions/{session_id}/artifacts/slidev-static/{cache_key}/index.html"
-                ),
-            }));
-        };
+        let artifacts_dir = session_paths.artifacts_dir();
+        let base_url = format!("/api/sessions/{session_id}/artifacts/slidev-static/{cache_key}/");
+        let build_cache_dir = cache_dir.clone();
+        let build_index_file = index_file.clone();
+        let build_diagnostics_file = diagnostics_file.clone();
+        // The build shells out through `tokio::process`, which needs a Tokio
+        // reactor; skyzen handlers run outside one, so hop onto the shared
+        // Tokio runtime for the whole build.
+        let build = state.tokio_handle.spawn(async move {
+            let Some(lock) = acquire_slidev_build_lock(
+                lock_path.as_path(),
+                build_index_file.as_path(),
+                build_diagnostics_file.as_path(),
+            )
+            .await?
+            else {
+                // Another request completed the build while we waited for lock acquisition.
+                return read_slidev_build_diagnostics(build_diagnostics_file.as_path()).await;
+            };
 
-        if async_fs::metadata(&index_file).await.is_err() {
-            let _ = async_fs::remove_dir_all(&cache_dir).await;
-            async_fs::create_dir_all(&cache_dir)
+            if async_fs::metadata(&build_index_file).await.is_ok() {
+                let _ = async_fs::remove_file(lock.path.as_path()).await;
+                return Ok(None);
+            }
+
+            let _ = async_fs::remove_dir_all(&build_cache_dir).await;
+            async_fs::create_dir_all(&build_cache_dir)
                 .await
                 .map_err(internal_error)?;
 
-            let base_url =
-                format!("/api/sessions/{session_id}/artifacts/slidev-static/{cache_key}/");
             let source_root = ensure_slidev_source_root(
                 toolchain_dir.as_path(),
                 cache_key.as_str(),
-                &session_paths.artifacts_dir(),
+                &artifacts_dir,
             )
             .await?;
             let build_entry = source_root.join(&raw_rel);
             let build_result = build_slidev_with_autoinstall(
                 build_entry.as_path(),
-                cache_dir.as_path(),
+                build_cache_dir.as_path(),
                 base_url.as_str(),
                 toolchain_dir.as_path(),
             )
             .await;
             let _ = async_fs::remove_file(lock.path.as_path()).await;
-            build_result?;
+            if let Err(error) = build_result {
+                let diagnostics = vec![format!("Slidev preview build failed: {error}")];
+                write_slidev_build_diagnostics(
+                    build_diagnostics_file.as_path(),
+                    diagnostics.as_slice(),
+                )
+                .await?;
+                return Ok(Some(diagnostics));
+            }
 
-            if async_fs::metadata(&index_file).await.is_err() {
+            if async_fs::metadata(&build_index_file).await.is_err() {
                 return Err(internal_error("slidev build completed without index.html"));
             }
-        } else {
-            let _ = async_fs::remove_file(lock.path.as_path()).await;
+            Ok(None)
+        });
+        let build_diagnostics = build
+            .await
+            .map_err(|error| internal_error(format!("slidev build task failed: {error}")))??;
+        if let Some(diagnostics) = build_diagnostics {
+            return Ok(Json(SlidevPreviewResponse {
+                preview_url: None,
+                diagnostics,
+            }));
         }
     }
+    ensure_slidev_runtime_bridge(index_file.as_path()).await?;
 
     Ok(Json(SlidevPreviewResponse {
-        preview_url: format!(
-            "/api/sessions/{session_id}/artifacts/slidev-static/{cache_key}/index.html"
-        ),
+        preview_url: Some(preview_url),
+        diagnostics: Vec::new(),
+    }))
+}
+
+#[derive(serde::Serialize, skyzen::ToSchema)]
+struct ArtifactValidationReminder<'a> {
+    #[serde(rename = "@type")]
+    reminder_type: &'static str,
+    validation_id: &'a str,
+    artifact_type: &'a str,
+    path: &'a str,
+    diagnostics: &'a [String],
+    instruction: &'static str,
+}
+
+fn normalized_artifact_diagnostics(diagnostics: Vec<String>) -> Result<Vec<String>, skyzen::Error> {
+    if diagnostics.is_empty() {
+        return Err(bad_request_error(
+            "artifact diagnostics must contain at least one error",
+        ));
+    }
+
+    let total = diagnostics.len();
+    let retained = total.min(MAX_ARTIFACT_DIAGNOSTICS);
+    let mut normalized = diagnostics
+        .into_iter()
+        .take(retained)
+        .map(|diagnostic| {
+            let diagnostic = diagnostic.trim();
+            if diagnostic.is_empty() {
+                return Err(bad_request_error("artifact diagnostic cannot be empty"));
+            }
+
+            if diagnostic.chars().count() <= MAX_ARTIFACT_DIAGNOSTIC_CHARS {
+                return Ok(diagnostic.to_string());
+            }
+
+            let retained_chars = MAX_ARTIFACT_DIAGNOSTIC_CHARS
+                .checked_sub(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX.chars().count())
+                .expect("artifact diagnostic truncation suffix must fit the diagnostic limit");
+            let mut truncated = diagnostic.chars().take(retained_chars).collect::<String>();
+            truncated.push_str(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX);
+            Ok(truncated)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if total > retained {
+        normalized[MAX_ARTIFACT_DIAGNOSTICS - 1] = format!(
+            "{} additional artifact diagnostics were omitted.",
+            total - MAX_ARTIFACT_DIAGNOSTICS + 1
+        );
+    }
+    Ok(normalized)
+}
+
+fn artifact_validation_id(
+    artifact_type: &str,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    diagnostics: &[String],
+) -> String {
+    let mut hasher = std::hash::DefaultHasher::new();
+    artifact_type.hash(&mut hasher);
+    path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    metadata_modified_nanos(metadata).hash(&mut hasher);
+    diagnostics.hash(&mut hasher);
+    format!("artifact-validation-{:016x}", hasher.finish())
+}
+
+pub(super) async fn report_artifact_diagnostics(
+    params: Params,
+    Json(request): Json<ArtifactDiagnosticsRequest>,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<Json<ArtifactDiagnosticsResponse>> {
+    let session_id = params.get("id").map_err(bad_request_error)?.to_string();
+    if session_id.is_empty() {
+        return Err(bad_request_error("session id is required"));
+    }
+
+    let artifact_type = request.artifact_type.as_str();
+    let diagnostics = normalized_artifact_diagnostics(request.diagnostics)?;
+    let relative_path = parse_safe_relative_path(request.path.as_str(), "artifact path")?;
+    let session_paths = load_session_paths(&state, &session_id).await?;
+    let resolved = resolve_scoped_file(
+        &session_paths.artifacts_dir(),
+        relative_path,
+        "artifact not found",
+        "artifact path traversal is not allowed",
+    )
+    .await?;
+    let validation_id = artifact_validation_id(
+        artifact_type,
+        &resolved.relative_path,
+        &resolved.metadata,
+        diagnostics.as_slice(),
+    );
+
+    let messages = state
+        .db()
+        .get_messages(&session_id)
+        .await
+        .map_err(internal_error)?;
+    if messages
+        .iter()
+        .any(|message| message.content.contains(validation_id.as_str()))
+    {
+        return Ok(Json(ArtifactDiagnosticsResponse {
+            repair_scheduled: false,
+        }));
+    }
+
+    let reminder = ArtifactValidationReminder {
+        reminder_type: "artifact_validation_failed",
+        validation_id: validation_id.as_str(),
+        artifact_type,
+        path: request.path.as_str(),
+        diagnostics: diagnostics.as_slice(),
+        instruction: "The declared artifact failed validation. Inspect and repair the source, validate it again, and do not claim completion until it renders without diagnostics. Return the artifact control tag again after the repair.",
+    };
+    let reminder_xml =
+        crate::xml::serialize_xml_block("system-reminder", &reminder).map_err(internal_error)?;
+    let hidden_context_xml = crate::XmlBlock::parse(reminder_xml).map_err(internal_error)?;
+    let pending = crate::session::PendingUserMessage {
+        content: String::new(),
+        attachments: Vec::new(),
+        hidden_context_xml: Some(hidden_context_xml),
+        created_at: jiff::Timestamp::now().to_string(),
+        delivery_mode: crate::session::PendingUserMessageMode::Queue,
+    };
+    let runtime = state
+        .runtime_service
+        .enqueue(
+            &session_id,
+            pending,
+            crate::session::PendingUserMessageMode::Queue,
+        )
+        .await
+        .map_err(internal_error)?;
+    if runtime.can_dispatch_follow_up() {
+        spawn_follow_up_runs(state, session_id);
+    }
+
+    Ok(Json(ArtifactDiagnosticsResponse {
+        repair_scheduled: true,
     }))
 }
 
@@ -1026,7 +1559,7 @@ async fn resolve_container_proxy_target(
                 .set_status(StatusCode::BAD_GATEWAY)
         })?;
 
-    container_manager.touch_activity(&container_id).await;
+    container_manager.touch_activity(&container_id);
 
     Ok(ResolvedContainerProxyTarget {
         container_id,
@@ -1078,9 +1611,7 @@ pub(super) async fn map_container_local_url(
         .await
         .map_err(internal_error)?;
     if let Some(container_manager) = state.container_manager.as_ref() {
-        container_manager
-            .touch_activity(&resolved.container_id)
-            .await;
+        container_manager.touch_activity(&resolved.container_id);
     }
     Ok(Json(LocalUrlMapResponse {
         mapped_url: mapped_url_from_target(mapped_port, &target_url),
@@ -1124,6 +1655,88 @@ pub(super) async fn get_artifact_preview(
         bytes,
         content_type_for_path(&resolved.relative_path).as_str(),
         &etag,
+        PREVIEW_CACHE_CONTROL,
+    ))
+}
+
+fn artifact_runtime_etag(
+    metadata: &std::fs::Metadata,
+    artifact_type: &str,
+    validation_profile: &str,
+) -> String {
+    let mut hasher = std::hash::DefaultHasher::new();
+    ARTIFACT_RUNTIME_BRIDGE.hash(&mut hasher);
+    ARTIFACT_RUNTIME_BRIDGE_TEMPLATE.hash(&mut hasher);
+    ARTIFACT_RUNTIME_BRIDGE_SRC.hash(&mut hasher);
+    artifact_type.hash(&mut hasher);
+    validation_profile.hash(&mut hasher);
+    format!(
+        "\"{}-{}-{:016x}\"",
+        metadata.len(),
+        metadata_modified_nanos(metadata),
+        hasher.finish()
+    )
+}
+
+pub(super) async fn get_artifact_runtime_bridge() -> SkyResult<skyzen::Response> {
+    let mut hasher = std::hash::DefaultHasher::new();
+    ARTIFACT_RUNTIME_BRIDGE.hash(&mut hasher);
+    let etag = format!("\"{:016x}\"", hasher.finish());
+    Ok(file_response(
+        ARTIFACT_RUNTIME_BRIDGE.as_bytes().to_vec(),
+        "application/javascript; charset=utf-8",
+        etag.as_str(),
+        SLIDEV_CACHE_CONTROL,
+    ))
+}
+
+pub(super) async fn get_artifact_runtime_preview(
+    params: Params,
+    Query(query): Query<ArtifactRuntimePreviewQuery>,
+    if_none_match: IfNoneMatchHeader,
+    State(state): State<Arc<UiServerState>>,
+) -> SkyResult<skyzen::Response> {
+    let session_id = params.get("id").map_err(bad_request_error)?.to_string();
+    if session_id.is_empty() {
+        return Err(bad_request_error("session id is required"));
+    }
+
+    let raw_rel = parse_safe_relative_path(query.path.as_str(), "artifact path")?;
+    let session_paths = load_session_paths(&state, &session_id).await?;
+    let resolved = resolve_scoped_file(
+        &session_paths.artifacts_dir(),
+        raw_rel,
+        "artifact not found",
+        "artifact path traversal is not allowed",
+    )
+    .await?;
+    let content_type = content_type_for_path(&resolved.relative_path);
+    if !content_type.starts_with("text/html") {
+        return Err(bad_request_error(
+            "artifact runtime preview requires an HTML artifact",
+        ));
+    }
+    let artifact_type = query.artifact_type.as_str();
+    let etag = artifact_runtime_etag(
+        &resolved.metadata,
+        artifact_type,
+        GENERIC_VALIDATION_PROFILE,
+    );
+    if etag_matches(&if_none_match, etag.as_str()) {
+        return Ok(not_modified_response(etag.as_str(), PREVIEW_CACHE_CONTROL));
+    }
+
+    let bytes = async_fs::read(&resolved.canonical_path)
+        .await
+        .map_err(internal_error)?;
+    let html = String::from_utf8(bytes)
+        .map_err(|_| bad_request_error("artifact runtime preview requires UTF-8 HTML"))?;
+    let instrumented =
+        instrument_artifact_html(html.as_str(), artifact_type, GENERIC_VALIDATION_PROFILE)?;
+    Ok(file_response(
+        instrumented.into_bytes(),
+        "text/html; charset=utf-8",
+        etag.as_str(),
         PREVIEW_CACHE_CONTROL,
     ))
 }
@@ -1203,4 +1816,107 @@ pub(super) async fn get_output_preview(
         &etag,
         PREVIEW_CACHE_CONTROL,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX, GENERIC_VALIDATION_PROFILE,
+        MAX_ARTIFACT_DIAGNOSTIC_CHARS, MAX_ARTIFACT_DIAGNOSTICS, acquire_slidev_build_lock,
+        instrument_artifact_html, normalized_artifact_diagnostics, read_slidev_build_diagnostics,
+        slidev_source_diagnostics, write_slidev_build_diagnostics,
+    };
+    use crate::ui_server::types::ArtifactDiagnosticsRequest;
+
+    const VALID_SLIDEV: &str = include_str!("../../tests/fixtures/slidev/valid.md");
+    const INVALID_SLIDEV: &str =
+        include_str!("../../tests/fixtures/slidev/invalid-swallowed-slides.md");
+
+    #[test]
+    fn valid_slidev_source_has_no_structural_diagnostics() {
+        assert!(slidev_source_diagnostics(VALID_SLIDEV).is_empty());
+    }
+
+    #[test]
+    fn catches_ambiguous_separators_and_blank_first_slide() {
+        let diagnostics = slidev_source_diagnostics(INVALID_SLIDEV);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("Ambiguous Slidev separator"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("Slide 1 has no visible content"))
+        );
+    }
+
+    #[test]
+    fn instruments_generic_artifact_html_with_runtime_metadata() {
+        let instrumented = instrument_artifact_html(
+            "<!doctype html><html><head><title>Artifact</title></head><body><main>artifact</main></body></html>",
+            "html",
+            GENERIC_VALIDATION_PROFILE,
+        )
+        .expect("valid HTML should be instrumented");
+        assert!(instrumented.contains("src=\"/api/artifact-runtime.js\""));
+        assert!(instrumented.contains("data-artifact-type=\"html\""));
+        assert!(instrumented.contains("data-validation-profile=\"generic\""));
+    }
+
+    #[test]
+    fn artifact_type_rejects_non_protocol_identifiers() {
+        let request = serde_json::json!({
+            "path": "index.html",
+            "artifactType": "HTML runtime",
+            "diagnostics": ["console.error: failed"]
+        });
+        assert!(serde_json::from_value::<ArtifactDiagnosticsRequest>(request).is_err());
+    }
+
+    #[test]
+    fn bounds_runtime_diagnostics_without_dropping_the_report() {
+        let mut diagnostics = vec!["x".repeat(MAX_ARTIFACT_DIAGNOSTIC_CHARS + 100)];
+        diagnostics.extend((1..=MAX_ARTIFACT_DIAGNOSTICS).map(|index| format!("error {index}")));
+
+        let normalized = normalized_artifact_diagnostics(diagnostics)
+            .expect("oversized runtime diagnostics should be bounded");
+
+        assert_eq!(normalized.len(), MAX_ARTIFACT_DIAGNOSTICS);
+        assert_eq!(normalized[0].chars().count(), MAX_ARTIFACT_DIAGNOSTIC_CHARS);
+        assert!(normalized[0].ends_with(ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX));
+        assert_eq!(
+            normalized[MAX_ARTIFACT_DIAGNOSTICS - 1],
+            "2 additional artifact diagnostics were omitted."
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_slidev_build_diagnostics_complete_waiting_requests() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let diagnostics_file = dir.path().join("diagnostics.json");
+        let diagnostics =
+            vec!["Slidev preview build failed: dependency install timed out".to_string()];
+        write_slidev_build_diagnostics(&diagnostics_file, diagnostics.as_slice())
+            .await
+            .expect("diagnostics should be persisted");
+
+        assert_eq!(
+            read_slidev_build_diagnostics(&diagnostics_file)
+                .await
+                .expect("diagnostics should be readable"),
+            Some(diagnostics)
+        );
+        assert!(
+            acquire_slidev_build_lock(
+                dir.path().join("build.lock").as_path(),
+                dir.path().join("index.html").as_path(),
+                diagnostics_file.as_path(),
+            )
+            .await
+            .expect("cached diagnostics should complete lock acquisition")
+            .is_none()
+        );
+    }
 }

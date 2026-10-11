@@ -62,8 +62,6 @@ enum ImagineToolError {
     NonPositiveSize,
     #[error("{0}")]
     MissingApiKey(String),
-    #[error("failed to create image provider: {0}")]
-    BuildProvider(String),
     #[error("image generation failed: {0}")]
     Generate(String),
     #[error("failed to prepare artifacts directory: {0}")]
@@ -80,7 +78,11 @@ impl Tool for ImagineTool {
     type Arguments = ImagineArgs;
     type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         match self.generate_image(arguments).await {
             Ok(artifact_path) => Ok(ToolResult::text(artifact_path)),
             Err(error) => Ok(ToolResult::error(error.to_string())),
@@ -189,26 +191,15 @@ fn build_image_provider(config: &ImageGeneratorConfig) -> Result<CloudProvider, 
 }
 
 pub fn resolve_image_generator_config(may_config: &MayConfig) -> Option<ImageGeneratorConfig> {
-    let model = may_config
+    let selector = may_config
         .default_model_for_tier(crate::config::ModelTier::ImageGeneration)?
-        .to_string();
-
-    let provider_id = may_config
-        .models
-        .provider_for_model(&model, may_config.preferences.strict_model_matching)
-        .map(std::string::ToString::to_string)
-        .or_else(|| {
-            let resolver = may_config.create_resolver();
-            resolver
-                .select_provider(&model)
-                .map(|selected| selected.id.to_string())
-        })?;
-
+        .clone();
+    let provider_id = selector.provider_id().to_string();
     let provider = may_config.provider.get(&provider_id)?.clone();
 
     Some(ImageGeneratorConfig {
         provider_id,
         provider,
-        model,
+        model: selector.model_id().to_string(),
     })
 }
