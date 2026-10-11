@@ -13,8 +13,6 @@
 //! only the [`tag::WORKSPACE_WORKDIRS`] block while the rest of the
 //! workspace prefix stays cached.
 
-use std::path::PathBuf;
-
 use aither_agent::SubagentDefinition;
 use aither_core::llm::model::Ability;
 use askama::Template;
@@ -687,7 +685,7 @@ pub(crate) fn build_macos_host_automation_context() -> Option<String> {
 }
 
 fn is_running_in_container() -> bool {
-    ContainerDetector::default().detect()
+    detect_container_signal().is_some()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,56 +696,37 @@ enum ContainerSignalKind {
     OverlayRootFs,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ContainerDetector;
-
-impl ContainerDetector {
-    fn detect(&self) -> bool {
-        self.detect_signal().is_some()
+fn detect_container_signal() -> Option<ContainerSignalKind> {
+    if std::env::var_os("container").is_some() {
+        return Some(ContainerSignalKind::EnvVar);
     }
 
-    fn detect_signal(&self) -> Option<ContainerSignalKind> {
-        if std::env::var_os("container").is_some() {
-            return Some(ContainerSignalKind::EnvVar);
-        }
-
-        if std::path::Path::new("/.dockerenv").exists() {
-            return Some(ContainerSignalKind::DockerEnvFile);
-        }
-
-        if std::path::Path::new("/run/.containerenv").exists() {
-            return Some(ContainerSignalKind::ContainerEnvFile);
-        }
-
-        self.proc_root_fs_type()
-            .filter(|fs_type| matches!(fs_type.as_str(), "overlay" | "aufs"))
-            .map(|_| ContainerSignalKind::OverlayRootFs)
+    if std::path::Path::new("/.dockerenv").exists() {
+        return Some(ContainerSignalKind::DockerEnvFile);
     }
 
-    fn proc_root_fs_type(&self) -> Option<String> {
-        let mountinfo = std::fs::read_to_string("/proc/1/mountinfo").ok()?;
-        for line in mountinfo.lines() {
-            let (left, right) = line.split_once(" - ")?;
-            let mut left_fields = left.split_whitespace();
-            let mount_point = left_fields.nth(4)?;
-            if mount_point != "/" {
-                continue;
-            }
-            let fs_type = right.split_whitespace().next()?;
-            return Some(fs_type.to_string());
-        }
-        None
+    if std::path::Path::new("/run/.containerenv").exists() {
+        return Some(ContainerSignalKind::ContainerEnvFile);
     }
+
+    proc_root_fs_type()
+        .filter(|fs_type| matches!(fs_type.as_str(), "overlay" | "aufs"))
+        .map(|_| ContainerSignalKind::OverlayRootFs)
 }
 
-pub(crate) fn global_memory_file_path(may_dir: &std::path::Path) -> PathBuf {
-    let upper = crate::session::MayHomePaths::new(may_dir.to_path_buf()).memory_file();
-    if !upper.exists() {
-        std::fs::write(&upper, "").unwrap_or_else(|e| {
-            panic!("failed to initialize MEMORY.md at {}: {e}", upper.display())
-        });
+fn proc_root_fs_type() -> Option<String> {
+    let mountinfo = std::fs::read_to_string("/proc/1/mountinfo").ok()?;
+    for line in mountinfo.lines() {
+        let (left, right) = line.split_once(" - ")?;
+        let mut left_fields = left.split_whitespace();
+        let mount_point = left_fields.nth(4)?;
+        if mount_point != "/" {
+            continue;
+        }
+        let fs_type = right.split_whitespace().next()?;
+        return Some(fs_type.to_string());
     }
-    upper
+    None
 }
 
 #[cfg(test)]

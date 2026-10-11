@@ -37,7 +37,9 @@ impl TaskTriggerKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeTriggerType {
     Once,

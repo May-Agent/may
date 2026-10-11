@@ -46,11 +46,6 @@ impl TurnPersister {
         });
     }
 
-    /// Check if any tool events have been buffered.
-    pub fn has_tool_activity(&self) -> bool {
-        self.pending.iter().any(|m| m.role == MessageRole::Tool)
-    }
-
     /// Flush all buffered messages to the database.
     ///
     /// Returns the ID of the last inserted message, or `None` if nothing was flushed.

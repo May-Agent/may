@@ -42,8 +42,6 @@ use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::workspace::Workspace as MayWorkspace;
 use crate::workspace_request::WorkspaceRequestBroker;
 
-const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
-
 /// May agent error.
 #[derive(Debug, thiserror::Error)]
 pub enum MayAgentError {

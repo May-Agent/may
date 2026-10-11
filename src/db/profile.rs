@@ -2,9 +2,7 @@
 //! operations (pin/unpin/archive/move to folder), pinned counters, and
 //! default profile bootstrapping.
 
-use crate::profile::{
-    ContainerMountPreference, ContainerProfilePreferences, ProfileInfo, ProfilePreferences,
-};
+use crate::profile::{ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences};
 use crate::session::SessionRuntimeState;
 
 use super::common::{

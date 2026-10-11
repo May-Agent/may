@@ -1,7 +1,7 @@
 //! Scheduled-task CRUD and task-run lifecycle queries on [`ChatDb`].
 
 use crate::scheduler::TaskRunStatus;
-use crate::task_trigger::{PersistedTaskTrigger, TRIGGER_KIND_WEBHOOK};
+use crate::task_trigger::TRIGGER_KIND_WEBHOOK;
 
 use super::common::{CreateScheduledTaskParams, UpdateScheduledTaskParams};
 use super::entity::scheduled_tasks;

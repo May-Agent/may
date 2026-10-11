@@ -23,7 +23,9 @@ pub struct PermissionRequestModeParseError {
 }
 
 /// Scope of an in-flight permission escalation request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionRequestMode {
     Default,

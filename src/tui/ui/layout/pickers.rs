@@ -2,15 +2,14 @@
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
 use super::super::super::app::App;
-use super::{centered_rect, centered_rect_exact, display_width_prefix};
-use crate::SessionSummary;
+use super::{centered_rect, centered_rect_exact};
 
 /// Render session selection popup with profile sections.
 pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {

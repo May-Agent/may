@@ -464,8 +464,6 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, popup_area);
 }
 
-/// Render unified configuration screen (full screen) with tabs.
-
 /// Render model select popup (anchored near input area).
 fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     // Position popup near bottom of screen, left-aligned

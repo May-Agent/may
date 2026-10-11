@@ -21,7 +21,9 @@ const fn session_runtime_state_is_idle(value: &SessionRuntimeState) -> bool {
 }
 
 /// Persisted runtime state for a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum SessionRuntimeState {
@@ -85,7 +87,9 @@ impl core::str::FromStr for SessionRuntimeState {
 }
 
 /// Persisted terminal-runtime metadata owned by the server runtime.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalRuntimeState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,7 +128,17 @@ impl TerminalRuntimeState {
 }
 
 /// Persisted browser interaction state owned by the server runtime.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    skyzen::ToSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserInteractionState {
     #[serde(default, skip_serializing_if = "is_false")]
@@ -141,7 +155,9 @@ impl BrowserInteractionState {
 }
 
 /// Persisted interactive-resource state for a session.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInteractionState {
     #[serde(default, skip_serializing_if = "BrowserInteractionState::is_empty")]
@@ -178,7 +194,9 @@ pub struct PendingUserMessage {
 }
 
 /// Delivery mode for a pending user message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum PendingUserMessageMode {
@@ -366,7 +384,9 @@ impl SessionRuntimeSummary {
 }
 
 /// Persisted attachment shape for pending user messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentKind {
     Image,
