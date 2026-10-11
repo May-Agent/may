@@ -531,9 +531,10 @@ impl BrowserRuntime {
 
     fn drop_peer(&mut self, peer_id: &str) {
         if self.peers.remove(peer_id).is_some() {
-            self.lifecycle.emit(BrowserLifecycleEvent::PeerDisconnected {
-                count: self.peers.len(),
-            });
+            self.lifecycle
+                .emit(BrowserLifecycleEvent::PeerDisconnected {
+                    count: self.peers.len(),
+                });
         }
     }
 
@@ -960,8 +961,8 @@ async fn seed_system_profile_if_empty(
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), BrowserError> {
     for entry in WalkDir::new(src) {
-        let entry = entry
-            .map_err(|error| BrowserError::browser_operation("walk system profile", error))?;
+        let entry =
+            entry.map_err(|error| BrowserError::browser_operation("walk system profile", error))?;
         let from = entry.path();
         let relative = from.strip_prefix(src).map_err(|error| {
             BrowserError::browser_operation("strip prefix during profile copy", error)
@@ -1149,9 +1150,9 @@ impl BrowserRuntime {
                         std::io::Error::other(error),
                     )
                 })?;
-            page.execute(stealth_params).await.map_err(|error| {
-                BrowserError::browser_operation("inject stealth shim", error)
-            })?;
+            page.execute(stealth_params)
+                .await
+                .map_err(|error| BrowserError::browser_operation("inject stealth shim", error))?;
         }
 
         let max_width = i64::from(config.screencast_max_width);
@@ -1522,10 +1523,7 @@ fn build_managed_browser_launch_config(
             .arg("--no-first-run");
     }
     builder.build().map_err(|error| {
-        BrowserError::browser_operation(
-            "build browser launch config",
-            std::io::Error::other(error),
-        )
+        BrowserError::browser_operation("build browser launch config", std::io::Error::other(error))
     })
 }
 
@@ -2123,8 +2121,8 @@ fn encode_loop(
     let keyframe_interval = Duration::from_secs(2);
 
     // `blocking_recv` is the documented bridge between tokio mpsc and
-     // a `spawn_blocking` task. It blocks the current OS thread (which
-     // is the blocking-pool thread we own here) until a frame arrives.
+    // a `spawn_blocking` task. It blocks the current OS thread (which
+    // is the blocking-pool thread we own here) until a frame arrives.
     while let Some(jpeg_bytes) = frame_rx.blocking_recv() {
         // Decode JPEG → RGB
         let img = match image::load_from_memory_with_format(&jpeg_bytes, image::ImageFormat::Jpeg) {
@@ -2266,8 +2264,7 @@ fn setup_data_channel_handler(
                         Err(_) => return,
                     };
                     if let Err(e) =
-                        handle_input_message(&page, &text, &peer_session_id, &takeover_owner)
-                            .await
+                        handle_input_message(&page, &text, &peer_session_id, &takeover_owner).await
                     {
                         tracing::warn!(error = %e, "Browser input handling failed");
                     }
@@ -2280,10 +2277,7 @@ fn setup_data_channel_handler(
 /// Returns true if the `peer_session_id` currently owns input over the
 /// browser. Pure function over the snapshot — exercised by the takeover
 /// gate unit test.
-fn takeover_allows_input(
-    peer_session_id: &str,
-    takeover_owner: &ArcSwapOption<String>,
-) -> bool {
+fn takeover_allows_input(peer_session_id: &str, takeover_owner: &ArcSwapOption<String>) -> bool {
     let owner = takeover_owner.load();
     owner
         .as_ref()
