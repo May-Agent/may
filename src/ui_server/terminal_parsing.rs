@@ -2,22 +2,24 @@
 
 use aither_core::llm::ToolResult;
 use aither_sandbox::{OutputEntry, TerminalArgs, TerminalExecutionMode};
+use serde::Deserialize;
 
 use super::types::{
     ApiTerminalExecution, TERMINAL_TOOL_NAME, TerminalCommandMode, TerminalExecutionStatus,
     TerminalStateSnapshot, ToolEventRecord,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum TerminalTaskStatus {
     Running,
     Stopped,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) struct ParsedTerminalToolResult {
+    #[schema(value_type = serde_json::Value)]
     pub(super) stdout: OutputEntry,
     pub(super) exit_code: i32,
     #[serde(default)]
@@ -59,7 +61,9 @@ pub(super) fn parse_terminal_result_payload(
     let ToolResult::Json { value } = result else {
         return None;
     };
-    serde_json::from_value(value.clone()).ok()
+    // Deserialize from `&Value` directly — `serde_json::from_value` would
+    // deep-clone the whole tree (including full stdout) first.
+    ParsedTerminalToolResult::deserialize(value).ok()
 }
 
 /// Preserve terminal tool output as structured JSON when possible.

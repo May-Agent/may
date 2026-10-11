@@ -26,7 +26,7 @@ use super::types::{
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct EventsQuery {
     #[serde(default)]

@@ -10,7 +10,7 @@
 //! variant cares about. Each projection is `Option<String>` — `None` when
 //! the field hasn't streamed in yet, `Some(value)` once readable.
 
-use partial_json_fixer::fix_json_parse;
+use partial_json_fixer::fix_json;
 use serde_json::Value;
 
 use crate::ui_server::types::ToolVariant;
@@ -23,7 +23,7 @@ use crate::ui_server::types::ToolVariant;
 /// - web_fetch → `url`
 /// - browser → `action`, `target`
 /// - task / ask / session / notify / generic → `description`, `prompt` where applicable
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,10 +79,11 @@ pub fn project_tool_summary(arguments_raw: &str, variant: ToolVariant) -> ToolSu
     if trimmed.is_empty() {
         return ToolSummary::default();
     }
-    let Ok(parsed_value) = fix_json_parse(trimmed.into()) else {
-        return ToolSummary::default();
-    };
-    let value: Value = match serde_json::from_str(&parsed_value.to_string()) {
+    // `fix_json` repairs the fragment textually (one pass, no intermediate
+    // tree); the single serde parse then performs JSON unescaping. This
+    // replaces the previous repair-parse → re-serialize → re-parse round
+    // trip, which did three full passes per streamed delta.
+    let value: Value = match serde_json::from_str(&fix_json(trimmed)) {
         Ok(v) => v,
         Err(_) => return ToolSummary::default(),
     };
@@ -163,8 +164,7 @@ mod tests {
             }
         }
         // Final frame: both fields populated.
-        let final_summary =
-            project_tool_summary(frames.last().unwrap(), ToolVariant::Terminal);
+        let final_summary = project_tool_summary(frames.last().unwrap(), ToolVariant::Terminal);
         assert_eq!(
             final_summary.description.as_deref(),
             Some("Get current local time")
