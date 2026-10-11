@@ -357,14 +357,14 @@ async fn run_browser_service(
             BrowserServiceRequest::Status => (
                 BrowserServiceResponse::Ok {
                     payload: BrowserServiceStatus {
-                        running: browser_manager.is_running().await,
+                        running: browser_manager.is_running(),
                         cdp_endpoint: browser_manager.cdp_endpoint(),
                     },
                 },
                 false,
             ),
             BrowserServiceRequest::EnsureStarted => match async {
-                if !browser_manager.is_running().await {
+                if !browser_manager.is_running() {
                     may_agent::container::browser::prepare_browser_runtime(
                         &config.browser,
                         &may_dir,
@@ -389,7 +389,7 @@ async fn run_browser_service(
                 Err(message) => (BrowserServiceResponse::Error { message }, false),
             },
             BrowserServiceRequest::Stop => match async {
-                if browser_manager.is_running().await {
+                if browser_manager.is_running() {
                     browser_manager
                         .stop()
                         .await
@@ -403,7 +403,7 @@ async fn run_browser_service(
                 Err(message) => (BrowserServiceResponse::Error { message }, false),
             },
             BrowserServiceRequest::Read { url, options } => match async {
-                if !browser_manager.is_running().await {
+                if !browser_manager.is_running() {
                     may_agent::container::browser::prepare_browser_runtime(
                         &config.browser,
                         &may_dir,

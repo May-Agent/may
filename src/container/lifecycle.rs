@@ -66,7 +66,7 @@ impl ContainerManager {
 
         let host_gateway = self.runtime.host_gateway().to_string();
         let shared_paths = self.ensure_shared_paths().await?;
-        let spec_fingerprint = self.compute_spec_fingerprint(spec, &host_gateway, &shared_paths)?;
+        let spec_fingerprint = Self::compute_spec_fingerprint(spec, &host_gateway, &shared_paths)?;
 
         if let Some(container) = self.find_container_by_name(spec.name.as_str()).await? {
             let id = container
@@ -100,7 +100,7 @@ impl ContainerManager {
                     .create_container(spec, &host_gateway, &shared_paths, &spec_fingerprint)
                     .await?;
                 self.runtime.client.start_container(&new_id, None).await?;
-                self.touch_activity(&new_id).await;
+                self.touch_activity(&new_id);
                 tracing::info!(
                     container_id = %new_id,
                     name = %spec.name,
@@ -110,13 +110,13 @@ impl ContainerManager {
             }
 
             if is_running {
-                self.touch_activity(&id).await;
+                self.touch_activity(&id);
                 return Ok(id);
             }
 
             // Container exists but isn't running — start it
             self.runtime.client.start_container(&id, None).await?;
-            self.touch_activity(&id).await;
+            self.touch_activity(&id);
             tracing::info!(container_id = %id, "Started existing container");
             return Ok(id);
         }
@@ -128,7 +128,7 @@ impl ContainerManager {
 
         // Start it
         self.runtime.client.start_container(&id, None).await?;
-        self.touch_activity(&id).await;
+        self.touch_activity(&id);
         tracing::info!(container_id = %id, name = %spec.name, "Created and started container");
 
         Ok(id)
@@ -167,8 +167,8 @@ impl ContainerManager {
         shared_paths: &SharedHostPaths,
         spec_fingerprint: &str,
     ) -> Result<String, ContainerError> {
-        let env = self.effective_env(spec, host_gateway);
-        let mounts = self.effective_mounts(spec, shared_paths)?;
+        let env = Self::effective_env(spec, host_gateway);
+        let mounts = Self::effective_mounts(spec, shared_paths)?;
 
         let host_config = HostConfig {
             mounts: Some(mounts),
@@ -238,7 +238,7 @@ impl ContainerManager {
         Ok(SharedHostPaths { memory_file })
     }
 
-    fn effective_env(&self, spec: &ContainerLaunchSpec, host_gateway: &str) -> Vec<String> {
+    fn effective_env(spec: &ContainerLaunchSpec, host_gateway: &str) -> Vec<String> {
         let mut env = vec![
             "TERM=xterm-256color".to_string(),
             format!("MAY_HOST_GATEWAY={host_gateway}"),
@@ -248,7 +248,6 @@ impl ContainerManager {
     }
 
     fn effective_mounts(
-        &self,
         spec: &ContainerLaunchSpec,
         shared_paths: &SharedHostPaths,
     ) -> Result<Vec<Mount>, ContainerError> {
@@ -300,16 +299,14 @@ impl ContainerManager {
     }
 
     fn compute_spec_fingerprint(
-        &self,
         spec: &ContainerLaunchSpec,
         host_gateway: &str,
         shared_paths: &SharedHostPaths,
     ) -> Result<String, ContainerError> {
-        let mut env = self.effective_env(spec, host_gateway);
+        let mut env = Self::effective_env(spec, host_gateway);
         env.sort_unstable();
 
-        let mut mounts: Vec<String> = self
-            .effective_mounts(spec, shared_paths)?
+        let mut mounts: Vec<String> = Self::effective_mounts(spec, shared_paths)?
             .iter()
             .map(|mount| {
                 format!(
@@ -385,7 +382,7 @@ impl ContainerManager {
     }
 
     /// Record activity for a container (resets auto-stop timer).
-    pub async fn touch_activity(&self, container_id: &str) {
+    pub fn touch_activity(&self, container_id: &str) {
         self.update_activity(|activity| {
             activity.insert(container_id.to_string(), Instant::now());
         });
