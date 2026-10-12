@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "aither-agent"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "aither-sandbox"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -394,26 +394,38 @@ dependencies = [
  "async-io 2.6.0",
  "async-process",
  "base64 0.23.1",
+ "blocking",
  "bollard",
  "executor-core",
+ "flate2",
+ "futures",
  "futures-lite 2.6.1",
  "globset",
  "heel",
+ "hex",
  "human-hash",
  "image",
  "libc",
+ "procfs-core",
  "quick-xml 0.42.0",
  "rmp-serde",
  "schemars 1.2.2",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shell-words",
  "strsim",
+ "tar",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
  "uuid",
  "vte",
+ "zenwave",
+ "zip 4.6.1",
 ]
 
 [[package]]
@@ -6150,9 +6162,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.2.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70db6a373556f9e6f64fefaa46576591d48030fa9d4dba636bf5a963878c8763"
+checksum = "d2326beefa82095d161bb67550d3dd1607e60281bf88067226dc25170b358a71"
 dependencies = [
  "askama 0.12.1",
  "async-channel 2.5.0",
@@ -6161,6 +6173,8 @@ dependencies = [
  "bytes",
  "clap",
  "crossterm 0.29.0",
+ "dunce",
+ "errno",
  "executor-core",
  "futures-lite 2.6.1",
  "http-body-util",
@@ -6172,6 +6186,7 @@ dependencies = [
  "polling 3.11.0",
  "pty-process",
  "rand 0.8.8",
+ "rappct",
  "remove_dir_all",
  "rmp-serde",
  "seccompiler",
@@ -6186,7 +6201,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "which 7.0.3",
- "windows",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -10905,6 +10920,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "procfs-core"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6401bf7b6af22f78b563665d15a22e9aef27775b79b149a66ca022468a4e405"
+dependencies = [
+ "bitflags 2.13.2",
+ "hex",
+]
+
+[[package]]
 name = "proptest"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11381,6 +11406,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
 
 [[package]]
+name = "rappct"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11762a6aea3b0a87a51b21cb2085d252f10c01cd0f3f505e1da002cf6e2427da"
+dependencies = [
+ "thiserror 2.0.21",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "ratatui"
 version = "0.30.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11444,7 +11480,7 @@ dependencies = [
  "ratatui",
  "rustix 0.38.44",
  "thiserror 1.0.69",
- "windows",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -12277,6 +12313,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "seq-macro"
@@ -15315,6 +15355,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections",
+ "windows-core 0.62.2",
+ "windows-future",
+ "windows-numerics",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core 0.62.2",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15338,6 +15399,17 @@ dependencies = [
  "windows-link 0.2.1",
  "windows-result 0.4.1",
  "windows-strings 0.5.1",
+]
+
+[[package]]
+name = "windows-future"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
+dependencies = [
+ "windows-core 0.62.2",
+ "windows-link 0.2.1",
+ "windows-threading",
 ]
 
 [[package]]
@@ -15395,6 +15467,16 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-numerics"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
+dependencies = [
+ "windows-core 0.62.2",
+ "windows-link 0.2.1",
+]
 
 [[package]]
 name = "windows-registry"
@@ -15564,6 +15646,15 @@ dependencies = [
  "windows_x86_64_gnu 0.53.1",
  "windows_x86_64_gnullvm 0.53.1",
  "windows_x86_64_msvc 0.53.1",
+]
+
+[[package]]
+name = "windows-threading"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -16084,6 +16175,19 @@ dependencies = [
  "memchr",
  "thiserror 2.0.21",
  "zopfli",
+]
+
+[[package]]
+name = "zip"
+version = "4.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.2",
+ "memchr",
 ]
 
 [[package]]

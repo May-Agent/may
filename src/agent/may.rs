@@ -47,6 +47,9 @@ use crate::workspace_request::WorkspaceRequestBroker;
 pub enum MayAgentError {
     #[error("Config error: {0}")]
     Config(#[from] crate::config::ConfigError),
+    /// Baseline preparation failed before the agent became ready.
+    #[error("Baseline tool initialization failed: {0}")]
+    ToolInitialization(#[from] aither_sandbox::ToolRuntimeError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("LLM error: {0}")]
@@ -92,6 +95,8 @@ pub enum AgentEnvironment {
 
 /// Configuration for creating a `MayAgent`.
 pub struct MayAgentConfig {
+    /// Trusted baseline tool distribution used by every configured backend.
+    pub tools: crate::config::ToolRuntimeConfig,
     /// The LLM provider.
     pub llm: CloudProvider,
     /// The concrete model identifier selected for this request.
@@ -299,12 +304,14 @@ impl MayAgent {
         } else {
             config.max_iterations
         };
+        let terminal_jobs = terminal_tool.job_registry();
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook);
         let terminal_command_factory = builder.terminal_tool_factory();
         let shared_terminal_commands = register_shared_terminal_commands(
             builder.tool_registry_mut(),
+            terminal_jobs,
             SharedTerminalCommandConfig {
                 llm: terminal_command_llm,
                 ask_flagship,
@@ -454,7 +461,10 @@ impl MayAgent {
 
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
-
+        let distribution = config.tools.load_distribution().await?;
+        let builder = builder
+            .initialize_tools(&distribution, &config.may_dir.join("tools/cache"))
+            .await?;
         let agent = builder.build();
 
         Ok(Self {
@@ -551,6 +561,7 @@ impl MayAgent {
         let ask_models =
             super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await;
         let config = MayAgentConfig {
+            tools: may_config.tools.clone(),
             llm,
             model_id: model.to_string(),
             provider_id,
