@@ -54,6 +54,8 @@ pub enum ExecError {
     CompileNetworkPolicy(aither_sandbox::NetworkPolicyError),
     #[error("failed to create terminal tool: {0}")]
     CreateTerminalTool(aither_sandbox::TerminalError),
+    #[error("failed to initialize baseline tools: {0}")]
+    InitializeBaselineTools(#[from] aither_sandbox::ToolRuntimeError),
     #[error("failed to initialize tool dispatch runtime: {0}")]
     InitializeToolDispatch(may_agent::tool_dispatch::ToolDispatchError),
     #[error("failed to configure ssh servers: {0}")]
@@ -80,24 +82,24 @@ struct ExecSessionContext {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct NoopSshAuthorizer;
+struct ExecSshAuthorizer {
+    allow_runtime_install: bool,
+}
 
-impl aither_sandbox::SshSessionAuthorizer for NoopSshAuthorizer {
-    fn authorize_connect(
+impl aither_sandbox::SshSessionAuthorizer for ExecSshAuthorizer {
+    async fn authorize_connect(
         &self,
         _target: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-    {
-        Box::pin(async { Ok(true) })
+    ) -> Result<bool, aither_sandbox::SshAuthorizationError> {
+        Ok(true)
     }
 
-    fn authorize_heel_install(
+    async fn authorize_runtime_install(
         &self,
         _target: &str,
         _details: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>>
-    {
-        Box::pin(async { Ok(true) })
+    ) -> Result<bool, aither_sandbox::SshAuthorizationError> {
+        Ok(self.allow_runtime_install)
     }
 }
 
@@ -121,8 +123,14 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
 
     let model = select_exec_model(&may_config);
     let shell_mode = select_exec_mode(&args, &environment);
-    let terminal_tool =
-        build_exec_terminal_tool(&context, &environment, &may_config, &model).await?;
+    let terminal_tool = build_exec_terminal_tool(
+        &context,
+        &environment,
+        &may_config,
+        &model,
+        args.allow_runtime_install,
+    )
+    .await?;
 
     let output = terminal_tool
         .call(
@@ -284,6 +292,7 @@ async fn build_exec_terminal_tool(
     environment: &may_agent::AgentEnvironment,
     may_config: &MayConfig,
     model: &str,
+    allow_runtime_install: bool,
 ) -> Result<
     TerminalTool<
         TerminalPermissionHandler,
@@ -311,7 +320,9 @@ async fn build_exec_terminal_tool(
         shell_sessions = shell_sessions
             .with_ssh_servers(ssh_servers)
             .map_err(ExecError::ConfigureSshServers)?
-            .with_ssh_authorizer(Arc::new(NoopSshAuthorizer));
+            .with_ssh_authorizer(Arc::new(ExecSshAuthorizer {
+                allow_runtime_install,
+            }));
     }
 
     let runtime_service = std::sync::Arc::new(may_agent::session::SessionRuntimeService::new(
@@ -367,6 +378,10 @@ async fn build_exec_terminal_tool(
         _ => terminal_tool.with_shell_sessions(shell_sessions),
     };
 
+    let distribution = may_config.tools.load_distribution().await?;
+    let terminal_tool = terminal_tool
+        .initialize_tools(&distribution, &context.may_dir.join("tools/cache"))
+        .await?;
     let resolved_provider = resolve_provider_runtime(may_config, model, 0)
         .await
         .map_err(ExecError::ResolveProviderRuntime)?;
@@ -390,6 +405,7 @@ async fn build_exec_terminal_tool(
         resolved_provider.search_embedder,
         &tool_dispatchers,
         terminal_tool_factory,
+        terminal_tool.job_registry(),
         environment,
     )
     .await?;
@@ -405,6 +421,7 @@ async fn build_exec_registry<LLM>(
     search_embedder: may_agent::embedding_provider::EmbeddingModelResolution,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     terminal_tool_factory: aither_sandbox::TerminalToolFactory,
+    terminal_jobs: aither_sandbox::JobRegistry,
     environment: &may_agent::AgentEnvironment,
 ) -> Result<Arc<aither_sandbox::ToolRegistry>, ExecError>
 where
@@ -413,6 +430,7 @@ where
     let mut builder = aither_sandbox::ToolRegistryBuilder::new();
     register_shared_terminal_commands(
         &mut builder,
+        terminal_jobs,
         SharedTerminalCommandConfig {
             llm,
             ask_flagship: None,

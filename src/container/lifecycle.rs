@@ -27,6 +27,7 @@ const DEFAULT_AUTO_STOP_MINUTES: u64 = 30;
 #[derive(Debug, Clone)]
 struct SharedHostPaths {
     memory_file: PathBuf,
+    tools_mount: aither_sandbox::MountSpec,
 }
 
 /// Manages container lifecycle for profile-based isolation.
@@ -65,7 +66,7 @@ impl ContainerManager {
         use bollard::models::ContainerSummaryStateEnum;
 
         let host_gateway = self.runtime.host_gateway().to_string();
-        let shared_paths = self.ensure_shared_paths().await?;
+        let shared_paths = self.ensure_shared_paths(spec).await?;
         let spec_fingerprint = Self::compute_spec_fingerprint(spec, &host_gateway, &shared_paths)?;
 
         if let Some(container) = self.find_container_by_name(spec.name.as_str()).await? {
@@ -212,7 +213,49 @@ impl ContainerManager {
         Ok(response.id)
     }
 
-    async fn ensure_shared_paths(&self) -> Result<SharedHostPaths, ContainerError> {
+    async fn ensure_shared_paths(
+        &self,
+        spec: &ContainerLaunchSpec,
+    ) -> Result<SharedHostPaths, ContainerError> {
+        let (image, distribution) = futures_lite::future::try_zip(
+            async {
+                self.runtime
+                    .client
+                    .inspect_image(&spec.image)
+                    .await
+                    .map_err(ContainerError::Docker)
+            },
+            async {
+                crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
+                    .await?
+                    .tools
+                    .load_distribution()
+                    .await
+                    .map_err(ContainerError::Tools)
+            },
+        )
+        .await?;
+        let target = aither_sandbox::ToolTarget::from_probe(
+            image.os.as_deref().ok_or_else(|| {
+                ContainerError::Bootstrap("container image has no operating system".into())
+            })?,
+            image.architecture.as_deref().ok_or_else(|| {
+                ContainerError::Bootstrap("container image has no architecture".into())
+            })?,
+        )?;
+        let bundle = distribution
+            .load(&target, &self.may_dir.join("tools/artifacts"))
+            .await?;
+        let (tools_mount, host_tools) = bundle
+            .prepare_container_mount(&self.may_dir.join("tools/container-runtimes"))
+            .await?;
+        let writable = std::iter::once(&spec.workspace).chain(
+            spec.mounts
+                .iter()
+                .filter(|mount| mount.access == MountAccess::ReadWrite)
+                .map(|mount| &mount.host_path),
+        );
+        host_tools.ensure_readonly(writable).await?;
         let home_paths = MayHomePaths::new(self.may_dir.clone());
         let memory_file = home_paths.memory_file();
         if tokio::fs::metadata(&memory_file).await.is_err() {
@@ -235,7 +278,10 @@ impl ContainerManager {
                     home_paths.memory_file().display()
                 ))
             })?;
-        Ok(SharedHostPaths { memory_file })
+        Ok(SharedHostPaths {
+            memory_file,
+            tools_mount,
+        })
     }
 
     fn effective_env(spec: &ContainerLaunchSpec, host_gateway: &str) -> Vec<String> {
@@ -295,6 +341,19 @@ impl ContainerManager {
             });
         }
 
+        mounts.push(Mount {
+            target: Some(
+                shared_paths
+                    .tools_mount
+                    .container_path
+                    .display()
+                    .to_string(),
+            ),
+            source: Some(shared_paths.tools_mount.host_path.display().to_string()),
+            typ: Some(MountType::BIND),
+            read_only: Some(true),
+            ..Default::default()
+        });
         Ok(mounts)
     }
 
@@ -465,5 +524,74 @@ impl ContainerManager {
             .await?;
         let running = info.state.and_then(|s| s.running).unwrap_or(false);
         Ok(running)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared_paths() -> SharedHostPaths {
+        SharedHostPaths {
+            memory_file: "/managed/MEMORY.md".into(),
+            tools_mount: aither_sandbox::MountSpec::read_only(
+                "/managed/tools/bundle",
+                "/opt/aither/tools/bundle",
+            ),
+        }
+    }
+
+    #[test]
+    fn tool_mount_is_readonly_and_preserves_workspace_mounts() {
+        let spec = ContainerLaunchSpec::new("test", "test-image", "/workspace-host").with_mount(
+            aither_sandbox::MountSpec::read_write("/project-host", "/project"),
+        );
+        let shared = shared_paths();
+        let mounts = ContainerManager::effective_mounts(&spec, &shared).unwrap();
+        let tools = mounts
+            .iter()
+            .find(|mount| mount.target.as_deref() == Some("/opt/aither/tools/bundle"))
+            .unwrap();
+        assert_eq!(tools.source.as_deref(), Some("/managed/tools/bundle"));
+        assert_eq!(tools.typ, Some(MountType::BIND));
+        assert_eq!(tools.read_only, Some(true));
+        for target in ["/workspace", "/project"] {
+            assert_eq!(
+                mounts
+                    .iter()
+                    .find(|mount| mount.target.as_deref() == Some(target))
+                    .unwrap()
+                    .read_only,
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_change_invalidates_container_fingerprint() {
+        let spec = ContainerLaunchSpec::new("test", "test-image", "/workspace-host");
+        let first = shared_paths();
+        let mut second = first.clone();
+        second.tools_mount = aither_sandbox::MountSpec::read_only(
+            "/managed/tools/new-bundle",
+            "/opt/aither/tools/new-bundle",
+        );
+        assert_ne!(
+            ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &first)
+                .unwrap(),
+            ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &second)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn tool_and_configuration_errors_remain_distinct() {
+        let preparation = ContainerError::from(aither_sandbox::ToolRuntimeError::InvalidProbe);
+        assert!(matches!(preparation, ContainerError::Tools(_)));
+        let configuration = ContainerError::from(crate::config::ConfigError::NoHomeDir);
+        assert!(matches!(
+            configuration,
+            ContainerError::ToolsConfiguration(_)
+        ));
     }
 }
