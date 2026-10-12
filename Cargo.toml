@@ -19,17 +19,17 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
 # Aither framework
-aither-core = { version = ">=0.4.1, <0.7", path = "../aither/core" }
-aither-agent = { version = ">=0.4.1, <0.7", path = "../aither/agent", features = ["mcp", "websearch", "webfetch", "skills"] }
-aither-sandbox = { version = ">=0.4.1, <0.7", path = "../aither/sandbox" }
-aither-cloud = { version = ">=0.4.1, <0.7", path = "../aither/cloud" }
-aither-rag = { version = ">=0.4.1, <0.7", path = "../aither/rag" }
-aither-copilot = { version = ">=0.4.1, <0.7", path = "../aither/copilot" }
-aither-codex = { version = ">=0.4.1, <0.7", path = "../aither/codex" }
-aither-models = { version = ">=0.4.1, <0.7", path = "../aither/models" }
-aither-mcp = { version = ">=0.4.1, <0.7", path = "../aither/mcp" }
-aither-browser = { version = ">=0.4.1, <0.7", path = "../aither/tools/browser" }
-aither-search = { version = ">=0.4.1, <0.7", path = "../aither/tools/search" }
+aither-core = { version = ">=0.4.1, <0.7", path = "../aither-tool-runtime/core" }
+aither-agent = { version = "0.7.0", path = "../aither-tool-runtime/agent", features = ["mcp", "websearch", "webfetch", "skills"] }
+aither-sandbox = { version = "0.7.0", path = "../aither-tool-runtime/sandbox" }
+aither-cloud = { version = ">=0.4.1, <0.7", path = "../aither-tool-runtime/cloud" }
+aither-rag = { version = ">=0.4.1, <0.7", path = "../aither-tool-runtime/rag" }
+aither-copilot = { version = ">=0.4.1, <0.7", path = "../aither-tool-runtime/copilot" }
+aither-codex = { version = ">=0.4.1, <0.7", path = "../aither-tool-runtime/codex" }
+aither-models = { version = ">=0.4.1, <0.7", path = "../aither-tool-runtime/models" }
+aither-mcp = { version = ">=0.4.1, <0.7", path = "../aither-tool-runtime/mcp" }
+aither-browser = { version = ">=0.4.1, <0.7", path = "../aither-tool-runtime/tools/browser" }
+aither-search = { version = ">=0.4.1, <0.7", path = "../aither-tool-runtime/tools/search" }
 
 # Container runtime (Docker/OrbStack/Podman)
 bollard = "0.21"
