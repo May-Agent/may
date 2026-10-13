@@ -380,6 +380,7 @@ async fn build_exec_terminal_tool(
 
     let distribution = may_config.tools.load_distribution().await?;
     let terminal_tool = terminal_tool
+        .with_process_priority(may_config.sandbox.command_priority.process_priority())
         .initialize_tools(&distribution, &context.may_dir.join("tools/cache"))
         .await?;
     let resolved_provider = resolve_provider_runtime(may_config, model, 0)

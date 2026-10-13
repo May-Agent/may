@@ -97,6 +97,8 @@ pub enum AgentEnvironment {
 pub struct MayAgentConfig {
     /// Trusted baseline tool distribution used by every configured backend.
     pub tools: crate::config::ToolRuntimeConfig,
+    /// Scheduling priority applied to commands this agent runs.
+    pub command_priority: crate::config::CommandPriority,
     /// The LLM provider.
     pub llm: CloudProvider,
     /// The concrete model identifier selected for this request.
@@ -203,7 +205,8 @@ impl MayAgent {
             )
             .await
             .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
-            .with_network_audit_log(network_audit);
+            .with_network_audit_log(network_audit)
+            .with_process_priority(config.command_priority.process_priority());
 
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
@@ -562,6 +565,7 @@ impl MayAgent {
             super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await;
         let config = MayAgentConfig {
             tools: may_config.tools.clone(),
+            command_priority: may_config.sandbox.command_priority,
             llm,
             model_id: model.to_string(),
             provider_id,

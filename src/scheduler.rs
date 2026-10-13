@@ -268,6 +268,14 @@ struct TaskScript {
     host_working_dir: PathBuf,
 }
 
+/// A task shell prepared from one config snapshot: verified sessions plus the
+/// command priority the schedule currently runs under.
+#[derive(Debug)]
+struct PreparedTaskShell {
+    sessions: ShellSessionRegistry,
+    priority: aither_sandbox::ProcessPriority,
+}
+
 #[derive(Debug, Clone)]
 struct MaterializedTaskExecution {
     command: String,
@@ -1064,24 +1072,30 @@ impl TaskRuntime {
 
     /// Loads the baseline tool distribution and prepares the registry's
     /// configured backends, so every terminal — local or container — runs
-    /// with the same verified tools before `TerminalTool` executes.
+    /// with the same verified tools before `TerminalTool` executes. The
+    /// command priority comes from the same config snapshot, so a saved
+    /// change reaches the next scheduled launch without global state.
     async fn initialize_shell_sessions(
         &self,
         registry: ShellSessionRegistry,
-    ) -> Result<ShellSessionRegistry, String> {
-        let distribution = crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
+    ) -> Result<PreparedTaskShell, String> {
+        let config = crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
             .await
             .map_err(|error| {
                 init_terminal_tool_error("failed to load May config for baseline tools: ", &error)
-            })?
-            .tools
-            .load_distribution()
-            .await
-            .map_err(|error| init_terminal_tool_error("failed to load baseline tools: ", &error))?;
-        registry
+            })?;
+        let priority = config.sandbox.command_priority.process_priority();
+        let distribution =
+            config.tools.load_distribution().await.map_err(|error| {
+                init_terminal_tool_error("failed to load baseline tools: ", &error)
+            })?;
+        let sessions = registry
             .initialize_tools(&distribution, &self.may_dir.join("tools/cache"))
             .await
-            .map_err(|error| init_terminal_tool_error("failed to prepare baseline tools: ", &error))
+            .map_err(|error| {
+                init_terminal_tool_error("failed to prepare baseline tools: ", &error)
+            })?;
+        Ok(PreparedTaskShell { sessions, priority })
     }
 
     async fn local_terminal_tool(
@@ -1096,7 +1110,7 @@ impl TaskRuntime {
             container: false,
             ssh: false,
         });
-        let shell_sessions = self.initialize_shell_sessions(shell_sessions).await?;
+        let prepared = self.initialize_shell_sessions(shell_sessions).await?;
         let registry =
             Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
@@ -1124,7 +1138,8 @@ impl TaskRuntime {
         })
         .map(|tool| {
             tool.with_network_audit_log(network_audit)
-                .with_shell_sessions(shell_sessions)
+                .with_shell_sessions(prepared.sessions)
+                .with_process_priority(prepared.priority)
                 .with_writable_paths([script.host_working_dir.clone()])
                 .with_readable_paths([script.host_working_dir.clone()])
                 .with_registry(registry)
@@ -1223,7 +1238,7 @@ impl TaskRuntime {
             ssh: false,
         })
         .with_container_runtime(container_runtime);
-        let shell_sessions = self.initialize_shell_sessions(shell_sessions).await?;
+        let prepared = self.initialize_shell_sessions(shell_sessions).await?;
 
         // Use host workspace dir for output storage while executing commands in
         // /workspace inside container.
@@ -1246,7 +1261,8 @@ impl TaskRuntime {
             .map_err(|error| {
                 init_terminal_tool_error("failed to initialize container terminal tool: ", &error)
             })?
-            .with_shell_sessions(shell_sessions)
+            .with_shell_sessions(prepared.sessions)
+            .with_process_priority(prepared.priority)
             .with_writable_paths([workspace_dir.clone()])
             .with_readable_paths([workspace_dir])
             .with_registry(registry);
@@ -1362,7 +1378,7 @@ impl TaskRuntime {
             ssh: false,
         })
         .with_container_runtime(container_runtime);
-        let shell_sessions = self.initialize_shell_sessions(shell_sessions).await?;
+        let prepared = self.initialize_shell_sessions(shell_sessions).await?;
 
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
@@ -1383,7 +1399,8 @@ impl TaskRuntime {
             .map_err(|error| {
                 init_terminal_tool_error("failed to initialize container terminal tool: ", &error)
             })?
-            .with_shell_sessions(shell_sessions)
+            .with_shell_sessions(prepared.sessions)
+            .with_process_priority(prepared.priority)
             .with_writable_paths([workspace_dir.clone()])
             .with_readable_paths([workspace_dir])
             .with_registry(registry);

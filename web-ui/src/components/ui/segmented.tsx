@@ -13,6 +13,7 @@ export interface SegmentedProps<T extends string> {
   options: SegmentedOption<T>[];
   className?: string;
   size?: 'sm' | 'md';
+  disabled?: boolean;
 }
 
 export function Segmented<T extends string>({
@@ -21,6 +22,7 @@ export function Segmented<T extends string>({
   options,
   className,
   size = 'md',
+  disabled = false,
 }: SegmentedProps<T>) {
   return (
     <div
@@ -38,6 +40,7 @@ export function Segmented<T extends string>({
             type="button"
             role="radio"
             aria-checked={active}
+            disabled={disabled}
             onClick={() => onValueChange(opt.value)}
             className={cn(
               'inline-flex items-center gap-1.5 rounded-md font-medium transition-colors',
