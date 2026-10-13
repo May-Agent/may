@@ -462,9 +462,24 @@ impl MayAgent {
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
         let distribution = config.tools.load_distribution().await?;
+        tracing::debug!(
+            stage = "tool_preparation",
+            "preparing session tool environments"
+        );
         let builder = builder
             .initialize_tools(&distribution, &config.may_dir.join("tools/cache"))
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::error!(
+                    stage = "tool_preparation",
+                    %error,
+                    "tool environment preparation failed"
+                );
+            })?;
+        tracing::debug!(
+            stage = "tool_preparation",
+            "session tool environments ready"
+        );
         let agent = builder.build();
 
         Ok(Self {
