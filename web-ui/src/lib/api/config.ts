@@ -75,6 +75,12 @@ export interface UiRemoteAccessConfig {
   allowLocalEnvironment: boolean;
 }
 
+export type CommandPriority = 'normal' | 'low' | 'lowest';
+
+export interface UiSandboxConfig {
+  commandPriority: CommandPriority;
+}
+
 export interface UiFullConfig {
   providers: UiProviderConfig[];
   models: UiModelsConfig;
@@ -84,6 +90,7 @@ export interface UiFullConfig {
   maxIterations: number;
   browser: UiBrowserConfig;
   remoteAccess: UiRemoteAccessConfig;
+  sandbox: UiSandboxConfig;
 }
 
 export interface UiSshServerConfig {

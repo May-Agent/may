@@ -34,6 +34,7 @@ import { NetworkSection } from '@/components/settings/NetworkSection';
 import { ActivityLogsSection } from '@/components/settings/ActivityLogsSection';
 import { RemoteAccessSection } from '@/components/settings/RemoteAccessSection';
 import { RemoteServersSection } from '@/components/settings/RemoteServersSection';
+import { CommandPrioritySection } from '@/components/settings/CommandPrioritySection';
 
 type SectionId =
   | 'appearance'
@@ -50,7 +51,8 @@ type SectionId =
   | 'network'
   | 'logs'
   | 'remote'
-  | 'remote-servers';
+  | 'remote-servers'
+  | 'execution';
 
 interface Section {
   id: SectionId;
@@ -91,6 +93,7 @@ const GROUPS: SectionGroup[] = [
     id: 'runtime',
     label: 'Runtime',
     items: [
+      { id: 'execution', icon: Cpu, labelKey: 'settings.sections.execution', Component: CommandPrioritySection },
       { id: 'browser', icon: Globe2, labelKey: 'settings.sections.browser', Component: BrowserSection },
       { id: 'notifications', icon: Bell, labelKey: 'settings.sections.notifications', Component: NotificationsSection },
       { id: 'network', icon: Shield, labelKey: 'settings.sections.network', Component: NetworkSection },
