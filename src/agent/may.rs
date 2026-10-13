@@ -84,8 +84,8 @@ pub enum AgentEnvironment {
     Container {
         /// Container ID from Docker.
         container_id: String,
-        /// Hostname reachable from the container for IPC back to the host.
-        container_ipc_host: String,
+        /// Route the container uses to reach the host's IPC bridge.
+        container_ipc_route: aither_sandbox::ContainerIpcRoute,
         /// Executor for running commands inside the container.
         container_exec: AnyContainerExec,
         /// Resolved browser CDP endpoint reachable from inside the container.
@@ -420,7 +420,7 @@ impl MayAgent {
         match config.environment {
             AgentEnvironment::Container {
                 container_id,
-                container_ipc_host,
+                container_ipc_route,
                 container_exec,
                 browser_cdp_endpoint: cdp_endpoint,
             } => {
@@ -431,7 +431,7 @@ impl MayAgent {
                     builder.system_text(tag::CONTAINER_ENVIRONMENT_CONTEXT, container_context);
                 builder = builder.container_runtime(ContainerShellRuntime::new(
                     container_id,
-                    container_ipc_host,
+                    container_ipc_route,
                     container_exec,
                 ));
                 browser_cdp_endpoint = cdp_endpoint;
