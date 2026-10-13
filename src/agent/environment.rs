@@ -27,6 +27,9 @@ pub enum ResolveAgentEnvironmentError {
     EnsureContainerImage(crate::container::ContainerError),
     #[error("container start failed: {0}")]
     StartContainer(crate::container::ContainerError),
+    /// The container's IPC bridge route could not be resolved.
+    #[error("container IPC route resolution failed: {0}")]
+    ResolveContainerIpcRoute(crate::container::ContainerError),
 }
 
 pub async fn resolve_agent_environment_for_session(
@@ -91,9 +94,15 @@ pub async fn resolve_agent_environment_for_session(
         container_manager.runtime().client.clone(),
     ))));
 
+    let container_ipc_route = container_manager
+        .runtime()
+        .ipc_route(&container_id)
+        .await
+        .map_err(ResolveAgentEnvironmentError::ResolveContainerIpcRoute)?;
+
     Ok(AgentEnvironment::Container {
         container_id,
-        container_ipc_host: container_manager.runtime().host_gateway().to_string(),
+        container_ipc_route,
         container_exec,
         browser_cdp_endpoint: None,
     })

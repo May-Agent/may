@@ -6162,9 +6162,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2326beefa82095d161bb67550d3dd1607e60281bf88067226dc25170b358a71"
+checksum = "9313cc352543e45ec01fe6c769ead395fe8b570ced8e9d011ce467dcc9313151"
 dependencies = [
  "askama 0.12.1",
  "async-channel 2.5.0",
@@ -6177,6 +6177,7 @@ dependencies = [
  "errno",
  "executor-core",
  "futures-lite 2.6.1",
+ "http 1.5.0",
  "http-body-util",
  "humantime",
  "hyper",
@@ -6186,12 +6187,12 @@ dependencies = [
  "polling 3.11.0",
  "pty-process",
  "rand 0.8.8",
- "rappct",
  "remove_dir_all",
  "rmp-serde",
  "seccompiler",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shell-escape",
  "smol",
  "smol-hyper",
@@ -11404,17 +11405,6 @@ name = "rangemap"
 version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
-
-[[package]]
-name = "rappct"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11762a6aea3b0a87a51b21cb2085d252f10c01cd0f3f505e1da002cf6e2427da"
-dependencies = [
- "thiserror 2.0.21",
- "tracing",
- "windows 0.62.2",
-]
 
 [[package]]
 name = "ratatui"

@@ -1062,6 +1062,28 @@ impl TaskRuntime {
         .map(|_| ())
     }
 
+    /// Loads the baseline tool distribution and prepares the registry's
+    /// configured backends, so every terminal — local or container — runs
+    /// with the same verified tools before `TerminalTool` executes.
+    async fn initialize_shell_sessions(
+        &self,
+        registry: ShellSessionRegistry,
+    ) -> Result<ShellSessionRegistry, String> {
+        let distribution = crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
+            .await
+            .map_err(|error| {
+                init_terminal_tool_error("failed to load May config for baseline tools: ", &error)
+            })?
+            .tools
+            .load_distribution()
+            .await
+            .map_err(|error| init_terminal_tool_error("failed to load baseline tools: ", &error))?;
+        registry
+            .initialize_tools(&distribution, &self.may_dir.join("tools/cache"))
+            .await
+            .map_err(|error| init_terminal_tool_error("failed to prepare baseline tools: ", &error))
+    }
+
     async fn local_terminal_tool(
         &self,
         profile_id: &str,
@@ -1074,6 +1096,7 @@ impl TaskRuntime {
             container: false,
             ssh: false,
         });
+        let shell_sessions = self.initialize_shell_sessions(shell_sessions).await?;
         let registry =
             Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
@@ -1182,9 +1205,14 @@ impl TaskRuntime {
             .map_err(|error| prefixed_error("failed to start container: ", &error))?;
         container_manager.touch_activity(&container_id);
 
+        let container_ipc_route = container_manager
+            .runtime()
+            .ipc_route(&container_id)
+            .await
+            .map_err(|error| prefixed_error("failed to resolve container IPC route: ", &error))?;
         let container_runtime = ContainerShellRuntime::new(
             container_id.clone(),
-            container_manager.runtime().host_gateway().to_string(),
+            container_ipc_route,
             AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
                 container_manager.runtime().client.clone(),
             )))),
@@ -1195,6 +1223,7 @@ impl TaskRuntime {
             ssh: false,
         })
         .with_container_runtime(container_runtime);
+        let shell_sessions = self.initialize_shell_sessions(shell_sessions).await?;
 
         // Use host workspace dir for output storage while executing commands in
         // /workspace inside container.
@@ -1315,9 +1344,14 @@ impl TaskRuntime {
             .map_err(|error| prefixed_error("failed to start container: ", &error))?;
         container_manager.touch_activity(&container_id);
 
+        let container_ipc_route = container_manager
+            .runtime()
+            .ipc_route(&container_id)
+            .await
+            .map_err(|error| prefixed_error("failed to resolve container IPC route: ", &error))?;
         let container_runtime = ContainerShellRuntime::new(
             container_id.clone(),
-            container_manager.runtime().host_gateway().to_string(),
+            container_ipc_route,
             AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
                 container_manager.runtime().client.clone(),
             )))),
@@ -1328,6 +1362,7 @@ impl TaskRuntime {
             ssh: false,
         })
         .with_container_runtime(container_runtime);
+        let shell_sessions = self.initialize_shell_sessions(shell_sessions).await?;
 
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
         let network_policy = self.network_policy.load().as_ref().clone();
@@ -1491,7 +1526,7 @@ fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
 mod tests {
     use super::TaskRuntime;
     use super::local_task_execution_mode;
-    use aither_sandbox::TerminalExecutionMode;
+    use aither_sandbox::{ShellRuntimeAvailability, ShellSessionRegistry, TerminalExecutionMode};
     use tempfile::tempdir;
 
     use crate::db::{ChatDb, CreateScheduledTaskParams};
@@ -1569,5 +1604,39 @@ mod tests {
             .expect("event dispatch should succeed");
 
         assert_eq!(triggered, 1);
+    }
+
+    #[tokio::test]
+    async fn initialize_shell_sessions_fails_without_tool_distribution() {
+        let dir = tempdir().expect("temp dir should be created");
+        let may_dir = dir.path().join(".may");
+        std::fs::create_dir_all(&may_dir).expect("may dir should be created");
+        // Point the manifest at a path that can never exist so the test does
+        // not depend on whether a distribution sits beside the test binary.
+        let mut config = crate::config::MayConfig::default();
+        config.tools.distribution_manifest = may_dir.join("missing-distribution.json");
+        config
+            .save_to(&may_dir.join("config.toml"))
+            .await
+            .expect("test config should save");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize");
+        let runtime = TaskRuntime::load(db, may_dir)
+            .await
+            .expect("task runtime should load");
+
+        let error = runtime
+            .initialize_shell_sessions(ShellSessionRegistry::new(ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            }))
+            .await
+            .expect_err("a missing baseline distribution must fail before any exec");
+        assert!(
+            error.contains("baseline tools"),
+            "unexpected error: {error}"
+        );
     }
 }

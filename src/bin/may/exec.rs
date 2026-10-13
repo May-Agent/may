@@ -365,14 +365,14 @@ async fn build_exec_terminal_tool(
     let terminal_tool = match environment {
         may_agent::AgentEnvironment::Container {
             container_id,
-            container_ipc_host,
+            container_ipc_route,
             container_exec,
             ..
         } => terminal_tool
             .with_shell_sessions(shell_sessions)
             .with_container_runtime(ContainerShellRuntime::new(
                 container_id.clone(),
-                container_ipc_host.clone(),
+                container_ipc_route.clone(),
                 container_exec.clone(),
             )),
         _ => terminal_tool.with_shell_sessions(shell_sessions),
