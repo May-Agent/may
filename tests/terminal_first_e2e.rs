@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use askama::Template;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -31,6 +32,20 @@ const TEST_PROVIDER_ID: &str = "mock";
 const TEST_MODEL: &str = "test-model";
 const TEST_SELECTOR: &str = "mock::test-model";
 const TEST_API_KEY: &str = "test-api-key";
+const TITLE_REQUEST_PREFIX: &str =
+    "Generate a short, descriptive title (3-6 words) for this conversation.";
+
+#[derive(Template)]
+#[template(path = "test_terminal_input.sh", escape = "none")]
+struct TerminalInputScript<'a> {
+    task_id: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "test_terminal_read.sh", escape = "none")]
+struct TerminalReadScript<'a> {
+    task_id: &'a str,
+}
 
 #[derive(Clone)]
 enum MockChatScenario {
@@ -56,6 +71,16 @@ impl MockOpenAiServer {
             .local_addr()
             .expect("mock OpenAI listener should expose local addr");
         let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let transcript = if matches!(&scenario, MockChatScenario::TerminalRoundTrip) {
+            std::env::var_os("MAY_TEST_TRANSCRIPT_DIR").map(|directory| {
+                PathBuf::from(directory).join("terminal-roundtrip-model-requests.json")
+            })
+        } else {
+            None
+        };
+        if let Some(path) = &transcript {
+            write_request_transcript(path, &requests).await;
+        }
         let state = Arc::new(tokio::sync::Mutex::new(MockScenarioState::new(scenario)));
         let requests_for_task = requests.clone();
         let handle = tokio::spawn(async move {
@@ -67,9 +92,15 @@ impl MockOpenAiServer {
                 let io = TokioIo::new(stream);
                 let state = state.clone();
                 let requests = requests_for_task.clone();
+                let transcript = transcript.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |request| {
-                        handle_mock_openai_request(request, state.clone(), requests.clone())
+                        handle_mock_openai_request(
+                            request,
+                            state.clone(),
+                            requests.clone(),
+                            transcript.clone(),
+                        )
                     });
                     let _ = http1::Builder::new().serve_connection(io, service).await;
                 });
@@ -113,6 +144,10 @@ impl MockScenarioState {
     }
 
     fn next_response(&mut self, request: &Value) -> Result<MockHttpResponse, String> {
+        verify_native_tool_surface(request)?;
+        if self.request_index == 0 {
+            verify_initial_tool_contract(request)?;
+        }
         let response = match &self.scenario {
             MockChatScenario::SlowText { chunks, delay } => {
                 if self.request_index != 0 {
@@ -134,6 +169,7 @@ impl MockScenarioState {
                                     "description": "Ask the terminal for the user's name",
                                     "script": "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
                                     "mode": "sandboxed",
+                                    "raw": true,
                                     "timeout": 0,
                                     "max_lines": 50
                                 }),
@@ -148,15 +184,21 @@ impl MockScenarioState {
                                 "terminal tool result did not include a task_id".to_string()
                             })?;
                         self.task_id = Some(task_id.clone());
+                        let script = TerminalInputScript { task_id: &task_id }
+                            .render()
+                            .map_err(|error| error.to_string())?;
                         MockHttpResponse::sse(vec![
                             delayed_sse_frame(
                                 tool_call_chunk(
                                     "call-terminal-input",
-                                    "terminal_input",
+                                    "terminal",
                                     &serde_json::json!({
-                                        "task_id": task_id,
-                                        "input": "lexo",
-                                        "append_newline": true
+                                        "description": "Send a name through terminal IPC",
+                                        "script": script,
+                                        "mode": "sandboxed",
+                                        "raw": true,
+                                        "timeout": 10,
+                                        "max_lines": 50
                                     }),
                                 ),
                                 Duration::from_millis(350),
@@ -165,19 +207,32 @@ impl MockScenarioState {
                         ])
                     }
                     2 => {
+                        let input_result = latest_tool_output(request)
+                            .ok_or_else(|| "terminal input command result missing".to_string())?;
+                        if input_result.get("exit_code").and_then(Value::as_i64) != Some(0) {
+                            return Err(format!(
+                                "terminal input IPC command failed: {input_result}"
+                            ));
+                        }
                         let task_id = self
                             .task_id
                             .clone()
                             .ok_or_else(|| "terminal task_id was not captured".to_string())?;
+                        let script = TerminalReadScript { task_id: &task_id }
+                            .render()
+                            .map_err(|error| error.to_string())?;
                         MockHttpResponse::sse(vec![
                             delayed_sse_frame(
                                 tool_call_chunk(
                                     "call-terminal-read",
-                                    "terminal_read",
+                                    "terminal",
                                     &serde_json::json!({
-                                        "task_id": task_id,
-                                        "cursor": 0,
-                                        "max_bytes": 4096
+                                        "description": "Read the reply through terminal IPC",
+                                        "script": script,
+                                        "mode": "sandboxed",
+                                        "raw": true,
+                                        "timeout": 10,
+                                        "max_lines": 50
                                     }),
                                 ),
                                 Duration::from_millis(250),
@@ -187,12 +242,15 @@ impl MockScenarioState {
                     }
                     3 => {
                         let tool_output = latest_tool_output(request)
-                            .ok_or_else(|| "terminal_read tool result missing".to_string())?;
+                            .ok_or_else(|| "terminal read command result missing".to_string())?;
+                        if tool_output.get("exit_code").and_then(Value::as_i64) != Some(0) {
+                            return Err(format!("terminal read IPC command failed: {tool_output}"));
+                        }
                         let text = tool_output
-                            .get("delta")
+                            .pointer("/stdout/content/text")
                             .and_then(Value::as_str)
                             .ok_or_else(|| {
-                                "terminal_read tool result missing textual delta".to_string()
+                                "terminal read command result missing stdout text".to_string()
                             })?;
                         if !text.contains("hello lexo") {
                             return Err(format!(
@@ -223,6 +281,38 @@ impl MockScenarioState {
         self.request_index += 1;
         Ok(response)
     }
+}
+
+fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "initial model request has no native tool definitions".to_string())?;
+    if tools.len() != 1
+        || tools[0].pointer("/function/name").and_then(Value::as_str) != Some("terminal")
+    {
+        return Err(format!("expected only the native terminal tool: {tools:?}"));
+    }
+    Ok(())
+}
+
+fn verify_initial_tool_contract(request: &Value) -> Result<(), String> {
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "initial model request has no messages".to_string())?;
+    let catalog = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .find(|content| content.contains("<prepared_tools>"))
+        .ok_or_else(|| "initial model request has no prepared tool catalog".to_string())?;
+    for command in ["apply_patch ", "rg ", "ast-grep ", "jq "] {
+        if !catalog.contains(command) {
+            return Err(format!("prepared tool catalog omits {command}"));
+        }
+    }
+    Ok(())
 }
 
 enum MockHttpResponse {
@@ -293,6 +383,7 @@ async fn handle_mock_openai_request(
     request: Request<Incoming>,
     state: Arc<tokio::sync::Mutex<MockScenarioState>>,
     requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    transcript: Option<PathBuf>,
 ) -> Result<Response<http_body_util::combinators::BoxBody<Bytes, Infallible>>, Infallible> {
     if request.method() == Method::GET && request.uri().path() == "/v1/models" {
         return Ok(json_response(
@@ -323,6 +414,21 @@ async fn handle_mock_openai_request(
     let payload: Value =
         serde_json::from_slice(&body).expect("mock OpenAI request should be valid JSON");
     requests.lock().await.push(payload.clone());
+    if let Some(path) = &transcript {
+        write_request_transcript(path, &requests).await;
+    }
+
+    // Title generation is a separate, tool-free request, not an agent turn.
+    if is_session_title_request(&payload) {
+        assert!(payload.get("tools").is_none());
+        return Ok(sse_response(vec![
+            delayed_sse_frame(
+                text_chunk("Terminal name exchange", Some("stop")),
+                Duration::ZERO,
+            ),
+            done_frame(Duration::ZERO),
+        ]));
+    }
 
     let response = {
         let mut state = state.lock().await;
@@ -340,6 +446,30 @@ async fn handle_mock_openai_request(
     Ok(match response {
         MockHttpResponse::Sse(frames) => sse_response(frames),
     })
+}
+
+fn is_session_title_request(request: &Value) -> bool {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.len() == 1
+                && messages[0].get("role").and_then(Value::as_str) == Some("user")
+                && messages[0]
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.starts_with(TITLE_REQUEST_PREFIX))
+        })
+}
+
+async fn write_request_transcript(path: &Path, requests: &Arc<tokio::sync::Mutex<Vec<Value>>>) {
+    let transcript = {
+        let requests = requests.lock().await;
+        serde_json::to_vec_pretty(requests.as_slice()).expect("model requests should serialize")
+    };
+    async_fs::write(path, transcript)
+        .await
+        .expect("model request transcript should be written");
 }
 
 fn json_response(
