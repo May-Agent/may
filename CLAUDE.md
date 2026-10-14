@@ -139,7 +139,7 @@ There is one native terminal command tool, `terminal`, for executing commands.
 This describes command execution capability and does not imply a specific shell implementation.
 
 Everything else is exposed as CLI commands through the terminal tool's IPC bridge rather than as additional native tools.
-For instance, web search is done by executing `websearch "query"` through the terminal tool, not by calling a separate native `websearch` tool. High-frequency browser work should use the May-managed `browser` command rather than ad-hoc shell recipes or direct browser installers.
+For instance, web search is done by executing `websearch "query"` through the terminal tool, not by calling a separate native `websearch` tool. A tool the model provider executes server-side is the exception: it is passed to the provider natively and, while enabled, replaces the corresponding terminal command. High-frequency browser work should use the May-managed `browser` command rather than ad-hoc shell recipes or direct browser installers.
 
 If the agent ends up using the same non-native workflow frequently, promote that workflow into a proper `Tool` implementation and let May auto-convert it into a terminal command through the existing Tool-trait CLI bridge.
 Do not leave high-frequency capabilities as ad-hoc shell snippets the agent has to reconstruct manually every time.
