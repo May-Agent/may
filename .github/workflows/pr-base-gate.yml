@@ -43,29 +43,45 @@ jobs:
           set -euo pipefail
           deadline=$(( $(date +%s) + 3300 ))
           while :; do
-            {
-              gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
-                --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
-              if [ -n "${MERGE_SHA:-}" ] && [ "${MERGE_SHA}" != "null" ]; then
-                gh api "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs?per_page=100" \
-                  --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
-              fi
-            } 2>/dev/null | grep -v '^PR source gate\b' > checks.tsv || true
+            checks="$(
+              {
+                gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
+                  --jq '.check_runs[] | {name, status, conclusion}'
+                if [ -n "${MERGE_SHA:-}" ] && [ "${MERGE_SHA}" != "null" ]; then
+                  gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs?per_page=100" \
+                    --jq '.check_runs[] | {name, status, conclusion}'
+                fi
+              } | jq -s 'map(select(.name != "PR source gate"))'
+            )"
 
-            if grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
-              echo "::error::a check on this pull request did not pass (see list above)"
+            total=$(jq 'length' <<<"${checks}")
+            failures="$(jq '[.[] | select(.status == "completed" and ((.conclusion == "success") or (.conclusion == "skipped") or (.conclusion == "neutral") | not))]' <<<"${checks}")"
+            if [ "$(jq 'length' <<<"${failures}")" -gt 0 ]; then
+              echo "::error::checks on this pull request did not pass:"
+              jq -r '.[] | "- \(.name): \(.conclusion)"' <<<"${failures}"
               exit 1
             fi
-            pending=$(grep -c $'\tpending$' checks.tsv || true)
-            if [ "${pending}" -eq 0 ]; then
-              echo "all checks on this pull request have passed"
+
+            pending=$(jq '[.[] | select(.status != "completed")] | length' <<<"${checks}")
+            if [ "${total}" -gt 0 ] && [ "${pending}" -eq 0 ]; then
+              echo "all ${total} check(s) on this pull request have passed"
               exit 0
             fi
+
             if [ "$(date +%s)" -gt "${deadline}" ]; then
-              echo "::error::timed out after 55 minutes waiting for ${pending} check(s) to conclude"
-              grep $'\tpending$' checks.tsv
+              if [ "${total}" -eq 0 ]; then
+                echo "::error::timed out after 55 minutes and no check runs other than this gate were ever reported"
+              else
+                echo "::error::timed out after 55 minutes waiting for ${pending} check(s) to conclude"
+                jq -r '.[] | select(.status != "completed") | "- \(.name): \(.status)"' <<<"${checks}"
+              fi
               exit 1
             fi
-            echo "waiting on ${pending} check(s)..."
+
+            if [ "${total}" -eq 0 ]; then
+              echo "no checks reported yet; waiting..."
+            else
+              echo "waiting on ${pending} check(s)..."
+            fi
             sleep 30
           done

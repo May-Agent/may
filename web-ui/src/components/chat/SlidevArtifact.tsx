@@ -11,19 +11,19 @@ interface SlidevArtifactProps {
 }
 
 export function SlidevArtifact({ sessionId, path }: SlidevArtifactProps) {
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const {
-    diagnostics,
-    iframeRef,
-    publishDiagnostics,
-    repairScheduled,
-    resetValidation,
-  } = useArtifactValidation({ sessionId, path, artifactType: 'slidev' });
+  const fetchKey = `${sessionId}:${path}`;
+  // Preview state is keyed by fetch identity so a sessionId/path switch
+  // derives empty state instead of requiring an effect-driven reset.
+  const [preview, setPreview] = useState<{ key: string; url: string | null }>({
+    key: fetchKey,
+    url: null,
+  });
+  const previewUrl = preview.key === fetchKey ? preview.url : null;
+  const { diagnostics, iframeRef, publishDiagnostics, repairScheduled } =
+    useArtifactValidation({ sessionId, path, artifactType: 'slidev' });
 
   useEffect(() => {
     let cancelled = false;
-    setPreviewUrl(null);
-    resetValidation();
     void (async () => {
       try {
         const response = await prepareSlidevPreview(sessionId, path);
@@ -36,7 +36,7 @@ export function SlidevArtifact({ sessionId, path }: SlidevArtifactProps) {
           await publishDiagnostics(['Slidev preview completed without a preview URL.']);
           return;
         }
-        setPreviewUrl(response.previewUrl);
+        setPreview({ key: fetchKey, url: response.previewUrl });
       } catch (error) {
         if (cancelled) return;
         const message = error instanceof Error ? error.message : 'Slidev preview failed';
@@ -46,7 +46,7 @@ export function SlidevArtifact({ sessionId, path }: SlidevArtifactProps) {
     return () => {
       cancelled = true;
     };
-  }, [path, publishDiagnostics, resetValidation, sessionId]);
+  }, [fetchKey, path, publishDiagnostics, sessionId]);
 
   return (
     <section className="not-prose mt-3 overflow-hidden rounded-xl border border-border bg-card/40">
