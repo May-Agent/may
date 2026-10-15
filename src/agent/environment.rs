@@ -27,6 +27,9 @@ pub enum ResolveAgentEnvironmentError {
     EnsureContainerImage(crate::container::ContainerError),
     #[error("container start failed: {0}")]
     StartContainer(crate::container::ContainerError),
+    /// The container's IPC bridge route could not be resolved.
+    #[error("container IPC route resolution failed: {0}")]
+    ResolveContainerIpcRoute(crate::container::ContainerError),
 }
 
 pub async fn resolve_agent_environment_for_session(
@@ -36,6 +39,7 @@ pub async fn resolve_agent_environment_for_session(
     may_dir: &Path,
     sandbox_dir: &Path,
     session_id: &SessionId,
+    tool_distribution: &Arc<aither_sandbox::ToolDistribution>,
 ) -> Result<AgentEnvironment, ResolveAgentEnvironmentError> {
     match profile_environment {
         Some(ProfileEnvironment::Container { .. }) => {}
@@ -48,7 +52,11 @@ pub async fn resolve_agent_environment_for_session(
     let runtime = ContainerRuntime::detect()
         .await
         .map_err(ResolveAgentEnvironmentError::DetectContainerRuntime)?;
-    let container_manager = ContainerManager::new(Arc::new(runtime), may_dir.to_path_buf());
+    let container_manager = ContainerManager::new(
+        Arc::new(runtime),
+        may_dir.to_path_buf(),
+        tool_distribution.clone(),
+    );
 
     let default_image_tag = crate::container::profile::default_image_tag(
         may_dir,
@@ -91,9 +99,15 @@ pub async fn resolve_agent_environment_for_session(
         container_manager.runtime().client.clone(),
     ))));
 
+    let container_ipc_route = container_manager
+        .runtime()
+        .ipc_route(&container_id)
+        .await
+        .map_err(ResolveAgentEnvironmentError::ResolveContainerIpcRoute)?;
+
     Ok(AgentEnvironment::Container {
         container_id,
-        container_ipc_host: container_manager.runtime().host_gateway().to_string(),
+        container_ipc_route,
         container_exec,
         browser_cdp_endpoint: None,
     })

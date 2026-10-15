@@ -1,10 +1,22 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use aither_sandbox::SshSessionAuthorizer;
+use aither_sandbox::{SshAuthorizationError, SshSessionAuthorizer};
+use askama::Template;
 
 use crate::ask_user::{AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload};
+
+#[derive(Template)]
+#[template(path = "ssh_connect_permission.txt", escape = "none")]
+struct SshConnectPermission<'a> {
+    target: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "ssh_install_permission.txt", escape = "none")]
+struct SshInstallPermission<'a> {
+    target: &'a str,
+    details: &'a str,
+}
 
 pub struct MaySshAuthorizer {
     broker: AskUserBroker,
@@ -20,7 +32,14 @@ impl MaySshAuthorizer {
     }
 
     /// Ask a yes/no permission question via the `AskUser` UI.
-    async fn ask_permission(&self, question: String, allow_label: &str) -> Result<bool, String> {
+    async fn ask_permission<T: Template + Send>(
+        &self,
+        question: T,
+        allow_label: &str,
+    ) -> Result<bool, SshAuthorizationError> {
+        let question = question
+            .render()
+            .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
         let args = AskUserArgs {
             question: Some(question),
             option: vec![allow_label.to_string(), "Deny".to_string()],
@@ -34,7 +53,7 @@ impl MaySshAuthorizer {
                 request: args,
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
         Ok(response.iter().any(|a| {
             matches!(&a.answer, AnswerValue::Selected(opts) if opts.iter().any(|o| o == allow_label))
         }))
@@ -42,27 +61,17 @@ impl MaySshAuthorizer {
 }
 
 impl SshSessionAuthorizer for MaySshAuthorizer {
-    fn authorize_connect(
-        &self,
-        target: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
-        let target = target.to_string();
-        Box::pin(async move {
-            self.ask_permission(format!("Allow SSH connection to {target}?"), "Allow")
-                .await
-        })
+    async fn authorize_connect(&self, target: &str) -> Result<bool, SshAuthorizationError> {
+        self.ask_permission(SshConnectPermission { target }, "Allow")
+            .await
     }
 
-    fn authorize_heel_install(
+    async fn authorize_runtime_install(
         &self,
         target: &str,
         details: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
-        let target = target.to_string();
-        let details = details.to_string();
-        Box::pin(async move {
-            self.ask_permission(format!("{details} Install heel on {target}?"), "Install")
-                .await
-        })
+    ) -> Result<bool, SshAuthorizationError> {
+        self.ask_permission(SshInstallPermission { target, details }, "Install")
+            .await
     }
 }

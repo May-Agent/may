@@ -108,6 +108,9 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
     let (tool_dispatchers, tool_queues) = tool_dispatch_channels();
 
     let config = MayConfig::load().await.context("Failed to load config")?;
+    let tool_distribution = Arc::new(
+        crate::tools::embedded_distribution().context("embedded tool distribution is invalid")?,
+    );
 
     // Try to detect a container runtime (OrbStack/Docker/Podman)
     let container_manager = match crate::container::ContainerRuntime::detect().await {
@@ -117,6 +120,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
                 crate::container::lifecycle::ContainerManager::new(
                     Arc::new(runtime),
                     may_dir.clone(),
+                    tool_distribution.clone(),
                 ),
             ))
         }
@@ -213,14 +217,17 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         .redeliver_pending()
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
-    let mut task_runtime =
-        crate::scheduler::TaskRuntime::load(db_for_archive.clone(), may_dir.clone())
-            .await
-            .context("failed to load task runtime state")?
-            .with_notifier(notification_service.clone())
-            .with_ui_event_bus(ui_event_bus.clone())
-            .with_network_policy(config.preferences.network_policy.clone())
-            .map_err(|error| anyhow!(error))?;
+    let mut task_runtime = crate::scheduler::TaskRuntime::load(
+        db_for_archive.clone(),
+        may_dir.clone(),
+        tool_distribution.clone(),
+    )
+    .await
+    .context("failed to load task runtime state")?
+    .with_notifier(notification_service.clone())
+    .with_ui_event_bus(ui_event_bus.clone())
+    .with_network_policy(config.preferences.network_policy.clone())
+    .map_err(|error| anyhow!(error))?;
     if let Some(ref manager) = container_manager {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
@@ -253,6 +260,8 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         location_provider: crate::location::LocationProvider::new(),
         runtime_service,
         task_runtime: task_runtime.clone(),
+        tool_distribution,
+        tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
         cwd,
         may_dir,
     });
