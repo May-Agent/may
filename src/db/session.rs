@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 
-use crate::PermissionHistoryMode;
 use crate::scheduler::TaskRunStatus;
 use crate::session::{
     BrowserInteractionState, PendingUserMessage, PersistedAskUserRequest,
@@ -20,12 +19,11 @@ use crate::session::{
 use crate::xml::XmlBlock;
 
 use super::common::{
-    BoolValueRow, I64ValueRow, PendingAskUserLookup, PendingAskUserQuestionOptionRow,
-    PendingAskUserQuestionRow, PendingAskUserRequestRow, PendingMessageAttachmentRow,
-    PendingMessageEntryRow, PendingPermissionLookup, PendingWorkspaceLookup, SessionIdRow,
-    db_custom_error, overflow_error, parse_attachment_kind, parse_pending_user_message_mode,
-    parse_session_plan_state, parse_session_runtime_state, row_not_found,
-    session_not_found_db_error, storage_error,
+    I64ValueRow, PendingAskUserLookup, PendingAskUserQuestionOptionRow, PendingAskUserQuestionRow,
+    PendingAskUserRequestRow, PendingMessageAttachmentRow, PendingMessageEntryRow,
+    PendingPermissionLookup, PendingWorkspaceLookup, SessionIdRow, db_custom_error, overflow_error,
+    parse_attachment_kind, parse_pending_user_message_mode, parse_session_plan_state,
+    parse_session_runtime_state, row_not_found, session_not_found_db_error, storage_error,
 };
 use super::entity::{
     session_pending_permissions, session_pending_workspace, session_plans, session_run_leases,
@@ -1276,31 +1274,6 @@ impl ChatDb {
         )
         .fetch_optional::<PendingAskUserLookup>()
         .await?)
-    }
-
-    /// Session has approved permission mode.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    pub async fn session_has_approved_permission_mode(
-        &self,
-        session_id: &str,
-        mode: PermissionHistoryMode,
-    ) -> Result<bool, ChatDbError> {
-        Ok(
-            query!(
-                self.db,
-                "SELECT EXISTS(SELECT 1 FROM messages AS request_message INNER JOIN message_permission_requests AS request ON request.message_id = request_message.id INNER JOIN message_permission_responses AS response ON response.request_id = request.request_id INNER JOIN messages AS response_message ON response_message.id = response.message_id WHERE request_message.session_id = ? AND response_message.session_id = request_message.session_id AND request.mode = ? AND response.approved = TRUE) AS value",
-                session_id,
-                mode.as_str()
-            )
-            .fetch_one::<self::BoolValueRow>()
-            .await?
-            .value,
-        )
     }
 
     /// Check if a session exists in the database.
