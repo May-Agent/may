@@ -11,6 +11,7 @@ use skyzen::utils::{Json, State};
 use skyzen::{Result as SkyResult, StatusCode};
 
 use super::chat::spawn_follow_up_runs;
+use super::error::{internal_error, internal_error_message};
 use super::error_chain::error_chain_text;
 use super::state::UiServerState;
 use super::types::BrowserTakeoverResponse;
@@ -113,9 +114,7 @@ pub(super) async fn browser_status(
         .runtime_service
         .find_browser_takeover_session()
         .await
-        .map_err(|error| {
-            skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
-        })?;
+        .map_err(internal_error)?;
     let Some(bm) = state.browser_manager() else {
         return Ok(Json(BrowserStatus {
             enabled,
@@ -146,8 +145,7 @@ pub(super) async fn browser_start(
         })
         .await
         .map_err(|_| {
-            skyzen::Error::msg("browser start task panicked before producing a response")
-                .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+            internal_error_message("browser start task panicked before producing a response")
         })??;
     Ok(Json(response))
 }
@@ -163,8 +161,7 @@ pub(super) async fn browser_stop(
         })
         .await
         .map_err(|_| {
-            skyzen::Error::msg("browser stop task panicked before producing a response")
-                .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+            internal_error_message("browser stop task panicked before producing a response")
         })??;
     Ok(Json(response))
 }
@@ -186,8 +183,7 @@ pub(super) async fn browser_offer(
         })
         .await
         .map_err(|_| {
-            skyzen::Error::msg("browser offer task panicked before producing a response")
-                .set_status(StatusCode::INTERNAL_SERVER_ERROR)
+            internal_error_message("browser offer task panicked before producing a response")
         })??;
     Ok(Json(response))
 }
@@ -214,9 +210,7 @@ async fn run_browser_start(state: Arc<UiServerState>) -> SkyResult<BrowserStatus
             .runtime_service
             .find_browser_takeover_session()
             .await
-            .map_err(|error| {
-                skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
-            })?,
+            .map_err(internal_error)?,
     })
 }
 
@@ -226,9 +220,7 @@ async fn run_browser_stop(state: Arc<UiServerState>) -> SkyResult<BrowserStatus>
             .set_status(StatusCode::NOT_FOUND));
     };
 
-    bm.stop().await.map_err(|error| {
-        skyzen::Error::msg(error_chain_text(&error)).set_status(StatusCode::INTERNAL_SERVER_ERROR)
-    })?;
+    bm.stop().await.map_err(internal_error)?;
     state.set_browser_owner_session_id(None);
     state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
 
@@ -241,9 +233,7 @@ async fn run_browser_stop(state: Arc<UiServerState>) -> SkyResult<BrowserStatus>
             .runtime_service
             .find_browser_takeover_session()
             .await
-            .map_err(|error| {
-                skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
-            })?,
+            .map_err(internal_error)?,
     })
 }
 
@@ -267,10 +257,7 @@ async fn run_browser_offer(
     let answer_sdp = bm
         .handle_offer(session_id.to_string(), req.sdp)
         .await
-        .map_err(|error| {
-            skyzen::Error::msg(error_chain_text(&error))
-                .set_status(StatusCode::INTERNAL_SERVER_ERROR)
-        })?;
+        .map_err(internal_error)?;
 
     Ok(WebRtcAnswerResponse { sdp: answer_sdp })
 }
@@ -292,10 +279,7 @@ pub(super) async fn browser_resize_viewport(
     }
     bm.resize_viewport(req.width, req.height, req.device_scale_factor)
         .await
-        .map_err(|error| {
-            skyzen::Error::msg(error_chain_text(&error))
-                .set_status(StatusCode::INTERNAL_SERVER_ERROR)
-        })?;
+        .map_err(internal_error)?;
     Ok(Json(BrowserResizeViewportResponse { ok: true }))
 }
 
@@ -316,9 +300,7 @@ pub(super) async fn browser_takeover_start(
         .runtime_service
         .set_browser_takeover_owner(session_id.as_str())
         .await
-        .map_err(|error| {
-            skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
-        })?;
+        .map_err(internal_error)?;
     // Interrupt an in-flight model request immediately. The chat loop checks
     // the persisted takeover owner after cancellation and records the run as a
     // takeover pause rather than an ordinary user cancellation.
@@ -350,9 +332,7 @@ pub(super) async fn browser_takeover_stop(
         .runtime_service
         .clear_browser_takeover_owner(session_id.as_str())
         .await
-        .map_err(|error| {
-            skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
-        })?;
+        .map_err(internal_error)?;
     if let Some(bm) = state.browser_manager() {
         bm.set_takeover(None);
     }

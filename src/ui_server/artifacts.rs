@@ -20,7 +20,7 @@ use skyzen::{Result as SkyResult, StatusCode};
 use tokio::process::Command;
 
 use super::chat::spawn_follow_up_runs;
-use super::error::{bad_request_error, internal_error};
+use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::helpers::{load_session_paths, parse_safe_relative_path, send_event};
 use super::local_url_mapper::{
     LocalUrlProxyKey, LocalUrlProxyUpstream, mapped_url_from_target, parse_local_proxy_target,
@@ -595,7 +595,7 @@ async fn install_slidev_toolchain(toolchain_dir: &Path) -> Result<(), skyzen::Er
     let output = tokio::time::timeout(SLIDEV_DEP_INSTALL_TIMEOUT, command.output())
         .await
         .map_err(|_| {
-            internal_error(format!(
+            internal_error_message(format!(
                 "slidev toolchain install timed out after {}s",
                 SLIDEV_DEP_INSTALL_TIMEOUT.as_secs()
             ))
@@ -604,7 +604,7 @@ async fn install_slidev_toolchain(toolchain_dir: &Path) -> Result<(), skyzen::Er
 
     if !output.status.success() {
         let detail = slidev_failure_detail(&output);
-        return Err(internal_error(format!(
+        return Err(internal_error_message(format!(
             "slidev toolchain install failed: {detail}"
         )));
     }
@@ -633,7 +633,7 @@ async fn install_slidev_dependency(
     let output = tokio::time::timeout(SLIDEV_DEP_INSTALL_TIMEOUT, command.output())
         .await
         .map_err(|_| {
-            internal_error(format!(
+            internal_error_message(format!(
                 "slidev dependency install timed out after {}s: {package}",
                 SLIDEV_DEP_INSTALL_TIMEOUT.as_secs()
             ))
@@ -642,7 +642,7 @@ async fn install_slidev_dependency(
 
     if !output.status.success() {
         let detail = slidev_failure_detail(&output);
-        return Err(internal_error(format!(
+        return Err(internal_error_message(format!(
             "slidev dependency install failed for {package}: {detail}"
         )));
     }
@@ -683,7 +683,7 @@ async fn replace_missing_slidev_icon_in_entry(
         .map_err(internal_error)?;
     let rewritten = rewrite_icon_references(original.as_str(), missing_icon, replacement_name);
     if rewritten == original {
-        return Err(internal_error(format!(
+        return Err(internal_error_message(format!(
             "slidev icon replacement could not find {}:{} in {}",
             missing_icon.collection,
             missing_icon.name,
@@ -725,7 +725,7 @@ async fn build_slidev_with_autoinstall(
         let output = tokio::time::timeout(SLIDEV_BUILD_TIMEOUT, command.output())
             .await
             .map_err(|_| {
-                internal_error(format!(
+                internal_error_message(format!(
                     "slidev build timed out after {}s",
                     SLIDEV_BUILD_TIMEOUT.as_secs()
                 ))
@@ -739,7 +739,7 @@ async fn build_slidev_with_autoinstall(
         let detail = slidev_failure_detail(&output);
         if let Some(package) = extract_missing_slidev_package(&detail) {
             if !installed_packages.insert(package.clone()) {
-                return Err(internal_error(format!(
+                return Err(internal_error_message(format!(
                     "slidev build repeatedly requested missing dependency {package}"
                 )));
             }
@@ -755,7 +755,7 @@ async fn build_slidev_with_autoinstall(
             }
 
             let Some(replacement_name) = replacement_icon_name(missing_icon.name.as_str()) else {
-                return Err(internal_error(format!(
+                return Err(internal_error_message(format!(
                     "slidev icon {}:{} is unavailable and has no known replacement",
                     missing_icon.collection, missing_icon.name
                 )));
@@ -766,7 +766,7 @@ async fn build_slidev_with_autoinstall(
                 missing_icon.collection, missing_icon.name, replacement_name
             );
             if !icon_rewrites.insert(rewrite_key.clone()) {
-                return Err(internal_error(format!(
+                return Err(internal_error_message(format!(
                     "slidev icon rewrite loop detected for {rewrite_key}"
                 )));
             }
@@ -776,10 +776,12 @@ async fn build_slidev_with_autoinstall(
             continue;
         }
 
-        return Err(internal_error(format!("slidev build failed: {detail}")));
+        return Err(internal_error_message(format!(
+            "slidev build failed: {detail}"
+        )));
     }
 
-    Err(internal_error(format!(
+    Err(internal_error_message(format!(
         "slidev build exceeded automatic dependency install limit ({SLIDEV_MAX_AUTOINSTALL_ROUNDS})"
     )))
 }
@@ -834,7 +836,7 @@ fn instrument_artifact_html(
     .render()
     .map_err(internal_error)?;
     let Some(bridge_tag) = bridge.strip_suffix("</head>") else {
-        return Err(internal_error(
+        return Err(internal_error_message(
             "artifact runtime bridge template must end with a closing head tag",
         ));
     };
@@ -842,12 +844,12 @@ fn instrument_artifact_html(
         return Ok(html.to_string());
     }
     if html.contains(ARTIFACT_RUNTIME_BRIDGE_SRC) {
-        return Err(internal_error(
+        return Err(internal_error_message(
             "artifact HTML contains a mismatched runtime bridge",
         ));
     }
     if !html.contains("</head>") {
-        return Err(internal_error(
+        return Err(internal_error_message(
             "artifact HTML does not contain a closing head tag",
         ));
     }
@@ -891,7 +893,9 @@ async fn ensure_slidev_source_root(
                 .await
                 .map_err(internal_error)?;
         } else {
-            return Err(internal_error("unsupported slidev source entry type"));
+            return Err(internal_error_message(
+                "unsupported slidev source entry type",
+            ));
         }
     }
 
@@ -981,7 +985,7 @@ async fn acquire_slidev_build_lock(
                     continue;
                 }
                 if started_at.elapsed() >= SLIDEV_BUILD_LOCK_WAIT_TIMEOUT {
-                    return Err(internal_error(format!(
+                    return Err(internal_error_message(format!(
                         "slidev build lock wait timed out after {}s",
                         SLIDEV_BUILD_LOCK_WAIT_TIMEOUT.as_secs()
                     )));
@@ -1143,13 +1147,15 @@ pub(super) async fn prepare_slidev_preview(
             }
 
             if async_fs::metadata(&build_index_file).await.is_err() {
-                return Err(internal_error("slidev build completed without index.html"));
+                return Err(internal_error_message(
+                    "slidev build completed without index.html",
+                ));
             }
             Ok(None)
         });
-        let build_diagnostics = build
-            .await
-            .map_err(|error| internal_error(format!("slidev build task failed: {error}")))??;
+        let build_diagnostics = build.await.map_err(|error| {
+            internal_error_message(format!("slidev build task failed: {error}"))
+        })??;
         if let Some(diagnostics) = build_diagnostics {
             return Ok(Json(SlidevPreviewResponse {
                 preview_url: None,

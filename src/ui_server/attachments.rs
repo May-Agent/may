@@ -6,12 +6,12 @@ use aither_core::llm::Attachment as LlmAttachment;
 use aither_models::{Ability, lookup as lookup_model_info};
 use base64::Engine;
 use serde::Serialize;
-use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
+use skyzen::Result as SkyResult;
 
 use crate::agent::generate_session_title;
 use crate::session::AttachmentKind;
 
-use super::error::{bad_request_error, internal_error};
+use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::helpers::{load_session_paths, parse_safe_relative_path};
 use super::state::UiServerState;
 use super::types::{ApiAttachment, ChatRequest};
@@ -358,10 +358,8 @@ async fn canonical_session_root_path(
 }
 
 fn path_to_file_url(path: &Path) -> SkyResult<url::Url> {
-    url::Url::from_file_path(path).map_err(|()| {
-        SkyError::msg("Failed to map multimodal attachment path to URL")
-            .set_status(StatusCode::INTERNAL_SERVER_ERROR)
-    })
+    url::Url::from_file_path(path)
+        .map_err(|()| internal_error_message("Failed to map multimodal attachment path to URL"))
 }
 
 fn resolve_attachment_media_type(
