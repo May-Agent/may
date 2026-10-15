@@ -833,16 +833,21 @@ impl ChatDb {
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, ChatDbError> {
         let mut tx = self.db.begin().await?;
+        // The transaction opens with the delete so it takes SQLite's write
+        // lock up front: a read first would make the later write a lock
+        // upgrade, which SQLite refuses with `SQLITE_BUSY` once another
+        // connection has written in the meantime.
         // Steer messages first (newest steer = highest priority), then queue (oldest first).
         // Two-level sort: steer before queue, then newest steer or oldest queue.
         let row = query!(
             tx,
-            "SELECT * FROM session_pending_message_entries WHERE session_id = ? ORDER BY CASE delivery_mode WHEN 'steer' THEN 0 ELSE 1 END, CASE delivery_mode WHEN 'steer' THEN -id ELSE id END LIMIT 1",
+            "DELETE FROM session_pending_message_entries WHERE id = (SELECT id FROM session_pending_message_entries WHERE session_id = ? ORDER BY CASE delivery_mode WHEN 'steer' THEN 0 ELSE 1 END, CASE delivery_mode WHEN 'steer' THEN -id ELSE id END LIMIT 1) RETURNING *",
             session_id
         )
         .fetch_optional::<PendingMessageEntryRow>()
         .await?;
         let Some(row) = row else {
+            tx.commit().await?;
             return Ok(None);
         };
         let row_id = row.id;
@@ -853,17 +858,9 @@ impl ChatDb {
         )
         .fetch_all::<PendingMessageAttachmentRow>()
         .await?;
-        // Delete atomically
         query!(
             tx,
             "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
-            row_id
-        )
-        .execute()
-        .await?;
-        query!(
-            tx,
-            "DELETE FROM session_pending_message_entries WHERE id = ?",
             row_id
         )
         .execute()
@@ -1466,54 +1463,28 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Claim session run lease.
+    /// Claim the session's run lease, returning whether this call took it.
+    ///
+    /// The claim is one conditional upsert, so it takes SQLite's write lock
+    /// directly (waiting out the busy timeout) instead of upgrading a read
+    /// transaction, which SQLite refuses outright with `SQLITE_BUSY` once
+    /// another connection has written in the meantime.
     ///
     /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn claim_session_run_lease(&self, session_id: &str) -> Result<bool, ChatDbError> {
-        let now = jiff::Timestamp::now().to_string();
-        let mut tx = self.db.begin().await?;
-        let existing = query!(
-            tx,
-            "SELECT * FROM session_run_leases WHERE session_id = ?",
-            session_id
+        let result = query!(
+            self.db,
+            "INSERT INTO session_run_leases (session_id, active, cancellation_requested, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET active = excluded.active, cancellation_requested = excluded.cancellation_requested, updated_at = excluded.updated_at WHERE session_run_leases.active = ?",
+            session_id,
+            true,
+            false,
+            jiff::Timestamp::now().to_string(),
+            false
         )
-        .fetch_optional::<session_run_leases::Model>()
+        .execute()
         .await?;
-        let claimed = if let Some(existing) = existing {
-            if existing.active {
-                false
-            } else {
-                query!(
-                    tx,
-                    "UPDATE session_run_leases SET active = ?, cancellation_requested = ?, updated_at = ? WHERE session_id = ?",
-                    true,
-                    false,
-                    now.as_str(),
-                    session_id
-                )
-                .execute()
-                .await?;
-                true
-            }
-        } else {
-            query!(
-                tx,
-                "INSERT INTO session_run_leases (session_id, active, cancellation_requested, updated_at) VALUES (?, ?, ?, ?)",
-                session_id,
-                true,
-                false,
-                now.as_str()
-            )
-            .execute()
-            .await?;
-            true
-        };
-        tx.commit().await?;
-        Ok(claimed)
+        Ok(result.rows_written > 0)
     }
 
     /// Release session run lease.
