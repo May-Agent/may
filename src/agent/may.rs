@@ -33,7 +33,7 @@ use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
-use crate::config::{MayConfig, NativeToolsConfig, ProviderType};
+use crate::config::MayConfig;
 use crate::embedding_provider::EmbeddingModelResolution;
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::session::{SessionId, SessionPaths, SessionPlanState};
@@ -356,14 +356,11 @@ impl MayAgent {
 
         // Clone LLM for terminal IPC commands before moving it into the builder.
         let terminal_command_llm = llm.clone();
-        let wrap_ask_model = |model: Option<CloudProvider>| {
-            model.map(|model| {
-                RequestParameterizedModel::new(model, config.request_parameters.clone())
-            })
-        };
-        let ask_flagship = wrap_ask_model(config.ask_models.flagship.clone());
-        let ask_balanced = wrap_ask_model(config.ask_models.balanced.clone());
-        let ask_fast = wrap_ask_model(config.ask_models.fast.clone());
+        // Ask-tier models arrive already wrapped in the parameters of their
+        // own provider instances.
+        let ask_flagship = config.ask_models.flagship.clone();
+        let ask_balanced = config.ask_models.balanced.clone();
+        let ask_fast = config.ask_models.fast.clone();
 
         let ssh_authorizer_broker = config.ask_user_broker.clone();
         let imagine_config = ImagineCommandConfig {
@@ -650,44 +647,12 @@ impl MayAgent {
         let provider_id = resolved_provider.provider_id;
         let llm = resolved_provider.llm;
         let model_info = aither_models::lookup(model);
-        let mut request_parameters = Parameters::default();
-        if let Some(reasoning_effort) = reasoning_effort {
-            request_parameters = request_parameters.reasoning_effort(reasoning_effort);
-        }
-
-        // Enable provider-hosted web tools only for the resolved provider type:
-        // each provider crate reads its own `native_tools` section, and the
-        // portable `websearch` flag reaches OpenAI/Gemini only.
-        let provider_instance = may_config.provider.get(&provider_id);
-        let native = provider_instance.map_or_else(NativeToolsConfig::default, |instance| {
-            instance.native_tools.clone()
-        });
-        let provider_type = provider_instance.map(|instance| instance.resolve_type(&provider_id));
-        let model_has_web_search = model_info
-            .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::WebSearch));
-        match provider_type {
-            Some(ProviderType::Anthropic) => {
-                request_parameters.native_tools.claude.web_search =
-                    native.web_search && model_has_web_search;
-                request_parameters.native_tools.claude.web_fetch = native.web_fetch;
-            }
-            Some(ProviderType::Google) => {
-                request_parameters.websearch = native.web_search && model_has_web_search;
-                request_parameters.native_tools.gemini.url_context = native.web_fetch;
-            }
-            Some(ProviderType::OpenAI) => {
-                request_parameters.websearch = native.web_search && model_has_web_search;
-            }
-            Some(ProviderType::Chatgpt) => {
-                // Hosted search is included in the subscription (no per-call
-                // billing), so default it on unless native_tools was configured
-                // explicitly. The backend's own catalog decides support — the
-                // aither-models db has no entries for codex slugs, so the
-                // Ability::WebSearch gate would always read false here.
-                request_parameters.websearch = native.web_search || native.is_empty();
-            }
-            _ => {}
-        }
+        let request_parameters = super::provider::request_parameters_for(
+            &provider_id,
+            may_config.provider.get(&provider_id),
+            model,
+            reasoning_effort,
+        );
 
         let ssh_servers = crate::profile::resolve_attached_ssh_servers(
             &db,
@@ -702,7 +667,7 @@ impl MayAgent {
         })?;
 
         let ask_models =
-            super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await;
+            super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await?;
         let config = MayAgentConfig {
             tool_distribution,
             tool_environments,
