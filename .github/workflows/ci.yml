@@ -43,6 +43,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # rust-cache prunes the files under target/tmp but keeps its directories,
+      # so a restored cache holds an empty skeleton of the tests' shared tool
+      # cache that the tests would take for a prepared one.
+      - name: Drop restored test scratch
+        shell: bash
+        run: rm -rf target/tmp
       # lance-encoding's build script compiles protobuf definitions with protoc.
       - uses: arduino/setup-protoc@v3
         with:
