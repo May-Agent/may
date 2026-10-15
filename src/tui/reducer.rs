@@ -45,6 +45,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
         AppEvent::SessionDeleted {
+            deleted: _,
             was_current,
             result,
         } => {

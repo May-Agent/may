@@ -225,6 +225,10 @@ where
     app.mcp_servers = mcp_manager.server_info();
 
     let local_runtime = LocalSessionRuntime::new(app.session_manager.db().clone());
+    let tool_distribution = std::sync::Arc::new(
+        may_agent::tools::embedded_distribution()
+            .context("embedded tool distribution is invalid")?,
+    );
     let tool_dispatchers = may_agent::tool_dispatch::ToolDispatchers::spawn(
         may_agent::tool_dispatch::ToolDispatchConfig {
             may_dir: app.session_manager.may_dir().to_path_buf(),
@@ -233,6 +237,7 @@ where
             browser_config: app.config.browser.clone(),
             network_policy: app.config.preferences.network_policy.clone(),
             ask_user_broker: ask_user_broker.clone(),
+            tool_distribution: tool_distribution.clone(),
         },
     )
     .await
@@ -243,23 +248,29 @@ where
         ask_user_broker.clone(),
         tool_dispatchers,
         std::sync::Arc::new(may_agent::location::LocationProvider::new()),
+        tool_distribution,
+        may_agent::agent::ToolEnvironmentCache::spawn(),
     );
 
     // Only start a session if configuration is complete
-    if app.is_configured()
-        && let Err(e) = runtime_deps.start_new_session(&mut app, &mut worker).await
-    {
-        tracing::warn!("Initial session start failed: {}", e);
-        app.mode = may_agent::tui::AppMode::Chat;
-        app.status = Some(format!(
-            "Session start failed: {e} (open /config to fix provider/model)"
-        ));
+    let mut worker_build = None;
+    if app.is_configured() {
+        match runtime_deps.begin_new_session(&mut app, &mut worker).await {
+            Ok(build) => {
+                worker_build = Some(WorkerBuild {
+                    purpose: WorkerBuildPurpose::Startup,
+                    build,
+                });
+            }
+            Err(e) => report_startup_failure(&mut app, &e),
+        }
     }
 
     // Main event loop - only receives from channels, never blocks on agent processing
     main_event_loop(
         &mut app,
         &mut worker,
+        worker_build,
         &mut events,
         terminal,
         runtime_deps,
@@ -270,6 +281,74 @@ where
     .await
 }
 
+/// Why the event loop is building an agent worker; decides how its outcome
+/// is reported.
+#[derive(Debug, Clone, Copy)]
+enum WorkerBuildPurpose {
+    /// The session started with the TUI; failure leaves it unconfigured.
+    Startup,
+    /// A user-requested new or loaded session; failure ends the TUI.
+    Session,
+    /// A user-requested model switch; failure keeps the current worker.
+    SwitchModel,
+}
+
+/// A worker build in flight, raced by the event loop against its queues so
+/// prompts raised while preparing tool environments are answered.
+struct WorkerBuild {
+    purpose: WorkerBuildPurpose,
+    build: may_agent::tui::runtime::PendingWorkerBuild,
+}
+
+fn report_startup_failure(app: &mut may_agent::tui::App, error: &impl std::fmt::Display) {
+    tracing::warn!("Initial session start failed: {}", error);
+    app.mode = may_agent::tui::AppMode::Chat;
+    app.status = Some(format!(
+        "Session start failed: {error} (open /config to fix provider/model)"
+    ));
+}
+
+/// Applies a finished worker build to the app.
+async fn finish_worker_build(
+    app: &mut may_agent::tui::App,
+    worker: &mut Option<AgentWorker>,
+    finished: WorkerBuild,
+    built: Result<AgentWorker, may_agent::tui::runtime::TuiRuntimeError>,
+) -> anyhow::Result<()> {
+    let WorkerBuild { purpose, build } = finished;
+    let built = match (purpose, built) {
+        (_, Ok(built)) => built,
+        (WorkerBuildPurpose::Startup, Err(error)) => {
+            report_startup_failure(app, &error);
+            return Ok(());
+        }
+        (WorkerBuildPurpose::Session, Err(error)) => return Err(error.into()),
+        (WorkerBuildPurpose::SwitchModel, Err(error)) => {
+            app.chat
+                .push_error(&format!("Failed to switch model: {error}"));
+            return Ok(());
+        }
+    };
+    RuntimeDeps::install_worker(app, worker, &build, built);
+    if matches!(purpose, WorkerBuildPurpose::SwitchModel) {
+        let model = build.model().to_string();
+        tracing::info!("Switched model to: {}", model);
+        app.status = Some(format!("Model: {model}"));
+        if let Err(e) = app.session_manager.set_current_model(model.clone()).await {
+            tracing::warn!("Failed to save model to session: {}", e);
+        }
+        app.config.last_model = Some(
+            model
+                .parse::<may_agent::ModelSelector>()
+                .expect("interactive model switch must persist a valid provider::model selector"),
+        );
+        if let Err(e) = app.config.clone().save().await {
+            tracing::warn!("Failed to save config: {}", e);
+        }
+    }
+    Ok(())
+}
+
 /// The main event loop - handles terminal events and channel messages.
 ///
 /// This loop NEVER directly calls `agent.run()` or `stream.next()` - all agent processing
@@ -278,6 +357,7 @@ where
 async fn main_event_loop<B: Backend>(
     app: &mut App,
     worker: &mut Option<AgentWorker>,
+    mut worker_build: Option<WorkerBuild>,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
     runtime_deps: RuntimeDeps,
@@ -346,8 +426,8 @@ where
 
         // Check for queued messages - start processing if agent is idle
         if agent_handle.is_none()
-            && let Some(msg) = runtime_deps.take_next_dispatchable(app).await?
             && let Some(w) = worker.as_ref()
+            && let Some(msg) = runtime_deps.take_next_dispatchable(app).await?
         {
             runtime_deps.mark_running(app).await?;
             agent_handle = Some(
@@ -370,6 +450,7 @@ where
         enum Event {
             AskUser(may_agent::ask_user::AskUserRequest),
             Workspace(may_agent::workspace_request::WorkspaceRequest),
+            WorkerBuilt(Result<AgentWorker, may_agent::tui::runtime::TuiRuntimeError>),
             Agent(TuiEvent),
             Terminal(AppEvent),
         }
@@ -385,31 +466,39 @@ where
             },
             futures_lite::future::or(
                 async {
-                    let result = workspace_queue.next().await;
-                    tracing::info!("workspace_queue.next() RETURNED");
-                    result.map(Event::Workspace)
+                    match worker_build.as_mut() {
+                        Some(pending) => Some(Event::WorkerBuilt(pending.build.wait().await)),
+                        None => futures_lite::future::pending().await,
+                    }
                 },
                 futures_lite::future::or(
                     async {
-                        if let Some(ref handle) = agent_handle {
-                            let result = handle.recv().await;
-                            tracing::info!("agent handle.recv() RETURNED");
-                            result.map(Event::Agent)
-                        } else {
-                            futures_lite::future::pending().await
-                        }
+                        let result = workspace_queue.next().await;
+                        tracing::info!("workspace_queue.next() RETURNED");
+                        result.map(Event::Workspace)
                     },
-                    async {
-                        let result = events.next().await;
-                        // Don't log ticks, too noisy
-                        if !matches!(result, Some(AppEvent::Tick)) {
-                            tracing::info!(
-                                "events.next() RETURNED: {:?}",
-                                result.as_ref().map(|_| "event")
-                            );
-                        }
-                        result.map(Event::Terminal)
-                    },
+                    futures_lite::future::or(
+                        async {
+                            if let Some(ref handle) = agent_handle {
+                                let result = handle.recv().await;
+                                tracing::info!("agent handle.recv() RETURNED");
+                                result.map(Event::Agent)
+                            } else {
+                                futures_lite::future::pending().await
+                            }
+                        },
+                        async {
+                            let result = events.next().await;
+                            // Don't log ticks, too noisy
+                            if !matches!(result, Some(AppEvent::Tick)) {
+                                tracing::info!(
+                                    "events.next() RETURNED: {:?}",
+                                    result.as_ref().map(|_| "event")
+                                );
+                            }
+                            result.map(Event::Terminal)
+                        },
+                    ),
                 ),
             ),
         )
@@ -420,6 +509,7 @@ where
             match &event {
                 Some(Event::AskUser(_)) => "AskUser",
                 Some(Event::Workspace(_)) => "Workspace",
+                Some(Event::WorkerBuilt(_)) => "WorkerBuilt",
                 Some(Event::Agent(_)) => "Agent",
                 Some(Event::Terminal(_)) => "Terminal",
                 None => "None",
@@ -432,6 +522,13 @@ where
         };
 
         match event {
+            Event::WorkerBuilt(built) => {
+                let finished = worker_build
+                    .take()
+                    .expect("a built worker comes from the pending worker build");
+                finish_worker_build(app, worker, finished, built).await?;
+            }
+
             Event::AskUser(request) => {
                 let questions = request.args.request.clone().into_questions();
                 tracing::info!(question_count = questions.len(), "User question requested");
@@ -554,14 +651,28 @@ where
                     }
                 }
 
+                if let AppEvent::SessionDeleted {
+                    deleted: Some(session_id),
+                    ..
+                } = &terminal_event
+                {
+                    runtime_deps.evict_session(session_id);
+                }
+
                 // Handle normal terminal events
                 match app.handle_event(terminal_event)? {
                     Some(SendAction::Quit) => break,
                     Some(SendAction::NewSession) => {
-                        runtime_deps.start_new_session(app, worker).await?;
+                        worker_build = Some(WorkerBuild {
+                            purpose: WorkerBuildPurpose::Session,
+                            build: runtime_deps.begin_new_session(app, worker).await?,
+                        });
                     }
                     Some(SendAction::LoadSession(id)) => {
-                        runtime_deps.load_session(app, worker, &id).await?;
+                        worker_build = Some(WorkerBuild {
+                            purpose: WorkerBuildPurpose::Session,
+                            build: runtime_deps.begin_load_session(app, worker, &id).await?,
+                        });
                     }
                     Some(SendAction::Send(msg)) => {
                         if agent_handle.is_none()
@@ -574,6 +685,10 @@ where
                                     .await?,
                             );
                             assistant_response.clear();
+                        } else if worker.is_none() && worker_build.is_some() {
+                            // The session's worker is still being prepared;
+                            // it picks the message up from the queue.
+                            runtime_deps.enqueue_pending_message(app, msg).await?;
                         }
                     }
                     Some(SendAction::EnqueuePending(msg)) => {
@@ -603,26 +718,15 @@ where
                         run_chatgpt_auth(app, events, terminal).await?;
                     }
                     Some(SendAction::SwitchModel(model)) => {
-                        if let Err(e) = runtime_deps.switch_model(app, worker, &model).await {
-                            let err_msg = format!("Failed to switch model: {e}");
-                            app.chat.push_error(&err_msg);
-                        } else {
-                            tracing::info!("Switched model to: {}", model);
-                            app.status = Some(format!("Model: {model}"));
-                            if let Err(e) =
-                                app.session_manager.set_current_model(model.clone()).await
-                            {
-                                tracing::warn!("Failed to save model to session: {}", e);
+                        match runtime_deps.begin_switch_model(app, &model) {
+                            Ok(build) => {
+                                worker_build = Some(WorkerBuild {
+                                    purpose: WorkerBuildPurpose::SwitchModel,
+                                    build,
+                                });
                             }
-                            app.config.last_model = Some(
-                                model
-                                    .parse::<may_agent::ModelSelector>()
-                                    .expect(
-                                        "interactive model switch must persist a valid provider::model selector",
-                                    ),
-                            );
-                            if let Err(e) = app.config.clone().save().await {
-                                tracing::warn!("Failed to save config: {}", e);
+                            Err(e) => {
+                                app.chat.push_error(&format!("Failed to switch model: {e}"));
                             }
                         }
                     }

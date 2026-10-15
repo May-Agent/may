@@ -107,8 +107,12 @@ struct ManagedHeelState {
 /// How often to re-check the GitHub API for a new heel release (24 hours).
 const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-pub(crate) fn current_host_heel_asset() -> Result<ManagedHeelAsset, ManagedHeelError> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+/// Maps an OS/arch pair onto the managed heel release asset published for it.
+fn host_heel_asset(
+    os: &'static str,
+    arch: &'static str,
+) -> Result<ManagedHeelAsset, ManagedHeelError> {
+    match (os, arch) {
         ("macos", "aarch64") => Ok(ManagedHeelAsset {
             release_asset_name: "heel-aarch64-apple-darwin",
             local_binary_name: "heel",
@@ -129,8 +133,16 @@ pub(crate) fn current_host_heel_asset() -> Result<ManagedHeelAsset, ManagedHeelE
             release_asset_name: "heel-x86_64-pc-windows-msvc.exe",
             local_binary_name: "heel.exe",
         }),
+        ("windows", "aarch64") => Ok(ManagedHeelAsset {
+            release_asset_name: "heel-aarch64-pc-windows-msvc.exe",
+            local_binary_name: "heel.exe",
+        }),
         (os, arch) => Err(ManagedHeelError::UnsupportedHostTarget { os, arch }),
     }
+}
+
+pub(crate) fn current_host_heel_asset() -> Result<ManagedHeelAsset, ManagedHeelError> {
+    host_heel_asset(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 pub(crate) fn linux_heel_asset_for_current_arch() -> Result<ManagedHeelAsset, ManagedHeelError> {
@@ -435,6 +447,40 @@ async fn make_executable(_path: &Path) -> Result<(), ManagedHeelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_heel_asset_covers_every_published_target() {
+        for (os, arch, asset_name, binary_name) in [
+            ("macos", "aarch64", "heel-aarch64-apple-darwin", "heel"),
+            ("macos", "x86_64", "heel-x86_64-apple-darwin", "heel"),
+            ("linux", "aarch64", "heel-aarch64-unknown-linux-gnu", "heel"),
+            ("linux", "x86_64", "heel-x86_64-unknown-linux-gnu", "heel"),
+            (
+                "windows",
+                "x86_64",
+                "heel-x86_64-pc-windows-msvc.exe",
+                "heel.exe",
+            ),
+            (
+                "windows",
+                "aarch64",
+                "heel-aarch64-pc-windows-msvc.exe",
+                "heel.exe",
+            ),
+        ] {
+            let asset = host_heel_asset(os, arch)
+                .unwrap_or_else(|error| panic!("{os}/{arch} should be supported: {error}"));
+            assert_eq!(asset.release_asset_name(), asset_name);
+            assert_eq!(asset.local_binary_name(), binary_name);
+        }
+        assert!(matches!(
+            host_heel_asset("freebsd", "x86_64"),
+            Err(ManagedHeelError::UnsupportedHostTarget {
+                os: "freebsd",
+                arch: "x86_64"
+            })
+        ));
+    }
 
     #[test]
     fn current_host_asset_matches_supported_runtime() {

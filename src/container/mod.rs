@@ -25,6 +25,9 @@ pub enum ContainerError {
     NoRuntime,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[doc = "Managed tools failed integrity or read-only preparation."]
+    #[error("baseline tools preparation failed: {0}")]
+    Tools(#[from] aither_sandbox::ToolRuntimeError),
     #[error("Container not found: {0}")]
     NotFound(String),
     #[error("Image build failed: {0}")]
@@ -33,6 +36,74 @@ pub enum ContainerError {
     Bootstrap(String),
     #[error("Managed Podman download requires explicit user approval before downloading binaries")]
     ManagedPodmanDownloadApprovalRequired,
+    /// The container exposes no gateway the host bridge can bind.
+    #[error("container {0} exposes no gateway for the host IPC bridge")]
+    IpcRouteNoGateway(String),
+    /// The container's networks report different gateway addresses.
+    #[error("container {0} reports conflicting gateways for the host IPC bridge: {1:?}")]
+    IpcRouteConflictingGateways(String, Vec<String>),
+    /// The container's gateway cannot bind the host bridge.
+    #[error("container {0} gateway {1} is not a usable bridge bind: {2}")]
+    IpcRouteUnusableGateway(String, String, String),
+    /// The platform has no container IPC bridge route.
+    #[error("container IPC bridge routes are unsupported on this platform")]
+    IpcRouteUnsupportedPlatform,
+}
+
+/// The bind address every Docker Desktop-family runtime forwards the host
+/// gateway name to: the host's loopback interface.
+#[cfg(target_os = "macos")]
+fn macos_ipc_bridge_bind() -> aither_sandbox::BridgeAddress {
+    aither_sandbox::BridgeAddress::try_from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        .expect("loopback is a usable bridge bind")
+}
+
+/// The gateway address a container uses to reach its host, selected from the
+/// container's own inspection: exactly one distinct non-empty reported
+/// gateway, and that address binds the IPC bridge.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn select_ipc_gateway(
+    inspect: &bollard::models::ContainerInspectResponse,
+    container_id: &str,
+) -> Result<aither_sandbox::BridgeAddress, ContainerError> {
+    let mut gateways: Vec<String> = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .map(|networks| {
+            networks
+                .values()
+                .filter_map(|endpoint| endpoint.gateway.as_deref())
+                .filter(|gateway| !gateway.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    gateways.sort_unstable();
+    gateways.dedup();
+    match gateways.as_slice() {
+        [] => Err(ContainerError::IpcRouteNoGateway(container_id.to_string())),
+        [gateway] => {
+            let address = gateway.parse::<std::net::IpAddr>().map_err(|error| {
+                ContainerError::IpcRouteUnusableGateway(
+                    container_id.to_string(),
+                    gateway.clone(),
+                    error.to_string(),
+                )
+            })?;
+            aither_sandbox::BridgeAddress::try_from(address).map_err(|error| {
+                ContainerError::IpcRouteUnusableGateway(
+                    container_id.to_string(),
+                    gateway.clone(),
+                    error.to_string(),
+                )
+            })
+        }
+        _ => Err(ContainerError::IpcRouteConflictingGateways(
+            container_id.to_string(),
+            gateways,
+        )),
+    }
 }
 
 /// A detected and connected container runtime.
@@ -62,6 +133,71 @@ impl ContainerRuntime {
             ContainerRuntimeKind::Podman => "host.containers.internal",
             _ => "host.docker.internal",
         }
+    }
+
+    /// The route a container uses to reach the host's IPC bridge: the
+    /// [`host_gateway`](Self::host_gateway) name it dials plus the host
+    /// address the bridge binds.
+    ///
+    /// The bridge executes host IPC commands for whoever connects, so the
+    /// bind is never a wildcard: Docker Desktop, OrbStack and Podman machine
+    /// forward the gateway name to host loopback; on native Linux the bind is
+    /// the container network's gateway as the host owns it.
+    ///
+    /// # Errors
+    /// Fails when the container reports no gateway or conflicting gateways,
+    /// when the gateway cannot bind the bridge, or when the platform cannot
+    /// route host IPC at all.
+    pub async fn ipc_route(
+        &self,
+        container_id: &str,
+    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
+        let bind = self.ipc_bridge_bind(container_id).await?;
+        Ok(aither_sandbox::ContainerIpcRoute::new(
+            self.host_gateway(),
+            bind,
+        ))
+    }
+
+    /// The host address the IPC bridge binds for `container_id`.
+    #[cfg(target_os = "macos")]
+    async fn ipc_bridge_bind(
+        &self,
+        _container_id: &str,
+    ) -> Result<aither_sandbox::BridgeAddress, ContainerError> {
+        // Docker Desktop, OrbStack and Podman machine forward the host
+        // gateway name to the host's loopback interface.
+        Ok(macos_ipc_bridge_bind())
+    }
+
+    /// The host address the IPC bridge binds for `container_id`.
+    #[cfg(target_os = "linux")]
+    async fn ipc_bridge_bind(
+        &self,
+        container_id: &str,
+    ) -> Result<aither_sandbox::BridgeAddress, ContainerError> {
+        // Native Docker and Podman resolve the host gateway name to the
+        // container network's gateway, so the bridge binds that exact
+        // address — read from the container's own inspection, never a
+        // hardcoded subnet.
+        let inspect = self
+            .client
+            .inspect_container(
+                container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(ContainerError::Docker)?;
+        select_ipc_gateway(&inspect, container_id)
+    }
+
+    /// The host address the IPC bridge binds for `container_id`.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    async fn ipc_bridge_bind(
+        &self,
+        _container_id: &str,
+    ) -> Result<aither_sandbox::BridgeAddress, ContainerError> {
+        Err(ContainerError::IpcRouteUnsupportedPlatform)
     }
 
     /// Detect and connect to the best available container runtime.
@@ -496,4 +632,108 @@ async fn run_command_checked<const N: usize>(
     })?;
 
     Ok(stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bollard::models::{ContainerInspectResponse, EndpointSettings, NetworkSettings};
+    use std::collections::HashMap;
+
+    fn inspect_with_gateways(gateways: &[&str]) -> ContainerInspectResponse {
+        let networks: HashMap<String, EndpointSettings> = gateways
+            .iter()
+            .enumerate()
+            .map(|(index, gateway)| {
+                (
+                    format!("net{index}"),
+                    EndpointSettings {
+                        gateway: Some((*gateway).to_string()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        ContainerInspectResponse {
+            network_settings: Some(NetworkSettings {
+                networks: Some(networks),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn select_ipc_gateway_uses_the_inspected_gateway() {
+        let bind = select_ipc_gateway(&inspect_with_gateways(&["172.30.5.1"]), "container")
+            .expect("a reported gateway binds the bridge");
+        assert_eq!(
+            bind.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 30, 5, 1))
+        );
+    }
+
+    #[test]
+    fn select_ipc_gateway_errors_without_a_gateway() {
+        for inspect in [
+            ContainerInspectResponse::default(),
+            inspect_with_gateways(&[""]),
+        ] {
+            assert!(
+                matches!(
+                    select_ipc_gateway(&inspect, "container"),
+                    Err(ContainerError::IpcRouteNoGateway(_))
+                ),
+                "inspection without a non-empty gateway must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn select_ipc_gateway_errors_on_conflicting_gateways() {
+        let error = select_ipc_gateway(
+            &inspect_with_gateways(&["172.30.5.1", "172.17.0.1"]),
+            "container",
+        )
+        .expect_err("distinct gateways must conflict");
+        assert!(matches!(
+            error,
+            ContainerError::IpcRouteConflictingGateways(_, _)
+        ));
+    }
+
+    #[test]
+    fn select_ipc_gateway_accepts_a_duplicate_gateway() {
+        let bind = select_ipc_gateway(
+            &inspect_with_gateways(&["172.30.5.1", "172.30.5.1"]),
+            "container",
+        )
+        .expect("a gateway repeated across networks is unambiguous");
+        assert_eq!(
+            bind.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 30, 5, 1))
+        );
+    }
+
+    #[test]
+    fn select_ipc_gateway_rejects_unusable_gateways() {
+        for gateway in ["not-an-ip", "0.0.0.0", "224.0.0.1"] {
+            assert!(
+                matches!(
+                    select_ipc_gateway(&inspect_with_gateways(&[gateway]), "container"),
+                    Err(ContainerError::IpcRouteUnusableGateway(_, _, _))
+                ),
+                "gateway {gateway} must be rejected"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ipc_bridge_bind_uses_loopback_on_macos() {
+        assert_eq!(
+            macos_ipc_bridge_bind().ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+    }
 }

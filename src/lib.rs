@@ -35,6 +35,7 @@ pub mod terminal_commands;
 pub mod terminal_permission_handler;
 pub mod todo_parser;
 pub mod tool_dispatch;
+pub mod tools;
 pub mod tui;
 pub mod ui_event_bus;
 pub mod ui_server;
