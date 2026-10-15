@@ -28,7 +28,7 @@ pub enum SkillError {
     /// YAML error.
     #[error("YAML error: {0}")]
     Yaml(#[from] serde_yml::Error),
-    /// Git clone failed for.
+    /// Cloning the skill repository failed.
     #[error("Git clone failed for {0}")]
     GitCloneFailed(String),
     /// Repository has no skills/ directory.

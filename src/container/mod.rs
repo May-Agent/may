@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 
 use aither_sandbox::{ContainerRuntimeKind, RuntimePreference};
 use bollard::Docker;
+#[cfg(target_os = "macos")]
 use tokio::process::Command;
+#[cfg(target_os = "macos")]
 use zenwave::ResponseExt;
 
 /// Error type for container operations.
@@ -277,14 +279,26 @@ impl ContainerRuntime {
             }
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(rt) = Self::bootstrap_managed_podman(options).await? {
-                return Ok(rt);
-            }
-        }
+        Self::managed_runtime(options)
+            .await?
+            .ok_or(ContainerError::NoRuntime)
+    }
 
-        Err(ContainerError::NoRuntime)
+    /// Fall back to a May-managed Podman when no system runtime answered.
+    #[cfg(target_os = "macos")]
+    async fn managed_runtime(
+        options: RuntimeDetectOptions,
+    ) -> Result<Option<Self>, ContainerError> {
+        Self::bootstrap_managed_podman(options).await
+    }
+
+    /// No managed runtime exists off macOS, so the download option has nothing
+    /// to govern here.
+    #[cfg(not(target_os = "macos"))]
+    fn managed_runtime(
+        _options: RuntimeDetectOptions,
+    ) -> impl std::future::Future<Output = Result<Option<Self>, ContainerError>> {
+        std::future::ready(Ok(None))
     }
 
     /// Try connecting to a Docker-compatible endpoint: a Unix socket on Unix

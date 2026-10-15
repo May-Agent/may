@@ -77,7 +77,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserInputError {
     /// A `navigate` input arrived with an empty URL.
-    /// Navigate input requires a non-empty url.
     #[error("navigate input requires a non-empty url")]
     EmptyNavigationUrl,
     /// A press/release mouse input arrived without naming a button.
@@ -113,7 +112,6 @@ pub enum BrowserError {
         source: BoxError,
     },
     /// A WebRTC negotiation or track operation failed.
-    /// Webrtc operation failed during.
     #[error("webrtc operation failed during {operation}")]
     WebRtcOperation {
         /// Operation that failed.
@@ -191,8 +189,6 @@ pub enum ManagedBrowserStartupError {
         url: reqwest::Url,
     },
     /// The debugger metadata endpoint did not return decodable JSON.
-    /// Failed to decode managed browser debugger metadata from.
-    /// Failed to decode managed browser debugger metadata from.
     #[error("failed to decode managed browser debugger metadata from {url}")]
     DecodeDebuggerMetadata {
         /// Metadata endpoint that was queried.
@@ -234,10 +230,10 @@ enum InputMessage {
     Navigate { url: String },
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 /// Mouse event kinds accepted over the browser input `DataChannel`,
 /// deserialized from `camelCase` JSON.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum MouseEventType {
     /// Button press (`mousePressed`).
     MousePressed,

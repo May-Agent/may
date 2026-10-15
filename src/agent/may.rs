@@ -56,7 +56,7 @@ pub enum MayAgentError {
     /// The session's prepared tool environment could not be acquired.
     #[error(transparent)]
     ToolEnvironment(#[from] ToolEnvironmentCacheError),
-    /// Underlying Error error.
+    /// I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// LLM error.

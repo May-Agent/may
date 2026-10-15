@@ -18,19 +18,15 @@ use super::entity::profiles;
 #[derive(Debug, thiserror::Error)]
 pub enum ChatDbError {
     /// Underlying store failure; carries the driver error message.
-    /// Database backend error.
     #[error("Database backend error: {0}")]
     Storage(String),
     /// The queried row does not exist; the string identifies what was looked up.
-    /// Database row not found.
     #[error("Database row not found: {0}")]
     RowNotFound(String),
     /// A persisted context fragment failed XML block validation.
-    /// Invalid context fragment.
     #[error("Invalid context fragment: {0}")]
     InvalidXml(#[from] crate::xml::XmlBlockError),
     /// A profile row carries an environment value that is not recognized or no longer allowed.
-    /// Invalid profile environment.
     #[error("Invalid profile environment: {0}")]
     InvalidProfileEnvironment(String),
     /// A pin operation would exceed the per-profile pinned-item limit.
@@ -423,7 +419,7 @@ pub struct ContextDebugSnapshot {
     pub model: String,
     /// Provider id recorded in the snapshot header.
     pub provider_id: String,
-    /// System prompt captured at snapshot time.
+    /// User prompt captured at snapshot time.
     pub prompt: String,
     /// Attachment URLs included with the prompt.
     pub prompt_attachments: Vec<String>,
@@ -556,7 +552,7 @@ pub struct CreateScheduledTaskParams<'a> {
     pub session_id: Option<&'a str>,
     /// Human-readable task name.
     pub name: &'a str,
-    /// Trigger definition (cron, one-shot, manual).
+    /// Trigger definition (time, event, or webhook).
     pub trigger: &'a crate::task_trigger::PersistedTaskTrigger,
     /// Cron expression for recurring tasks.
     pub cron_expression: Option<&'a str>,

@@ -5,7 +5,7 @@
 pub struct Model {
     /// Owning session id.
     pub session_id: String,
-    /// Plan state string (`disabled`/`planning`/..).
+    /// Plan state string (`disabled`/`draft`/`approved`).
     pub plan_state: String,
     /// Last update timestamp (ISO 8601).
     pub updated_at: String,

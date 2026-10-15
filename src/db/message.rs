@@ -142,6 +142,7 @@ impl ChatDb {
         Ok(model)
     }
 
+    /// Append a permission-request message for a session.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
@@ -176,6 +177,7 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append a permission-response message for a session.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
@@ -208,6 +210,7 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append a workspace-request message for a session.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
@@ -242,6 +245,7 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append a workspace-response message for a session.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
@@ -274,6 +278,7 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append an ask-user request message with its questions and options.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
@@ -332,6 +337,7 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append an ask-user response message with its answers.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
@@ -395,6 +401,7 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append a chat history message to a session.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
@@ -488,6 +495,7 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Update usage/context stats on the latest assistant message from a [`ChatMessageStats`].
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
