@@ -25,9 +25,6 @@ pub enum ContainerError {
     NoRuntime,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[doc = "Managed tool configuration could not be loaded."]
-    #[error("baseline tools configuration failed: {0}")]
-    ToolsConfiguration(#[from] crate::config::ConfigError),
     #[doc = "Managed tools failed integrity or read-only preparation."]
     #[error("baseline tools preparation failed: {0}")]
     Tools(#[from] aither_sandbox::ToolRuntimeError),

@@ -1,6 +1,7 @@
 //! May agent wrapper around aither-agent.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aither_agent::{
     Agent, AgentError, AgentEvent, AgentKind, CompactResult, HCons, TerminalAgentBuilder,
@@ -96,7 +97,7 @@ pub enum AgentEnvironment {
 /// Configuration for creating a `MayAgent`.
 pub struct MayAgentConfig {
     /// Trusted baseline tool distribution used by every configured backend.
-    pub tools: crate::config::ToolRuntimeConfig,
+    pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// The LLM provider.
     pub llm: CloudProvider,
     /// The concrete model identifier selected for this request.
@@ -304,14 +305,12 @@ impl MayAgent {
         } else {
             config.max_iterations
         };
-        let terminal_jobs = terminal_tool.job_registry();
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook);
         let terminal_command_factory = builder.terminal_tool_factory();
         let shared_terminal_commands = register_shared_terminal_commands(
             builder.tool_registry_mut(),
-            terminal_jobs,
             SharedTerminalCommandConfig {
                 llm: terminal_command_llm,
                 ask_flagship,
@@ -349,8 +348,10 @@ impl MayAgent {
             builder = builder.with_skills(&skills_dir).await?;
             builder = builder.with_subagents(&subagents_dir).await?;
         }
+        // The builder's descriptions cover the terminal controls aither
+        // registers itself plus every shared command registered above.
         let base_system_prompt =
-            build_base_system_prompt(&shared_terminal_commands, &skills_dir, &subagents_dir)
+            build_base_system_prompt(builder.tool_descriptions(), &skills_dir, &subagents_dir)
                 .await?;
         builder = builder
             .system_prompt_raw(base_system_prompt)
@@ -461,13 +462,16 @@ impl MayAgent {
 
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
-        let distribution = config.tools.load_distribution().await?;
         tracing::debug!(
             stage = "tool_preparation",
             "preparing session tool environments"
         );
+        let preparation_started = std::time::Instant::now();
         let builder = builder
-            .initialize_tools(&distribution, &config.may_dir.join("tools/cache"))
+            .initialize_tools(
+                &config.tool_distribution,
+                &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
+            )
             .await
             .inspect_err(|error| {
                 tracing::error!(
@@ -478,6 +482,7 @@ impl MayAgent {
             })?;
         tracing::debug!(
             stage = "tool_preparation",
+            elapsed_ms = preparation_started.elapsed().as_millis(),
             "session tool environments ready"
         );
         let agent = builder.build();
@@ -515,6 +520,7 @@ impl MayAgent {
         register_skills_broker: Option<RegisterBroker>,
         register_subagents_broker: Option<RegisterBroker>,
         environment: AgentEnvironment,
+        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
         provider_attempt: usize,
     ) -> Result<Self, MayAgentError> {
         let resolved_provider =
@@ -576,7 +582,7 @@ impl MayAgent {
         let ask_models =
             super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await;
         let config = MayAgentConfig {
-            tools: may_config.tools.clone(),
+            tool_distribution,
             llm,
             model_id: model.to_string(),
             provider_id,

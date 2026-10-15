@@ -432,6 +432,8 @@ pub struct UiServerState {
     pub(crate) location_provider: crate::location::LocationProvider,
     pub(crate) runtime_service: Arc<crate::session::SessionRuntimeService>,
     pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,
+    /// Embedded baseline tool distribution shared by agents, tasks and containers.
+    pub(crate) tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     pub(crate) cwd: PathBuf,
     pub(crate) may_dir: PathBuf,
 }
@@ -774,6 +776,7 @@ impl UiServerState {
             crate::container::lifecycle::ContainerManager::new(
                 Arc::new(runtime),
                 self.may_dir.clone(),
+                self.tool_distribution.clone(),
             ),
         ))
     }
