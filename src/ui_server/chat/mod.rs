@@ -631,42 +631,58 @@ struct SessionRunRegistration {
 }
 
 impl SessionRunRegistration {
-    async fn try_new(state: Arc<UiServerState>, session_id: impl Into<String>) -> Option<Self> {
+    /// Claim the session's run, or `Ok(None)` when another run holds it.
+    ///
+    /// A storage failure is an error, never a refusal: reporting it as "the
+    /// session is already active" would hide the failure behind a conflict.
+    async fn try_new(
+        state: Arc<UiServerState>,
+        session_id: impl Into<String>,
+    ) -> Result<Option<Self>, crate::db::ChatDbError> {
         let session_id = session_id.into();
-        let claimed = state
+        if !state
             .db()
             .claim_session_run_lease(session_id.as_str())
-            .await
-            .ok()?;
-        if !claimed {
-            return None;
+            .await?
+        {
+            return Ok(None);
         }
         let Some(receiver) = state.run_cancellation_registry.try_open(&session_id) else {
-            let _ = state
+            state
                 .db()
                 .release_session_run_lease(session_id.as_str())
-                .await;
-            return None;
+                .await?;
+            return Ok(None);
         };
-        Some(Self {
+        Ok(Some(Self {
             state,
             session_id,
             receiver,
-        })
+        }))
     }
 
     const fn receiver(&self) -> &async_channel::Receiver<()> {
         &self.receiver
     }
 
-    async fn close(&self) {
-        let _ = self
+    async fn close(&self) -> Result<(), crate::db::ChatDbError> {
+        let released = self
             .state
             .db()
             .release_session_run_lease(self.session_id.as_str())
             .await;
         self.state.run_cancellation_registry.close(&self.session_id);
+        released
     }
+}
+
+/// The run registration a client turn proceeds with, or the response that
+/// refuses it: a conflict when another run holds the session, an internal
+/// error when claiming the run failed.
+fn registration_or_refusal<T>(claim: Result<Option<T>, crate::db::ChatDbError>) -> SkyResult<T> {
+    claim
+        .map_err(internal_error)?
+        .ok_or_else(active_session_conflict_error)
 }
 
 impl Drop for SessionRunRegistration {
@@ -829,11 +845,16 @@ fn result_waits_for_terminal_input(result: &ToolResult) -> bool {
 pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
-        let Some(run_registration) =
-            SessionRunRegistration::try_new(state.clone(), session_id.clone()).await
-        else {
-            return;
-        };
+        let run_registration =
+            match SessionRunRegistration::try_new(state.clone(), session_id.clone()).await {
+                Ok(Some(run_registration)) => run_registration,
+                // The run holding the session dispatches pending work when it ends.
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::error!(session_id = %session_id, error = %error, "failed to claim session run for follow-up dispatch");
+                    return;
+                }
+            };
 
         loop {
             let next = match state
@@ -873,8 +894,12 @@ pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String
             }
         }
 
-        run_registration.close().await;
-        let _ = clear_running_state_if_needed(&state, &session_id).await;
+        if let Err(error) = run_registration.close().await {
+            tracing::error!(session_id = %session_id, error = %error, "failed to release session run after follow-up dispatch");
+        }
+        if let Err(error) = clear_running_state_if_needed(&state, &session_id).await {
+            tracing::error!(session_id = %session_id, error = %error, "failed to clear running state after follow-up dispatch");
+        }
     });
 }
 
@@ -1135,11 +1160,9 @@ pub(super) async fn chat_stream(
         return Err(active_session_conflict_error());
     }
 
-    let Some(run_registration) =
-        SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await
-    else {
-        return Err(active_session_conflict_error());
-    };
+    let run_registration = registration_or_refusal(
+        SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await,
+    )?;
     let (sender, sse) = Sse::channel();
 
     let tokio_handle = state.tokio_handle.clone();
@@ -1840,11 +1863,14 @@ async fn stream_chat_events(
             };
             // Release the session before announcing the end of the turn, so
             // a client that sends its next message on `done` is never refused
-            // as a concurrent run.
-            run_registration.close().await;
+            // as a concurrent run. For the same reason the follow-up
+            // dispatcher starts only when there is pending work: it claims
+            // the session's run, and claiming it with nothing to dispatch
+            // would refuse that next message.
+            run_registration.close().await?;
             clear_running_state_if_needed(&state, &response_session_id).await?;
             send_event(&sender, "done", &done_event).await;
-            spawn_follow_up_runs(state.clone(), response_session_id.clone());
+            spawn_follow_up_runs_if_dispatchable(&state, &response_session_id).await?;
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
             let done_event = SseDoneEvent {
@@ -1853,14 +1879,14 @@ async fn stream_chat_events(
                 session_id: response_session_id.clone(),
                 assistant: api_message_from_run_result(*result),
             };
-            run_registration.close().await;
+            run_registration.close().await?;
             clear_running_state_if_needed(&state, &response_session_id).await?;
             send_event(&sender, "paused", &done_event).await;
             spawn_follow_up_runs_if_dispatchable(&state, &response_session_id).await?;
         }
         // Errors are already sent to the sink via on_error in run_agent_loop.
         Err(_) => {
-            run_registration.close().await;
+            run_registration.close().await?;
             clear_running_state_if_needed(&state, &response_session_id).await?;
         }
     }
@@ -2878,7 +2904,30 @@ async fn take_over_alert_pending(state: &UiServerState, session_id: &SessionId) 
 #[cfg(test)]
 mod tests {
     use aither_core::llm::Message as LlmMessage;
+    use skyzen::{HttpError, StatusCode};
     use std::collections::HashMap;
+
+    #[test]
+    fn run_claim_storage_failure_is_an_internal_error_not_a_conflict() {
+        let refusal = super::registration_or_refusal::<()>(Err(crate::db::ChatDbError::Storage(
+            "database is locked".to_string(),
+        )))
+        .expect_err("a failed claim must refuse the turn");
+        let refusal = refusal.into_boxed_http_error();
+        assert_eq!(refusal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            refusal.to_string().contains("database is locked"),
+            "the refusal should carry the storage failure: {refusal}"
+        );
+    }
+
+    #[test]
+    fn run_claim_held_by_another_run_is_a_conflict() {
+        let refusal = super::registration_or_refusal::<()>(Ok(None))
+            .expect_err("a held run must refuse the turn")
+            .into_boxed_http_error();
+        assert_eq!(refusal.status(), StatusCode::CONFLICT);
+    }
 
     #[test]
     fn history_delta_since_snapshot_returns_suffix_after_anchor_id() {
