@@ -32,7 +32,14 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    env:
+      # Full debuginfo for this dependency tree overflows the hosted runner's disk;
+      # line tables keep test backtraces readable.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      - name: Free runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
