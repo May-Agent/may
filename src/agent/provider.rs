@@ -17,12 +17,12 @@ use aither_cloud::{
 use aither_core::LanguageModel;
 use aither_core::llm::{
     Event as LlmEvent, LLMRequest,
-    model::{Parameters, Profile as ModelProfile},
+    model::{Ability, Parameters, Profile as ModelProfile, ReasoningEffort},
 };
 use futures_lite::Stream;
 
 use super::may::MayAgentError;
-use crate::config::{MayConfig, ProviderInstance, ProviderType};
+use crate::config::{MayConfig, ModelTier, NativeToolsConfig, ProviderInstance, ProviderType};
 use crate::copilot::clear_copilot_credentials;
 use crate::embedding_provider::{EmbeddingModelResolution, resolve_embedding_model};
 use crate::model_selector::ModelSelector;
@@ -68,16 +68,75 @@ fn resolve_model_selector(
 
 /// Wraps a base [`LanguageModel`] so every request carries a pinned
 /// [`Parameters`] struct (temperature, max tokens, reasoning effort, ...).
-#[derive(Clone)]
-pub(super) struct RequestParameterizedModel<M> {
+#[derive(Debug, Clone)]
+pub struct RequestParameterizedModel<M> {
     inner: M,
     parameters: Parameters,
 }
 
 impl<M> RequestParameterizedModel<M> {
-    pub(super) const fn new(inner: M, parameters: Parameters) -> Self {
+    /// Wraps `inner`, pinning `parameters` onto every request it serves.
+    pub const fn new(inner: M, parameters: Parameters) -> Self {
         Self { inner, parameters }
     }
+
+    /// The [`Parameters`] pinned onto every request routed through this model.
+    #[cfg(test)]
+    const fn parameters(&self) -> &Parameters {
+        &self.parameters
+    }
+}
+
+/// Computes the [`Parameters`] a model should run with: `reasoning_effort`
+/// plus the provider-hosted web tools `instance`'s `native_tools` enables
+/// for the provider type `provider_id` resolves to, gated by the model's own
+/// abilities.
+///
+/// `instance` is `None` when `provider_id` is absent from the config.
+pub(super) fn request_parameters_for(
+    provider_id: &str,
+    instance: Option<&ProviderInstance>,
+    model_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Parameters {
+    let mut request_parameters = Parameters::default();
+    if let Some(reasoning_effort) = reasoning_effort {
+        request_parameters = request_parameters.reasoning_effort(reasoning_effort);
+    }
+
+    // Enable provider-hosted web tools only for the resolved provider type:
+    // each provider crate reads its own `native_tools` section, and the
+    // portable `websearch` flag reaches OpenAI/Gemini only.
+    let native = instance.map_or_else(NativeToolsConfig::default, |instance| {
+        instance.native_tools.clone()
+    });
+    let provider_type = instance.map(|instance| instance.resolve_type(provider_id));
+    let model_has_web_search =
+        aither_models::lookup(model_id).is_some_and(|info| info.has_ability(Ability::WebSearch));
+    match provider_type {
+        Some(ProviderType::Anthropic) => {
+            request_parameters.native_tools.claude.web_search =
+                native.web_search && model_has_web_search;
+            request_parameters.native_tools.claude.web_fetch = native.web_fetch;
+        }
+        Some(ProviderType::Google) => {
+            request_parameters.websearch = native.web_search && model_has_web_search;
+            request_parameters.native_tools.gemini.url_context = native.web_fetch;
+        }
+        Some(ProviderType::OpenAI) => {
+            request_parameters.websearch = native.web_search && model_has_web_search;
+        }
+        Some(ProviderType::Chatgpt) => {
+            // Hosted search is included in the subscription (no per-call
+            // billing), so default it on unless native_tools was configured
+            // explicitly. The backend's own catalog decides support — the
+            // aither-models db has no entries for codex slugs, so the
+            // Ability::WebSearch gate would always read false here.
+            request_parameters.websearch = native.web_search || native.is_empty();
+        }
+        _ => {}
+    }
+    request_parameters
 }
 
 impl<M> LanguageModel for RequestParameterizedModel<M>
@@ -160,65 +219,96 @@ pub async fn resolve_provider_runtime(
     })
 }
 
-/// Tier-resolved models for the `ask` terminal command.
+/// Tier-resolved models for the `ask` terminal command, each carrying the
+/// [`Parameters`] of its own provider instance and model.
 ///
-/// `None` for a tier means no distinct model is configured (or it failed to
-/// initialize) and the session model should answer that tier.
+/// `None` for a tier means no distinct model is configured and the session
+/// model should answer that tier.
 #[derive(Debug, Clone, Default)]
 pub struct AskTierModels {
-    pub flagship: Option<CloudProvider>,
-    pub balanced: Option<CloudProvider>,
-    pub fast: Option<CloudProvider>,
+    /// Model for the flagship (`Advanced`) tier.
+    pub flagship: Option<RequestParameterizedModel<CloudProvider>>,
+    /// Model for the balanced tier.
+    pub balanced: Option<RequestParameterizedModel<CloudProvider>>,
+    /// Model for the fast tier.
+    pub fast: Option<RequestParameterizedModel<CloudProvider>>,
 }
 
 /// Resolves per-tier models for the `ask` command from the configured tier
-/// defaults, skipping tiers that resolve to the session's own model.
+/// defaults, building them concurrently and skipping tiers that resolve to
+/// the session's own model.
+///
+/// # Errors
+///
+/// Returns [`MayAgentError`] when a configured tier selector references a
+/// provider missing from `config` or its model fails to build.
 pub async fn resolve_ask_tier_models(
     config: &MayConfig,
     session_provider_id: &str,
     session_model_id: &str,
-) -> AskTierModels {
-    let mut models = AskTierModels::default();
-    for (tier, slot) in [
-        (crate::config::ModelTier::Advanced, &mut models.flagship),
-        (crate::config::ModelTier::Balanced, &mut models.balanced),
-        (crate::config::ModelTier::Fast, &mut models.fast),
-    ] {
-        let Some(selector) = config.default_model_for_tier(tier) else {
-            continue;
-        };
-        if selector.provider_id() == session_provider_id && selector.model_id() == session_model_id
-        {
-            continue;
-        }
-        let Some(instance) = config.get_provider(selector.provider_id()) else {
-            tracing::warn!(
-                tier = ?tier,
-                provider_id = selector.provider_id(),
-                "ask tier model references an unknown provider; tier falls back to session model"
-            );
-            continue;
-        };
-        match build_cloud_provider_from_instance(
-            selector.provider_id(),
-            instance,
-            selector.model_id(),
-        )
-        .await
-        {
-            Ok(llm) => *slot = Some(llm),
-            Err(error) => {
-                tracing::warn!(
-                    tier = ?tier,
-                    provider_id = selector.provider_id(),
-                    model = selector.model_id(),
-                    error = %error,
-                    "failed to initialize ask tier model; tier falls back to session model"
-                );
-            }
-        }
+) -> Result<AskTierModels, MayAgentError> {
+    let (flagship, balanced, fast) = futures_util::future::try_join3(
+        resolve_ask_tier_model(
+            config,
+            ModelTier::Advanced,
+            session_provider_id,
+            session_model_id,
+        ),
+        resolve_ask_tier_model(
+            config,
+            ModelTier::Balanced,
+            session_provider_id,
+            session_model_id,
+        ),
+        resolve_ask_tier_model(
+            config,
+            ModelTier::Fast,
+            session_provider_id,
+            session_model_id,
+        ),
+    )
+    .await?;
+    Ok(AskTierModels {
+        flagship,
+        balanced,
+        fast,
+    })
+}
+
+/// Builds the model configured for `tier` wrapped in the [`Parameters`] of
+/// its own provider instance. `None` means the session model answers the
+/// tier: nothing is configured for it, or it resolves to the session's own
+/// model.
+async fn resolve_ask_tier_model(
+    config: &MayConfig,
+    tier: ModelTier,
+    session_provider_id: &str,
+    session_model_id: &str,
+) -> Result<Option<RequestParameterizedModel<CloudProvider>>, MayAgentError> {
+    let Some(selector) = config.default_model_for_tier(tier) else {
+        return Ok(None);
+    };
+    let provider_id = selector.provider_id();
+    if provider_id == session_provider_id && selector.model_id() == session_model_id {
+        return Ok(None);
     }
-    models
+    let Some(instance) = config.get_provider(provider_id) else {
+        return Err(MayAgentError::MissingApiKey(format!(
+            "ask {tier:?} tier model '{selector}' references provider '{provider_id}', \
+             which is not configured"
+        )));
+    };
+    let llm = build_cloud_provider_from_instance(provider_id, instance, selector.model_id())
+        .await
+        .map_err(|error| {
+            MayAgentError::Llm(format!(
+                "failed to build ask {tier:?} tier model '{selector}': {error}"
+            ))
+        })?;
+    Ok(Some(RequestParameterizedModel::new(
+        llm,
+        request_parameters_for(provider_id, Some(instance), selector.model_id(), None),
+    )))
 }
 
 /// Builds a fast+balanced provider chain for background memory extraction.
@@ -423,4 +513,138 @@ fn is_copilot_unauthorized(err: &crate::copilot::CopilotTokenError) -> bool {
         crate::copilot::CopilotTokenError::Exchange(error)
             if error.status() == Some(401)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use aither_core::llm::model::ReasoningEffort;
+
+    use super::*;
+    use crate::config::MayConfig;
+
+    #[test]
+    fn request_parameters_for_google_session() {
+        let mut instance = ProviderInstance::new(ProviderType::Google).with_api_key("key");
+        instance.native_tools.web_search = true;
+        instance.native_tools.web_fetch = true;
+
+        let parameters = request_parameters_for(
+            "google",
+            Some(&instance),
+            "gemini-3-flash-preview",
+            Some(ReasoningEffort::High),
+        );
+
+        assert!(parameters.websearch);
+        assert!(parameters.native_tools.gemini.url_context);
+        assert!(!parameters.native_tools.claude.web_search);
+        assert!(!parameters.native_tools.claude.web_fetch);
+        assert_eq!(parameters.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn request_parameters_for_chatgpt_defaults_web_search_on() {
+        let instance = ProviderInstance::new(ProviderType::Chatgpt);
+        let parameters = request_parameters_for("chatgpt", Some(&instance), "gpt-5", None);
+        assert!(parameters.websearch);
+
+        // An explicitly configured `native_tools` section drops the default.
+        let mut fetch_only = ProviderInstance::new(ProviderType::Chatgpt);
+        fetch_only.native_tools.web_fetch = true;
+        let parameters = request_parameters_for("chatgpt", Some(&fetch_only), "gpt-5", None);
+        assert!(!parameters.websearch);
+    }
+
+    #[test]
+    fn request_parameters_for_anthropic_gates_on_model_ability() {
+        let mut instance = ProviderInstance::new(ProviderType::Anthropic).with_api_key("key");
+        instance.native_tools.web_search = true;
+        instance.native_tools.web_fetch = true;
+
+        let parameters = request_parameters_for(
+            "anthropic",
+            Some(&instance),
+            "claude-sonnet-4-5-20250929",
+            None,
+        );
+        assert!(parameters.native_tools.claude.web_search);
+        assert!(parameters.native_tools.claude.web_fetch);
+        assert!(!parameters.websearch);
+
+        // A model without the WebSearch ability keeps the flag off even when
+        // the provider instance enables it.
+        let parameters = request_parameters_for(
+            "anthropic",
+            Some(&instance),
+            "claude-haiku-4-5-20251001",
+            None,
+        );
+        assert!(!parameters.native_tools.claude.web_search);
+        assert!(parameters.native_tools.claude.web_fetch);
+    }
+
+    #[tokio::test]
+    async fn ask_tier_models_carry_their_own_providers_parameters() {
+        let mut config = MayConfig::default();
+
+        // Session provider: Google with hosted web tools enabled.
+        let mut google = ProviderInstance::new(ProviderType::Google).with_api_key("google-key");
+        google.native_tools.web_search = true;
+        google.native_tools.web_fetch = true;
+        config.upsert_provider("google", google);
+
+        // Fast tier provider: a separate Anthropic instance.
+        let mut anthropic =
+            ProviderInstance::new(ProviderType::Anthropic).with_api_key("anthropic-key");
+        anthropic.native_tools.web_search = true;
+        anthropic.native_tools.web_fetch = true;
+        config.upsert_provider("anthropic", anthropic);
+
+        config
+            .models
+            .add_model(ModelTier::Fast, "claude-sonnet-4-5-20250929", "anthropic");
+        // The balanced tier resolving to the session's own model is skipped.
+        config
+            .models
+            .add_model(ModelTier::Balanced, "gemini-3-flash-preview", "google");
+
+        let models = resolve_ask_tier_models(&config, "google", "gemini-3-flash-preview")
+            .await
+            .expect("tier models resolve");
+
+        let fast = models.fast.expect("fast tier model is built");
+        let parameters = fast.parameters();
+        // None of the Google session's flags reach the Claude tier model: it
+        // carries only Claude's own `native_tools` for its instance, and no
+        // reasoning effort.
+        assert!(parameters.native_tools.claude.web_search);
+        assert!(parameters.native_tools.claude.web_fetch);
+        assert!(!parameters.websearch);
+        assert!(!parameters.native_tools.gemini.url_context);
+        assert!(parameters.reasoning_effort.is_none());
+
+        assert!(models.balanced.is_none());
+        assert!(models.flagship.is_none());
+    }
+
+    #[tokio::test]
+    async fn ask_tier_model_with_unknown_provider_fails() {
+        let mut config = MayConfig::default();
+        config.upsert_provider(
+            "google",
+            ProviderInstance::new(ProviderType::Google).with_api_key("google-key"),
+        );
+        config
+            .models
+            .add_model(ModelTier::Fast, "some-model", "ghost");
+
+        let error = resolve_ask_tier_models(&config, "google", "gemini-3-flash-preview")
+            .await
+            .expect_err("an unknown tier provider must fail resolution");
+
+        let message = error.to_string();
+        assert!(message.contains("Fast"), "{message}");
+        assert!(message.contains("ghost"), "{message}");
+        assert!(message.contains("some-model"), "{message}");
+    }
 }

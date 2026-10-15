@@ -531,8 +531,12 @@ impl TestHarness {
             .await
             .expect("test config should be written");
 
-        seed_container_heel_cache(&may_dir).await;
-        futures_lite::future::zip(share_and_warm_tool_cache(&may_dir), warm_may_binary()).await;
+        seed_container_heel(&may_dir).await;
+        futures_lite::future::zip(
+            share_and_warm_tool_cache(&may_dir),
+            warm_may_binary(home.path()),
+        )
+        .await;
 
         Self { home, may_dir }
     }
@@ -605,6 +609,13 @@ impl TestHarness {
     fn home_path(&self) -> &Path {
         self.home.path()
     }
+
+    /// The managed container heel's `release-state.json`, as stored.
+    async fn container_heel_state(&self) -> String {
+        async_fs::read_to_string(self.may_dir.join("container/heel/release-state.json"))
+            .await
+            .expect("container heel release state should be readable")
+    }
 }
 
 struct TestSession {
@@ -645,9 +656,7 @@ impl RunningUiServer {
             .stdin(Stdio::null())
             .stdout(StdStdio::from(log_file))
             .stderr(StdStdio::from(log_file_err));
-        if let Some(heel_bin) = optional_heel_bin() {
-            command.env("HEEL_BIN", heel_bin);
-        }
+        command.env("HEEL_BIN", heel_bin());
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -711,9 +720,10 @@ impl RunningUiServer {
 /// The first load of a freshly rebuilt (large, ad-hoc-signed) debug binary
 /// can stall many seconds inside dyld/AMFI code-signature validation. Pay
 /// that cost here so server spawns stay within their health-check timeout.
-async fn warm_may_binary() {
+async fn warm_may_binary(home: &Path) {
     let output = Command::new(may_binary_path())
         .arg("--help")
+        .env("HOME", home)
         .output()
         .await
         .expect("may --help should run");
@@ -744,32 +754,127 @@ fn may_binary_path() -> PathBuf {
     candidate
 }
 
-/// Copy the developer machine's managed container heel cache (Linux binary +
-/// release state) into the test home, so container bootstrap inside tests
-/// does not depend on the GitHub release API.
-async fn seed_container_heel_cache(may_dir: &Path) {
-    let Ok(real_home) = std::env::var("HOME") else {
-        return;
-    };
-    let source = PathBuf::from(real_home).join(".may/container/heel");
-    if !source.join("bin/heel").exists() {
-        return;
+/// Release of heel whose Linux binary the harness stages as the container heel.
+const CONTAINER_HEEL_RELEASE_TAG: &str = "heel-v0.4.1";
+
+/// A pinned Linux heel release asset and the SHA-256 of its published bytes.
+struct PinnedHeelAsset {
+    name: &'static str,
+    sha256: &'static str,
+}
+
+// The container heel asset for this architecture, mirroring the product's
+// `linux_heel_asset_for_current_arch` (crate-private in `src/heel/release.rs`).
+#[cfg(target_arch = "x86_64")]
+const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
+    name: "heel-x86_64-unknown-linux-gnu",
+    sha256: "81e61a01e678feb7abc30f9ad266f2336717540eb72bc8d63aa45cf6fa152917",
+};
+#[cfg(target_arch = "aarch64")]
+const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
+    name: "heel-aarch64-unknown-linux-gnu",
+    sha256: "9c090b092ef0097fba4602b47f2f31ec2eb3ca9926127fa37892b9f077ab7a10",
+};
+
+/// Stages the pinned container heel in the test home exactly as the product's
+/// managed install leaves it — `container/heel/bin/heel` plus a
+/// `release-state.json` checked just now — so the server's recent-check fast
+/// path never queries the GitHub release API.
+async fn seed_container_heel(may_dir: &Path) {
+    let source = pinned_container_heel().await;
+    let install_root = may_dir.join("container").join("heel");
+    let binary_path = install_root.join("bin").join("heel");
+    async_fs::create_dir_all(install_root.join("bin"))
+        .await
+        .expect("container heel bin dir should be created");
+    async_fs::copy(&source, &binary_path)
+        .await
+        .expect("pinned container heel should copy into the test home");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        async_fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("container heel should be made executable");
     }
-    let dest = may_dir.join("container/heel");
-    tokio::fs::create_dir_all(dest.join("bin"))
+    // The product's `ManagedHeelState` is crate-private; this is its serde shape.
+    let state = serde_json::json!({
+        "release_tag": CONTAINER_HEEL_RELEASE_TAG,
+        "asset_name": CONTAINER_HEEL_ASSET.name,
+        "last_checked_at": jiff::Timestamp::now(),
+    });
+    async_fs::write(
+        install_root.join("release-state.json"),
+        serde_json::to_vec(&state).expect("container heel release state should serialize"),
+    )
+    .await
+    .expect("container heel release state should be written");
+}
+
+/// The pinned container heel in the shared test-tmp cache, downloaded from
+/// its release on first use. Its SHA-256 is verified every time it is handed
+/// out, whether freshly downloaded or reused.
+async fn pinned_container_heel() -> PathBuf {
+    let cache_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("container-heel")
+        .join(CONTAINER_HEEL_RELEASE_TAG);
+    let cached = cache_dir.join(CONTAINER_HEEL_ASSET.name);
+    match async_fs::read(&cached).await {
+        Ok(bytes) => {
+            verify_container_heel(bytes, &cached.display().to_string()).await;
+            return cached;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "cached container heel {} should be readable: {error}",
+            cached.display()
+        ),
+    }
+
+    let url = format!(
+        "https://github.com/lexoliu/heel/releases/download/{CONTAINER_HEEL_RELEASE_TAG}/{}",
+        CONTAINER_HEEL_ASSET.name
+    );
+    let bytes = reqwest::get(&url)
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .unwrap_or_else(|error| panic!("pinned container heel download {url} failed: {error}"))
+        .bytes()
+        .await
+        .unwrap_or_else(|error| panic!("pinned container heel body from {url} failed: {error}"));
+    let bytes = verify_container_heel(bytes.to_vec(), &url).await;
+
+    async_fs::create_dir_all(&cache_dir)
         .await
         .expect("container heel cache dir should be created");
-    tokio::fs::copy(source.join("bin/heel"), dest.join("bin/heel"))
+    // Concurrent test binaries may download at once: each writes its own
+    // temporary file and renames it into place atomically.
+    let staging = tempfile::NamedTempFile::new_in(&cache_dir)
+        .expect("container heel staging file should be created");
+    async_fs::write(staging.path(), bytes)
         .await
-        .expect("container heel binary should copy");
-    if source.join("release-state.json").exists() {
-        tokio::fs::copy(
-            source.join("release-state.json"),
-            dest.join("release-state.json"),
-        )
-        .await
-        .expect("container heel release state should copy");
-    }
+        .expect("container heel staging file should be written");
+    staging
+        .persist(&cached)
+        .expect("container heel should move into the cache");
+    cached
+}
+
+/// Panics unless `bytes` hash to the pinned digest; returns them on success.
+async fn verify_container_heel(bytes: Vec<u8>, origin: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    let (bytes, actual) = blocking::unblock(move || {
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        (bytes, digest)
+    })
+    .await;
+    assert_eq!(
+        actual, CONTAINER_HEEL_ASSET.sha256,
+        "container heel {} from {origin} has SHA-256 {actual}, expected {}",
+        CONTAINER_HEEL_ASSET.name, CONTAINER_HEEL_ASSET.sha256
+    );
+    bytes
 }
 
 /// Points the test home's tool cache at one cache shared by every test run
@@ -804,29 +909,17 @@ async fn share_and_warm_tool_cache(may_dir: &Path) {
         .expect("baseline tools should prepare");
 }
 
-fn optional_heel_bin() -> Option<String> {
-    if let Ok(path) = std::env::var("HEEL_BIN") {
-        let candidate = PathBuf::from(path);
-        if candidate.exists() {
-            return Some(candidate.display().to_string());
-        }
-    }
-
-    // Host-runnable heel binaries only: the sibling heel build and the CI
-    // release drop. The container heel under ~/.may is a Linux ELF and must
-    // never be offered for host-side sandboxing.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidates = [
-        manifest_dir.join("../heel/target/debug/heel"),
-        PathBuf::from("/tmp/heel-release/heel-aarch64-apple-darwin"),
-    ];
-    candidates
-        .into_iter()
-        .find_map(|candidate| candidate.exists().then(|| candidate.display().to_string()))
-}
-
-fn required_heel_bin() -> String {
-    optional_heel_bin().expect("prebuilt heel binary must be available for terminal E2E tests")
+/// The host heel binary the E2E suite runs commands under. `HEEL_BIN` is its
+/// only source; the suite never probes the developer's machine for one.
+fn heel_bin() -> String {
+    let path = std::env::var("HEEL_BIN").unwrap_or_else(|_| {
+        panic!("HEEL_BIN must name a prebuilt host heel binary for the terminal E2E suite")
+    });
+    assert!(
+        Path::new(&path).is_file(),
+        "HEEL_BIN={path} must name an existing heel binary file"
+    );
+    path
 }
 
 impl Drop for RunningUiServer {
@@ -1019,6 +1112,20 @@ fn terminal_task_id_from_latest_tool_output(request: &Value) -> Option<String> {
         .as_str()
         .map(ToOwned::to_owned)
 }
+/// Return `response` when it carries `expected`, otherwise fail with its body,
+/// so a server error explains itself in CI output.
+async fn expect_status(response: reqwest::Response, expected: StatusCode) -> reqwest::Response {
+    let status = response.status();
+    if status == expected {
+        return response;
+    }
+    let url = response.url().clone();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+    panic!("{url} returned {status}, expected {expected}; body: {body}");
+}
 
 async fn create_session_via_api(client: &reqwest::Client, base_url: &str) -> String {
     // Chat round-trip tests run in the local profile: the container-backed
@@ -1031,7 +1138,7 @@ async fn create_session_via_api(client: &reqwest::Client, base_url: &str) -> Str
         .send()
         .await
         .expect("create session request should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
+    let response = expect_status(response, StatusCode::OK).await;
     let value: Value = response
         .json()
         .await
@@ -1049,7 +1156,7 @@ async fn local_profile_id_via_api(client: &reqwest::Client, base_url: &str) -> S
         .send()
         .await
         .expect("list profiles request should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
+    let response = expect_status(response, StatusCode::OK).await;
     let profiles: Value = response
         .json()
         .await
@@ -1070,7 +1177,7 @@ async fn get_runtime(client: &reqwest::Client, base_url: &str, session_id: &str)
         .send()
         .await
         .expect("runtime request should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
+    let response = expect_status(response, StatusCode::OK).await;
     response
         .json()
         .await
@@ -1112,7 +1219,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let session = harness.create_session().await;
     let binary = may_binary_path();
-    let heel_bin = required_heel_bin();
+    let heel_bin = heel_bin();
 
     let pwd_output = Command::new(&binary)
         .arg("exec")
@@ -1177,7 +1284,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let session = harness.create_session().await;
     let binary = may_binary_path();
-    let heel_bin = required_heel_bin();
+    let heel_bin = heel_bin();
 
     let output = Command::new(binary)
         .arg("exec")
@@ -1222,6 +1329,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
 #[serial]
 async fn ui_session_crud_round_trip_matches_api_contract() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
+    let seeded_heel_state = harness.container_heel_state().await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
 
@@ -1231,7 +1339,14 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("create session request should succeed");
-    assert_eq!(create_response.status(), StatusCode::OK);
+    let create_response = expect_status(create_response, StatusCode::OK).await;
+    // Any release-API check rewrites the state's timestamp; an untouched
+    // state proves the default container profile took the seeded fast path.
+    assert_eq!(
+        harness.container_heel_state().await,
+        seeded_heel_state,
+        "session creation must reuse the seeded container heel without a release check"
+    );
     let created: Value = create_response
         .json()
         .await
@@ -1251,7 +1366,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("list sessions request should succeed");
-    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_response = expect_status(list_response, StatusCode::OK).await;
     let listed: Value = list_response
         .json()
         .await
@@ -1273,7 +1388,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("update session request should succeed");
-    assert_eq!(update_response.status(), StatusCode::OK);
+    let update_response = expect_status(update_response, StatusCode::OK).await;
     let updated: Value = update_response
         .json()
         .await
@@ -1288,7 +1403,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("get session request should succeed");
-    assert_eq!(get_response.status(), StatusCode::OK);
+    let get_response = expect_status(get_response, StatusCode::OK).await;
     let fetched: Value = get_response
         .json()
         .await
@@ -1311,14 +1426,14 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("delete session request should succeed");
-    assert_eq!(delete_response.status(), StatusCode::OK);
+    expect_status(delete_response, StatusCode::OK).await;
 
     let missing_response = client
         .get(format!("{}/api/sessions/{session_id}", server.base_url))
         .send()
         .await
         .expect("missing session request should succeed");
-    assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+    expect_status(missing_response, StatusCode::NOT_FOUND).await;
 
     server.stop().await;
 }
@@ -1354,7 +1469,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
                 .send()
                 .await
                 .expect("chat stream request should succeed");
-            assert_eq!(response.status(), StatusCode::OK);
+            let response = expect_status(response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
     });
@@ -1381,7 +1496,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         .send()
         .await
         .expect("stop session request should succeed");
-    assert_eq!(stop_response.status(), StatusCode::OK);
+    expect_status(stop_response, StatusCode::OK).await;
 
     let events = tokio::time::timeout(Duration::from_secs(15), chat_task)
         .await
@@ -1407,7 +1522,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         .send()
         .await
         .expect("get session after cancel should succeed");
-    assert_eq!(session_response.status(), StatusCode::OK);
+    let session_response = expect_status(session_response, StatusCode::OK).await;
     let session_payload: Value = session_response
         .json()
         .await
@@ -1446,7 +1561,7 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
                 .send()
                 .await
                 .expect("chat stream request should succeed");
-            assert_eq!(response.status(), StatusCode::OK);
+            let response = expect_status(response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
     });
@@ -1617,16 +1732,9 @@ async fn ui_chat_turns_on_one_session_prepare_tools_once() {
 #[cfg(target_os = "linux")]
 #[serial]
 async fn ui_linux_runtime_has_heel_env_for_sandbox_stdin_detection() {
-    let heel_bin = std::env::var("HEEL_BIN")
-        .expect("Linux sandbox stdin-detection UI test requires HEEL_BIN to be set");
-    assert!(
-        Path::new(&heel_bin).exists(),
-        "HEEL_BIN must point to an existing prebuilt heel binary"
-    );
-
     let mock = MockOpenAiServer::spawn(MockChatScenario::TerminalRoundTrip).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[("HEEL_BIN", &heel_bin)]).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
 
     server.stop().await;
 }
@@ -1715,7 +1823,7 @@ const IO_BACKGROUND: i32 = 3 << 13; // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0)
 #[tokio::test]
 #[serial]
 async fn exec_applies_local_command_priority() {
-    let heel_bin = required_heel_bin();
+    let heel_bin = heel_bin();
     let probe = priority_probe_command().await;
 
     // Host baseline first, through a shell exactly as the sandbox runs it: an
