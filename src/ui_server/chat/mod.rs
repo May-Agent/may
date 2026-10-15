@@ -6,6 +6,7 @@ use self::tool_dispatch::{
     handle_register_subagents_request, handle_task_request,
 };
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -100,33 +101,45 @@ fn persist_stopped_terminal_calls(
 /// and a heartbeat task. `CollectSink` is a no-op used by internal
 /// follow-up dispatch when no client is attached.
 trait ChatSink {
-    async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool;
-    async fn on_text(&mut self, chunk: &str) -> bool;
-    async fn on_reasoning(&mut self, chunk: &str) -> bool;
-    async fn on_tool_delta(
+    fn on_start(
+        &mut self,
+        session_id: &str,
+        assistant_id: &str,
+    ) -> impl Future<Output = bool> + Send;
+    fn on_text(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
+    fn on_reasoning(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
+    fn on_tool_delta(
         &mut self,
         id: &str,
         name: &str,
         arguments_fragment: &str,
         summary: crate::ui_server::tool_summary::ToolSummary,
-    ) -> bool;
-    async fn on_tool_start(
+    ) -> impl Future<Output = bool> + Send;
+    fn on_tool_start(
         &mut self,
         id: &str,
         name: &str,
         arguments: &str,
         summary: crate::ui_server::tool_summary::ToolSummary,
-    ) -> bool;
-    async fn on_tool_end(
+    ) -> impl Future<Output = bool> + Send;
+    fn on_tool_end(
         &mut self,
         id: &str,
         name: &str,
         arguments: Option<&str>,
         result: &ToolResult,
         summary: crate::ui_server::tool_summary::ToolSummary,
-    ) -> bool;
-    async fn on_todo_update(&mut self, checklist: &crate::todo_parser::TodoChecklist) -> bool;
-    async fn on_error(&mut self, code: ApiErrorCode, message: &str, retryable: bool) -> bool;
+    ) -> impl Future<Output = bool> + Send;
+    fn on_todo_update(
+        &mut self,
+        checklist: &crate::todo_parser::TodoChecklist,
+    ) -> impl Future<Output = bool> + Send;
+    fn on_error(
+        &mut self,
+        code: ApiErrorCode,
+        message: &str,
+        retryable: bool,
+    ) -> impl Future<Output = bool> + Send;
 }
 
 /// Shared seq counter — `AtomicU64` so the background heartbeat task
@@ -628,7 +641,7 @@ impl SessionRunRegistration {
         if !claimed {
             return None;
         }
-        let Some(receiver) = state.run_cancellation_registry.try_open(session_id.clone()) else {
+        let Some(receiver) = state.run_cancellation_registry.try_open(&session_id) else {
             let _ = state
                 .db()
                 .release_session_run_lease(session_id.as_str())
@@ -1328,11 +1341,10 @@ async fn run_agent_loop(
                     cancel = cancel_rx.recv() => {
                         if cancel == Ok(()) {
                             cancellation_reason = Some("run cancelled by user");
-                            None
                         } else {
                             cancellation_reason = Some("run cancellation channel closed unexpectedly");
-                            None
                         }
+                        None
                     }
                     next = stream.next() => next,
                 };
@@ -1684,16 +1696,18 @@ async fn run_agent_loop(
             .await;
             schedule_browser_takeover_resume(state, session_id.as_str()).await?;
 
-            return Err(AgentLoopError::BrowserTakeoverPaused(AgentRunResult {
-                assistant_id,
-                full_text,
-                reasoning_text,
-                terminal_snapshot,
-                usage,
-                provider_id,
-                model_context_window,
-                elapsed_ms: elapsed_ms_saturating(&started_at),
-            }));
+            return Err(AgentLoopError::BrowserTakeoverPaused(Box::new(
+                AgentRunResult {
+                    assistant_id,
+                    full_text,
+                    reasoning_text,
+                    terminal_snapshot,
+                    usage,
+                    provider_id,
+                    model_context_window,
+                    elapsed_ms: elapsed_ms_saturating(&started_at),
+                },
+            )));
         }
 
         // Handle terminal errors with provider failover.
@@ -1831,28 +1845,26 @@ async fn stream_chat_events(
             clear_running_state_if_needed(&state, &response_session_id).await?;
             send_event(&sender, "done", &done_event).await;
             spawn_follow_up_runs(state.clone(), response_session_id.clone());
-            Ok(())
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
             let done_event = SseDoneEvent {
                 seq: sink.next_seq(),
                 turn_id: sink.turn_id.clone(),
                 session_id: response_session_id.clone(),
-                assistant: api_message_from_run_result(result),
+                assistant: api_message_from_run_result(*result),
             };
             run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
             send_event(&sender, "paused", &done_event).await;
             spawn_follow_up_runs_if_dispatchable(&state, &response_session_id).await?;
-            Ok(())
         }
         // Errors are already sent to the sink via on_error in run_agent_loop.
         Err(_) => {
             run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
-            Ok(())
         }
     }
+    Ok(())
 }
 
 /// Drive a chat turn without an attached SSE client — used by the follow-up
@@ -1987,15 +1999,15 @@ async fn persist_context_debug_snapshot(
     let timestamp = jiff::Timestamp::now().to_string();
 
     let db = state.db();
-    db.upsert_context_debug_snapshot(
-        session_id.as_str(),
-        &timestamp,
+    db.upsert_context_debug_snapshot(&crate::db::context_snapshot::ContextDebugSnapshotWrite {
+        session_id: session_id.as_str(),
+        timestamp: &timestamp,
         model,
         provider_id,
         prompt,
-        &prompt_attachments,
-        &assembled_messages,
-    )
+        prompt_attachments: &prompt_attachments,
+        assembled_messages: &assembled_messages,
+    })
     .await
 }
 
@@ -2113,10 +2125,6 @@ enum UiChatPreparationError {
     ResolveContainerRuntime(#[source] crate::container::ContainerError),
     #[error("invalid container profile image tag: {0}")]
     InvalidContainerImageTag(#[source] crate::container::ContainerError),
-    #[error("invalid container profile configuration: {0}")]
-    InvalidContainerProfileConfiguration(#[source] crate::container::ContainerError),
-    #[error("invalid container mount configuration: {0}")]
-    InvalidContainerMountConfiguration(#[source] crate::container::ContainerError),
     #[error("container image build failed: {0}")]
     EnsureContainerImage(#[source] crate::container::ContainerError),
     #[error("container start failed: {0}")]
@@ -2145,15 +2153,12 @@ impl UiChatPreparationError {
             Self::InvalidFileMentionPath(_) => ApiErrorCode::BadRequest,
             Self::MissingContainerProfileModel
             | Self::ParseProfileEnvironment(_)
-            | Self::InvalidContainerImageTag(_)
-            | Self::InvalidContainerProfileConfiguration(_)
-            | Self::InvalidContainerMountConfiguration(_) => {
-                ApiErrorCode::ProfileConfigurationInvalid
+            | Self::InvalidContainerImageTag(_) => ApiErrorCode::ProfileConfigurationInvalid,
+            Self::ResolveContainerRuntime(_) | Self::ResolveContainerIpcRoute(_) => {
+                ApiErrorCode::ContainerRuntimeUnavailable
             }
-            Self::ResolveContainerRuntime(_) => ApiErrorCode::ContainerRuntimeUnavailable,
             Self::EnsureContainerImage(_) => ApiErrorCode::ContainerBuildFailed,
             Self::StartContainer(_) => ApiErrorCode::ContainerStartFailed,
-            Self::ResolveContainerIpcRoute(_) => ApiErrorCode::ContainerRuntimeUnavailable,
             Self::LoadLocation(_) => ApiErrorCode::LocationUnavailable,
             Self::LoadSession(_)
             | Self::LoadHistory(_)
@@ -2206,7 +2211,7 @@ enum AgentLoopError {
     #[error("{0}")]
     Cancelled(&'static str),
     #[error("Browser takeover is active for this session; model execution paused")]
-    BrowserTakeoverPaused(AgentRunResult),
+    BrowserTakeoverPaused(Box<AgentRunResult>),
     #[error("Model returned an empty assistant response")]
     EmptyAssistantResponse,
 }
@@ -2447,12 +2452,14 @@ fn session_paths_for_session(
     session_id: &SessionId,
 ) -> SessionPaths {
     let home_paths = MayHomePaths::new(state.may_dir.clone());
-    match profile_id {
-        Some(profile_id) => home_paths
-            .profile_home(profile_id)
-            .session_paths(session_id.as_str()),
-        None => home_paths.session_paths(session_id.as_str()),
-    }
+    profile_id.map_or_else(
+        || home_paths.session_paths(session_id.as_str()),
+        |profile_id| {
+            home_paths
+                .profile_home(profile_id)
+                .session_paths(session_id.as_str())
+        },
+    )
 }
 
 async fn push_hidden_context_part(
@@ -2535,10 +2542,8 @@ async fn setup_agent_environment(
                 profile,
                 &default_image_tag,
                 container_preferences.clone(),
-            )
-            .map_err(UiChatPreparationError::InvalidContainerProfileConfiguration)?;
-            let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences)
-                .map_err(UiChatPreparationError::InvalidContainerMountConfiguration)?;
+            );
+            let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences);
 
             crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
                 .await
@@ -2691,12 +2696,12 @@ async fn prepare_agent_for_request(
     use_persisted_context_snapshot: bool,
     provider_attempt: usize,
 ) -> Result<PreparedAgent, UiChatPreparationError> {
-    let ctx = resolve_session_context(
+    let ctx = Box::pin(resolve_session_context(
         state,
         req,
         persist_user_message,
         use_persisted_context_snapshot,
-    )
+    ))
     .await?;
     let (environment, location) = Box::pin(setup_agent_environment(state, &ctx)).await?;
     let brokers = build_tool_brokers(state, &ctx.session_id);
@@ -2704,34 +2709,36 @@ async fn prepare_agent_for_request(
     let config = state.config_snapshot();
     let mut agent = MayAgent::from_config_with_model_and_permissions(
         &config,
-        ctx.sandbox_dir,
-        state.may_dir.clone(),
-        state.cwd.clone(),
-        ctx.session_id.clone(),
-        brokers.workspace,
-        brokers.ask_user,
-        state.db(),
-        &ctx.current_model,
-        ctx.reasoning_effort,
-        ctx.profile_id.clone(),
-        Some(
-            state
-                .permission_approver
-                .for_session(ctx.session_id.as_str().to_string()),
-        ),
-        ctx.profile_persona,
-        ctx.profile_memories,
-        ctx.plan_state,
-        location,
-        Some(brokers.task),
-        Some(brokers.notify),
-        state.browser_manager().map(|_| brokers.browser),
-        Some(brokers.register_skills),
-        Some(brokers.register_subagents),
-        environment,
-        state.tool_distribution.clone(),
-        state.tool_environments.clone(),
-        provider_attempt,
+        crate::agent::MayAgentSessionInput {
+            sandbox_dir: ctx.sandbox_dir,
+            may_dir: state.may_dir.clone(),
+            cwd: state.cwd.clone(),
+            session_id: ctx.session_id.clone(),
+            workspace_request_broker: brokers.workspace,
+            ask_user_broker: brokers.ask_user,
+            db: state.db(),
+            model: &ctx.current_model,
+            reasoning_effort: ctx.reasoning_effort,
+            profile_id: ctx.profile_id.clone(),
+            permission_approver: Some(
+                state
+                    .permission_approver
+                    .for_session(ctx.session_id.as_str().to_string()),
+            ),
+            profile_persona: ctx.profile_persona,
+            profile_memories: ctx.profile_memories,
+            plan_state: ctx.plan_state,
+            location,
+            task_broker: Some(brokers.task),
+            notify_broker: Some(brokers.notify),
+            browser_broker: state.browser_manager().map(|_| brokers.browser),
+            register_skills_broker: Some(brokers.register_skills),
+            register_subagents_broker: Some(brokers.register_subagents),
+            environment,
+            tool_distribution: state.tool_distribution.clone(),
+            tool_environments: state.tool_environments.clone(),
+            provider_attempt,
+        },
     )
     .await
     .map_err(UiChatPreparationError::BuildAgent)?;

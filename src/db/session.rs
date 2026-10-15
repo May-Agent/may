@@ -420,8 +420,10 @@ impl ChatDb {
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure or malformed rows.
     ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    /// # Panics
+    ///
+    /// Panics if `BackgroundReason` fails to serialize — the type is
+    /// serde-derived, so this cannot happen.
     pub async fn write_session_runtime(
         &self,
         session_id: &str,
@@ -691,6 +693,11 @@ impl ChatDb {
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `BackgroundReason` fails to serialize — the type is
+    /// serde-derived, so this cannot happen.
     pub async fn set_terminal_interaction(
         &self,
         session_id: &str,

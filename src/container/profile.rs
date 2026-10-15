@@ -14,32 +14,32 @@ use crate::profile::{ContainerMountAccess, ContainerProfilePreferences};
 use crate::session::SessionId;
 
 /// Build a container image spec from profile preferences.
+#[must_use]
 pub fn image_spec_for_profile(
     may_dir: &Path,
     _profile: &profiles::Model,
     default_tag: &str,
     preferences: Option<ContainerProfilePreferences>,
-) -> Result<ContainerImageSpec, ContainerError> {
+) -> ContainerImageSpec {
     let context_dir = may_dir.join("container");
     let mut spec = ContainerImageSpec::new(default_tag.to_string(), context_dir.clone());
     let Some(preferences) = preferences else {
-        return Ok(spec);
+        return spec;
     };
     let Some(dockerfile) = preferences.dockerfile else {
-        return Ok(spec);
+        return spec;
     };
 
     let dockerfile_path = normalize_path(&context_dir, &dockerfile);
     spec = spec.with_dockerfile(dockerfile_path);
-    Ok(spec)
+    spec
 }
 
 /// Build typed mount specs from profile preferences.
-pub fn mounts_for_profile(
-    preferences: Option<ContainerProfilePreferences>,
-) -> Result<Vec<MountSpec>, ContainerError> {
+#[must_use]
+pub fn mounts_for_profile(preferences: Option<ContainerProfilePreferences>) -> Vec<MountSpec> {
     let Some(preferences) = preferences else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
 
     let mut mounts = Vec::with_capacity(preferences.mounts.len());
@@ -52,7 +52,7 @@ pub fn mounts_for_profile(
         };
         mounts.push(spec);
     }
-    Ok(mounts)
+    mounts
 }
 
 fn normalize_path(context_dir: &Path, configured: &str) -> PathBuf {
@@ -63,10 +63,12 @@ fn normalize_path(context_dir: &Path, configured: &str) -> PathBuf {
     context_dir.join(path)
 }
 
-/// Resolve the default image tag for a profile when no explicit `container_image` is set.
+/// Stage the assets the container runtime needs (the managed `heel` binary)
+/// under `may_dir`.
 ///
-/// Profiles without a custom Dockerfile share the global May workspace image to
-/// avoid duplicate builds across `daily` / `work` style profiles.
+/// # Errors
+///
+/// Returns [`ContainerError`] when preparing the heel binary fails.
 pub async fn ensure_container_runtime_assets(may_dir: &Path) -> Result<(), ContainerError> {
     super::heel::ensure_container_heel_binary(may_dir).await
 }
@@ -75,6 +77,11 @@ pub async fn ensure_container_runtime_assets(may_dir: &Path) -> Result<(), Conta
 ///
 /// Profiles without a custom Dockerfile share the global May workspace image to
 /// avoid duplicate builds across `daily` / `work` style profiles.
+///
+/// # Errors
+///
+/// Returns [`ContainerError`] when preparing container runtime assets fails or
+/// the container context directory cannot be hashed.
 pub async fn default_image_tag(
     may_dir: &Path,
     profile: &profiles::Model,
@@ -114,7 +121,7 @@ pub async fn default_image_tag(
 async fn container_context_hash_hex(may_dir: &Path) -> Result<String, ContainerError> {
     let context_dir = may_dir.join("container");
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_path_recursive(&context_dir, &context_dir, &mut hasher).await?;
+    Box::pin(hash_path_recursive(&context_dir, &context_dir, &mut hasher)).await?;
     Ok(format!("{:016x}", hasher.finish()))
 }
 
@@ -248,8 +255,7 @@ mod tests {
                 dockerfile: Some("custom/Dockerfile.profile".to_string()),
                 mounts: Vec::new(),
             }),
-        )
-        .expect("valid spec");
+        );
 
         assert_eq!(spec.tag, "may-workspace:test");
         assert_eq!(spec.context_dir, PathBuf::from("/tmp/may/container"));
@@ -277,8 +283,7 @@ mod tests {
                     access: ContainerMountAccess::ReadWrite,
                 },
             ],
-        }))
-        .expect("valid mounts");
+        }));
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].host_path, PathBuf::from("/host/ro"));
         assert_eq!(mounts[0].container_path, PathBuf::from("/mnt/ro"));

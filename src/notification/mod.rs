@@ -28,14 +28,22 @@ use crate::xml::XmlBlock;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationPayload {
+    /// ID assigned when the notification was created.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notification_id: Option<String>,
+    /// Notification title.
     pub title: String,
+    /// Notification body text.
     pub body: String,
+    /// Session the notification relates to, when any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Hidden context delivered back to the session when the user opens the
+    /// notification.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_context_xml: Option<XmlBlock>,
+    /// Message injected into the session when the user opens the
+    /// notification.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_message: Option<String>,
 }
@@ -84,6 +92,11 @@ impl NotificationManager {
     /// Create a new notification manager.
     ///
     /// Loads or generates a VAPID keypair at `may_dir/vapid_private.pem`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when reading or generating the VAPID keypair
+    /// fails.
     pub async fn new(may_dir: &Path, db: ChatDb) -> Result<Self, NotificationError> {
         let pem_path = may_dir.join("vapid_private.pem");
 
@@ -139,6 +152,11 @@ impl NotificationManager {
     }
 
     /// Send a push notification to all subscribed browsers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when listing subscriptions or delivering
+    /// the payload fails; see [`Self::send_payload`].
     pub async fn send(&self, title: &str, body: &str) -> Result<usize, NotificationError> {
         self.send_payload(NotificationPayload {
             notification_id: None,
@@ -152,6 +170,11 @@ impl NotificationManager {
     }
 
     /// Send a structured push notification payload to all subscribers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when the subscription list cannot be loaded
+    /// or the push transport rejects the payload.
     pub async fn send_payload(
         &self,
         payload: NotificationPayload,

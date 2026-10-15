@@ -5,7 +5,6 @@ use async_channel::Receiver;
 use crossterm::event::KeyCode;
 use executor_core::spawn;
 
-use super::super::error::AppResult;
 use super::super::state::AppMode;
 use super::{App, SendAction};
 use crate::config::{ModelTier, get_model_tier};
@@ -13,10 +12,7 @@ use crate::models::FetchedModel;
 
 impl App {
     /// Handle key in tier model picker.
-    pub(super) fn handle_tier_model_picker_key(
-        &mut self,
-        code: KeyCode,
-    ) -> AppResult<Option<SendAction>> {
+    pub(super) fn handle_tier_model_picker_key(&mut self, code: KeyCode) -> Option<SendAction> {
         match code {
             KeyCode::Esc => {
                 // Cancel and go back to config
@@ -56,7 +52,7 @@ impl App {
             }
             _ => {}
         }
-        Ok(None)
+        None
     }
 
     /// Update tier picker filtered list based on query.
@@ -145,10 +141,7 @@ impl App {
     }
 
     /// Handle key in model select popup.
-    pub(super) fn handle_model_select_key(
-        &mut self,
-        code: KeyCode,
-    ) -> AppResult<Option<SendAction>> {
+    pub(super) fn handle_model_select_key(&mut self, code: KeyCode) -> Option<SendAction> {
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.model_select_index = self.model_select_index.saturating_sub(1);
@@ -161,7 +154,7 @@ impl App {
             KeyCode::Enter => {
                 if let Some(model) = self.model_select_list.get(self.model_select_index).cloned() {
                     self.mode = AppMode::Chat;
-                    return Ok(Some(SendAction::SwitchModel(model)));
+                    return Some(SendAction::SwitchModel(model));
                 }
             }
             KeyCode::Esc => {
@@ -169,7 +162,7 @@ impl App {
             }
             _ => {}
         }
-        Ok(None)
+        None
     }
 
     /// Collect all unique models from config for model select.

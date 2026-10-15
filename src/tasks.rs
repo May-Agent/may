@@ -16,6 +16,10 @@ const AUTO_ARCHIVE_CUTOFF: jiff::SignedDuration = jiff::SignedDuration::from_hou
 /// - Not pinned
 /// - Not already archived
 /// - `updated_at` is older than 48 hours
+/// # Panics
+///
+/// Panics if the 48-hour cutoff subtraction overflows, which cannot happen
+/// on any realistic clock value.
 #[must_use]
 pub fn spawn_auto_archive(db: ChatDb) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

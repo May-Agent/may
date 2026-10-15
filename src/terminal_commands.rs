@@ -296,8 +296,14 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        async fn profile(&self) -> ModelProfile {
-            ModelProfile::new("mock", "test", "mock-model", "mock model", 100_000)
+        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
+            std::future::ready(ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                100_000,
+            ))
         }
     }
 

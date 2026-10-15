@@ -31,6 +31,7 @@ use super::queue::{Attachment, LARGE_PASTE_THRESHOLD, MessageQueue, PendingMessa
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
 
+/// User-facing message shown when a tool response cannot be sent to the session.
 pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../../texts/tool_response_send_failed.txt");
 
 /// Convert a character index to a byte index in a string.
@@ -211,6 +212,11 @@ pub struct App {
 impl App {
     /// Create a new application.
     /// `image_support` should be detected before entering raw mode using `TerminalImageSupport::detect()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TuiError`] if the May configuration cannot be loaded or the session
+    /// manager cannot be initialized.
     pub async fn new(
         event_tx: EventSender,
         image_support: Option<super::ui::image::TerminalImageSupport>,
@@ -505,6 +511,11 @@ impl App {
     ///
     /// Takes the session ID and a slice of messages to avoid borrow conflicts
     /// with the session manager.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the session manager has no current session while a session is
+    /// being initialized.
     pub fn init_session(
         &mut self,
         session_id: &SessionId,
@@ -575,6 +586,11 @@ impl App {
     }
 
     /// Handle an event. Returns Some(message) if user wants to send a message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TuiError`] when a reducer action fails, such as copying the
+    /// selection to the clipboard or running a session-management command.
     pub fn handle_event(&mut self, event: AppEvent) -> AppResult<Option<SendAction>> {
         super::reducer::reduce_event(self, event)
     }
@@ -673,23 +689,21 @@ impl App {
                     }
                 }
             }
-            AppMode::FilePicker => {
-                // FilePicker is handled separately (has its own insert_str method)
-            }
+            // FilePicker is handled separately (has its own insert_str method)
             _ => {}
         }
         None
     }
 
     /// Handle bracketed paste event.
-    pub(super) fn handle_bracketed_paste(&mut self, text: String) -> AppResult<Option<SendAction>> {
+    pub(super) fn handle_bracketed_paste(&mut self, text: String) -> Option<SendAction> {
         // Special handling for Chat mode: large pastes become attachments
         if matches!(self.mode, AppMode::Chat)
             && (text.contains('\n') || text.len() > LARGE_PASTE_THRESHOLD)
         {
             self.status = Some("Saving pasted text...".to_string());
             self.enqueue_paste_result(Ok(ClipboardPasteResult::text(text)));
-            return Ok(None);
+            return None;
         }
 
         // Use first line only for non-chat inputs (URLs, API keys, etc. are single-line)
@@ -700,7 +714,7 @@ impl App {
         };
 
         if text.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         // Handle FilePicker separately (has its own insert_str method)
@@ -708,7 +722,7 @@ impl App {
             if let Some(picker) = &mut self.file_picker {
                 picker.insert_str(&text);
             }
-            return Ok(None);
+            return None;
         }
 
         // Get active text input and paste into it
@@ -731,7 +745,7 @@ impl App {
             None => {}
         }
 
-        Ok(None)
+        None
     }
 
     /// Handle a key event.
@@ -798,31 +812,35 @@ impl App {
         }
 
         match &self.mode {
-            AppMode::Chat => self.handle_chat_key(code, modifiers),
-            AppMode::SessionSelect => {
-                super::reducer::navigation::handle_session_select_key(self, code)
-            }
-            AppMode::FilePicker => super::reducer::navigation::handle_file_picker_key(self, code),
-            AppMode::Help => super::reducer::navigation::handle_help_key(self, code),
-            AppMode::ToolDetail => super::reducer::navigation::handle_tool_detail_key(self, code),
-            AppMode::Config => self.handle_config_key(code, modifiers),
-            AppMode::ModelSelect => self.handle_model_select_key(code),
-            AppMode::TierModelPicker => self.handle_tier_model_picker_key(code),
-            AppMode::CopilotAuth => super::reducer::manage::handle_copilot_auth_key(self, code),
-            AppMode::ChatgptAuth => super::reducer::manage::handle_chatgpt_auth_key(self, code),
-            AppMode::PermissionConfirm(_) => {
-                super::reducer::manage::handle_permission_confirm_key(self, code)
-            }
-            AppMode::WorkspaceConfirm(_) => {
-                super::reducer::manage::handle_workspace_confirm_key(self, code)
-            }
-            AppMode::McpManage => super::reducer::manage::handle_mcp_key(self, code),
-            AppMode::SshManage => super::reducer::manage::handle_ssh_key(self, code),
-            AppMode::AskUser(_) => super::reducer::ask_user::handle_ask_user_key(self, code),
-            AppMode::SkillManage => super::reducer::manage::handle_skill_key(self, code),
-            AppMode::ProfileSelect => {
-                super::reducer::navigation::handle_profile_select_key(self, code)
-            }
+            AppMode::Chat => Ok(self.handle_chat_key(code, modifiers)),
+            AppMode::SessionSelect => Ok(super::reducer::navigation::handle_session_select_key(
+                self, code,
+            )),
+            AppMode::FilePicker => Ok(super::reducer::navigation::handle_file_picker_key(
+                self, code,
+            )),
+            AppMode::Help => Ok(super::reducer::navigation::handle_help_key(self, code)),
+            AppMode::ToolDetail => Ok(super::reducer::navigation::handle_tool_detail_key(
+                self, code,
+            )),
+            AppMode::Config => Ok(self.handle_config_key(code, modifiers)),
+            AppMode::ModelSelect => Ok(self.handle_model_select_key(code)),
+            AppMode::TierModelPicker => Ok(self.handle_tier_model_picker_key(code)),
+            AppMode::CopilotAuth => Ok(super::reducer::manage::handle_copilot_auth_key(self, code)),
+            AppMode::ChatgptAuth => Ok(super::reducer::manage::handle_chatgpt_auth_key(self, code)),
+            AppMode::PermissionConfirm(_) => Ok(
+                super::reducer::manage::handle_permission_confirm_key(self, code),
+            ),
+            AppMode::WorkspaceConfirm(_) => Ok(
+                super::reducer::manage::handle_workspace_confirm_key(self, code),
+            ),
+            AppMode::McpManage => Ok(super::reducer::manage::handle_mcp_key(self, code)),
+            AppMode::SshManage => Ok(super::reducer::manage::handle_ssh_key(self, code)),
+            AppMode::AskUser(_) => Ok(super::reducer::ask_user::handle_ask_user_key(self, code)),
+            AppMode::SkillManage => Ok(super::reducer::manage::handle_skill_key(self, code)),
+            AppMode::ProfileSelect => Ok(super::reducer::navigation::handle_profile_select_key(
+                self, code,
+            )),
         }
     }
 
@@ -1006,15 +1024,11 @@ impl App {
     }
 
     /// Handle key in chat mode (unified input + navigation).
-    fn handle_chat_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> AppResult<Option<SendAction>> {
+    fn handle_chat_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<SendAction> {
         // Handle Ctrl+V for paste
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('v') {
-            self.handle_paste()?;
-            return Ok(None);
+            self.handle_paste();
+            return None;
         }
 
         match code {
@@ -1040,15 +1054,15 @@ impl App {
                         // No item to select, just cancel completion
                         self.completion.cancel();
                     }
-                    return Ok(None);
+                    return None;
                 }
                 if self.has_pending_attachments() {
                     self.status = Some("Waiting for attachments to finish...".to_string());
-                    return Ok(None);
+                    return None;
                 }
                 // Send as message (slash commands only work from menu selection)
                 if !self.input.is_empty() || !self.attachments.is_empty() {
-                    return Ok(Some(self.prepare_message(PendingUserMessageMode::Steer)));
+                    return Some(self.prepare_message(PendingUserMessageMode::Steer));
                 }
             }
             KeyCode::Backspace => {
@@ -1092,7 +1106,7 @@ impl App {
             KeyCode::Down => {
                 if self.completion.is_active() {
                     self.completion.next();
-                } else if let Some(entry) = self.history.next() {
+                } else if let Some(entry) = self.history.next_entry() {
                     self.input = entry.to_string();
                     self.input_char_count = self.input.chars().count();
                     self.cursor = self.input_char_count;
@@ -1128,14 +1142,14 @@ impl App {
                     && let Some(item) = self.completion.complete()
                 {
                     self.accept_completion(&item.insert.clone());
-                    return Ok(None);
+                    return None;
                 }
                 if self.processing && (!self.input.is_empty() || !self.attachments.is_empty()) {
                     if self.has_pending_attachments() {
                         self.status = Some("Waiting for attachments to finish...".to_string());
-                        return Ok(None);
+                        return None;
                     }
-                    return Ok(Some(self.prepare_message(PendingUserMessageMode::Queue)));
+                    return Some(self.prepare_message(PendingUserMessageMode::Queue));
                 }
             }
             KeyCode::Char(c) => {
@@ -1151,7 +1165,7 @@ impl App {
             }
             _ => {}
         }
-        Ok(None)
+        None
     }
 
     /// Largest scroll offset that still shows a full view of content.
@@ -1202,11 +1216,11 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
+        const SCROLL_STEP_LINES: usize = 3;
+
         if !matches!(self.mode, AppMode::Chat) {
             return Ok(None);
         }
-
-        const SCROLL_STEP_LINES: usize = 3;
 
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_chat_up(SCROLL_STEP_LINES),
@@ -1302,7 +1316,7 @@ impl App {
         if out.is_empty() { None } else { Some(out) }
     }
 
-    fn copy_selection_to_clipboard(&mut self) -> AppResult<bool> {
+    fn copy_selection_to_clipboard(&self) -> AppResult<bool> {
         let Some(text) = self.selected_text() else {
             return Ok(false);
         };
@@ -1324,13 +1338,13 @@ impl App {
     }
 
     /// Execute a slash command directly (from menu selection only).
-    fn execute_slash_command(&mut self, cmd: &str) -> AppResult<Option<SendAction>> {
+    fn execute_slash_command(&mut self, cmd: &str) -> Option<SendAction> {
         match cmd {
             "/session" => {
                 self.load_session_list();
-                Ok(None)
+                None
             }
-            "/new" => Ok(Some(SendAction::NewSession)),
+            "/new" => Some(SendAction::NewSession),
             "/profile" => {
                 if self.profiles.len() > 1 {
                     self.profile_selected = self
@@ -1342,7 +1356,7 @@ impl App {
                 } else {
                     self.load_session_list();
                 }
-                Ok(None)
+                None
             }
             "/sandbox" => {
                 if let Some(session) = self.session_manager.current() {
@@ -1364,13 +1378,13 @@ impl App {
                             .spawn();
                     }
                 }
-                Ok(None)
+                None
             }
             "/config" => {
                 self.config_state = ConfigState::default();
                 self.config_state.load_providers(&self.config);
                 self.mode = AppMode::Config;
-                Ok(None)
+                None
             }
             "/model" => {
                 self.model_select_list = self.collect_all_models();
@@ -1383,17 +1397,17 @@ impl App {
                     self.model_select_index = idx;
                 }
                 self.mode = AppMode::ModelSelect;
-                Ok(None)
+                None
             }
-            "/quit" => Ok(Some(SendAction::Quit)),
-            "/compact" => Ok(Some(SendAction::Compact(None))),
+            "/quit" => Some(SendAction::Quit),
+            "/compact" => Some(SendAction::Compact(None)),
             "/mcp" => {
                 self.mode = AppMode::McpManage;
-                Ok(None)
+                None
             }
             "/ssh" => {
                 self.mode = AppMode::SshManage;
-                Ok(None)
+                None
             }
             "/skill" => {
                 let tx = self.event_tx.clone();
@@ -1415,9 +1429,9 @@ impl App {
                 })
                 .detach();
                 self.status = Some("Loading skills...".to_string());
-                Ok(None)
+                None
             }
-            _ => Ok(None),
+            _ => None,
         }
     }
 
@@ -1437,6 +1451,13 @@ impl App {
     }
 
     /// Handle a completed paste result (clipboard or bracketed paste).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TuiError::MissingImageManager`] or [`TuiError::MissingTextManager`]
+    /// when the corresponding attachment manager is not initialized, an error from
+    /// saving the pasted content, or [`TuiError::EmptyPasteResult`] when the paste
+    /// result contains neither image nor text.
     pub async fn handle_paste_result(
         &mut self,
         result: Result<ClipboardPasteResult, TuiError>,
@@ -1492,10 +1513,10 @@ impl App {
     }
 
     /// Handle paste (Ctrl+V) - check for image or text in clipboard.
-    fn handle_paste(&mut self) -> AppResult<()> {
+    fn handle_paste(&mut self) {
         if self.clipboard_rx.is_some() {
             self.status = Some("Clipboard paste already in progress".to_string());
-            return Ok(());
+            return;
         }
 
         let (tx, rx) = async_channel::bounded(1);
@@ -1531,8 +1552,6 @@ impl App {
             let _ = tx.send(result).await;
         })
         .detach();
-
-        Ok(())
     }
 
     /// Prepare a message for sending, returning the action.
@@ -1677,12 +1696,7 @@ impl App {
                             self.usage = Some(u);
                         }
                     }
-                    AgentEvent::RunStart { .. }
-                    | AgentEvent::TurnComplete { .. }
-                    | AgentEvent::Checkpoint { .. } => {
-                        // Lifecycle events are currently used for runtime coordination,
-                        // not directly rendered in the TUI timeline.
-                    }
+                    // Lifecycle events are used for runtime coordination, not rendered.
                     _ => {}
                 }
                 false
@@ -1772,21 +1786,27 @@ pub enum SendAction {
     EnqueuePending(PendingMessage),
     /// Submit an ask-user response.
     RespondAskUser {
+        /// ID of the pending ask-user request being answered.
         request_id: String,
+        /// The ask-user request that was presented to the user.
         request: crate::ask_user::AskUserRequest,
+        /// The user's answers, one entry per question.
         answers: Vec<crate::ask_user::QuestionAnswer>,
     },
     /// Start GitHub Copilot OAuth authentication.
     StartCopilotAuth,
     /// Open Copilot auth URL in browser and copy code to clipboard.
     OpenCopilotAuthUrl {
+        /// OAuth URL to open in the browser.
         url: String,
+        /// Device-flow code to copy to the clipboard.
         code: String,
     },
     /// Start `ChatGPT` subscription OAuth authentication.
     StartChatgptAuth,
     /// Open the `ChatGPT` authorization URL in a browser.
     OpenChatgptAuthUrl {
+        /// Authorization URL to open in the browser.
         url: String,
         /// Device-flow user code to copy to the clipboard (empty for browser flow).
         code: String,
@@ -1797,40 +1817,59 @@ pub enum SendAction {
     Compact(Option<String>),
     /// MCP server management actions.
     McpAdd {
+        /// Name of the MCP server to add.
         name: String,
+        /// Command used to launch the server.
         command: String,
+        /// Arguments passed to the launch command.
         args: Vec<String>,
     },
+    /// Remove an MCP server.
     McpRemove {
+        /// Name of the MCP server to remove.
         name: String,
     },
+    /// Reconnect an MCP server.
     McpReconnect {
+        /// Name of the MCP server to reconnect.
         name: String,
     },
     /// SSH server management actions.
     SshAdd {
+        /// Display name for the SSH server.
         name: String,
+        /// SSH destination, e.g. `user@host`.
         target: String,
     },
+    /// Remove an SSH server.
     SshRemove {
+        /// Name of the SSH server to remove.
         name: String,
     },
     /// Submit a workspace approval response.
     RespondWorkspace {
+        /// ID of the pending workspace request being answered.
         request_id: String,
+        /// The workspace request that was presented to the user.
         request: crate::workspace_request::WorkspaceRequest,
+        /// Whether the user approved the request.
         approved: bool,
     },
     /// Submit a permission approval response.
     RespondPermission {
+        /// ID of the pending permission request being answered.
         request_id: String,
+        /// Whether the user approved the permission request.
         approved: bool,
     },
     /// Skill management actions.
     SkillInstall {
+        /// GitHub repository (`owner/name`) to install the skill from.
         repo: String,
     },
+    /// Delete an installed skill.
     SkillDelete {
+        /// Directory name of the skill to delete.
         dir_name: String,
     },
 }

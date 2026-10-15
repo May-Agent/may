@@ -9,6 +9,8 @@ use crate::network_policy::CompiledNetworkPolicy;
 use crate::session::SessionRuntimeService;
 use crate::ui_event_bus::UiEventTopics;
 
+/// Permission handler for terminal commands: routes approval requests to
+/// the interactive approver and enforces the session's network policy.
 #[derive(Debug, Clone)]
 pub struct TerminalPermissionHandler {
     approver: Option<PermissionApprover>,
@@ -20,6 +22,7 @@ pub struct TerminalPermissionHandler {
 }
 
 impl TerminalPermissionHandler {
+    /// Create the handler used inside an agent session.
     #[must_use]
     pub fn for_agent(
         approver: Option<PermissionApprover>,
@@ -43,6 +46,7 @@ impl TerminalPermissionHandler {
         }
     }
 
+    /// Create the handler used for one-shot `may exec` runs.
     #[must_use]
     pub const fn for_exec(
         session_id: String,

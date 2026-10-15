@@ -2,7 +2,6 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::super::error::AppResult;
 use super::super::state::{AppMode, ConfigEditMode, ConfigSection, detect_api_key_from_env};
 use super::{App, SendAction, char_to_byte_index};
 use crate::config::{ModelTier, ProviderType, get_model_tier};
@@ -14,7 +13,7 @@ impl App {
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
-    ) -> AppResult<Option<SendAction>> {
+    ) -> Option<SendAction> {
         let state = &mut self.config_state;
 
         // If in edit mode, handle text input
@@ -30,7 +29,7 @@ impl App {
                 state.section = state.section.next();
             }
             state.selected = 0;
-            return Ok(None);
+            return None;
         }
 
         // Navigation within section
@@ -67,17 +66,17 @@ impl App {
                     // Setup is done - at least one provider configured
                     self.needs_setup = false;
                     self.mode = AppMode::Chat;
-                    return Ok(Some(SendAction::NewSession));
+                    return Some(SendAction::NewSession);
                 }
             }
             _ => {}
         }
 
-        Ok(None)
+        None
     }
 
     /// Handle Enter in config screen - edit/toggle the selected item.
-    fn handle_config_enter(&mut self) -> AppResult<Option<SendAction>> {
+    fn handle_config_enter(&mut self) -> Option<SendAction> {
         let state = &mut self.config_state;
 
         match state.section {
@@ -93,10 +92,10 @@ impl App {
                 } else if let Some(id) = state.provider_ids.get(state.selected).cloned() {
                     // OAuth providers restart their login flow on Enter.
                     if id == "copilot" {
-                        return Ok(Some(SendAction::StartCopilotAuth));
+                        return Some(SendAction::StartCopilotAuth);
                     }
                     if id == "chatgpt" {
-                        return Ok(Some(SendAction::StartChatgptAuth));
+                        return Some(SendAction::StartChatgptAuth);
                     }
                     // Check if this is a custom provider (has base_url)
                     let instance = self.config.provider.get(&id);
@@ -113,7 +112,7 @@ impl App {
                             editing_existing: true,
                             original_name: Some(id),
                         };
-                        return Ok(None);
+                        return None;
                     }
                     // Regular provider - just edit API key
                     let current_key = self
@@ -157,11 +156,11 @@ impl App {
             }
         }
 
-        Ok(None)
+        None
     }
 
     /// Handle key input when editing in config screen.
-    fn handle_config_edit_key(&mut self, code: KeyCode) -> AppResult<Option<SendAction>> {
+    fn handle_config_edit_key(&mut self, code: KeyCode) -> Option<SendAction> {
         let state = &mut self.config_state;
 
         // Handle list selection mode
@@ -182,12 +181,12 @@ impl App {
                         // For Copilot, start OAuth
                         if *provider_type == ProviderType::Copilot {
                             state.edit_mode = ConfigEditMode::None;
-                            return Ok(Some(SendAction::StartCopilotAuth));
+                            return Some(SendAction::StartCopilotAuth);
                         }
                         // For ChatGPT, start subscription OAuth
                         if *provider_type == ProviderType::Chatgpt {
                             state.edit_mode = ConfigEditMode::None;
-                            return Ok(Some(SendAction::StartChatgptAuth));
+                            return Some(SendAction::StartChatgptAuth);
                         }
                         // For Custom provider, need name + base_url + api_key
                         if *provider_type == ProviderType::Custom {
@@ -200,7 +199,7 @@ impl App {
                                 editing_existing: false,
                                 original_name: None,
                             };
-                            return Ok(None);
+                            return None;
                         }
                         state.edit_mode = ConfigEditMode::None;
                         // For others, try auto-detect API key
@@ -236,7 +235,7 @@ impl App {
                 }
                 _ => {}
             }
-            return Ok(None);
+            return None;
         }
 
         // Handle custom provider edit mode
@@ -314,11 +313,11 @@ impl App {
                     // Validate and save
                     if name.is_empty() {
                         // Name is required, flash error or just don't save
-                        return Ok(None);
+                        return None;
                     }
                     if base_url.is_empty() {
                         // Base URL is required for custom provider
-                        return Ok(None);
+                        return None;
                     }
                     // Clone values before moving out of the borrowed state
                     let name_val = name.clone();
@@ -350,14 +349,14 @@ impl App {
                     self.config_state.load_providers(&self.config);
                     self.auto_populate_models_if_empty();
                     self.persist_config_background();
-                    return Ok(None);
+                    return None;
                 }
                 KeyCode::Esc => {
                     self.config_state.edit_mode = ConfigEditMode::None;
                 }
                 _ => {}
             }
-            return Ok(None);
+            return None;
         }
 
         // Handle text edit mode
@@ -406,17 +405,17 @@ impl App {
             }
         }
 
-        Ok(None)
+        None
     }
 
     /// Save the current edit in config screen.
-    fn save_config_edit(&mut self) -> AppResult<Option<SendAction>> {
+    fn save_config_edit(&mut self) -> Option<SendAction> {
         // Extract needed values from state first to avoid borrow issues
         let (value, section, selected) = {
             let state = &self.config_state;
             let value = match &state.edit_mode {
                 ConfigEditMode::Text { input, .. } => input.clone(),
-                _ => return Ok(None),
+                _ => return None,
             };
             (value, state.section, state.selected)
         };
@@ -464,7 +463,7 @@ impl App {
         self.config_state.cancel_edit();
         self.persist_config_background();
 
-        Ok(None)
+        None
     }
 
     /// Auto-populate models from the first configured provider if models are empty.

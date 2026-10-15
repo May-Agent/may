@@ -36,13 +36,10 @@ pub(super) fn spawn_worker(
 }
 
 fn is_replaceable_session_title(current: Option<&str>, placeholder: &str) -> bool {
-    match current {
-        None => true,
-        Some(title) => {
-            let trimmed = title.trim();
-            trimmed.is_empty() || trimmed == "New Chat" || trimmed == placeholder
-        }
-    }
+    current.is_none_or(|title| {
+        let trimmed = title.trim();
+        trimmed.is_empty() || trimmed == "New Chat" || trimmed == placeholder
+    })
 }
 
 async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
@@ -72,8 +69,12 @@ async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
     }
 
     let config = (*state.config_snapshot()).clone();
-    let Some(generated_title) =
-        generate_session_title(&config, &task.user_message, &task.assistant_response).await
+    let Some(generated_title) = Box::pin(generate_session_title(
+        &config,
+        &task.user_message,
+        &task.assistant_response,
+    ))
+    .await
     else {
         return;
     };

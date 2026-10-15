@@ -101,10 +101,11 @@ pub enum ConfigError {
 pub enum ProviderType {
     /// Anthropic Claude models
     /// Anthropic Messages API format.
+    /// Anthropic Claude models.
     #[default]
     Anthropic,
     /// `OpenAI` GPT models
-    /// OpenAI API format.
+    /// `OpenAI` API format.
     OpenAI,
     /// Google Gemini models
     Google,
@@ -362,8 +363,10 @@ impl ProviderType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiFormat {
+    /// `OpenAI` chat-completions API format.
     #[default]
     OpenAI,
+    /// `Anthropic` messages API format.
     Anthropic,
     /// Google Gemini API format.
     Gemini,
@@ -717,7 +720,7 @@ pub enum BrowserBackendKind {
     /// May runs and manages the browser process.
     #[default]
     Managed,
-    /// Connect to an external Chrome DevTools Protocol endpoint.
+    /// Connect to an external Chrome `DevTools` Protocol endpoint.
     RemoteCdp,
 }
 

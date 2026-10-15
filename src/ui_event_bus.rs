@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 
 const UI_EVENT_BUS_CAPACITY: usize = 256;
 
+/// Topics the UI event bus publishes cache/state invalidations on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum UiEventTopic {

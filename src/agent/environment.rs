@@ -11,6 +11,7 @@ use crate::profile::ContainerProfilePreferences;
 use crate::profile::ProfileEnvironment;
 use crate::session::SessionId;
 
+/// Error type for resolving the environment an agent session runs in.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveAgentEnvironmentError {
     /// Container profile model is missing.
@@ -39,6 +40,13 @@ pub enum ResolveAgentEnvironmentError {
     ResolveContainerIpcRoute(crate::container::ContainerError),
 }
 
+/// Resolve the container/local environment an agent session should run in,
+/// deriving image tag, mounts, and tool environments from the profile.
+///
+/// # Errors
+///
+/// Returns [`ResolveAgentEnvironmentError`] when the profile requires a
+/// container environment but its model row is missing.
 pub async fn resolve_agent_environment_for_session(
     profile_environment: Option<ProfileEnvironment>,
     profile_model: Option<&profiles::Model>,
@@ -65,11 +73,11 @@ pub async fn resolve_agent_environment_for_session(
         tool_distribution.clone(),
     );
 
-    let default_image_tag = crate::container::profile::default_image_tag(
+    let default_image_tag = Box::pin(crate::container::profile::default_image_tag(
         may_dir,
         profile,
         container_preferences.clone(),
-    )
+    ))
     .await
     .map_err(ResolveAgentEnvironmentError::ContainerImageTag)?;
     let image_spec = crate::container::profile::image_spec_for_profile(
@@ -77,10 +85,8 @@ pub async fn resolve_agent_environment_for_session(
         profile,
         &default_image_tag,
         container_preferences.clone(),
-    )
-    .map_err(ResolveAgentEnvironmentError::ContainerProfileConfig)?;
-    let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences)
-        .map_err(ResolveAgentEnvironmentError::ContainerMountConfig)?;
+    );
+    let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences);
 
     crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
         .await

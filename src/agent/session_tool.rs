@@ -57,6 +57,7 @@ pub enum SessionSearchMode {
     Semantic,
 }
 
+/// Output shape for the `session list` tool command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionOutputMode {
@@ -1001,9 +1002,7 @@ fn plan_from_raw_query(
     }
 
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    let Some(first) = tokens.first().copied() else {
-        return None;
-    };
+    let first = tokens.first().copied()?;
 
     match first {
         "inspect" | "show" | "read" | "get" | "view" if tokens.len() == 2 => {

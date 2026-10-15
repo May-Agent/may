@@ -3,7 +3,7 @@
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
 mod common;
-mod context_snapshot;
+pub mod context_snapshot;
 pub mod entity;
 mod logs;
 mod memory;
@@ -53,6 +53,11 @@ impl ChatDb {
     /// Open (or create) the chat history database at the given path.
     ///
     /// Creates the current schema if the tables don't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when connecting to the SQLite database or creating
+    /// the schema fails.
     pub async fn open(db_path: &Path) -> Result<Self, ChatDbError> {
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let db = SkyDb::connect_sqlite(&url).await?;
@@ -216,6 +221,10 @@ impl ChatDb {
     // ── Permission / AskUser Queries ─────────────────────────────
 
     /// Find unanswered permission requests in a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the query fails.
     pub async fn pending_permission_requests(
         &self,
         session_id: &str,
@@ -243,6 +252,10 @@ impl ChatDb {
     }
 
     /// Find unanswered ask-user requests in a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the query fails.
     pub async fn pending_ask_user_requests(
         &self,
         session_id: &str,
@@ -343,29 +356,38 @@ struct LegacyRemoteProfileRow {
 /// Persisted permission request from structured history rows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PermissionRequestPayload {
+    /// ID of the permission request.
     pub id: String,
+    /// How the request was presented to the user.
     pub mode: PermissionHistoryMode,
+    /// Command or script the permission request covers.
     pub script: String,
 }
 
 /// Persisted permission response from structured history rows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct PermissionResponsePayload {
+    /// ID of the permission request this answers.
     pub id: String,
+    /// Whether the user approved the request.
     pub approved: bool,
 }
 
 /// Persisted ask-user request from structured history rows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AskUserRequestPayload {
+    /// ID of the ask-user request.
     pub id: String,
+    /// Questions that were presented to the user.
     pub questions: Vec<crate::ask_user::Question>,
 }
 
 /// Persisted ask-user response from structured history rows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AskUserResponsePayload {
+    /// ID of the ask-user request this answers.
     pub id: String,
+    /// Answers supplied by the user, one per question.
     pub answers: Vec<crate::ask_user::QuestionAnswer>,
 }
 

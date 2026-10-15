@@ -15,9 +15,13 @@ use crate::session::SessionPaths;
 /// Image format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
+    /// PNG image.
     Png,
+    /// JPEG image.
     Jpeg,
+    /// GIF image.
     Gif,
+    /// WebP image.
     Webp,
 }
 
@@ -94,7 +98,9 @@ impl ImageFormat {
 /// A clipboard image.
 #[derive(Debug, Clone)]
 pub struct ClipboardImage {
+    /// Encoded image bytes.
     pub data: Vec<u8>,
+    /// Format `data` is encoded in.
     pub format: ImageFormat,
 }
 
@@ -183,6 +189,11 @@ impl ImageManager {
     }
 
     /// Save an image to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImageError::Io`] when creating the image directory or writing
+    /// the file fails.
     pub async fn save(&mut self, image: &ClipboardImage) -> Result<PathBuf, ImageError> {
         // Ensure directory exists
         async_fs::create_dir_all(&self.session_images_dir).await?;
@@ -215,6 +226,12 @@ pub enum ImageError {
 }
 
 /// Try to get an image from the clipboard.
+///
+/// # Errors
+///
+/// Returns [`ImageError::Clipboard`] when the clipboard cannot be opened or
+/// read, or [`ImageError::Encoding`] when the image cannot be encoded as PNG
+/// (including dimensions that do not fit into `u32`).
 pub fn get_clipboard_image() -> Result<Option<ClipboardImage>, ImageError> {
     let mut clipboard = Clipboard::new().map_err(|e| ImageError::Clipboard(e.to_string()))?;
 
@@ -226,8 +243,10 @@ pub fn get_clipboard_image() -> Result<Option<ClipboardImage>, ImageError> {
     };
 
     // Convert to PNG bytes
-    let width = image_data.width as u32;
-    let height = image_data.height as u32;
+    let width = u32::try_from(image_data.width)
+        .map_err(|_| ImageError::Encoding("clipboard image width exceeds u32".to_string()))?;
+    let height = u32::try_from(image_data.height)
+        .map_err(|_| ImageError::Encoding("clipboard image height exceeds u32".to_string()))?;
 
     // Create an image buffer from the raw bytes
     let img = image::RgbaImage::from_raw(width, height, image_data.bytes.into_owned())
@@ -246,18 +265,26 @@ pub fn get_clipboard_image() -> Result<Option<ClipboardImage>, ImageError> {
 }
 
 /// Try to get text from the clipboard.
+///
+/// # Errors
+///
+/// Returns [`ImageError::Clipboard`] when the clipboard cannot be opened or
+/// the text read fails for a reason other than missing content.
 pub fn get_clipboard_text() -> Result<Option<String>, ImageError> {
     let mut clipboard = Clipboard::new().map_err(|e| ImageError::Clipboard(e.to_string()))?;
 
     match clipboard.get_text() {
         Ok(text) if !text.is_empty() => Ok(Some(text)),
-        Ok(_) => Ok(None),
-        Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        Ok(_) | Err(arboard::Error::ContentNotAvailable) => Ok(None),
         Err(e) => Err(ImageError::Clipboard(e.to_string())),
     }
 }
 
 /// Try to read from the clipboard, preferring images over text.
+///
+/// # Errors
+///
+/// Returns [`ImageError`] when reading the clipboard image or text fails.
 pub fn read_clipboard() -> Result<ClipboardPasteResult, ImageError> {
     if let Some(image) = get_clipboard_image()? {
         return Ok(ClipboardPasteResult::image(image));
@@ -271,6 +298,11 @@ pub fn read_clipboard() -> Result<ClipboardPasteResult, ImageError> {
 }
 
 /// Copy text to the system clipboard.
+///
+/// # Errors
+///
+/// Returns [`ImageError::Clipboard`] when the clipboard cannot be opened or
+/// the write fails.
 pub fn set_clipboard_text(text: &str) -> Result<(), ImageError> {
     let mut clipboard = Clipboard::new().map_err(|e| ImageError::Clipboard(e.to_string()))?;
     clipboard
@@ -290,6 +322,13 @@ pub fn is_image_url(text: &str) -> Option<Url> {
 }
 
 /// Download an image from a URL.
+///
+/// # Errors
+///
+/// Returns [`ImageError::Download`] when the request fails or the response
+/// status is not successful, or when the content-type header and the payload's
+/// magic bytes disagree; [`ImageError::NotImage`] when the response is not a
+/// supported image format.
 pub async fn download_image(url: &Url) -> Result<ClipboardImage, ImageError> {
     let response = zenwave::get(url.as_str())
         .await
@@ -397,6 +436,11 @@ impl TextManager {
     }
 
     /// Save large text to a file and return the path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImageError::Io`] when creating the paste directory or writing
+    /// the file fails.
     pub async fn save(&mut self, text: &str) -> Result<PathBuf, ImageError> {
         async_fs::create_dir_all(&self.session_dir).await?;
         self.counter += 1;
@@ -452,6 +496,11 @@ pub fn markdown_to_basic_html(markdown: &str) -> String {
 }
 
 /// Try to write plain text into terminal clipboard via OSC52.
+///
+/// # Errors
+///
+/// Returns [`ImageError::Io`] when writing the escape sequence to standard
+/// output fails.
 pub fn copy_via_osc52(text: &str) -> Result<(), ImageError> {
     let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let mut stdout = std::io::stdout();
@@ -462,6 +511,11 @@ pub fn copy_via_osc52(text: &str) -> Result<(), ImageError> {
 }
 
 /// Copy both rich text (HTML + alt text) and plain text using arboard.
+///
+/// # Errors
+///
+/// Returns [`ImageError::Clipboard`] when the clipboard cannot be opened or
+/// the write fails.
 pub fn set_clipboard_html(html: &str, alt_text: &str) -> Result<(), ImageError> {
     let mut clipboard = Clipboard::new().map_err(|e| ImageError::Clipboard(e.to_string()))?;
     clipboard

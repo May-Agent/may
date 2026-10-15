@@ -435,9 +435,9 @@ impl TaskRuntime {
     /// Returns [`NetworkPolicyError`] when the policy fails to compile.
     pub fn with_network_policy(
         self,
-        network_policy: NetworkPolicyConfig,
+        network_policy: &NetworkPolicyConfig,
     ) -> Result<Self, NetworkPolicyError> {
-        self.set_network_policy(&network_policy)?;
+        self.set_network_policy(network_policy)?;
         Ok(self)
     }
 
@@ -1256,20 +1256,8 @@ impl TaskRuntime {
             profile,
             &default_image_tag,
             container_preferences.clone(),
-        )
-        .map_err(|error| {
-            invalid_profile_component_error(
-                "invalid container profile image configuration: ",
-                &error,
-            )
-        })?;
-        let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences)
-            .map_err(|error| {
-                invalid_profile_component_error(
-                    "invalid container profile mount configuration: ",
-                    &error,
-                )
-            })?;
+        );
+        let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences);
 
         crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
             .await

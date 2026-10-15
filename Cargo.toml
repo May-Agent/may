@@ -189,6 +189,9 @@ clippy.struct_excessive_bools = { level = "allow", priority = 1 }
 # serde's `skip_serializing_if` expects predicates of the form `fn(&T) -> bool`;
 # the suggested by-value signature cannot satisfy that contract.
 clippy.trivially_copy_pass_by_ref = { level = "allow", priority = 1 }
+# u64 -> f64 casts in usage-metric rate calculations are intentional; the only
+# conversion path is `as`, and counter magnitudes never approach 2^53.
+clippy.cast_precision_loss = { level = "allow", priority = 1 }
 
 
 [lints]

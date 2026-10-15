@@ -15,6 +15,10 @@ use crate::db::ChatDb;
 
 const PREFERENCE_PROMPT: &str = include_str!("../templates/preference_extraction_prompt.txt");
 const RECENCY_PROMPT: &str = include_str!("../templates/recency_extraction_prompt.txt");
+/// Placeholder in the extraction templates replaced with the existing memory text.
+const CURRENT_PLACEHOLDER: &str = "{current}";
+/// Placeholder in the extraction templates replaced with the conversation text.
+const CONVERSATION_PLACEHOLDER: &str = "{conversation}";
 /// Cheap DB sweep cadence; extraction itself runs at most once per profile/day.
 const MEMORY_JOB_SWEEP_INTERVAL: Duration = Duration::from_mins(5);
 /// A dirty profile is refreshed at most once per 24 hours.
@@ -45,10 +49,14 @@ enum MemoryProcessingError {
     Llm(#[from] aither_cloud::CloudError),
 }
 
+/// A provider candidate for memory extraction, tried in order.
 #[derive(Debug, Clone)]
 pub struct MemoryExtractionProvider {
+    /// Identifier of the LLM provider, used in diagnostics.
     pub provider_id: String,
+    /// Model name to run extraction with.
     pub model: String,
+    /// Client used to run the extraction prompt.
     pub llm: CloudProvider,
 }
 
@@ -61,7 +69,7 @@ impl MemoryProcessor {
     pub fn new(db: ChatDb, providers: Vec<MemoryExtractionProvider>) -> Self {
         let worker_db = db.clone();
         tokio::spawn(async move {
-            Self::worker(worker_db, providers).await;
+            Box::pin(Self::worker(worker_db, providers)).await;
         });
 
         Self { db }
@@ -119,7 +127,14 @@ impl MemoryProcessor {
                     continue;
                 }
 
-                match Self::process_request(&db, &providers, &job.profile_id, &conversation).await {
+                match Box::pin(Self::process_request(
+                    &db,
+                    &providers,
+                    &job.profile_id,
+                    &conversation,
+                ))
+                .await
+                {
                     Ok(()) => {
                         if let Err(error) = db
                             .mark_profile_memory_job_processed(&job.profile_id, &job.updated_at)
@@ -197,12 +212,12 @@ impl MemoryProcessor {
             .map(|m| m.content)
             .unwrap_or_default();
 
-        let preference_result = Self::extract(
+        let preference_result = Box::pin(Self::extract(
             providers,
             PREFERENCE_PROMPT,
             &current_preference,
             conversation,
-        )
+        ))
         .await?;
 
         if !preference_result.trim().is_empty() {
@@ -218,8 +233,13 @@ impl MemoryProcessor {
             .map(|m| m.content)
             .unwrap_or_default();
 
-        let recency_result =
-            Self::extract(providers, RECENCY_PROMPT, &current_recency, conversation).await?;
+        let recency_result = Box::pin(Self::extract(
+            providers,
+            RECENCY_PROMPT,
+            &current_recency,
+            conversation,
+        ))
+        .await?;
 
         if !recency_result.trim().is_empty() {
             db.upsert_profile_memory(profile_id, "recency", &recency_result)
@@ -238,12 +258,12 @@ impl MemoryProcessor {
         conversation: &str,
     ) -> Result<String, MemoryProcessingError> {
         let prompt = template
-            .replace("{current}", current)
-            .replace("{conversation}", conversation);
+            .replace(CURRENT_PLACEHOLDER, current)
+            .replace(CONVERSATION_PLACEHOLDER, conversation);
         let mut errors = Vec::new();
 
         for provider in providers {
-            match Self::extract_with_provider(&provider.llm, &prompt).await {
+            match Box::pin(Self::extract_with_provider(&provider.llm, &prompt)).await {
                 Ok(content) => return Ok(content),
                 Err(error) => {
                     let error_text = error.to_string();
@@ -287,12 +307,19 @@ impl MemoryProcessor {
 /// Profile memories to inject into agent context (read-only).
 #[derive(Debug)]
 pub struct ProfileMemories {
+    /// Long-lived user preference memory, when present.
     pub preference: Option<String>,
+    /// Memory of recent activity, when present.
     pub recency: Option<String>,
 }
 
 impl ProfileMemories {
     /// Load profile memories from the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`](crate::db::ChatDbError) when reading the profile
+    /// memories fails.
     pub async fn load(db: &ChatDb, profile_id: &str) -> Result<Self, crate::db::ChatDbError> {
         let memories = db.get_profile_memories(profile_id).await?;
         let mut preference = None;

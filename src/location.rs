@@ -17,9 +17,13 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Approximate geographic location derived from IP.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct LocationInfo {
+    /// City name from the geolocation lookup.
     pub city: String,
+    /// Region/state name from the geolocation lookup.
     pub region: String,
+    /// Country name or code from the geolocation lookup.
     pub country: String,
+    /// IANA timezone name reported for the location.
     pub timezone: String,
 }
 
@@ -35,6 +39,7 @@ pub struct LocationProvider {
     cache: ArcSwapOption<CachedLocation>,
 }
 
+/// Error type for the IP geolocation lookup.
 #[derive(Debug, thiserror::Error)]
 pub enum LocationError {
     /// Failed to fetch location from ipinfo.io.
@@ -52,6 +57,7 @@ impl Default for LocationProvider {
 }
 
 impl LocationProvider {
+    /// Create a provider with an empty cache.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -60,6 +66,11 @@ impl LocationProvider {
     }
 
     /// Get the current location, fetching from ipinfo.io if cache is stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocationError::Fetch`] when the ipinfo.io request fails and
+    /// [`LocationError::Decode`] when the response cannot be decoded.
     pub async fn get(&self) -> Result<LocationInfo, LocationError> {
         if let Some(cached) = self.cache.load_full()
             && cached.fetched_at.elapsed() < CACHE_TTL

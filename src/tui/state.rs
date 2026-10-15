@@ -164,6 +164,7 @@ pub struct WorkspaceConfirmState {
 /// Pending permission confirmation shown in the TUI.
 #[derive(Debug)]
 pub struct PermissionConfirmState {
+    /// ID of the pending permission request being confirmed.
     pub request_id: String,
     /// The permission request being confirmed.
     pub request: crate::session::PersistedPermissionRequestPayload,
@@ -194,7 +195,10 @@ pub enum ChatgptAuthStatus {
     Working,
     /// Browser flow: waiting for the user to authorize; the loopback listener
     /// on localhost:1455 will receive the callback.
-    WaitingForCallback { url: String },
+    WaitingForCallback {
+        /// Loopback URL shown to the user while awaiting the callback.
+        url: String,
+    },
     /// Device flow (SSH/headless): user authorizes on the verification page.
     WaitingForUser {
         /// User code shown for device authorization.
@@ -381,10 +385,20 @@ pub enum ConfigEditMode {
     None,
     /// Editing a text field (provider API key, base URL, etc.)
     /// Editing a text field (provider API key, base URL, etc.)
-    Text { input: String, cursor: usize },
+    Text {
+        /// Current text being edited.
+        input: String,
+        /// Cursor position within `input`, in characters.
+        cursor: usize,
+    },
     /// Selecting from a list (provider type, model list)
     /// Selecting from a list (provider type, model list)
-    List { items: Vec<String>, selected: usize },
+    List {
+        /// Selectable items.
+        items: Vec<String>,
+        /// Index of the highlighted item.
+        selected: usize,
+    },
     /// Editing a custom provider (name, `base_url`, `api_key`)
     CustomProvider {
         /// Which field is focused (0=name, `1=base_url`, `2=api_key`)

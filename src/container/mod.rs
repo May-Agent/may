@@ -133,12 +133,17 @@ pub(crate) fn select_ipc_gateway(
 
 /// A detected and connected container runtime.
 pub struct ContainerRuntime {
+    /// Detected runtime kind.
     pub kind: ContainerRuntimeKind,
+    /// Bollard client connected to the runtime.
     pub client: Docker,
 }
 
+/// Options controlling container-runtime detection.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeDetectOptions {
+    /// Whether detection may download a managed Podman when no runtime is
+    /// found.
     pub allow_managed_podman_download: bool,
 }
 
@@ -181,11 +186,11 @@ impl ContainerRuntime {
     /// The Docker Desktop route: the container's own network is irrelevant
     /// because the engine VM forwards the gateway name to host loopback.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    async fn resolve_ipc_route(
+    fn resolve_ipc_route(
         &self,
         _container_id: &str,
-    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
-        Ok(docker_desktop_ipc_route(self.kind))
+    ) -> std::future::Ready<Result<aither_sandbox::ContainerIpcRoute, ContainerError>> {
+        std::future::ready(Ok(docker_desktop_ipc_route(self.kind)))
     }
 
     /// The native Linux route.
@@ -215,16 +220,21 @@ impl ContainerRuntime {
 
     /// Hosts that are neither Docker Desktop hosts nor native Linux.
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    async fn resolve_ipc_route(
+    fn resolve_ipc_route(
         &self,
         _container_id: &str,
-    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
-        Err(ContainerError::IpcRouteUnsupportedPlatform)
+    ) -> std::future::Ready<Result<aither_sandbox::ContainerIpcRoute, ContainerError>> {
+        std::future::ready(Err(ContainerError::IpcRouteUnsupportedPlatform))
     }
 
     /// Detect and connect to the best available container runtime.
     ///
     /// Default priority: `OrbStack` > Podman > Docker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError`] when no runtime can be found or reached,
+    /// including failures of a managed Podman bootstrap when one is attempted.
     pub async fn detect() -> Result<Self, ContainerError> {
         Self::detect_with_preference_and_options(
             RuntimePreference::default(),
@@ -234,6 +244,11 @@ impl ContainerRuntime {
     }
 
     /// Detect and connect to a container runtime using a specific selection order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError`] when none of the runtimes in `preference`'s
+    /// order can be found or reached.
     pub async fn detect_with_preference(
         preference: RuntimePreference,
     ) -> Result<Self, ContainerError> {
@@ -241,6 +256,14 @@ impl ContainerRuntime {
     }
 
     /// Detect and connect to a container runtime with explicit managed-runtime options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::NoRuntime`] when none of the candidates connect,
+    /// or the errors of managed Podman bootstrap —
+    /// [`ContainerError::Bootstrap`],
+    /// [`ContainerError::ManagedPodmanDownloadApprovalRequired`],
+    /// [`ContainerError::Io`] — when a managed download is attempted.
     pub async fn detect_with_preference_and_options(
         preference: RuntimePreference,
         options: RuntimeDetectOptions,
@@ -433,10 +456,18 @@ async fn extract_podman_binary(
     archive_name: &str,
     destination: &Path,
 ) -> Result<(), ContainerError> {
-    if archive_name.ends_with(".zip") {
+    let archive_name_lower = archive_name.to_ascii_lowercase();
+    let (stem, last_ext) = archive_name_lower
+        .rsplit_once('.')
+        .unwrap_or((archive_name_lower.as_str(), ""));
+    if last_ext == "zip" {
         return extract_podman_binary_from_zip(archive_path, destination).await;
     }
-    if archive_name.ends_with(".tar.gz") {
+    if last_ext == "gz"
+        && std::path::Path::new(stem)
+            .extension()
+            .is_some_and(|ext| ext == "tar")
+    {
         return extract_podman_binary_from_tar_gz(archive_path, destination).await;
     }
     Err(ContainerError::Bootstrap(format!(

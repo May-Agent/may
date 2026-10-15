@@ -15,6 +15,7 @@ use crate::tui::{App, Attachment, PendingMessage};
 use crate::workspace_request::WorkspaceRequestBroker;
 use crate::{ChatDb, ChatMessage, MayAgent, MayConfig, SessionId, generate_session_title};
 
+/// Error type for TUI runtime operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TuiRuntimeError {
     /// Database error.
@@ -45,9 +46,11 @@ pub enum TuiRuntimeError {
     #[error("unsupported persisted attachment type in TUI runtime: {0}")]
     UnsupportedPersistedAttachmentType(AttachmentKind),
     /// Failed to convert path into file URL.
-    /// Path that could not be converted.
     #[error("failed to convert path into file URL: {path}")]
-    FileUrlConversion { path: std::path::PathBuf },
+    FileUrlConversion {
+        /// Path that could not be converted.
+        path: std::path::PathBuf,
+    },
     /// Failed to parse attachment URL.
     #[error("failed to parse attachment URL {url}: {source}")]
     AttachmentUrlParse {
@@ -58,9 +61,11 @@ pub enum TuiRuntimeError {
         source: url::ParseError,
     },
     /// Attachment URL is not a local file URL.
-    /// URL that is not a local `file://` URL.
     #[error("attachment URL is not a local file URL: {url}")]
-    NonLocalAttachmentUrl { url: String },
+    NonLocalAttachmentUrl {
+        /// URL that is not a local `file://` URL.
+        url: String,
+    },
     /// Selected model is empty.
     #[error("Selected model is empty")]
     EmptySelectedModel,
@@ -77,13 +82,17 @@ pub enum TuiRuntimeError {
     #[error("agent operation failed: {0}")]
     Agent(#[from] aither_agent::AgentError),
     /// Failed to convert attachment path to URL.
-    /// Path that could not be converted.
     #[error("Failed to convert attachment path to URL: {path}")]
-    AttachmentPathToUrl { path: std::path::PathBuf },
+    AttachmentPathToUrl {
+        /// Path that could not be converted.
+        path: std::path::PathBuf,
+    },
     /// Unable to determine attachment MIME type.
-    /// Path whose MIME type could not be determined.
     #[error("Unable to determine attachment MIME type: {path}")]
-    UnknownAttachmentMediaType { path: std::path::PathBuf },
+    UnknownAttachmentMediaType {
+        /// Path whose MIME type could not be determined.
+        path: std::path::PathBuf,
+    },
     /// Failed to serialize paste XML.
     #[error("Failed to serialize paste XML: {0}")]
     SerializePasteXml(#[source] quick_xml::SeError),
@@ -640,6 +649,8 @@ struct WorkerBuildInputs {
 }
 
 impl RuntimeDeps {
+    /// Create the dependency bundle shared by every agent worker the runtime
+    /// spawns.
     pub const fn new(
         local_runtime: LocalSessionRuntime,
         workspace_broker: WorkspaceRequestBroker,
@@ -667,6 +678,8 @@ impl RuntimeDeps {
         self.tool_environments.evict(session_id);
     }
 
+    /// Return a copy that overrides the configured model and reasoning effort for
+    /// the next spawned worker only.
     #[must_use]
     pub fn with_oneshot_overrides(
         mut self,
@@ -827,6 +840,8 @@ impl RuntimeDeps {
         ))
     }
 
+    /// Settle the app after a run finishes: persist the assistant message, save
+    /// the session, clear runtime state, and kick off title generation.
     pub async fn finish_agent_task(
         &self,
         app: &mut App,
@@ -1073,8 +1088,12 @@ impl RuntimeDeps {
         };
 
         spawn(async move {
-            if let Some(title) =
-                generate_session_title(&config, &user_message, &assistant_response).await
+            if let Some(title) = Box::pin(generate_session_title(
+                &config,
+                &user_message,
+                &assistant_response,
+            ))
+            .await
                 && let Err(e) = db
                     .update_session(session_id.as_str(), Some(&title), None, None)
                     .await
@@ -1086,8 +1105,10 @@ impl RuntimeDeps {
     }
 }
 
+/// Context needed to generate a session title once a run finishes.
 #[derive(Debug)]
 pub struct TitleGenContext {
+    /// The user message that opened the session.
     pub user_message: String,
 }
 
@@ -1222,7 +1243,7 @@ async fn build_worker_for_session(
         .get_session_runtime(session_id.as_str())
         .await?
         .unwrap_or_default();
-    let environment = crate::agent::resolve_agent_environment_for_session(
+    let environment = Box::pin(crate::agent::resolve_agent_environment_for_session(
         profile_environment,
         profile_model.as_ref(),
         profile_preferences.and_then(|preferences| preferences.container),
@@ -1230,37 +1251,39 @@ async fn build_worker_for_session(
         &sandbox_dir,
         &session_id,
         &deps.tool_distribution,
-    )
+    ))
     .await
     .map_err(TuiRuntimeError::ResolveAgentEnvironment)?;
     let permission_approver = deps.local_runtime.permission_approver_for(&session_id);
-    let mut agent = MayAgent::from_config_with_model_and_permissions(
+    let mut agent = Box::pin(MayAgent::from_config_with_model_and_permissions(
         &config,
-        sandbox_dir,
-        may_dir,
-        cwd,
-        session_id,
-        deps.workspace_broker.clone(),
-        deps.ask_user_broker.clone(),
-        db.clone(),
-        &model,
-        reasoning_effort,
-        profile_model.as_ref().map(|profile| profile.id.clone()),
-        Some(permission_approver),
-        profile_persona,
-        profile_memories,
-        runtime.plan_state,
-        location,
-        Some(deps.tool_dispatchers.task.clone()),
-        Some(deps.tool_dispatchers.notify.clone()),
-        deps.tool_dispatchers.browser.clone(),
-        Some(deps.tool_dispatchers.register_skills.clone()),
-        Some(deps.tool_dispatchers.register_subagents.clone()),
-        environment,
-        deps.tool_distribution.clone(),
-        deps.tool_environments.clone(),
-        0,
-    )
+        crate::agent::MayAgentSessionInput {
+            sandbox_dir,
+            may_dir,
+            cwd,
+            session_id,
+            workspace_request_broker: deps.workspace_broker.clone(),
+            ask_user_broker: deps.ask_user_broker.clone(),
+            db: db.clone(),
+            model: &model,
+            reasoning_effort,
+            profile_id: profile_model.as_ref().map(|profile| profile.id.clone()),
+            permission_approver: Some(permission_approver),
+            profile_persona,
+            profile_memories,
+            plan_state: runtime.plan_state,
+            location,
+            task_broker: Some(deps.tool_dispatchers.task.clone()),
+            notify_broker: Some(deps.tool_dispatchers.notify.clone()),
+            browser_broker: deps.tool_dispatchers.browser.clone(),
+            register_skills_broker: Some(deps.tool_dispatchers.register_skills.clone()),
+            register_subagents_broker: Some(deps.tool_dispatchers.register_subagents.clone()),
+            environment,
+            tool_distribution: deps.tool_distribution.clone(),
+            tool_environments: deps.tool_environments.clone(),
+            provider_attempt: 0,
+        },
+    ))
     .await?;
 
     if let Some(snapshot) =
@@ -1331,6 +1354,8 @@ fn build_pasted_text_xml(
     quick_xml::se::to_string(&xml).map_err(TuiRuntimeError::SerializePasteXml)
 }
 
+/// Send an image-fetch result back to the TUI event loop; failures are logged
+/// and swallowed because the attachment is optional.
 pub async fn send_image_fetch_event(
     event_tx: &Sender<crate::tui::AppEvent>,
     url: String,

@@ -117,7 +117,7 @@ pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
         .into_iter()
         .flat_map(|entry| {
             entry.models.into_iter().map(move |mut model| {
-                model.provider_id = entry.provider_id.clone();
+                model.provider_id.clone_from(&entry.provider_id);
                 model
             })
         })
@@ -325,6 +325,12 @@ struct OpenAiModelDescriptor {
     input_token_limit: Option<u32>,
 }
 
+/// Stable lowercase label for a model [`Ability`], used in listings.
+///
+/// # Panics
+///
+/// Panics on an [`Ability`] variant added without a corresponding label —
+/// keep the arm list in sync.
 #[must_use]
 pub fn ability_to_label(ability: Ability) -> String {
     match ability {

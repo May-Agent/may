@@ -1,5 +1,6 @@
 //! Session row model for the chat history database.
 
+/// Session row model.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
     /// Session id.

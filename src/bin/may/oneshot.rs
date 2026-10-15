@@ -45,6 +45,12 @@ async fn answer_oneshot_question(
 }
 
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
+    enum Event {
+        AskUser(may_agent::ask_user::AskUserRequest),
+        Workspace(may_agent::workspace_request::WorkspaceRequest),
+        Agent(TuiEvent),
+    }
+
     const ONESHOT_IDLE_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     let (event_tx, _event_rx) = async_channel::unbounded();
@@ -97,20 +103,20 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         .await?;
     // Preparing the session's tool environments can ask for SSH consent, so
     // questions are answered while the worker is built.
-    let built = loop {
+    let completed = loop {
         let next = futures_lite::future::or(async { Ok(build.wait().await) }, async {
             Err(ask_user_queue.next().await)
         })
         .await;
         match next {
-            Ok(built) => break built?,
+            Ok(completed) => break completed?,
             Err(Some(request)) => {
                 answer_oneshot_question(&runtime_deps, &mut app, request, &mut stderr).await?;
             }
             Err(None) => anyhow::bail!("ask-user channel closed while preparing the session"),
         }
     };
-    RuntimeDeps::install_worker(&mut app, &mut worker, &build, built);
+    RuntimeDeps::install_worker(&mut app, &mut worker, &build, completed);
     let worker = worker
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("oneshot worker was not initialized"))?;
@@ -143,11 +149,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 .resolve_permission_response(&mut app, &request.id, approved)
                 .await?;
             continue;
-        }
-        enum Event {
-            AskUser(may_agent::ask_user::AskUserRequest),
-            Workspace(may_agent::workspace_request::WorkspaceRequest),
-            Agent(TuiEvent),
         }
 
         let Some(handle) = agent_handle.as_ref() else {
@@ -487,9 +488,14 @@ fn render_oneshot_event(
                 writeln!(stderr, "Thinking: {text}")?;
             }
         }
-        Ok(AgentEvent::ToolCallDelta { .. }) => {
-            // UI progress — oneshot mode ignores deltas
-        }
+        // UI progress — oneshot mode ignores deltas.
+        Ok(
+            AgentEvent::ToolCallDelta { .. }
+            | AgentEvent::TurnComplete { .. }
+            | AgentEvent::Checkpoint { .. }
+            | AgentEvent::Complete { .. }
+            | AgentEvent::Text(_),
+        ) => {}
         Ok(AgentEvent::ToolCallStart { name, .. }) => {
             writeln!(stderr, "Tool: {name}")?;
         }
@@ -501,8 +507,6 @@ fn render_oneshot_event(
                 writeln!(stderr, "Tool finished: {name}")?;
             }
         }
-        Ok(AgentEvent::TurnComplete { .. }) => {}
-        Ok(AgentEvent::Checkpoint { .. }) => {}
         Ok(AgentEvent::BackgroundTaskStarted {
             task_id,
             output_file,
@@ -547,12 +551,7 @@ fn render_oneshot_event(
                 usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
             )?;
         }
-        Ok(AgentEvent::Complete { .. }) => {}
-        Ok(AgentEvent::Text(_)) => {}
-        Ok(AgentEvent::Error(error)) => {
-            writeln!(stderr, "Error: {error}")?;
-        }
-        Err(error) => {
+        Ok(AgentEvent::Error(error)) | Err(error) => {
             writeln!(stderr, "Error: {error}")?;
         }
     }

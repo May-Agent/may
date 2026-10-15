@@ -1,7 +1,9 @@
 //! Scheduled task row model for the chat history database.
 
+/// Scheduled task row model.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
+    /// Task row ID.
     pub id: String,
     /// Profile this task belongs to.
     pub profile_id: String,

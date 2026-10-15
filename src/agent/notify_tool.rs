@@ -29,12 +29,18 @@ pub struct NotifyArgs {
     pub callback_message: Option<String>,
 }
 
+/// Outcome of a handled notify request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotifyResult {
+    /// Number of push subscriptions the notification was delivered to.
     pub sent: usize,
 }
 
+/// Broker half of the notify-request channel: submits requests to the
+/// session runtime.
 pub type NotifyBroker = ToolRequestBroker<NotifyArgs, Result<NotifyResult, String>>;
+/// Queue half of the notify-request channel: the session runtime drains
+/// pending notify requests from it.
 pub type NotifyQueue = ToolRequestQueue<NotifyArgs, Result<NotifyResult, String>>;
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +57,7 @@ enum NotifyToolError {
     Rejected(String),
 }
 
+/// Create a paired notify broker and queue for a session.
 #[must_use]
 pub fn channel() -> (NotifyBroker, NotifyQueue) {
     tool_request_channel()

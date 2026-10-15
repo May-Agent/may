@@ -123,11 +123,7 @@ pub async fn fetch_image(url: &str) -> Option<Vec<u8>> {
         }
     } else {
         // Try to load as local file
-        let path = if url.starts_with("file://") {
-            &url[7..]
-        } else {
-            url
-        };
+        let path = url.strip_prefix("file://").unwrap_or(url);
         match async_fs::read(path).await {
             Ok(bytes) => bytes,
             Err(e) => {

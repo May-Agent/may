@@ -91,9 +91,8 @@ impl MockOpenAiServer {
         let requests_for_task = requests.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(_) => break,
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
                 };
                 let io = TokioIo::new(stream);
                 let state = state.clone();
@@ -392,11 +391,11 @@ async fn handle_mock_openai_request(
     if request.method() == Method::GET && request.uri().path() == "/v1/models" {
         return Ok(json_response(
             StatusCode::OK,
-            serde_json::json!({
+            &serde_json::json!({
                 "data": [{
                     "id": TEST_MODEL,
                     "owned_by": "mock",
-                    "context_length": 128000
+                    "context_length": 128_000
                 }]
             }),
         ));
@@ -405,7 +404,7 @@ async fn handle_mock_openai_request(
     if request.method() != Method::POST || request.uri().path() != "/v1/chat/completions" {
         return Ok(json_response(
             StatusCode::NOT_FOUND,
-            serde_json::json!({ "error": "not found" }),
+            &serde_json::json!({ "error": "not found" }),
         ));
     }
 
@@ -441,7 +440,7 @@ async fn handle_mock_openai_request(
             Err(error) => {
                 return Ok(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": { "message": error } }),
+                    &serde_json::json!({ "error": { "message": error } }),
                 ));
             }
         }
@@ -478,7 +477,7 @@ async fn write_request_transcript(path: &Path, requests: &Arc<tokio::sync::Mutex
 
 fn json_response(
     status: StatusCode,
-    value: Value,
+    value: &Value,
 ) -> Response<http_body_util::combinators::BoxBody<Bytes, Infallible>> {
     let mut response = Response::new(Full::new(Bytes::from(value.to_string())).boxed());
     *response.status_mut() = status;
@@ -674,10 +673,11 @@ impl RunningUiServer {
                     self.logs().await
                 );
             }
-            let healthy = match client.get(&url).send().await {
-                Ok(response) => response.status().is_success(),
-                Err(_) => false,
-            };
+            let healthy = client
+                .get(&url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success());
             if healthy {
                 return;
             }
@@ -864,7 +864,7 @@ impl SseReader {
                 .await
                 .expect("SSE response chunk should be readable");
             if let Some(bytes) = chunk {
-                self.buffer.push_str(&String::from_utf8_lossy(&bytes))
+                self.buffer.push_str(&String::from_utf8_lossy(&bytes));
             } else {
                 if self.buffer.trim().is_empty() {
                     return None;
@@ -937,10 +937,9 @@ fn reserve_tcp_port() -> u16 {
 }
 
 fn runtime_is_idle(runtime: &Value) -> bool {
-    let state_idle = match runtime.get("state") {
-        None => true,
-        Some(state) => state.as_str() == Some("idle"),
-    };
+    let state_idle = runtime
+        .get("state")
+        .is_none_or(|state| state.as_str() == Some("idle"));
     let terminal_clear = runtime
         .get("interactions")
         .and_then(|interactions| interactions.get("terminal"))
@@ -1257,13 +1256,13 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .json()
         .await
         .expect("list sessions response should be valid JSON");
-    let ids = listed
+    let contains = listed
         .as_array()
         .expect("list sessions response should be an array")
         .iter()
         .filter_map(|session| session.get("id").and_then(Value::as_str))
-        .collect::<Vec<_>>();
-    assert!(ids.contains(&session_id.as_str()));
+        .any(|id| id == session_id.as_str());
+    assert!(contains);
 
     let update_response = client
         .put(format!("{}/api/sessions/{session_id}", server.base_url))
@@ -1692,9 +1691,8 @@ async fn priority_probe_command() -> String {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn parse_priority_probe(stdout: &[u8]) -> [i32; 4] {
     let text = String::from_utf8_lossy(stdout);
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-    let [a, b, c, d] = tokens
-        .into_iter()
+    let [a, b, c, d] = text
+        .split_whitespace()
         .map(|token| token.parse::<i32>().expect("probe prints signed integers"))
         .collect::<Vec<i32>>()
         .try_into()

@@ -11,6 +11,10 @@ enum HeelBinaryConfigurationError {
     ManagedHeel(#[from] ManagedHeelError),
 }
 
+/// Resolve the heel binary for sandbox execution: honor `HEEL_BIN` when
+/// set, otherwise use the managed download.
+///
+///
 pub async fn configure_heel_binary() {
     if let Some(path) = std::env::var_os("HEEL_BIN") {
         assert_heel_executes(&PathBuf::from(path), "HEEL_BIN environment variable").await;

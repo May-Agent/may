@@ -16,26 +16,26 @@ impl<Response> LiveResponseRegistry<Response> {
         }
     }
 
-    pub(crate) fn open(&self, request_id: String) -> Receiver<Response> {
+    pub(crate) fn open(&self, request_id: &str) -> Receiver<Response> {
         let (tx, rx) = async_channel::bounded(1);
         self.senders.rcu(|senders| {
             let mut next = HashMap::clone(senders);
-            next.insert(request_id.clone(), tx.clone());
+            next.insert(request_id.to_string(), tx.clone());
             next
         });
         rx
     }
 
-    pub(crate) fn try_open(&self, request_id: String) -> Option<Receiver<Response>> {
+    pub(crate) fn try_open(&self, request_id: &str) -> Option<Receiver<Response>> {
         let (tx, rx) = async_channel::bounded(1);
         loop {
             let current = self.senders.load_full();
-            if current.contains_key(request_id.as_str()) {
+            if current.contains_key(request_id) {
                 return None;
             }
 
             let mut next = HashMap::clone(current.as_ref());
-            next.insert(request_id.clone(), tx.clone());
+            next.insert(request_id.to_string(), tx.clone());
             let previous =
                 Guard::into_inner(self.senders.compare_and_swap(&current, Arc::new(next)));
             if Arc::ptr_eq(&current, &previous) {

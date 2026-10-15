@@ -6,18 +6,38 @@ use aither_sandbox::{
 /// Frontend-agnostic start event for a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolStartKind {
-    Terminal { command: String, mode: TerminalMode },
-    Generic { name: String, arguments: String },
+    /// A terminal tool invocation.
+    Terminal {
+        /// Command or script being executed.
+        command: String,
+        /// Display mode the command runs under.
+        mode: TerminalMode,
+    },
+    /// Any other tool invocation.
+    Generic {
+        /// Tool name.
+        name: String,
+        /// Raw arguments payload.
+        arguments: String,
+    },
 }
 
 /// Frontend-agnostic end event for a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolEndKind {
+    /// The tool call completed; payload is the text to display.
     Output(String),
+    /// The tool call failed; payload is the error message.
     Error(String),
 }
 
 /// Parse tool-call start payload into a minimal start event.
+///
+/// # Panics
+///
+/// Panics when `name` is `terminal` but `arguments` does not deserialize as
+/// terminal tool args — the agent and its tool schema are versioned together,
+/// so a malformed payload indicates a bug.
 #[must_use]
 pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
     if name == "terminal" {
@@ -55,11 +75,10 @@ pub fn parse_tool_end(result: &ToolResult) -> ToolEndKind {
         Ok(output) => output,
         Err(error) => return ToolEndKind::Error(error.to_string()),
     };
-    if let Ok(terminal_result) = serde_json::from_str::<TerminalResult>(&output) {
-        ToolEndKind::Output(extract_output_text(&terminal_result))
-    } else {
-        ToolEndKind::Output(output)
-    }
+    serde_json::from_str::<TerminalResult>(&output).map_or_else(
+        |_| ToolEndKind::Output(output),
+        |terminal_result| ToolEndKind::Output(extract_output_text(&terminal_result)),
+    )
 }
 
 fn extract_output_text(result: &TerminalResult) -> String {
