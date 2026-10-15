@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# No clippy job yet: ~2200 existing warnings tracked in #25, which adds the -D warnings gate.
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      # Full debuginfo for this dependency tree overflows the hosted runner's disk;
+      # line tables keep test backtraces readable.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Free runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # rust-cache prunes the files under target/tmp but keeps its directories,
+      # so a restored cache holds an empty skeleton of the tests' shared tool
+      # cache that the tests would take for a prepared one.
+      - name: Drop restored test scratch
+        shell: bash
+        run: rm -rf target/tmp
+      # lance-encoding's build script compiles protobuf definitions with protoc.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install heel runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install heel --version 0.4.1 --locked --debug --root "${RUNNER_TEMP}/heel-runtime" --target-dir target/heel-runtime-build
+          executable="${RUNNER_TEMP}/heel-runtime/bin/heel"
+          "${executable}" --version
+          echo "HEEL_BIN=${executable}" >> "${GITHUB_ENV}"
+      - name: cargo build
+        run: cargo build --locked --all-targets
+      - name: cargo test
+        run: cargo test --locked --all-targets
+
+  web-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: bun install
+        working-directory: web-ui
+        run: bun install --frozen-lockfile
+      - name: typecheck
+        working-directory: web-ui
+        run: bunx tsc -b
+      - name: lint
+        working-directory: web-ui
+        run: bun run lint
+      - name: bun test
+        working-directory: web-ui
+        run: bun test
