@@ -1073,14 +1073,16 @@ impl TaskRuntime {
     /// access and prepares the baseline tools through
     /// [`TerminalTool::initialize_tools`], so scheduled commands run the same
     /// verified tools — including the read-only and version checks — as agent
-    /// terminals.
+    /// terminals. The command priority is read from the current config on
+    /// every launch, so a saved change reaches the next scheduled command
+    /// without global state.
     async fn initialized_terminal_tool(
         &self,
         permission_handler: SchedulerPermissionHandler,
         workspace: PathBuf,
         shell_sessions: ShellSessionRegistry,
     ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
-        let (terminal_tool, network_audit) = futures_lite::future::try_zip(
+        let (terminal_tool, (network_audit, priority)) = futures_lite::future::try_zip(
             async {
                 TerminalTool::new_exact(&workspace, permission_handler, DefaultExecutor)
                     .await
@@ -1088,16 +1090,29 @@ impl TaskRuntime {
                         init_terminal_tool_error("failed to initialize terminal tool: ", &error)
                     })
             },
-            async {
-                aither_sandbox::open_network_audit_log(
-                    self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
-                    crate::config::NETWORK_AUDIT_MAX_FILES,
-                )
-                .await
-                .map_err(|error| {
-                    init_terminal_tool_error("failed to open network audit log: ", &error)
-                })
-            },
+            futures_lite::future::try_zip(
+                async {
+                    aither_sandbox::open_network_audit_log(
+                        self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
+                        crate::config::NETWORK_AUDIT_MAX_FILES,
+                    )
+                    .await
+                    .map_err(|error| {
+                        init_terminal_tool_error("failed to open network audit log: ", &error)
+                    })
+                },
+                async {
+                    crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
+                        .await
+                        .map(|config| config.sandbox.command_priority.process_priority())
+                        .map_err(|error| {
+                            init_terminal_tool_error(
+                                "failed to load May config for command priority: ",
+                                &error,
+                            )
+                        })
+                },
+            ),
         )
         .await?;
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace.join("outputs")));
@@ -1106,6 +1121,7 @@ impl TaskRuntime {
             .with_shell_sessions(shell_sessions)
             .with_writable_paths([workspace.clone()])
             .with_readable_paths([workspace])
+            .with_process_priority(priority)
             .initialize_tools(
                 &self.tool_distribution,
                 &crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir(),
