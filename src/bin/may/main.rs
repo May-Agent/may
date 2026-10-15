@@ -82,7 +82,11 @@ async fn main() -> anyhow::Result<()> {
         .add_directive("aither_cloud=debug".parse()?)
         .add_directive("aither_gemini=info".parse()?)
         .add_directive("aither_claude=info".parse()?)
-        .add_directive("aither_openai=info".parse()?);
+        .add_directive("aither_openai=info".parse()?)
+        // skyzen logs every endpoint error here (5xx at `error` with the cause
+        // chain, 4xx at `warn`) before redacting a 5xx response body; it is
+        // the only record of a 500's cause.
+        .add_directive("skyzen_core=warn".parse()?);
 
     if is_server_mode {
         let file_appender = tracing_appender::rolling::daily(log_dir, "may.log");
