@@ -156,7 +156,7 @@ impl RuntimeSystemContext {
         self
     }
 
-    pub(crate) fn reconcile(&mut self, context: &mut aither_agent::Context) {
+    pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
         reconcile_memory_block(
             context,
             build_memory_context_content(&self.last_memory_content),
@@ -216,7 +216,7 @@ fn reconcile_text_block(
     value: Option<String>,
 ) {
     match value {
-        Some(content) => context.insert_system_text(tag, content),
+        Some(text) => context.insert_system_text(tag, text),
         None => context.remove_system_named(tag),
     }
 }
@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
         let db = test_db();
-        let mut runtime_context = RuntimeSystemContext::new(db, "remember this".to_string());
+        let runtime_context = RuntimeSystemContext::new(db, "remember this".to_string());
         let mut context = aither_agent::Context::default();
         context.insert_system_text(tag::PROFILE_PERSONA, "stale persona");
         context.insert_system_text(tag::WORKSPACE, "stale workspace");
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn terminal_runtime_context_is_reconciled_as_system_block() {
         let db = test_db();
-        let mut runtime_context = RuntimeSystemContext::new(db, "remember this".to_string())
+        let runtime_context = RuntimeSystemContext::new(db, "remember this".to_string())
             .with_terminal_runtime("Model: demo-model\nHome environment kind: local".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);

@@ -182,14 +182,69 @@ pub struct MayAgentConfig {
     pub db: crate::db::ChatDb,
 }
 
+/// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
+#[derive(Debug)]
+pub struct MayAgentSessionInput<'a> {
+    /// Session sandbox directory (`TerminalTool` creates a working dir inside).
+    pub sandbox_dir: PathBuf,
+    /// May directory (`~/.may/`).
+    pub may_dir: PathBuf,
+    /// Host directory where May was launched.
+    pub cwd: PathBuf,
+    /// Session ID.
+    pub session_id: SessionId,
+    /// Channel for workspace access requests.
+    pub workspace_request_broker: WorkspaceRequestBroker,
+    /// Channel for ask-user requests.
+    pub ask_user_broker: AskUserBroker,
+    /// Database handle for runtime memory/state lookups.
+    pub db: crate::db::ChatDb,
+    /// Concrete model identifier selected for this request.
+    pub model: &'a str,
+    /// Reasoning effort override, if any.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Profile this session belongs to.
+    pub profile_id: Option<String>,
+    /// Optional permission approver handling interactive approval.
+    pub permission_approver: Option<PermissionApprover>,
+    /// Optional profile persona overlay injected into the agent context.
+    pub profile_persona: Option<String>,
+    /// Optional profile memories injected as read-only context.
+    pub profile_memories: Option<crate::memory::ProfileMemories>,
+    /// Session-scoped planning workflow state.
+    pub plan_state: SessionPlanState,
+    /// Resolved location info, when the profile is location-aware.
+    pub location: Option<crate::location::LocationInfo>,
+    /// Channel for scheduled-task create requests.
+    pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
+    /// Channel for notification requests.
+    pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
+    /// Channel for browser requests.
+    pub browser_broker: Option<BrowserBroker>,
+    /// Channel for register-skills requests.
+    pub register_skills_broker: Option<RegisterBroker>,
+    /// Channel for register-subagents requests.
+    pub register_subagents_broker: Option<RegisterBroker>,
+    /// Execution environment (local heel sandbox or container).
+    pub environment: AgentEnvironment,
+    /// Trusted baseline tool distribution used by every configured backend.
+    pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    /// Prepared tool environments kept across agent rebuilds.
+    pub tool_environments: ToolEnvironmentCache,
+    /// Which provider candidate this build should try (retry counter).
+    pub provider_attempt: usize,
+}
+
+type MayAgentInner = Agent<
+    RequestParameterizedModel<CloudProvider>,
+    RequestParameterizedModel<CloudProvider>,
+    RequestParameterizedModel<CloudProvider>,
+    HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>,
+>;
+
 /// The May agent.
 pub struct MayAgent {
-    inner: Agent<
-        RequestParameterizedModel<CloudProvider>,
-        RequestParameterizedModel<CloudProvider>,
-        RequestParameterizedModel<CloudProvider>,
-        HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>,
-    >,
+    inner: MayAgentInner,
     session_id: SessionId,
     sandbox_dir: PathBuf,
     provider_id: String,
@@ -210,6 +265,12 @@ impl std::fmt::Debug for MayAgent {
 
 impl MayAgent {
     /// Create a new `MayAgent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MayAgentError`] when the sandbox environment cannot be
+    /// prepared — opening the network audit log, creating the terminal tool,
+    /// or registering the skills/subagents directories fails.
     pub async fn new(config: MayAgentConfig) -> Result<Self, MayAgentError> {
         let is_container = matches!(config.environment, AgentEnvironment::Container { .. });
 
@@ -506,7 +567,7 @@ impl MayAgent {
             Acquired::Ready(registry) => (
                 // An equal key describes this registry, so a rejection here
                 // is a key derivation bug and is reported, never re-prepared.
-                builder.prepared_shell_sessions(registry).await?,
+                builder.prepared_shell_sessions(*registry).await?,
                 "adopted",
             ),
             Acquired::Prepare(lease) => {
@@ -546,33 +607,44 @@ impl MayAgent {
         })
     }
 
+    /// Create a `MayAgent` for a session from the May config plus the
+    /// session-scoped inputs in `input`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MayAgentError`] when resolving the provider runtime fails,
+    /// the SSH attachments for the profile cannot be loaded, or
+    /// [`MayAgent::new`] fails.
     pub async fn from_config_with_model_and_permissions(
         may_config: &MayConfig,
-        sandbox_dir: PathBuf,
-        may_dir: PathBuf,
-        cwd: PathBuf,
-        session_id: SessionId,
-        workspace_request_broker: WorkspaceRequestBroker,
-        ask_user_broker: AskUserBroker,
-        db: crate::db::ChatDb,
-        model: &str,
-        reasoning_effort: Option<ReasoningEffort>,
-        profile_id: Option<String>,
-        permission_approver: Option<PermissionApprover>,
-        profile_persona: Option<String>,
-        profile_memories: Option<crate::memory::ProfileMemories>,
-        plan_state: SessionPlanState,
-        location: Option<crate::location::LocationInfo>,
-        task_broker: Option<crate::agent::task_tool::TaskBroker>,
-        notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
-        browser_broker: Option<BrowserBroker>,
-        register_skills_broker: Option<RegisterBroker>,
-        register_subagents_broker: Option<RegisterBroker>,
-        environment: AgentEnvironment,
-        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
-        tool_environments: ToolEnvironmentCache,
-        provider_attempt: usize,
+        input: MayAgentSessionInput<'_>,
     ) -> Result<Self, MayAgentError> {
+        let MayAgentSessionInput {
+            sandbox_dir,
+            may_dir,
+            cwd,
+            session_id,
+            workspace_request_broker,
+            ask_user_broker,
+            db,
+            model,
+            reasoning_effort,
+            profile_id,
+            permission_approver,
+            profile_persona,
+            profile_memories,
+            plan_state,
+            location,
+            task_broker,
+            notify_broker,
+            browser_broker,
+            register_skills_broker,
+            register_subagents_broker,
+            environment,
+            tool_distribution,
+            tool_environments,
+            provider_attempt,
+        } = input;
         let resolved_provider =
             resolve_provider_runtime(may_config, model, provider_attempt).await?;
         let provider_id = resolved_provider.provider_id;
@@ -673,7 +745,7 @@ impl MayAgent {
             db,
         };
 
-        Self::new(config).await
+        Box::pin(Self::new(config)).await
     }
 
     /// Run a query and stream events.
@@ -702,9 +774,13 @@ impl MayAgent {
     }
 
     /// One-shot query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the underlying agent run fails.
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
         self.sync_runtime_context().await;
-        self.inner.query(prompt).await
+        Box::pin(self.inner.query(prompt)).await
     }
 
     /// Preview the exact request message sequence for the next turn.
@@ -724,6 +800,10 @@ impl MayAgent {
     /// Mirrors [`run_with_hidden_context`](Self::run_with_hidden_context): the
     /// hidden context is pushed as a regular system message at the conversation
     /// tail, the preview is built, then the checkpointed state is restored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if exporting the agent checkpoint needed for the preview fails.
     pub async fn preview_request_messages_with_hidden_context(
         &mut self,
         prompt: &str,
@@ -795,7 +875,7 @@ impl MayAgent {
         &mut self,
         focus: Option<&str>,
     ) -> Result<Option<CompactResult>, AgentError> {
-        self.inner.compact(focus).await
+        Box::pin(self.inner.compact(focus)).await
     }
 
     pub(crate) fn restore_checkpoint(

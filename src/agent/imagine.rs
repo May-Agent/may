@@ -24,8 +24,11 @@ use crate::config::{MayConfig, ProviderInstance, ProviderType};
 /// tool will surface a friendly error to the agent on first call.
 #[derive(Debug, Clone)]
 pub struct ImageGeneratorConfig {
+    /// Provider used to generate images.
     pub provider_id: String,
+    /// Resolved provider instance carrying credentials/settings.
     pub provider: ProviderInstance,
+    /// Model used to generate images.
     pub model: String,
 }
 

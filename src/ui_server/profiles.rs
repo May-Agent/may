@@ -137,8 +137,7 @@ pub(super) async fn ensure_profile_environment_ready(
         &profile,
         &default_image_tag,
         container_preferences,
-    )
-    .map_err(internal_error)?;
+    );
 
     if !state.try_begin_container_prepare(profile_id).await {
         let summary = state.get_container_prepare_status(profile_id).map_or_else(
@@ -174,7 +173,7 @@ pub(super) async fn ensure_profile_environment_ready(
                     recent_logs.push_back(progress.message.clone());
                 }
 
-                let stage = match progress.phase {
+                let prepare_stage = match progress.phase {
                     crate::container::image::ImageBuildPhase::CheckingExisting => {
                         ContainerPrepareStage::Checking
                     }
@@ -190,7 +189,7 @@ pub(super) async fn ensure_profile_environment_ready(
 
                 let status = ContainerPrepareStatus {
                     profile_id: progress_profile_id.clone(),
-                    stage,
+                    stage: prepare_stage,
                     summary: progress.message,
                     recent_logs: recent_logs.iter().cloned().collect(),
                 };

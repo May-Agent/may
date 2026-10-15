@@ -32,6 +32,7 @@ impl std::fmt::Debug for MayEmbeddingModel {
     }
 }
 
+/// Tri-state outcome of resolving the configured embedding selector.
 #[derive(Debug, Clone)]
 pub enum EmbeddingModelResolution {
     /// No embedding model is configured.
@@ -151,11 +152,13 @@ enum EmbeddingSupport {
     RequiresProbe,
 }
 
+/// Error type for resolving the configured embedding selector.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum EmbeddingProviderError {
     /// Semantic search requires a global `models.embedding_model` to be configured.
     #[error("semantic search requires a global models.embedding_model to be configured")]
     MissingModel,
+    /// The provider needs a global `models.embedding_dimensions` setting for the model.
     #[error(
         "embedding provider '{provider_id}' requires global models.embedding_dimensions for model '{model_id}'"
     )]
@@ -165,20 +168,29 @@ pub enum EmbeddingProviderError {
         /// Model that needs the setting.
         model_id: String,
     },
-    /// No enabled provider supports embedding selector ''.
     /// No enabled provider supports the selector.
     #[error("no enabled provider supports embedding selector '{model_id}'")]
-    NoSupportingProvider { model_id: String },
-    /// Embedding probe failed for selector ''.
+    NoSupportingProvider {
+        /// Embedding selector no enabled provider supports.
+        model_id: String,
+    },
     /// Embedding probe failed for the selector.
     #[error("embedding probe failed for selector '{model_id}': {details}")]
-    ProbeFailed { model_id: String, details: String },
+    ProbeFailed {
+        /// Embedding selector that was probed.
+        model_id: String,
+        /// Failure details reported by the provider.
+        details: String,
+    },
 }
 
+/// Error type returned when an embedding model is required but unavailable.
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddingModelRequireError {
+    /// Embeddings are disabled or unconfigured.
     #[error("{0}")]
     Disabled(&'static str),
+    /// Resolution failed with the recorded provider error.
     #[error("{0}")]
     Resolution(EmbeddingProviderError),
 }

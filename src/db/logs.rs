@@ -12,6 +12,11 @@ use super::{
 };
 
 impl ChatDb {
+    /// Append one LLM request/response log entry for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`](ChatDbError) when the insert fails.
     pub async fn append_request_log(
         &self,
         params: RequestLogParams<'_>,
@@ -73,6 +78,11 @@ impl ChatDb {
             .await?)
     }
 
+    /// List request log entries for a session, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`](ChatDbError) when the query fails.
     pub async fn list_request_logs(
         &self,
         limit: u64,
@@ -85,6 +95,11 @@ impl ChatDb {
             .await?)
     }
 
+    /// Append one network-access log entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`](ChatDbError) when the insert fails.
     pub async fn append_network_access_log(
         &self,
         params: NetworkAccessLogParams<'_>,
@@ -115,6 +130,11 @@ impl ChatDb {
             .await?)
     }
 
+    /// List network-access log entries for a session, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`](ChatDbError) when the query fails.
     pub async fn list_network_access_logs(
         &self,
         limit: u64,

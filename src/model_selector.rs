@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const SELECTOR_SEPARATOR: &str = "::";
 
+/// A `provider::model` pair identifying a concrete model.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelSelector {
     provider_id: String,
@@ -13,6 +14,11 @@ pub struct ModelSelector {
 }
 
 impl ModelSelector {
+    /// Create a selector from provider and model IDs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either ID is empty or `provider_id` contains `::`.
     #[must_use]
     pub fn new(provider_id: impl Into<String>, model_id: impl Into<String>) -> Self {
         let provider_id = provider_id.into();
@@ -35,11 +41,13 @@ impl ModelSelector {
         }
     }
 
+    /// The provider part of the selector.
     #[must_use]
     pub fn provider_id(&self) -> &str {
         &self.provider_id
     }
 
+    /// The model part of the selector.
     #[must_use]
     pub fn model_id(&self) -> &str {
         &self.model_id
@@ -119,17 +127,27 @@ impl<'de> Deserialize<'de> for ModelSelector {
     }
 }
 
+/// Error type for parsing a `provider::model` selector.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ModelSelectorParseError {
     /// Invalid model selector '': expected '<`provider_id>::`<`model_id`>'.
     #[error("invalid model selector '{value}': expected '<provider_id>::<model_id>'")]
-    MissingSeparator { value: String },
+    MissingSeparator {
+        /// Raw selector text that failed to parse.
+        value: String,
+    },
     /// Invalid model selector '': provider id must not be empty.
     #[error("invalid model selector '{value}': provider id must not be empty")]
-    EmptyProviderId { value: String },
+    EmptyProviderId {
+        /// Raw selector text that failed to parse.
+        value: String,
+    },
     /// Invalid model selector '': model id must not be empty.
     #[error("invalid model selector '{value}': model id must not be empty")]
-    EmptyModelId { value: String },
+    EmptyModelId {
+        /// Raw selector text that failed to parse.
+        value: String,
+    },
 }
 
 #[cfg(test)]

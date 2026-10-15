@@ -265,7 +265,7 @@ async fn run_save_full_config(
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty())
             .collect();
-        config.appearance.font = req.appearance.font.clone();
+        config.appearance.font.clone_from(&req.appearance.font);
         config.appearance.theme = req.appearance.theme;
         config.last_model = req.last_model.clone().map(|value| {
             value
@@ -297,7 +297,10 @@ async fn run_save_full_config(
                     copy_on_first_use: sp.copy_on_first_use,
                 });
         config.remote_access.enabled = req.remote_access.enabled;
-        config.remote_access.cloudflared_binary = req.remote_access.cloudflared_binary.clone();
+        config
+            .remote_access
+            .cloudflared_binary
+            .clone_from(&req.remote_access.cloudflared_binary);
         config.remote_access.tunnel_token = req
             .remote_access
             .tunnel_token

@@ -77,6 +77,11 @@ impl AgentWorker {
     ///
     /// Returns a handle to receive events from this run.
     #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
     pub fn run(
         &self,
         prompt: String,
@@ -102,6 +107,11 @@ impl AgentWorker {
 
     /// Shutdown the worker task.
     #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
     pub fn compact(&self, focus: Option<String>) -> AgentHandle {
         const ERR_WORKER_CHANNEL_CLOSED: &str =
             include_str!("../texts/agent_worker_channel_closed.txt");
@@ -115,6 +125,7 @@ impl AgentWorker {
         }
     }
 
+    /// Signal the worker task to shut down.
     pub fn shutdown(&self) {
         let _ = self.command_tx.try_send(WorkerCommand::Shutdown);
     }
@@ -187,14 +198,14 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>, sn
                 attachments,
                 event_tx,
             } => {
-                let completed = run_agent_prompt(
+                let completed = Box::pin(run_agent_prompt(
                     &mut agent,
                     &prompt,
                     hidden_context.as_deref(),
                     attachments,
                     &command_rx,
                     &event_tx,
-                )
+                ))
                 .await;
                 if completed {
                     let session_id = agent.session_id().as_str().to_string();
@@ -247,10 +258,12 @@ async fn run_agent_prompt(
         // Race between stream event and cancel command
         let event = futures_lite::future::or(
             async {
-                match stream.next().await {
-                    Some(result) => Some(TuiEvent::Agent(result)),
-                    None => Some(TuiEvent::Complete),
-                }
+                stream
+                    .next()
+                    .await
+                    .map_or(Some(TuiEvent::Complete), |result| {
+                        Some(TuiEvent::Agent(result))
+                    })
             },
             async {
                 // Check for cancel command (non-blocking peek then async recv)

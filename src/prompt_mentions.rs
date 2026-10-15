@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::db::{ChatDb, ChatDbError};
 
+/// Error type for building prompt mention XML.
 #[derive(Debug, thiserror::Error)]
 pub enum PromptMentionError {
     /// Failed to load session metadata.
@@ -76,6 +77,15 @@ struct MentionCandidate {
     value: String,
 }
 
+/// Build the `session_mentions` XML block for `@`-mentions found in `content`,
+/// looking each up in the database. Returns `None` when no valid session
+/// mentions are present.
+///
+/// # Errors
+///
+/// Returns [`PromptMentionError::SessionLookup`] when a session lookup fails,
+/// or [`PromptMentionError::Serialize`] when the XML block cannot be
+/// serialized.
 pub async fn build_session_mentions_xml(
     db: &ChatDb,
     content: &str,
@@ -120,6 +130,16 @@ pub async fn build_session_mentions_xml(
     )?))
 }
 
+/// Build the `file_mentions` XML block for file `@`-mentions found in
+/// `content`, resolving each against `files_dir`. Returns `None` when no valid
+/// file mentions are present.
+///
+/// # Errors
+///
+/// Returns [`PromptMentionError::AbsolutePath`] or
+/// [`PromptMentionError::ParentTraversal`] when a mention path is not a safe
+/// relative path, and [`PromptMentionError::Serialize`] when the XML block
+/// cannot be serialized.
 pub async fn build_file_mentions_xml(
     files_dir: &Path,
     content: &str,
@@ -134,9 +154,8 @@ pub async fn build_file_mentions_xml(
     for relative_path in relative_paths {
         let validated = parse_relative_file_mention(relative_path.as_str())?;
         let full_path = files_dir.join(&validated);
-        let metadata = match async_fs::metadata(&full_path).await {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
+        let Ok(metadata) = async_fs::metadata(&full_path).await else {
+            continue;
         };
         if !metadata.is_file() {
             continue;
@@ -145,16 +164,16 @@ pub async fn build_file_mentions_xml(
         let content_type = mime_guess::from_path(&full_path)
             .first_raw()
             .map(ToOwned::to_owned);
-        let preview = match async_fs::read_to_string(&full_path).await {
-            Ok(content) => Some(TextXmlBlockOwned {
+        let preview = async_fs::read_to_string(&full_path)
+            .await
+            .ok()
+            .map(|content| TextXmlBlockOwned {
                 content: truncate_preview_with_limit(content.as_str(), preview_limit),
-            }),
-            Err(_) => None,
-        };
+            });
         let name = validated
             .file_name()
             .and_then(|value| value.to_str())
-            .unwrap_or(validated.as_os_str().to_str().unwrap_or("file"))
+            .unwrap_or_else(|| validated.as_os_str().to_str().unwrap_or("file"))
             .to_string();
         files.push(FileMentionXml {
             path: validated.to_string_lossy().replace('\\', "/"),
@@ -174,6 +193,8 @@ pub async fn build_file_mentions_xml(
     )?))
 }
 
+/// Extract session `@`-mention IDs from `content`, skipping mentions inside
+/// code spans, fenced code blocks, and inline HTML.
 #[must_use]
 pub fn extract_session_mention_ids(content: &str) -> Vec<String> {
     extract_mention_candidates(content)
@@ -183,6 +204,8 @@ pub fn extract_session_mention_ids(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extract file `@`-mention paths from `content`, skipping mentions inside
+/// code spans, fenced code blocks, and inline HTML.
 #[must_use]
 pub fn extract_file_mention_paths(content: &str) -> Vec<String> {
     extract_mention_candidates(content)
@@ -192,6 +215,8 @@ pub fn extract_file_mention_paths(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// Truncate `content` to at most `max_chars` characters, appending `...` when
+/// truncated.
 #[must_use]
 pub fn truncate_preview_with_limit(content: &str, max_chars: usize) -> String {
     let trimmed = content.trim();

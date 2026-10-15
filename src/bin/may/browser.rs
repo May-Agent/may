@@ -592,10 +592,9 @@ async fn try_fetch_browser_targets(
 async fn require_browser_targets(
     endpoint: &str,
 ) -> Result<Vec<BrowserTargetOutput>, BrowserCliError> {
-    match try_fetch_browser_targets(endpoint).await? {
-        Some(targets) => Ok(targets),
-        None => Err(BrowserCliError::BrowserNotRunning(endpoint.to_string())),
-    }
+    try_fetch_browser_targets(endpoint)
+        .await?
+        .ok_or_else(|| BrowserCliError::BrowserNotRunning(endpoint.to_string()))
 }
 
 async fn can_connect_to_browser_endpoint(endpoint: &str) -> Result<bool, BrowserCliError> {

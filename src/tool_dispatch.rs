@@ -118,7 +118,7 @@ impl ToolDispatchers {
             .map_err(ToolDispatchError::LoadTaskRuntime)?
             .with_notifier(notification_service.clone())
             .with_ui_event_bus(ui_event_bus)
-            .with_network_policy(config.network_policy.clone())
+            .with_network_policy(&config.network_policy)
             .map_err(ToolDispatchError::ConfigureTaskRuntime)?,
         );
         let registration = RegistrationRuntime {
@@ -635,7 +635,7 @@ async fn ensure_browser_service_started(
                 last_error =
                     Some("browser service returned page payload for startup request".to_string());
             }
-            Ok(None) | Ok(Some(BrowserServiceResponse::Ok { .. })) => {}
+            Ok(None | Some(BrowserServiceResponse::Ok { .. })) => {}
             Err(error) => last_error = Some(error),
         }
     }

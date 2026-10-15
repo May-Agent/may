@@ -11,18 +11,27 @@ use super::{ContainerError, ContainerRuntime};
 /// Default image tag for the May workspace container.
 pub const MAY_IMAGE_TAG: &str = "may-workspace:latest";
 
+/// Stage of an image ensure/build operation reported via [`ImageBuildProgress`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageBuildPhase {
+    /// Checking whether the image already exists locally.
     CheckingExisting,
+    /// The image already exists; no build is needed.
     AlreadyExists,
+    /// A build is starting.
     BuildStarting,
+    /// A line of build output was produced.
     BuildOutput,
+    /// The build finished successfully.
     BuildCompleted,
 }
 
+/// A progress update emitted while ensuring or building a container image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageBuildProgress {
+    /// Stage this update belongs to.
     pub phase: ImageBuildPhase,
+    /// Human-readable description of the update.
     pub message: String,
 }
 
@@ -42,6 +51,10 @@ pub fn default_image_spec(context_dir: impl Into<PathBuf>) -> ContainerImageSpec
 }
 
 /// Check if an image already exists.
+///
+/// # Errors
+///
+/// Returns [`ContainerError::Docker`] when the image list query fails.
 pub async fn image_exists(
     runtime: &ContainerRuntime,
     spec: &ContainerImageSpec,
@@ -56,6 +69,11 @@ pub async fn image_exists(
 }
 
 /// Build a container image from a Docker build context.
+///
+/// # Errors
+///
+/// Returns [`ContainerError`] when the build fails; see
+/// [`build_image_with_progress`].
 pub async fn build_image(
     runtime: &ContainerRuntime,
     spec: &ContainerImageSpec,
@@ -64,6 +82,13 @@ pub async fn build_image(
 }
 
 /// Build a container image and stream progress messages to callback.
+///
+/// # Errors
+///
+/// Returns [`ContainerError::Io`] when the build context cannot be archived or
+/// the Dockerfile lies outside the context directory,
+/// [`ContainerError::Docker`] when the daemon rejects the build request, or
+/// [`ContainerError::ImageBuildFailed`] when the build itself reports an error.
 pub async fn build_image_with_progress<F>(
     runtime: &ContainerRuntime,
     spec: &ContainerImageSpec,
@@ -127,6 +152,11 @@ where
 }
 
 /// Ensure the requested container image exists, building it if needed.
+///
+/// # Errors
+///
+/// Returns [`ContainerError`] when checking for the image or building it
+/// fails; see [`ensure_image_with_progress`].
 pub async fn ensure_image(
     runtime: &ContainerRuntime,
     spec: &ContainerImageSpec,
@@ -135,6 +165,11 @@ pub async fn ensure_image(
 }
 
 /// Ensure image exists and stream progress messages to callback.
+///
+/// # Errors
+///
+/// Returns [`ContainerError::Docker`] when the image query fails, or the
+/// errors of [`build_image_with_progress`] when a build is needed.
 pub async fn ensure_image_with_progress<F>(
     runtime: &ContainerRuntime,
     spec: &ContainerImageSpec,
