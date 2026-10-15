@@ -798,12 +798,10 @@ impl MayAgent {
     /// Preview the exact request message sequence for the next turn with hidden context.
     ///
     /// Mirrors [`run_with_hidden_context`](Self::run_with_hidden_context): the
-    /// hidden context is pushed as a regular system message at the conversation
-    /// tail, the preview is built, then the checkpointed state is restored.
-    ///
-    /// # Panics
-    ///
-    /// Panics if exporting the agent checkpoint needed for the preview fails.
+    /// hidden context is appended as a regular system message at the
+    /// conversation tail. The preview is assembled against a fork of the
+    /// context installed for the duration of the call, so the live
+    /// conversation is never mutated.
     pub async fn preview_request_messages_with_hidden_context(
         &mut self,
         prompt: &str,
@@ -811,24 +809,27 @@ impl MayAgent {
         attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> Vec<LlmMessage> {
         self.sync_runtime_context().await;
-        let checkpoint = self
-            .inner
-            .export_checkpoint()
-            .await
-            .expect("checkpoint export for preview must succeed");
+        // aither populates the static system blocks into `Agent::context`
+        // during the first request assembly; they must land on the live
+        // context, not on the fork that is discarded below. `profile` is set
+        // by that same first assembly, so a missing profile means the context
+        // has not been initialized yet.
+        if self.inner.profile().is_none() {
+            self.inner.snapshot_context_window().await;
+        }
+        let mut preview_context = self.inner.context().fork();
         if let Some(hidden_context) = hidden_context
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
-            self.inner.push_message(LlmMessage::system(hidden_context));
+            preview_context.push(LlmMessage::system(hidden_context));
         }
+        std::mem::swap(self.inner.context_mut(), &mut preview_context);
         let preview = self
             .inner
             .preview_request_messages(prompt, attachments)
             .await;
-        if let Err(error) = self.inner.restore_checkpoint(checkpoint) {
-            tracing::warn!(%error, "failed to restore checkpoint after preview");
-        }
+        std::mem::swap(self.inner.context_mut(), &mut preview_context);
         preview
     }
 
@@ -961,4 +962,118 @@ fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
         .char_indices()
         .nth(max_chars)
         .map_or(input, |(idx, _)| &input[..idx])
+}
+
+#[cfg(test)]
+mod tests {
+    use aither_core::llm::Role;
+
+    use super::*;
+
+    /// Builds a `MayAgent` backed by a `Codex` provider — its `profile()` is a
+    /// static `aither-models` lookup, so initialization never touches the
+    /// network. Hooks are constructed without a live database, which makes
+    /// them no-ops.
+    async fn test_agent() -> (MayAgent, tempfile::TempDir) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&temp.path().join("history.db"))
+            .await
+            .expect("open test db");
+        let session_id = SessionId::new();
+        let llm = RequestParameterizedModel::new(
+            CloudProvider::Codex(aither_cloud::codex::Codex::new(
+                aither_cloud::codex::auth::CodexCredentials::new("test-access", "test-refresh"),
+                "gpt-5",
+            )),
+            Parameters::default(),
+        );
+        let inner = Agent::builder(llm)
+            .hook(ContextSnapshotHook::new(None, &session_id))
+            .hook(PendingSteerHook::new(None, &session_id))
+            .build();
+        (
+            MayAgent {
+                inner,
+                session_id,
+                sandbox_dir: temp.path().join("sandbox"),
+                provider_id: "chatgpt".to_string(),
+                model_context_window: None,
+                runtime_system_context: RuntimeSystemContext::new(db, String::new()),
+            },
+            temp,
+        )
+    }
+
+    #[tokio::test]
+    async fn preview_with_hidden_context_leaves_conversation_untouched() {
+        let (mut agent, _temp) = test_agent().await;
+        agent.push_message(LlmMessage::user("first turn"));
+        agent.push_message(LlmMessage::assistant("first answer"));
+        let before = agent.inner.history();
+
+        let preview = agent
+            .preview_request_messages_with_hidden_context(
+                "second turn",
+                Some("hidden facts"),
+                Vec::<LlmAttachment>::new(),
+            )
+            .await;
+
+        assert_eq!(agent.inner.history(), before);
+        // The hidden context sits immediately before the user prompt, exactly
+        // where `run_with_hidden_context` pushes it.
+        let prompt_index = preview
+            .iter()
+            .position(|message| {
+                message.role() == Role::User && message.content().contains("second turn")
+            })
+            .expect("preview contains the user prompt");
+        let hidden = &preview[prompt_index - 1];
+        assert_eq!(hidden.role(), Role::System);
+        assert!(hidden.content().contains("hidden facts"));
+        // And it did not leak into the live conversation.
+        assert!(
+            !agent
+                .inner
+                .history()
+                .iter()
+                .any(|message| message.content().contains("hidden facts"))
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_with_hidden_context_matches_run_position_on_fresh_agent() {
+        let (mut preview_agent, _temp) = test_agent().await;
+        let (mut run_agent, _temp2) = test_agent().await;
+
+        let preview = preview_agent
+            .preview_request_messages_with_hidden_context(
+                "hi",
+                Some("hidden facts"),
+                Vec::<LlmAttachment>::new(),
+            )
+            .await;
+
+        // The same sequence `run_with_hidden_context` would send: history,
+        // hidden system message, then the user prompt, with generated
+        // reminders appended at the tail.
+        let conversation: Vec<_> = preview
+            .iter()
+            .filter(|message| message.role() != Role::System || message.content() == "hidden facts")
+            .collect();
+        let hidden_index = conversation
+            .iter()
+            .position(|message| message.content() == "hidden facts")
+            .expect("preview contains the hidden context");
+        assert_eq!(conversation[hidden_index].role(), Role::System);
+        assert_eq!(conversation[hidden_index + 1].role(), Role::User);
+
+        // A fresh agent's live context must not be left half-initialized by a
+        // preview that ran on a fork.
+        run_agent.push_message(LlmMessage::system("hidden facts"));
+        let run_preview = run_agent
+            .preview_request_messages("hi", Vec::<LlmAttachment>::new())
+            .await;
+        assert_eq!(preview, run_preview);
+    }
 }
