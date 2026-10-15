@@ -8,7 +8,7 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use tokio::time::MissedTickBehavior;
 
-use crate::config::{MayConfig, ProviderInstance, SshServerConfig};
+use crate::config::{MayConfig, NativeToolsConfig, ProviderInstance, SshServerConfig};
 use crate::copilot::{clear_copilot_credentials, has_copilot_token, save_copilot_token};
 use crate::mcp::MayMcpServerConfig;
 use crate::model_selector::ModelSelector;
@@ -25,8 +25,8 @@ use super::types::{
     ApiHealth, CopilotAuthEvent, CopilotAuthStatus, CopilotStartResponse, CopilotStatusResponse,
     LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest, SkillInfoDto,
     SkillInstallRequest, SseHeartbeat, SshServerRequest, UiAppearanceConfig, UiBrowserConfig,
-    UiConfigResponse, UiFullConfig, UiModelsConfig, UiPreferencesConfig, UiProviderConfig,
-    UiRemoteAccessConfig, UiSandboxConfig,
+    UiConfigResponse, UiFullConfig, UiModelsConfig, UiNativeToolsConfig, UiPreferencesConfig,
+    UiProviderConfig, UiRemoteAccessConfig, UiSandboxConfig,
 };
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -97,6 +97,7 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             base_url: instance.base_url.clone(),
             display_name: instance.display_name.clone(),
             enabled: instance.enabled,
+            native_tools: UiNativeToolsConfig::from(&instance.native_tools),
         })
         .collect::<Vec<_>>();
     providers.sort_by(|a, b| a.id.cmp(&b.id));
@@ -182,6 +183,27 @@ pub(super) async fn save_full_config(
     Ok(Json(response))
 }
 
+/// Build the provider map for a full-config save.
+///
+/// Shared by the REST handler and tests so a save applies exactly what the
+/// web UI submits, including provider-native tool toggles.
+fn provider_map_from_ui(
+    providers: &[UiProviderConfig],
+) -> std::collections::HashMap<String, ProviderInstance> {
+    providers
+        .iter()
+        .map(|p| {
+            let mut instance = ProviderInstance::new(p.provider_type);
+            instance.api_key = p.api_key.clone().filter(|v| !v.trim().is_empty());
+            instance.base_url = p.base_url.clone().filter(|v| !v.trim().is_empty());
+            instance.display_name = p.display_name.clone().filter(|v| !v.trim().is_empty());
+            instance.enabled = p.enabled;
+            instance.native_tools = NativeToolsConfig::from(&p.native_tools);
+            (p.id.clone(), instance)
+        })
+        .collect()
+}
+
 async fn run_save_full_config(
     state: Arc<UiServerState>,
     req: UiFullConfig,
@@ -229,17 +251,7 @@ async fn run_save_full_config(
     };
 
     let updated = state.update_config(|config| {
-        let mut provider_map = std::collections::HashMap::new();
-        for p in &req.providers {
-            let mut instance = ProviderInstance::new(p.provider_type);
-            instance.api_key = p.api_key.clone().filter(|v| !v.trim().is_empty());
-            instance.base_url = p.base_url.clone().filter(|v| !v.trim().is_empty());
-            instance.display_name = p.display_name.clone().filter(|v| !v.trim().is_empty());
-            instance.enabled = p.enabled;
-            provider_map.insert(p.id.clone(), instance);
-        }
-
-        config.provider = provider_map;
+        config.provider = provider_map_from_ui(&req.providers);
         config.models.advanced = parse_selector_list(&req.models.advanced);
         config.models.balanced = parse_selector_list(&req.models.balanced);
         config.models.fast = parse_selector_list(&req.models.fast);
@@ -688,8 +700,50 @@ pub(super) async fn copilot_logout() -> SkyResult<Json<ApiHealth>> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_ui_full_config;
-    use crate::config::{CommandPriority, MayConfig};
+    use super::{build_ui_full_config, provider_map_from_ui};
+    use crate::config::{CommandPriority, MayConfig, ProviderInstance, ProviderType};
+
+    #[test]
+    fn full_config_save_roundtrip_preserves_native_tools() {
+        let mut config = MayConfig::default();
+        let mut instance = ProviderInstance::new(ProviderType::OpenAI).with_api_key("sk-test");
+        instance.native_tools.web_search = true;
+        instance.native_tools.web_fetch = true;
+        config.upsert_provider("openai", instance);
+
+        // Simulate the web UI save flow: GET response serialized to the wire,
+        // then POSTed back verbatim as the save body.
+        let ui = serde_json::to_value(build_ui_full_config(&config)).expect("ui config serializes");
+        let saved: super::UiFullConfig =
+            serde_json::from_value(ui).expect("ui config deserializes");
+
+        let providers = provider_map_from_ui(&saved.providers);
+        let openai = providers.get("openai").expect("provider survives a save");
+        assert!(openai.native_tools.web_search);
+        assert!(openai.native_tools.web_fetch);
+        assert_eq!(openai.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn full_config_roundtrips_a_chatgpt_provider() {
+        let mut config = MayConfig::default();
+        let mut instance = ProviderInstance::new(ProviderType::Chatgpt);
+        instance.native_tools.web_search = true;
+        config.upsert_provider("chatgpt", instance);
+
+        let ui = serde_json::to_value(build_ui_full_config(&config)).expect("ui config serializes");
+        assert_eq!(ui["providers"][0]["providerType"], "chatgpt");
+        assert_eq!(ui["providers"][0]["nativeTools"]["webSearch"], true);
+        assert_eq!(ui["providers"][0]["nativeTools"]["webFetch"], false);
+
+        let saved: super::UiFullConfig =
+            serde_json::from_value(ui).expect("ui config deserializes");
+        let providers = provider_map_from_ui(&saved.providers);
+        let chatgpt = providers.get("chatgpt").expect("provider survives a save");
+        assert_eq!(chatgpt.resolve_type("chatgpt"), ProviderType::Chatgpt);
+        assert!(chatgpt.native_tools.web_search);
+        assert!(!chatgpt.native_tools.web_fetch);
+    }
 
     #[test]
     fn full_config_serializes_sandbox_command_priority() {
