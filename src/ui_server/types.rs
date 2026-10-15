@@ -1,5 +1,6 @@
 use crate::config::{
-    BrowserBackendKind, CommandPriority, ProviderType, RemoteAccessConfig, SshServerConfig,
+    BrowserBackendKind, CommandPriority, NativeToolsConfig, ProviderType, RemoteAccessConfig,
+    SshServerConfig,
 };
 use crate::network_policy::NetworkPolicyMode;
 use crate::session::{
@@ -1239,6 +1240,32 @@ impl skyzen::extract::Extractor for IfNoneMatchHeader {
     }
 }
 
+/// Provider-native hosted tool toggles as exposed to the web UI.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UiNativeToolsConfig {
+    pub(crate) web_search: bool,
+    pub(crate) web_fetch: bool,
+}
+
+impl From<&NativeToolsConfig> for UiNativeToolsConfig {
+    fn from(value: &NativeToolsConfig) -> Self {
+        Self {
+            web_search: value.web_search,
+            web_fetch: value.web_fetch,
+        }
+    }
+}
+
+impl From<&UiNativeToolsConfig> for NativeToolsConfig {
+    fn from(value: &UiNativeToolsConfig) -> Self {
+        Self {
+            web_search: value.web_search,
+            web_fetch: value.web_fetch,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiProviderConfig {
@@ -1248,6 +1275,7 @@ pub struct UiProviderConfig {
     pub(crate) base_url: Option<String>,
     pub(crate) display_name: Option<String>,
     pub(crate) enabled: bool,
+    pub(crate) native_tools: UiNativeToolsConfig,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
