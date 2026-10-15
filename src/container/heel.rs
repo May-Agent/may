@@ -3,7 +3,9 @@
 use std::path::Path;
 
 use super::ContainerError;
-use crate::heel::release::{ensure_managed_heel_binary, linux_heel_asset_for_current_arch};
+use crate::heel::release::{
+    HEEL_RELEASE_API_URL, ensure_managed_heel_binary, linux_heel_asset_for_current_arch,
+};
 
 /// Stage the managed `heel` binary under `may_dir` for container
 /// environments.
@@ -15,10 +17,14 @@ use crate::heel::release::{ensure_managed_heel_binary, linux_heel_asset_for_curr
 pub async fn ensure_container_heel_binary(may_dir: &Path) -> Result<(), ContainerError> {
     let asset = linux_heel_asset_for_current_arch()
         .map_err(|error| ContainerError::Bootstrap(error.to_string()))?;
-    ensure_managed_heel_binary(&may_dir.join("container").join("heel"), asset)
-        .await
-        .map(|_| ())
-        .map_err(|error| ContainerError::Bootstrap(error.to_string()))
+    ensure_managed_heel_binary(
+        &may_dir.join("container").join("heel"),
+        asset,
+        HEEL_RELEASE_API_URL,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| ContainerError::Bootstrap(error.to_string()))
 }
 
 #[cfg(test)]
