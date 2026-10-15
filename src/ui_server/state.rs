@@ -434,6 +434,8 @@ pub struct UiServerState {
     pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,
     /// Embedded baseline tool distribution shared by agents, tasks and containers.
     pub(crate) tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    /// Prepared tool environments reused by every agent rebuilt for a session.
+    pub(crate) tool_environments: crate::agent::ToolEnvironmentCache,
     pub(crate) cwd: PathBuf,
     pub(crate) may_dir: PathBuf,
 }

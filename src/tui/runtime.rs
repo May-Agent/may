@@ -516,6 +516,7 @@ pub struct RuntimeDeps {
     location_provider: Arc<crate::location::LocationProvider>,
     local_runtime: LocalSessionRuntime,
     tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    tool_environments: crate::agent::ToolEnvironmentCache,
     oneshot_model: Option<String>,
     oneshot_reasoning_effort: Option<ReasoningEffort>,
 }
@@ -570,6 +571,7 @@ impl RuntimeDeps {
         tool_dispatchers: ToolDispatchers,
         location_provider: Arc<crate::location::LocationProvider>,
         tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+        tool_environments: crate::agent::ToolEnvironmentCache,
     ) -> Self {
         Self {
             workspace_broker,
@@ -578,9 +580,15 @@ impl RuntimeDeps {
             location_provider,
             local_runtime,
             tool_distribution,
+            tool_environments,
             oneshot_model: None,
             oneshot_reasoning_effort: None,
         }
+    }
+
+    /// Forgets the prepared tool environment of a deleted session.
+    pub fn evict_session(&self, session_id: &SessionId) {
+        self.tool_environments.evict(session_id);
     }
 
     #[must_use]
@@ -1130,6 +1138,7 @@ async fn build_worker_for_session(
         Some(deps.tool_dispatchers.register_subagents.clone()),
         environment,
         deps.tool_distribution.clone(),
+        deps.tool_environments.clone(),
         0,
     )
     .await?;
