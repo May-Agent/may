@@ -1683,9 +1683,9 @@ async fn priority_probe_command() -> String {
 /// See the macOS variant: on Linux the probe is the script itself, run by `sh`
 /// so its POSIX word splitting holds whatever shell the terminal tool uses.
 #[cfg(target_os = "linux")]
-async fn priority_probe_command() -> String {
+fn priority_probe_command() -> std::future::Ready<String> {
     let script = shell_escape::escape(PRIORITY_PROBE_SCRIPT.into());
-    format!("sh -c {script}")
+    std::future::ready(format!("sh -c {script}"))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
