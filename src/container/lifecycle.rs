@@ -34,16 +34,23 @@ struct SharedHostPaths {
 pub struct ContainerManager {
     runtime: Arc<ContainerRuntime>,
     may_dir: PathBuf,
+    /// Baseline tool distribution mounted read-only into every container.
+    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Last activity timestamp per container ID.
     activity: Arc<ArcSwap<HashMap<String, Instant>>>,
 }
 
 impl ContainerManager {
     #[must_use]
-    pub fn new(runtime: Arc<ContainerRuntime>, may_dir: PathBuf) -> Self {
+    pub fn new(
+        runtime: Arc<ContainerRuntime>,
+        may_dir: PathBuf,
+        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    ) -> Self {
         Self {
             runtime,
             may_dir,
+            tool_distribution,
             activity: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         }
     }
@@ -217,24 +224,31 @@ impl ContainerManager {
         &self,
         spec: &ContainerLaunchSpec,
     ) -> Result<SharedHostPaths, ContainerError> {
-        let (image, distribution) = futures_lite::future::try_zip(
-            async {
-                self.runtime
-                    .client
-                    .inspect_image(&spec.image)
-                    .await
-                    .map_err(ContainerError::Docker)
-            },
-            async {
-                crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
-                    .await?
-                    .tools
-                    .load_distribution()
-                    .await
-                    .map_err(ContainerError::Tools)
-            },
+        let home_paths = MayHomePaths::new(self.may_dir.clone());
+        let (tools_mount, memory_file) = futures_lite::future::try_zip(
+            self.prepare_tools_mount(spec, &home_paths),
+            Self::ensure_memory_file(&home_paths),
         )
         .await?;
+        Ok(SharedHostPaths {
+            memory_file,
+            tools_mount,
+        })
+    }
+
+    /// Prepares the image's baseline tool bundle on the host and describes
+    /// its read-only mount, rejecting writable grants that would expose it.
+    async fn prepare_tools_mount(
+        &self,
+        spec: &ContainerLaunchSpec,
+        home_paths: &MayHomePaths,
+    ) -> Result<aither_sandbox::MountSpec, ContainerError> {
+        let image = self
+            .runtime
+            .client
+            .inspect_image(&spec.image)
+            .await
+            .map_err(ContainerError::Docker)?;
         let target = aither_sandbox::ToolTarget::from_probe(
             image.os.as_deref().ok_or_else(|| {
                 ContainerError::Bootstrap("container image has no operating system".into())
@@ -243,11 +257,12 @@ impl ContainerManager {
                 ContainerError::Bootstrap("container image has no architecture".into())
             })?,
         )?;
-        let bundle = distribution
-            .load(&target, &self.may_dir.join("tools/artifacts"))
+        let bundle = self
+            .tool_distribution
+            .load(&target, &home_paths.tool_artifacts_dir())
             .await?;
         let (tools_mount, host_tools) = bundle
-            .prepare_container_mount(&self.may_dir.join("tools/container-runtimes"))
+            .prepare_container_mount(&home_paths.tool_runtimes_dir())
             .await?;
         let writable = std::iter::once(&spec.workspace).chain(
             spec.mounts
@@ -256,7 +271,11 @@ impl ContainerManager {
                 .map(|mount| &mount.host_path),
         );
         host_tools.ensure_readonly(writable).await?;
-        let home_paths = MayHomePaths::new(self.may_dir.clone());
+        Ok(tools_mount)
+    }
+
+    /// Ensures the global memory file exists and returns its canonical path.
+    async fn ensure_memory_file(home_paths: &MayHomePaths) -> Result<PathBuf, ContainerError> {
         let memory_file = home_paths.memory_file();
         if tokio::fs::metadata(&memory_file).await.is_err() {
             tokio::fs::write(&memory_file, "").await?;
@@ -267,21 +286,17 @@ impl ContainerManager {
             .map_err(|error| {
                 ContainerError::Bootstrap(format!(
                     "failed to canonicalize may dir {}: {error}",
-                    self.may_dir.display()
+                    home_paths.root().display()
                 ))
             })?;
-        let memory_file = tokio::fs::canonicalize(home_paths.memory_file())
+        tokio::fs::canonicalize(&memory_file)
             .await
             .map_err(|error| {
                 ContainerError::Bootstrap(format!(
                     "failed to canonicalize global memory file {}: {error}",
-                    home_paths.memory_file().display()
+                    memory_file.display()
                 ))
-            })?;
-        Ok(SharedHostPaths {
-            memory_file,
-            tools_mount,
-        })
+            })
     }
 
     fn effective_env(spec: &ContainerLaunchSpec, host_gateway: &str) -> Vec<String> {
@@ -582,16 +597,5 @@ mod tests {
             ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &second)
                 .unwrap()
         );
-    }
-
-    #[test]
-    fn tool_and_configuration_errors_remain_distinct() {
-        let preparation = ContainerError::from(aither_sandbox::ToolRuntimeError::InvalidProbe);
-        assert!(matches!(preparation, ContainerError::Tools(_)));
-        let configuration = ContainerError::from(crate::config::ConfigError::NoHomeDir);
-        assert!(matches!(
-            configuration,
-            ContainerError::ToolsConfiguration(_)
-        ));
     }
 }

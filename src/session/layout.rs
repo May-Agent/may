@@ -66,6 +66,26 @@ impl MayHomePaths {
         self.root.join("history.db")
     }
 
+    /// Cache root for the baseline tool distribution, shared by every backend.
+    #[must_use]
+    pub fn tools_dir(&self) -> PathBuf {
+        self.root.join("tools")
+    }
+
+    /// Hash-addressed downloaded artifacts: the `artifacts` directory
+    /// `ShellSessionRegistry::initialize_tools` keeps under [`Self::tools_dir`].
+    #[must_use]
+    pub fn tool_artifacts_dir(&self) -> PathBuf {
+        self.tools_dir().join("artifacts")
+    }
+
+    /// Prepared read-only executables: the `runtimes` directory
+    /// `ShellSessionRegistry::initialize_tools` keeps under [`Self::tools_dir`].
+    #[must_use]
+    pub fn tool_runtimes_dir(&self) -> PathBuf {
+        self.tools_dir().join("runtimes")
+    }
+
     #[must_use]
     pub fn browser_dir(&self) -> PathBuf {
         self.root.join("browser")
