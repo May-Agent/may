@@ -38,9 +38,16 @@ impl ChatDb {
             let access = row.access.parse().map_err(|error| {
                 storage_error(db_custom_error("invalid profile mount access: ", &error))
             })?;
+            let container_path =
+                aither_sandbox::ContainerPath::new(row.container_path).map_err(|error| {
+                    storage_error(db_custom_error(
+                        "invalid profile mount container path: ",
+                        &error,
+                    ))
+                })?;
             Ok(ContainerMountPreference {
                 host_path: row.host_path,
-                container_path: row.container_path,
+                container_path,
                 access,
             })
         })

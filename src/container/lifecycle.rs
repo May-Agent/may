@@ -317,14 +317,17 @@ impl ContainerManager {
                     home_paths.root().display()
                 ))
             })?;
-        tokio::fs::canonicalize(&memory_file)
+        let canonical = tokio::fs::canonicalize(&memory_file)
             .await
             .map_err(|error| {
                 ContainerError::Bootstrap(format!(
                     "failed to canonicalize global memory file {}: {error}",
                     memory_file.display()
                 ))
-            })
+            })?;
+        // Windows canonical paths carry the `\\?\` verbatim prefix, which container
+        // runtimes reject as a bind-mount source.
+        Ok(dunce::simplified(&canonical).to_path_buf())
     }
 
     fn effective_env(spec: &ContainerLaunchSpec, host_gateway: &str) -> Vec<String> {
@@ -373,7 +376,7 @@ impl ContainerManager {
 
         for mount in &spec.mounts {
             mounts.push(Mount {
-                target: Some(mount.container_path.display().to_string()),
+                target: Some(mount.container_path.to_string()),
                 source: Some(mount.host_path.display().to_string()),
                 typ: Some(MountType::BIND),
                 read_only: Some(mount.access == MountAccess::ReadOnly),
@@ -382,13 +385,7 @@ impl ContainerManager {
         }
 
         mounts.push(Mount {
-            target: Some(
-                shared_paths
-                    .tools_mount
-                    .container_path
-                    .display()
-                    .to_string(),
-            ),
+            target: Some(shared_paths.tools_mount.container_path.to_string()),
             source: Some(shared_paths.tools_mount.host_path.display().to_string()),
             typ: Some(MountType::BIND),
             read_only: Some(true),
@@ -583,6 +580,8 @@ impl ContainerManager {
 
 #[cfg(test)]
 mod tests {
+    use aither_sandbox::ContainerPath;
+
     use super::*;
 
     fn shared_paths() -> SharedHostPaths {
@@ -590,7 +589,7 @@ mod tests {
             memory_file: "/managed/MEMORY.md".into(),
             tools_mount: aither_sandbox::MountSpec::read_only(
                 "/managed/tools/bundle",
-                "/opt/aither/tools/bundle",
+                ContainerPath::new("/opt/aither/tools/bundle").unwrap(),
             ),
         }
     }
@@ -598,7 +597,10 @@ mod tests {
     #[test]
     fn tool_mount_is_readonly_and_preserves_workspace_mounts() {
         let spec = ContainerLaunchSpec::new("test", "test-image", "/workspace-host").with_mount(
-            aither_sandbox::MountSpec::read_write("/project-host", "/project"),
+            aither_sandbox::MountSpec::read_write(
+                "/project-host",
+                ContainerPath::new("/project").unwrap(),
+            ),
         );
         let shared = shared_paths();
         let mounts = ContainerManager::effective_mounts(&spec, &shared);
@@ -628,7 +630,7 @@ mod tests {
         let mut second = first.clone();
         second.tools_mount = aither_sandbox::MountSpec::read_only(
             "/managed/tools/new-bundle",
-            "/opt/aither/tools/new-bundle",
+            ContainerPath::new("/opt/aither/tools/new-bundle").unwrap(),
         );
         assert_ne!(
             ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &first)
