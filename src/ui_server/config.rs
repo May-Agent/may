@@ -16,7 +16,7 @@ use crate::session::MayHomePaths;
 use crate::skill::SkillManager;
 use crate::ui_event_bus::UiEventTopics;
 
-use super::error::{bad_request_error, internal_error};
+use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::helpers::send_event;
 use super::message_mapping::map_skill;
 use super::model_resolution::persist_last_model;
@@ -179,7 +179,9 @@ pub(super) async fn save_full_config(
             async move { run_save_full_config(state, req).await }
         })
         .await
-        .map_err(|_| internal_error("config save task panicked before producing a response"))??;
+        .map_err(|_| {
+            internal_error_message("config save task panicked before producing a response")
+        })??;
     Ok(Json(response))
 }
 

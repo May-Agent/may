@@ -18,7 +18,7 @@ use crate::task_trigger::{
     TaskTriggerResponse, TaskWebhookRequest,
 };
 
-use super::error::{bad_request_error, internal_error};
+use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::state::UiServerState;
 
 // ── Response type ──────────────────────────────────────────
@@ -253,7 +253,7 @@ where
         .spawn(future)
         .await
         .map_err(|_| {
-            internal_error(format!(
+            internal_error_message(format!(
                 "{operation} task panicked before producing a response"
             ))
         })?
