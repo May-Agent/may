@@ -45,17 +45,35 @@ pub enum ContainerError {
     /// The container's gateway cannot bind the host bridge.
     #[error("container {0} gateway {1} is not a usable bridge bind: {2}")]
     IpcRouteUnusableGateway(String, String, String),
-    /// The platform has no container IPC bridge route.
+    /// The host platform has no container IPC bridge route: neither a
+    /// Docker Desktop-family host (macOS, Windows) nor native Linux.
     #[error("container IPC bridge routes are unsupported on this platform")]
     IpcRouteUnsupportedPlatform,
 }
 
-/// The bind address every Docker Desktop-family runtime forwards the host
-/// gateway name to: the host's loopback interface.
-#[cfg(target_os = "macos")]
-fn macos_ipc_bridge_bind() -> aither_sandbox::BridgeAddress {
-    aither_sandbox::BridgeAddress::try_from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-        .expect("loopback is a usable bridge bind")
+/// The hostname that resolves to the host machine from inside a container of
+/// `kind`.
+const fn host_gateway_name(kind: ContainerRuntimeKind) -> &'static str {
+    match kind {
+        ContainerRuntimeKind::Podman => "host.containers.internal",
+        _ => "host.docker.internal",
+    }
+}
+
+/// The Docker Desktop route to the host's IPC bridge, used on macOS and
+/// Windows hosts.
+///
+/// Docker Desktop runs its engine in a VM and forwards the host gateway name
+/// to the host's loopback interface, so the bridge binds loopback and the
+/// container dials the gateway name. `OrbStack` and Podman machine forward
+/// their gateway names the same way.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn docker_desktop_ipc_route(kind: ContainerRuntimeKind) -> aither_sandbox::ContainerIpcRoute {
+    let loopback = aither_sandbox::BridgeAddress::try_from(std::net::IpAddr::V4(
+        std::net::Ipv4Addr::LOCALHOST,
+    ))
+    .expect("loopback is a usable bridge bind");
+    aither_sandbox::ContainerIpcRoute::new(host_gateway_name(kind), loopback)
 }
 
 /// The gateway address a container uses to reach its host, selected from the
@@ -129,10 +147,7 @@ impl ContainerRuntime {
     /// The hostname that resolves to the host machine from inside a container.
     #[must_use]
     pub const fn host_gateway(&self) -> &'static str {
-        match self.kind {
-            ContainerRuntimeKind::Podman => "host.containers.internal",
-            _ => "host.docker.internal",
-        }
+        host_gateway_name(self.kind)
     }
 
     /// The route a container uses to reach the host's IPC bridge: the
@@ -140,9 +155,10 @@ impl ContainerRuntime {
     /// address the bridge binds.
     ///
     /// The bridge executes host IPC commands for whoever connects, so the
-    /// bind is never a wildcard: Docker Desktop, OrbStack and Podman machine
-    /// forward the gateway name to host loopback; on native Linux the bind is
-    /// the container network's gateway as the host owns it.
+    /// bind is never a wildcard: on macOS and Windows hosts Docker Desktop,
+    /// OrbStack and Podman machine forward the gateway name to host loopback
+    /// (see [`docker_desktop_ipc_route`]); on native Linux the bind is the
+    /// container network's gateway as the host owns it.
     ///
     /// # Errors
     /// Fails when the container reports no gateway or conflicting gateways,
@@ -152,30 +168,25 @@ impl ContainerRuntime {
         &self,
         container_id: &str,
     ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
-        let bind = self.ipc_bridge_bind(container_id).await?;
-        Ok(aither_sandbox::ContainerIpcRoute::new(
-            self.host_gateway(),
-            bind,
-        ))
+        self.resolve_ipc_route(container_id).await
     }
 
-    /// The host address the IPC bridge binds for `container_id`.
-    #[cfg(target_os = "macos")]
-    async fn ipc_bridge_bind(
+    /// The Docker Desktop route: the container's own network is irrelevant
+    /// because the engine VM forwards the gateway name to host loopback.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    async fn resolve_ipc_route(
         &self,
         _container_id: &str,
-    ) -> Result<aither_sandbox::BridgeAddress, ContainerError> {
-        // Docker Desktop, OrbStack and Podman machine forward the host
-        // gateway name to the host's loopback interface.
-        Ok(macos_ipc_bridge_bind())
+    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
+        Ok(docker_desktop_ipc_route(self.kind))
     }
 
-    /// The host address the IPC bridge binds for `container_id`.
+    /// The native Linux route.
     #[cfg(target_os = "linux")]
-    async fn ipc_bridge_bind(
+    async fn resolve_ipc_route(
         &self,
         container_id: &str,
-    ) -> Result<aither_sandbox::BridgeAddress, ContainerError> {
+    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
         // Native Docker and Podman resolve the host gateway name to the
         // container network's gateway, so the bridge binds that exact
         // address — read from the container's own inspection, never a
@@ -188,15 +199,19 @@ impl ContainerRuntime {
             )
             .await
             .map_err(ContainerError::Docker)?;
-        select_ipc_gateway(&inspect, container_id)
+        let bind = select_ipc_gateway(&inspect, container_id)?;
+        Ok(aither_sandbox::ContainerIpcRoute::new(
+            self.host_gateway(),
+            bind,
+        ))
     }
 
-    /// The host address the IPC bridge binds for `container_id`.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    async fn ipc_bridge_bind(
+    /// Hosts that are neither Docker Desktop hosts nor native Linux.
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    async fn resolve_ipc_route(
         &self,
         _container_id: &str,
-    ) -> Result<aither_sandbox::BridgeAddress, ContainerError> {
+    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
         Err(ContainerError::IpcRouteUnsupportedPlatform)
     }
 
@@ -242,14 +257,20 @@ impl ContainerRuntime {
         Err(ContainerError::NoRuntime)
     }
 
-    /// Try connecting to a Docker-compatible socket.
+    /// Try connecting to a Docker-compatible endpoint: a Unix socket on Unix
+    /// hosts, a named pipe on Windows hosts.
     async fn try_connect(socket_path: &Path, kind: ContainerRuntimeKind) -> Option<Self> {
         if !socket_path.exists() {
             return None;
         }
 
-        let url = format!("unix://{}", socket_path.display());
-        let client = Docker::connect_with_socket(&url, 5, bollard::API_DEFAULT_VERSION).ok()?;
+        let Some(endpoint) = socket_path.to_str() else {
+            tracing::warn!(socket = %socket_path.display(), "Runtime endpoint path is not UTF-8");
+            return None;
+        };
+        // `connect_with_socket` dials a Unix socket on Unix and a named pipe
+        // on Windows.
+        let client = Docker::connect_with_socket(endpoint, 5, bollard::API_DEFAULT_VERSION).ok()?;
 
         match client.ping().await {
             Ok(_) => Some(Self { kind, client }),
@@ -304,9 +325,18 @@ fn socket_candidates(kind: ContainerRuntimeKind) -> Vec<PathBuf> {
             }
             candidates
         }
-        ContainerRuntimeKind::Docker => vec![PathBuf::from("/var/run/docker.sock")],
+        ContainerRuntimeKind::Docker => vec![PathBuf::from(DOCKER_ENGINE_ENDPOINT)],
     }
 }
+
+/// The Docker Engine's local endpoint: the Unix socket on Unix hosts.
+#[cfg(unix)]
+const DOCKER_ENGINE_ENDPOINT: &str = "/var/run/docker.sock";
+
+/// The Docker Engine's local endpoint: the named pipe Docker Desktop serves
+/// on Windows hosts.
+#[cfg(windows)]
+const DOCKER_ENGINE_ENDPOINT: &str = r"\\.\pipe\docker_engine";
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, serde::Deserialize)]
@@ -728,11 +758,12 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn ipc_bridge_bind_uses_loopback_on_macos() {
+    fn docker_desktop_route_dials_host_docker_internal_over_loopback() {
+        let route = docker_desktop_ipc_route(ContainerRuntimeKind::Docker);
+        assert_eq!(route.host(), "host.docker.internal");
         assert_eq!(
-            macos_ipc_bridge_bind().ip(),
+            route.bind().ip(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
     }
