@@ -12,7 +12,7 @@ use crate::session::{
 use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
-use super::error::{bad_request_error, internal_error};
+use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::message_mapping::map_db_messages;
 use super::model_resolution::{
     persist_last_model, preferred_advanced_model, resolve_default_model,
@@ -42,8 +42,9 @@ fn resolve_session_model(
     model: Option<String>,
 ) -> Result<String, skyzen::Error> {
     let config = state.config_snapshot();
-    resolve_default_model(&config, model)
-        .ok_or_else(|| internal_error(format!("no model resolved for session {session_id}")))
+    resolve_default_model(&config, model).ok_or_else(|| {
+        internal_error_message(format!("no model resolved for session {session_id}"))
+    })
 }
 
 pub(super) async fn list_sessions(
@@ -62,7 +63,7 @@ pub(super) async fn list_api_sessions(
     let mut sessions = Vec::with_capacity(summaries.len());
     for s in summaries {
         let model = resolve_default_model(&config, s.model.clone()).ok_or_else(|| {
-            internal_error(format!("no model resolved for session {}", s.id.as_str()))
+            internal_error_message(format!("no model resolved for session {}", s.id.as_str()))
         })?;
         sessions.push(ApiSession::from_summary(s, model, Vec::new()));
     }
