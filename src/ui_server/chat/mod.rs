@@ -2714,6 +2714,7 @@ async fn prepare_agent_for_request(
         Some(brokers.register_skills),
         Some(brokers.register_subagents),
         environment,
+        state.tool_distribution.clone(),
         provider_attempt,
     )
     .await

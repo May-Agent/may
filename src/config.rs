@@ -893,51 +893,6 @@ impl Default for RemoteAccessConfig {
     }
 }
 
-/// Location of the harness-managed, pinned baseline distribution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolRuntimeConfig {
-    /// Manifest path, relative to the May installation unless absolute.
-    pub distribution_manifest: PathBuf,
-}
-
-impl Default for ToolRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            distribution_manifest: PathBuf::from("tools/distribution.json"),
-        }
-    }
-}
-
-impl ToolRuntimeConfig {
-    /// Loads the installed distribution before any model or terminal execution.
-    ///
-    /// # Errors
-    /// Fails on missing, malformed or invalid distribution metadata.
-    pub async fn load_distribution(
-        &self,
-    ) -> Result<aither_sandbox::ToolDistribution, aither_sandbox::ToolRuntimeError> {
-        let executable = blocking::unblock(std::env::current_exe).await?;
-        self.load_distribution_at(&executable).await
-    }
-
-    /// Resolves a distribution for a concrete May installation.
-    ///
-    /// # Errors
-    /// Fails if the installation or its manifest cannot be validated.
-    pub async fn load_distribution_at(
-        &self,
-        executable: &Path,
-    ) -> Result<aither_sandbox::ToolDistribution, aither_sandbox::ToolRuntimeError> {
-        let parent = executable.parent().ok_or_else(|| {
-            aither_sandbox::ToolRuntimeError::NotInitialized(
-                "executable has no installation directory".into(),
-            )
-        })?;
-        let manifest = parent.join(&self.distribution_manifest);
-        aither_sandbox::ToolDistribution::from_path(&manifest).await
-    }
-}
-
 /// May agent configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MayConfig {
@@ -946,9 +901,6 @@ pub struct MayConfig {
     /// `0` means unlimited.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
-    /// Pinned baseline tools prepared before the agent becomes available.
-    #[serde(default)]
-    pub tools: ToolRuntimeConfig,
     /// Configured provider instances, keyed by ID.
     /// Example: `[provider.anthropic]`, `[provider.my-ollama]`
     #[serde(default)]
@@ -984,7 +936,6 @@ impl Default for MayConfig {
     fn default() -> Self {
         Self {
             max_iterations: default_max_iterations(),
-            tools: ToolRuntimeConfig::default(),
             provider: HashMap::new(),
             models: ModelsConfig::default(),
             preferences: Preferences::default(),
@@ -1202,34 +1153,6 @@ pub struct AvailableModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn missing_tool_distribution_fails_closed() {
-        let installation = tempfile::tempdir().unwrap();
-        let error = ToolRuntimeConfig::default()
-            .load_distribution_at(&installation.path().join("may"))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, aither_sandbox::ToolRuntimeError::Io(ref error) if error.kind() == std::io::ErrorKind::NotFound)
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_tool_distribution_fails_closed() {
-        let installation = tempfile::tempdir().unwrap();
-        let manifest = installation.path().join("distribution.json");
-        async_fs::write(&manifest, b"not JSON").await.unwrap();
-        let config = ToolRuntimeConfig {
-            distribution_manifest: manifest,
-        };
-        assert!(matches!(
-            config
-                .load_distribution_at(&installation.path().join("may"))
-                .await,
-            Err(aither_sandbox::ToolRuntimeError::Manifest(_))
-        ));
-    }
 
     #[test]
     fn test_default_config() {

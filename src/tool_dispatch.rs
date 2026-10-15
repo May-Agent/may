@@ -47,6 +47,8 @@ pub struct ToolDispatchConfig {
     pub browser_config: BrowserConfig,
     pub network_policy: NetworkPolicyConfig,
     pub ask_user_broker: AskUserBroker,
+    /// Baseline tool distribution prepared for task terminals.
+    pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,13 +88,17 @@ impl ToolDispatchers {
             ui_event_bus.clone(),
         ));
         let task_runtime = Arc::new(
-            TaskRuntime::load(config.db.clone(), config.may_dir.clone())
-                .await
-                .map_err(ToolDispatchError::LoadTaskRuntime)?
-                .with_notifier(notification_service.clone())
-                .with_ui_event_bus(ui_event_bus)
-                .with_network_policy(config.network_policy.clone())
-                .map_err(ToolDispatchError::ConfigureTaskRuntime)?,
+            TaskRuntime::load(
+                config.db.clone(),
+                config.may_dir.clone(),
+                config.tool_distribution.clone(),
+            )
+            .await
+            .map_err(ToolDispatchError::LoadTaskRuntime)?
+            .with_notifier(notification_service.clone())
+            .with_ui_event_bus(ui_event_bus)
+            .with_network_policy(config.network_policy.clone())
+            .map_err(ToolDispatchError::ConfigureTaskRuntime)?,
         );
         let registration = RegistrationRuntime {
             may_dir: config.may_dir.clone(),

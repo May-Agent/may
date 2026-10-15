@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aither_sandbox::ToolTarget;
 use askama::Template;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -17,10 +18,10 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use may_agent::MayConfig;
 use may_agent::config::{ProviderInstance, ProviderType};
 use may_agent::model_selector::ModelSelector;
 use may_agent::session::{SandboxResourceLayout, SessionId, initialize_session_persistence};
+use may_agent::{MayConfig, MayHomePaths};
 use serde_json::Value;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -529,7 +530,7 @@ impl TestHarness {
             .expect("test config should be written");
 
         seed_container_heel_cache(&may_dir).await;
-        warm_may_binary().await;
+        futures_lite::future::zip(share_and_warm_tool_cache(&may_dir), warm_may_binary()).await;
 
         Self { home, may_dir }
     }
@@ -742,6 +743,38 @@ async fn seed_container_heel_cache(may_dir: &Path) {
         .await
         .expect("container heel release state should copy");
     }
+}
+
+/// Points the test home's tool cache at one cache shared by every test run
+/// and prepares the host's baseline tools in it through the embedded
+/// distribution, so the first hash-verified download happens here instead of
+/// inside a server's readiness deadline. Later runs reuse the cached artifacts.
+async fn share_and_warm_tool_cache(may_dir: &Path) {
+    let shared = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("may-tools");
+    tokio::fs::create_dir_all(&shared)
+        .await
+        .expect("shared tool cache dir should be created");
+    let home_paths = MayHomePaths::new(may_dir.to_path_buf());
+    #[cfg(unix)]
+    tokio::fs::symlink(&shared, home_paths.tools_dir())
+        .await
+        .expect("test home tool cache should link to the shared cache");
+    #[cfg(windows)]
+    tokio::fs::symlink_dir(&shared, home_paths.tools_dir())
+        .await
+        .expect("test home tool cache should link to the shared cache");
+    let bundle = may_agent::tools::embedded_distribution()
+        .expect("embedded distribution should validate")
+        .load(
+            &ToolTarget::native().expect("test host should have a tool target"),
+            &home_paths.tool_artifacts_dir(),
+        )
+        .await
+        .expect("baseline tool artifacts should download and verify");
+    bundle
+        .prepare_local(&home_paths.tool_runtimes_dir())
+        .await
+        .expect("baseline tools should prepare");
 }
 
 fn optional_heel_bin() -> Option<String> {

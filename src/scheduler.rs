@@ -43,6 +43,8 @@ pub struct TaskRuntime {
     ui_event_bus: Option<UiEventBus>,
     may_dir: PathBuf,
     container_manager: Option<Arc<ContainerManager>>,
+    /// Baseline tool distribution prepared for every task terminal.
+    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
 }
@@ -367,13 +369,18 @@ impl PermissionHandler for SchedulerPermissionHandler {
 }
 
 impl TaskRuntime {
-    pub async fn load(db: ChatDb, may_dir: PathBuf) -> Result<Self, crate::db::ChatDbError> {
+    pub async fn load(
+        db: ChatDb,
+        may_dir: PathBuf,
+        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    ) -> Result<Self, crate::db::ChatDbError> {
         let runtime = Self {
             db,
             notifier: None,
             ui_event_bus: None,
             may_dir,
             container_manager: None,
+            tool_distribution,
             network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
         };
@@ -1062,25 +1069,49 @@ impl TaskRuntime {
         .map(|_| ())
     }
 
-    /// Loads the baseline tool distribution and prepares the registry's
-    /// configured backends, so every terminal — local or container — runs
-    /// with the same verified tools before `TerminalTool` executes.
-    async fn initialize_shell_sessions(
+    /// Builds a terminal over `shell_sessions`, grants `workspace` read-write
+    /// access and prepares the baseline tools through
+    /// [`TerminalTool::initialize_tools`], so scheduled commands run the same
+    /// verified tools — including the read-only and version checks — as agent
+    /// terminals.
+    async fn initialized_terminal_tool(
         &self,
-        registry: ShellSessionRegistry,
-    ) -> Result<ShellSessionRegistry, String> {
-        let distribution = crate::config::MayConfig::load_from(&self.may_dir.join("config.toml"))
+        permission_handler: SchedulerPermissionHandler,
+        workspace: PathBuf,
+        shell_sessions: ShellSessionRegistry,
+    ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
+        let (terminal_tool, network_audit) = futures_lite::future::try_zip(
+            async {
+                TerminalTool::new_exact(&workspace, permission_handler, DefaultExecutor)
+                    .await
+                    .map_err(|error| {
+                        init_terminal_tool_error("failed to initialize terminal tool: ", &error)
+                    })
+            },
+            async {
+                aither_sandbox::open_network_audit_log(
+                    self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
+                    crate::config::NETWORK_AUDIT_MAX_FILES,
+                )
+                .await
+                .map_err(|error| {
+                    init_terminal_tool_error("failed to open network audit log: ", &error)
+                })
+            },
+        )
+        .await?;
+        let registry = Arc::new(ToolRegistryBuilder::new().build(workspace.join("outputs")));
+        terminal_tool
+            .with_network_audit_log(network_audit)
+            .with_shell_sessions(shell_sessions)
+            .with_writable_paths([workspace.clone()])
+            .with_readable_paths([workspace])
+            .initialize_tools(
+                &self.tool_distribution,
+                &crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir(),
+            )
             .await
-            .map_err(|error| {
-                init_terminal_tool_error("failed to load May config for baseline tools: ", &error)
-            })?
-            .tools
-            .load_distribution()
-            .await
-            .map_err(|error| init_terminal_tool_error("failed to load baseline tools: ", &error))?;
-        registry
-            .initialize_tools(&distribution, &self.may_dir.join("tools/cache"))
-            .await
+            .map(|terminal_tool| terminal_tool.with_registry(registry))
             .map_err(|error| init_terminal_tool_error("failed to prepare baseline tools: ", &error))
     }
 
@@ -1091,53 +1122,42 @@ impl TaskRuntime {
         script: &TaskScript,
         allow_network: bool,
     ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
-        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: true,
-            container: false,
-            ssh: false,
-        });
-        let shell_sessions = self.initialize_shell_sessions(shell_sessions).await?;
-        let registry =
-            Arc::new(ToolRegistryBuilder::new().build(script.host_working_dir.join("outputs")));
-        let network_policy = self.network_policy.load().as_ref().clone();
-        let network_audit = aither_sandbox::open_network_audit_log(
-            self.may_dir.join(crate::config::NETWORK_AUDIT_LOG_SUBDIR),
-            crate::config::NETWORK_AUDIT_MAX_FILES,
-        )
-        .await
-        .map_err(|error| init_terminal_tool_error("failed to open network audit log: ", &error))?;
-        TerminalTool::new_exact(
-            &script.host_working_dir,
+        self.initialized_terminal_tool(
             SchedulerPermissionHandler {
                 db: self.db.clone(),
                 ui_event_bus: self.ui_event_bus.clone(),
                 profile_id: profile_id.to_string(),
                 source,
                 allow_network,
-                network_policy,
+                network_policy: self.network_policy.load().as_ref().clone(),
             },
-            DefaultExecutor,
+            script.host_working_dir.clone(),
+            ShellSessionRegistry::new(ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            }),
         )
         .await
-        .map_err(|error| {
-            init_terminal_tool_error("failed to initialize local terminal tool: ", &error)
-        })
-        .map(|tool| {
-            tool.with_network_audit_log(network_audit)
-                .with_shell_sessions(shell_sessions)
-                .with_writable_paths([script.host_working_dir.clone()])
-                .with_readable_paths([script.host_working_dir.clone()])
-                .with_registry(registry)
-        })
     }
 
-    async fn execute_container(
+    /// Starts the profile's container and builds a terminal that executes in
+    /// it, storing outputs in the host-side task workspace mounted at
+    /// `/workspace`. Returns the container manager and container ID so callers
+    /// can record activity.
+    async fn container_terminal_tool(
         &self,
-        _task: &scheduled_tasks::Model,
         profile: &profiles::Model,
-        command: String,
-    ) -> Result<String, String> {
-        let container_manager = self.container_manager.as_ref().ok_or_else(|| {
+        source: NetworkAccessSource,
+    ) -> Result<
+        (
+            TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
+            Arc<ContainerManager>,
+            String,
+        ),
+        String,
+    > {
+        let container_manager = self.container_manager.clone().ok_or_else(|| {
             "container profile task cannot run: container runtime unavailable".to_string()
         })?;
         let container_preferences = self
@@ -1182,7 +1202,6 @@ impl TaskRuntime {
             .map_err(|error| prefixed_error("container image check/build failed: ", &error))?;
 
         let container_name = container_profile_name(profile);
-
         let workspace_dir = self
             .may_dir
             .join("task-workspaces")
@@ -1217,40 +1236,37 @@ impl TaskRuntime {
                 container_manager.runtime().client.clone(),
             )))),
         );
-        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: false,
-            container: true,
-            ssh: false,
-        })
-        .with_container_runtime(container_runtime);
-        let shell_sessions = self.initialize_shell_sessions(shell_sessions).await?;
-
-        // Use host workspace dir for output storage while executing commands in
-        // /workspace inside container.
-        let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
-        let network_policy = self.network_policy.load().as_ref().clone();
-        let terminal_tool: TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
-            TerminalTool::new_exact(
-                &workspace_dir,
+        let terminal_tool = self
+            .initialized_terminal_tool(
                 SchedulerPermissionHandler {
                     db: self.db.clone(),
                     ui_event_bus: self.ui_event_bus.clone(),
                     profile_id: profile.id.clone(),
-                    source: NetworkAccessSource::TaskContainer,
+                    source,
                     allow_network: true,
-                    network_policy,
+                    network_policy: self.network_policy.load().as_ref().clone(),
                 },
-                DefaultExecutor,
+                workspace_dir,
+                ShellSessionRegistry::new(ShellRuntimeAvailability {
+                    local: false,
+                    container: true,
+                    ssh: false,
+                })
+                .with_container_runtime(container_runtime),
             )
-            .await
-            .map_err(|error| {
-                init_terminal_tool_error("failed to initialize container terminal tool: ", &error)
-            })?
-            .with_shell_sessions(shell_sessions)
-            .with_writable_paths([workspace_dir.clone()])
-            .with_readable_paths([workspace_dir])
-            .with_registry(registry);
+            .await?;
+        Ok((terminal_tool, container_manager, container_id))
+    }
 
+    async fn execute_container(
+        &self,
+        _task: &scheduled_tasks::Model,
+        profile: &profiles::Model,
+        command: String,
+    ) -> Result<String, String> {
+        let (terminal_tool, container_manager, container_id) = self
+            .container_terminal_tool(profile, NetworkAccessSource::TaskContainer)
+            .await?;
         let result = run_terminal_command(
             &terminal_tool,
             TerminalExecutionMode::Default,
@@ -1277,117 +1293,9 @@ impl TaskRuntime {
         profile: &profiles::Model,
         script: &TaskScript,
     ) -> Result<(), String> {
-        let container_manager = self.container_manager.as_ref().ok_or_else(|| {
-            "container profile task cannot run: container runtime unavailable".to_string()
-        })?;
-        let container_preferences = self
-            .db
-            .load_container_profile_preferences(profile)
-            .await
-            .map_err(|error| {
-                invalid_profile_component_error("invalid container profile preferences: ", &error)
-            })?;
-
-        let default_image_tag = crate::container::profile::default_image_tag(
-            &self.may_dir,
-            profile,
-            container_preferences.clone(),
-        )
-        .await
-        .map_err(|error| {
-            invalid_profile_component_error("invalid container profile image tag: ", &error)
-        })?;
-        let image_spec = crate::container::profile::image_spec_for_profile(
-            &self.may_dir,
-            profile,
-            &default_image_tag,
-            container_preferences.clone(),
-        )
-        .map_err(|error| {
-            invalid_profile_component_error(
-                "invalid container profile image configuration: ",
-                &error,
-            )
-        })?;
-        let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences)
-            .map_err(|error| {
-                invalid_profile_component_error(
-                    "invalid container profile mount configuration: ",
-                    &error,
-                )
-            })?;
-
-        crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
-            .await
-            .map_err(|error| prefixed_error("container image check/build failed: ", &error))?;
-
-        let container_name = container_profile_name(profile);
-        let workspace_dir = self
-            .may_dir
-            .join("task-workspaces")
-            .join(profile_workspace_key(profile));
-        tokio::fs::create_dir_all(&workspace_dir)
-            .await
-            .map_err(|error| workspace_prepare_error(&workspace_dir, &error))?;
-
-        let mut launch_spec = ContainerLaunchSpec::new(
-            container_name,
-            image_spec.tag.clone(),
-            workspace_dir.clone(),
-        );
-        for mount in extra_mounts {
-            launch_spec = launch_spec.with_mount(mount);
-        }
-        let container_id = container_manager
-            .ensure_running(&launch_spec)
-            .await
-            .map_err(|error| prefixed_error("failed to start container: ", &error))?;
-        container_manager.touch_activity(&container_id);
-
-        let container_ipc_route = container_manager
-            .runtime()
-            .ipc_route(&container_id)
-            .await
-            .map_err(|error| prefixed_error("failed to resolve container IPC route: ", &error))?;
-        let container_runtime = ContainerShellRuntime::new(
-            container_id.clone(),
-            container_ipc_route,
-            AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
-                container_manager.runtime().client.clone(),
-            )))),
-        );
-        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: false,
-            container: true,
-            ssh: false,
-        })
-        .with_container_runtime(container_runtime);
-        let shell_sessions = self.initialize_shell_sessions(shell_sessions).await?;
-
-        let registry = Arc::new(ToolRegistryBuilder::new().build(workspace_dir.join("outputs")));
-        let network_policy = self.network_policy.load().as_ref().clone();
-        let terminal_tool: TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured> =
-            TerminalTool::new_exact(
-                &workspace_dir,
-                SchedulerPermissionHandler {
-                    db: self.db.clone(),
-                    ui_event_bus: self.ui_event_bus.clone(),
-                    profile_id: profile.id.clone(),
-                    source: NetworkAccessSource::TaskValidationContainer,
-                    allow_network: true,
-                    network_policy,
-                },
-                DefaultExecutor,
-            )
-            .await
-            .map_err(|error| {
-                init_terminal_tool_error("failed to initialize container terminal tool: ", &error)
-            })?
-            .with_shell_sessions(shell_sessions)
-            .with_writable_paths([workspace_dir.clone()])
-            .with_readable_paths([workspace_dir])
-            .with_registry(registry);
-
+        let (terminal_tool, container_manager, container_id) = self
+            .container_terminal_tool(profile, NetworkAccessSource::TaskValidationContainer)
+            .await?;
         let result = run_terminal_command(
             &terminal_tool,
             TerminalExecutionMode::Default,
@@ -1524,12 +1432,13 @@ fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
 
 #[cfg(test)]
 mod tests {
-    use super::TaskRuntime;
-    use super::local_task_execution_mode;
-    use aither_sandbox::{ShellRuntimeAvailability, ShellSessionRegistry, TerminalExecutionMode};
+    use std::sync::Arc;
+
+    use super::{TaskRuntime, TaskScript, local_task_execution_mode};
+    use aither_sandbox::TerminalExecutionMode;
     use tempfile::tempdir;
 
-    use crate::db::{ChatDb, CreateScheduledTaskParams};
+    use crate::db::{ChatDb, CreateScheduledTaskParams, NetworkAccessSource};
     use crate::task_trigger::PersistedTaskTrigger;
 
     #[test]
@@ -1590,9 +1499,13 @@ mod tests {
             }
         }
 
-        let runtime = TaskRuntime::load(db.clone(), may_dir)
-            .await
-            .expect("task runtime should load");
+        let runtime = TaskRuntime::load(
+            db.clone(),
+            may_dir,
+            Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+        )
+        .await
+        .expect("task runtime should load");
 
         let triggered = runtime
             .dispatch_event(
@@ -1607,35 +1520,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_shell_sessions_fails_without_tool_distribution() {
+    async fn local_terminal_fails_before_exec_without_prepared_tools() {
+        // Terminal construction spawns its job registry on the global
+        // executor, which the `may` binary installs at startup.
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let dir = tempdir().expect("temp dir should be created");
         let may_dir = dir.path().join(".may");
         std::fs::create_dir_all(&may_dir).expect("may dir should be created");
-        // Point the manifest at a path that can never exist so the test does
-        // not depend on whether a distribution sits beside the test binary.
-        let mut config = crate::config::MayConfig::default();
-        config.tools.distribution_manifest = may_dir.join("missing-distribution.json");
-        config
-            .save_to(&may_dir.join("config.toml"))
-            .await
-            .expect("test config should save");
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
             .expect("db should initialize");
-        let runtime = TaskRuntime::load(db, may_dir)
+        let empty_distribution =
+            aither_sandbox::ToolDistribution::from_json(br#"{"artifacts":[]}"#)
+                .expect("an empty distribution is well-formed");
+        let runtime = TaskRuntime::load(db, may_dir.clone(), Arc::new(empty_distribution))
             .await
             .expect("task runtime should load");
 
         let error = runtime
-            .initialize_shell_sessions(ShellSessionRegistry::new(ShellRuntimeAvailability {
-                local: true,
-                container: false,
-                ssh: false,
-            }))
+            .local_terminal_tool(
+                "profile",
+                NetworkAccessSource::TaskValidationLocal,
+                &TaskScript {
+                    content: "true".to_string(),
+                    host_working_dir: may_dir.join("task"),
+                },
+                false,
+            )
             .await
-            .expect_err("a missing baseline distribution must fail before any exec");
+            .err()
+            .expect("a distribution without native tools must fail before any exec");
         assert!(
-            error.contains("baseline tools"),
+            error.starts_with("failed to prepare baseline tools: "),
             "unexpected error: {error}"
         );
     }

@@ -163,6 +163,7 @@ similar = "3.1.1"
 
 [dev-dependencies]
 serial_test = "3"
+sha2 = "0.10"
 tokio-test = "0.4"
 
 [workspace.lints]
@@ -182,3 +183,27 @@ clippy.multiple_crate_versions =  { level = "allow", priority = 1 }
 
 [lints]
 workspace = true
+
+# Baseline tool preparation hashes and inflates ~120 MB of pinned tool
+# artifacts before every agent is built; unoptimized, these crates make that
+# take seconds in dev and test builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
+[profile.dev.package.zip]
+opt-level = 3
+
+[profile.dev.package.tar]
+opt-level = 3
