@@ -179,6 +179,19 @@ clippy.pedantic = "warn"
 clippy.nursery = "warn"
 clippy.cargo = "warn"
 clippy.multiple_crate_versions =  { level = "allow", priority = 1 }
+# A raw line-count cap fights the deliberately linear structure of the TUI draw
+# and event-dispatch passes; splitting them at an arbitrary boundary adds
+# indirection without a real abstraction.
+clippy.too_many_lines = { level = "allow", priority = 1 }
+# Flag groups appear naturally in serde wire structs and TUI state; packing
+# them into bitflags/enums would obscure the declared shape.
+clippy.struct_excessive_bools = { level = "allow", priority = 1 }
+# serde's `skip_serializing_if` expects predicates of the form `fn(&T) -> bool`;
+# the suggested by-value signature cannot satisfy that contract.
+clippy.trivially_copy_pass_by_ref = { level = "allow", priority = 1 }
+# u64 -> f64 casts in usage-metric rate calculations are intentional; the only
+# conversion path is `as`, and counter magnitudes never approach 2^53.
+clippy.cast_precision_loss = { level = "allow", priority = 1 }
 
 
 [lints]

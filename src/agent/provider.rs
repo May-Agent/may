@@ -3,7 +3,7 @@
 //! Resolves an explicit `<provider_id>::<model_id>` selector into one
 //! concrete provider instance, then builds the `CloudProvider` client
 //! with the right base URL, API key, and per-provider quirks
-//! (OpenRouter, DeepSeek, Ollama, LMStudio, Copilot, custom
+//! (`OpenRouter`, `DeepSeek`, Ollama, `LMStudio`, Copilot, custom
 //! OpenAI-compatible proxies, etc.). Also exposes the thin
 //! [`RequestParameterizedModel`] wrapper that pins a [`Parameters`]
 //! struct onto every inference request routed through the wrapped
@@ -106,12 +106,23 @@ pub fn provider_candidate_count(config: &MayConfig, selector: &str) -> usize {
 }
 
 /// The concrete runtime produced by [`resolve_provider_runtime`].
+#[derive(Debug)]
 pub struct ResolvedProviderRuntime {
+    /// Resolved provider identifier.
     pub provider_id: String,
+    /// Configured LLM client for the provider.
     pub llm: CloudProvider,
+    /// Embedding model resolution used by retrieval tools.
     pub search_embedder: EmbeddingModelResolution,
 }
 
+/// Resolve a model selector against `may_config` into a usable provider
+/// runtime, trying fallback candidates in order.
+///
+/// # Errors
+///
+/// Returns [`MayAgentError`] when no configured provider can serve the
+/// selector or all candidates fail.
 pub async fn resolve_provider_runtime(
     may_config: &MayConfig,
     selector: &str,
@@ -153,7 +164,7 @@ pub async fn resolve_provider_runtime(
 ///
 /// `None` for a tier means no distinct model is configured (or it failed to
 /// initialize) and the session model should answer that tier.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AskTierModels {
     pub flagship: Option<CloudProvider>,
     pub balanced: Option<CloudProvider>,
@@ -211,6 +222,18 @@ pub async fn resolve_ask_tier_models(
 }
 
 /// Builds a fast+balanced provider chain for background memory extraction.
+///
+/// # Errors
+///
+/// Returns [`MayAgentError`] when a configured selector cannot be resolved
+/// into a provider, and [`MayAgentError::MissingApiKey`] when a candidate
+/// provider is not authenticated.
+///
+/// # Panics
+///
+/// Panics when a configured model selector references a provider that is not
+/// in the provider map — config validation is expected to reject that
+/// earlier.
 pub async fn build_fast_provider_chain(
     config: &MayConfig,
 ) -> Result<Vec<crate::memory::MemoryExtractionProvider>, MayAgentError> {
@@ -299,7 +322,11 @@ pub(super) async fn build_cloud_provider_from_instance(
             }
             client.into()
         }
-        ProviderType::OpenAI => {
+        ProviderType::OpenAI
+        | ProviderType::Groq
+        | ProviderType::Together
+        | ProviderType::Mistral
+        | ProviderType::XAI => {
             let mut client = OpenAI::new(api_key).with_model(model);
             if let Some(url) = base_url {
                 client = client.with_base_url(url);
@@ -372,13 +399,6 @@ pub(super) async fn build_cloud_provider_from_instance(
                 .with_model(model)
                 .with_chat_completions_api()
                 .into()
-        }
-        ProviderType::Groq | ProviderType::Together | ProviderType::Mistral | ProviderType::XAI => {
-            let mut client = OpenAI::new(api_key).with_model(model);
-            if let Some(url) = base_url {
-                client = client.with_base_url(url);
-            }
-            client.into()
         }
         ProviderType::Custom => {
             let url = base_url.ok_or_else(|| {

@@ -413,7 +413,10 @@ pub(super) fn render_search_preview(
 /// Render profile selection popup.
 pub(super) fn render_profile_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_width = 50u16.min(area.width.saturating_sub(4));
-    let popup_height = (app.profiles.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let popup_height = u16::try_from(app.profiles.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(4)
+        .min(area.height.saturating_sub(4));
     let popup_area = centered_rect_exact(popup_width, popup_height, area);
     frame.render_widget(Clear, popup_area);
 

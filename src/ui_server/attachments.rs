@@ -160,7 +160,7 @@ pub(super) async fn build_prompt_and_attachments(
         if let Some((saved_path, relative_path)) = uploaded {
             xml_items.push(AttachmentXml {
                 name: attachment.name.clone(),
-                attachment_type: attachment.attachment_type.clone(),
+                attachment_type: attachment.attachment_type,
                 path: Some(relative_path),
                 offloaded: None,
                 required_modality: None,
@@ -186,7 +186,7 @@ pub(super) async fn build_prompt_and_attachments(
                 prompt_sections.push(PromptSection::PastedText(text.clone()));
             } else {
                 let (_, relative_path) =
-                    save_large_pasted_text(state, &req.session_id, text).await?;
+                    Box::pin(save_large_pasted_text(state, &req.session_id, text)).await?;
                 xml_items.push(AttachmentXml {
                     name: attachment.name.clone(),
                     attachment_type: AttachmentKind::Document,
@@ -216,7 +216,7 @@ pub(super) async fn build_prompt_and_attachments(
             )?;
             xml_items.push(AttachmentXml {
                 name: attachment.name.clone(),
-                attachment_type: attachment.attachment_type.clone(),
+                attachment_type: attachment.attachment_type,
                 path: source.relative_path,
                 offloaded: None,
                 required_modality: None,
@@ -228,7 +228,7 @@ pub(super) async fn build_prompt_and_attachments(
 
         xml_items.push(AttachmentXml {
             name: attachment.name.clone(),
-            attachment_type: attachment.attachment_type.clone(),
+            attachment_type: attachment.attachment_type,
             path: None,
             offloaded: None,
             required_modality: None,
@@ -424,7 +424,7 @@ enum AttachmentModality {
 }
 
 impl AttachmentModality {
-    fn for_attachment_type(attachment_type: AttachmentKind) -> Option<Self> {
+    const fn for_attachment_type(attachment_type: AttachmentKind) -> Option<Self> {
         match attachment_type {
             AttachmentKind::Image => Some(Self::Vision),
             AttachmentKind::Audio => Some(Self::Audio),
@@ -505,7 +505,7 @@ fn build_offloaded_attachment_xml(
 ) -> AttachmentXml {
     AttachmentXml {
         name: attachment.name.clone(),
-        attachment_type: attachment.attachment_type.clone(),
+        attachment_type: attachment.attachment_type,
         path: relative_path.map(ToOwned::to_owned),
         offloaded: Some(true),
         required_modality: Some(modality.label().to_string()),
@@ -560,7 +560,7 @@ async fn save_large_pasted_text(
     session_id: &str,
     text: &str,
 ) -> SkyResult<(PathBuf, String)> {
-    let filename_base = generate_pasted_text_filename(state, text).await;
+    let filename_base = Box::pin(generate_pasted_text_filename(state, text)).await;
     let (path, relative_path) =
         allocate_upload_path(state, session_id, &filename_base, "txt").await?;
 
@@ -581,7 +581,7 @@ async fn generate_pasted_text_filename(state: &UiServerState, text: &str) -> Str
     let config = state.config_snapshot();
     let snippet: String = text.chars().take(600).collect();
 
-    let generated = generate_session_title(&config, &snippet, "").await;
+    let generated = Box::pin(generate_session_title(&config, &snippet, "")).await;
     let base = generated
         .as_deref()
         .map(sanitize_upload_stem)
@@ -614,8 +614,7 @@ async fn allocate_upload_path(
     if async_fs::metadata(&path).await.is_ok() {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         file_name = format!("{base_name}-{ts}.{clean_ext}");
         path = uploads_dir.join(&file_name);
     }

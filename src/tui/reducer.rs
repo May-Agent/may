@@ -10,6 +10,11 @@ use super::event::AppEvent;
 use super::state::AppMode;
 
 /// Reduce a single UI event into state transitions and optional actions.
+///
+/// # Errors
+///
+/// Returns [`TuiError`](crate::tui::error::TuiError) when the underlying
+/// handler fails — e.g. a database write for a UI action errors.
 pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendAction>> {
     match event {
         AppEvent::Key(code, modifiers) => app.handle_key(code, modifiers),
@@ -24,7 +29,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
         AppEvent::Resize(_, _) => Ok(None),
-        AppEvent::Paste(text) => app.handle_bracketed_paste(text),
+        AppEvent::Paste(text) => Ok(app.handle_bracketed_paste(text)),
         AppEvent::Mouse(mouse) => app.handle_mouse(mouse),
 
         AppEvent::SessionsLoaded(result) => {

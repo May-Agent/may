@@ -325,11 +325,9 @@ async fn emit_browser_status_if_changed(
     let browser_manager = state.browser_manager();
     let enabled = state.config_snapshot().browser.enabled;
     let owner_session_id = state.browser_owner_session_id();
-    let running = if let Some(manager) = browser_manager.as_ref() {
-        manager.is_running()
-    } else {
-        false
-    };
+    let running = browser_manager
+        .as_ref()
+        .is_some_and(|manager| manager.is_running());
     let payload = BrowserStatusEventPayload {
         enabled,
         running,

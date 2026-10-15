@@ -25,10 +25,10 @@ pub(super) async fn get_bootstrap(
 
     let (sessions, profiles) = tokio::join!(sessions_fut, profiles_fut);
     let profiles = profiles.map_err(super::error::internal_error)?;
-    let default_profile_id = profiles
-        .first()
-        .map(|profile| profile.id.clone())
-        .unwrap_or_else(|| state.default_profile_id.clone());
+    let default_profile_id = profiles.first().map_or_else(
+        || state.default_profile_id.clone(),
+        |profile| profile.id.clone(),
+    );
     let (default_profile_sessions, default_profile_sessions_error, default_profile_skills) =
         if let Some(default_profile) = profiles.first() {
             let default_profile_id = default_profile.id.clone();
@@ -72,19 +72,19 @@ async fn load_default_profile_sessions(
     match ensure_profile_environment_ready(&state, &db, &profile_id, false).await {
         Ok(()) => match query_profile_sessions(&db, &profile_id).await {
             Ok(sessions) => (Some(sessions), None),
-            Err(error) => unavailable_profile_sessions(profile_id, None, error.to_string()),
+            Err(error) => unavailable_profile_sessions(&profile_id, None, error.to_string()),
         },
         Err(ContainerPrepareError::Domain { code, message }) => {
-            unavailable_profile_sessions(profile_id, Some(code), message)
+            unavailable_profile_sessions(&profile_id, Some(code), message)
         }
         Err(ContainerPrepareError::Sky(error)) => {
-            unavailable_profile_sessions(profile_id, None, error.to_string())
+            unavailable_profile_sessions(&profile_id, None, error.to_string())
         }
     }
 }
 
 fn unavailable_profile_sessions(
-    profile_id: String,
+    profile_id: &str,
     code: Option<super::types::ApiErrorCode>,
     message: String,
 ) -> (

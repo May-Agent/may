@@ -6,7 +6,7 @@
 //! without re-implementing partial-JSON parsing in TypeScript.
 //!
 //! This module repairs the partial JSON via `partial-json-fixer`, parses
-//! it with serde_json, and projects only the string fields each tool
+//! it with `serde_json`, and projects only the string fields each tool
 //! variant cares about. Each projection is `Option<String>` — `None` when
 //! the field hasn't streamed in yet, `Some(value)` once readable.
 
@@ -18,9 +18,9 @@ use crate::ui_server::types::ToolVariant;
 /// Per-variant subset of tool arguments shown in the UI summary chip.
 ///
 /// Fields are populated based on `ToolVariant`:
-/// - terminal/terminal_input/terminal_read/terminal_kill → `description`, `script`
-/// - web_search → `query`
-/// - web_fetch → `url`
+/// - `terminal/terminal_input/terminal_read/terminal_kill` → `description`, `script`
+/// - `web_search` → `query`
+/// - `web_fetch` → `url`
 /// - browser → `action`, `target`
 /// - task / ask / session / notify / generic → `description`, `prompt` where applicable
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, skyzen::ToSchema)]
@@ -45,7 +45,7 @@ pub struct ToolSummary {
 impl ToolSummary {
     /// Returns `true` iff at least one field is populated.
     #[must_use]
-    pub fn has_any(&self) -> bool {
+    pub const fn has_any(&self) -> bool {
         self.description.is_some()
             || self.script.is_some()
             || self.query.is_some()
@@ -58,7 +58,7 @@ impl ToolSummary {
     /// Returns `true` iff every field is `None`. Used by serde to skip
     /// emitting the `summary` object on the wire when there's nothing yet.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         !self.has_any()
     }
 }

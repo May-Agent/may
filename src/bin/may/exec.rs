@@ -89,19 +89,21 @@ struct ExecSshAuthorizer {
 }
 
 impl aither_sandbox::SshSessionAuthorizer for ExecSshAuthorizer {
-    async fn authorize_connect(
+    fn authorize_connect(
         &self,
         _target: &str,
-    ) -> Result<bool, aither_sandbox::SshAuthorizationError> {
-        Ok(true)
+    ) -> impl std::future::Future<Output = Result<bool, aither_sandbox::SshAuthorizationError>> + Send
+    {
+        std::future::ready(Ok(true))
     }
 
-    async fn authorize_runtime_install(
+    fn authorize_runtime_install(
         &self,
         _target: &str,
         _details: &str,
-    ) -> Result<bool, aither_sandbox::SshAuthorizationError> {
-        Ok(self.allow_runtime_install)
+    ) -> impl std::future::Future<Output = Result<bool, aither_sandbox::SshAuthorizationError>> + Send
+    {
+        std::future::ready(Ok(self.allow_runtime_install))
     }
 }
 
@@ -183,16 +185,16 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
         .map_err(|error| ExecError::InitializeSession(error.into()))?
         .ok_or_else(|| ExecError::SessionNotFound(session_id.to_string()))?;
     let profile_id = session_row.profile_id.clone();
-    let profile_model = match profile_id.as_deref() {
-        Some(profile_id) => Some(
+    let profile_model = match profile_id {
+        Some(ref profile_id) => Some(
             db.get_profile(profile_id)
                 .await
                 .map_err(|source| ExecError::LoadProfile {
-                    profile_id: profile_id.to_string(),
+                    profile_id: profile_id.clone(),
                     source,
                 })?
                 .ok_or_else(|| ExecError::LoadProfile {
-                    profile_id: profile_id.to_string(),
+                    profile_id: profile_id.clone(),
                     source: may_agent::db::ChatDbError::InvalidProfileEnvironment(
                         "profile is missing".to_string(),
                     ),
@@ -241,7 +243,7 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
 
     ensure_exec_session_layout(
         &store,
-        &profile_id,
+        profile_id.as_deref(),
         profile_environment.as_ref(),
         session_id,
     )
@@ -262,7 +264,7 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
 
 async fn ensure_exec_session_layout(
     store: &SessionStore,
-    profile_id: &Option<String>,
+    profile_id: Option<&str>,
     profile_environment: Option<&ProfileEnvironment>,
     session_id: &str,
 ) -> Result<(), ExecError> {
@@ -273,9 +275,9 @@ async fn ensure_exec_session_layout(
         _ => may_agent::session::SandboxResourceLayout::Symlinked,
     };
 
-    if !store.exists(session_id, profile_id.as_deref()) {
+    if !store.exists(session_id, profile_id) {
         store
-            .create_session_dirs(session_id, profile_id.as_deref(), layout)
+            .create_session_dirs(session_id, profile_id, layout)
             .await
             .map_err(|error| ExecError::InitializeSession(error.into()))?;
     }
@@ -285,7 +287,7 @@ async fn ensure_exec_session_layout(
         Some(ProfileEnvironment::Container { .. })
     ) {
         store
-            .reconcile_container_mount_points(session_id, profile_id.as_deref())
+            .reconcile_container_mount_points(session_id, profile_id)
             .await
             .map_err(|error| ExecError::InitializeSession(error.into()))?;
     }
@@ -388,7 +390,7 @@ async fn build_exec_terminal_tool(
                 container_ipc_route.clone(),
                 container_exec.clone(),
             )),
-        _ => terminal_tool.with_shell_sessions(shell_sessions),
+        may_agent::AgentEnvironment::Local => terminal_tool.with_shell_sessions(shell_sessions),
     };
 
     let tools_dir = may_agent::MayHomePaths::new(context.may_dir.clone()).tools_dir();
@@ -525,7 +527,7 @@ fn select_exec_model(config: &MayConfig) -> String {
         .unwrap_or_else(|| panic!("may exec requires at least one configured model"))
 }
 
-fn select_exec_mode(
+const fn select_exec_mode(
     args: &ExecArgs,
     _environment: &may_agent::AgentEnvironment,
 ) -> TerminalExecutionMode {

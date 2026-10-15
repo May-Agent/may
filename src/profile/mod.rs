@@ -16,35 +16,45 @@ use crate::db::ChatDb;
 use crate::db::entity::profiles;
 use crate::session::SessionSummary;
 
+/// User-facing preferences stored on a profile.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ProfilePreferences {
+    /// Container-environment preferences.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<ContainerProfilePreferences>,
 }
 
+/// Preferences applying to container-environment profiles.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerProfilePreferences {
+    /// Custom Dockerfile override for the container image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<String>,
+    /// Extra host paths mounted into the container.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<ContainerMountPreference>,
 }
 
+/// A host path mounted into the container.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerMountPreference {
+    /// Path on the host to mount.
     pub host_path: String,
+    /// Mount point inside the container.
     pub container_path: String,
+    /// Mount access level.
     #[serde(default)]
     pub access: ContainerMountAccess,
 }
 
+/// Access level granted to a container mount.
 #[derive(
     Debug,
     Clone,
@@ -58,12 +68,15 @@ pub struct ContainerMountPreference {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerMountAccess {
+    /// Mount is readable but not writable.
     #[default]
     ReadOnly,
+    /// Mount is readable and writable.
     ReadWrite,
 }
 
 impl ContainerMountAccess {
+    /// Persisted `snake_case` string form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -88,9 +101,13 @@ impl core::str::FromStr for ContainerMountAccess {
 /// A profile with its organized sessions.
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 pub struct ProfileSessions {
+    /// The profile these sessions belong to.
     pub profile: ProfileInfo,
+    /// Pinned items (sessions and folders) in display order.
     pub pinned: Vec<PinnedItem>,
+    /// Unpinned, non-archived sessions.
     pub regular: Vec<SessionSummary>,
+    /// Archived sessions.
     pub archived: Vec<SessionSummary>,
 }
 
@@ -98,15 +115,25 @@ pub struct ProfileSessions {
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileInfo {
+    /// Profile id.
     pub id: String,
+    /// Short URL/display slug.
     pub slug: Option<String>,
+    /// Display name.
     pub name: String,
+    /// Icon identifier, if any.
     pub icon: Option<String>,
+    /// Environment the profile's agents run in.
     pub environment: HomeEnvironment,
+    /// Persona text folded into the system prompt.
     pub persona: Option<String>,
+    /// User-tunable profile preferences.
     pub preferences: Option<ProfilePreferences>,
+    /// Whether location context is injected for this profile.
     pub location_aware: bool,
+    /// Maximum number of pinned sessions and folders.
     pub pinned_limit: i32,
+    /// Display order among profiles.
     pub sort_order: i32,
     /// SSH server names (matching `SshServerConfig.name` in `config.toml`)
     /// attached to this profile as auxiliary environments. Ordered by
@@ -115,6 +142,10 @@ pub struct ProfileInfo {
 }
 
 impl ProfileInfo {
+    /// Assemble a [`ProfileInfo`] from a database row and decoded preferences.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError::InvalidProfileEnvironment`] when the persisted environment string is unrecognized.
     pub fn from_db_parts(
         m: profiles::Model,
         preferences: Option<ProfilePreferences>,
@@ -157,21 +188,25 @@ impl ProfileInfo {
 pub struct HomeEnvironment(ProfileEnvironment);
 
 impl HomeEnvironment {
+    /// Wrap an environment kind.
     #[must_use]
     pub const fn new(environment: ProfileEnvironment) -> Self {
         Self(environment)
     }
 
+    /// The underlying environment kind.
     #[must_use]
     pub const fn kind(&self) -> &ProfileEnvironment {
         &self.0
     }
 
+    /// Unwrap into the environment kind.
     #[must_use]
     pub fn into_kind(self) -> ProfileEnvironment {
         self.0
     }
 
+    /// Persisted database string form.
     #[must_use]
     pub const fn as_db_str(&self) -> &str {
         self.0.as_db_str()
@@ -194,9 +229,13 @@ impl AsRef<ProfileEnvironment> for HomeEnvironment {
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProfileEnvironment {
+    /// Run agents on the host.
     Local,
+    /// Run agents inside a container.
     Container {
+        /// Container image override.
         image: Option<String>,
+        /// Running container id once started.
         container_id: Option<String>,
     },
 }
@@ -216,11 +255,17 @@ impl ProfileEnvironment {
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PinnedItem {
-    Session(SessionSummary),
+    /// A single pinned session (not grouped in a folder).
+    Session(Box<SessionSummary>),
+    /// A named group of pinned sessions.
     Folder {
+        /// Folder id.
         id: String,
+        /// Folder display name.
         name: String,
+        /// Display order within the pinned section.
         sort_order: i32,
+        /// Sessions grouped in the folder.
         sessions: Vec<SessionSummary>,
     },
 }
@@ -245,6 +290,9 @@ impl PinnedItem {
 ///
 /// This is the single source of truth for attachment resolution; both the
 /// in-process agent runtime and the `may exec` binary consume it.
+///
+/// # Errors
+/// Returns [`crate::db::ChatDbError`] on storage failure.
 pub async fn resolve_attached_ssh_servers(
     db: &ChatDb,
     profile_id: Option<&str>,
@@ -263,19 +311,23 @@ pub async fn resolve_attached_ssh_servers(
         .collect();
     let mut resolved = Vec::with_capacity(attachments.len());
     for name in &attachments {
-        match catalog.get(name.as_str()) {
-            Some(server) => resolved.push((*server).clone()),
-            None => tracing::warn!(
+        if let Some(server) = catalog.get(name.as_str()) {
+            resolved.push((*server).clone());
+        } else {
+            tracing::warn!(
                 profile_id,
                 ssh_server = name.as_str(),
                 "profile has an SSH attachment whose server is no longer configured; skipping"
-            ),
+            );
         }
     }
     Ok(resolved)
 }
 
 /// Query profile sessions from the database, grouped into pinned/regular/archived.
+///
+/// # Errors
+/// Returns [`crate::db::ChatDbError`] on storage failure.
 pub async fn query_profile_sessions(
     db: &ChatDb,
     profile_id: &str,
@@ -317,7 +369,7 @@ pub async fn query_profile_sessions(
     let mut pinned: Vec<PinnedItem> = Vec::new();
 
     for s in pinned_bare {
-        pinned.push(PinnedItem::Session(s));
+        pinned.push(PinnedItem::Session(Box::new(s)));
     }
 
     for f in folders {
@@ -338,6 +390,21 @@ pub async fn query_profile_sessions(
         regular,
         archived,
     })
+}
+
+/// List all profiles as [`ProfileInfo`].
+///
+/// # Errors
+/// Returns [`crate::db::ChatDbError`] on storage failure.
+pub async fn list_profiles(db: &ChatDb) -> Result<Vec<ProfileInfo>, crate::db::ChatDbError> {
+    let models = db.list_profiles().await?;
+    let mut profiles = Vec::with_capacity(models.len());
+    for model in models {
+        let preferences = db.load_profile_preferences(&model).await?;
+        let attachments = db.list_profile_remote_servers(&model.id).await?;
+        profiles.push(ProfileInfo::from_db_parts(model, preferences, attachments)?);
+    }
+    Ok(profiles)
 }
 
 #[cfg(test)]
@@ -373,7 +440,7 @@ mod tests {
         assert!(matches!(info.environment, HomeEnvironment(_)));
         assert!(matches!(info.environment.kind(), ProfileEnvironment::Local));
         assert_eq!(info.environment.as_db_str(), "local");
-        assert!(info.remote_attachments.is_empty());
+        assert_eq!(info.remote_attachments, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -383,16 +450,4 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("remote"), "unexpected error: {message}");
     }
-}
-
-/// List all profiles as [`ProfileInfo`].
-pub async fn list_profiles(db: &ChatDb) -> Result<Vec<ProfileInfo>, crate::db::ChatDbError> {
-    let models = db.list_profiles().await?;
-    let mut profiles = Vec::with_capacity(models.len());
-    for model in models {
-        let preferences = db.load_profile_preferences(&model).await?;
-        let attachments = db.list_profile_remote_servers(&model.id).await?;
-        profiles.push(ProfileInfo::from_db_parts(model, preferences, attachments)?);
-    }
-    Ok(profiles)
 }

@@ -1,5 +1,7 @@
 //! Main layout for the TUI.
 
+use std::sync::atomic::Ordering;
+
 mod config;
 mod pickers;
 mod popups;
@@ -87,7 +89,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Build usage info for status
     let usage_info = app.usage.as_ref().and_then(|u| {
         u.prompt_tokens
-            .map(|pt| (u64::from(pt), app.context_window.map(|w| u64::from(w))))
+            .map(|pt| (u64::from(pt), app.context_window.map(u64::from)))
     });
 
     let images_supported = app.supports_images();
@@ -136,30 +138,32 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     );
 
     // Keep selection cache aligned with chat content and account for top padding.
+    let queue_ctx = if queue_messages.is_empty() {
+        None
+    } else {
+        Some(QueueContext {
+            messages: &queue_messages,
+        })
+    };
+    let status_ctx = StatusContext {
+        model: &app.model_display(),
+        usage: usage_info,
+        queue_count: app.queue.len(),
+        background_tasks: app.background_tasks,
+        processing: app.processing,
+        status_message: app.status.as_deref(),
+        profile_name: app.current_profile_name(),
+    };
     let plain_all_lines = chat::build_plain_wrapped_lines_unified(
         &app.chat,
         chat_area.width,
-        if queue_messages.is_empty() {
-            None
-        } else {
-            Some(QueueContext {
-                messages: &queue_messages,
-            })
-        },
+        queue_ctx.as_ref(),
         Some(InputContext {
             input: &app.input,
             cursor: app.cursor,
             attachments: &app.attachments,
         }),
-        Some(StatusContext {
-            model: &app.model_display(),
-            usage: usage_info,
-            queue_count: app.queue.len(),
-            background_tasks: app.background_tasks,
-            processing: app.processing,
-            status_message: app.status.as_deref(),
-            profile_name: app.current_profile_name(),
-        }),
+        Some(&status_ctx),
     );
 
     let view_h = chat_area.height as usize;
@@ -231,8 +235,8 @@ fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
 
     let base_scroll = if app.scroll == usize::MAX {
         app.content_height
-            .get()
-            .saturating_sub(app.view_height.get())
+            .load(Ordering::Relaxed)
+            .saturating_sub(app.view_height.load(Ordering::Relaxed))
     } else {
         app.scroll
     };
@@ -271,9 +275,9 @@ fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         let rect = Rect::new(
-            area.x + x0 as u16,
-            area.y + y_in_view as u16,
-            (x1 - x0) as u16,
+            area.x + u16::try_from(x0).unwrap_or(u16::MAX),
+            area.y + u16::try_from(y_in_view).unwrap_or(u16::MAX),
+            u16::try_from(x1 - x0).unwrap_or(u16::MAX),
             1,
         );
         frame
@@ -341,8 +345,8 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     // Create a popup area (60% width, 50% height, centered)
-    let popup_width = (area.width * 60 / 100).min(80).max(40);
-    let popup_height = (area.height * 50 / 100).min(20).max(10);
+    let popup_width = (area.width * 60 / 100).clamp(40, 80);
+    let popup_height = (area.height * 50 / 100).clamp(10, 20);
     let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
@@ -467,7 +471,7 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
 /// Render model select popup (anchored near input area).
 fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     // Position popup near bottom of screen, left-aligned
-    let popup_height = (app.model_select_list.len() + 2).min(10) as u16;
+    let popup_height = u16::try_from((app.model_select_list.len() + 2).min(10)).unwrap_or(u16::MAX);
     let popup_width = 40.min(area.width);
     let popup_x = area.x;
     // Position near bottom, leaving space for status and input (2 lines from bottom)
@@ -975,7 +979,7 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     // Calculate overlay height: question(2) + items + custom_input?(1) + help(1) + border(2)
     let custom_line = u16::from(qs.custom_mode);
     let max_height = (area.height * 60) / 100;
-    let needed = 2 + total_items as u16 + custom_line + 1 + 2;
+    let needed = 2 + u16::try_from(total_items).unwrap_or(u16::MAX) + custom_line + 1 + 2;
     let height = needed.min(max_height);
 
     // Bottom-anchored overlay
@@ -1076,82 +1080,86 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
             Style::default().fg(Color::White)
         };
 
-        if global_idx < opt_count {
-            // Regular option
-            let is_selected = qs.selections.contains(&global_idx);
-            let checkbox = if question.multi_select {
-                if is_selected { "[x] " } else { "[ ] " }
-            } else if is_selected {
-                "(*) "
-            } else {
-                "( ) "
-            };
-            let sel_style = if is_selected {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled(prefix, cursor_style),
-                Span::styled(checkbox, sel_style),
-                Span::styled(&question.option[global_idx], cursor_style),
-            ])));
-        } else if global_idx == opt_count {
-            // Skip
-            let skip_style = if qs.skipped {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let mark = if qs.skipped { ">> " } else { "   " };
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled(prefix, cursor_style),
-                Span::styled(mark, skip_style),
-                Span::styled("Skip", if is_cursor { cursor_style } else { skip_style }),
-            ])));
-        } else {
-            // Custom answer
-            let has_custom = !qs.custom_text.is_empty();
-            let custom_style = if has_custom {
-                Style::default().fg(Color::Magenta)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let mark = if has_custom { ">> " } else { "   " };
-            let label = if has_custom {
-                format!("Custom: {}", qs.custom_text)
-            } else {
-                "Custom answer...".to_string()
-            };
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled(prefix, cursor_style),
-                Span::styled(mark, custom_style),
-                Span::styled(
-                    label,
-                    if is_cursor {
-                        cursor_style
-                    } else {
-                        custom_style
-                    },
-                ),
-            ])));
+        match global_idx.cmp(&opt_count) {
+            std::cmp::Ordering::Less => {
+                // Regular option
+                let is_selected = qs.selections.contains(&global_idx);
+                let checkbox = if question.multi_select {
+                    if is_selected { "[x] " } else { "[ ] " }
+                } else if is_selected {
+                    "(*) "
+                } else {
+                    "( ) "
+                };
+                let sel_style = if is_selected {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(prefix, cursor_style),
+                    Span::styled(checkbox, sel_style),
+                    Span::styled(&question.option[global_idx], cursor_style),
+                ])));
+            }
+            std::cmp::Ordering::Equal => {
+                // Skip
+                let skip_style = if qs.skipped {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let mark = if qs.skipped { ">> " } else { "   " };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(prefix, cursor_style),
+                    Span::styled(mark, skip_style),
+                    Span::styled("Skip", if is_cursor { cursor_style } else { skip_style }),
+                ])));
+            }
+            std::cmp::Ordering::Greater => {
+                // Custom answer
+                let has_custom = !qs.custom_text.is_empty();
+                let custom_style = if has_custom {
+                    Style::default().fg(Color::Magenta)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let mark = if has_custom { ">> " } else { "   " };
+                let label = if has_custom {
+                    format!("Custom: {}", qs.custom_text)
+                } else {
+                    "Custom answer...".to_string()
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(prefix, cursor_style),
+                    Span::styled(mark, custom_style),
+                    Span::styled(
+                        label,
+                        if is_cursor {
+                            cursor_style
+                        } else {
+                            custom_style
+                        },
+                    ),
+                ])));
+            }
         }
     }
     frame.render_widget(List::new(items), chunks[1]);
 
     // Custom text input line
-    let chunk_idx_help;
-    if qs.custom_mode {
+
+    let chunk_idx_help = if qs.custom_mode {
         let input_line = Paragraph::new(Line::from(vec![
             Span::styled("  > ", Style::default().fg(Color::Cyan)),
             Span::styled(&qs.custom_text, Style::default().fg(Color::White)),
             Span::styled("_", Style::default().fg(Color::DarkGray)),
         ]));
         frame.render_widget(input_line, chunks[2]);
-        chunk_idx_help = 3;
+        3
     } else {
-        chunk_idx_help = 2;
-    }
+        2
+    };
 
     // Help text
     let nav = if state.is_multi() {
@@ -1176,7 +1184,7 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
 fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let max_items = 10;
     let item_count = app.completion.len().min(max_items);
-    let height = (item_count + 2) as u16; // +2 for borders
+    let height = u16::try_from(item_count + 2).unwrap_or(u16::MAX); // +2 for borders
 
     // Position overlay near bottom, leaving 2 lines for input/status
     let overlay_y = area.y + area.height.saturating_sub(height + 2);
@@ -1208,8 +1216,7 @@ fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
                 CompletionMode::Slash => {
                     format!("{:<15} {}", item.label, item.description)
                 }
-                CompletionMode::File => item.label.clone(),
-                CompletionMode::None => item.label.clone(),
+                CompletionMode::File | CompletionMode::None => item.label.clone(),
             };
 
             ListItem::new(text).style(style)
@@ -1250,7 +1257,7 @@ fn render_inline_images(
     }
 
     let view_height = chat_area.height as usize;
-    let content_height = app.content_height.get();
+    let content_height = app.content_height.load(Ordering::Relaxed);
 
     // Calculate offset the same way as render_impl does:
     // When content doesn't fill the screen, it renders at the BOTTOM of the
@@ -1325,7 +1332,7 @@ fn render_inline_images(
             continue;
         }
 
-        let image_start_y = chat_area.y + image_content_line as u16;
+        let image_start_y = chat_area.y + u16::try_from(image_content_line).unwrap_or(u16::MAX);
         let available_height = (chat_area.y + chat_area.height).saturating_sub(image_start_y);
 
         // Skip if no space available
@@ -1335,7 +1342,9 @@ fn render_inline_images(
 
         // Calculate image area with proper bounds
         // IMAGE_HEIGHT - 1 because we skip the header line
-        let image_height = ((IMAGE_HEIGHT - 1) as u16).min(available_height);
+        let image_height = u16::try_from(IMAGE_HEIGHT - 1)
+            .unwrap_or(u16::MAX)
+            .min(available_height);
         let indent = 2u16; // Indent from left edge
 
         let image_area = Rect::new(

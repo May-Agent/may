@@ -4,6 +4,7 @@
 //! (cron or one-time), and executes them through profile-specific runtimes.
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -36,7 +37,7 @@ use crate::task_trigger::{
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 
 /// Shared task execution facility used by the scheduler, REST API, and agent tools.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct TaskRuntime {
     db: ChatDb,
     notifier: Option<Arc<NotificationService>>,
@@ -50,6 +51,7 @@ pub struct TaskRuntime {
 }
 
 /// Time-based wrapper that periodically asks [`TaskRuntime`] to run due tasks.
+#[derive(Debug)]
 pub struct TaskScheduler {
     runtime: Arc<TaskRuntime>,
 }
@@ -73,18 +75,24 @@ struct TaskCatalog {
     tasks: Vec<scheduled_tasks::Model>,
 }
 
+/// Terminal state of a scheduled task run.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRunStatus {
+    /// Run is in progress.
     Running,
+    /// Run completed successfully.
     Success,
+    /// Run failed.
     Failed,
+    /// Run was interrupted (restart/shutdown).
     Interrupted,
 }
 
 impl TaskRunStatus {
+    /// Persisted `snake_case` string form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -95,6 +103,10 @@ impl TaskRunStatus {
         }
     }
 
+    /// Parse a persisted status string.
+    ///
+    /// # Errors
+    /// Returns the unrecognized value when it is not a known status.
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "running" => Ok(Self::Running),
@@ -227,7 +239,7 @@ fn task_notification_callback_payload(
     )
 }
 
-fn task_db_error(message: String) -> crate::db::ChatDbError {
+const fn task_db_error(message: String) -> crate::db::ChatDbError {
     crate::db::ChatDbError::Storage(message)
 }
 
@@ -336,17 +348,21 @@ struct SchedulerPermissionHandler {
 }
 
 impl PermissionHandler for SchedulerPermissionHandler {
-    async fn check(&self, _mode: TerminalMode, _script: &str) -> Result<bool, PermissionError> {
-        Ok(true)
+    fn check(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+        std::future::ready(Ok(true))
     }
 
     async fn check_domain(&self, domain: &str, port: u16) -> bool {
-        let reason = if !self.allow_network {
-            Some("needs_network_disabled")
-        } else {
+        let reason = if self.allow_network {
             self.network_policy
                 .as_ref()
                 .map(|policy| policy.mode().as_str())
+        } else {
+            Some("needs_network_disabled")
         };
         let _ = self
             .db
@@ -369,6 +385,10 @@ impl PermissionHandler for SchedulerPermissionHandler {
 }
 
 impl TaskRuntime {
+    /// Build the runtime: load config, open the database, and restore active tasks.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] when config loading, database setup, or task restoration fails.
     pub async fn load(
         db: ChatDb,
         may_dir: PathBuf,
@@ -395,6 +415,7 @@ impl TaskRuntime {
         self
     }
 
+    /// Attach the UI event bus used for runtime notifications.
     #[must_use]
     pub fn with_ui_event_bus(mut self, ui_event_bus: UiEventBus) -> Self {
         self.ui_event_bus = Some(ui_event_bus);
@@ -408,23 +429,35 @@ impl TaskRuntime {
         self
     }
 
+    /// Set the compiled network policy used for container task runs.
+    ///
+    /// # Errors
+    /// Returns [`NetworkPolicyError`] when the policy fails to compile.
     pub fn with_network_policy(
         self,
-        network_policy: NetworkPolicyConfig,
+        network_policy: &NetworkPolicyConfig,
     ) -> Result<Self, NetworkPolicyError> {
         self.set_network_policy(network_policy)?;
         Ok(self)
     }
 
+    /// Replace the network policy used for container task runs.
+    ///
+    /// # Errors
+    /// Returns [`NetworkPolicyError`] when the policy fails to compile.
     pub fn set_network_policy(
         &self,
-        network_policy: NetworkPolicyConfig,
+        network_policy: &NetworkPolicyConfig,
     ) -> Result<(), NetworkPolicyError> {
         let compiled = network_policy.compile()?;
         self.network_policy.store(Arc::new(compiled));
         Ok(())
     }
 
+    /// Reload due/active tasks from the database into the in-memory set.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn reload_active_tasks(&self) -> Result<(), crate::db::ChatDbError> {
         let tasks = self.db.list_due_tasks().await?;
         self.active_tasks
@@ -433,6 +466,9 @@ impl TaskRuntime {
     }
 
     /// Validate that a task script can be parsed in the target profile runtime.
+    ///
+    /// # Errors
+    /// Returns a validation error message when the profile lookup fails or the script fails validation.
     pub async fn validate_task_script_for_profile(
         &self,
         profile_id: &str,
@@ -445,11 +481,14 @@ impl TaskRuntime {
             .await
             .map_err(|error| profile_load_error(profile_id, &error))?
             .ok_or_else(|| profile_not_found_error(profile_id))?;
-        self.validate_task_script_for_profile_model(&profile, script_path, script_inline)
+        Box::pin(self.validate_task_script_for_profile_model(&profile, script_path, script_inline))
             .await
     }
 
     /// Create a scheduled task requested by the in-chat `task` tool.
+    ///
+    /// # Errors
+    /// Returns an error message when the payload is malformed, script validation fails, or the insert errors.
     pub async fn create_task_from_tool_request(
         &self,
         request: TaskCreateRequest,
@@ -493,11 +532,11 @@ impl TaskRuntime {
             ));
         }
 
-        self.validate_task_script_for_profile_model(
+        Box::pin(self.validate_task_script_for_profile_model(
             &profile,
             normalized.script.script_path.as_deref(),
             normalized.script.script_inline.as_deref(),
-        )
+        ))
         .await?;
 
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -537,6 +576,10 @@ impl TaskRuntime {
         })
     }
 
+    /// Run a task immediately outside its schedule.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure or task spawn failure.
     pub async fn run_manual_task(
         &self,
         task: scheduled_tasks::Model,
@@ -545,6 +588,12 @@ impl TaskRuntime {
     }
 
     /// Check for due tasks and execute them.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] when task rows fail to load or spawn.
+    ///
+    /// # Panics
+    /// Panics if `is_due` reports a non-time trigger as due (internal invariant).
     pub async fn tick_due_tasks(&self) -> Result<(), crate::db::ChatDbError> {
         let tasks = self.active_tasks.load();
         let now = jiff::Timestamp::now();
@@ -568,6 +617,9 @@ impl TaskRuntime {
     /// Dispatch event-triggered tasks.
     ///
     /// Returns the number of matching tasks that were started.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure or task spawn failure.
     pub async fn dispatch_event(
         &self,
         event_name: &str,
@@ -615,6 +667,10 @@ impl TaskRuntime {
         Ok(dispatched)
     }
 
+    /// Run every enabled task whose webhook trigger matches `token`.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure or task spawn failure.
     pub async fn dispatch_webhook(
         &self,
         token: String,
@@ -733,9 +789,7 @@ impl TaskRuntime {
             .await?;
         let runtime = self.clone();
         tokio::spawn(async move {
-            runtime
-                .execute_task(run_id.as_str(), &task, invocation)
-                .await;
+            Box::pin(runtime.execute_task(run_id.as_str(), &task, invocation)).await;
         });
         Ok(())
     }
@@ -757,7 +811,9 @@ impl TaskRuntime {
 
         match profile_info.environment.kind() {
             ProfileEnvironment::Local => self.validate_local(&profile.id, &script).await,
-            ProfileEnvironment::Container { .. } => self.validate_container(profile, &script).await,
+            ProfileEnvironment::Container { .. } => {
+                Box::pin(self.validate_container(profile, &script)).await
+            }
         }
     }
 
@@ -776,7 +832,7 @@ impl TaskRuntime {
             "Executing scheduled task"
         );
 
-        let result = self.execute_task_inner(task, invocation).await;
+        let result = Box::pin(self.execute_task_inner(task, invocation)).await;
 
         match result {
             Ok(output) => {
@@ -896,8 +952,7 @@ impl TaskRuntime {
                     .await
             }
             ProfileEnvironment::Container { .. } => {
-                self.execute_container(task, &profile, materialized.command.clone())
-                    .await
+                Box::pin(self.execute_container(task, &profile, materialized.command.clone())).await
             }
         };
 
@@ -1184,11 +1239,11 @@ impl TaskRuntime {
                 invalid_profile_component_error("invalid container profile preferences: ", &error)
             })?;
 
-        let default_image_tag = crate::container::profile::default_image_tag(
+        let default_image_tag = Box::pin(crate::container::profile::default_image_tag(
             &self.may_dir,
             profile,
             container_preferences.clone(),
-        )
+        ))
         .await
         .map_err(|error| {
             invalid_profile_component_error("invalid container profile image tag: ", &error)
@@ -1198,20 +1253,8 @@ impl TaskRuntime {
             profile,
             &default_image_tag,
             container_preferences.clone(),
-        )
-        .map_err(|error| {
-            invalid_profile_component_error(
-                "invalid container profile image configuration: ",
-                &error,
-            )
-        })?;
-        let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences)
-            .map_err(|error| {
-                invalid_profile_component_error(
-                    "invalid container profile mount configuration: ",
-                    &error,
-                )
-            })?;
+        );
+        let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences);
 
         crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
             .await
@@ -1280,9 +1323,9 @@ impl TaskRuntime {
         profile: &profiles::Model,
         command: String,
     ) -> Result<String, String> {
-        let (terminal_tool, container_manager, container_id) = self
-            .container_terminal_tool(profile, NetworkAccessSource::TaskContainer)
-            .await?;
+        let (terminal_tool, container_manager, container_id) =
+            Box::pin(self.container_terminal_tool(profile, NetworkAccessSource::TaskContainer))
+                .await?;
         let result = run_terminal_command(
             &terminal_tool,
             TerminalExecutionMode::Default,
@@ -1309,9 +1352,10 @@ impl TaskRuntime {
         profile: &profiles::Model,
         script: &TaskScript,
     ) -> Result<(), String> {
-        let (terminal_tool, container_manager, container_id) = self
-            .container_terminal_tool(profile, NetworkAccessSource::TaskValidationContainer)
-            .await?;
+        let (terminal_tool, container_manager, container_id) = Box::pin(
+            self.container_terminal_tool(profile, NetworkAccessSource::TaskValidationContainer),
+        )
+        .await?;
         let result = run_terminal_command(
             &terminal_tool,
             TerminalExecutionMode::Default,
@@ -1334,6 +1378,7 @@ const fn local_task_execution_mode(needs_network: bool) -> TerminalExecutionMode
 }
 
 impl TaskScheduler {
+    /// Create the handler over the shared task runtime.
     #[must_use]
     pub const fn new(runtime: Arc<TaskRuntime>) -> Self {
         Self { runtime }
@@ -1442,8 +1487,11 @@ fn build_validation_command(script: &TaskScript) -> String {
 
 /// Convert a `jiff::Timestamp` to `chrono::DateTime`<chrono::Utc> for cron compatibility.
 fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(ts.as_second(), ts.subsec_nanosecond() as u32)
-        .expect("jiff timestamp must fit within chrono DateTime range")
+    chrono::DateTime::from_timestamp(
+        ts.as_second(),
+        u32::try_from(ts.subsec_nanosecond()).expect("jiff subsecond nanos are non-negative"),
+    )
+    .expect("jiff timestamp must fit within chrono DateTime range")
 }
 
 #[cfg(test)]
@@ -1564,8 +1612,7 @@ mod tests {
                 false,
             )
             .await
-            .err()
-            .expect("a distribution without native tools must fail before any exec");
+            .expect_err("a distribution without native tools must fail before any exec");
         assert!(
             error.starts_with("failed to prepare baseline tools: "),
             "unexpected error: {error}"

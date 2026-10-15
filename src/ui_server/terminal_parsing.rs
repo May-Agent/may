@@ -26,7 +26,7 @@ pub(super) struct ParsedTerminalToolResult {
     pub(super) status: Option<TerminalTaskStatus>,
 }
 
-fn parse_terminal_mode(mode: TerminalExecutionMode) -> TerminalCommandMode {
+const fn parse_terminal_mode(mode: TerminalExecutionMode) -> TerminalCommandMode {
     match mode {
         TerminalExecutionMode::Default => TerminalCommandMode::Default,
         TerminalExecutionMode::Sandboxed => TerminalCommandMode::Sandboxed,

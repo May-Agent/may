@@ -10,27 +10,46 @@ pub use aither_browser::{
 
 use crate::session::SessionPaths;
 
+/// Error type for persisting browser page captures to session artifacts.
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserCapturePersistError {
+    /// Failed to prepare browser artifact directory.
     #[error("failed to prepare browser artifact directory: {source}")]
     CreateArtifactDirectory {
+        /// Underlying I/O failure.
         #[source]
         source: std::io::Error,
     },
+    /// Browser screenshot used an unsupported MIME type.
     #[error("browser screenshot used an unsupported MIME type: {mime_type}")]
-    UnsupportedScreenshotMimeType { mime_type: String },
+    UnsupportedScreenshotMimeType {
+        /// MIME type reported by the browser that we cannot persist.
+        mime_type: String,
+    },
+    /// Failed to decode browser screenshot payload.
     #[error("failed to decode browser screenshot payload: {source}")]
     DecodeScreenshot {
+        /// Underlying base64 decode failure.
         #[source]
         source: base64::DecodeError,
     },
+    /// Failed to write browser artifact.
     #[error("failed to write browser artifact: {source}")]
     WriteArtifact {
+        /// Underlying write failure.
         #[source]
         source: std::io::Error,
     },
 }
 
+/// Persist a browser page capture (screenshot and text) into the session's
+/// artifact directory and return the snapshot record.
+///
+/// # Errors
+///
+/// Returns [`BrowserCapturePersistError`] when the artifact directory
+/// cannot be created, a screenshot uses an unsupported MIME type or fails
+/// base64 decoding, or writing an artifact fails.
 pub async fn persist_browser_page_capture(
     session_id: &str,
     session_paths: &SessionPaths,

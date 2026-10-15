@@ -11,12 +11,16 @@ use aither_agent::SubagentDefinition;
 /// Subagent management error.
 #[derive(Debug, thiserror::Error)]
 pub enum SubagentError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Invalid subagent path.
     #[error("Invalid subagent path: {0}")]
     InvalidPath(String),
+    /// Invalid subagent definition.
     #[error("Invalid subagent definition: {0}")]
     InvalidDefinition(String),
+    /// Subagent already exists.
     #[error("Subagent already exists: {0}")]
     AlreadyExists(String),
 }
@@ -24,9 +28,13 @@ pub enum SubagentError {
 /// Lightweight subagent metadata.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SubagentInfo {
+    /// Subagent identifier.
     pub id: String,
+    /// Human-readable description of what the subagent does.
     pub description: String,
+    /// Definition file name (`<name>.md`).
     pub file_name: String,
+    /// Absolute path of the definition file.
     pub path: PathBuf,
 }
 
@@ -65,6 +73,11 @@ impl SubagentManager {
     ///
     /// - If `source` is a file, it must be a `.md` subagent definition.
     /// - If `source` is a directory, all top-level `.md` files are registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubagentError`] when `source` is not a `.md` file or
+    /// directory, or when reading/registering a definition fails.
     pub async fn register_from_local_path(
         &self,
         source: &Path,
