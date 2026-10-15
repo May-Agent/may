@@ -32,7 +32,7 @@ pub use context_snapshot::ContextDebugSnapshotWrite;
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
-    PermissionRequestMessageRow, SqliteTableInfoRow, db_custom_error, overflow_error,
+    I64ValueRow, PermissionRequestMessageRow, SqliteTableInfoRow, db_custom_error, overflow_error,
     row_not_found, storage_error, to_i32, to_i64_from_u64,
 };
 
@@ -192,21 +192,42 @@ impl ChatDb {
     }
 
     async fn ensure_session_context_snapshot_table(db: &SkyDb) -> Result<(), ChatDbError> {
-        let columns = query!(db, db_sql::SESSION_CONTEXT_SNAPSHOT_COLUMNS)
-            .fetch_all::<SqliteTableInfoRow>()
-            .await?;
-        let expected_columns = [
+        // The pre-versioning layout: it gains `format_version` defaulting to
+        // 1 ("every blob written before versioning existed") so its rows are
+        // then invalidated below.
+        const LEGACY_COLUMNS: [&str; 4] = [
             "session_id",
             "checkpoint_blob",
             "last_message_db_id",
             "updated_at",
         ];
+        const EXPECTED_COLUMNS: [&str; 5] = [
+            "session_id",
+            "checkpoint_blob",
+            "last_message_db_id",
+            "updated_at",
+            "format_version",
+        ];
+        let columns = query!(db, db_sql::SESSION_CONTEXT_SNAPSHOT_COLUMNS)
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
         let actual_columns = columns
             .iter()
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>();
 
-        if !actual_columns.is_empty() && actual_columns != expected_columns {
+        if actual_columns == LEGACY_COLUMNS {
+            query!(
+                db,
+                "ALTER TABLE session_context_snapshots ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1"
+            )
+            .execute()
+            .await?;
+        } else if !actual_columns.is_empty() && actual_columns != EXPECTED_COLUMNS {
+            tracing::warn!(
+                columns = ?actual_columns,
+                "session_context_snapshots has an unexpected column layout; dropping and recreating it"
+            );
             query!(db, db_sql::SESSION_CONTEXT_SNAPSHOT_DROP)
                 .execute()
                 .await?;
@@ -214,6 +235,33 @@ impl ChatDb {
 
         for statement in db_sql::statements(db_sql::SESSION_CONTEXT_SNAPSHOT_SCHEMA) {
             query!(db, statement).execute().await?;
+        }
+
+        // Invalidate every snapshot whose blob was written under a different
+        // `AgentCheckpoint` shape: `deny_unknown_fields` makes it undecodable.
+        // Runs on every open so a bumped `CONTEXT_SNAPSHOT_FORMAT` also
+        // invalidates rows whose table layout did not change.
+        let stale_versions = query!(
+            db,
+            "SELECT DISTINCT format_version AS value FROM session_context_snapshots WHERE format_version != ?",
+            context_snapshot::CONTEXT_SNAPSHOT_FORMAT
+        )
+        .fetch_all::<I64ValueRow>()
+        .await?;
+        if !stale_versions.is_empty() {
+            let deleted = query!(
+                db,
+                "DELETE FROM session_context_snapshots WHERE format_version != ?",
+                context_snapshot::CONTEXT_SNAPSHOT_FORMAT
+            )
+            .execute()
+            .await?;
+            tracing::info!(
+                invalidated = deleted.rows_written,
+                previous_formats = ?stale_versions.iter().map(|row| row.value).collect::<Vec<_>>(),
+                current_format = context_snapshot::CONTEXT_SNAPSHOT_FORMAT,
+                "invalidated session context snapshots written under an older blob format"
+            );
         }
 
         Ok(())
