@@ -19,17 +19,17 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
 # Aither framework
-aither-core = { version = ">=0.4.1, <0.7", path = "../aither/core" }
-aither-agent = { version = ">=0.4.1, <0.7", path = "../aither/agent", features = ["mcp", "websearch", "webfetch", "skills"] }
-aither-sandbox = { version = ">=0.4.1, <0.7", path = "../aither/sandbox" }
-aither-cloud = { version = ">=0.4.1, <0.7", path = "../aither/cloud" }
-aither-rag = { version = ">=0.4.1, <0.7", path = "../aither/rag" }
-aither-copilot = { version = ">=0.4.1, <0.7", path = "../aither/copilot" }
-aither-codex = { version = ">=0.4.1, <0.7", path = "../aither/codex" }
-aither-models = { version = ">=0.4.1, <0.7", path = "../aither/models" }
-aither-mcp = { version = ">=0.4.1, <0.7", path = "../aither/mcp" }
-aither-browser = { version = ">=0.4.1, <0.7", path = "../aither/tools/browser" }
-aither-search = { version = ">=0.4.1, <0.7", path = "../aither/tools/search" }
+aither-core = { version = "0.7.0" }
+aither-agent = { version = "0.7.0", features = ["mcp", "websearch", "webfetch", "skills"] }
+aither-sandbox = { version = "0.7.0" }
+aither-cloud = { version = "0.7.0" }
+aither-rag = { version = "0.7.0" }
+aither-copilot = { version = "0.7.0" }
+aither-codex = { version = "0.7.0" }
+aither-models = { version = "0.7.0" }
+aither-mcp = { version = "0.7.0" }
+aither-browser = { version = "0.7.0" }
+aither-search = { version = "0.7.0" }
 
 # Container runtime (Docker/OrbStack/Podman)
 bollard = "0.21"
@@ -163,6 +163,7 @@ similar = "3.1.1"
 
 [dev-dependencies]
 serial_test = "3"
+sha2 = "0.10"
 tokio-test = "0.4"
 
 [workspace.lints]
@@ -182,3 +183,27 @@ clippy.multiple_crate_versions =  { level = "allow", priority = 1 }
 
 [lints]
 workspace = true
+
+# Baseline tool preparation hashes and inflates ~120 MB of pinned tool
+# artifacts before every agent is built; unoptimized, these crates make that
+# take seconds in dev and test builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
+[profile.dev.package.zip]
+opt-level = 3
+
+[profile.dev.package.tar]
+opt-level = 3

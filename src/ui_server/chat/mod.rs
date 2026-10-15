@@ -2104,6 +2104,8 @@ enum UiChatPreparationError {
     EnsureContainerImage(#[source] crate::container::ContainerError),
     #[error("container start failed: {0}")]
     StartContainer(#[source] crate::container::ContainerError),
+    #[error("container IPC route resolution failed: {0}")]
+    ResolveContainerIpcRoute(#[source] crate::container::ContainerError),
     #[error("location fetch failed: {0}")]
     LoadLocation(#[source] crate::location::LocationError),
     #[error("failed to create agent: {0}")]
@@ -2134,6 +2136,7 @@ impl UiChatPreparationError {
             Self::ResolveContainerRuntime(_) => ApiErrorCode::ContainerRuntimeUnavailable,
             Self::EnsureContainerImage(_) => ApiErrorCode::ContainerBuildFailed,
             Self::StartContainer(_) => ApiErrorCode::ContainerStartFailed,
+            Self::ResolveContainerIpcRoute(_) => ApiErrorCode::ContainerRuntimeUnavailable,
             Self::LoadLocation(_) => ApiErrorCode::LocationUnavailable,
             Self::LoadSession(_)
             | Self::LoadHistory(_)
@@ -2575,7 +2578,11 @@ async fn setup_agent_environment(
                 .await
                 .map_err(UiChatPreparationError::StartContainer)?;
 
-            let container_ipc_host = host_gateway.to_string();
+            let container_ipc_route = container_manager
+                .runtime()
+                .ipc_route(&container_id)
+                .await
+                .map_err(UiChatPreparationError::ResolveContainerIpcRoute)?;
             let container_exec =
                 AnyContainerExec::new(std::sync::Arc::new(BollardContainerExec::new(
                     std::sync::Arc::new(container_manager.runtime().client.clone()),
@@ -2583,7 +2590,7 @@ async fn setup_agent_environment(
 
             crate::agent::AgentEnvironment::Container {
                 container_id,
-                container_ipc_host,
+                container_ipc_route,
                 container_exec,
                 browser_cdp_endpoint,
             }
@@ -2707,6 +2714,7 @@ async fn prepare_agent_for_request(
         Some(brokers.register_skills),
         Some(brokers.register_subagents),
         environment,
+        state.tool_distribution.clone(),
         provider_attempt,
     )
     .await
