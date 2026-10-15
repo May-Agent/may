@@ -88,6 +88,18 @@ pub enum ConfigError {
     /// Invalid browser config.
     #[error("invalid browser config: {0}")]
     InvalidBrowserConfig(String),
+    /// A provider instance already exists under the ID with a different type.
+    #[error(
+        "provider `{id}` is configured as {actual:?}, not {expected:?}; refusing to overwrite it"
+    )]
+    ProviderTypeMismatch {
+        /// Provider ID from the config section key.
+        id: String,
+        /// Provider type the caller requires.
+        expected: ProviderType,
+        /// Provider type the existing instance resolves to.
+        actual: ProviderType,
+    },
 }
 
 /// LLM provider types.
@@ -1131,6 +1143,39 @@ impl MayConfig {
         self.provider.insert(id.into(), provider);
     }
 
+    /// Register a provider after a completed OAuth flow.
+    ///
+    /// Re-authentication keeps an existing instance in place — only its type
+    /// is validated and made explicit — so fields the flow does not own
+    /// (`native_tools`, `base_url`, `display_name`, `enabled`) survive. A
+    /// fresh instance is inserted only when no provider with `id` exists.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::ProviderTypeMismatch`] when a provider with `id`
+    /// already exists but resolves to a different provider type.
+    pub fn ensure_authenticated_provider(
+        &mut self,
+        id: impl Into<String>,
+        provider_type: ProviderType,
+    ) -> Result<(), ConfigError> {
+        let id = id.into();
+        if let Some(existing) = self.provider.get_mut(&id) {
+            let actual = existing.resolve_type(&id);
+            if actual != provider_type {
+                return Err(ConfigError::ProviderTypeMismatch {
+                    id,
+                    expected: provider_type,
+                    actual,
+                });
+            }
+            existing.provider_type = Some(provider_type);
+            return Ok(());
+        }
+        self.provider
+            .insert(id, ProviderInstance::new(provider_type));
+        Ok(())
+    }
+
     /// Remove a provider by ID.
     pub fn remove_provider(&mut self, id: &str) {
         self.provider.remove(id);
@@ -1481,6 +1526,76 @@ mod tests {
         let lmstudio = ProviderInstance::new(ProviderType::LMStudio);
         assert!(lmstudio.is_generic_model_proxy("lmstudio"));
         assert!(lmstudio.can_serve_model("lmstudio", "qwen3-embedding-0.6b-dwq"));
+    }
+
+    #[test]
+    fn ensure_authenticated_provider_inserts_when_absent() {
+        let mut config = MayConfig::default();
+        config
+            .ensure_authenticated_provider("copilot", ProviderType::Copilot)
+            .expect("insert succeeds");
+        assert_eq!(
+            config.get_provider("copilot").map(|p| p.provider_type),
+            Some(Some(ProviderType::Copilot))
+        );
+    }
+
+    #[test]
+    fn ensure_authenticated_provider_preserves_existing_instance() {
+        let mut config = MayConfig::default();
+        let mut instance = ProviderInstance::new(ProviderType::Chatgpt)
+            .with_base_url("https://proxy.internal/codex");
+        instance.native_tools.web_search = true;
+        instance.native_tools.web_fetch = true;
+        instance.display_name = Some("Work ChatGPT".to_string());
+        instance.enabled = false;
+        config.upsert_provider("chatgpt", instance);
+
+        config
+            .ensure_authenticated_provider("chatgpt", ProviderType::Chatgpt)
+            .expect("matching type succeeds");
+
+        let kept = config.get_provider("chatgpt").expect("provider exists");
+        assert!(kept.native_tools.web_search);
+        assert!(kept.native_tools.web_fetch);
+        assert_eq!(
+            kept.base_url.as_deref(),
+            Some("https://proxy.internal/codex")
+        );
+        assert_eq!(kept.display_name.as_deref(), Some("Work ChatGPT"));
+        assert!(!kept.enabled);
+    }
+
+    #[test]
+    fn ensure_authenticated_provider_infers_type_from_id() {
+        // An existing `[provider.copilot]` section with no explicit `type`
+        // field resolves to Copilot and is kept on re-auth.
+        let mut config = MayConfig::default();
+        config.upsert_provider("copilot", ProviderInstance::default());
+
+        config
+            .ensure_authenticated_provider("copilot", ProviderType::Copilot)
+            .expect("inferred type matches");
+        assert_eq!(
+            config.get_provider("copilot").map(|p| p.provider_type),
+            Some(Some(ProviderType::Copilot))
+        );
+    }
+
+    #[test]
+    fn ensure_authenticated_provider_rejects_type_mismatch() {
+        let mut config = MayConfig::default();
+        config.upsert_provider("chatgpt", ProviderInstance::new(ProviderType::OpenAI));
+
+        let error = config
+            .ensure_authenticated_provider("chatgpt", ProviderType::Chatgpt)
+            .expect_err("type mismatch must fail");
+        assert!(matches!(error, ConfigError::ProviderTypeMismatch { .. }));
+        // The existing instance is untouched.
+        assert_eq!(
+            config.get_provider("chatgpt").map(|p| p.provider_type),
+            Some(Some(ProviderType::OpenAI))
+        );
     }
 
     #[test]

@@ -1032,10 +1032,20 @@ where
                     .await?;
                     return Ok(());
                 }
-                let instance = may_agent::config::ProviderInstance::new(
+                if let Err(e) = app.config.ensure_authenticated_provider(
+                    "copilot",
                     may_agent::config::ProviderType::Copilot,
-                );
-                app.config.upsert_provider("copilot", instance);
+                ) {
+                    app.copilot_auth_failed(e.to_string());
+                    wait_for_auth_dismiss(
+                        app,
+                        events,
+                        terminal,
+                        may_agent::tui::AppMode::CopilotAuth,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 app.config_state.load_providers(&app.config);
                 if let Err(e) = app.config.clone().save().await {
                     tracing::error!("Failed to save config: {}", e);
@@ -1242,9 +1252,14 @@ where
         wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::ChatgptAuth).await?;
         return Ok(());
     }
-    let instance =
-        may_agent::config::ProviderInstance::new(may_agent::config::ProviderType::Chatgpt);
-    app.config.upsert_provider("chatgpt", instance);
+    if let Err(e) = app
+        .config
+        .ensure_authenticated_provider("chatgpt", may_agent::config::ProviderType::Chatgpt)
+    {
+        app.chatgpt_auth_failed(e.to_string());
+        wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::ChatgptAuth).await?;
+        return Ok(());
+    }
     app.config_state.load_providers(&app.config);
     if let Err(e) = app.config.clone().save().await {
         tracing::error!("Failed to save config: {}", e);
