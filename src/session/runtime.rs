@@ -44,9 +44,6 @@ pub enum SessionRuntimeState {
 
 impl SessionRuntimeState {
     /// Returns the stable string form used in the database.
-    /// Persisted `snake_case` string form.
-    /// Return the persisted name of the attachment kind.
-    /// Return the persisted name of the attachment kind.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -272,8 +269,6 @@ impl core::str::FromStr for PendingUserMessageMode {
 #[serde(rename_all = "camelCase")]
 pub struct PersistedAskUserRequest {
     /// Request id.
-    /// Attachment ID.
-    /// Attachment ID.
     pub id: String,
     /// Questions presented to the user.
     pub questions: Vec<PersistedAskUserQuestion>,

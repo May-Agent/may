@@ -7,7 +7,7 @@ use thiserror::Error;
 /// Errors that can occur when replaying chat history into LLM messages.
 #[derive(Debug, Error)]
 pub enum HistoryReplayError {
-    /// Tool history entry is missing `tool_call_id` (content preview: ).
+    /// Tool history entry is missing `tool_call_id`.
     #[error("tool history entry is missing tool_call_id (content preview: {preview})")]
     MissingToolCallId {
         /// First 100 characters of the offending entry.
@@ -16,7 +16,7 @@ pub enum HistoryReplayError {
     /// Tool history entry is not a valid persisted tool event.
     #[error("tool history entry is not a valid persisted tool event")]
     InvalidToolEvent(#[source] serde_json::Error),
-    /// Tool event id '' does not match message `tool_call_id` ''.
+    /// Tool event id does not match the message `tool_call_id`.
     #[error("tool event id '{event_id}' does not match message tool_call_id '{message_id}'")]
     ToolEventIdMismatch {
         /// Id recorded in the tool event.
@@ -24,7 +24,7 @@ pub enum HistoryReplayError {
         /// `tool_call_id` stored on the message.
         message_id: String,
     },
-    /// Tool start '' contains invalid JSON arguments.
+    /// Tool start contains invalid JSON arguments.
     #[error("tool start '{tool_call_id}' contains invalid JSON arguments")]
     InvalidToolArguments {
         /// Id of the malformed tool call.
@@ -33,7 +33,7 @@ pub enum HistoryReplayError {
         #[source]
         source: serde_json::Error,
     },
-    /// Tool result '' could not be rendered for the model.
+    /// Tool result could not be rendered for the model.
     #[error("tool result '{tool_call_id}' could not be rendered for the model")]
     RenderToolResult {
         /// Id of the tool call whose result failed to render.
@@ -217,7 +217,6 @@ pub struct ChatMessage {
     /// Message body (JSON payload for tool events).
     pub content: String,
     /// Message timestamp, when recorded.
-    /// When the tool call completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<Timestamp>,
     /// Tool call this message is the result of, when it is one.

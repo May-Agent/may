@@ -3,7 +3,7 @@
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
 mod common;
-pub mod context_snapshot;
+mod context_snapshot;
 pub mod entity;
 mod logs;
 mod memory;
@@ -28,6 +28,7 @@ pub use common::{
     ProfileEnvironmentKind, RequestLogParams, SessionContextSnapshotUpsert,
     StoredSessionContextSnapshot, UpdateProfileParams, UpdateScheduledTaskParams,
 };
+pub use context_snapshot::ContextDebugSnapshotWrite;
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,

@@ -1190,11 +1190,9 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>) {
 /// Format large numbers with K/M suffix for readability.
 fn format_number(n: usize) -> String {
     if n >= 1_000_000 {
-        let capped = u32::try_from(n).unwrap_or(u32::MAX);
-        format!("{:.1}M", f64::from(capped) / 1_000_000.0)
+        format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
-        let capped = u32::try_from(n).unwrap_or(u32::MAX);
-        format!("{:.1}K", f64::from(capped) / 1_000.0)
+        format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         n.to_string()
     }

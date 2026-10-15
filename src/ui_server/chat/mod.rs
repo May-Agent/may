@@ -1999,7 +1999,7 @@ async fn persist_context_debug_snapshot(
     let timestamp = jiff::Timestamp::now().to_string();
 
     let db = state.db();
-    db.upsert_context_debug_snapshot(&crate::db::context_snapshot::ContextDebugSnapshotWrite {
+    db.upsert_context_debug_snapshot(&crate::db::ContextDebugSnapshotWrite {
         session_id: session_id.as_str(),
         timestamp: &timestamp,
         model,

@@ -130,19 +130,19 @@ impl<'de> Deserialize<'de> for ModelSelector {
 /// Error type for parsing a `provider::model` selector.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ModelSelectorParseError {
-    /// Invalid model selector '': expected '<`provider_id>::`<`model_id`>'.
+    /// The selector is missing the `::` separator.
     #[error("invalid model selector '{value}': expected '<provider_id>::<model_id>'")]
     MissingSeparator {
         /// Raw selector text that failed to parse.
         value: String,
     },
-    /// Invalid model selector '': provider id must not be empty.
+    /// The selector's provider id is empty.
     #[error("invalid model selector '{value}': provider id must not be empty")]
     EmptyProviderId {
         /// Raw selector text that failed to parse.
         value: String,
     },
-    /// Invalid model selector '': model id must not be empty.
+    /// The selector's model id is empty.
     #[error("invalid model selector '{value}': model id must not be empty")]
     EmptyModelId {
         /// Raw selector text that failed to parse.

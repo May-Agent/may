@@ -16,39 +16,30 @@ use crate::db::{ChatDb, ChatDbError};
 /// Session management error.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
-    /// Home directory not found.
     /// No usable home directory could be determined.
     #[error("Home directory not found")]
     NoHomeDir,
-    /// IO error.
     /// Filesystem I/O failed.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    /// Store error.
     /// Session store operation failed.
     #[error("Store error: {0}")]
     Store(#[from] super::store::StoreError),
-    /// Database error.
     /// Database operation failed.
     #[error("Database error: {0}")]
     Database(#[from] ChatDbError),
-    /// Session not found.
     /// The referenced session does not exist.
     #[error("Session not found: {0}")]
     NotFound(String),
-    /// No active session.
     /// No session is currently active.
     #[error("No active session")]
     NoActiveSession,
-    /// Bundle error.
     /// Embedded resource bundle extraction failed.
     #[error("Bundle error: {0}")]
     Bundle(#[from] crate::bundle::BundleError),
     /// Container runtime preparation failed.
-    /// Container runtime preparation failed.
     #[error("Container runtime preparation failed: {0}")]
     Container(#[from] crate::container::ContainerError),
-    /// Persisted message error.
     /// A persisted message failed to decode.
     #[error("Persisted message error: {0}")]
     PersistedMessage(#[from] PersistedMessageError),
@@ -61,10 +52,10 @@ pub struct SessionId(String);
 
 impl SessionId {
     /// Create a new random session ID using four words.
-    #[must_use]
     ///
     /// # Panics
     /// Panics if the embedded petname dictionary cannot produce an id.
+    #[must_use]
     pub fn new() -> Self {
         let petnames = Petnames::default();
         let id = petnames
@@ -168,12 +159,12 @@ pub struct SessionSummary {
 
 impl SessionSummary {
     /// Convert a DB session model to a summary.
-    #[must_use]
     ///
     /// # Panics
     ///
     /// Panics when the row's `message_count` is negative — database rows are
     /// expected to satisfy that invariant.
+    #[must_use]
     pub fn from_db_model(s: crate::db::entity::sessions::Model) -> Self {
         let created_at = s.created_at.parse::<Timestamp>().ok();
         let updated_at = s.updated_at.parse::<Timestamp>().ok();
@@ -282,9 +273,10 @@ pub async fn list_summaries_from_db(db: &ChatDb) -> Result<Vec<SessionSummary>, 
     Ok(summarize_db_sessions(db, db_sessions).await?)
 }
 
+/// Summarize DB session rows into [`SessionSummary`] values with runtime state.
 ///
 /// # Errors
-/// Returns [`SessionError`] on storage failure or malformed rows.
+/// Returns [`ChatDbError`] on storage failure.
 pub async fn summarize_db_sessions(
     db: &ChatDb,
     db_sessions: Vec<crate::db::entity::sessions::Model>,
