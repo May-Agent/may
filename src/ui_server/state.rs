@@ -244,7 +244,7 @@ struct CachedValue<T> {
     value: T,
 }
 
-impl<T: Clone> RefreshableCache<T> {
+impl<T: Clone + Send + Sync> RefreshableCache<T> {
     pub(crate) fn new(ttl: Duration) -> Self {
         Self {
             ttl,
@@ -255,8 +255,8 @@ impl<T: Clone> RefreshableCache<T> {
 
     pub(crate) async fn get_or_refresh<F, Fut>(&self, refresh: F) -> T
     where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T>,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = T> + Send,
     {
         if let Some(cached) = self.inner.load_full()
             && cached.updated_at.elapsed() < self.ttl
@@ -489,14 +489,14 @@ impl UiServerState {
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum UiAnswerInput {
+pub enum UiAnswerInput {
     Selected { values: Vec<String> },
     Custom { text: String },
     Skipped,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum UiAnswerInputError {
+pub enum UiAnswerInputError {
     #[error("ask-user selected answer requires at least one option")]
     EmptySelected,
     #[error("ask-user selected answers must not contain empty options")]
@@ -558,7 +558,7 @@ pub struct WorkspaceApprover {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WorkspaceApprovalError {
+pub enum WorkspaceApprovalError {
     #[error("failed to persist waiting workspace request: {0}")]
     PersistWaiting(#[source] crate::db::ChatDbError),
     #[error("failed to append workspace request history: {0}")]

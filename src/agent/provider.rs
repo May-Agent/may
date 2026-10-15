@@ -3,7 +3,7 @@
 //! Resolves an explicit `<provider_id>::<model_id>` selector into one
 //! concrete provider instance, then builds the `CloudProvider` client
 //! with the right base URL, API key, and per-provider quirks
-//! (OpenRouter, DeepSeek, Ollama, LMStudio, Copilot, custom
+//! (`OpenRouter`, `DeepSeek`, Ollama, `LMStudio`, Copilot, custom
 //! OpenAI-compatible proxies, etc.). Also exposes the thin
 //! [`RequestParameterizedModel`] wrapper that pins a [`Parameters`]
 //! struct onto every inference request routed through the wrapped
@@ -106,6 +106,7 @@ pub fn provider_candidate_count(config: &MayConfig, selector: &str) -> usize {
 }
 
 /// The concrete runtime produced by [`resolve_provider_runtime`].
+#[derive(Debug)]
 pub struct ResolvedProviderRuntime {
     pub provider_id: String,
     pub llm: CloudProvider,
@@ -153,7 +154,7 @@ pub async fn resolve_provider_runtime(
 ///
 /// `None` for a tier means no distinct model is configured (or it failed to
 /// initialize) and the session model should answer that tier.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AskTierModels {
     pub flagship: Option<CloudProvider>,
     pub balanced: Option<CloudProvider>,

@@ -5,6 +5,7 @@ pub struct Model {
     pub id: String,
     /// Profile this folder belongs to.
     pub profile_id: String,
+    /// Folder display name.
     pub name: String,
     /// Display order within the pinned section.
     pub sort_order: i32,

@@ -69,7 +69,7 @@ pub enum BrowserCliCommand {
 }
 
 impl OneShotArgs {
-    pub fn help_text() -> &'static str {
+    pub const fn help_text() -> &'static str {
         "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may ui [args...]\n       may rest [args...]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
     }
 }
@@ -77,7 +77,7 @@ impl OneShotArgs {
 pub struct UiArgs;
 
 impl UiArgs {
-    pub fn help_text() -> &'static str {
+    pub const fn help_text() -> &'static str {
         "Usage: may ui [--host <addr>] [--port <port>] [--open]\n\nRun the May web UI and API server."
     }
 }
@@ -85,19 +85,19 @@ impl UiArgs {
 pub struct RestArgs;
 
 impl RestArgs {
-    pub fn help_text() -> &'static str {
+    pub const fn help_text() -> &'static str {
         "Usage: may rest [--host <addr>] [--port <port>]\n\nRun the May REST API server without the embedded web UI."
     }
 }
 
 impl ExecArgs {
-    pub fn help_text() -> &'static str {
+    pub const fn help_text() -> &'static str {
         "Usage: may exec --session <id> [--ssh-server <id>] [--timeout <sec>] [--max-lines <n>] [--raw] [--allow-runtime-install] [--] <command...>\n\nExec runs a terminal command in the session home environment. Use --ssh-server to target an attached SSH environment, and container profile sessions execute inside the configured container environment."
     }
 }
 
 impl BrowserCliArgs {
-    pub fn help_text() -> &'static str {
+    pub const fn help_text() -> &'static str {
         "Usage: may browser <status|open|close|targets|contexts|cdp-endpoint|read <url> [--detail <brief|standard|full>] [--screenshot <off|viewport|full-page>] [--format json]|provision|kill>\n\nInspect or maintain the May-managed browser runtime used for browser automation."
     }
 }
@@ -128,7 +128,7 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
 }
 
 fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
-    let command = match args.first().map(String::as_str).unwrap_or("status") {
+    let command = match args.first().map_or("status", String::as_str) {
         "--help" | "-h" => panic!("{}", BrowserCliArgs::help_text()),
         "status" => BrowserCliCommand::Status,
         "open" => BrowserCliCommand::Start,
@@ -157,8 +157,7 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
                             "standard" => BrowserReadDetail::Standard,
                             "full" => BrowserReadDetail::Full,
                             other => panic!(
-                                "invalid may browser read detail '{}'; expected brief, standard, or full",
-                                other
+                                "invalid may browser read detail '{other}'; expected brief, standard, or full"
                             ),
                         };
                         index += 2;
@@ -174,8 +173,7 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
                             "viewport" => BrowserScreenshotMode::Viewport,
                             "full-page" => BrowserScreenshotMode::FullPage,
                             other => panic!(
-                                "invalid may browser read screenshot mode '{}'; expected off, viewport, or full-page",
-                                other
+                                "invalid may browser read screenshot mode '{other}'; expected off, viewport, or full-page"
                             ),
                         };
                         index += 2;
@@ -187,7 +185,7 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
                         format = match value.as_str() {
                             "json" => BrowserReadFormat::Json,
                             other => {
-                                panic!("invalid may browser read format '{}'; expected json", other)
+                                panic!("invalid may browser read format '{other}'; expected json")
                             }
                         };
                         index += 2;
@@ -223,8 +221,7 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
             }
         }
         other => panic!(
-            "invalid browser command '{}'; expected one of: status, open, close, targets, contexts, cdp-endpoint, read, provision, kill",
-            other
+            "invalid browser command '{other}'; expected one of: status, open, close, targets, contexts, cdp-endpoint, read, provision, kill"
         ),
     };
     if !matches!(
@@ -295,7 +292,7 @@ fn parse_exec_args(args: &[String]) -> ExecArgs {
                     .unwrap_or_else(|| panic!("--timeout requires a value"));
                 timeout = next
                     .parse::<u64>()
-                    .unwrap_or_else(|_| panic!("invalid --timeout '{}'", next));
+                    .unwrap_or_else(|_| panic!("invalid --timeout '{next}'"));
                 index += 2;
             }
             "--max-lines" => {
@@ -304,7 +301,7 @@ fn parse_exec_args(args: &[String]) -> ExecArgs {
                     .unwrap_or_else(|| panic!("--max-lines requires a value"));
                 max_lines = next
                     .parse::<u32>()
-                    .unwrap_or_else(|_| panic!("invalid --max-lines '{}'", next));
+                    .unwrap_or_else(|_| panic!("invalid --max-lines '{next}'"));
                 index += 2;
             }
             "--allow-runtime-install" => {
@@ -324,9 +321,7 @@ fn parse_exec_args(args: &[String]) -> ExecArgs {
 
     let session_id = session_id.unwrap_or_else(|| panic!("--session is required"));
     let script = script_parts.join(" ").trim().to_string();
-    if script.is_empty() {
-        panic!("exec command must not be empty");
-    }
+    assert!(!script.is_empty(), "exec command must not be empty");
 
     ExecArgs {
         session_id,
@@ -371,9 +366,7 @@ fn parse_oneshot_args(args: &[String]) -> OneShotArgs {
     }
 
     let prompt = prompt_parts.join(" ").trim().to_string();
-    if prompt.is_empty() {
-        panic!("oneshot prompt must not be empty");
-    }
+    assert!(!prompt.is_empty(), "oneshot prompt must not be empty");
 
     OneShotArgs {
         prompt,
@@ -387,10 +380,7 @@ pub fn parse_reasoning_effort(value: &str) -> ReasoningEffort {
         "low" => ReasoningEffort::Low,
         "medium" => ReasoningEffort::Medium,
         "high" => ReasoningEffort::High,
-        _ => panic!(
-            "invalid --reasoning-effort '{}'; expected one of: low, medium, high",
-            value
-        ),
+        _ => panic!("invalid --reasoning-effort '{value}'; expected one of: low, medium, high"),
     }
 }
 
@@ -400,10 +390,7 @@ fn parse_terminal_execution_mode(value: &str) -> TerminalExecutionMode {
         "sandboxed" => TerminalExecutionMode::Sandboxed,
         "unsafe" => TerminalExecutionMode::Unsafe,
         "ssh" => TerminalExecutionMode::Ssh,
-        _ => panic!(
-            "invalid --mode '{}'; expected one of: default, sandboxed, unsafe, ssh",
-            value
-        ),
+        _ => panic!("invalid --mode '{value}'; expected one of: default, sandboxed, unsafe, ssh"),
     }
 }
 

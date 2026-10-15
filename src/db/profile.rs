@@ -139,7 +139,7 @@ impl ChatDb {
     ) -> Result<profiles::Model, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         let sort_order = self.max_profile_sort_order().await? + 1;
-        let preferences = normalize_profile_preferences(params.environment, params.preferences)?;
+        let preferences = normalize_profile_preferences(params.environment, params.preferences);
         let container_image = match params.environment {
             ProfileEnvironmentKind::Local => None,
             ProfileEnvironmentKind::Container => params.container_image,
@@ -250,7 +250,7 @@ impl ChatDb {
         let environment = parse_profile_environment(existing.environment.as_str())?;
         let current_preferences = self.load_profile_preferences(&existing).await?;
         let merged_preferences = match params.preferences {
-            Some(preferences) => normalize_profile_preferences(environment, preferences)?,
+            Some(preferences) => normalize_profile_preferences(environment, preferences),
             None => current_preferences,
         };
         existing.container_dockerfile = merged_preferences

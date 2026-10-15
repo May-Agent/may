@@ -1,6 +1,6 @@
 //! Markdown checklist parser for `tasks.md`.
 //!
-//! Extracts structured checklist items from CommonMark task lists using
+//! Extracts structured checklist items from `CommonMark` task lists using
 //! `pulldown-cmark`. This correctly handles nesting, task markers inside
 //! code spans vs real items, and edge cases that a regex approach would
 //! miss (for example, `- [ ]` lines inside fenced code blocks must not
@@ -25,7 +25,7 @@ pub struct TodoChecklistItem {
 }
 
 impl TodoChecklist {
-    /// Parse a CommonMark string into a structured checklist.
+    /// Parse a `CommonMark` string into a structured checklist.
     ///
     /// Nested task-list items are flattened into document order: a
     /// top-level checklist item containing a nested sub-checklist

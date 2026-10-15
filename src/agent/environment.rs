@@ -13,18 +13,25 @@ use crate::session::SessionId;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveAgentEnvironmentError {
+    /// Container profile model is missing.
     #[error("container profile model is missing")]
     MissingContainerProfileModel,
+    /// No container runtime available for container profile.
     #[error("no container runtime available for container profile: {0}")]
     DetectContainerRuntime(crate::container::ContainerError),
+    /// Invalid container profile image tag.
     #[error("invalid container profile image tag: {0}")]
     ContainerImageTag(crate::container::ContainerError),
+    /// Invalid container profile configuration.
     #[error("invalid container profile configuration: {0}")]
     ContainerProfileConfig(crate::container::ContainerError),
+    /// Invalid container mount configuration.
     #[error("invalid container mount configuration: {0}")]
     ContainerMountConfig(crate::container::ContainerError),
+    /// Container image build failed.
     #[error("container image build failed: {0}")]
     EnsureContainerImage(crate::container::ContainerError),
+    /// Container start failed.
     #[error("container start failed: {0}")]
     StartContainer(crate::container::ContainerError),
     /// The container's IPC bridge route could not be resolved.

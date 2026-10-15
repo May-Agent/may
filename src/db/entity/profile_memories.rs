@@ -12,5 +12,6 @@ pub struct Model {
     pub memory_type: String,
     /// Memory content (markdown).
     pub content: String,
+    /// Last update timestamp (ISO 8601).
     pub updated_at: String,
 }

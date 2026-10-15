@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 const MAX_HISTORY_SIZE: usize = 1000;
 
 /// Input history with navigation.
+#[derive(Debug)]
 pub struct InputHistory {
     /// History entries (oldest first).
     entries: Vec<String>,

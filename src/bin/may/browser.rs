@@ -510,7 +510,7 @@ async fn stop_browser_service(
     match send_browser_service_request(socket_path, BrowserServiceRequest::Stop).await? {
         Some(BrowserServiceResponse::Stopped) | None => {
             if config.requires_managed_runtime() {
-                may_agent::container::browser::stop_managed_browser(config.port, &may_dir).await;
+                may_agent::container::browser::stop_managed_browser(config.port, may_dir).await;
             }
             Ok(())
         }

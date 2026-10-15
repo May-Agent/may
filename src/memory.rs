@@ -16,7 +16,7 @@ use crate::db::ChatDb;
 const PREFERENCE_PROMPT: &str = include_str!("../templates/preference_extraction_prompt.txt");
 const RECENCY_PROMPT: &str = include_str!("../templates/recency_extraction_prompt.txt");
 /// Cheap DB sweep cadence; extraction itself runs at most once per profile/day.
-const MEMORY_JOB_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const MEMORY_JOB_SWEEP_INTERVAL: Duration = Duration::from_mins(5);
 /// A dirty profile is refreshed at most once per 24 hours.
 const MEMORY_REFRESH_AGE: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 /// Batch the first few chat turns before creating a profile's initial memory.
@@ -28,6 +28,7 @@ const MAX_CONVERSATION_CHARS: usize = 30_000;
 /// Profile memory processor.
 ///
 /// Runs in the background, polling durable dirty jobs from the database.
+#[derive(Debug)]
 pub struct MemoryProcessor {
     db: ChatDb,
 }
@@ -44,7 +45,7 @@ enum MemoryProcessingError {
     Llm(#[from] aither_cloud::CloudError),
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MemoryExtractionProvider {
     pub provider_id: String,
     pub model: String,
@@ -284,6 +285,7 @@ impl MemoryProcessor {
 }
 
 /// Profile memories to inject into agent context (read-only).
+#[derive(Debug)]
 pub struct ProfileMemories {
     pub preference: Option<String>,
     pub recency: Option<String>,

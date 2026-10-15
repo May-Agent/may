@@ -17,7 +17,7 @@ use crate::session::{MayHomePaths, SessionPaths};
 use super::error::{bad_request_error, internal_error};
 use super::state::UiServerState;
 
-pub(super) async fn send_event<T: Serialize>(
+pub(super) async fn send_event<T: Serialize + Sync>(
     sender: &skyzen::responder::sse::Sender,
     kind: &str,
     data: &T,

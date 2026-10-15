@@ -23,6 +23,7 @@ impl ImageSupport {
 }
 
 /// Result of rendering markdown with image position tracking.
+#[derive(Debug)]
 pub struct MarkdownRenderResult {
     /// Rendered lines
     pub lines: Vec<Line<'static>>,

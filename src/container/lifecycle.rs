@@ -31,6 +31,7 @@ struct SharedHostPaths {
 }
 
 /// Manages container lifecycle for profile-based isolation.
+#[derive(Debug)]
 pub struct ContainerManager {
     runtime: Arc<ContainerRuntime>,
     may_dir: PathBuf,

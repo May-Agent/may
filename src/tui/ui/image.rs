@@ -16,6 +16,7 @@ use ratatui_image::protocol::StatefulProtocol;
 /// Terminal image support state.
 /// Created once at startup, before raw mode, and stored in App.
 /// Only created if terminal supports native graphics protocols (Kitty, iTerm2, Sixel).
+#[derive(Debug)]
 pub struct TerminalImageSupport {
     picker: Picker,
     protocol: ProtocolType,
@@ -94,6 +95,12 @@ impl TerminalImageSupport {
 pub struct ImageState {
     /// The protocol state for rendering
     pub protocol: StatefulProtocol,
+}
+
+impl std::fmt::Debug for ImageState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageState").finish_non_exhaustive()
+    }
 }
 
 /// Render an image using the stateful protocol.

@@ -1,4 +1,4 @@
-//! ChatGPT subscription credential persistence.
+//! `ChatGPT` subscription credential persistence.
 //!
 //! OAuth credentials for the Codex backend are stored in
 //! `~/.may/chatgpt_token.json`. Access tokens are short-lived and refresh
@@ -12,10 +12,10 @@ use aither_codex::auth::CodexCredentials;
 use crate::auth_store::{delete_file, load_json, save_json};
 use crate::config::MayConfig;
 
-/// Token file name for ChatGPT OAuth credentials.
+/// Token file name for `ChatGPT` OAuth credentials.
 const TOKEN_FILE: &str = "chatgpt_token.json";
 
-/// Error type for ChatGPT credential operations.
+/// Error type for `ChatGPT` credential operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatgptAuthError {
     /// Failed to resolve the May config directory.
@@ -54,5 +54,5 @@ pub async fn delete_credentials() -> Result<(), ChatgptAuthError> {
 /// Whether a credential file exists on disk.
 #[must_use]
 pub fn has_credentials() -> bool {
-    token_path().map(|p| p.exists()).unwrap_or(false)
+    token_path().is_ok_and(|p| p.exists())
 }
