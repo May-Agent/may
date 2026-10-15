@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use aither_sandbox::TerminalMode;
+use aither_sandbox::TerminalExecutionMode;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -130,8 +130,8 @@ pub enum ToolDisplay {
     Terminal {
         /// Command text.
         command: String,
-        /// Execution mode.
-        mode: TerminalMode,
+        /// Requested execution backend.
+        mode: TerminalExecutionMode,
         /// Call status.
         status: ToolStatus,
         /// The output from this command.
@@ -1199,6 +1199,16 @@ fn format_number(n: usize) -> String {
 }
 
 /// Render a tool call inline with optional selection highlight.
+/// Marker prefix shown before a terminal command for its execution backend.
+const fn terminal_mode_marker(mode: TerminalExecutionMode) -> &'static str {
+    match mode {
+        TerminalExecutionMode::Default => "",
+        TerminalExecutionMode::Sandboxed => "[sandbox] ",
+        TerminalExecutionMode::Unsafe => "[unsafe] ",
+        TerminalExecutionMode::Ssh => "[ssh] ",
+    }
+}
+
 fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, is_selected: bool) {
     let selection_marker = if is_selected { "▶ " } else { "  " };
     let selection_style = if is_selected {
@@ -1345,10 +1355,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 ToolStatus::Failed(e) => Some(format!("failed: {e}")),
             };
 
-            let mode_prefix = match mode {
-                TerminalMode::Unsafe => "[unsafe] ",
-                TerminalMode::Sandboxed => "",
-            };
+            let mode_prefix = terminal_mode_marker(*mode);
 
             let mut command_lines = command.lines();
             if let Some(first) = command_lines.next() {
@@ -1415,11 +1422,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
             subagent, prompt, ..
         } => format!("Subagent:{subagent} - {prompt}"),
         ToolDisplay::Terminal { command, mode, .. } => {
-            let mode_prefix = match mode {
-                TerminalMode::Unsafe => "[unsafe] ",
-                TerminalMode::Sandboxed => "",
-            };
-            format!("{mode_prefix}$ {command}")
+            format!("{}$ {command}", terminal_mode_marker(*mode))
         }
     };
 
@@ -1521,4 +1524,49 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         .scroll((scroll_y, 0));
 
     frame.render_widget(paragraph, area);
+}
+#[cfg(test)]
+mod tests {
+    use super::{ToolDisplay, ToolStatus, render_tool_inline, terminal_mode_marker};
+    use aither_sandbox::TerminalExecutionMode;
+    use ratatui::text::Line;
+
+    #[test]
+    fn terminal_mode_marker_covers_every_backend() {
+        assert_eq!(terminal_mode_marker(TerminalExecutionMode::Default), "");
+        assert_eq!(
+            terminal_mode_marker(TerminalExecutionMode::Sandboxed),
+            "[sandbox] "
+        );
+        assert_eq!(
+            terminal_mode_marker(TerminalExecutionMode::Unsafe),
+            "[unsafe] "
+        );
+        assert_eq!(terminal_mode_marker(TerminalExecutionMode::Ssh), "[ssh] ");
+    }
+
+    #[test]
+    fn inline_terminal_renders_mode_marker() {
+        for (mode, marker) in [
+            (TerminalExecutionMode::Default, ""),
+            (TerminalExecutionMode::Sandboxed, "[sandbox] "),
+            (TerminalExecutionMode::Unsafe, "[unsafe] "),
+            (TerminalExecutionMode::Ssh, "[ssh] "),
+        ] {
+            let display = ToolDisplay::Terminal {
+                command: "echo hi".to_string(),
+                mode,
+                status: ToolStatus::Done,
+                output: None,
+            };
+            let mut lines: Vec<Line> = Vec::new();
+            render_tool_inline(&mut lines, &display, false);
+            let rendered: String = lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(rendered, format!("  {marker}$ echo hi"));
+        }
+    }
 }
