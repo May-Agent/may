@@ -495,11 +495,6 @@ pub struct OptionalI64ValueRow {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
-pub(super) struct BoolValueRow {
-    pub(super) value: bool,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct AssistantCacheUsageSummaryRow {
     pub(super) assistant_message_count: i64,
     pub(super) cache_hit_message_count: i64,
