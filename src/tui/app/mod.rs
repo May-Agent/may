@@ -1650,7 +1650,7 @@ impl App {
                             },
                             ToolStartKind::Generic { name, arguments } => ToolDisplay::Terminal {
                                 command: format!("{name} {arguments}"),
-                                mode: aither_sandbox::TerminalMode::Sandboxed,
+                                mode: aither_sandbox::TerminalExecutionMode::Default,
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
                             },
