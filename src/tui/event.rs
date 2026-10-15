@@ -33,6 +33,8 @@ pub enum AppEvent {
     SessionsLoaded(Result<Vec<SessionSummary>, TuiError>),
     /// Session deleted from background task (includes refreshed list)
     SessionDeleted {
+        /// The session removed from the database, when deletion got that far.
+        deleted: Option<crate::session::SessionId>,
         was_current: bool,
         result: Result<Vec<SessionSummary>, TuiError>,
     },

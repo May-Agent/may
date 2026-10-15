@@ -85,6 +85,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         tool_dispatchers,
         std::sync::Arc::new(may_agent::location::LocationProvider::new()),
         tool_distribution,
+        may_agent::agent::ToolEnvironmentCache::spawn(),
     )
     .with_oneshot_overrides(args.model.clone(), args.reasoning_effort);
 

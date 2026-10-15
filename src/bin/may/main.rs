@@ -249,6 +249,7 @@ where
         tool_dispatchers,
         std::sync::Arc::new(may_agent::location::LocationProvider::new()),
         tool_distribution,
+        may_agent::agent::ToolEnvironmentCache::spawn(),
     );
 
     // Only start a session if configuration is complete
@@ -648,6 +649,14 @@ where
                             .await;
                         continue;
                     }
+                }
+
+                if let AppEvent::SessionDeleted {
+                    deleted: Some(session_id),
+                    ..
+                } = &terminal_event
+                {
+                    runtime_deps.evict_session(session_id);
                 }
 
                 // Handle normal terminal events

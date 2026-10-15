@@ -1810,9 +1810,12 @@ async fn stream_chat_events(
                 session_id: response_session_id.clone(),
                 assistant: api_message_from_run_result(result),
             };
-            send_event(&sender, "done", &done_event).await;
+            // Release the session before announcing the end of the turn, so
+            // a client that sends its next message on `done` is never refused
+            // as a concurrent run.
             run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
+            send_event(&sender, "done", &done_event).await;
             spawn_follow_up_runs(state.clone(), response_session_id.clone());
             Ok(())
         }
@@ -1823,9 +1826,9 @@ async fn stream_chat_events(
                 session_id: response_session_id.clone(),
                 assistant: api_message_from_run_result(result),
             };
-            send_event(&sender, "paused", &done_event).await;
             run_registration.close().await;
             clear_running_state_if_needed(&state, &response_session_id).await?;
+            send_event(&sender, "paused", &done_event).await;
             spawn_follow_up_runs_if_dispatchable(&state, &response_session_id).await?;
             Ok(())
         }
@@ -2715,6 +2718,7 @@ async fn prepare_agent_for_request(
         Some(brokers.register_subagents),
         environment,
         state.tool_distribution.clone(),
+        state.tool_environments.clone(),
         provider_attempt,
     )
     .await
