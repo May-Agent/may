@@ -261,6 +261,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         runtime_service,
         task_runtime: task_runtime.clone(),
         tool_distribution,
+        tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
         cwd,
         may_dir,
     });
