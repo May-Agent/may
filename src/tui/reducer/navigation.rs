@@ -137,6 +137,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Opti
                                     Err(error) => {
                                         let _ = tx
                                             .send(crate::tui::event::AppEvent::SessionDeleted {
+                                                deleted: None,
                                                 was_current,
                                                 result: Err(TuiError::from(error)),
                                             })
@@ -147,6 +148,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Opti
                                 if let Err(e) = db.delete_session(&deleted_id).await {
                                     let _ = tx
                                         .send(crate::tui::event::AppEvent::SessionDeleted {
+                                            deleted: None,
                                             was_current,
                                             result: Err(TuiError::from(e)),
                                         })
@@ -159,6 +161,9 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Opti
                                 let result = crate::session::list_summaries_from_db(&db).await;
                                 let _ = tx
                                     .send(crate::tui::event::AppEvent::SessionDeleted {
+                                        deleted: Some(crate::session::SessionId::from_string(
+                                            deleted_id,
+                                        )),
                                         was_current,
                                         result: result.map_err(TuiError::from),
                                     })

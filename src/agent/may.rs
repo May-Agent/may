@@ -11,9 +11,7 @@ use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage,
     model::{Parameters, ReasoningEffort},
 };
-use aither_sandbox::{
-    AnyContainerExec, ContainerShellRuntime, ShellRuntimeAvailability, SshServer, TerminalTool,
-};
+use aither_sandbox::{AnyContainerExec, ContainerShellRuntime, SshServer, TerminalTool};
 use executor_core::DefaultExecutor;
 use futures_lite::Stream;
 
@@ -27,6 +25,9 @@ use super::runtime_context::{
     build_macos_host_automation_context, build_memory_context_content, build_native_voice_context,
     build_network_restrictions_context, build_plan_mode_context, build_terminal_runtime_context,
     build_workspace_context, build_workspace_workdirs_context, tag,
+};
+use super::tool_environment_cache::{
+    Acquired, HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
@@ -51,6 +52,9 @@ pub enum MayAgentError {
     /// Baseline preparation failed before the agent became ready.
     #[error("Baseline tool initialization failed: {0}")]
     ToolInitialization(#[from] aither_sandbox::ToolRuntimeError),
+    /// The session's prepared tool environment could not be acquired.
+    #[error(transparent)]
+    ToolEnvironment(#[from] ToolEnvironmentCacheError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("LLM error: {0}")]
@@ -98,6 +102,8 @@ pub enum AgentEnvironment {
 pub struct MayAgentConfig {
     /// Trusted baseline tool distribution used by every configured backend.
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+    /// Prepared tool environments kept across rebuilds of a session's agent.
+    pub tool_environments: ToolEnvironmentCache,
     /// The LLM provider.
     pub llm: CloudProvider,
     /// The concrete model identifier selected for this request.
@@ -223,7 +229,20 @@ impl MayAgent {
                 target: s.target.clone(),
             })
             .collect();
-        let ssh_enabled = !ssh_servers.is_empty();
+        // The cache key and the builder's backend setters are derived from
+        // the same values, so an equal key means the cached registry is the
+        // one this builder would prepare.
+        let tool_environment_key = ToolEnvironmentKey::new(
+            match &config.environment {
+                AgentEnvironment::Local => HomeBackend::Local,
+                AgentEnvironment::Container {
+                    container_id,
+                    container_ipc_route,
+                    ..
+                } => HomeBackend::container(container_id, container_ipc_route),
+            },
+            &ssh_servers,
+        );
 
         // Read global memory from the database.
         let memory_content = config
@@ -279,22 +298,6 @@ impl MayAgent {
         } else {
             let home = crate::session::MayHomePaths::new(config.may_dir.clone());
             (home.skills_dir(), home.subagents_dir())
-        };
-
-        // Shell runtime depends on the home environment. SSH remains a
-        // per-command routing capability on top of Local (it cannot be the
-        // session-level runtime here).
-        let availability = match &config.environment {
-            AgentEnvironment::Container { .. } => ShellRuntimeAvailability {
-                local: false,
-                container: true,
-                ssh: ssh_enabled,
-            },
-            AgentEnvironment::Local => ShellRuntimeAvailability {
-                local: true,
-                container: false,
-                ssh: ssh_enabled,
-            },
         };
 
         // Build the agent using a minimal base prompt + structured context blocks.
@@ -355,7 +358,9 @@ impl MayAgent {
                 .await?;
         builder = builder
             .system_prompt_raw(base_system_prompt)
-            .shell_runtime_availability(availability)
+            // Shell runtime depends on the home environment. SSH remains a
+            // per-command routing capability on top of it.
+            .shell_runtime_availability(tool_environment_key.availability())
             .ssh_servers(ssh_servers)
             .ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
                 config.session_id.as_str().to_string(),
@@ -467,21 +472,39 @@ impl MayAgent {
             "preparing session tool environments"
         );
         let preparation_started = std::time::Instant::now();
-        let builder = builder
-            .initialize_tools(
-                &config.tool_distribution,
-                &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
-            )
-            .await
-            .inspect_err(|error| {
-                tracing::error!(
-                    stage = "tool_preparation",
-                    %error,
-                    "tool environment preparation failed"
-                );
-            })?;
+        let (builder, outcome) = match config
+            .tool_environments
+            .acquire(&config.session_id, tool_environment_key)
+            .await?
+        {
+            Acquired::Ready(registry) => (
+                // An equal key describes this registry, so a rejection here
+                // is a key derivation bug and is reported, never re-prepared.
+                builder.prepared_shell_sessions(registry).await?,
+                "adopted",
+            ),
+            Acquired::Prepare(lease) => {
+                let builder = builder
+                    .initialize_tools(
+                        &config.tool_distribution,
+                        &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
+                    )
+                    .await
+                    .inspect_err(|error| {
+                        tracing::error!(
+                            stage = "tool_preparation",
+                            %error,
+                            "tool environment preparation failed"
+                        );
+                    })?;
+                lease.complete(builder.shell_sessions().clone());
+                (builder, "prepared")
+            }
+        };
         tracing::debug!(
             stage = "tool_preparation",
+            session_id = %config.session_id,
+            outcome,
             elapsed_ms = preparation_started.elapsed().as_millis(),
             "session tool environments ready"
         );
@@ -521,6 +544,7 @@ impl MayAgent {
         register_subagents_broker: Option<RegisterBroker>,
         environment: AgentEnvironment,
         tool_distribution: Arc<aither_sandbox::ToolDistribution>,
+        tool_environments: ToolEnvironmentCache,
         provider_attempt: usize,
     ) -> Result<Self, MayAgentError> {
         let resolved_provider =
@@ -583,6 +607,7 @@ impl MayAgent {
             super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await;
         let config = MayAgentConfig {
             tool_distribution,
+            tool_environments,
             llm,
             model_id: model.to_string(),
             provider_id,
