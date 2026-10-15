@@ -5,6 +5,7 @@ export type ProviderType =
   | 'openai'
   | 'google'
   | 'copilot'
+  | 'chatgpt'
   | 'openrouter'
   | 'deepseek'
   | 'ollama'
@@ -18,6 +19,11 @@ export type ProviderType =
 export type NetworkPolicyMode = 'disabled' | 'restricted' | 'allow_list' | 'deny_list';
 export type BrowserBackendKind = 'managed' | 'remote_cdp';
 
+export interface UiNativeToolsConfig {
+  webSearch: boolean;
+  webFetch: boolean;
+}
+
 export interface UiProviderConfig {
   id: string;
   providerType: ProviderType;
@@ -25,6 +31,7 @@ export interface UiProviderConfig {
   baseUrl?: string | null;
   displayName?: string | null;
   enabled: boolean;
+  nativeTools: UiNativeToolsConfig;
 }
 
 export interface UiModelsConfig {
