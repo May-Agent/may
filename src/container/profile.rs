@@ -45,10 +45,11 @@ pub fn mounts_for_profile(preferences: Option<ContainerProfilePreferences>) -> V
     let mut mounts = Vec::with_capacity(preferences.mounts.len());
     for mount in preferences.mounts {
         let host_path = PathBuf::from(mount.host_path);
-        let container_path = PathBuf::from(mount.container_path);
         let spec = match mount.access {
-            ContainerMountAccess::ReadOnly => MountSpec::read_only(host_path, container_path),
-            ContainerMountAccess::ReadWrite => MountSpec::read_write(host_path, container_path),
+            ContainerMountAccess::ReadOnly => MountSpec::read_only(host_path, mount.container_path),
+            ContainerMountAccess::ReadWrite => {
+                MountSpec::read_write(host_path, mount.container_path)
+            }
         };
         mounts.push(spec);
     }
@@ -208,7 +209,7 @@ pub fn container_name_for_profile_session(
 mod tests {
     use std::fs;
 
-    use aither_sandbox::MountAccess;
+    use aither_sandbox::{ContainerPath, MountAccess};
     use tempfile::TempDir;
 
     use super::*;
@@ -274,21 +275,35 @@ mod tests {
             mounts: vec![
                 ContainerMountPreference {
                     host_path: "/host/ro".to_string(),
-                    container_path: "/mnt/ro".to_string(),
+                    container_path: ContainerPath::new("/mnt/ro").unwrap(),
                     access: ContainerMountAccess::ReadOnly,
                 },
                 ContainerMountPreference {
                     host_path: "/host/rw".to_string(),
-                    container_path: "/mnt/rw".to_string(),
+                    container_path: ContainerPath::new("/mnt/rw").unwrap(),
                     access: ContainerMountAccess::ReadWrite,
                 },
             ],
         }));
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].host_path, PathBuf::from("/host/ro"));
-        assert_eq!(mounts[0].container_path, PathBuf::from("/mnt/ro"));
+        assert_eq!(mounts[0].container_path.as_str(), "/mnt/ro");
         assert_eq!(mounts[0].access, MountAccess::ReadOnly);
         assert_eq!(mounts[1].access, MountAccess::ReadWrite);
+    }
+
+    #[test]
+    fn mount_preference_rejects_relative_container_path() {
+        let error = serde_json::from_str::<ContainerMountPreference>(
+            r#"{"hostPath":"/host/data","containerPath":"mnt/data"}"#,
+        )
+        .expect_err("relative container path must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("container path must be absolute"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

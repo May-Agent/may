@@ -47,8 +47,9 @@ pub struct ContainerProfilePreferences {
 pub struct ContainerMountPreference {
     /// Path on the host to mount.
     pub host_path: String,
-    /// Mount point inside the container.
-    pub container_path: String,
+    /// Absolute mount point inside the container.
+    #[schema(value_type = String)]
+    pub container_path: aither_sandbox::ContainerPath,
     /// Mount access level.
     #[serde(default)]
     pub access: ContainerMountAccess,
