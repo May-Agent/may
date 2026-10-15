@@ -626,7 +626,27 @@ struct TestSession {
 struct RunningUiServer {
     child: Child,
     base_url: String,
-    log_path: PathBuf,
+    log: ServerLog,
+}
+
+/// The file a spawned UI server's stdout and stderr go to. Cheap to clone, so
+/// tasks that outlive a borrow of the server can still report its logs.
+#[derive(Clone)]
+struct ServerLog {
+    path: PathBuf,
+}
+
+impl ServerLog {
+    async fn contents(&self) -> String {
+        tokio::fs::read_to_string(&self.path)
+            .await
+            .unwrap_or_else(|error| {
+                format!(
+                    "failed to read ui server logs at {}: {error}",
+                    self.path.display()
+                )
+            })
+    }
 }
 
 impl RunningUiServer {
@@ -665,7 +685,7 @@ impl RunningUiServer {
         let mut server = Self {
             child,
             base_url,
-            log_path,
+            log: ServerLog { path: log_path },
         };
         server.wait_until_healthy(Duration::from_secs(15)).await;
         server
@@ -679,7 +699,7 @@ impl RunningUiServer {
             if let Ok(Some(status)) = self.child.try_wait() {
                 panic!(
                     "ui server exited with {status} before becoming healthy; server logs:\n{}",
-                    self.logs().await
+                    self.log.contents().await
                 );
             }
             let healthy = client
@@ -694,21 +714,10 @@ impl RunningUiServer {
                 Instant::now() < deadline,
                 "ui server did not become healthy within {:?}; server logs:\n{}",
                 timeout_duration,
-                self.logs().await
+                self.log.contents().await
             );
             sleep(Duration::from_millis(50)).await;
         }
-    }
-
-    async fn logs(&self) -> String {
-        tokio::fs::read_to_string(&self.log_path)
-            .await
-            .unwrap_or_else(|error| {
-                format!(
-                    "failed to read ui server logs at {}: {error}",
-                    self.log_path.display()
-                )
-            })
     }
 
     async fn stop(mut self) {
@@ -1043,14 +1052,13 @@ fn runtime_is_idle(runtime: &Value) -> bool {
 
 async fn wait_for_runtime_state_clear(
     client: &reqwest::Client,
-    base_url: &str,
-    session_id: &str,
     server: &RunningUiServer,
+    session_id: &str,
     timeout_duration: Duration,
 ) {
     let deadline = Instant::now() + timeout_duration;
     loop {
-        let last_runtime = get_runtime(client, base_url, session_id).await;
+        let last_runtime = get_runtime(client, server, session_id).await;
         if runtime_is_idle(&last_runtime) {
             return;
         }
@@ -1059,7 +1067,7 @@ async fn wait_for_runtime_state_clear(
             "runtime state did not clear within {:?}; runtime: {}; server logs:\n{}",
             timeout_duration,
             last_runtime,
-            server.logs().await
+            server.log.contents().await
         );
         sleep(Duration::from_millis(50)).await;
     }
@@ -1067,9 +1075,8 @@ async fn wait_for_runtime_state_clear(
 
 async fn wait_for_runtime_condition<F>(
     client: &reqwest::Client,
-    base_url: &str,
-    session_id: &str,
     server: &RunningUiServer,
+    session_id: &str,
     timeout_duration: Duration,
     description: &str,
     mut predicate: F,
@@ -1079,7 +1086,7 @@ where
 {
     let deadline = Instant::now() + timeout_duration;
     loop {
-        let runtime = get_runtime(client, base_url, session_id).await;
+        let runtime = get_runtime(client, server, session_id).await;
         if predicate(&runtime) {
             return runtime;
         }
@@ -1088,7 +1095,7 @@ where
             "runtime condition `{description}` was not satisfied within {:?}; runtime: {}; server logs:\n{}",
             timeout_duration,
             runtime,
-            server.logs().await
+            server.log.contents().await
         );
         sleep(Duration::from_millis(50)).await;
     }
@@ -1112,9 +1119,13 @@ fn terminal_task_id_from_latest_tool_output(request: &Value) -> Option<String> {
         .as_str()
         .map(ToOwned::to_owned)
 }
-/// Return `response` when it carries `expected`, otherwise fail with its body,
-/// so a server error explains itself in CI output.
-async fn expect_status(response: reqwest::Response, expected: StatusCode) -> reqwest::Response {
+/// Return `response` when it carries `expected`, otherwise fail with its body
+/// and the server's logs, which carry the cause of a redacted 5xx body.
+async fn expect_status(
+    log: &ServerLog,
+    response: reqwest::Response,
+    expected: StatusCode,
+) -> reqwest::Response {
     let status = response.status();
     if status == expected {
         return response;
@@ -1124,21 +1135,24 @@ async fn expect_status(response: reqwest::Response, expected: StatusCode) -> req
         .text()
         .await
         .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
-    panic!("{url} returned {status}, expected {expected}; body: {body}");
+    panic!(
+        "{url} returned {status}, expected {expected}; body: {body}; server logs:\n{}",
+        log.contents().await
+    );
 }
 
-async fn create_session_via_api(client: &reqwest::Client, base_url: &str) -> String {
+async fn create_session_via_api(client: &reqwest::Client, server: &RunningUiServer) -> String {
     // Chat round-trip tests run in the local profile: the container-backed
     // default profile would spend the assertions' timeout budget on
     // first-run container provisioning.
-    let profile_id = local_profile_id_via_api(client, base_url).await;
+    let profile_id = local_profile_id_via_api(client, server).await;
     let response = client
-        .post(format!("{base_url}/api/sessions"))
+        .post(format!("{}/api/sessions", server.base_url))
         .json(&serde_json::json!({ "profileId": profile_id }))
         .send()
         .await
         .expect("create session request should succeed");
-    let response = expect_status(response, StatusCode::OK).await;
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
     let value: Value = response
         .json()
         .await
@@ -1150,13 +1164,13 @@ async fn create_session_via_api(client: &reqwest::Client, base_url: &str) -> Str
         .to_string()
 }
 
-async fn local_profile_id_via_api(client: &reqwest::Client, base_url: &str) -> String {
+async fn local_profile_id_via_api(client: &reqwest::Client, server: &RunningUiServer) -> String {
     let response = client
-        .get(format!("{base_url}/api/profiles"))
+        .get(format!("{}/api/profiles", server.base_url))
         .send()
         .await
         .expect("list profiles request should succeed");
-    let response = expect_status(response, StatusCode::OK).await;
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
     let profiles: Value = response
         .json()
         .await
@@ -1171,13 +1185,20 @@ async fn local_profile_id_via_api(client: &reqwest::Client, base_url: &str) -> S
         .to_string()
 }
 
-async fn get_runtime(client: &reqwest::Client, base_url: &str, session_id: &str) -> Value {
+async fn get_runtime(
+    client: &reqwest::Client,
+    server: &RunningUiServer,
+    session_id: &str,
+) -> Value {
     let response = client
-        .get(format!("{base_url}/api/sessions/{session_id}/runtime"))
+        .get(format!(
+            "{}/api/sessions/{session_id}/runtime",
+            server.base_url
+        ))
         .send()
         .await
         .expect("runtime request should succeed");
-    let response = expect_status(response, StatusCode::OK).await;
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
     response
         .json()
         .await
@@ -1339,7 +1360,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("create session request should succeed");
-    let create_response = expect_status(create_response, StatusCode::OK).await;
+    let create_response = expect_status(&server.log, create_response, StatusCode::OK).await;
     // Any release-API check rewrites the state's timestamp; an untouched
     // state proves the default container profile took the seeded fast path.
     assert_eq!(
@@ -1366,7 +1387,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("list sessions request should succeed");
-    let list_response = expect_status(list_response, StatusCode::OK).await;
+    let list_response = expect_status(&server.log, list_response, StatusCode::OK).await;
     let listed: Value = list_response
         .json()
         .await
@@ -1388,7 +1409,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("update session request should succeed");
-    let update_response = expect_status(update_response, StatusCode::OK).await;
+    let update_response = expect_status(&server.log, update_response, StatusCode::OK).await;
     let updated: Value = update_response
         .json()
         .await
@@ -1403,7 +1424,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("get session request should succeed");
-    let get_response = expect_status(get_response, StatusCode::OK).await;
+    let get_response = expect_status(&server.log, get_response, StatusCode::OK).await;
     let fetched: Value = get_response
         .json()
         .await
@@ -1426,14 +1447,74 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("delete session request should succeed");
-    expect_status(delete_response, StatusCode::OK).await;
+    expect_status(&server.log, delete_response, StatusCode::OK).await;
 
     let missing_response = client
         .get(format!("{}/api/sessions/{session_id}", server.base_url))
         .send()
         .await
         .expect("missing session request should succeed");
-    expect_status(missing_response, StatusCode::NOT_FOUND).await;
+    expect_status(&server.log, missing_response, StatusCode::NOT_FOUND).await;
+
+    server.stop().await;
+}
+
+/// A 500's response body is redacted, so the server log is the only place its
+/// cause survives: the failing request must be logged at error level with the
+/// underlying error.
+#[tokio::test]
+#[serial]
+async fn ui_server_error_logs_its_cause() {
+    let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let profile_id = local_profile_id_via_api(&client, &server).await;
+
+    // A regular file where the profile's sessions directory belongs makes
+    // session directory creation fail with an I/O error.
+    let sessions_dir = MayHomePaths::new(harness.may_dir.clone())
+        .profile_home(&profile_id)
+        .sessions_dir();
+    if tokio::fs::try_exists(&sessions_dir)
+        .await
+        .expect("sessions dir existence should be checkable")
+    {
+        tokio::fs::remove_dir_all(&sessions_dir)
+            .await
+            .expect("existing sessions dir should be removable");
+    }
+    tokio::fs::write(&sessions_dir, b"not a directory")
+        .await
+        .expect("sessions dir placeholder file should be written");
+
+    let response = client
+        .post(format!("{}/api/sessions", server.base_url))
+        .json(&serde_json::json!({ "profileId": profile_id }))
+        .send()
+        .await
+        .expect("create session request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::INTERNAL_SERVER_ERROR).await;
+    let body: Value = response
+        .json()
+        .await
+        .expect("error response should be valid JSON");
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": "Internal server error" })
+    );
+
+    let logs = harness.file_logs().await;
+    let logged = logs.lines().any(|line| {
+        line.contains("ERROR")
+            && line.contains("internal server error")
+            && line.contains("path=\"/api/sessions\"")
+            && line.contains("status=500")
+            && line.contains("IO error:")
+    });
+    assert!(
+        logged,
+        "the 500 should be logged with its cause; logs:\n{logs}"
+    );
 
     server.stop().await;
 }
@@ -1453,11 +1534,12 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let session_id = create_session_via_api(&client, &server.base_url).await;
+    let session_id = create_session_via_api(&client, &server).await;
 
     let chat_task = tokio::spawn({
         let client = client.clone();
         let base_url = server.base_url.clone();
+        let log = server.log.clone();
         let session_id = session_id.clone();
         async move {
             let response = client
@@ -1469,7 +1551,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
                 .send()
                 .await
                 .expect("chat stream request should succeed");
-            let response = expect_status(response, StatusCode::OK).await;
+            let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
     });
@@ -1482,7 +1564,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         assert!(
             Instant::now() < deadline,
             "LLM request did not reach mock server within 10s; server logs:\n{}",
-            server.logs().await
+            server.log.contents().await
         );
         sleep(Duration::from_millis(50)).await;
     }
@@ -1496,7 +1578,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         .send()
         .await
         .expect("stop session request should succeed");
-    expect_status(stop_response, StatusCode::OK).await;
+    expect_status(&server.log, stop_response, StatusCode::OK).await;
 
     let events = tokio::time::timeout(Duration::from_secs(15), chat_task)
         .await
@@ -1505,24 +1587,17 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
     assert!(
         events.iter().any(|(kind, _)| kind == "text"),
         "stream should deliver partial text before cancellation; events: {events:?}; server logs:\n{}",
-        server.logs().await
+        server.log.contents().await
     );
 
-    wait_for_runtime_state_clear(
-        &client,
-        &server.base_url,
-        &session_id,
-        &server,
-        Duration::from_secs(10),
-    )
-    .await;
+    wait_for_runtime_state_clear(&client, &server, &session_id, Duration::from_secs(10)).await;
 
     let session_response = client
         .get(format!("{}/api/sessions/{}", server.base_url, session_id))
         .send()
         .await
         .expect("get session after cancel should succeed");
-    let session_response = expect_status(session_response, StatusCode::OK).await;
+    let session_response = expect_status(&server.log, session_response, StatusCode::OK).await;
     let session_payload: Value = session_response
         .json()
         .await
@@ -1545,11 +1620,12 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let session_id = create_session_via_api(&client, &server.base_url).await;
+    let session_id = create_session_via_api(&client, &server).await;
 
     let chat_task = tokio::spawn({
         let client = client.clone();
         let base_url = server.base_url.clone();
+        let log = server.log.clone();
         let session_id = session_id.clone();
         async move {
             let response = client
@@ -1561,16 +1637,15 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
                 .send()
                 .await
                 .expect("chat stream request should succeed");
-            let response = expect_status(response, StatusCode::OK).await;
+            let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
     });
 
     let runtime_during_background = wait_for_runtime_condition(
         &client,
-        &server.base_url,
-        &session_id,
         &server,
+        &session_id,
         Duration::from_secs(10),
         "terminal runtime to expose taskId and outputFile",
         |runtime| {
@@ -1606,7 +1681,7 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
         .await
         .expect("chat stream should finish before timeout")
         .expect("chat task should join");
-    let server_logs = server.logs().await;
+    let server_logs = server.log.contents().await;
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
         "terminal round-trip chat should complete with a done event; events: {events:?}; server logs:\n{server_logs}"
@@ -1635,9 +1710,8 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
 
     wait_for_runtime_condition(
         &client,
-        &server.base_url,
-        &session_id,
         &server,
+        &session_id,
         Duration::from_secs(10),
         "terminal runtime to clear after background completion",
         runtime_is_idle,
@@ -1664,7 +1738,7 @@ async fn ui_chat_turns_on_one_session_prepare_tools_once() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let session_id = create_session_via_api(&client, &server.base_url).await;
+    let session_id = create_session_via_api(&client, &server).await;
 
     for content in ["First turn.", "Second turn."] {
         let response = client
@@ -1684,7 +1758,7 @@ async fn ui_chat_turns_on_one_session_prepare_tools_once() {
                 .text()
                 .await
                 .expect("refusal body should be readable"),
-            server.logs().await
+            server.log.contents().await
         );
         let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
             .await
@@ -1692,13 +1766,12 @@ async fn ui_chat_turns_on_one_session_prepare_tools_once() {
         assert!(
             events.iter().any(|(kind, _)| kind == "done"),
             "turn should complete with a done event; events: {events:?}; server logs:\n{}",
-            server.logs().await
+            server.log.contents().await
         );
         wait_for_runtime_condition(
             &client,
-            &server.base_url,
-            &session_id,
             &server,
+            &session_id,
             Duration::from_secs(10),
             "session runtime to settle after the turn",
             runtime_is_idle,
