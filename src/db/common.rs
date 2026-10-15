@@ -510,6 +510,7 @@ pub(super) struct SessionIdRow {
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct StoredSessionContextSnapshotRow {
+    pub(super) format_version: i64,
     pub(super) checkpoint_blob: Vec<u8>,
     pub(super) last_message_db_id: Option<i64>,
     pub(super) updated_at: String,
