@@ -1645,48 +1645,29 @@ async fn ui_linux_runtime_has_heel_env_for_sandbox_stdin_detection() {
     server.stop().await;
 }
 
-/// Reads the kernel's view of a process: prints `parentNice parentIO
-/// childNice childIO` where the child is an exec'd copy of itself, so a run
-/// shows both the ambient priority and whether descendants inherit it.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Reads the kernel's view of a process on macOS: prints `parentNice
+/// parentIO childNice childIO` where the child is an exec'd copy of itself, so
+/// a run shows both the ambient priority and whether descendants inherit it.
+#[cfg(target_os = "macos")]
 const PRIORITY_PROBE_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/priority_probe.rs"
 );
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn parse_priority_probe(stdout: &[u8]) -> [i32; 4] {
-    let text = String::from_utf8_lossy(stdout);
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-    let [a, b, c, d] = tokens
-        .into_iter()
-        .map(|token| token.parse::<i32>().expect("probe prints signed integers"))
-        .collect::<Vec<i32>>()
-        .try_into()
-        .expect("probe prints exactly four integers");
-    [a, b, c, d]
-}
-
-#[cfg(target_os = "macos")]
-const IO_UTILITY: i32 = 4; // IOPOL_UTILITY
-#[cfg(target_os = "macos")]
-const IO_BACKGROUND: i32 = 3; // IOPOL_THROTTLE
+/// The Linux counterpart of the macOS probe, printing the same four values.
+/// It is a shell script over system tools because the Linux sandbox executes
+/// only from system directories, never a binary the test compiled.
 #[cfg(target_os = "linux")]
-const IO_UTILITY: i32 = (2 << 13) | 7; // IOPRIO_PRIO_VALUE(BEST_EFFORT, 7)
-#[cfg(target_os = "linux")]
-const IO_BACKGROUND: i32 = 3 << 13; // IOPRIO_PRIO_VALUE(IDLE, 0)
+const PRIORITY_PROBE_SCRIPT: &str = include_str!("fixtures/priority_probe.sh");
 
-/// `may exec` under each configured command priority must apply the mapped
-/// CPU nice level and I/O policy, and the probe's own child must inherit both.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[tokio::test]
-#[serial]
-async fn exec_applies_local_command_priority() {
-    let heel_bin = required_heel_bin();
-
-    // Compile the kernel probe into the shared test-tmp root: that path is
-    // ordinary read-only executable storage to the sandbox, unlike the
-    // session-writable roots where exec is explicitly denied.
+/// The shell command that prints `parentNice parentIO childNice childIO` for
+/// the process it runs as and for a child of it, the I/O value in the
+/// platform's kernel encoding. The macOS probe reads the disk I/O policy,
+/// which no system tool exposes, so it is compiled into the shared test-tmp
+/// root: ordinary read-only executable storage to the macOS sandbox, unlike
+/// the session-writable roots where exec is explicitly denied.
+#[cfg(target_os = "macos")]
+async fn priority_probe_command() -> String {
     let probe_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("priority-probe");
     async_fs::create_dir_all(&probe_dir)
         .await
@@ -1710,13 +1691,59 @@ async fn exec_applies_local_command_priority() {
         "probe compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
+    shell_escape::escape(probe_binary.display().to_string().into()).into_owned()
+}
 
-    // Host baseline first: an unsandboxed probe's child inherits its priorities.
-    let probe_for_baseline = probe_binary.clone();
-    let baseline_output =
-        blocking::unblock(move || std::process::Command::new(probe_for_baseline).output())
-            .await
-            .expect("host probe should run");
+/// See the macOS variant: on Linux the probe is the script itself, run by `sh`
+/// so its POSIX word splitting holds whatever shell the terminal tool uses.
+#[cfg(target_os = "linux")]
+async fn priority_probe_command() -> String {
+    let script = shell_escape::escape(PRIORITY_PROBE_SCRIPT.into());
+    format!("sh -c {script}")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn parse_priority_probe(stdout: &[u8]) -> [i32; 4] {
+    let text = String::from_utf8_lossy(stdout);
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let [a, b, c, d] = tokens
+        .into_iter()
+        .map(|token| token.parse::<i32>().expect("probe prints signed integers"))
+        .collect::<Vec<i32>>()
+        .try_into()
+        .expect("probe prints exactly four integers");
+    [a, b, c, d]
+}
+
+#[cfg(target_os = "macos")]
+const IO_UTILITY: i32 = 4; // IOPOL_UTILITY
+#[cfg(target_os = "macos")]
+const IO_BACKGROUND: i32 = 3; // IOPOL_THROTTLE
+#[cfg(target_os = "linux")]
+const IO_UTILITY: i32 = (2 << 13) | 7; // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 7)
+#[cfg(target_os = "linux")]
+const IO_BACKGROUND: i32 = 3 << 13; // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0)
+
+/// `may exec` under each configured command priority must apply the mapped
+/// CPU nice level and I/O policy, and the probe's own child must inherit both.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+#[serial]
+async fn exec_applies_local_command_priority() {
+    let heel_bin = required_heel_bin();
+    let probe = priority_probe_command().await;
+
+    // Host baseline first, through a shell exactly as the sandbox runs it: an
+    // unsandboxed probe's child inherits its priorities.
+    let probe_for_baseline = probe.clone();
+    let baseline_output = blocking::unblock(move || {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(probe_for_baseline)
+            .output()
+    })
+    .await
+    .expect("host probe should run");
     assert!(
         baseline_output.status.success(),
         "host probe failed: {}",
@@ -1765,7 +1792,7 @@ async fn exec_applies_local_command_priority() {
 
         let session = harness.create_session().await;
 
-        let script = shell_escape::escape(probe_binary.display().to_string().into()).into_owned();
+        let script = probe.clone();
         let session_id = session.id.clone();
         let home = harness.home_path().to_path_buf();
         let heel = heel_bin.clone();
