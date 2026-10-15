@@ -1,7 +1,5 @@
 use aither_core::llm::ToolResult;
-use aither_sandbox::{
-    Content, OutputEntry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalResult,
-};
+use aither_sandbox::{Content, OutputEntry, TerminalArgs, TerminalExecutionMode, TerminalResult};
 
 /// Frontend-agnostic start event for a tool call.
 #[derive(Debug, Clone)]
@@ -10,8 +8,8 @@ pub enum ToolStartKind {
     Terminal {
         /// Command or script being executed.
         command: String,
-        /// Display mode the command runs under.
-        mode: TerminalMode,
+        /// Requested execution backend for the command.
+        mode: TerminalExecutionMode,
     },
     /// Any other tool invocation.
     Generic {
@@ -45,22 +43,13 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
             .unwrap_or_else(|e| panic!("invalid terminal tool args payload: {e}"));
         ToolStartKind::Terminal {
             command: args.script,
-            mode: display_mode_from_execution_mode(args.mode),
+            mode: args.mode,
         }
     } else {
         ToolStartKind::Generic {
             name: name.to_string(),
             arguments: arguments.to_string(),
         }
-    }
-}
-
-const fn display_mode_from_execution_mode(mode: TerminalExecutionMode) -> TerminalMode {
-    match mode {
-        TerminalExecutionMode::Default
-        | TerminalExecutionMode::Ssh
-        | TerminalExecutionMode::Sandboxed => TerminalMode::Sandboxed,
-        TerminalExecutionMode::Unsafe => TerminalMode::Unsafe,
     }
 }
 
@@ -101,18 +90,27 @@ fn extract_output_text(result: &TerminalResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ToolStartKind, parse_tool_start};
-    use aither_sandbox::TerminalMode;
+    use aither_sandbox::TerminalExecutionMode;
 
     #[test]
     fn parse_tool_start_uses_actual_execution_mode() {
-        let args = r#"{"description":"say hi","script":"echo hi","mode":"unsafe","timeout":5}"#;
-        let start = parse_tool_start("terminal", args);
-        match start {
-            ToolStartKind::Terminal { command, mode } => {
-                assert_eq!(command, "echo hi");
-                assert_eq!(mode, TerminalMode::Unsafe);
+        for (mode_json, expected) in [
+            ("default", TerminalExecutionMode::Default),
+            ("sandboxed", TerminalExecutionMode::Sandboxed),
+            ("unsafe", TerminalExecutionMode::Unsafe),
+            ("ssh", TerminalExecutionMode::Ssh),
+        ] {
+            let args = format!(
+                r#"{{"description":"say hi","script":"echo hi","mode":"{mode_json}","timeout":5}}"#
+            );
+            let start = parse_tool_start("terminal", &args);
+            match start {
+                ToolStartKind::Terminal { command, mode } => {
+                    assert_eq!(command, "echo hi");
+                    assert_eq!(mode, expected);
+                }
+                ToolStartKind::Generic { .. } => panic!("expected terminal start event"),
             }
-            ToolStartKind::Generic { .. } => panic!("expected terminal start event"),
         }
     }
 }
