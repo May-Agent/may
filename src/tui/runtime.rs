@@ -515,8 +515,51 @@ pub struct RuntimeDeps {
     tool_dispatchers: ToolDispatchers,
     location_provider: Arc<crate::location::LocationProvider>,
     local_runtime: LocalSessionRuntime,
+    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     oneshot_model: Option<String>,
     oneshot_reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// An agent worker under construction off the event loop.
+///
+/// Construction prepares the session's tool environments, which may ask the
+/// user for SSH consent, so the event loop awaits [`Self::wait`] alongside its
+/// ask-user queue instead of blocking on it. Dropping the build cancels it.
+#[derive(Debug)]
+pub struct PendingWorkerBuild {
+    model: String,
+    task: std::pin::Pin<Box<executor_core::AnyExecutorTask<Result<AgentWorker, TuiRuntimeError>>>>,
+}
+
+impl PendingWorkerBuild {
+    /// Model the worker is being built for.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Waits for the worker; cancellation-safe, so it can be raced in a select.
+    ///
+    /// # Errors
+    /// Returns the agent construction failure.
+    pub async fn wait(&mut self) -> Result<AgentWorker, TuiRuntimeError> {
+        self.task.as_mut().await
+    }
+}
+
+/// Everything a worker build needs, owned so it runs off the event loop.
+struct WorkerBuildInputs {
+    deps: RuntimeDeps,
+    config: MayConfig,
+    db: ChatDb,
+    history_messages: Vec<aither_core::llm::Message>,
+    may_dir: std::path::PathBuf,
+    cwd: std::path::PathBuf,
+    profile_id: Option<String>,
+    sandbox_dir: std::path::PathBuf,
+    session_id: SessionId,
+    model: String,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl RuntimeDeps {
@@ -526,6 +569,7 @@ impl RuntimeDeps {
         ask_user_broker: AskUserBroker,
         tool_dispatchers: ToolDispatchers,
         location_provider: Arc<crate::location::LocationProvider>,
+        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     ) -> Self {
         Self {
             workspace_broker,
@@ -533,6 +577,7 @@ impl RuntimeDeps {
             tool_dispatchers,
             location_provider,
             local_runtime,
+            tool_distribution,
             oneshot_model: None,
             oneshot_reasoning_effort: None,
         }
@@ -549,11 +594,15 @@ impl RuntimeDeps {
         self
     }
 
-    pub async fn start_new_session(
+    /// Creates and activates a new session and starts building its worker.
+    ///
+    /// The previous session's worker is dropped at once; messages sent before
+    /// the new worker is ready are queued for it.
+    pub async fn begin_new_session(
         &self,
         app: &mut App,
         worker: &mut Option<AgentWorker>,
-    ) -> Result<(), TuiRuntimeError> {
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
         let model = self
             .oneshot_model
             .clone()
@@ -571,30 +620,29 @@ impl RuntimeDeps {
 
         app.session_manager.ensure_persisted().await?;
         app.init_session(&session_id, &messages, model.as_deref());
+        *worker = None;
         self.local_runtime.sync_app_queue(app, &session_id).await?;
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
-        let new_worker = self
-            .build_worker_for_session(
-                app,
-                sandbox_dir,
-                session_id,
-                selected_model.as_str(),
-                self.oneshot_reasoning_effort,
-            )
-            .await?;
-
-        app.set_current_model(selected_model.as_str());
-        *worker = Some(new_worker);
-        Ok(())
+        self.begin_worker_build(
+            app,
+            sandbox_dir,
+            session_id,
+            selected_model,
+            self.oneshot_reasoning_effort,
+        )
     }
 
-    pub async fn load_session(
+    /// Activates a stored session and starts building its worker.
+    ///
+    /// The previous session's worker is dropped at once; messages sent before
+    /// the new worker is ready are queued for it.
+    pub async fn begin_load_session(
         &self,
         app: &mut App,
         worker: &mut Option<AgentWorker>,
         id: &SessionId,
-    ) -> Result<(), TuiRuntimeError> {
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
         let session = app.session_manager.load_session(id).await?;
 
         let sandbox_dir = session.sandbox_dir.clone();
@@ -603,24 +651,20 @@ impl RuntimeDeps {
         let messages: Vec<_> = session.history.messages().to_vec();
 
         app.init_session(&session_id, &messages, session_model.as_deref());
+        *worker = None;
         self.local_runtime.sync_app_queue(app, &session_id).await?;
 
         let selected_model = SelectedModel::resolve(&app.config, session_model.as_deref())?;
-        let new_worker = self
-            .build_worker_for_session(app, sandbox_dir, session_id, selected_model.as_str(), None)
-            .await?;
-
-        app.set_current_model(selected_model.as_str());
-        *worker = Some(new_worker);
-        Ok(())
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
     }
 
-    pub async fn switch_model(
+    /// Starts building a worker for the current session on `model`; the
+    /// current worker keeps serving until the new one is installed.
+    pub fn begin_switch_model(
         &self,
-        app: &mut App,
-        worker: &mut Option<AgentWorker>,
+        app: &App,
         model: &str,
-    ) -> Result<(), TuiRuntimeError> {
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
         let session = app
             .session_manager
             .current()
@@ -629,14 +673,24 @@ impl RuntimeDeps {
         let sandbox_dir = session.sandbox_dir.clone();
         let session_id = session.id.clone();
 
-        let selected_model = SelectedModel::new(model)?;
-        let new_worker = self
-            .build_worker_for_session(app, sandbox_dir, session_id, selected_model.as_str(), None)
-            .await?;
+        self.begin_worker_build(
+            app,
+            sandbox_dir,
+            session_id,
+            SelectedModel::new(model)?,
+            None,
+        )
+    }
 
-        app.set_current_model(selected_model.as_str());
-        *worker = Some(new_worker);
-        Ok(())
+    /// Installs a worker finished by `build` as the current session's worker.
+    pub fn install_worker(
+        app: &mut App,
+        worker: &mut Option<AgentWorker>,
+        build: &PendingWorkerBuild,
+        built: AgentWorker,
+    ) {
+        app.set_current_model(build.model());
+        *worker = Some(built);
     }
 
     pub async fn start_agent_task(
@@ -724,157 +778,37 @@ impl RuntimeDeps {
         }
     }
 
-    async fn build_worker_for_session(
+    fn begin_worker_build(
         &self,
         app: &App,
         sandbox_dir: std::path::PathBuf,
         session_id: SessionId,
-        model: &str,
+        model: SelectedModel,
         reasoning_effort: Option<ReasoningEffort>,
-    ) -> Result<AgentWorker, TuiRuntimeError> {
-        let db = app.session_manager.db().clone();
-        let session_id_string = session_id.as_str().to_string();
-        let history_messages = app
-            .session_manager
-            .current()
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        let current = app.session_manager.current();
+        let history_messages = current
             .map(|session| session.history.to_aither_messages())
             .transpose()
-            .map_err(|e| TuiRuntimeError::HistoryReplay(e))?
+            .map_err(TuiRuntimeError::HistoryReplay)?
             .unwrap_or_default();
-        let may_dir = app.session_manager.may_dir().to_path_buf();
-        let profile_model = if let Some(profile_id) = app
-            .session_manager
-            .current()
-            .and_then(|session| session.profile_id.clone())
-        {
-            app.session_manager.db().get_profile(&profile_id).await?
-        } else {
-            None
-        };
-        let profile_persona = profile_model
-            .as_ref()
-            .and_then(|profile| profile.persona.clone());
-        let profile_memories = if let Some(ref profile) = profile_model {
-            let memories =
-                crate::memory::ProfileMemories::load(app.session_manager.db(), &profile.id).await?;
-            if memories.is_empty() {
-                None
-            } else {
-                Some(memories)
-            }
-        } else {
-            None
-        };
-        let location = if profile_model
-            .as_ref()
-            .is_some_and(|profile| profile.location_aware)
-        {
-            Some(
-                self.location_provider
-                    .get()
-                    .await
-                    .map_err(TuiRuntimeError::LocationFetch)?,
-            )
-        } else {
-            None
-        };
-        let profile_preferences = match profile_model.as_ref() {
-            Some(profile) => {
-                app.session_manager
-                    .db()
-                    .load_profile_preferences(profile)
-                    .await?
-            }
-            None => None,
-        };
-        let profile_environment = match profile_model.as_ref() {
-            Some(profile) => Some(
-                app.session_manager
-                    .db()
-                    .profile_info_from_model(profile.clone())
-                    .await?
-                    .environment
-                    .into_kind(),
-            ),
-            None => None,
-        };
-        let runtime = app
-            .session_manager
-            .db()
-            .get_session_runtime(session_id.as_str())
-            .await?
-            .unwrap_or_default();
-        let environment = resolve_agent_environment_for_tui(
-            profile_environment,
-            profile_model.as_ref(),
-            profile_preferences.and_then(|preferences| preferences.container),
-            &may_dir,
-            &sandbox_dir,
-            &session_id,
-        )
-        .await?;
-        let permission_approver = self.local_runtime.permission_approver_for(&session_id);
-        let mut agent = MayAgent::from_config_with_model_and_permissions(
-            &app.config,
+        let inputs = WorkerBuildInputs {
+            deps: self.clone(),
+            config: app.config.clone(),
+            db: app.session_manager.db().clone(),
+            history_messages,
+            may_dir: app.session_manager.may_dir().to_path_buf(),
+            cwd: app.cwd.clone(),
+            profile_id: current.and_then(|session| session.profile_id.clone()),
             sandbox_dir,
-            may_dir,
-            app.cwd.clone(),
             session_id,
-            self.workspace_broker.clone(),
-            self.ask_user_broker.clone(),
-            db.clone(),
-            model,
+            model: model.as_str().to_string(),
             reasoning_effort,
-            profile_model.as_ref().map(|profile| profile.id.clone()),
-            Some(permission_approver),
-            profile_persona,
-            profile_memories,
-            runtime.plan_state,
-            location,
-            Some(self.tool_dispatchers.task.clone()),
-            Some(self.tool_dispatchers.notify.clone()),
-            self.tool_dispatchers.browser.clone(),
-            Some(self.tool_dispatchers.register_skills.clone()),
-            Some(self.tool_dispatchers.register_subagents.clone()),
-            environment,
-            0,
-        )
-        .await?;
-
-        if let Some(snapshot) =
-            crate::session::load_persisted_context_snapshot(&db, &session_id_string).await?
-        {
-            let db_messages = db.get_messages(&session_id_string).await?;
-            let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
-            match crate::session::history_delta_since_snapshot(
-                &history_messages,
-                &db_ids,
-                snapshot.last_message_db_id,
-            ) {
-                Some(delta) => {
-                    agent.restore_checkpoint(snapshot.checkpoint.clone())?;
-                    for message in delta {
-                        agent.push_message(message);
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        session_id = %session_id_string,
-                        "context snapshot anchor is stale, falling back to full history replay"
-                    );
-                    let _ = db.delete_session_context_snapshot(&session_id_string).await;
-                    for message in history_messages {
-                        agent.push_message(message);
-                    }
-                }
-            }
-        } else {
-            for message in history_messages {
-                agent.push_message(message);
-            }
-        }
-
-        Ok(spawn_worker(DefaultExecutor, agent, db))
+        };
+        Ok(PendingWorkerBuild {
+            model: model.0,
+            task: Box::pin(spawn(build_worker_for_session(inputs))),
+        })
     }
 
     pub async fn enqueue_pending_message(
@@ -1095,24 +1029,145 @@ fn prepare_message_content(
     Ok((parts.join(""), attachment_urls))
 }
 
-async fn resolve_agent_environment_for_tui(
-    profile_environment: Option<crate::profile::ProfileEnvironment>,
-    profile_model: Option<&crate::db::entity::profiles::Model>,
-    container_preferences: Option<crate::profile::ContainerProfilePreferences>,
-    may_dir: &std::path::Path,
-    sandbox_dir: &std::path::Path,
-    session_id: &SessionId,
-) -> Result<crate::agent::AgentEnvironment, TuiRuntimeError> {
-    crate::agent::resolve_agent_environment_for_session(
-        profile_environment,
-        profile_model,
-        container_preferences,
+/// Builds a session's agent worker from owned inputs, off the event loop.
+async fn build_worker_for_session(
+    inputs: WorkerBuildInputs,
+) -> Result<AgentWorker, TuiRuntimeError> {
+    let WorkerBuildInputs {
+        deps,
+        config,
+        db,
+        history_messages,
         may_dir,
+        cwd,
+        profile_id,
         sandbox_dir,
         session_id,
+        model,
+        reasoning_effort,
+    } = inputs;
+    let session_id_string = session_id.as_str().to_string();
+    let profile_model = match profile_id {
+        Some(profile_id) => db.get_profile(&profile_id).await?,
+        None => None,
+    };
+    let profile_persona = profile_model
+        .as_ref()
+        .and_then(|profile| profile.persona.clone());
+    let profile_memories = if let Some(ref profile) = profile_model {
+        let memories = crate::memory::ProfileMemories::load(&db, &profile.id).await?;
+        if memories.is_empty() {
+            None
+        } else {
+            Some(memories)
+        }
+    } else {
+        None
+    };
+    let location = if profile_model
+        .as_ref()
+        .is_some_and(|profile| profile.location_aware)
+    {
+        Some(
+            deps.location_provider
+                .get()
+                .await
+                .map_err(TuiRuntimeError::LocationFetch)?,
+        )
+    } else {
+        None
+    };
+    let profile_preferences = match profile_model.as_ref() {
+        Some(profile) => db.load_profile_preferences(profile).await?,
+        None => None,
+    };
+    let profile_environment = match profile_model.as_ref() {
+        Some(profile) => Some(
+            db.profile_info_from_model(profile.clone())
+                .await?
+                .environment
+                .into_kind(),
+        ),
+        None => None,
+    };
+    let runtime = db
+        .get_session_runtime(session_id.as_str())
+        .await?
+        .unwrap_or_default();
+    let environment = crate::agent::resolve_agent_environment_for_session(
+        profile_environment,
+        profile_model.as_ref(),
+        profile_preferences.and_then(|preferences| preferences.container),
+        &may_dir,
+        &sandbox_dir,
+        &session_id,
+        &deps.tool_distribution,
     )
     .await
-    .map_err(TuiRuntimeError::ResolveAgentEnvironment)
+    .map_err(TuiRuntimeError::ResolveAgentEnvironment)?;
+    let permission_approver = deps.local_runtime.permission_approver_for(&session_id);
+    let mut agent = MayAgent::from_config_with_model_and_permissions(
+        &config,
+        sandbox_dir,
+        may_dir,
+        cwd,
+        session_id,
+        deps.workspace_broker.clone(),
+        deps.ask_user_broker.clone(),
+        db.clone(),
+        &model,
+        reasoning_effort,
+        profile_model.as_ref().map(|profile| profile.id.clone()),
+        Some(permission_approver),
+        profile_persona,
+        profile_memories,
+        runtime.plan_state,
+        location,
+        Some(deps.tool_dispatchers.task.clone()),
+        Some(deps.tool_dispatchers.notify.clone()),
+        deps.tool_dispatchers.browser.clone(),
+        Some(deps.tool_dispatchers.register_skills.clone()),
+        Some(deps.tool_dispatchers.register_subagents.clone()),
+        environment,
+        deps.tool_distribution.clone(),
+        0,
+    )
+    .await?;
+
+    if let Some(snapshot) =
+        crate::session::load_persisted_context_snapshot(&db, &session_id_string).await?
+    {
+        let db_messages = db.get_messages(&session_id_string).await?;
+        let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
+        match crate::session::history_delta_since_snapshot(
+            &history_messages,
+            &db_ids,
+            snapshot.last_message_db_id,
+        ) {
+            Some(delta) => {
+                agent.restore_checkpoint(snapshot.checkpoint.clone())?;
+                for message in delta {
+                    agent.push_message(message);
+                }
+            }
+            None => {
+                tracing::warn!(
+                    session_id = %session_id_string,
+                    "context snapshot anchor is stale, falling back to full history replay"
+                );
+                let _ = db.delete_session_context_snapshot(&session_id_string).await;
+                for message in history_messages {
+                    agent.push_message(message);
+                }
+            }
+        }
+    } else {
+        for message in history_messages {
+            agent.push_message(message);
+        }
+    }
+
+    Ok(spawn_worker(DefaultExecutor, agent, db))
 }
 
 #[derive(Serialize)]

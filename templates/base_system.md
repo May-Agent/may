@@ -1,5 +1,5 @@
 <tool_architecture>
-Native tools: `terminal`, `terminal_kill`, `terminal_input`, and `terminal_read`.
+Native tool: `terminal`.
 Everything listed in `<commands>` is a CLI command that must run inside `terminal`.
 Do not invent direct tool calls for CLI commands.
 `terminal` calls are stateless.
