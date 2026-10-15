@@ -59,28 +59,12 @@ pub struct SharedTerminalCommandConfig<LLM> {
 
 pub async fn register_shared_terminal_commands<LLM>(
     builder: &mut ToolRegistryBuilder,
-    terminal_jobs: aither_sandbox::JobRegistry,
     config: SharedTerminalCommandConfig<LLM>,
 ) -> Result<Vec<(String, String)>, crate::mcp::McpConnectionLoadError>
 where
     LLM: LanguageModel + Clone + 'static,
 {
     let mut descriptions = Vec::new();
-    register_tool_with_description(
-        builder,
-        &mut descriptions,
-        aither_sandbox::builtin::KillTerminalTool::new(terminal_jobs.clone()),
-    );
-    register_tool_with_description(
-        builder,
-        &mut descriptions,
-        aither_sandbox::builtin::InputTerminalTool::new(terminal_jobs.clone()),
-    );
-    register_tool_with_description(
-        builder,
-        &mut descriptions,
-        aither_sandbox::builtin::ReadTerminalDeltaTool::new(terminal_jobs),
-    );
 
     if !config.request_parameters.hosted_web_search() {
         register_tool_with_description(builder, &mut descriptions, WebSearchTool::default());
@@ -304,7 +288,6 @@ mod tests {
 
         let descriptions = register_shared_terminal_commands(
             &mut builder,
-            aither_sandbox::job_registry_channel().0,
             SharedTerminalCommandConfig {
                 llm: MockLlm,
                 ask_flagship: None,
@@ -356,7 +339,6 @@ mod tests {
 
         let descriptions = register_shared_terminal_commands(
             &mut builder,
-            aither_sandbox::job_registry_channel().0,
             SharedTerminalCommandConfig {
                 llm: MockLlm,
                 ask_flagship: None,
@@ -409,7 +391,6 @@ mod tests {
 
         let descriptions = register_shared_terminal_commands(
             &mut builder,
-            aither_sandbox::job_registry_channel().0,
             SharedTerminalCommandConfig {
                 llm: MockLlm,
                 ask_flagship: None,
@@ -450,7 +431,6 @@ mod tests {
 
         let descriptions = register_shared_terminal_commands(
             &mut builder,
-            aither_sandbox::job_registry_channel().0,
             SharedTerminalCommandConfig {
                 llm: MockLlm,
                 ask_flagship: None,

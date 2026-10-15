@@ -13,24 +13,30 @@ export function useArtifactValidation({
   path,
   artifactType,
 }: ArtifactValidationOptions) {
+  const artifactKey = `${artifactType}:${path}:${sessionId}`;
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const reportedRef = useRef(new Set<string>());
-  const [diagnostics, setDiagnostics] = useState<string[] | null>(null);
-  const [repairScheduled, setRepairScheduled] = useState(false);
-
-  const resetValidation = useCallback(() => {
-    setDiagnostics(null);
-    setRepairScheduled(false);
-    reportedRef.current.clear();
-  }, []);
+  const reportedRef = useRef<{ key: string; reported: Set<string> }>({
+    key: artifactKey,
+    reported: new Set(),
+  });
+  // Validation state is keyed by artifact identity so a sessionId/path switch
+  // derives empty state instead of requiring an effect-driven reset.
+  const [validation, setValidation] = useState<{
+    key: string;
+    diagnostics: string[] | null;
+    repairScheduled: boolean;
+  }>({ key: artifactKey, diagnostics: null, repairScheduled: false });
 
   const publishDiagnostics = useCallback(
     async (nextDiagnostics: string[]) => {
-      setDiagnostics(nextDiagnostics);
+      setValidation({ key: artifactKey, diagnostics: nextDiagnostics, repairScheduled: false });
       if (nextDiagnostics.length === 0) return;
+      if (reportedRef.current.key !== artifactKey) {
+        reportedRef.current = { key: artifactKey, reported: new Set() };
+      }
       const reportKey = nextDiagnostics.join('\n');
-      if (reportedRef.current.has(reportKey)) return;
-      reportedRef.current.add(reportKey);
+      if (reportedRef.current.reported.has(reportKey)) return;
+      reportedRef.current.reported.add(reportKey);
       try {
         const response = await reportArtifactDiagnostics(
           sessionId,
@@ -38,19 +44,23 @@ export function useArtifactValidation({
           artifactType,
           nextDiagnostics,
         );
-        setRepairScheduled(response.repairScheduled);
+        setValidation((current) =>
+          current.key === artifactKey
+            ? { ...current, repairScheduled: response.repairScheduled }
+            : current,
+        );
       } catch (error) {
         const message =
           error instanceof Error ? error.message : 'Failed to report artifact diagnostics';
-        setDiagnostics((current) => [...(current ?? []), message]);
+        setValidation((current) =>
+          current.key === artifactKey
+            ? { ...current, diagnostics: [...(current.diagnostics ?? []), message] }
+            : current,
+        );
       }
     },
-    [artifactType, path, sessionId],
+    [artifactKey, artifactType, path, sessionId],
   );
-
-  useEffect(() => {
-    resetValidation();
-  }, [artifactType, path, resetValidation, sessionId]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<unknown>) => {
@@ -63,11 +73,11 @@ export function useArtifactValidation({
     return () => window.removeEventListener('message', onMessage);
   }, [artifactType, publishDiagnostics]);
 
+  const current = validation.key === artifactKey ? validation : null;
   return {
-    diagnostics,
+    diagnostics: current?.diagnostics ?? null,
     iframeRef,
     publishDiagnostics,
-    repairScheduled,
-    resetValidation,
+    repairScheduled: current?.repairScheduled ?? false,
   };
 }
