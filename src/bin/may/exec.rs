@@ -60,6 +60,8 @@ pub enum ExecError {
     InitializeToolDispatch(may_agent::tool_dispatch::ToolDispatchError),
     #[error("failed to configure ssh servers: {0}")]
     ConfigureSshServers(String),
+    #[error("ssh server '{0}' is not attached to the session's profile")]
+    SshServerNotAttached(String),
     #[error("terminal execution failed: {0}")]
     TerminalCall(aither_core::Error),
     #[error("failed to parse terminal result: {0}")]
@@ -110,6 +112,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         .await
         .map_err(ExecError::LoadConfig)?;
 
+    let tool_distribution = Arc::new(may_agent::tools::embedded_distribution()?);
     let environment = resolve_agent_environment_for_session(
         context.profile_environment.clone(),
         context.profile_model.as_ref(),
@@ -117,6 +120,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         &context.may_dir,
         &context.sandbox_dir,
         &context.session_id,
+        &tool_distribution,
     )
     .await
     .map_err(ExecError::ResolveEnvironment)?;
@@ -128,7 +132,9 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         &environment,
         &may_config,
         &model,
+        args.ssh_server_id.as_deref(),
         args.allow_runtime_install,
+        tool_distribution,
     )
     .await?;
 
@@ -292,7 +298,9 @@ async fn build_exec_terminal_tool(
     environment: &may_agent::AgentEnvironment,
     may_config: &MayConfig,
     model: &str,
+    ssh_server_id: Option<&str>,
     allow_runtime_install: bool,
+    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
 ) -> Result<
     TerminalTool<
         TerminalPermissionHandler,
@@ -301,8 +309,13 @@ async fn build_exec_terminal_tool(
     >,
     ExecError,
 > {
-    let ssh_servers = resolve_attached_ssh_servers(context, may_config).await?;
-    let ssh_available = !ssh_servers.is_empty();
+    // Only the targeted server is registered, so a local exec never depends
+    // on the state of the profile's other attached servers.
+    let ssh_server = match ssh_server_id {
+        Some(server_id) => Some(resolve_targeted_ssh_server(context, may_config, server_id).await?),
+        None => None,
+    };
+    let ssh_available = ssh_server.is_some();
     let mut shell_sessions = aither_sandbox::ShellSessionRegistry::new(match environment {
         may_agent::AgentEnvironment::Container { .. } => ShellRuntimeAvailability {
             local: false,
@@ -316,9 +329,9 @@ async fn build_exec_terminal_tool(
         },
     });
 
-    if !ssh_servers.is_empty() {
+    if let Some(ssh_server) = ssh_server {
         shell_sessions = shell_sessions
-            .with_ssh_servers(ssh_servers)
+            .with_ssh_servers(vec![ssh_server])
             .map_err(ExecError::ConfigureSshServers)?
             .with_ssh_authorizer(Arc::new(ExecSshAuthorizer {
                 allow_runtime_install,
@@ -378,27 +391,40 @@ async fn build_exec_terminal_tool(
         _ => terminal_tool.with_shell_sessions(shell_sessions),
     };
 
-    let distribution = may_config.tools.load_distribution().await?;
-    let terminal_tool = terminal_tool
-        .with_process_priority(may_config.sandbox.command_priority.process_priority())
-        .initialize_tools(&distribution, &context.may_dir.join("tools/cache"))
-        .await?;
-    let resolved_provider = resolve_provider_runtime(may_config, model, 0)
-        .await
-        .map_err(ExecError::ResolveProviderRuntime)?;
-    let (terminal_tool_factory, terminal_tool_factory_receiver) = terminal_tool_factory_channel();
-    let tool_dispatchers = may_agent::tool_dispatch::ToolDispatchers::spawn(
-        may_agent::tool_dispatch::ToolDispatchConfig {
-            may_dir: context.may_dir.clone(),
-            cwd: context.sandbox_dir.clone(),
-            db: context.db.clone(),
-            browser_config: may_config.browser.clone(),
-            network_policy: may_config.preferences.network_policy.clone(),
-            ask_user_broker: may_agent::ask_user::channel().0,
+    let tools_dir = may_agent::MayHomePaths::new(context.may_dir.clone()).tools_dir();
+    let (terminal_tool, (resolved_provider, tool_dispatchers)) = futures_lite::future::try_zip(
+        async {
+            terminal_tool
+                .with_process_priority(may_config.sandbox.command_priority.process_priority())
+                .initialize_tools(&tool_distribution, &tools_dir)
+                .await
+                .map_err(ExecError::InitializeBaselineTools)
         },
+        futures_lite::future::try_zip(
+            async {
+                resolve_provider_runtime(may_config, model, 0)
+                    .await
+                    .map_err(ExecError::ResolveProviderRuntime)
+            },
+            async {
+                may_agent::tool_dispatch::ToolDispatchers::spawn(
+                    may_agent::tool_dispatch::ToolDispatchConfig {
+                        may_dir: context.may_dir.clone(),
+                        cwd: context.sandbox_dir.clone(),
+                        db: context.db.clone(),
+                        browser_config: may_config.browser.clone(),
+                        network_policy: may_config.preferences.network_policy.clone(),
+                        ask_user_broker: may_agent::ask_user::channel().0,
+                        tool_distribution: tool_distribution.clone(),
+                    },
+                )
+                .await
+                .map_err(ExecError::InitializeToolDispatch)
+            },
+        ),
     )
-    .await
-    .map_err(ExecError::InitializeToolDispatch)?;
+    .await?;
+    let (terminal_tool_factory, terminal_tool_factory_receiver) = terminal_tool_factory_channel();
     let registry = build_exec_registry(
         context,
         may_config,
@@ -406,7 +432,6 @@ async fn build_exec_terminal_tool(
         resolved_provider.search_embedder,
         &tool_dispatchers,
         terminal_tool_factory,
-        terminal_tool.job_registry(),
         environment,
     )
     .await?;
@@ -422,7 +447,6 @@ async fn build_exec_registry<LLM>(
     search_embedder: may_agent::embedding_provider::EmbeddingModelResolution,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     terminal_tool_factory: aither_sandbox::TerminalToolFactory,
-    terminal_jobs: aither_sandbox::JobRegistry,
     environment: &may_agent::AgentEnvironment,
 ) -> Result<Arc<aither_sandbox::ToolRegistry>, ExecError>
 where
@@ -431,7 +455,6 @@ where
     let mut builder = aither_sandbox::ToolRegistryBuilder::new();
     register_shared_terminal_commands(
         &mut builder,
-        terminal_jobs,
         SharedTerminalCommandConfig {
             llm,
             ask_flagship: None,
@@ -466,10 +489,12 @@ where
     )))
 }
 
-async fn resolve_attached_ssh_servers(
+/// Resolves `server_id` among the SSH servers attached to the session's profile.
+async fn resolve_targeted_ssh_server(
     context: &ExecSessionContext,
     may_config: &MayConfig,
-) -> Result<Vec<SshServer>, ExecError> {
+    server_id: &str,
+) -> Result<SshServer, ExecError> {
     let profile_id = context.profile_model.as_ref().map(|p| p.id.as_str());
     let servers = may_agent::profile::resolve_attached_ssh_servers(
         &context.db,
@@ -481,13 +506,14 @@ async fn resolve_attached_ssh_servers(
         profile_id: profile_id.unwrap_or_default().to_string(),
         source,
     })?;
-    Ok(servers
+    servers
         .into_iter()
         .map(|s| SshServer {
             name: s.name,
             target: s.target,
         })
-        .collect())
+        .find(|server| server.id() == server_id)
+        .ok_or_else(|| ExecError::SshServerNotAttached(server_id.to_string()))
 }
 
 fn select_exec_model(config: &MayConfig) -> String {
