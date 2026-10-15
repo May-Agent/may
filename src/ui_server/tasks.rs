@@ -428,8 +428,7 @@ async fn run_update_task(
     };
     let normalized_run_at_update = match current_kind {
         TaskTriggerKind::Time => normalized_run_at.as_deref().map(Some),
-        TaskTriggerKind::Event => None,
-        TaskTriggerKind::Webhook => None,
+        TaskTriggerKind::Event | TaskTriggerKind::Webhook => None,
     };
 
     db.update_scheduled_task(

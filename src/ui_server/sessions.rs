@@ -19,9 +19,10 @@ use super::model_resolution::{
 };
 use super::state::UiServerState;
 use super::types::{
-    ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, SessionContextDebugResponse,
-    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse,
-    SessionPlanStateRequest, SessionPlanStateResponse, SessionTasksPayload, UpdateSessionRequest,
+    ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, NullableStringPatch,
+    SessionContextDebugResponse, SessionContextWindowMetricsResponse,
+    SessionContextWindowSnapshotResponse, SessionPlanStateRequest, SessionPlanStateResponse,
+    SessionTasksPayload, UpdateSessionRequest,
 };
 
 fn session_not_found_error(session_id: &str) -> SkyError {
@@ -112,8 +113,7 @@ pub(super) async fn get_session_context_debug(
         .get_session_context_snapshot(&id)
         .await
         .map_err(internal_error)?
-        .map(build_window_snapshot)
-        .transpose()?;
+        .map(build_window_snapshot);
 
     Ok(Json(SessionContextDebugResponse {
         session_id: row.session_id,
@@ -207,10 +207,10 @@ pub(super) async fn save_session_tasks(
 
 fn build_window_snapshot(
     snapshot: crate::db::StoredSessionContextSnapshot,
-) -> Result<SessionContextWindowSnapshotResponse, skyzen::Error> {
+) -> SessionContextWindowSnapshotResponse {
     let window = snapshot.checkpoint.context_window;
 
-    Ok(SessionContextWindowSnapshotResponse {
+    SessionContextWindowSnapshotResponse {
         phase: window.phase,
         metrics: SessionContextWindowMetricsResponse::from(window.metrics),
         assembled_messages: window
@@ -218,7 +218,7 @@ fn build_window_snapshot(
             .iter()
             .map(map_context_window_message)
             .collect(),
-    })
+    }
 }
 
 fn map_context_window_message(message: &LlmMessage) -> ContextDebugMessage {
@@ -336,7 +336,8 @@ pub(super) async fn update_session(
     let next_title = requested_title.clone().or_else(|| session.title.clone());
     let next_model = requested_model.clone().or_else(|| session.model.clone());
     let next_effort = match requested_effort_patch.as_ref() {
-        Some(patch) => patch.clone(),
+        Some(NullableStringPatch::Null) => None,
+        Some(NullableStringPatch::Set(value)) => Some(value.clone()),
         None => session.reasoning_effort.clone(),
     };
 
@@ -346,9 +347,10 @@ pub(super) async fn update_session(
         model_to_persist = Some(model);
     }
 
-    let effort_patch_ref = requested_effort_patch
-        .as_ref()
-        .map(|inner| inner.as_deref());
+    let effort_patch_ref = requested_effort_patch.as_ref().map(|inner| match inner {
+        NullableStringPatch::Null => None,
+        NullableStringPatch::Set(value) => Some(value.as_str()),
+    });
 
     db.update_session(
         &id,

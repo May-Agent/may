@@ -15,6 +15,13 @@ use super::entity::{folders, profiles, sessions};
 use super::{ChatDb, ChatDbError, query};
 
 impl ChatDb {
+    /// Assemble [`ProfilePreferences`] for `profile` from its row and stored
+    /// container mounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when reading the container mounts fails or a stored
+    /// mount access value cannot be parsed.
     pub async fn load_profile_preferences(
         &self,
         profile: &profiles::Model,
@@ -41,6 +48,14 @@ impl ChatDb {
         Ok(build_profile_preferences(profile, mounts))
     }
 
+    /// Convert a profile row into [`ProfileInfo`](crate::profile::ProfileInfo),
+    /// resolving its preferences and SSH server attachments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when loading the profile's preferences or remote
+    /// server attachments fails, or the row cannot be converted into
+    /// [`ProfileInfo`](crate::profile::ProfileInfo).
     pub async fn profile_info_from_model(
         &self,
         profile: profiles::Model,
@@ -52,6 +67,10 @@ impl ChatDb {
 
     /// Return SSH server names attached to this profile, ordered by
     /// `sort_order` ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the attachment query fails.
     pub async fn list_profile_remote_servers(
         &self,
         profile_id: &str,
@@ -71,6 +90,10 @@ impl ChatDb {
     /// Remove all profile attachments that reference the given SSH server
     /// name. Called when an SSH server is deleted from the global config so
     /// no profile ends up pointing at a server that no longer exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the delete fails.
     pub async fn remove_profile_attachments_for_server(
         &self,
         ssh_server_name: &str,
@@ -88,6 +111,11 @@ impl ChatDb {
     /// Replace the full attachment list for a profile with the given names,
     /// preserving order. Caller must have validated that each name exists in
     /// the global SSH server configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the transaction fails or an attachment ordinal
+    /// does not fit into `i32`.
     pub async fn set_profile_remote_servers(
         &self,
         profile_id: &str,
@@ -120,6 +148,13 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Return the container-specific section of the profile's preferences, or
+    /// `None` when the profile has no container preferences.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when reading the container mounts fails or a stored
+    /// mount access value cannot be parsed.
     pub async fn load_container_profile_preferences(
         &self,
         profile: &profiles::Model,
@@ -133,6 +168,11 @@ impl ChatDb {
     // ── Profile CRUD ────────────────────────────────────────────
 
     /// Create a new profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the insert transaction fails, a mount ordinal
+    /// does not fit into `i64`, or the newly inserted row cannot be read back.
     pub async fn create_profile(
         &self,
         params: CreateProfileParams<'_>,
@@ -151,8 +191,7 @@ impl ChatDb {
         let container_mounts = preferences
             .as_ref()
             .and_then(|value| value.container.as_ref())
-            .map(|value| value.mounts.as_slice())
-            .unwrap_or(&[]);
+            .map_or(&[][..], |value| value.mounts.as_slice());
         let mut tx = self.db.begin().await?;
         query!(
             tx,
@@ -194,6 +233,10 @@ impl ChatDb {
     }
 
     /// List all profiles ordered by `sort_order`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the query fails.
     pub async fn list_profiles(&self) -> Result<Vec<profiles::Model>, ChatDbError> {
         Ok(
             query!(self.db, "SELECT * FROM profiles ORDER BY sort_order ASC")
@@ -203,6 +246,10 @@ impl ChatDb {
     }
 
     /// Get a profile by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the query fails.
     pub async fn get_profile(&self, id: &str) -> Result<Option<profiles::Model>, ChatDbError> {
         Ok(query!(self.db, "SELECT * FROM profiles WHERE id = ?", id)
             .fetch_optional::<profiles::Model>()
@@ -210,6 +257,13 @@ impl ChatDb {
     }
 
     /// Update profile fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError::RowNotFound`] when no profile with `id` exists,
+    /// [`ChatDbError::InvalidProfileEnvironment`] when the stored environment value
+    /// is not recognized, or [`ChatDbError`] when a query in the update transaction
+    /// fails.
     pub async fn update_profile(
         &self,
         id: &str,
@@ -249,10 +303,11 @@ impl ChatDb {
         }
         let environment = parse_profile_environment(existing.environment.as_str())?;
         let current_preferences = self.load_profile_preferences(&existing).await?;
-        let merged_preferences = match params.preferences {
-            Some(preferences) => normalize_profile_preferences(environment, preferences),
-            None => current_preferences,
-        };
+        let merged_preferences = params
+            .preferences
+            .map_or(current_preferences, |preferences| {
+                normalize_profile_preferences(environment, preferences)
+            });
         existing.container_dockerfile = merged_preferences
             .as_ref()
             .and_then(|value| value.container.as_ref())
@@ -260,8 +315,7 @@ impl ChatDb {
         let container_mounts = merged_preferences
             .as_ref()
             .and_then(|value| value.container.as_ref())
-            .map(|value| value.mounts.as_slice())
-            .unwrap_or(&[]);
+            .map_or(&[][..], |value| value.mounts.as_slice());
         existing.updated_at = jiff::Timestamp::now().to_string();
         let mut tx = self.db.begin().await?;
         query!(
@@ -308,6 +362,10 @@ impl ChatDb {
     }
 
     /// Delete a profile and reassign its sessions to the default profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the delete or the session reassignment fails.
     pub async fn delete_profile(&self, id: &str) -> Result<(), ChatDbError> {
         query!(
             self.db,
@@ -326,6 +384,10 @@ impl ChatDb {
     }
 
     /// Get a profile by its well-known slug ("daily", "work", "local").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the query fails.
     pub async fn get_profile_by_slug(
         &self,
         slug: &str,
@@ -340,6 +402,14 @@ impl ChatDb {
     /// Ensure the three default profiles (daily, work, local) exist.
     ///
     /// Returns the ID of the first profile (daily).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when reading or inserting a default profile fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no default profile ID exists after all defaults have been ensured.
     pub async fn ensure_default_profiles(&self) -> Result<String, ChatDbError> {
         let local_hostname = hostname::get().map_or_else(
             |_| "local".to_string(),
@@ -412,6 +482,11 @@ impl ChatDb {
     // ── Folder CRUD ─────────────────────────────────────────────
 
     /// Create a folder in a profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError::PinnedLimitExceeded`] when the profile's pinned-item
+    /// limit is already reached, or [`ChatDbError`] when the insert fails.
     pub async fn create_folder(
         &self,
         id: &str,
@@ -443,6 +518,10 @@ impl ChatDb {
     }
 
     /// List folders for a profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the query fails.
     pub async fn list_folders(&self, profile_id: &str) -> Result<Vec<folders::Model>, ChatDbError> {
         Ok(query!(
             self.db,
@@ -454,6 +533,10 @@ impl ChatDb {
     }
 
     /// Update a folder's name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the update fails.
     pub async fn update_folder(&self, id: &str, name: &str) -> Result<(), ChatDbError> {
         query!(
             self.db,
@@ -467,6 +550,10 @@ impl ChatDb {
     }
 
     /// Update a folder's sort order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the update fails.
     pub async fn update_folder_sort_order(
         &self,
         id: &str,
@@ -484,6 +571,11 @@ impl ChatDb {
     }
 
     /// Delete a folder and unpin its sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when unpinning the folder's sessions or the delete
+    /// fails.
     pub async fn delete_folder(&self, id: &str) -> Result<(), ChatDbError> {
         query!(self.db, "UPDATE sessions SET folder_id = NULL, pinned = FALSE, pin_sort_order = NULL WHERE folder_id = ?", id)
             .execute()
@@ -508,6 +600,13 @@ impl ChatDb {
     // ── Session Profile Operations ──────────────────────────────
 
     /// Pin a session in its profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError::RowNotFound`] when the session does not exist or is
+    /// not attached to a profile, [`ChatDbError::PinnedLimitExceeded`] when pinning
+    /// would exceed the profile's pinned-item limit, or [`ChatDbError`] when the
+    /// update fails.
     pub async fn pin_session(&self, id: &str) -> Result<(), ChatDbError> {
         let session = self
             .get_session(id)
@@ -538,6 +637,10 @@ impl ChatDb {
     }
 
     /// Unpin a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the update fails.
     pub async fn unpin_session(&self, id: &str) -> Result<(), ChatDbError> {
         query!(self.db, "UPDATE sessions SET pinned = FALSE, folder_id = NULL, pin_sort_order = NULL WHERE id = ?", id)
             .execute()
@@ -546,6 +649,12 @@ impl ChatDb {
     }
 
     /// Archive a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError::Storage`] when the session still has an active
+    /// runtime or pending follow-up work, [`ChatDbError::RowNotFound`] when the
+    /// session does not exist, or [`ChatDbError`] when a query fails.
     pub async fn archive_session(&self, id: &str) -> Result<(), ChatDbError> {
         let runtime = self.load_session_runtime_summary(id).await?;
         if runtime.is_active() {
@@ -565,6 +674,10 @@ impl ChatDb {
     }
 
     /// Unarchive (reopen) a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the update fails.
     pub async fn unarchive_session(&self, id: &str) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         query!(self.db, "UPDATE sessions SET archived = FALSE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL, updated_at = ? WHERE id = ?", now, id)
@@ -574,6 +687,14 @@ impl ChatDb {
     }
 
     /// Move a session to a folder (or out of a folder if `folder_id` is None).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError::RowNotFound`] when the session or target folder does
+    /// not exist, when the session is not attached to a profile, or when the folder
+    /// belongs to a different profile; [`ChatDbError::Storage`] when the session is
+    /// archived or unpinned; and [`ChatDbError::PinnedLimitExceeded`] when moving
+    /// the session out of a folder would exceed the profile's pinned-item limit.
     pub async fn move_session_to_folder(
         &self,
         session_id: &str,
@@ -637,6 +758,10 @@ impl ChatDb {
     }
 
     /// Set a session's `profile_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the update fails.
     pub async fn set_session_profile(
         &self,
         session_id: &str,
@@ -654,6 +779,10 @@ impl ChatDb {
     }
 
     /// List sessions for a specific profile, ordered by `updated_at` descending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the query fails.
     pub async fn list_sessions_for_profile(
         &self,
         profile_id: &str,
@@ -668,6 +797,10 @@ impl ChatDb {
     }
 
     /// Find non-pinned, non-archived sessions with `updated_at` before the cutoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when the query fails.
     pub async fn sessions_needing_archive(
         &self,
         cutoff: &str,
@@ -730,6 +863,10 @@ impl ChatDb {
     }
 
     /// Count pinned items (sessions + folders) in a profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`] when a count query fails.
     pub async fn pinned_count(&self, profile_id: &str) -> Result<i64, ChatDbError> {
         let session_count = query!(self.db, "SELECT COUNT(*) AS value FROM sessions WHERE profile_id = ? AND pinned = TRUE AND folder_id IS NULL", profile_id)
             .fetch_one::<I64ValueRow>()

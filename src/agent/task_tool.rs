@@ -8,14 +8,18 @@ use std::borrow::Cow;
 
 use crate::task_trigger::{NormalizedTaskTrigger, TaskTriggerRequest, TaskTriggerResponse};
 
+/// Runtime a scheduled task executes in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskRuntimeKind {
+    /// Runs on the host via the local heel runtime.
     Local,
+    /// Runs inside the session's container.
     Container,
 }
 
 impl TaskRuntimeKind {
+    /// Return the serialized name of the runtime kind.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -48,10 +52,14 @@ pub struct TaskArgs {
     pub needs_network: Option<bool>,
 }
 
+/// Request to create a scheduled task, delivered over the task broker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCreateRequest {
+    /// Session the task belongs to.
     pub session_id: String,
+    /// Runtime the task executes in.
     pub runtime: TaskRuntimeKind,
+    /// Task arguments supplied by the tool call.
     pub args: TaskArgs,
 }
 
@@ -70,12 +78,18 @@ pub struct NormalizedTaskCreateRequest {
     pub needs_network: bool,
 }
 
+/// Outcome of a handled task-create request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCreateResult {
+    /// ID assigned to the created task.
     pub task_id: String,
+    /// Profile the task was created under.
     pub profile_id: String,
+    /// Normalized trigger stored for the task.
     pub trigger: TaskTriggerResponse,
+    /// Whether the user approved creating the task.
     pub approved: bool,
+    /// Whether the task is enabled to fire.
     pub enabled: bool,
 }
 
@@ -90,7 +104,11 @@ struct TaskToolResponse {
     approval_required: bool,
 }
 
+/// Broker half of the task-request channel: submits create requests to the
+/// session runtime.
 pub type TaskBroker = ToolRequestBroker<TaskCreateRequest, Result<TaskCreateResult, String>>;
+/// Queue half of the task-request channel: the session runtime drains pending
+/// create requests from it.
 pub type TaskQueue = ToolRequestQueue<TaskCreateRequest, Result<TaskCreateResult, String>>;
 
 #[derive(Debug, thiserror::Error)]
@@ -101,12 +119,22 @@ enum TaskToolError {
     Rejected(String),
 }
 
+/// Create a paired task broker and queue for a session.
 #[must_use]
 pub fn channel() -> (TaskBroker, TaskQueue) {
     tool_request_channel()
 }
 
 impl TaskCreateRequest {
+    /// Validate the request and produce the normalized form used to create the
+    /// task.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when the task name is empty, the trigger
+    /// fails normalization, the script spec is invalid (both or neither of
+    /// `script_path`/`script_inline` set), or a local task does not set
+    /// `needs_network` explicitly.
     pub fn normalize(self) -> Result<NormalizedTaskCreateRequest, String> {
         let name = self.args.name.trim();
         if name.is_empty() {

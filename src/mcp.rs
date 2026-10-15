@@ -256,11 +256,13 @@ pub enum McpConnectionState {
 impl McpConnectionState {
     /// Check if the server is connected.
     /// Whether the status is `Connected`.
+    #[must_use]
     pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Connected(_))
     }
 
     /// Get the connection if connected.
+    #[must_use]
     pub fn connection(&self) -> Option<&McpConnection> {
         if let Self::Connected(conn) = self {
             Some(&**conn)
@@ -284,9 +286,17 @@ impl McpConnectionState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpServerSource {
     /// Remote MCP server reached by URL.
-    Url { url: String },
+    Url {
+        /// Server URL the client connects to.
+        url: String,
+    },
     /// Local MCP server spawned as a process.
-    Process { command: String, args: Vec<String> },
+    Process {
+        /// Program used to spawn the server.
+        command: String,
+        /// Arguments passed to the command.
+        args: Vec<String>,
+    },
     /// No usable source recorded.
     Unknown,
 }
@@ -312,19 +322,24 @@ impl std::fmt::Display for McpServerSource {
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum McpServerStatus {
+    /// Server is not connected.
     Disconnected,
+    /// A connection attempt is in progress.
     Connecting,
     /// Connected; `tool_count` tools are exposed.
     Connected {
+        /// Number of tools the server exposes.
         tool_count: usize,
     },
     /// Connection failed; `message` describes the error.
     Error {
+        /// Error message from the failed connection.
         message: String,
     },
 }
 
 impl McpServerStatus {
+    /// Whether the status is `Connected`.
     #[must_use]
     pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Connected { .. })

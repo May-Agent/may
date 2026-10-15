@@ -281,6 +281,17 @@ pub enum NotificationMailboxStatus {
     Failed,
 }
 
+impl NotificationMailboxStatus {
+    fn from_stored(raw: &str) -> Self {
+        match raw {
+            "pending" => Self::Pending,
+            "delivered" => Self::Delivered,
+            "failed" => Self::Failed,
+            other => panic!("unknown notification mailbox status: {other}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationMailboxEntryResponse {
@@ -304,12 +315,7 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
             title: value.title,
             body: value.body,
             session_id: value.session_id,
-            status: match value.status.as_str() {
-                "pending" => NotificationMailboxStatus::Pending,
-                "delivered" => NotificationMailboxStatus::Delivered,
-                "failed" => NotificationMailboxStatus::Failed,
-                other => panic!("unknown notification mailbox status: {other}"),
-            },
+            status: NotificationMailboxStatus::from_stored(&value.status),
             sent_count: value.sent_count,
             last_error: value.last_error,
             delivered_at: value.delivered_at,
@@ -769,19 +775,21 @@ pub struct UpdateSessionRequest {
     pub(crate) model: Option<String>,
     /// Tri-state reasoning-effort patch:
     /// field absent → `None` (leave DB untouched);
-    /// field present + `null` → `Some(None)` (clear to NULL);
-    /// field present + string → `Some(Some(s))` (set).
-    #[serde(default, deserialize_with = "deserialize_optional_field")]
-    pub(crate) reasoning_effort: Option<Option<String>>,
+    /// field present + `null` → `Some(NullableStringPatch::Null)` (clear to NULL);
+    /// field present + string → `Some(NullableStringPatch::Set(s))` (set).
+    #[serde(default)]
+    pub(crate) reasoning_effort: Option<NullableStringPatch>,
 }
 
-fn deserialize_optional_field<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    T: serde::Deserialize<'de>,
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    Option::<T>::deserialize(deserializer).map(Some)
+/// Tri-state payload for a nullable request field that is present in the JSON
+/// body: either an explicit `null` or a value.
+#[derive(Debug, Clone, serde::Deserialize, skyzen::ToSchema)]
+#[serde(untagged)]
+pub enum NullableStringPatch {
+    /// Explicit `null` — clear the stored value.
+    Null,
+    /// A concrete value — set the stored value.
+    Set(String),
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::ToSchema)]
@@ -1207,13 +1215,15 @@ pub struct IfNoneMatchHeader(pub(crate) Option<String>);
 impl skyzen::extract::Extractor for IfNoneMatchHeader {
     type Error = std::convert::Infallible;
 
-    async fn extract(request: &mut skyzen::Request) -> Result<Self, Self::Error> {
+    fn extract(
+        request: &mut skyzen::Request,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
         let value = request
             .headers()
             .get(skyzen::header::IF_NONE_MATCH)
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
-        Ok(Self(value))
+        std::future::ready(Ok(Self(value)))
     }
 }
 

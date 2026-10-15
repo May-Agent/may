@@ -34,7 +34,6 @@ pub(super) fn map_db_messages(
                     pending_tool_events
                         .push(tool_event_to_api_json(&record, pending_tool_events.len()));
                 }
-                continue;
             }
             MessageRole::PermissionRequest
             | MessageRole::PermissionResponse
@@ -42,7 +41,7 @@ pub(super) fn map_db_messages(
             | MessageRole::WorkspaceResponse
             | MessageRole::AskUserRequest
             | MessageRole::AskUserResponse
-            | MessageRole::HiddenContext => continue,
+            | MessageRole::HiddenContext => {}
             MessageRole::User => {
                 flush_trailing_tools_in_turn(
                     &mut out,

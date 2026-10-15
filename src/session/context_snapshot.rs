@@ -3,13 +3,17 @@ use aither_core::llm::Message as LlmMessage;
 
 use crate::{MayAgent, db::ChatDb};
 
+/// A context snapshot persisted for a session, used to resume without a full
+/// history replay.
 #[derive(Debug, Clone)]
 pub struct PersistedContextSnapshot {
+    /// The agent checkpoint captured at snapshot time.
     pub checkpoint: AgentCheckpoint,
     /// The DB `messages.id` of the last message at snapshot time.
     pub last_message_db_id: Option<i64>,
 }
 
+/// Convert a stored snapshot row into a [`PersistedContextSnapshot`].
 #[must_use]
 pub fn parse_persisted_context_snapshot(
     snapshot: crate::db::StoredSessionContextSnapshot,
@@ -20,6 +24,7 @@ pub fn parse_persisted_context_snapshot(
     }
 }
 
+/// Build an [`AgentCheckpoint`] from a checkpoint-hook context.
 #[must_use]
 pub fn checkpoint_from_hook(ctx: &CheckpointContext<'_>) -> AgentCheckpoint {
     AgentCheckpoint {
@@ -52,9 +57,8 @@ pub fn history_delta_since_snapshot(
     };
     // Find the position of the first message *after* the anchor
     let start_idx = db_message_ids.iter().position(|&id| id > anchor_id);
-    match start_idx {
-        Some(idx) => Some(history_messages[idx..].to_vec()),
-        None => {
+    start_idx.map_or_else(
+        || {
             // Either all messages are <= anchor (no new messages — empty delta)
             // or the anchor is missing entirely (stale snapshot)
             if db_message_ids.contains(&anchor_id) {
@@ -62,10 +66,12 @@ pub fn history_delta_since_snapshot(
             } else {
                 None // stale anchor — caller should fall back
             }
-        }
-    }
+        },
+        |idx| Some(history_messages[idx..].to_vec()),
+    )
 }
 
+/// Error type for persisting a session's context snapshot.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistContextSnapshotError {
     /// Failed to export agent checkpoint.
@@ -76,6 +82,11 @@ pub enum PersistContextSnapshotError {
     Persist(#[from] crate::db::ChatDbError),
 }
 
+/// Load the stored context snapshot for `session_id`, if one exists.
+///
+/// # Errors
+///
+/// Returns [`ChatDbError`](crate::db::ChatDbError) when the query fails.
 pub async fn load_persisted_context_snapshot(
     db: &ChatDb,
     session_id: &str,
@@ -103,6 +114,13 @@ async fn persist_checkpoint(
     Ok(())
 }
 
+/// Persist a checkpoint produced by a checkpoint hook as the session's
+/// context snapshot.
+///
+/// # Errors
+///
+/// Returns [`ChatDbError`](crate::db::ChatDbError) when reading the latest
+/// message ID or upserting the snapshot fails.
 pub async fn persist_checkpoint_from_hook(
     db: &ChatDb,
     session_id: &str,
@@ -111,6 +129,14 @@ pub async fn persist_checkpoint_from_hook(
     persist_checkpoint(db, session_id, checkpoint_from_hook(ctx)).await
 }
 
+/// Export the agent's checkpoint and persist it as the session's context
+/// snapshot.
+///
+/// # Errors
+///
+/// Returns [`PersistContextSnapshotError::ExportCheckpoint`] when the agent
+/// cannot export its checkpoint, or [`PersistContextSnapshotError::Persist`]
+/// when storing the snapshot fails.
 pub async fn persist_agent_context_snapshot(
     db: &ChatDb,
     session_id: &str,

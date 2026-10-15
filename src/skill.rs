@@ -58,9 +58,17 @@ pub enum SkillSource {
     /// Bundled with the application.
     Bundled,
     /// Installed from GitHub.
-    GitHub { owner: String, repo: String },
+    GitHub {
+        /// Repository owner.
+        owner: String,
+        /// Repository name.
+        repo: String,
+    },
     /// Registered from a local project path.
-    LocalPath { path: String },
+    LocalPath {
+        /// Absolute path of the directory the skill was registered from.
+        path: String,
+    },
 }
 
 impl std::fmt::Display for SkillSource {
@@ -145,6 +153,11 @@ impl SkillManager {
     }
 
     /// List all installed skills.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkillError`] when the skills directory cannot be read or a
+    /// skill's metadata fails to parse.
     pub async fn list_skills(&self) -> Result<Vec<SkillInfo>, SkillError> {
         let mut skills = Vec::new();
 
@@ -212,6 +225,16 @@ impl SkillManager {
     ///
     /// # Returns
     /// List of installed skills
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkillError::GitCloneFailed`] when the clone fails,
+    /// [`SkillError::NoSkillsDirectory`] when the repository has no `skills/`
+    /// directory, or [`SkillError::Io`] when copying a skill fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a cloned skills directory entry has no file name.
     pub async fn install_from_github(
         &self,
         owner: &str,
@@ -284,6 +307,11 @@ impl SkillManager {
     }
 
     /// Delete a skill by directory name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkillError::NotFound`] when no skill with `dir_name` exists, or
+    /// [`SkillError::Io`] when removing its directory fails.
     pub async fn delete_skill(&self, dir_name: &str) -> Result<(), SkillError> {
         let skill_dir = self.skills_dir.join(dir_name);
         if async_fs::metadata(&skill_dir).await.is_err() {
@@ -297,6 +325,11 @@ impl SkillManager {
     /// Register a skill from an existing local directory.
     ///
     /// The source directory must contain a valid `SKILL.md` frontmatter block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkillError`] when the source lacks valid `SKILL.md` frontmatter
+    /// or copying it into the skills directory fails.
     pub async fn register_from_local_path(&self, source: &Path) -> Result<SkillInfo, SkillError> {
         let source = source.to_path_buf();
         let skills_dir = self.skills_dir.clone();
@@ -354,6 +387,11 @@ impl SkillManager {
     }
 
     /// Parse a GitHub repo string in "owner/repo" format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkillError::InvalidRepoFormat`] when `input` is not in
+    /// `owner/repo` form.
     pub fn parse_github_repo(input: &str) -> Result<(&str, &str), SkillError> {
         let input = input.trim();
         match input.split_once('/') {

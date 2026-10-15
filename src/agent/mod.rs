@@ -12,7 +12,9 @@ pub(crate) mod register_tool;
 pub mod runner;
 mod runtime_context;
 mod search_match;
+/// Session tool registration for the agent.
 pub mod session_tool;
+/// Authorization for `terminal` ssh-mode targets.
 pub mod ssh_authorizer;
 pub(crate) mod task_tool;
 pub mod tool_environment_cache;
@@ -22,7 +24,10 @@ pub use browser_tool::{
 };
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use imagine::ImageGeneratorConfig;
-pub use may::{AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, generate_session_title};
+pub use may::{
+    AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, MayAgentSessionInput,
+    generate_session_title,
+};
 pub use notify_tool::{NotifyArgs, NotifyBroker, NotifyResult, channel as notify_channel};
 pub use permission::{
     PermissionApprover, PermissionHistoryMode, PermissionHistoryModeParseError, PermissionRequest,

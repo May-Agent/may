@@ -3,13 +3,11 @@ use itertools::Itertools;
 
 use crate::ask_user::{AnswerValue, QuestionAnswer};
 use crate::tui::app::{App, SendAction};
-use crate::tui::error::AppResult;
 use crate::tui::state::AppMode;
 
-pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
-    let state = match &mut app.mode {
-        AppMode::AskUser(s) => s,
-        _ => return Ok(None),
+pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::AskUser(state) = &mut app.mode else {
+        return None;
     };
 
     if let Some(qs) = state.current_state_mut()
@@ -19,7 +17,7 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> AppResult<Option<Sen
             KeyCode::Esc => qs.custom_mode = false,
             KeyCode::Enter => {
                 qs.custom_mode = false;
-                return Ok(ask_user_advance_or_submit(app));
+                return ask_user_advance_or_submit(app);
             }
             KeyCode::Backspace => {
                 qs.custom_text.pop();
@@ -29,7 +27,7 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> AppResult<Option<Sen
             }
             _ => {}
         }
-        return Ok(None);
+        return None;
     }
 
     let item_count = state.current_item_count();
@@ -90,14 +88,14 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> AppResult<Option<Sen
                         qs.selections.push(cursor);
                         qs.skipped = false;
                     }
-                    return Ok(ask_user_advance_or_submit(app));
+                    return ask_user_advance_or_submit(app);
                 } else if cursor == opt_count {
                     if let Some(qs) = state.current_state_mut() {
                         qs.skipped = true;
                         qs.selections.clear();
                         qs.custom_text.clear();
                     }
-                    return Ok(ask_user_advance_or_submit(app));
+                    return ask_user_advance_or_submit(app);
                 } else if cursor == opt_count + 1 {
                     if let Some(qs) = state.current_state_mut() {
                         qs.custom_mode = true;
@@ -105,21 +103,20 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> AppResult<Option<Sen
                         qs.selections.clear();
                     }
                 } else if q.multi_select {
-                    return Ok(ask_user_advance_or_submit(app));
+                    return ask_user_advance_or_submit(app);
                 }
             }
         }
-        KeyCode::Esc => return Ok(ask_user_submit_all_skipped(app)),
+        KeyCode::Esc => return ask_user_submit_all_skipped(app),
         _ => {}
     }
 
-    Ok(None)
+    None
 }
 
 fn ask_user_advance_or_submit(app: &mut App) -> Option<SendAction> {
-    let state = match &mut app.mode {
-        AppMode::AskUser(s) => s,
-        _ => return None,
+    let AppMode::AskUser(state) = &mut app.mode else {
+        return None;
     };
 
     if state.current_question + 1 < state.questions.len() {

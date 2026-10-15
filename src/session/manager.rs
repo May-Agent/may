@@ -108,6 +108,7 @@ impl std::fmt::Display for SessionId {
 pub struct Session {
     /// Unique session identifier.
     pub id: SessionId,
+    /// Title generated for the session, once the title task finishes.
     pub title: Option<String>,
     /// Model bound to this session (set via /model command).
     pub model: Option<String>,
@@ -130,8 +131,11 @@ pub struct Session {
 pub struct SessionSummary {
     /// Unique session identifier.
     pub id: SessionId,
+    /// Session title, once assigned.
     pub title: Option<String>,
+    /// Model bound to the session.
     pub model: Option<String>,
+    /// Profile the session belongs to.
     pub profile_id: Option<String>,
     /// Whether the session is pinned in its profile.
     pub pinned: bool,
@@ -165,6 +169,11 @@ pub struct SessionSummary {
 impl SessionSummary {
     /// Convert a DB session model to a summary.
     #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row's `message_count` is negative — database rows are
+    /// expected to satisfy that invariant.
     pub fn from_db_model(s: crate::db::entity::sessions::Model) -> Self {
         let created_at = s.created_at.parse::<Timestamp>().ok();
         let updated_at = s.updated_at.parse::<Timestamp>().ok();
@@ -263,6 +272,11 @@ pub async fn load_history_from_db(
 ///
 /// This is a standalone function that doesn't require a [`SessionManager`] lock,
 /// useful for spawned tasks that only need a `ChatDb` clone.
+///
+/// # Errors
+///
+/// Returns [`SessionError`] when the session list query or summarization
+/// fails.
 pub async fn list_summaries_from_db(db: &ChatDb) -> Result<Vec<SessionSummary>, SessionError> {
     let db_sessions = db.list_sessions().await?;
     Ok(summarize_db_sessions(db, db_sessions).await?)
@@ -499,6 +513,10 @@ impl SessionManager {
     ///
     /// # Errors
     /// Returns [`SessionError::NotFound`] when the session does not exist, or [`SessionError`] on storage/layout failure.
+    ///
+    /// # Panics
+    /// Panics if the freshly loaded session is missing from `self.current`,
+    /// which cannot happen given the immediately preceding assignment.
     pub async fn load_session(&mut self, id: &SessionId) -> Result<&Session, SessionError> {
         let db_session = self
             .db

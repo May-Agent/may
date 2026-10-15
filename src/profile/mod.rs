@@ -16,6 +16,7 @@ use crate::db::ChatDb;
 use crate::db::entity::profiles;
 use crate::session::SessionSummary;
 
+/// User-facing preferences stored on a profile.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
@@ -26,6 +27,7 @@ pub struct ProfilePreferences {
     pub container: Option<ContainerProfilePreferences>,
 }
 
+/// Preferences applying to container-environment profiles.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
@@ -39,6 +41,7 @@ pub struct ContainerProfilePreferences {
     pub mounts: Vec<ContainerMountPreference>,
 }
 
+/// A host path mounted into the container.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerMountPreference {
@@ -51,6 +54,7 @@ pub struct ContainerMountPreference {
     pub access: ContainerMountAccess,
 }
 
+/// Access level granted to a container mount.
 #[derive(
     Debug,
     Clone,

@@ -1,3 +1,4 @@
+/// Error type for TUI operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
     /// Failed to load config.
@@ -35,4 +36,5 @@ pub enum TuiError {
     ClipboardCopyFailed,
 }
 
+/// Result alias for TUI operations.
 pub type AppResult<T> = Result<T, TuiError>;

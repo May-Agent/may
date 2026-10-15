@@ -186,7 +186,7 @@ pub(super) async fn build_prompt_and_attachments(
                 prompt_sections.push(PromptSection::PastedText(text.clone()));
             } else {
                 let (_, relative_path) =
-                    save_large_pasted_text(state, &req.session_id, text).await?;
+                    Box::pin(save_large_pasted_text(state, &req.session_id, text)).await?;
                 xml_items.push(AttachmentXml {
                     name: attachment.name.clone(),
                     attachment_type: AttachmentKind::Document,
@@ -560,7 +560,7 @@ async fn save_large_pasted_text(
     session_id: &str,
     text: &str,
 ) -> SkyResult<(PathBuf, String)> {
-    let filename_base = generate_pasted_text_filename(state, text).await;
+    let filename_base = Box::pin(generate_pasted_text_filename(state, text)).await;
     let (path, relative_path) =
         allocate_upload_path(state, session_id, &filename_base, "txt").await?;
 
@@ -581,7 +581,7 @@ async fn generate_pasted_text_filename(state: &UiServerState, text: &str) -> Str
     let config = state.config_snapshot();
     let snippet: String = text.chars().take(600).collect();
 
-    let generated = generate_session_title(&config, &snippet, "").await;
+    let generated = Box::pin(generate_session_title(&config, &snippet, "")).await;
     let base = generated
         .as_deref()
         .map(sanitize_upload_stem)

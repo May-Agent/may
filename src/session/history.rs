@@ -217,8 +217,10 @@ pub struct ChatMessage {
     /// Message body (JSON payload for tool events).
     pub content: String,
     /// Message timestamp, when recorded.
+    /// When the tool call completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<Timestamp>,
+    /// Tool call this message is the result of, when it is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// Usage/context stats for assistant messages.

@@ -290,7 +290,11 @@ impl StreamingMarkdown {
                     ),
                 ]));
             }
-            ParseEvent::CodeBlockEnd => {
+            ParseEvent::CodeBlockEnd
+            | ParseEvent::ListEnd
+            | ParseEvent::BlockquoteEnd
+            | ParseEvent::TableEnd
+            | ParseEvent::EmptyLine => {
                 self.end_inline_line();
                 self.rendered.push(Line::from(""));
             }
@@ -316,10 +320,6 @@ impl StreamingMarkdown {
                     Span::raw(content),
                 ]));
             }
-            ParseEvent::ListEnd => {
-                self.end_inline_line();
-                self.rendered.push(Line::from(""));
-            }
             ParseEvent::BlockquoteStart { .. } => {
                 self.end_inline_line();
             }
@@ -334,10 +334,6 @@ impl StreamingMarkdown {
                             .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
-            }
-            ParseEvent::BlockquoteEnd => {
-                self.end_inline_line();
-                self.rendered.push(Line::from(""));
             }
             ParseEvent::HorizontalRule => {
                 self.end_inline_line();
@@ -374,14 +370,6 @@ impl StreamingMarkdown {
                     .map(|c| Span::raw(format!("│ {c} ")))
                     .collect();
                 self.rendered.push(Line::from(spans));
-            }
-            ParseEvent::TableEnd => {
-                self.end_inline_line();
-                self.rendered.push(Line::from(""));
-            }
-            ParseEvent::EmptyLine => {
-                self.end_inline_line();
-                self.rendered.push(Line::from(""));
             }
             ParseEvent::Newline => {
                 // Newline terminates the current logical line; it should not add
