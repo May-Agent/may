@@ -57,7 +57,7 @@ pub fn history_delta_since_snapshot(
         None => {
             // Either all messages are <= anchor (no new messages — empty delta)
             // or the anchor is missing entirely (stale snapshot)
-            if db_message_ids.iter().any(|&id| id == anchor_id) {
+            if db_message_ids.contains(&anchor_id) {
                 Some(Vec::new()) // anchor exists, just no newer messages
             } else {
                 None // stale anchor — caller should fall back
@@ -68,8 +68,10 @@ pub fn history_delta_since_snapshot(
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistContextSnapshotError {
+    /// Failed to export agent checkpoint.
     #[error("failed to export agent checkpoint: {0}")]
     ExportCheckpoint(#[from] aither_agent::AgentError),
+    /// Failed to persist context snapshot.
     #[error("failed to persist context snapshot: {0}")]
     Persist(#[from] crate::db::ChatDbError),
 }

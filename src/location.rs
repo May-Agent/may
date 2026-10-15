@@ -37,8 +37,10 @@ pub struct LocationProvider {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LocationError {
+    /// Failed to fetch location from ipinfo.io.
     #[error("failed to fetch location from ipinfo.io")]
     Fetch(#[source] BoxError),
+    /// Failed to decode location response from ipinfo.io.
     #[error("failed to decode location response from ipinfo.io")]
     Decode(#[source] BoxError),
 }

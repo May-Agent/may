@@ -162,28 +162,27 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         );
         let next = if assistant_response.is_empty() || !active_tool_calls.is_empty() {
             event_future.await
+        } else if let Ok(event) =
+            tokio::time::timeout(ONESHOT_IDLE_FINISH_TIMEOUT, event_future).await
+        {
+            event
         } else {
-            match tokio::time::timeout(ONESHOT_IDLE_FINISH_TIMEOUT, event_future).await {
-                Ok(event) => event,
-                Err(_) => {
-                    if let Some(handle) = agent_handle.take() {
-                        handle.cancel();
-                    }
-                    runtime_deps
-                        .finish_agent_task(
-                            &mut app,
-                            &mut agent_handle,
-                            &mut pending_title_gen,
-                            &assistant_response,
-                        )
-                        .await;
-                    if !assistant_response.ends_with('\n') {
-                        stdout.write_all(b"\n")?;
-                        stdout.flush()?;
-                    }
-                    return Ok(());
-                }
+            if let Some(handle) = agent_handle.take() {
+                handle.cancel();
             }
+            runtime_deps
+                .finish_agent_task(
+                    &mut app,
+                    &mut agent_handle,
+                    &mut pending_title_gen,
+                    &assistant_response,
+                )
+                .await;
+            if !assistant_response.ends_with('\n') {
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+            }
+            return Ok(());
         };
         let Some(event) = next else {
             break;
@@ -394,7 +393,7 @@ async fn build_oneshot_prompt_with_mentions(
 
     let db = app.session_manager.db();
     if let Ok(Some(session_mentions_xml)) =
-        may_agent::prompt_mentions::build_session_mentions_xml(&db, prompt).await
+        may_agent::prompt_mentions::build_session_mentions_xml(db, prompt).await
     {
         hidden_context_parts.push(session_mentions_xml);
     }

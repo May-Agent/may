@@ -1834,7 +1834,10 @@ mod tests {
 
     #[test]
     fn valid_slidev_source_has_no_structural_diagnostics() {
-        assert!(slidev_source_diagnostics(VALID_SLIDEV).is_empty());
+        assert_eq!(
+            slidev_source_diagnostics(VALID_SLIDEV),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

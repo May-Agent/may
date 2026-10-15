@@ -1,7 +1,7 @@
 //! Chat stream display with inline tools and todos.
 
-use std::cell::Cell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aither_sandbox::TerminalMode;
 use ratatui::{
@@ -18,10 +18,13 @@ use super::markdown;
 /// Status of a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolStatus {
+    /// Tool call in progress.
     Running,
+    /// Tool call completed.
     Done,
     /// Search completed with N results.
     SearchDone(usize),
+    /// Tool call failed with an error message.
     Failed(String),
 }
 
@@ -94,31 +97,42 @@ impl TerminalCallInfo {
 pub enum ToolDisplay {
     /// Web search query executed through the terminal command tool.
     Search {
+        /// Search query text.
         query: String,
+        /// Call status.
         status: ToolStatus,
+        /// Result count once completed.
         results: Option<usize>,
         /// The underlying terminal call info.
         terminal_info: Option<TerminalCallInfo>,
     },
     /// URL fetch executed through the terminal command tool.
     Fetch {
+        /// Fetched URL.
         url: String,
+        /// Call status.
         status: ToolStatus,
         /// The underlying terminal call info.
         terminal_info: Option<TerminalCallInfo>,
     },
     /// Subagent task.
     Task {
+        /// Subagent name.
         subagent: String,
+        /// Prompt given to the subagent.
         prompt: String,
+        /// Call status.
         status: ToolStatus,
         /// Terminal calls made by this subagent (most recent at end).
         terminal_calls: Vec<TerminalCallInfo>,
     },
     /// Direct terminal command.
     Terminal {
+        /// Command text.
         command: String,
+        /// Execution mode.
         mode: TerminalMode,
+        /// Call status.
         status: ToolStatus,
         /// The output from this command.
         output: Option<TerminalCallInfo>,
@@ -130,8 +144,9 @@ impl ToolDisplay {
     #[must_use]
     pub fn latest_terminal(&self) -> Option<&TerminalCallInfo> {
         match self {
-            Self::Search { terminal_info, .. } => terminal_info.as_ref(),
-            Self::Fetch { terminal_info, .. } => terminal_info.as_ref(),
+            Self::Search { terminal_info, .. } | Self::Fetch { terminal_info, .. } => {
+                terminal_info.as_ref()
+            }
             Self::Task { terminal_calls, .. } => terminal_calls.last(),
             Self::Terminal { output, .. } => output.as_ref(),
         }
@@ -141,8 +156,9 @@ impl ToolDisplay {
     #[must_use]
     pub fn all_terminal_calls(&self) -> Vec<&TerminalCallInfo> {
         match self {
-            Self::Search { terminal_info, .. } => terminal_info.iter().collect(),
-            Self::Fetch { terminal_info, .. } => terminal_info.iter().collect(),
+            Self::Search { terminal_info, .. } | Self::Fetch { terminal_info, .. } => {
+                terminal_info.iter().collect()
+            }
             Self::Task { terminal_calls, .. } => terminal_calls.iter().collect(),
             Self::Terminal { output, .. } => output.iter().collect(),
         }
@@ -152,10 +168,10 @@ impl ToolDisplay {
     #[must_use]
     pub const fn status(&self) -> &ToolStatus {
         match self {
-            Self::Search { status, .. } => status,
-            Self::Fetch { status, .. } => status,
-            Self::Task { status, .. } => status,
-            Self::Terminal { status, .. } => status,
+            Self::Search { status, .. }
+            | Self::Fetch { status, .. }
+            | Self::Task { status, .. }
+            | Self::Terminal { status, .. } => status,
         }
     }
 
@@ -178,7 +194,7 @@ impl ToolDisplay {
 
     /// Check if this tool call is complete (not running).
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    pub const fn is_complete(&self) -> bool {
         !matches!(self.status(), ToolStatus::Running)
     }
 }
@@ -186,15 +202,20 @@ impl ToolDisplay {
 /// Status of a todo item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TodoStatus {
+    /// Todo not started.
     Pending,
+    /// Todo in progress.
     InProgress,
+    /// Todo completed.
     Completed,
 }
 
 /// A todo item.
 #[derive(Debug, Clone)]
 pub struct TodoItem {
+    /// Todo text.
     pub content: String,
+    /// Item status.
     pub status: TodoStatus,
 }
 
@@ -203,21 +224,45 @@ pub struct TodoItem {
 pub enum ChatElement {
     /// User message with optional attachments
     UserMessage {
+        /// Message text.
         content: String,
+        /// Attachments carried by the message.
         attachments: Vec<Attachment>,
     },
     /// Assistant text (streaming or complete)
-    AssistantText { content: String, streaming: bool },
+    AssistantText {
+        /// Message text.
+        content: String,
+        /// Whether tokens are still arriving.
+        streaming: bool,
+    },
     /// Tool call
-    ToolCall { id: String, display: ToolDisplay },
+    ToolCall {
+        /// Tool call id.
+        id: String,
+        /// Display details for the tool.
+        display: ToolDisplay,
+    },
     /// Todo block
-    TodoBlock { items: Vec<TodoItem> },
+    TodoBlock {
+        /// Todo items.
+        items: Vec<TodoItem>,
+    },
     /// Error message
-    Error { message: String },
+    Error {
+        /// Error text shown in the stream.
+        message: String,
+    },
     /// Loading indicator (waiting for LLM response)
-    Loading { frame: usize },
+    Loading {
+        /// Spinner frame counter.
+        frame: usize,
+    },
     /// Thinking indicator (for thinking models)
-    Thinking { seconds: u64 },
+    Thinking {
+        /// Seconds spent thinking.
+        seconds: u64,
+    },
 }
 
 impl ChatElement {}
@@ -334,7 +379,7 @@ impl ChatStream {
         id: &str,
         status: ToolStatus,
         results: Option<usize>,
-        output: Option<String>,
+        output: Option<&str>,
     ) {
         for elem in &mut self.elements {
             if let ChatElement::ToolCall {
@@ -352,10 +397,11 @@ impl ChatStream {
                     } => {
                         *s = status;
                         *r = results;
-                        if let Some(ref out) = output
+                        if let Some(out) = output
                             && let Some(info) = terminal_info
                         {
-                            info.output = out.clone();
+                            info.output.clear();
+                            info.output.push_str(out);
                         }
                     }
                     ToolDisplay::Fetch {
@@ -364,10 +410,11 @@ impl ChatStream {
                         ..
                     } => {
                         *s = status;
-                        if let Some(ref out) = output
+                        if let Some(out) = output
                             && let Some(info) = terminal_info
                         {
-                            info.output = out.clone();
+                            info.output.clear();
+                            info.output.push_str(out);
                         }
                     }
                     ToolDisplay::Task { status: s, .. } => {
@@ -382,10 +429,10 @@ impl ChatStream {
                         ..
                     } => {
                         *s = status;
-                        if let Some(ref output_text) = output {
+                        if let Some(output_text) = output {
                             *out = Some(TerminalCallInfo {
                                 command: command.clone(),
-                                output: output_text.clone(),
+                                output: output_text.to_string(),
                                 output_file: None,
                             });
                         }
@@ -480,6 +527,7 @@ impl ChatStream {
 }
 
 /// Input rendering context for combined view.
+#[derive(Debug)]
 pub struct InputContext<'a> {
     /// Current input text.
     pub input: &'a str,
@@ -490,6 +538,7 @@ pub struct InputContext<'a> {
 }
 
 /// Status bar rendering context for combined view.
+#[derive(Debug)]
 pub struct StatusContext<'a> {
     /// Model display string.
     pub model: &'a str,
@@ -508,6 +557,7 @@ pub struct StatusContext<'a> {
 }
 
 /// Queued message context for rendering queue indicator.
+#[derive(Debug)]
 pub struct QueueContext<'a> {
     /// Queued message previews.
     pub messages: &'a [String],
@@ -519,12 +569,19 @@ pub fn render(frame: &mut Frame, area: Rect, chat: &ChatStream, scroll: usize) {
 }
 
 /// Full-screen unified render context.
+#[derive(Debug)]
 pub struct UnifiedRenderContext<'a> {
+    /// Tool id currently selected for copy/scroll.
     pub selected_tool: Option<&'a str>,
-    pub content_height_out: Option<&'a Cell<usize>>,
-    pub view_height_out: Option<&'a Cell<usize>>,
+    /// Receives the rendered content height for scroll bookkeeping.
+    pub content_height_out: Option<&'a AtomicUsize>,
+    /// Receives the rendered view height for scroll bookkeeping.
+    pub view_height_out: Option<&'a AtomicUsize>,
+    /// Input line rendered below chat content, when present.
     pub input_ctx: Option<InputContext<'a>>,
+    /// Queue indicator context, when messages are queued.
     pub queue_ctx: Option<QueueContext<'a>>,
+    /// Status bar context, when the bar is shown.
     pub status_ctx: Option<StatusContext<'a>>,
     /// Whether terminal supports image rendering
     pub images_supported: bool,
@@ -563,9 +620,9 @@ pub fn render_unified(
 pub fn build_plain_wrapped_lines_unified(
     chat: &ChatStream,
     width: u16,
-    queue_ctx: Option<QueueContext<'_>>,
+    queue_ctx: Option<&QueueContext<'_>>,
     input_ctx: Option<InputContext<'_>>,
-    status_ctx: Option<StatusContext<'_>>,
+    status_ctx: Option<&StatusContext<'_>>,
 ) -> Vec<String> {
     if width == 0 {
         return Vec::new();
@@ -573,17 +630,17 @@ pub fn build_plain_wrapped_lines_unified(
 
     let mut lines: Vec<Line<'static>> = build_plain_chat_lines(chat);
 
-    if let Some(ref ctx) = queue_ctx
+    if let Some(ctx) = queue_ctx
         && !ctx.messages.is_empty()
     {
         render_queue_lines(&mut lines, ctx, width);
     }
 
     if let Some(ctx) = input_ctx {
-        render_input_line(&mut lines, ctx);
+        render_input_line(&mut lines, &ctx);
     }
 
-    if let Some(ref ctx) = status_ctx {
+    if let Some(ctx) = status_ctx {
         render_status_line(&mut lines, ctx);
     }
 
@@ -668,6 +725,7 @@ fn wrap_plain_line(line: &str, max_width: usize) -> Vec<String> {
     out
 }
 
+/// Clamp a visual column in `line` to `target_col`, counting wide characters.
 #[must_use]
 pub fn clamp_column_by_width(line: &str, target_col: usize) -> usize {
     let mut col = 0usize;
@@ -689,7 +747,7 @@ fn safe_scroll(scroll: usize, content_height: usize, area_height: u16) -> u16 {
     let max_scroll = content_height.saturating_sub(area_height as usize);
     let clamped = scroll.min(max_scroll);
     // Clamp to u16::MAX to prevent overflow
-    clamped.min(u16::MAX as usize) as u16
+    u16::try_from(clamped).unwrap_or(u16::MAX)
 }
 
 /// Calculate actual visual row count using ratatui's own `Paragraph::line_count`.
@@ -699,7 +757,7 @@ fn total_wrapped_lines(lines: &[Line], width: usize) -> usize {
     if width == 0 || lines.is_empty() {
         return 0;
     }
-    let w = width.min(u16::MAX as usize) as u16;
+    let w = u16::try_from(width).unwrap_or(u16::MAX);
     Paragraph::new(lines.to_vec())
         .wrap(Wrap { trim: false })
         .line_count(w)
@@ -709,8 +767,8 @@ fn total_wrapped_lines(lines: &[Line], width: usize) -> usize {
 #[derive(Default)]
 struct RenderContext<'a> {
     selected_tool: Option<&'a str>,
-    content_height_out: Option<&'a Cell<usize>>,
-    view_height_out: Option<&'a Cell<usize>>,
+    content_height_out: Option<&'a AtomicUsize>,
+    view_height_out: Option<&'a AtomicUsize>,
     input_ctx: Option<InputContext<'a>>,
     queue_ctx: Option<QueueContext<'a>>,
     status_ctx: Option<StatusContext<'a>>,
@@ -775,11 +833,15 @@ fn render_impl(
                             saved_path,
                         } => {
                             let char_count = content.chars().count();
-                            if let Some(path) = saved_path {
-                                format!("[pasted text: {} chars -> {}]", char_count, path.display())
-                            } else {
-                                format!("[pasted text: {char_count} chars]")
-                            }
+                            saved_path.as_ref().map_or_else(
+                                || format!("[pasted text: {char_count} chars]"),
+                                |path| {
+                                    format!(
+                                        "[pasted text: {char_count} chars -> {}]",
+                                        path.display()
+                                    )
+                                },
+                            )
                         }
                     };
                     lines.push(Line::from(Span::styled(
@@ -910,7 +972,7 @@ fn render_impl(
 
     // Render input line if provided (for full-screen scroll mode)
     if let Some(ctx) = input_ctx {
-        render_input_line(&mut lines, ctx);
+        render_input_line(&mut lines, &ctx);
     }
 
     // Render status bar if provided
@@ -932,10 +994,10 @@ fn render_impl(
     // Export dimensions for scroll normalization
     // Use visual height so scrolling works correctly with wrapped lines
     if let Some(cell) = content_height_out {
-        cell.set(visual_content_height);
+        cell.store(visual_content_height, Ordering::Relaxed);
     }
     if let Some(cell) = view_height_out {
-        cell.set(view_height);
+        cell.store(view_height, Ordering::Relaxed);
     }
 
     // Keep input/composer anchored to the bottom when content underflows.
@@ -955,7 +1017,7 @@ fn render_impl(
         } else {
             scroll.min(max_scroll)
         };
-        (actual_scroll.min(u16::MAX as usize) as u16, lines)
+        (u16::try_from(actual_scroll).unwrap_or(u16::MAX), lines)
     };
 
     frame.render_widget(Clear, area);
@@ -971,7 +1033,7 @@ fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
 }
 
 /// Render the input line into the lines vector.
-fn render_input_line(lines: &mut Vec<Line<'_>>, ctx: InputContext<'_>) {
+fn render_input_line(lines: &mut Vec<Line<'_>>, ctx: &InputContext<'_>) {
     let mut spans = Vec::new();
 
     // Prompt
@@ -1093,9 +1155,13 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>) {
 
     // Add token usage info
     if let Some((prompt_tokens, context_window)) = ctx.usage {
-        let used = format_number(prompt_tokens as usize);
+        let used = format_number(usize::try_from(prompt_tokens).unwrap_or(usize::MAX));
         if let Some(window) = context_window {
-            parts.push(format!("{}/{}", used, format_number(window as usize)));
+            parts.push(format!(
+                "{}/{}",
+                used,
+                format_number(usize::try_from(window).unwrap_or(usize::MAX))
+            ));
         } else {
             parts.push(format!("{used}tok"));
         }
@@ -1124,9 +1190,11 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>) {
 /// Format large numbers with K/M suffix for readability.
 fn format_number(n: usize) -> String {
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        let capped = u32::try_from(n).unwrap_or(u32::MAX);
+        format!("{:.1}M", f64::from(capped) / 1_000_000.0)
     } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
+        let capped = u32::try_from(n).unwrap_or(u32::MAX);
+        format!("{:.1}K", f64::from(capped) / 1_000.0)
     } else {
         n.to_string()
     }

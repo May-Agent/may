@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::db::ChatDb;
 
 /// Interval between auto-archive sweeps.
-const AUTO_ARCHIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const AUTO_ARCHIVE_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Sessions older than this are candidates for auto-archiving.
 const AUTO_ARCHIVE_CUTOFF: jiff::SignedDuration = jiff::SignedDuration::from_hours(48);

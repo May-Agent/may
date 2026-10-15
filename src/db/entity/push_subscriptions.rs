@@ -9,5 +9,6 @@ pub struct Model {
     pub p256dh: String,
     /// Auth secret (base64url).
     pub auth: String,
+    /// Subscription creation timestamp (ISO 8601).
     pub created_at: String,
 }

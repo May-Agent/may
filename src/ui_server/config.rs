@@ -327,7 +327,7 @@ async fn run_save_full_config(
     state.set_browser_manager(next_browser_manager);
     state
         .task_runtime
-        .set_network_policy(state.config_snapshot().preferences.network_policy.clone())
+        .set_network_policy(&state.config_snapshot().preferences.network_policy)
         .map_err(internal_error)?;
     super::remote_access::sync_remote_access_from_state(&state)
         .await

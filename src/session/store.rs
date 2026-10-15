@@ -11,14 +11,16 @@ use crate::fs_utils::copy_dir_contents_recursive;
 /// Session store error.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Bundle error.
     #[error("Bundle error: {0}")]
     Bundle(#[from] crate::bundle::BundleError),
 }
 
 /// Handles persistence of sessions to filesystem.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SessionStore {
     home_paths: MayHomePaths,
 }

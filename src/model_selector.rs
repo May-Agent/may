@@ -17,15 +17,18 @@ impl ModelSelector {
     pub fn new(provider_id: impl Into<String>, model_id: impl Into<String>) -> Self {
         let provider_id = provider_id.into();
         let model_id = model_id.into();
-        if provider_id.trim().is_empty() {
-            panic!("model selector provider_id must not be empty");
-        }
-        if model_id.trim().is_empty() {
-            panic!("model selector model_id must not be empty");
-        }
-        if provider_id.contains(SELECTOR_SEPARATOR) {
-            panic!("model selector provider_id must not contain '::'");
-        }
+        assert!(
+            !provider_id.trim().is_empty(),
+            "model selector provider_id must not be empty"
+        );
+        assert!(
+            !model_id.trim().is_empty(),
+            "model selector model_id must not be empty"
+        );
+        assert!(
+            !provider_id.contains(SELECTOR_SEPARATOR),
+            "model selector provider_id must not contain '::'"
+        );
         Self {
             provider_id,
             model_id,
@@ -118,10 +121,13 @@ impl<'de> Deserialize<'de> for ModelSelector {
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ModelSelectorParseError {
+    /// Invalid model selector '': expected '<`provider_id>::`<`model_id`>'.
     #[error("invalid model selector '{value}': expected '<provider_id>::<model_id>'")]
     MissingSeparator { value: String },
+    /// Invalid model selector '': provider id must not be empty.
     #[error("invalid model selector '{value}': provider id must not be empty")]
     EmptyProviderId { value: String },
+    /// Invalid model selector '': model id must not be empty.
     #[error("invalid model selector '{value}': model id must not be empty")]
     EmptyModelId { value: String },
 }

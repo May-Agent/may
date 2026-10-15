@@ -525,7 +525,7 @@ fn select_exec_model(config: &MayConfig) -> String {
         .unwrap_or_else(|| panic!("may exec requires at least one configured model"))
 }
 
-fn select_exec_mode(
+const fn select_exec_mode(
     args: &ExecArgs,
     _environment: &may_agent::AgentEnvironment,
 ) -> TerminalExecutionMode {
