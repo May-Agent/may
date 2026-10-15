@@ -1019,6 +1019,20 @@ fn terminal_task_id_from_latest_tool_output(request: &Value) -> Option<String> {
         .as_str()
         .map(ToOwned::to_owned)
 }
+/// Return `response` when it carries `expected`, otherwise fail with its body,
+/// so a server error explains itself in CI output.
+async fn expect_status(response: reqwest::Response, expected: StatusCode) -> reqwest::Response {
+    let status = response.status();
+    if status == expected {
+        return response;
+    }
+    let url = response.url().clone();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+    panic!("{url} returned {status}, expected {expected}; body: {body}");
+}
 
 async fn create_session_via_api(client: &reqwest::Client, base_url: &str) -> String {
     // Chat round-trip tests run in the local profile: the container-backed
@@ -1031,7 +1045,7 @@ async fn create_session_via_api(client: &reqwest::Client, base_url: &str) -> Str
         .send()
         .await
         .expect("create session request should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
+    let response = expect_status(response, StatusCode::OK).await;
     let value: Value = response
         .json()
         .await
@@ -1049,7 +1063,7 @@ async fn local_profile_id_via_api(client: &reqwest::Client, base_url: &str) -> S
         .send()
         .await
         .expect("list profiles request should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
+    let response = expect_status(response, StatusCode::OK).await;
     let profiles: Value = response
         .json()
         .await
@@ -1070,7 +1084,7 @@ async fn get_runtime(client: &reqwest::Client, base_url: &str, session_id: &str)
         .send()
         .await
         .expect("runtime request should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
+    let response = expect_status(response, StatusCode::OK).await;
     response
         .json()
         .await
@@ -1231,7 +1245,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("create session request should succeed");
-    assert_eq!(create_response.status(), StatusCode::OK);
+    let create_response = expect_status(create_response, StatusCode::OK).await;
     let created: Value = create_response
         .json()
         .await
@@ -1251,7 +1265,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("list sessions request should succeed");
-    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_response = expect_status(list_response, StatusCode::OK).await;
     let listed: Value = list_response
         .json()
         .await
@@ -1273,7 +1287,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("update session request should succeed");
-    assert_eq!(update_response.status(), StatusCode::OK);
+    let update_response = expect_status(update_response, StatusCode::OK).await;
     let updated: Value = update_response
         .json()
         .await
@@ -1288,7 +1302,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("get session request should succeed");
-    assert_eq!(get_response.status(), StatusCode::OK);
+    let get_response = expect_status(get_response, StatusCode::OK).await;
     let fetched: Value = get_response
         .json()
         .await
@@ -1311,14 +1325,14 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .send()
         .await
         .expect("delete session request should succeed");
-    assert_eq!(delete_response.status(), StatusCode::OK);
+    expect_status(delete_response, StatusCode::OK).await;
 
     let missing_response = client
         .get(format!("{}/api/sessions/{session_id}", server.base_url))
         .send()
         .await
         .expect("missing session request should succeed");
-    assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+    expect_status(missing_response, StatusCode::NOT_FOUND).await;
 
     server.stop().await;
 }
@@ -1354,7 +1368,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
                 .send()
                 .await
                 .expect("chat stream request should succeed");
-            assert_eq!(response.status(), StatusCode::OK);
+            let response = expect_status(response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
     });
@@ -1381,7 +1395,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         .send()
         .await
         .expect("stop session request should succeed");
-    assert_eq!(stop_response.status(), StatusCode::OK);
+    expect_status(stop_response, StatusCode::OK).await;
 
     let events = tokio::time::timeout(Duration::from_secs(15), chat_task)
         .await
@@ -1407,7 +1421,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         .send()
         .await
         .expect("get session after cancel should succeed");
-    assert_eq!(session_response.status(), StatusCode::OK);
+    let session_response = expect_status(session_response, StatusCode::OK).await;
     let session_payload: Value = session_response
         .json()
         .await
@@ -1446,7 +1460,7 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
                 .send()
                 .await
                 .expect("chat stream request should succeed");
-            assert_eq!(response.status(), StatusCode::OK);
+            let response = expect_status(response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
     });
