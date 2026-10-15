@@ -26,7 +26,7 @@ pub enum AppMode {
     TierModelPicker,
     /// GitHub Copilot OAuth authentication
     CopilotAuth,
-    /// ChatGPT subscription OAuth authentication
+    /// `ChatGPT` subscription OAuth authentication
     ChatgptAuth,
     /// Permission approval dialog for elevated terminal modes.
     PermissionConfirm(PermissionConfirmState),
@@ -45,6 +45,7 @@ pub enum AppMode {
 }
 
 /// Per-question interaction state.
+#[derive(Debug)]
 pub struct AskUserQuestionState {
     /// Cursor position in the option list (includes extra items: skip, custom).
     pub cursor: usize,
@@ -65,6 +66,7 @@ impl Default for AskUserQuestionState {
 }
 
 impl AskUserQuestionState {
+    /// Create empty question state.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -83,10 +85,11 @@ impl std::fmt::Debug for AskUserState {
         f.debug_struct("AskUserState")
             .field("question_count", &self.questions.len())
             .field("current_question", &self.current_question)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
+/// Live `ask_user` interaction state (request id, question states, focus).
 pub struct AskUserState {
     /// Stable persisted request identifier.
     pub request_id: String,
@@ -101,6 +104,7 @@ pub struct AskUserState {
 }
 
 impl AskUserState {
+    /// Build interaction state for `request` and its `questions`.
     #[must_use]
     pub fn new(request_id: String, request: AskUserRequest, questions: Vec<Question>) -> Self {
         let states = questions
@@ -147,15 +151,21 @@ impl AskUserState {
     }
 }
 
+/// Pending workspace-access confirmation shown in the TUI.
 #[derive(Debug)]
 pub struct WorkspaceConfirmState {
+    /// Persisted request id.
     pub request_id: String,
+    /// The request being confirmed.
     pub request: WorkspaceRequest,
 }
 
+/// Pending permission confirmation shown in the TUI.
 #[derive(Debug)]
 pub struct PermissionConfirmState {
+    /// ID of the pending permission request being confirmed.
     pub request_id: String,
+    /// The permission request being confirmed.
     pub request: crate::session::PersistedPermissionRequestPayload,
 }
 
@@ -166,7 +176,9 @@ pub enum CopilotAuthStatus {
     RequestingCode,
     /// Waiting for user to authorize in browser
     WaitingForUser {
+        /// User code shown for device authorization.
         user_code: String,
+        /// URL the user must visit to authorize.
         verification_uri: String,
     },
     /// Successfully authenticated
@@ -175,17 +187,22 @@ pub enum CopilotAuthStatus {
     Failed(String),
 }
 
-/// Status of ChatGPT OAuth authentication flow.
+/// Status of `ChatGPT` OAuth authentication flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatgptAuthStatus {
-    /// Talking to the OpenAI auth service (requesting a device code).
+    /// Talking to the `OpenAI` auth service (requesting a device code).
     Working,
     /// Browser flow: waiting for the user to authorize; the loopback listener
     /// on localhost:1455 will receive the callback.
-    WaitingForCallback { url: String },
+    WaitingForCallback {
+        /// Loopback URL shown to the user while awaiting the callback.
+        url: String,
+    },
     /// Device flow (SSH/headless): user authorizes on the verification page.
     WaitingForUser {
+        /// User code shown for device authorization.
         user_code: String,
+        /// URL the user must visit to authorize.
         verification_uri: String,
     },
     /// Successfully authenticated
@@ -224,15 +241,20 @@ impl PasteFilter {
 }
 
 /// Represents an active text input field for paste handling.
+#[derive(Debug)]
 pub enum ActiveTextInput<'a> {
     /// Input with cursor position tracking (insert at cursor)
     Cursored {
+        /// The buffer being edited.
         input: &'a mut String,
+        /// Cursor position within the buffer.
         cursor: &'a mut usize,
     },
     /// Simple input (append at end) with character filter
     Simple {
+        /// The buffer being edited.
         input: &'a mut String,
+        /// Filter deciding which characters are accepted.
         filter: PasteFilter,
     },
 }
@@ -240,23 +262,29 @@ pub enum ActiveTextInput<'a> {
 /// A visual cursor position in the rendered chat viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionPoint {
+    /// Line in the rendered viewport.
     pub line: usize,
+    /// Column in the rendered viewport.
     pub column: usize,
 }
 
 /// Drag selection in rendered chat content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextSelection {
+    /// Fixed end of the selection.
     pub anchor: SelectionPoint,
+    /// Moving end of the selection.
     pub cursor: SelectionPoint,
 }
 
 impl TextSelection {
+    /// Whether the selection covers zero cells.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.anchor == self.cursor
     }
 
+    /// (start, end) ordering of the selection ends.
     #[must_use]
     pub fn normalized(&self) -> (SelectionPoint, SelectionPoint) {
         if (self.anchor.line, self.anchor.column) <= (self.cursor.line, self.cursor.column) {
@@ -304,9 +332,12 @@ pub enum SkillAddMode {
 /// Config section tabs (like Claude Code's /config).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConfigSection {
+    /// Provider list section.
     #[default]
     Providers,
+    /// Model selection section.
     Models,
+    /// Preferences section.
     Preferences,
 }
 
@@ -352,9 +383,19 @@ pub enum ConfigEditMode {
     #[default]
     None,
     /// Editing a text field (provider API key, base URL, etc.)
-    Text { input: String, cursor: usize },
+    Text {
+        /// Current text being edited.
+        input: String,
+        /// Cursor position within `input`, in characters.
+        cursor: usize,
+    },
     /// Selecting from a list (provider type, model list)
-    List { items: Vec<String>, selected: usize },
+    List {
+        /// Selectable items.
+        items: Vec<String>,
+        /// Index of the highlighted item.
+        selected: usize,
+    },
     /// Editing a custom provider (name, `base_url`, `api_key`)
     CustomProvider {
         /// Which field is focused (0=name, `1=base_url`, `2=api_key`)
@@ -375,6 +416,7 @@ pub enum ConfigEditMode {
 }
 
 /// Unified config state for all sections.
+#[derive(Debug)]
 pub struct ConfigState {
     /// Current section (Tab to switch)
     pub section: ConfigSection,

@@ -8,20 +8,45 @@ use super::common::{
 };
 use super::{ChatDb, ChatDbError, query};
 
+/// Inputs for [`ChatDb::upsert_context_debug_snapshot`].
+#[derive(Debug)]
+pub struct ContextDebugSnapshotWrite<'a> {
+    /// Session the snapshot belongs to.
+    pub session_id: &'a str,
+    /// ISO 8601 capture timestamp.
+    pub timestamp: &'a str,
+    /// Model that produced the context.
+    pub model: &'a str,
+    /// Provider that produced the context.
+    pub provider_id: &'a str,
+    /// User prompt that seeded the context.
+    pub prompt: &'a str,
+    /// Attachment URLs recorded on the prompt.
+    pub prompt_attachments: &'a [String],
+    /// Assembled messages that made up the context window.
+    pub assembled_messages: &'a [ContextDebugSnapshotMessage],
+}
+
 impl ChatDb {
     // ── Context Debug Snapshot ────────────────────────────────
 
     /// Upsert the latest context-debug snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn upsert_context_debug_snapshot(
         &self,
-        session_id: &str,
-        timestamp: &str,
-        model: &str,
-        provider_id: &str,
-        prompt: &str,
-        prompt_attachments: &[String],
-        assembled_messages: &[ContextDebugSnapshotMessage],
+        snapshot: &ContextDebugSnapshotWrite<'_>,
     ) -> Result<(), ChatDbError> {
+        let &ContextDebugSnapshotWrite {
+            session_id,
+            timestamp,
+            model,
+            provider_id,
+            prompt,
+            prompt_attachments,
+            assembled_messages,
+        } = snapshot;
         let mut tx = self.db.begin().await?;
         query!(
             tx,
@@ -117,6 +142,9 @@ impl ChatDb {
     }
 
     /// Load latest context-debug snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_context_debug_snapshot(
         &self,
         session_id: &str,
@@ -207,6 +235,9 @@ impl ChatDb {
     }
 
     /// Upsert the latest serialized agent context snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn upsert_session_context_snapshot(
         &self,
         session_id: &str,
@@ -229,6 +260,9 @@ impl ChatDb {
     }
 
     /// Load the serialized agent context snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_session_context_snapshot(
         &self,
         session_id: &str,
@@ -260,6 +294,9 @@ impl ChatDb {
     }
 
     /// Delete a persisted context snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn delete_session_context_snapshot(
         &self,
         session_id: &str,

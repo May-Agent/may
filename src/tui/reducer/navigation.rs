@@ -1,10 +1,10 @@
 use crossterm::event::KeyCode;
 
 use crate::tui::app::{App, SendAction};
-use crate::tui::error::{AppResult, TuiError};
+use crate::tui::error::TuiError;
 use crate::tui::state::AppMode;
 
-pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let filtered = app.filtered_sessions();
     let filtered_len = filtered.len();
 
@@ -34,7 +34,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Opti
             {
                 let id = summary.id.clone();
                 app.mode = AppMode::Chat;
-                return Ok(Some(SendAction::LoadSession(id)));
+                return Some(SendAction::LoadSession(id));
             }
         }
         KeyCode::Tab => {
@@ -83,27 +83,27 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Opti
                         if app.session_selected > 0 {
                             app.session_selected -= 1;
                         }
-                        return Ok(None);
+                        return None;
                     }
                     'j' => {
                         if app.session_selected + 1 < filtered_len {
                             app.session_selected += 1;
                         }
-                        return Ok(None);
+                        return None;
                     }
                     'n' => {
                         app.mode = AppMode::Chat;
-                        return Ok(Some(SendAction::NewSession));
+                        return Some(SendAction::NewSession);
                     }
                     'p' => {
                         // Toggle pin/unpin for selected session
                         toggle_pin(app);
-                        return Ok(None);
+                        return None;
                     }
                     'a' => {
                         // Toggle archive/unarchive for selected session
                         toggle_archive(app);
-                        return Ok(None);
+                        return None;
                     }
                     'e' => {
                         // Toggle archived section expansion
@@ -115,7 +115,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Opti
                                 app.session_selected = app.session_list.len().saturating_sub(1);
                             }
                         }
-                        return Ok(None);
+                        return None;
                     }
                     'd' => {
                         if let Some((original_idx, _)) = filtered.get(app.session_selected)
@@ -172,7 +172,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Opti
                             .detach();
                             app.status = Some("Deleting session...".to_string());
                         }
-                        return Ok(None);
+                        return None;
                     }
                     _ => {}
                 }
@@ -184,7 +184,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> AppResult<Opti
         _ => {}
     }
 
-    Ok(None)
+    None
 }
 
 /// Toggle pin/unpin for the currently selected session.
@@ -275,7 +275,7 @@ fn toggle_archive(app: &mut App) {
     });
 }
 
-pub fn handle_profile_select_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_profile_select_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let profile_count = app.profiles.len();
 
     match code {
@@ -303,7 +303,7 @@ pub fn handle_profile_select_key(app: &mut App, code: KeyCode) -> AppResult<Opti
         _ => {}
     }
 
-    Ok(None)
+    None
 }
 
 fn set_active_profile(app: &mut App, profile_id: String) {
@@ -311,17 +311,17 @@ fn set_active_profile(app: &mut App, profile_id: String) {
     app.session_manager.set_current_profile(profile_id);
 }
 
-pub fn handle_help_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_help_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Esc | KeyCode::Char('?' | 'q') => {
             app.mode = AppMode::Chat;
         }
         _ => {}
     }
-    Ok(None)
+    None
 }
 
-pub fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = AppMode::Chat;
@@ -340,13 +340,13 @@ pub fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> AppResult<Option<
         }
         _ => {}
     }
-    Ok(None)
+    None
 }
 
-pub fn handle_file_picker_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_file_picker_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let Some(picker) = app.file_picker.as_mut() else {
         app.mode = AppMode::Chat;
-        return Ok(None);
+        return None;
     };
 
     match code {
@@ -369,5 +369,5 @@ pub fn handle_file_picker_key(app: &mut App, code: KeyCode) -> AppResult<Option<
         _ => {}
     }
 
-    Ok(None)
+    None
 }

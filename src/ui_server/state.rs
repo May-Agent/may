@@ -244,7 +244,7 @@ struct CachedValue<T> {
     value: T,
 }
 
-impl<T: Clone> RefreshableCache<T> {
+impl<T: Clone + Send + Sync> RefreshableCache<T> {
     pub(crate) fn new(ttl: Duration) -> Self {
         Self {
             ttl,
@@ -255,8 +255,8 @@ impl<T: Clone> RefreshableCache<T> {
 
     pub(crate) async fn get_or_refresh<F, Fut>(&self, refresh: F) -> T
     where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T>,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = T> + Send,
     {
         if let Some(cached) = self.inner.load_full()
             && cached.updated_at.elapsed() < self.ttl
@@ -489,20 +489,20 @@ impl UiServerState {
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum UiAnswerInput {
+pub enum UiAnswerInput {
     Selected { values: Vec<String> },
     Custom { text: String },
     Skipped,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum UiAnswerInputError {
+pub enum UiAnswerInputError {
     #[error("ask-user selected answer requires at least one option")]
-    EmptySelected,
+    MissingSelection,
     #[error("ask-user selected answers must not contain empty options")]
-    EmptySelectedOption,
+    BlankSelectedOption,
     #[error("ask-user custom answer must not be empty")]
-    EmptyCustom,
+    BlankCustom,
 }
 
 impl TryFrom<UiAnswerInput> for AnswerValue {
@@ -512,17 +512,17 @@ impl TryFrom<UiAnswerInput> for AnswerValue {
         match value {
             UiAnswerInput::Selected { values } => {
                 if values.is_empty() {
-                    return Err(UiAnswerInputError::EmptySelected);
+                    return Err(UiAnswerInputError::MissingSelection);
                 }
                 if values.iter().any(|value| value.trim().is_empty()) {
-                    return Err(UiAnswerInputError::EmptySelectedOption);
+                    return Err(UiAnswerInputError::BlankSelectedOption);
                 }
                 Ok(Self::Selected(values))
             }
             UiAnswerInput::Custom { text } => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
-                    return Err(UiAnswerInputError::EmptyCustom);
+                    return Err(UiAnswerInputError::BlankCustom);
                 }
                 Ok(Self::Custom(trimmed.to_string()))
             }
@@ -558,7 +558,7 @@ pub struct WorkspaceApprover {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WorkspaceApprovalError {
+pub enum WorkspaceApprovalError {
     #[error("failed to persist waiting workspace request: {0}")]
     PersistWaiting(#[source] crate::db::ChatDbError),
     #[error("failed to append workspace request history: {0}")]
@@ -584,7 +584,7 @@ impl SessionRunCancellationRegistry {
         &self,
         session_id: impl Into<String>,
     ) -> Option<async_channel::Receiver<()>> {
-        self.live_responses.try_open(session_id.into())
+        self.live_responses.try_open(&session_id.into())
     }
 
     pub(crate) fn cancel(&self, session_id: &str) -> bool {
@@ -640,7 +640,7 @@ impl AskUserApprover {
         let questions = request.args.request.clone().into_questions();
         let request_session_id = Some(request.args.session_id.clone()).or(session_id);
         let request_id = uuid::Uuid::new_v4().to_string();
-        let rx = self.live_responses.open(request_id.clone());
+        let rx = self.live_responses.open(&request_id);
 
         if let Some(session_id) = request_session_id.as_deref()
             && let Some(runtime_service) = self.runtime_service.clone()
@@ -715,7 +715,7 @@ impl WorkspaceApprover {
         request: RequestWorkspaceArgs,
     ) -> Result<bool, WorkspaceApprovalError> {
         let request_id = uuid::Uuid::new_v4().to_string();
-        let rx = self.live_responses.open(request_id.clone());
+        let rx = self.live_responses.open(&request_id);
 
         if let Some(runtime_service) = self.runtime_service.clone() {
             runtime_service

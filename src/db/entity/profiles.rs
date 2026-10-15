@@ -1,10 +1,13 @@
 //! Profile row model for the chat history database.
 
+/// Profile row model.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
+    /// Profile id.
     pub id: String,
     /// Well-known identifier: "daily", "work", "local", or None for custom profiles.
     pub slug: Option<String>,
+    /// Display name.
     pub name: String,
     /// Emoji or icon identifier for the profile.
     pub icon: Option<String>,
@@ -26,6 +29,8 @@ pub struct Model {
     pub pinned_limit: i32,
     /// Display order among profiles.
     pub sort_order: i32,
+    /// Creation timestamp (ISO 8601).
     pub created_at: String,
+    /// Last update timestamp (ISO 8601).
     pub updated_at: String,
 }

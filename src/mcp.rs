@@ -14,12 +14,16 @@ use serde::{Deserialize, Serialize};
 /// MCP configuration error.
 #[derive(Debug, thiserror::Error)]
 pub enum McpConfigError {
+    /// Home directory not found.
     #[error("Home directory not found")]
     NoHomeDir,
+    /// Failed to read MCP config.
     #[error("Failed to read MCP config: {0}")]
     Read(#[from] std::io::Error),
+    /// Failed to parse MCP config.
     #[error("Failed to parse MCP config: {0}")]
     Parse(#[from] serde_json::Error),
+    /// MCP connection error.
     #[error("MCP connection error: {0}")]
     Connection(#[from] McpError),
 }
@@ -27,11 +31,15 @@ pub enum McpConfigError {
 /// MCP connection loading error for terminal-command registration.
 #[derive(Debug, thiserror::Error)]
 pub enum McpConnectionLoadError {
+    /// Underlying `McpConfigError` error.
     #[error(transparent)]
     Config(#[from] McpConfigError),
+    /// Failed to connect to the MCP server.
     #[error("failed to connect MCP server '{server}': {source}")]
     Connect {
+        /// Server name that failed.
         server: String,
+        /// Underlying connection error.
         #[source]
         source: McpError,
     },
@@ -147,6 +155,9 @@ pub struct McpConfig {
 
 impl McpConfig {
     /// Get the MCP config file path (~/.may/mcp.json).
+    ///
+    /// # Errors
+    /// Returns [`McpConfigError`] when no home directory can be determined.
     pub fn config_path() -> Result<PathBuf, McpConfigError> {
         dirs::home_dir()
             .map(|h| h.join(".may").join("mcp.json"))
@@ -154,12 +165,18 @@ impl McpConfig {
     }
 
     /// Load MCP configuration from `~/.may/mcp.json` or use defaults.
+    ///
+    /// # Errors
+    /// Returns [`McpConfigError`] when the file exists but cannot be read or parsed.
     pub async fn load() -> Result<Self, McpConfigError> {
         let path = Self::config_path()?;
         Self::load_from(&path).await
     }
 
     /// Load MCP configuration from a specific path.
+    ///
+    /// # Errors
+    /// Returns [`McpConfigError`] when `path` cannot be read or parsed.
     pub async fn load_from(path: &Path) -> Result<Self, McpConfigError> {
         match async_fs::metadata(path).await {
             Ok(_) => {
@@ -172,12 +189,18 @@ impl McpConfig {
     }
 
     /// Save MCP configuration to `~/.may/mcp.json`.
+    ///
+    /// # Errors
+    /// Returns [`McpConfigError`] when the path cannot be resolved or the write fails.
     pub async fn save(&self) -> Result<(), McpConfigError> {
         let path = Self::config_path()?;
         self.save_to(&path).await
     }
 
     /// Save MCP configuration to a specific path.
+    ///
+    /// # Errors
+    /// Returns [`McpConfigError`] when serialization or the filesystem write fails.
     pub async fn save_to(&self, path: &Path) -> Result<(), McpConfigError> {
         if let Some(parent) = path.parent() {
             async_fs::create_dir_all(parent).await?;
@@ -223,30 +246,32 @@ pub enum McpConnectionState {
     /// Connection is in progress.
     Connecting,
     /// Server is connected and ready.
-    Connected(McpConnection),
+    Connected(Box<McpConnection>),
     /// Connection failed with an error.
     Error(String),
 }
 
 impl McpConnectionState {
     /// Check if the server is connected.
+    #[must_use]
     pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Connected(_))
     }
 
     /// Get the connection if connected.
-    pub const fn connection(&self) -> Option<&McpConnection> {
+    #[must_use]
+    pub fn connection(&self) -> Option<&McpConnection> {
         if let Self::Connected(conn) = self {
-            Some(conn)
+            Some(&**conn)
         } else {
             None
         }
     }
 
     /// Get a mutable reference to the connection if connected.
-    pub const fn connection_mut(&mut self) -> Option<&mut McpConnection> {
+    pub fn connection_mut(&mut self) -> Option<&mut McpConnection> {
         if let Self::Connected(conn) = self {
-            Some(conn)
+            Some(conn.as_mut())
         } else {
             None
         }
@@ -257,8 +282,19 @@ impl McpConnectionState {
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpServerSource {
-    Url { url: String },
-    Process { command: String, args: Vec<String> },
+    /// Remote MCP server reached by URL.
+    Url {
+        /// Server URL the client connects to.
+        url: String,
+    },
+    /// Local MCP server spawned as a process.
+    Process {
+        /// Program used to spawn the server.
+        command: String,
+        /// Arguments passed to the command.
+        args: Vec<String>,
+    },
+    /// No usable source recorded.
     Unknown,
 }
 
@@ -279,16 +315,28 @@ impl std::fmt::Display for McpServerSource {
     }
 }
 
+/// Connection status of one MCP server, for UI display.
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum McpServerStatus {
+    /// Server is not connected.
     Disconnected,
+    /// A connection attempt is in progress.
     Connecting,
-    Connected { tool_count: usize },
-    Error { message: String },
+    /// Connected; `tool_count` tools are exposed.
+    Connected {
+        /// Number of tools the server exposes.
+        tool_count: usize,
+    },
+    /// Connection failed; `message` describes the error.
+    Error {
+        /// Error message from the failed connection.
+        message: String,
+    },
 }
 
 impl McpServerStatus {
+    /// Whether the status is `Connected`.
     #[must_use]
     pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Connected { .. })
@@ -351,6 +399,9 @@ impl McpManager {
     }
 
     /// Load MCP manager from default configuration path.
+    ///
+    /// # Errors
+    /// Returns [`McpConfigError`] when the config cannot be loaded or parsed.
     pub async fn load() -> Result<Self, McpConfigError> {
         let config = McpConfig::load().await?;
         Ok(Self::new(config))
@@ -368,6 +419,9 @@ impl McpManager {
     }
 
     /// Save the current configuration.
+    ///
+    /// # Errors
+    /// Returns [`McpConfigError`] when the write fails.
     pub async fn save_config(&self) -> Result<(), McpConfigError> {
         self.config.save().await
     }
@@ -413,8 +467,10 @@ impl McpManager {
         match McpConnection::from_config(&mcp_config).await {
             Ok(conn) => {
                 tracing::info!("Connected to MCP server: {name}");
-                self.connections
-                    .insert(name.to_string(), McpConnectionState::Connected(conn));
+                self.connections.insert(
+                    name.to_string(),
+                    McpConnectionState::Connected(Box::new(conn)),
+                );
                 Ok(())
             }
             Err(e) => {
@@ -427,6 +483,9 @@ impl McpManager {
     }
 
     /// Reconnect to a specific server by name.
+    ///
+    /// # Errors
+    /// Returns [`McpError`] when the server is unknown or reconnecting fails.
     pub async fn reconnect(&mut self, name: &str) -> Result<(), McpError> {
         if let Some(config) = self.config.mcp_servers.get(name).cloned() {
             self.connect_server_internal(name, &config).await
@@ -438,6 +497,9 @@ impl McpManager {
     }
 
     /// Add a new server and connect to it.
+    ///
+    /// # Errors
+    /// Returns [`McpError`] when the config is invalid, the connection fails, or persistence fails.
     pub async fn add_server(
         &mut self,
         name: impl Into<String>,
@@ -461,6 +523,9 @@ impl McpManager {
     }
 
     /// Remove a server and disconnect if connected.
+    ///
+    /// # Errors
+    /// Returns [`McpError`] when the server is unknown or persistence fails.
     pub async fn remove_server(&mut self, name: &str) -> Result<(), McpError> {
         let mut next_config = self.config.clone();
         if next_config.remove_server(name).is_none() {
@@ -494,7 +559,7 @@ impl McpManager {
     pub fn active_connections(&self) -> impl Iterator<Item = (&str, &McpConnection)> {
         self.connections.iter().filter_map(|(name, state)| {
             if let McpConnectionState::Connected(conn) = state {
-                Some((name.as_str(), conn))
+                Some((name.as_str(), &**conn))
             } else {
                 None
             }
@@ -524,7 +589,7 @@ impl McpManager {
                 .connections
                 .insert(name, McpConnectionState::Disconnected)
             {
-                connections.push(conn);
+                connections.push(*conn);
             }
         }
         connections
@@ -537,16 +602,18 @@ impl McpManager {
             .mcp_servers
             .iter()
             .map(|(name, config)| {
-                let source = if let Some(ref url) = config.url {
-                    McpServerSource::Url { url: url.clone() }
-                } else if let Some(ref cmd) = config.command {
-                    McpServerSource::Process {
-                        command: cmd.clone(),
-                        args: config.args.clone(),
-                    }
-                } else {
-                    McpServerSource::Unknown
-                };
+                let source = config.url.as_ref().map_or_else(
+                    || {
+                        config
+                            .command
+                            .as_ref()
+                            .map_or(McpServerSource::Unknown, |cmd| McpServerSource::Process {
+                                command: cmd.clone(),
+                                args: config.args.clone(),
+                            })
+                    },
+                    |url| McpServerSource::Url { url: url.clone() },
+                );
 
                 let status = match self.connections.get(name) {
                     Some(McpConnectionState::Connected(conn)) => {
@@ -590,6 +657,9 @@ impl McpManager {
 /// This is the single runtime path for May's automatic MCP -> terminal-command conversion.
 /// Every connected MCP tool is expected to be exposed through the schema-driven IPC command
 /// registry rather than a bespoke native tool path.
+///
+/// # Errors
+/// Returns [`McpConnectionLoadError`] when the config cannot be loaded or a server fails to connect.
 pub async fn load_active_mcp_connections(
     may_dir: &Path,
 ) -> Result<Vec<McpConnection>, McpConnectionLoadError> {

@@ -25,11 +25,10 @@ pub(super) async fn handle_task_request(
     state: &Arc<UiServerState>,
     request: crate::agent::task_tool::TaskCreateRequest,
 ) -> Result<crate::agent::task_tool::TaskCreateResult, String> {
-    let result = state
+    state
         .task_runtime
         .create_task_from_tool_request(request)
-        .await;
-    result
+        .await
 }
 
 pub(super) async fn handle_notify_request(

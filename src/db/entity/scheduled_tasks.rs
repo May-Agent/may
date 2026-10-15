@@ -1,7 +1,9 @@
 //! Scheduled task row model for the chat history database.
 
+/// Scheduled task row model.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
+    /// Task row ID.
     pub id: String,
     /// Profile this task belongs to.
     pub profile_id: String,
@@ -33,6 +35,8 @@ pub struct Model {
     pub last_run_status: Option<String>,
     /// Last run output (truncated).
     pub last_run_output: Option<String>,
+    /// Creation timestamp (ISO 8601).
     pub created_at: String,
+    /// Last update timestamp (ISO 8601).
     pub updated_at: String,
 }

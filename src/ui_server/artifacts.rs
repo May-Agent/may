@@ -111,8 +111,9 @@ async fn collect_session_artifacts(
                     .and_then(|v| v.to_str())
                     .unwrap_or("artifact")
                     .to_string();
-                let lower = name.to_lowercase();
-                let is_html = lower.ends_with(".html") || lower.ends_with(".htm");
+                let is_html = std::path::Path::new(&name).extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm")
+                });
 
                 let modified = meta
                     .modified()
@@ -395,8 +396,7 @@ fn slidev_source_diagnostics(source: &str) -> Vec<String> {
         return vec!["Slidev source is empty.".to_string()];
     }
 
-    let mut cursor = 0usize;
-    if lines.first().is_some_and(|line| is_slidev_separator(line)) {
+    let mut cursor = if lines.first().is_some_and(|line| is_slidev_separator(line)) {
         let Some(headmatter_end) = lines
             .iter()
             .enumerate()
@@ -405,8 +405,10 @@ fn slidev_source_diagnostics(source: &str) -> Vec<String> {
         else {
             return vec!["Slidev headmatter is not closed with `---`.".to_string()];
         };
-        cursor = headmatter_end + 1;
-    }
+        headmatter_end + 1
+    } else {
+        0
+    };
 
     let mut diagnostics = Vec::new();
     let mut slides = Vec::new();
@@ -517,9 +519,7 @@ fn extract_missing_slidev_package(detail: &str) -> Option<String> {
 
 fn extract_missing_slidev_icon(detail: &str) -> Option<MissingSlidevIcon> {
     const ICON_MARKER: &str = "Icon `";
-    let Some(start) = detail.find(ICON_MARKER) else {
-        return None;
-    };
+    let start = detail.find(ICON_MARKER)?;
     let rest = &detail[start + ICON_MARKER.len()..];
     let end = rest.find('`')?;
     let icon = rest[..end].trim();
@@ -652,10 +652,8 @@ async fn install_slidev_dependency(
 
 fn replacement_icon_name(name: &str) -> Option<&'static str> {
     match name {
-        "prev" => Some("arrow-left"),
-        "next" => Some("arrow-right"),
-        "left" => Some("arrow-left"),
-        "right" => Some("arrow-right"),
+        "prev" | "left" => Some("arrow-left"),
+        "next" | "right" => Some("arrow-right"),
         _ => None,
     }
 }
@@ -1546,7 +1544,7 @@ async fn resolve_container_proxy_target(
         .await
         .map_err(internal_error)?;
 
-    let container_ip = inspect
+    let guest_ip = inspect
         .network_settings
         .and_then(|settings| settings.networks)
         .and_then(|networks| {
@@ -1563,7 +1561,7 @@ async fn resolve_container_proxy_target(
 
     Ok(ResolvedContainerProxyTarget {
         container_id,
-        container_ip,
+        container_ip: guest_ip,
     })
 }
 
@@ -1834,7 +1832,10 @@ mod tests {
 
     #[test]
     fn valid_slidev_source_has_no_structural_diagnostics() {
-        assert!(slidev_source_diagnostics(VALID_SLIDEV).is_empty());
+        assert_eq!(
+            slidev_source_diagnostics(VALID_SLIDEV),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

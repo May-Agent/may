@@ -35,7 +35,7 @@ const PLAN_MODE_APPROVED_HINT: &str = include_str!("../texts/plan_mode_approved.
 /// with no XML wrapping, so these strings end up as the `IndexMap` keys
 /// in `aither_agent::Context::system_blocks` and as stable KV-cache
 /// prefix segments.
-pub(crate) mod tag {
+pub mod tag {
     pub const MEMORY: &str = "memory";
     pub const TERMINAL_RUNTIME_CONTEXT: &str = "terminal_runtime_context";
     pub const WORKSPACE: &str = "workspace";
@@ -59,7 +59,7 @@ pub(crate) mod tag {
 /// strings means reconcile is a cheap set/unset operation with no
 /// additional templating cost and no XML wrapping.
 #[derive(Clone)]
-pub(crate) struct RuntimeSystemContext {
+pub struct RuntimeSystemContext {
     memory_db: crate::db::ChatDb,
     last_memory_content: String,
     terminal_runtime: Option<String>,
@@ -77,7 +77,7 @@ pub(crate) struct RuntimeSystemContext {
 }
 
 impl RuntimeSystemContext {
-    pub(crate) fn new(memory_db: crate::db::ChatDb, memory_content: String) -> Self {
+    pub(crate) const fn new(memory_db: crate::db::ChatDb, memory_content: String) -> Self {
         Self {
             memory_db,
             last_memory_content: memory_content,
@@ -156,7 +156,7 @@ impl RuntimeSystemContext {
         self
     }
 
-    pub(crate) fn reconcile(&mut self, context: &mut aither_agent::Context) {
+    pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
         reconcile_memory_block(
             context,
             build_memory_context_content(&self.last_memory_content),
@@ -216,7 +216,7 @@ fn reconcile_text_block(
     value: Option<String>,
 ) {
     match value {
-        Some(content) => context.insert_system_text(tag, content),
+        Some(text) => context.insert_system_text(tag, text),
         None => context.remove_system_named(tag),
     }
 }
@@ -369,7 +369,7 @@ struct BaseSystemTemplate {
     subagents: Vec<BaseSystemSubagent>,
 }
 
-pub(crate) fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> String {
+pub fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> String {
     let state = if enabled {
         BrowserContextState::Enabled
     } else {
@@ -384,7 +384,7 @@ pub(crate) fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -
         .unwrap_or_else(|error| panic!("failed to render browser context: {error}"))
 }
 
-pub(crate) fn build_terminal_runtime_context(
+pub fn build_terminal_runtime_context(
     config: &MayAgentConfig,
     session_paths: &SessionPaths,
     model_info: Option<&aither_models::ModelEntry>,
@@ -479,7 +479,7 @@ fn resolved_model_capability(model_id: &str) -> String {
     text
 }
 
-pub(crate) fn build_workspace_context(workspace: &MayWorkspace) -> String {
+pub fn build_workspace_context(workspace: &MayWorkspace) -> String {
     let template = WorkspaceTemplate {
         operating_system: operating_system_hint(&AgentEnvironment::Local).to_string(),
         sandbox: workspace.sandbox.display().to_string(),
@@ -490,11 +490,11 @@ pub(crate) fn build_workspace_context(workspace: &MayWorkspace) -> String {
         .unwrap_or_else(|error| panic!("failed to render workspace context: {error}"))
 }
 
-/// Builds the optional workspace_workdirs block from currently approved
+/// Builds the optional `workspace_workdirs` block from currently approved
 /// workspace grants. Split from [`build_workspace_context`] so that runtime
 /// workdir approvals can invalidate only this block and leave the stable
 /// workspace prefix cached.
-pub(crate) fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<String> {
+pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<String> {
     let workdirs: Vec<WorkspaceDirEntry> = workspace
         .config
         .workdirs
@@ -512,7 +512,7 @@ pub(crate) fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Opti
     )
 }
 
-pub(crate) fn build_container_environment_context(cwd: &std::path::Path) -> String {
+pub fn build_container_environment_context(cwd: &std::path::Path) -> String {
     let template = ContainerEnvironmentContextTemplate {
         operating_system: "linux (managed container runtime)".to_string(),
         cwd: cwd.display().to_string(),
@@ -522,7 +522,7 @@ pub(crate) fn build_container_environment_context(cwd: &std::path::Path) -> Stri
         .unwrap_or_else(|error| panic!("failed to render container environment context: {error}"))
 }
 
-pub(crate) async fn build_base_system_prompt(
+pub async fn build_base_system_prompt(
     shared_terminal_commands: &[(String, String)],
     skills_dir: &std::path::Path,
     subagents_dir: &std::path::Path,
@@ -590,7 +590,7 @@ async fn load_prompt_subagents(
         .collect())
 }
 
-fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static str {
+const fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static str {
     match environment {
         AgentEnvironment::Local => "local",
         AgentEnvironment::Container { .. } => "container",
@@ -628,14 +628,14 @@ fn environment_runtime_rules(environment: &AgentEnvironment) -> Vec<String> {
     }
 }
 
-pub(crate) fn build_location_context(location: &crate::location::LocationInfo) -> String {
+pub fn build_location_context(location: &crate::location::LocationInfo) -> String {
     format!(
         "Location hint (inferred):\nCity: {}\nRegion: {}\nCountry: {}\nTimezone: {}",
         location.city, location.region, location.country, location.timezone,
     )
 }
 
-pub(crate) fn build_memory_context_content(memory: &str) -> String {
+pub fn build_memory_context_content(memory: &str) -> String {
     let mut out = String::with_capacity(MEMORY_CONTEXT_HINT.len() + memory.len() + 2);
     out.push_str(MEMORY_CONTEXT_HINT.trim());
     out.push_str("\n\n");
@@ -643,11 +643,11 @@ pub(crate) fn build_memory_context_content(memory: &str) -> String {
     out
 }
 
-pub(crate) fn build_native_voice_context(native_voice_input: bool) -> Option<String> {
+pub fn build_native_voice_context(native_voice_input: bool) -> Option<String> {
     native_voice_input.then(|| NATIVE_VOICE_AVAILABLE_HINT.to_string())
 }
 
-pub(crate) fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<String> {
+pub fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<String> {
     match plan_state {
         SessionPlanState::Disabled => None,
         SessionPlanState::Draft => Some(PLAN_MODE_DRAFT_HINT.to_string()),
@@ -655,7 +655,7 @@ pub(crate) fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<St
     }
 }
 
-pub(crate) fn build_network_restrictions_context(
+pub fn build_network_restrictions_context(
     policy: Option<&CompiledNetworkPolicy>,
 ) -> Option<String> {
     let policy = policy?;
@@ -677,7 +677,7 @@ pub(crate) fn build_network_restrictions_context(
     Some(out)
 }
 
-pub(crate) fn build_macos_host_automation_context() -> Option<String> {
+pub fn build_macos_host_automation_context() -> Option<String> {
     if cfg!(target_os = "macos") && !is_running_in_container() {
         return Some(MACOS_HOST_AUTOMATION_HINT.to_string());
     }
@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
         let db = test_db();
-        let mut runtime_context = RuntimeSystemContext::new(db, "remember this".to_string());
+        let runtime_context = RuntimeSystemContext::new(db, "remember this".to_string());
         let mut context = aither_agent::Context::default();
         context.insert_system_text(tag::PROFILE_PERSONA, "stale persona");
         context.insert_system_text(tag::WORKSPACE, "stale workspace");
@@ -819,13 +819,13 @@ mod tests {
             .get(tag::MEMORY)
             .expect("memory block should be present");
         assert_eq!(memory, &build_memory_context_content("after"));
-        assert!(system_alerts(&context).is_empty());
+        assert_eq!(system_alerts(&context), [] as [std::string::String; 0]);
     }
 
     #[test]
     fn terminal_runtime_context_is_reconciled_as_system_block() {
         let db = test_db();
-        let mut runtime_context = RuntimeSystemContext::new(db, "remember this".to_string())
+        let runtime_context = RuntimeSystemContext::new(db, "remember this".to_string())
             .with_terminal_runtime("Model: demo-model\nHome environment kind: local".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);

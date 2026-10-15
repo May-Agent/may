@@ -17,20 +17,28 @@ use super::entity::profiles;
 /// Error type for database operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatDbError {
+    /// Underlying store failure; carries the driver error message.
     #[error("Database backend error: {0}")]
     Storage(String),
+    /// The queried row does not exist; the string identifies what was looked up.
     #[error("Database row not found: {0}")]
     RowNotFound(String),
+    /// A persisted context fragment failed XML block validation.
     #[error("Invalid context fragment: {0}")]
     InvalidXml(#[from] crate::xml::XmlBlockError),
+    /// A profile row carries an environment value that is not recognized or no longer allowed.
     #[error("Invalid profile environment: {0}")]
     InvalidProfileEnvironment(String),
+    /// A pin operation would exceed the per-profile pinned-item limit.
     #[error(
         "Pinned limit exceeded for profile {profile_id}: current pinned items {current}, limit {limit}"
     )]
     PinnedLimitExceeded {
+        /// Profile whose pin list hit the limit.
         profile_id: String,
+        /// Configured maximum number of pinned items.
         limit: i64,
+        /// Number of items already pinned.
         current: i64,
     },
 }
@@ -45,71 +53,117 @@ impl From<SkyDbError> for ChatDbError {
 }
 
 /// Parameters for creating a new profile.
+#[derive(Debug)]
 pub struct CreateProfileParams<'a> {
+    /// Id to create the profile under.
     pub id: &'a str,
+    /// Display name.
     pub name: &'a str,
+    /// Environment the profile's agents run in.
     pub environment: ProfileEnvironmentKind,
+    /// Container image reference; only meaningful for `Container` environments.
     pub container_image: Option<&'a str>,
+    /// Optional friendly slug; a default is derived when absent.
     pub slug: Option<&'a str>,
+    /// Optional icon identifier for pickers.
     pub icon: Option<&'a str>,
+    /// Optional persona text folded into the system prompt.
     pub persona: Option<&'a str>,
+    /// Optional initial preferences (mounts, dockerfile, ..).
     pub preferences: Option<&'a crate::profile::ProfilePreferences>,
+    /// Whether the profile may use device location context.
     pub location_aware: bool,
 }
 
 /// Parameters for updating a profile's mutable fields.
+#[derive(Debug)]
 pub struct UpdateProfileParams<'a> {
+    /// New display name, if changing.
     pub name: Option<&'a str>,
+    /// Icon update; `Some(None)` clears the stored icon.
     pub icon: Option<Option<&'a str>>,
+    /// Environment update.
     pub environment: Option<ProfileEnvironmentKind>,
+    /// Container image update; `Some(None)` clears it.
     pub container_image: Option<Option<&'a str>>,
+    /// Attached container id update; `Some(None)` detaches.
     pub container_id: Option<Option<&'a str>>,
+    /// Sort position update.
     pub sort_order: Option<i32>,
+    /// Persona update; `Some(None)` clears it.
     pub persona: Option<Option<&'a str>>,
+    /// Preferences update; `Some(None)` clears stored preferences.
     pub preferences: Option<Option<&'a crate::profile::ProfilePreferences>>,
+    /// Location-awareness toggle update.
     pub location_aware: Option<bool>,
 }
 
 /// Persisted assistant usage/context stats.
 #[derive(Debug, Clone, Default)]
 pub struct MessageStatsParams {
+    /// Provider that produced the message.
     pub provider_id: Option<String>,
+    /// Prompt (input) token count.
     pub prompt_tokens: Option<u32>,
+    /// Completion (output) token count.
     pub completion_tokens: Option<u32>,
+    /// Total tokens billed for the message.
     pub total_tokens: Option<u32>,
+    /// Tokens served from the provider's prompt cache.
     pub cache_read_tokens: Option<u32>,
+    /// Tokens written into the provider's prompt cache.
     pub cache_write_tokens: Option<u32>,
+    /// Model context window size at request time.
     pub context_window: Option<u32>,
+    /// Wall-clock time the request took, in milliseconds.
     pub elapsed_ms: Option<u64>,
 }
 
+/// Row payload recording one network access decision.
 #[derive(Debug, Clone)]
 pub struct NetworkAccessLogParams<'a> {
+    /// Session the access was attributed to, if any.
     pub session_id: Option<&'a str>,
+    /// Profile the access was attributed to, if any.
     pub profile_id: Option<&'a str>,
+    /// Which surface attempted the access.
     pub source: NetworkAccessSource,
+    /// Access mode (currently only `network`).
     pub mode: NetworkAccessMode,
+    /// Target host.
     pub domain: &'a str,
+    /// Target port.
     pub port: u16,
+    /// Whether policy allowed the access.
     pub allowed: bool,
+    /// Optional human-readable policy reason.
     pub reason: Option<&'a str>,
 }
 
+/// Which subsystem attempted a network access, persisted as `snake_case`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccessSource {
+    /// Interactive chat agent.
     Chat,
+    /// `may exec` one-shot command execution.
     Exec,
+    /// Scheduled task running on the host.
     TaskLocal,
+    /// Scheduled-task validation run on the host.
     TaskValidationLocal,
+    /// Scheduled task on a remote target.
     TaskRemote,
+    /// Scheduled task inside a container.
     TaskContainer,
+    /// Scheduled-task validation inside a container.
     TaskValidationContainer,
 }
 
 impl NetworkAccessSource {
+    /// Persisted lowercase string form used in the database.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -147,15 +201,18 @@ impl core::str::FromStr for NetworkAccessSource {
     }
 }
 
+/// Network access mode stored for a log row.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAccessMode {
+    /// Plain outbound network access.
     Network,
 }
 
 impl NetworkAccessMode {
+    /// Persisted lowercase string form used in the database.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -181,29 +238,49 @@ impl core::str::FromStr for NetworkAccessMode {
     }
 }
 
+/// Row payload for one provider request log entry.
 #[derive(Debug, Clone)]
 pub struct RequestLogParams<'a> {
+    /// Session the request belongs to.
     pub session_id: &'a str,
+    /// Request timestamp as an ISO string.
     pub timestamp: &'a str,
+    /// Model id the request was sent to.
     pub model: &'a str,
+    /// Provider that served the request.
     pub provider_id: &'a str,
+    /// Prompt (input) token count.
     pub prompt_tokens: Option<u32>,
+    /// Completion (output) token count.
     pub completion_tokens: Option<u32>,
+    /// Total tokens billed for the request.
     pub total_tokens: Option<u32>,
+    /// Tokens served from the provider's prompt cache.
     pub cache_read_tokens: Option<u32>,
+    /// Tokens written into the provider's prompt cache.
     pub cache_write_tokens: Option<u32>,
+    /// Model context window size at request time.
     pub context_window: Option<u32>,
+    /// Wall-clock time the request took, in milliseconds.
     pub elapsed_ms: u64,
+    /// Whether the request completed successfully.
     pub ok: bool,
+    /// Error summary when `ok` is false.
     pub error: Option<&'a str>,
 }
 
+/// Aggregate prompt-cache statistics across assistant messages.
 #[derive(Debug, Clone, Default)]
 pub struct AssistantCacheUsageSummary {
+    /// Total assistant messages counted.
     pub assistant_message_count: u64,
+    /// Messages that read from the provider cache.
     pub cache_hit_message_count: u64,
+    /// Summed prompt tokens.
     pub prompt_tokens_total: u64,
+    /// Summed cache-read tokens.
     pub cache_read_tokens_total: u64,
+    /// Summed cache-write tokens.
     pub cache_write_tokens_total: u64,
 }
 
@@ -331,34 +408,56 @@ pub(super) struct ContextDebugMessageToolCallRow {
     pub(super) name: String,
 }
 
+/// Materialized view of a persisted session context snapshot, for debugging.
 #[derive(Debug, Clone)]
 pub struct ContextDebugSnapshot {
+    /// Session the snapshot belongs to.
     pub session_id: String,
+    /// Snapshot timestamp as an ISO string.
     pub timestamp: String,
+    /// Model id recorded in the snapshot header.
     pub model: String,
+    /// Provider id recorded in the snapshot header.
     pub provider_id: String,
+    /// User prompt captured at snapshot time.
     pub prompt: String,
+    /// Attachment URLs included with the prompt.
     pub prompt_attachments: Vec<String>,
+    /// Messages assembled into the request context, in order.
     pub assembled_messages: Vec<ContextDebugSnapshotMessage>,
 }
 
+/// One message inside a [`ContextDebugSnapshot`].
 #[derive(Debug, Clone)]
 pub struct ContextDebugSnapshotMessage {
+    /// Message role (`user`, `assistant`, ..).
     pub role: String,
+    /// Message body text.
     pub content: String,
+    /// Attachment URLs carried by the message.
     pub attachments: Vec<String>,
+    /// Tool call id when the message answers one.
     pub tool_call_id: Option<String>,
+    /// Names of tool calls the message issued.
     pub tool_call_names: Vec<String>,
 }
 
+/// Outcome of consuming a notification's pending callback.
 #[derive(Debug, Clone)]
 pub struct NotificationCallbackConsumeResult {
+    /// Notification id that was consumed.
     pub id: String,
+    /// Session the notification belongs to, if any.
     pub session_id: Option<String>,
+    /// Profile the notification belongs to, if any.
     pub profile_id: Option<String>,
+    /// Serialized context fragment attached to the callback.
     pub callback_context_xml: Option<String>,
+    /// Callback message text delivered to the session.
     pub callback_message: Option<String>,
+    /// Whether a callback was registered for the notification.
     pub has_callback: bool,
+    /// Whether the callback had already been consumed.
     pub callback_consumed: bool,
 }
 
@@ -422,7 +521,9 @@ pub(super) struct StoredSessionContextSnapshotRow {
 }
 
 /// Parameters for upserting a persisted session context snapshot.
+#[derive(Debug)]
 pub struct SessionContextSnapshotUpsert {
+    /// Serialized agent checkpoint to persist.
     pub checkpoint: aither_agent::AgentCheckpoint,
     /// The DB `messages.id` of the last message at snapshot time.
     /// `None` means the snapshot was taken with an empty history.
@@ -432,47 +533,72 @@ pub struct SessionContextSnapshotUpsert {
 /// Structured snapshot loaded from SQL-backed session context storage.
 #[derive(Debug, Clone)]
 pub struct StoredSessionContextSnapshot {
+    /// Deserialized agent checkpoint.
     pub checkpoint: aither_agent::AgentCheckpoint,
     /// The DB `messages.id` of the last message at snapshot time.
     pub last_message_db_id: Option<i64>,
+    /// Last update timestamp as an ISO string.
     pub updated_at: String,
 }
 
 /// Parameters for creating a scheduled task.
+#[derive(Debug)]
 pub struct CreateScheduledTaskParams<'a> {
+    /// Id to create the task under.
     pub id: &'a str,
+    /// Profile the task runs under.
     pub profile_id: &'a str,
+    /// Session the task is bound to, if any.
     pub session_id: Option<&'a str>,
+    /// Human-readable task name.
     pub name: &'a str,
+    /// Trigger definition (time, event, or webhook).
     pub trigger: &'a crate::task_trigger::PersistedTaskTrigger,
+    /// Cron expression for recurring tasks.
     pub cron_expression: Option<&'a str>,
+    /// ISO timestamp for one-shot tasks.
     pub run_at: Option<&'a str>,
+    /// Path to a script file the task runs.
     pub script_path: Option<&'a str>,
+    /// Inline script body the task runs.
     pub script_inline: Option<&'a str>,
+    /// Whether the task requires outbound network access.
     pub needs_network: bool,
 }
 
 /// Parameters for updating a scheduled task.
+#[derive(Debug)]
 pub struct UpdateScheduledTaskParams<'a> {
+    /// New task name, if changing.
     pub name: Option<&'a str>,
+    /// Enabled flag update.
     pub enabled: Option<bool>,
+    /// Approval flag update.
     pub approved: Option<bool>,
+    /// Cron schedule update; `Some(None)` clears it.
     pub cron_expression: Option<Option<&'a str>>,
+    /// One-shot timestamp update; `Some(None)` clears it.
     pub run_at: Option<Option<&'a str>>,
+    /// Script path update; `Some(None)` clears it.
     pub script_path: Option<Option<&'a str>>,
+    /// Inline script update; `Some(None)` clears it.
     pub script_inline: Option<Option<&'a str>>,
 }
 
+/// Where a profile's agent workload runs, persisted as lowercase.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileEnvironmentKind {
+    /// Runs on the host.
     Local,
+    /// Runs inside a container.
     Container,
 }
 
 impl ProfileEnvironmentKind {
+    /// Lowercase persisted/serde form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -601,7 +727,7 @@ pub(super) fn parse_attachment_kind(
 pub(super) fn normalize_profile_preferences(
     environment: ProfileEnvironmentKind,
     preferences: Option<&ProfilePreferences>,
-) -> Result<Option<ProfilePreferences>, ChatDbError> {
+) -> Option<ProfilePreferences> {
     let mut preferences = preferences.cloned().unwrap_or_default();
     match environment {
         ProfileEnvironmentKind::Local => {
@@ -609,7 +735,7 @@ pub(super) fn normalize_profile_preferences(
         }
         ProfileEnvironmentKind::Container => {}
     }
-    Ok(preferences.container.is_some().then_some(preferences))
+    preferences.container.is_some().then_some(preferences)
 }
 
 pub(super) fn build_profile_preferences(

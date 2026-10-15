@@ -68,18 +68,24 @@ fn normalize_base_url(url: &str) -> &str {
 /// Configuration error.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// Home directory not found.
     #[error("Home directory not found")]
     NoHomeDir,
+    /// Failed to read config.
     #[error("Failed to read config: {0}")]
     Read(#[from] std::io::Error),
+    /// Failed to parse config.
     #[error("Failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
+    /// Failed to serialize config.
     #[error("Failed to serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
+    /// Legacy `[playwright]` config section found; it must be renamed to `[browser]`.
     #[error(
         "legacy config section `[playwright]` is no longer supported; rename it to `[browser]`"
     )]
     LegacyPlaywrightSection,
+    /// Invalid browser config.
     #[error("invalid browser config: {0}")]
     InvalidBrowserConfig(String),
 }
@@ -102,7 +108,7 @@ pub enum ProviderType {
     Google,
     /// GitHub Copilot (OAuth, `OpenAI` format)
     Copilot,
-    /// ChatGPT subscription (OAuth, Codex Responses backend)
+    /// `ChatGPT` subscription (OAuth, Codex Responses backend)
     Chatgpt,
     /// `OpenRouter` (aggregator, `OpenAI` format)
     OpenRouter,
@@ -354,9 +360,12 @@ impl ProviderType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiFormat {
+    /// `OpenAI` chat-completions API format.
     #[default]
     OpenAI,
+    /// `Anthropic` messages API format.
     Anthropic,
+    /// Google Gemini API format.
     Gemini,
 }
 
@@ -441,12 +450,14 @@ impl ProviderInstance {
     }
 
     /// Set API key.
+    #[must_use]
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
 
     /// Set base URL.
+    #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = Some(url.into());
         self
@@ -544,9 +555,9 @@ impl ProviderInstance {
             return false;
         };
         let normalized_explicit = normalize_base_url(explicit_base_url);
-        provider_type.base_url().map_or(true, |default_url| {
-            normalize_base_url(default_url) != normalized_explicit
-        })
+        provider_type
+            .base_url()
+            .is_none_or(|default_url| normalize_base_url(default_url) != normalized_explicit)
     }
 }
 
@@ -608,7 +619,7 @@ impl ModelsConfig {
 
     /// Check if no models are configured.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         !self.has_any_models()
     }
 
@@ -617,6 +628,7 @@ impl ModelsConfig {
         self.add_selector(tier, ModelSelector::new(provider_id, model_id));
     }
 
+    /// Add `selector` to `tier` unless already present.
     pub fn add_selector(&mut self, tier: ModelTier, selector: ModelSelector) {
         let list = self.models_for_tier_mut(tier);
         if !list.contains(&selector) {
@@ -624,15 +636,19 @@ impl ModelsConfig {
         }
     }
 
+    /// Embedding model selector, if configured.
     #[must_use]
     pub const fn embedding_model(&self) -> Option<&ModelSelector> {
         self.embedding_model.as_ref()
     }
 }
 
+/// SSH server definition usable as a remote environment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
 pub struct SshServerConfig {
+    /// Server name referenced by profiles.
     pub name: String,
+    /// SSH target (`user@host[:port]`).
     pub target: String,
 }
 
@@ -663,8 +679,10 @@ impl Default for Preferences {
 /// UI appearance preferences persisted in config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Appearance {
+    /// UI font family.
     #[serde(default = "default_ui_font")]
     pub font: String,
+    /// UI theme name.
     #[serde(default = "default_ui_theme")]
     pub theme: String,
 }
@@ -694,17 +712,16 @@ fn default_ui_theme() -> String {
 /// not install or manage browser binaries themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserBackendKind {
+    /// May runs and manages the browser process.
+    #[default]
     Managed,
+    /// Connect to an external Chrome `DevTools` Protocol endpoint.
     RemoteCdp,
 }
 
-impl Default for BrowserBackendKind {
-    fn default() -> Self {
-        Self::Managed
-    }
-}
-
+/// Settings for the browser automation runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserConfig {
     /// Whether browser automation is enabled.
@@ -743,7 +760,7 @@ pub struct BrowserConfig {
     #[serde(default = "default_every_nth_frame")]
     pub every_nth_frame: u32,
     /// Disable common automation fingerprints surfaced to target sites:
-    /// the AutomationControlled blink feature, navigator.webdriver,
+    /// the `AutomationControlled` blink feature, navigator.webdriver,
     /// chrome.runtime stub, plugin/language emptiness, and WebGL
     /// vendor/renderer overrides. Default on; turn off to debug a site
     /// that misbehaves under the stealth shim.
@@ -758,6 +775,7 @@ pub struct BrowserConfig {
     pub system_profile: Option<SystemProfileConfig>,
 }
 
+/// Existing Chromium profile seeded into the managed browser on first launch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemProfileConfig {
@@ -823,6 +841,10 @@ impl Default for BrowserConfig {
 }
 
 impl BrowserConfig {
+    /// Check the browser config for consistency.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidBrowserConfig`] when `remote_cdp` is selected without a `remote_cdp_endpoint`, or any value is out of range.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.backend == BrowserBackendKind::RemoteCdp
             && self
@@ -838,11 +860,16 @@ impl BrowserConfig {
         Ok(())
     }
 
+    /// Whether this backend requires May to run the browser process.
     #[must_use]
     pub const fn requires_managed_runtime(&self) -> bool {
         matches!(self.backend, BrowserBackendKind::Managed)
     }
 
+    /// The configured remote CDP endpoint.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidBrowserConfig`] when the endpoint is missing or blank.
     pub fn remote_cdp_endpoint(&self) -> Result<&str, ConfigError> {
         self.remote_cdp_endpoint
             .as_deref()
@@ -912,6 +939,9 @@ pub enum CommandPriority {
 
 impl CommandPriority {
     /// Maps the configured level onto the sandbox process priority.
+    ///
+    /// # Panics
+    /// Panics only if the compiled-in nice-level constants were somehow invalid (they are fixed at 10/19).
     #[must_use]
     pub fn process_priority(self) -> aither_sandbox::ProcessPriority {
         match self {
@@ -1001,6 +1031,9 @@ impl Default for MayConfig {
 
 impl MayConfig {
     /// Get the May directory path (~/.may/).
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when no home directory can be determined.
     pub fn may_dir() -> Result<PathBuf, ConfigError> {
         dirs::home_dir()
             .map(|h| h.join(".may"))
@@ -1008,17 +1041,26 @@ impl MayConfig {
     }
 
     /// Get the config file path (~/.may/config.toml).
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when no home directory can be determined.
     pub fn config_path() -> Result<PathBuf, ConfigError> {
         Ok(Self::may_dir()?.join("config.toml"))
     }
 
     /// Load configuration from ~/.may/config.toml or use defaults.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when the file exists but cannot be read or parsed.
     pub async fn load() -> Result<Self, ConfigError> {
         let path = Self::config_path()?;
         Self::load_from(&path).await
     }
 
     /// Load configuration from a specific path.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when the file exists but cannot be read or parsed.
     pub async fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match async_fs::read_to_string(path).await {
             Ok(content) => {
@@ -1033,12 +1075,18 @@ impl MayConfig {
     }
 
     /// Save configuration to ~/.may/config.toml.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when serialization or the filesystem write fails.
     pub async fn save(&self) -> Result<(), ConfigError> {
         let path = Self::config_path()?;
         self.save_to(&path).await
     }
 
     /// Save configuration to a specific path.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when serialization or the filesystem write fails.
     pub async fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         self.validate()?;
         if let Some(parent) = path.parent() {
@@ -1049,6 +1097,10 @@ impl MayConfig {
         Ok(())
     }
 
+    /// Check the whole config for consistency.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when any section contains an invalid value.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.browser.validate()
     }

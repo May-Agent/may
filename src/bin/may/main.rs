@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
             .await;
         }
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
-        CliMode::Exec(args) => std::process::exit(run_exec(args).await?),
+        CliMode::Exec(args) => std::process::exit(Box::pin(run_exec(args)).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,
         CliMode::Tui => {}
     }
@@ -376,6 +376,14 @@ where
     let mut assistant_response = String::new();
 
     loop {
+        enum Event {
+            AskUser(may_agent::ask_user::AskUserRequest),
+            Workspace(may_agent::workspace_request::WorkspaceRequest),
+            WorkerBuilt(Box<Result<AgentWorker, may_agent::tui::runtime::TuiRuntimeError>>),
+            Agent(TuiEvent),
+            Terminal(Box<AppEvent>),
+        }
+
         tracing::info!("=== LOOP START ===");
 
         // First draw: updates content_height/view_height for accurate overflow calculation.
@@ -447,14 +455,6 @@ where
             "channel states before select"
         );
 
-        enum Event {
-            AskUser(may_agent::ask_user::AskUserRequest),
-            Workspace(may_agent::workspace_request::WorkspaceRequest),
-            WorkerBuilt(Result<AgentWorker, may_agent::tui::runtime::TuiRuntimeError>),
-            Agent(TuiEvent),
-            Terminal(AppEvent),
-        }
-
         tracing::info!("entering select");
 
         // Use futures_lite::future::or chain
@@ -467,7 +467,9 @@ where
             futures_lite::future::or(
                 async {
                     match worker_build.as_mut() {
-                        Some(pending) => Some(Event::WorkerBuilt(pending.build.wait().await)),
+                        Some(pending) => {
+                            Some(Event::WorkerBuilt(Box::new(pending.build.wait().await)))
+                        }
                         None => futures_lite::future::pending().await,
                     }
                 },
@@ -496,7 +498,7 @@ where
                                     result.as_ref().map(|_| "event")
                                 );
                             }
-                            result.map(Event::Terminal)
+                            result.map(|event| Event::Terminal(Box::new(event)))
                         },
                     ),
                 ),
@@ -526,7 +528,7 @@ where
                 let finished = worker_build
                     .take()
                     .expect("a built worker comes from the pending worker build");
-                finish_worker_build(app, worker, finished, built).await?;
+                finish_worker_build(app, worker, finished, *built).await?;
             }
 
             Event::AskUser(request) => {
@@ -624,7 +626,7 @@ where
             Event::Terminal(terminal_event) => {
                 // Check for interrupt during agent processing
                 if agent_handle.is_some()
-                    && let AppEvent::Key(key_code, modifiers) = &terminal_event
+                    && let AppEvent::Key(key_code, modifiers) = &*terminal_event
                 {
                     let is_ctrl_c = *key_code == KeyCode::Char('c')
                         && modifiers.contains(KeyModifiers::CONTROL);
@@ -654,13 +656,13 @@ where
                 if let AppEvent::SessionDeleted {
                     deleted: Some(session_id),
                     ..
-                } = &terminal_event
+                } = &*terminal_event
                 {
                     runtime_deps.evict_session(session_id);
                 }
 
                 // Handle normal terminal events
-                match app.handle_event(terminal_event)? {
+                match app.handle_event(*terminal_event)? {
                     Some(SendAction::Quit) => break,
                     Some(SendAction::NewSession) => {
                         worker_build = Some(WorkerBuild {
@@ -1045,7 +1047,6 @@ where
             }
             Err(aither_copilot::CopilotError::AuthorizationPending) => {
                 terminal.draw(|frame| ui::render(frame, app))?;
-                continue;
             }
             Err(e) => {
                 app.copilot_auth_failed(e.to_string());
@@ -1057,11 +1058,11 @@ where
     }
 }
 
-/// Run the ChatGPT subscription OAuth flow.
+/// Run the `ChatGPT` subscription OAuth flow.
 ///
 /// Uses the PKCE browser loopback on localhost:1455. Over SSH (where the
 /// redirect cannot reach this machine) or when the listener fails to bind,
-/// falls back to OpenAI's device-authorization flow.
+/// falls back to `OpenAI`'s device-authorization flow.
 async fn run_chatgpt_auth<B: Backend>(
     app: &mut App,
     events: &mut EventHandler,
@@ -1139,7 +1140,7 @@ where
     finish_chatgpt_auth(app, events, terminal, credentials).await
 }
 
-/// Device-authorization variant of the ChatGPT OAuth flow.
+/// Device-authorization variant of the `ChatGPT` OAuth flow.
 async fn run_chatgpt_device_auth<B: Backend>(
     app: &mut App,
     events: &mut EventHandler,
@@ -1186,7 +1187,7 @@ where
             match tokio::time::timeout(event_timeout, events.next()).await {
                 Ok(Some(event)) => {
                     if let Some(action) = app.handle_event(event)?
-                        && let SendAction::Quit = action
+                        && matches!(action, SendAction::Quit)
                     {
                         return Ok(());
                     }

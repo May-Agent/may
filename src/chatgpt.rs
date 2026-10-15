@@ -1,4 +1,4 @@
-//! ChatGPT subscription credential persistence.
+//! `ChatGPT` subscription credential persistence.
 //!
 //! OAuth credentials for the Codex backend are stored in
 //! `~/.may/chatgpt_token.json`. Access tokens are short-lived and refresh
@@ -12,10 +12,10 @@ use aither_codex::auth::CodexCredentials;
 use crate::auth_store::{delete_file, load_json, save_json};
 use crate::config::MayConfig;
 
-/// Token file name for ChatGPT OAuth credentials.
+/// Token file name for `ChatGPT` OAuth credentials.
 const TOKEN_FILE: &str = "chatgpt_token.json";
 
-/// Error type for ChatGPT credential operations.
+/// Error type for `ChatGPT` credential operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatgptAuthError {
     /// Failed to resolve the May config directory.
@@ -30,22 +30,42 @@ pub enum ChatgptAuthError {
 }
 
 /// Path to the stored credential file.
+///
+/// # Errors
+///
+/// Returns [`ChatgptAuthError`] when the May config directory cannot be
+/// resolved.
 pub fn token_path() -> Result<PathBuf, ChatgptAuthError> {
     Ok(MayConfig::may_dir()?.join(TOKEN_FILE))
 }
 
 /// Load stored credentials; `Ok(None)` when the file does not exist.
+///
+/// # Errors
+///
+/// Returns [`ChatgptAuthError`] when the credential path cannot be resolved
+/// or the file exists but cannot be read or parsed.
 pub async fn load_credentials() -> Result<Option<CodexCredentials>, ChatgptAuthError> {
     Ok(load_json(&token_path()?).await?)
 }
 
 /// Persist credentials (called on login and on every token rotation).
+///
+/// # Errors
+///
+/// Returns [`ChatgptAuthError`] when the credential path cannot be resolved
+/// or the write fails.
 pub async fn save_credentials(credentials: &CodexCredentials) -> Result<(), ChatgptAuthError> {
     save_json(&token_path()?, credentials).await?;
     Ok(())
 }
 
 /// Delete stored credentials (logout or after an unrecoverable auth failure).
+///
+/// # Errors
+///
+/// Returns [`ChatgptAuthError`] when the credential path cannot be resolved
+/// or removing the file fails.
 pub async fn delete_credentials() -> Result<(), ChatgptAuthError> {
     delete_file(&token_path()?).await?;
     Ok(())
@@ -54,5 +74,5 @@ pub async fn delete_credentials() -> Result<(), ChatgptAuthError> {
 /// Whether a credential file exists on disk.
 #[must_use]
 pub fn has_credentials() -> bool {
-    token_path().map(|p| p.exists()).unwrap_or(false)
+    token_path().is_ok_and(|p| p.exists())
 }

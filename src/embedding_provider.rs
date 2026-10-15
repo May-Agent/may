@@ -12,6 +12,7 @@ struct EmbeddingCandidate {
     embedder: CloudEmbedder,
 }
 
+/// A resolved embedding model with its provider fallback candidates.
 #[derive(Clone)]
 pub struct MayEmbeddingModel {
     selector: String,
@@ -27,18 +28,23 @@ impl std::fmt::Debug for MayEmbeddingModel {
             .field("model_id", &self.model_id)
             .field("dimension", &self.dimension)
             .field("provider_ids", &self.provider_ids())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
+/// Tri-state outcome of resolving the configured embedding selector.
 #[derive(Debug, Clone)]
 pub enum EmbeddingModelResolution {
+    /// No embedding model is configured.
     Disabled,
+    /// Resolution failed with a recorded error.
     Failed(EmbeddingProviderError),
+    /// A model resolved successfully.
     Ready(MayEmbeddingModel),
 }
 
 impl EmbeddingModelResolution {
+    /// Map a resolution result onto the tri-state.
     #[must_use]
     pub fn from_result(result: Result<Option<MayEmbeddingModel>, EmbeddingProviderError>) -> Self {
         match result {
@@ -48,6 +54,7 @@ impl EmbeddingModelResolution {
         }
     }
 
+    /// The resolved model when `Ready`.
     #[must_use]
     pub const fn ready(&self) -> Option<&MayEmbeddingModel> {
         match self {
@@ -56,11 +63,16 @@ impl EmbeddingModelResolution {
         }
     }
 
+    /// Owned clone of the resolved model when `Ready`.
     #[must_use]
     pub fn clone_ready(&self) -> Option<MayEmbeddingModel> {
         self.ready().cloned()
     }
 
+    /// Return the resolved model, or an error describing why embeddings are unavailable.
+    ///
+    /// # Errors
+    /// Returns [`EmbeddingModelRequireError::Disabled`] when embeddings are not configured, or [`EmbeddingModelRequireError::Resolution`] when resolution failed.
     pub fn require_ready(
         &self,
         disabled_message: &'static str,
@@ -74,16 +86,19 @@ impl EmbeddingModelResolution {
 }
 
 impl MayEmbeddingModel {
+    /// Selector string identifying the model.
     #[must_use]
     pub fn selector(&self) -> &str {
         &self.selector
     }
 
+    /// Provider-facing model id.
     #[must_use]
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
 
+    /// Provider ids to try, in preference order.
     #[must_use]
     pub fn provider_ids(&self) -> Vec<&str> {
         self.candidates
@@ -137,27 +152,45 @@ enum EmbeddingSupport {
     RequiresProbe,
 }
 
+/// Error type for resolving the configured embedding selector.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum EmbeddingProviderError {
+    /// Semantic search requires a global `models.embedding_model` to be configured.
     #[error("semantic search requires a global models.embedding_model to be configured")]
     MissingModel,
+    /// The provider needs a global `models.embedding_dimensions` setting for the model.
     #[error(
         "embedding provider '{provider_id}' requires global models.embedding_dimensions for model '{model_id}'"
     )]
     MissingDimensions {
+        /// Provider lacking the setting.
         provider_id: String,
+        /// Model that needs the setting.
         model_id: String,
     },
+    /// No enabled provider supports the selector.
     #[error("no enabled provider supports embedding selector '{model_id}'")]
-    NoSupportingProvider { model_id: String },
+    NoSupportingProvider {
+        /// Embedding selector no enabled provider supports.
+        model_id: String,
+    },
+    /// Embedding probe failed for the selector.
     #[error("embedding probe failed for selector '{model_id}': {details}")]
-    ProbeFailed { model_id: String, details: String },
+    ProbeFailed {
+        /// Embedding selector that was probed.
+        model_id: String,
+        /// Failure details reported by the provider.
+        details: String,
+    },
 }
 
+/// Error type returned when an embedding model is required but unavailable.
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddingModelRequireError {
+    /// Embeddings are disabled or unconfigured.
     #[error("{0}")]
     Disabled(&'static str),
+    /// Resolution failed with the recorded provider error.
     #[error("{0}")]
     Resolution(EmbeddingProviderError),
 }
@@ -169,6 +202,13 @@ struct EmbeddingRequestError {
     details: String,
 }
 
+/// Resolve the configured embedding selector into a ready model, if any.
+///
+/// # Errors
+/// Returns [`EmbeddingProviderError`] when the selector is unsupported or the probe fails.
+///
+/// # Panics
+/// Panics when the configured selector references a provider that does not exist in config (invalid configuration invariant).
 pub async fn resolve_embedding_model(
     config: &MayConfig,
 ) -> Result<Option<MayEmbeddingModel>, EmbeddingProviderError> {
@@ -231,7 +271,7 @@ pub async fn resolve_embedding_model(
     }))
 }
 
-fn embedding_support(provider_type: ProviderType) -> EmbeddingSupport {
+const fn embedding_support(provider_type: ProviderType) -> EmbeddingSupport {
     match provider_type {
         ProviderType::Anthropic | ProviderType::Copilot | ProviderType::Chatgpt => {
             EmbeddingSupport::Unsupported

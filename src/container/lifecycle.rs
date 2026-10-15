@@ -30,7 +30,19 @@ struct SharedHostPaths {
     tools_mount: aither_sandbox::MountSpec,
 }
 
+#[derive(serde::Serialize)]
+struct SpecFingerprintPayload<'a> {
+    env: &'a [String],
+    host_gateway: &'a str,
+    image: &'a str,
+    mounts: &'a [String],
+    name: &'a str,
+    rev: &'a str,
+    workspace: String,
+}
+
 /// Manages container lifecycle for profile-based isolation.
+#[derive(Debug)]
 pub struct ContainerManager {
     runtime: Arc<ContainerRuntime>,
     may_dir: PathBuf,
@@ -41,6 +53,8 @@ pub struct ContainerManager {
 }
 
 impl ContainerManager {
+    /// Create a container manager bound to a detected `runtime`, persisting
+    /// managed-container state under `may_dir`.
     #[must_use]
     pub fn new(
         runtime: Arc<ContainerRuntime>,
@@ -66,6 +80,12 @@ impl ContainerManager {
     /// - If the container exists and is running, returns its ID.
     /// - If the container exists but is stopped, starts it.
     /// - If the container doesn't exist, creates and starts it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError`] when inspecting, creating, or starting the
+    /// container fails, when a stale container cannot be replaced, or when shared
+    /// host paths cannot be prepared.
     pub async fn ensure_running(
         &self,
         spec: &ContainerLaunchSpec,
@@ -143,6 +163,10 @@ impl ContainerManager {
     }
 
     /// Resolve a managed container id by deterministic container name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when the container list query fails.
     pub async fn resolve_container_id_by_name(
         &self,
         name: &str,
@@ -152,6 +176,10 @@ impl ContainerManager {
     }
 
     /// Resolve a managed container id by name, but only when it is running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when the container list query fails.
     pub async fn resolve_running_container_id_by_name(
         &self,
         name: &str,
@@ -176,7 +204,7 @@ impl ContainerManager {
         spec_fingerprint: &str,
     ) -> Result<String, ContainerError> {
         let env = Self::effective_env(spec, host_gateway);
-        let mounts = Self::effective_mounts(spec, shared_paths)?;
+        let mounts = Self::effective_mounts(spec, shared_paths);
 
         let host_config = HostConfig {
             mounts: Some(mounts),
@@ -308,10 +336,7 @@ impl ContainerManager {
         env
     }
 
-    fn effective_mounts(
-        spec: &ContainerLaunchSpec,
-        shared_paths: &SharedHostPaths,
-    ) -> Result<Vec<Mount>, ContainerError> {
+    fn effective_mounts(spec: &ContainerLaunchSpec, shared_paths: &SharedHostPaths) -> Vec<Mount> {
         let mut mounts = vec![
             // Session sandbox -> /workspace
             Mount {
@@ -369,7 +394,7 @@ impl ContainerManager {
             read_only: Some(true),
             ..Default::default()
         });
-        Ok(mounts)
+        mounts
     }
 
     fn compute_spec_fingerprint(
@@ -380,7 +405,7 @@ impl ContainerManager {
         let mut env = Self::effective_env(spec, host_gateway);
         env.sort_unstable();
 
-        let mut mounts: Vec<String> = Self::effective_mounts(spec, shared_paths)?
+        let mut mounts: Vec<String> = Self::effective_mounts(spec, shared_paths)
             .iter()
             .map(|mount| {
                 format!(
@@ -393,15 +418,17 @@ impl ContainerManager {
             .collect();
         mounts.sort_unstable();
 
-        let payload = serde_json::to_string(&serde_json::json!({
-            "rev": SPEC_FINGERPRINT_REVISION,
-            "name": spec.name,
-            "image": spec.image,
-            "workspace": spec.workspace.display().to_string(),
-            "host_gateway": host_gateway,
-            "env": env,
-            "mounts": mounts,
-        }))
+        // Field order matches the sorted-key ordering serde_json's default
+        // map produced previously, so fingerprints stay byte-identical.
+        let payload = serde_json::to_string(&SpecFingerprintPayload {
+            env: &env,
+            host_gateway,
+            image: &spec.image,
+            mounts: &mounts,
+            name: &spec.name,
+            rev: SPEC_FINGERPRINT_REVISION,
+            workspace: spec.workspace.display().to_string(),
+        })
         .map_err(|error| {
             ContainerError::Bootstrap(format!(
                 "failed to serialize container spec fingerprint payload: {error}"
@@ -409,7 +436,7 @@ impl ContainerManager {
         })?;
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        payload.hash(&mut hasher);
+        payload.as_str().hash(&mut hasher);
         Ok(format!("{:016x}", hasher.finish()))
     }
 
@@ -428,6 +455,10 @@ impl ContainerManager {
     }
 
     /// Stop a container gracefully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when the stop request fails.
     pub async fn stop(&self, container_id: &str) -> Result<(), ContainerError> {
         let opts = StopContainerOptionsBuilder::default().t(10).build();
         self.runtime
@@ -442,6 +473,10 @@ impl ContainerManager {
     }
 
     /// Remove a container (force).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when the remove request fails.
     pub async fn remove(&self, container_id: &str) -> Result<(), ContainerError> {
         let opts = RemoveContainerOptionsBuilder::default().force(true).build();
         self.runtime
@@ -531,6 +566,10 @@ impl ContainerManager {
     }
 
     /// Check if a container is currently running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::Docker`] when inspecting the container fails.
     pub async fn is_running(&self, container_id: &str) -> Result<bool, ContainerError> {
         let info = self
             .runtime
@@ -562,7 +601,7 @@ mod tests {
             aither_sandbox::MountSpec::read_write("/project-host", "/project"),
         );
         let shared = shared_paths();
-        let mounts = ContainerManager::effective_mounts(&spec, &shared).unwrap();
+        let mounts = ContainerManager::effective_mounts(&spec, &shared);
         let tools = mounts
             .iter()
             .find(|mount| mount.target.as_deref() == Some("/opt/aither/tools/bundle"))

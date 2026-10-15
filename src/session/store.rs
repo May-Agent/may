@@ -11,21 +11,29 @@ use crate::fs_utils::copy_dir_contents_recursive;
 /// Session store error.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Bundle error.
     #[error("Bundle error: {0}")]
     Bundle(#[from] crate::bundle::BundleError),
 }
 
 /// Handles persistence of sessions to filesystem.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SessionStore {
     home_paths: MayHomePaths,
 }
 
+/// How a session sandbox's resource directories (skills, subagents) are
+/// provisioned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxResourceLayout {
+    /// Resource directories are exposed through symlinks into the host's shared
+    /// directories.
     Symlinked,
+    /// Resource directories are real directories used as bind-mount points for
+    /// the container.
     ContainerMountPoints,
 }
 
@@ -45,10 +53,10 @@ impl SessionStore {
     /// Get typed layout for a session.
     #[must_use]
     pub fn session_paths(&self, id: &str, profile_id: Option<&str>) -> SessionPaths {
-        match profile_id {
-            Some(profile_id) => self.home_paths.profile_home(profile_id).session_paths(id),
-            None => self.home_paths.session_paths(id),
-        }
+        profile_id.map_or_else(
+            || self.home_paths.session_paths(id),
+            |profile_id| self.home_paths.profile_home(profile_id).session_paths(id),
+        )
     }
 
     /// Get path for a session's images directory.
@@ -71,6 +79,11 @@ impl SessionStore {
     }
 
     /// Create session directory structure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when creating the directory tree or seeding
+    /// profile-scoped resources fails.
     pub async fn create_session_dirs(
         &self,
         id: &str,
@@ -114,6 +127,14 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Bring an existing session's sandbox up to the container mount-point
+    /// layout: create the standard directories, replace the skills/subagents
+    /// entries with mount-point directories, and seed session resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when a directory cannot be created or an existing
+    /// skills/subagents entry is neither a directory nor removable.
     pub async fn reconcile_container_mount_points(
         &self,
         id: &str,
@@ -139,6 +160,10 @@ impl SessionStore {
     }
 
     /// Delete a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when removing the session directory fails.
     pub async fn delete_session(
         &self,
         id: &str,
@@ -152,6 +177,11 @@ impl SessionStore {
     }
 
     /// Delete every session directory across the root home and all profile homes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when listing profile directories or removing a
+    /// sessions directory fails.
     pub async fn delete_all_session_dirs(&self) -> Result<(), StoreError> {
         let sessions_dir = self.home_paths.sessions_dir();
         if sessions_dir.exists() {
@@ -211,6 +241,11 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Seed a profile's skills and subagents directories from the shared home.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when syncing the directory contents fails.
     pub async fn sync_profile_scoped_resources(&self, profile_id: &str) -> Result<(), StoreError> {
         self.seed_profile_scoped_resources(profile_id).await
     }

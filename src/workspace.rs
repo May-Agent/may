@@ -42,10 +42,13 @@ pub struct WorkspaceConfig {
 /// Error type for workspace configuration operations.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceConfigError {
+    /// Failed to read workspace config.
     #[error("Failed to read workspace config: {0}")]
     Read(#[from] std::io::Error),
+    /// Failed to parse workspace config.
     #[error("Failed to parse workspace config: {0}")]
     Parse(#[from] toml::de::Error),
+    /// Failed to serialize workspace config.
     #[error("Failed to serialize workspace config: {0}")]
     Serialize(#[from] toml::ser::Error),
 }
@@ -55,6 +58,11 @@ impl WorkspaceConfig {
     ///
     /// Returns `Ok(default)` if the file does not exist,
     /// but propagates parse errors so corrupt configs are not silently dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceConfigError::Read`] when the file exists but cannot
+    /// be read, and [`WorkspaceConfigError`] when its TOML fails to parse.
     pub fn load(config_path: &Path) -> Result<Self, WorkspaceConfigError> {
         match fs::read_to_string(config_path) {
             Ok(content) => Ok(toml::from_str(&content)?),
@@ -64,6 +72,11 @@ impl WorkspaceConfig {
     }
 
     /// Save workspace config to file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceConfigError`] when serializing or writing the file
+    /// fails.
     pub fn save(&self, config_path: &Path) -> Result<(), WorkspaceConfigError> {
         let content = toml::to_string_pretty(self)?;
         fs::write(config_path, content)?;
@@ -104,6 +117,7 @@ impl WorkspaceConfig {
 }
 
 /// The complete workspace state for a May session.
+#[derive(Debug)]
 pub struct Workspace {
     /// Session sandbox directory (always read/write).
     pub sandbox: PathBuf,
@@ -117,6 +131,11 @@ pub struct Workspace {
 
 impl Workspace {
     /// Create a new workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceConfigError`] when loading the workspace config
+    /// fails.
     pub fn new(
         sandbox: PathBuf,
         cwd: PathBuf,
@@ -132,6 +151,10 @@ impl Workspace {
     }
 
     /// Add a working directory (requires user approval).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceConfigError`] when saving the updated config fails.
     pub fn add_workdir(
         &mut self,
         path: PathBuf,

@@ -60,6 +60,15 @@ pub struct Completion {
     sandbox: PathBuf,
 }
 
+impl std::fmt::Debug for Completion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Completion")
+            .field("selected", &self.selected)
+            .field("workdir", &self.workdir)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Completion {
     /// Create a new completion state.
     #[must_use]

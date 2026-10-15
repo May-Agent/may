@@ -20,32 +20,49 @@ use crate::scheduler::TaskRuntime;
 use crate::session::{MayHomePaths, SessionStore};
 use crate::{SkillManager, SubagentManager};
 
+/// Failures while wiring the shared IPC command brokers.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolDispatchError {
+    /// Failed to initialize notification manager.
     #[error("failed to initialize notification manager: {0}")]
     InitializeNotificationManager(crate::notification::NotificationError),
+    /// Failed to load task runtime.
     #[error("failed to load task runtime: {0}")]
     LoadTaskRuntime(crate::db::ChatDbError),
+    /// Failed to configure task runtime.
     #[error("failed to configure task runtime: {0}")]
     ConfigureTaskRuntime(aither_sandbox::NetworkPolicyError),
 }
 
+/// Live broker handles for the shared terminal commands.
 #[derive(Debug, Clone)]
 pub struct ToolDispatchers {
+    /// Broker for the `task` command.
     pub task: TaskBroker,
+    /// Broker for the `notify` command.
     pub notify: NotifyBroker,
+    /// Broker for `browser` commands, when enabled.
     pub browser: Option<BrowserBroker>,
+    /// Broker for skill registration.
     pub register_skills: RegisterBroker,
+    /// Broker for subagent registration.
     pub register_subagents: RegisterBroker,
 }
 
-#[derive(Clone)]
+/// Dependencies needed to construct the shared IPC brokers.
+#[derive(Debug, Clone)]
 pub struct ToolDispatchConfig {
+    /// `~/.may` data directory.
     pub may_dir: PathBuf,
+    /// Working directory for spawned commands.
     pub cwd: PathBuf,
+    /// Database handle.
     pub db: ChatDb,
+    /// Browser automation config.
     pub browser_config: BrowserConfig,
+    /// Network policy applied to brokered commands.
     pub network_policy: NetworkPolicyConfig,
+    /// Broker for `ask_user` prompts.
     pub ask_user_broker: AskUserBroker,
     /// Baseline tool distribution prepared for task terminals.
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
@@ -75,6 +92,10 @@ impl BrowserServiceRuntime {
 }
 
 impl ToolDispatchers {
+    /// Construct every broker and spawn its servicing task.
+    ///
+    /// # Errors
+    /// Returns [`ToolDispatchError`] when a broker or its backing task fails to initialize.
     pub async fn spawn(config: ToolDispatchConfig) -> Result<Self, ToolDispatchError> {
         let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
         let notification_manager = Arc::new(
@@ -97,7 +118,7 @@ impl ToolDispatchers {
             .map_err(ToolDispatchError::LoadTaskRuntime)?
             .with_notifier(notification_service.clone())
             .with_ui_event_bus(ui_event_bus)
-            .with_network_policy(config.network_policy.clone())
+            .with_network_policy(&config.network_policy)
             .map_err(ToolDispatchError::ConfigureTaskRuntime)?,
         );
         let registration = RegistrationRuntime {
@@ -110,9 +131,9 @@ impl ToolDispatchers {
         let (task, task_queue) = crate::agent::task_channel();
         tokio::spawn(async move {
             while let Some(request) = task_queue.next().await {
-                let result = task_runtime
-                    .create_task_from_tool_request(request.args.clone())
-                    .await;
+                let result =
+                    Box::pin(task_runtime.create_task_from_tool_request(request.args.clone()))
+                        .await;
                 let _ = request.respond(result);
             }
         });
@@ -218,15 +239,7 @@ async fn handle_browser_request(
             let status = match browser_service_status(browser_service.socket_path().as_path()).await
             {
                 Ok(Some(status)) => Some(status),
-                Ok(None) => Some(
-                    ensure_browser_service_started(
-                        browser_service.may_dir.as_path(),
-                        &browser_service.browser_config,
-                    )
-                    .await
-                    .map_err(BrowserToolError::request_failed)?,
-                ),
-                Err(_) => Some(
+                Ok(None) | Err(_) => Some(
                     ensure_browser_service_started(
                         browser_service.may_dir.as_path(),
                         &browser_service.browser_config,
@@ -565,12 +578,11 @@ async fn browser_service_status(
     let request = BrowserServiceRequest::Status;
     match query_browser_service(socket_path, &request).await? {
         Some(BrowserServiceResponse::Ok { payload }) => Ok(Some(payload)),
-        Some(BrowserServiceResponse::Stopped) => Ok(None),
+        Some(BrowserServiceResponse::Stopped) | None => Ok(None),
         Some(BrowserServiceResponse::Error { message }) => Err(message),
         Some(BrowserServiceResponse::ReadOk { .. }) => {
             Err("browser service returned page payload for status request".to_string())
         }
-        None => Ok(None),
     }
 }
 
@@ -623,9 +635,8 @@ async fn ensure_browser_service_started(
                 last_error =
                     Some("browser service returned page payload for startup request".to_string());
             }
-            Ok(None) => {}
+            Ok(None | Some(BrowserServiceResponse::Ok { .. })) => {}
             Err(error) => last_error = Some(error),
-            Ok(Some(BrowserServiceResponse::Ok { .. })) => {}
         }
     }
 
@@ -635,9 +646,7 @@ async fn ensure_browser_service_started(
 async fn stop_browser_service(socket_path: &Path, _port: u16) -> Result<(), String> {
     let request = BrowserServiceRequest::Stop;
     match query_browser_service(socket_path, &request).await? {
-        Some(BrowserServiceResponse::Ok { .. }) | Some(BrowserServiceResponse::Stopped) | None => {
-            Ok(())
-        }
+        Some(BrowserServiceResponse::Ok { .. } | BrowserServiceResponse::Stopped) | None => Ok(()),
         Some(BrowserServiceResponse::Error { message }) => Err(message),
         Some(BrowserServiceResponse::ReadOk { .. }) => {
             Err("browser service returned page payload for stop request".to_string())

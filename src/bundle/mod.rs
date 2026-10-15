@@ -23,16 +23,23 @@ static CONTAINER_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/container");
 /// Bundle extraction error.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 /// Bundled resources manager.
+#[derive(Debug)]
 pub struct Bundle;
 
 impl Bundle {
     /// Extract bundled resources to ~/.may/ if not already present.
     /// Creates ~/.may/skills/, ~/.may/subagents/, and ~/.may/container/ directories.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError`] when a bundled resource directory or file
+    /// cannot be extracted under `may_dir`.
     pub async fn ensure_extracted(may_dir: &Path) -> Result<(), BundleError> {
         let skills_dir = may_dir.join("skills");
         let subagents_dir = may_dir.join("subagents");
@@ -67,6 +74,11 @@ impl Bundle {
     }
 
     /// Create symlinks in a local/heel session sandbox pointing to its home-scoped resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError`] when a symlink or its parent directory cannot
+    /// be created.
     pub async fn create_sandbox_home_symlinks(
         sandbox_dir: &Path,
         home_root: &Path,

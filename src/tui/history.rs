@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 const MAX_HISTORY_SIZE: usize = 1000;
 
 /// Input history with navigation.
+#[derive(Debug)]
 pub struct InputHistory {
     /// History entries (oldest first).
     entries: Vec<String>,
@@ -35,14 +36,16 @@ impl InputHistory {
 
     /// Load history from file.
     fn load_from_file(path: &Path) -> Vec<String> {
-        match fs::read_to_string(path) {
-            Ok(content) => content
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(String::from)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        fs::read_to_string(path).map_or_else(
+            |_| Vec::new(),
+            |content| {
+                content
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(String::from)
+                    .collect()
+            },
+        )
     }
 
     /// Save history to file.
@@ -107,7 +110,7 @@ impl InputHistory {
 
     /// Navigate to next entry (Down arrow).
     /// Returns the entry to display, or None if returning to current input.
-    pub fn next(&mut self) -> Option<&str> {
+    pub fn next_entry(&mut self) -> Option<&str> {
         match self.nav_index {
             None => None,
             Some(idx) => {

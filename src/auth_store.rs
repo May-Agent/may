@@ -38,7 +38,10 @@ pub(crate) async fn load_json<T: DeserializeOwned>(
 }
 
 /// Save a value as a JSON file, creating parent directories if needed.
-pub(crate) async fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), AuthStoreError> {
+pub(crate) async fn save_json<T: Serialize + Sync>(
+    path: &Path,
+    value: &T,
+) -> Result<(), AuthStoreError> {
     if let Some(parent) = path.parent() {
         async_fs::create_dir_all(parent)
             .await

@@ -1,10 +1,10 @@
 //! Message persistence queries on [`ChatDb`].
 //!
 //! All methods operating on `messages` and its satellite tables:
-//! append_message, the typed helpers (permission request/response,
-//! workspace request/response, ask_user request/response), the chat
-//! message stats writers, and the message readers (get_messages,
-//! llm_message_count, get_messages_by_role, assistant_cache_usage_summary).
+//! `append_message`, the typed helpers (permission request/response,
+//! workspace request/response, `ask_user` request/response), the chat
+//! message stats writers, and the message readers (`get_messages`,
+//! `llm_message_count`, `get_messages_by_role`, `assistant_cache_usage_summary`).
 
 use crate::PermissionHistoryMode;
 use crate::ask_user::AnswerValue;
@@ -20,6 +20,9 @@ use super::{ChatDb, ChatDbError, query, truncate_preview};
 
 impl ChatDb {
     /// Append a message to a session. Updates session preview and message count.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn append_message(
         &self,
         session_id: &str,
@@ -67,7 +70,7 @@ impl ChatDb {
             session_id,
             role_str,
             content,
-            timestamp.map(String::from).or(Some(now.clone())),
+            timestamp.map(String::from).or_else(|| Some(now.clone())),
             tool_call_id,
             provider_id,
             prompt_tokens,
@@ -113,7 +116,7 @@ impl ChatDb {
             session_id,
             role_str,
             "",
-            timestamp.map(String::from).or(Some(now.clone())),
+            timestamp.map(String::from).or_else(|| Some(now.clone())),
             Option::<String>::None,
             Option::<String>::None,
             Option::<i32>::None,
@@ -139,6 +142,10 @@ impl ChatDb {
         Ok(model)
     }
 
+    /// Append a permission-request message for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn append_permission_request_message(
         &self,
         session_id: &str,
@@ -170,6 +177,10 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append a permission-response message for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn append_permission_response_message(
         &self,
         session_id: &str,
@@ -199,6 +210,10 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append a workspace-request message for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn append_workspace_request_message(
         &self,
         session_id: &str,
@@ -230,6 +245,10 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append a workspace-response message for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn append_workspace_response_message(
         &self,
         session_id: &str,
@@ -259,6 +278,10 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append an ask-user request message with its questions and options.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn append_ask_user_request_message(
         &self,
         session_id: &str,
@@ -314,6 +337,10 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append an ask-user response message with its answers.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn append_ask_user_response_message(
         &self,
         session_id: &str,
@@ -374,6 +401,10 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Append a chat history message to a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn append_chat_message(
         &self,
         session_id: &str,
@@ -396,6 +427,9 @@ impl ChatDb {
     }
 
     /// Update usage/context stats on the latest assistant message in a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn set_latest_assistant_stats(
         &self,
         session_id: &str,
@@ -461,6 +495,10 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Update usage/context stats on the latest assistant message from a [`ChatMessageStats`].
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn set_latest_assistant_chat_stats(
         &self,
         session_id: &str,
@@ -471,6 +509,9 @@ impl ChatDb {
     }
 
     /// Get all messages for a session, ordered by id.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_messages(
         &self,
         session_id: &str,
@@ -485,6 +526,9 @@ impl ChatDb {
     }
 
     /// Return the highest `messages.id` for a session, or `None` if empty.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn max_message_id(&self, session_id: &str) -> Result<Option<i64>, ChatDbError> {
         let row = query!(
             self.db,
@@ -497,6 +541,9 @@ impl ChatDb {
     }
 
     /// Count messages that contribute to the LLM-visible conversation history.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn llm_message_count(&self, session_id: &str) -> Result<usize, ChatDbError> {
         let count = query!(
             self.db,
@@ -515,6 +562,9 @@ impl ChatDb {
     }
 
     /// Get messages for a session filtered by role.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_messages_by_role(
         &self,
         session_id: &str,
@@ -531,6 +581,9 @@ impl ChatDb {
     }
 
     /// Summarize persisted cache-token usage across assistant messages.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn assistant_cache_usage_summary(
         &self,
     ) -> Result<AssistantCacheUsageSummary, ChatDbError> {

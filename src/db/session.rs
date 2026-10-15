@@ -33,8 +33,18 @@ use super::entity::{
 };
 use super::{ChatDb, ChatDbError, query};
 
+/// Grouped pending ask-user request rows used when assembling a runtime summary.
+struct PendingAskUserParts {
+    row: Option<PendingAskUserRequestRow>,
+    questions: Vec<PendingAskUserQuestionRow>,
+    options: Vec<PendingAskUserQuestionOptionRow>,
+}
+
 impl ChatDb {
     /// Create a new session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn create_session(
         &self,
         id: &str,
@@ -45,6 +55,9 @@ impl ChatDb {
     }
 
     /// Create a new session within a specific profile.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn create_session_in_profile(
         &self,
         id: &str,
@@ -78,6 +91,9 @@ impl ChatDb {
     }
 
     /// Get a session by ID.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn get_session(&self, id: &str) -> Result<Option<sessions::Model>, ChatDbError> {
         Ok(query!(self.db, "SELECT * FROM sessions WHERE id = ?", id)
             .fetch_optional::<sessions::Model>()
@@ -144,7 +160,7 @@ impl ChatDb {
         row: PendingAskUserRequestRow,
         question_rows: Vec<PendingAskUserQuestionRow>,
         option_rows: Vec<PendingAskUserQuestionOptionRow>,
-    ) -> Result<PersistedAskUserRequest, ChatDbError> {
+    ) -> PersistedAskUserRequest {
         let mut option_rows_by_question = option_rows.into_iter().fold(
             std::collections::BTreeMap::<i64, Vec<PendingAskUserQuestionOptionRow>>::new(),
             |mut grouped, row| {
@@ -152,7 +168,7 @@ impl ChatDb {
                 grouped
             },
         );
-        Ok(PersistedAskUserRequest {
+        PersistedAskUserRequest {
             id: row.request_id,
             questions: question_rows
                 .into_iter()
@@ -168,7 +184,7 @@ impl ChatDb {
                     multi_select: question.multi_select,
                 })
                 .collect(),
-        })
+        }
     }
 
     fn build_session_runtime_summary(
@@ -177,10 +193,8 @@ impl ChatDb {
         attachment_rows: Vec<PendingMessageAttachmentRow>,
         permission_row: Option<session_pending_permissions::Model>,
         workspace_row: Option<session_pending_workspace::Model>,
-        ask_user_row: Option<PendingAskUserRequestRow>,
-        ask_user_question_rows: Vec<PendingAskUserQuestionRow>,
-        ask_user_option_rows: Vec<PendingAskUserQuestionOptionRow>,
-        plan_row: Option<session_plans::Model>,
+        ask_user: PendingAskUserParts,
+        plan_row: Option<&session_plans::Model>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let mut attachments_by_message = attachment_rows.into_iter().fold(
             std::collections::BTreeMap::<i64, Vec<PendingMessageAttachmentRow>>::new(),
@@ -219,11 +233,9 @@ impl ChatDb {
                     .map_or(SessionRuntimeState::Idle.as_str(), |row| row.state.as_str()),
             )?,
             plan_state: parse_session_plan_state(
-                plan_row
-                    .as_ref()
-                    .map_or(SessionPlanState::Disabled.as_str(), |row| {
-                        row.plan_state.as_str()
-                    }),
+                plan_row.map_or(SessionPlanState::Disabled.as_str(), |row| {
+                    row.plan_state.as_str()
+                }),
             )?,
             interactions: SessionInteractionState {
                 browser: BrowserInteractionState {
@@ -259,15 +271,13 @@ impl ChatDb {
                 .map(Self::persisted_permission_request_from_row)
                 .transpose()?,
             waiting_workspace: workspace_row.map(Self::persisted_workspace_request_from_row),
-            waiting_ask_user: ask_user_row
-                .map(|row| {
-                    Self::persisted_ask_user_request_from_parts(
-                        row,
-                        ask_user_question_rows.clone(),
-                        ask_user_option_rows.clone(),
-                    )
-                })
-                .transpose()?,
+            waiting_ask_user: ask_user.row.map(|row| {
+                Self::persisted_ask_user_request_from_parts(
+                    row,
+                    ask_user.questions.clone(),
+                    ask_user.options.clone(),
+                )
+            }),
             updated_at: runtime_row.map(|row| row.updated_at),
             ..Default::default()
         };
@@ -276,6 +286,9 @@ impl ChatDb {
     }
 
     /// Get the persisted runtime summary for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn get_session_runtime(
         &self,
         id: &str,
@@ -368,13 +381,22 @@ impl ChatDb {
             attachment_rows,
             permission_row,
             workspace_row,
-            ask_user_row,
-            ask_user_question_rows,
-            ask_user_option_rows,
-            plan_row,
+            PendingAskUserParts {
+                row: ask_user_row,
+                questions: ask_user_question_rows,
+                options: ask_user_option_rows,
+            },
+            plan_row.as_ref(),
         )
     }
 
+    /// List session runtime summaries.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn list_session_runtime_summaries(
         &self,
         session_ids: &[String],
@@ -393,6 +415,15 @@ impl ChatDb {
         Ok(summaries)
     }
 
+    /// Write session runtime.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `BackgroundReason` fails to serialize — the type is
+    /// serde-derived, so this cannot happen.
     pub async fn write_session_runtime(
         &self,
         session_id: &str,
@@ -621,6 +652,9 @@ impl ChatDb {
     }
 
     /// Set the base runtime state for a session with a direct SQL update.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn set_session_runtime_state(
         &self,
         session_id: &str,
@@ -640,6 +674,9 @@ impl ChatDb {
     }
 
     /// Atomically transition Running → Idle only if currently Running.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn clear_running_if_idle(&self, session_id: &str) -> Result<bool, ChatDbError> {
         let result = query!(
             self.db,
@@ -653,6 +690,14 @@ impl ChatDb {
     }
 
     /// Set only the terminal interaction fields via direct SQL update.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `BackgroundReason` fails to serialize — the type is
+    /// serde-derived, so this cannot happen.
     pub async fn set_terminal_interaction(
         &self,
         session_id: &str,
@@ -678,6 +723,13 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Set session plan state.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn set_session_plan_state(
         &self,
         session_id: &str,
@@ -697,10 +749,13 @@ impl ChatDb {
     }
 
     /// Enqueue a pending-immediate (steer) message. Existing steer messages
-    /// remain in the DB with their original delivery_mode — the
+    /// remain in the DB with their original `delivery_mode` — the
     /// `build_session_runtime_summary` method sorts steer messages by recency
     /// and only promotes the newest one to `pending_immediate`, keeping older
     /// steers as overflow in the queue.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn set_pending_immediate_message(
         &self,
         session_id: &str,
@@ -714,6 +769,9 @@ impl ChatDb {
     }
 
     /// Append a queued message via direct SQL insert.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn push_queued_message(
         &self,
         session_id: &str,
@@ -769,6 +827,9 @@ impl ChatDb {
 
     /// Atomically dequeue the next pending message.
     /// Priority: newest steer first, then oldest queued.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn take_next_pending_message(
         &self,
         session_id: &str,
@@ -817,6 +878,9 @@ impl ChatDb {
     }
 
     /// Remove and return the next pending message only when follow-up execution is allowed.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn take_next_dispatchable_pending_message(
         &self,
         session_id: &str,
@@ -830,6 +894,9 @@ impl ChatDb {
     }
 
     /// Remove all steer (pending-immediate) messages for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn clear_pending_immediate_message(
         &self,
         session_id: &str,
@@ -854,6 +921,9 @@ impl ChatDb {
     }
 
     /// Remove a queued message by its position in the queue.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn remove_queued_message_at(
         &self,
         session_id: &str,
@@ -894,6 +964,9 @@ impl ChatDb {
     }
 
     /// Persist or clear a waiting-permission request via direct SQL.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn set_waiting_permission(
         &self,
         session_id: &str,
@@ -930,6 +1003,9 @@ impl ChatDb {
     /// Use this when responding to a specific permission prompt so a fresh row
     /// inserted by the resumed agent for the *next* permission isn't wiped by a
     /// session-wide delete.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn clear_waiting_permission_request(
         &self,
         session_id: &str,
@@ -946,6 +1022,9 @@ impl ChatDb {
     }
 
     /// Persist or clear a waiting workspace request via direct SQL.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn set_waiting_workspace(
         &self,
         session_id: &str,
@@ -978,6 +1057,9 @@ impl ChatDb {
     }
 
     /// Persist or clear a waiting ask-user request via direct SQL.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn set_waiting_ask_user(
         &self,
         session_id: &str,
@@ -1051,6 +1133,9 @@ impl ChatDb {
     }
 
     /// Set browser takeover to this session. Clears takeover from OTHER sessions only.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn set_browser_takeover_owner(
         &self,
         session_id: &str,
@@ -1080,6 +1165,9 @@ impl ChatDb {
     }
 
     /// Clear browser takeover and set alert pending via direct SQL.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn clear_browser_takeover_owner(
         &self,
         session_id: &str,
@@ -1098,6 +1186,9 @@ impl ChatDb {
     }
 
     /// Atomically consume the browser takeover alert pending flag.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn take_browser_takeover_alert_pending(
         &self,
         session_id: &str,
@@ -1114,6 +1205,13 @@ impl ChatDb {
         Ok(result.rows_written > 0)
     }
 
+    /// Session has browser takeover.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn session_has_browser_takeover(
         &self,
         session_id: &str,
@@ -1124,6 +1222,13 @@ impl ChatDb {
         Ok(summary.interactions.browser.takeover_active)
     }
 
+    /// Find browser takeover session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn find_browser_takeover_session(&self) -> Result<Option<String>, ChatDbError> {
         Ok(query!(
             self.db,
@@ -1173,6 +1278,13 @@ impl ChatDb {
         .await?)
     }
 
+    /// Session has approved permission mode.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn session_has_approved_permission_mode(
         &self,
         session_id: &str,
@@ -1192,6 +1304,9 @@ impl ChatDb {
     }
 
     /// Check if a session exists in the database.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn session_exists(&self, id: &str) -> Result<bool, ChatDbError> {
         Ok(query!(
             self.db,
@@ -1207,6 +1322,9 @@ impl ChatDb {
     ///
     /// `reasoning_effort` uses a tri-state patch: `None` leaves the column
     /// untouched, `Some(None)` clears it to NULL, `Some(Some(value))` sets it.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn update_session(
         &self,
         id: &str,
@@ -1251,6 +1369,9 @@ impl ChatDb {
     }
 
     /// Delete a session and all its messages (CASCADE).
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn delete_session(&self, id: &str) -> Result<(), ChatDbError> {
         query!(self.db, "DELETE FROM messages WHERE session_id = ?", id)
             .execute()
@@ -1263,6 +1384,9 @@ impl ChatDb {
     }
 
     /// Delete all sessions.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn delete_all_sessions(&self) -> Result<u64, ChatDbError> {
         let result = query!(self.db, "DELETE FROM messages").execute().await?;
         let snapshot_result = query!(self.db, "DELETE FROM session_context_snapshots")
@@ -1273,6 +1397,9 @@ impl ChatDb {
     }
 
     /// List all sessions ordered by `updated_at` descending.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn list_sessions(&self) -> Result<Vec<sessions::Model>, ChatDbError> {
         Ok(
             query!(self.db, "SELECT * FROM sessions ORDER BY updated_at DESC")
@@ -1285,6 +1412,9 @@ impl ChatDb {
     ///
     /// This only repairs durable state. Live resources such as streams,
     /// process handles, and SSH connections must be rebuilt lazily.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn recover_session_runtimes_after_restart(&self) -> Result<(), ChatDbError> {
         let sessions = self.list_sessions().await?;
         for session in sessions {
@@ -1319,6 +1449,13 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Recover task runs after restart.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn recover_task_runs_after_restart(&self) -> Result<(), ChatDbError> {
         let finished_at = jiff::Timestamp::now().to_string();
         query!(
@@ -1335,6 +1472,13 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Recover session run leases after restart.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn recover_session_run_leases_after_restart(&self) -> Result<(), ChatDbError> {
         query!(
             self.db,
@@ -1349,6 +1493,13 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Claim session run lease.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn claim_session_run_lease(&self, session_id: &str) -> Result<bool, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         let mut tx = self.db.begin().await?;
@@ -1392,6 +1543,13 @@ impl ChatDb {
         Ok(claimed)
     }
 
+    /// Release session run lease.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn release_session_run_lease(&self, session_id: &str) -> Result<(), ChatDbError> {
         query!(
             self.db,
@@ -1406,6 +1564,13 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Session run lease active.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn session_run_lease_active(&self, session_id: &str) -> Result<bool, ChatDbError> {
         let lease = query!(
             self.db,
@@ -1417,6 +1582,13 @@ impl ChatDb {
         Ok(lease.is_some_and(|lease| lease.active))
     }
 
+    /// Request session run cancel.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn request_session_run_cancel(&self, session_id: &str) -> Result<bool, ChatDbError> {
         let result = query!(
             self.db,
@@ -1432,6 +1604,9 @@ impl ChatDb {
     }
 
     /// Return session ids that have persisted follow-up work ready to resume.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn sessions_requiring_pending_dispatch(&self) -> Result<Vec<String>, ChatDbError> {
         let sessions = self.list_sessions().await?;
         let mut session_ids = Vec::new();

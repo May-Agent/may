@@ -1,12 +1,11 @@
 use crossterm::event::KeyCode;
 
 use crate::tui::app::{App, SendAction};
-use crate::tui::error::AppResult;
 use crate::tui::state::{
     ChatgptAuthStatus, CopilotAuthStatus, McpAddMode, SkillAddMode, SshAddMode,
 };
 
-pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Esc => {
             app.copilot_auth_status = None;
@@ -18,10 +17,10 @@ pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option
                 verification_uri,
             }) = &app.copilot_auth_status
             {
-                return Ok(Some(SendAction::OpenCopilotAuthUrl {
+                return Some(SendAction::OpenCopilotAuthUrl {
                     url: verification_uri.clone(),
                     code: user_code.clone(),
-                }));
+                });
             }
             if matches!(
                 app.copilot_auth_status,
@@ -33,10 +32,10 @@ pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option
         }
         _ => {}
     }
-    Ok(None)
+    None
 }
 
-pub fn handle_chatgpt_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_chatgpt_auth_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Esc => {
             app.chatgpt_auth_status = None;
@@ -44,19 +43,19 @@ pub fn handle_chatgpt_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option
         }
         KeyCode::Enter => match &app.chatgpt_auth_status {
             Some(ChatgptAuthStatus::WaitingForCallback { url }) => {
-                return Ok(Some(SendAction::OpenChatgptAuthUrl {
+                return Some(SendAction::OpenChatgptAuthUrl {
                     url: url.clone(),
                     code: String::new(),
-                }));
+                });
             }
             Some(ChatgptAuthStatus::WaitingForUser {
                 user_code,
                 verification_uri,
             }) => {
-                return Ok(Some(SendAction::OpenChatgptAuthUrl {
+                return Some(SendAction::OpenChatgptAuthUrl {
                     url: verification_uri.clone(),
                     code: user_code.clone(),
-                }));
+                });
             }
             Some(ChatgptAuthStatus::Success | ChatgptAuthStatus::Failed(_)) => {
                 app.chatgpt_auth_status = None;
@@ -66,65 +65,62 @@ pub fn handle_chatgpt_auth_key(app: &mut App, code: KeyCode) -> AppResult<Option
         },
         _ => {}
     }
-    Ok(None)
+    None
 }
 
-pub fn handle_workspace_confirm_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_workspace_confirm_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::WorkspaceConfirm(state) = mode {
-                return Ok(Some(SendAction::RespondWorkspace {
+                return Some(SendAction::RespondWorkspace {
                     request_id: state.request_id,
                     request: state.request,
                     approved: true,
-                }));
+                });
             }
         }
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::WorkspaceConfirm(state) = mode {
-                return Ok(Some(SendAction::RespondWorkspace {
+                return Some(SendAction::RespondWorkspace {
                     request_id: state.request_id,
                     request: state.request,
                     approved: false,
-                }));
+                });
             }
         }
         _ => {}
     }
-    Ok(None)
+    None
 }
 
-pub fn handle_permission_confirm_key(
-    app: &mut App,
-    code: KeyCode,
-) -> AppResult<Option<SendAction>> {
+pub fn handle_permission_confirm_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::PermissionConfirm(state) = mode {
-                return Ok(Some(SendAction::RespondPermission {
+                return Some(SendAction::RespondPermission {
                     request_id: state.request_id,
                     approved: true,
-                }));
+                });
             }
         }
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::PermissionConfirm(state) = mode {
-                return Ok(Some(SendAction::RespondPermission {
+                return Some(SendAction::RespondPermission {
                     request_id: state.request_id,
                     approved: false,
-                }));
+                });
             }
         }
         _ => {}
     }
-    Ok(None)
+    None
 }
 
-pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match app.mcp_add_mode {
         McpAddMode::None => match code {
             KeyCode::Esc => {
@@ -148,13 +144,13 @@ pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
                 if let Some(server) = app.mcp_servers.get(app.mcp_selected) {
                     let name = server.name.clone();
-                    return Ok(Some(SendAction::McpRemove { name }));
+                    return Some(SendAction::McpRemove { name });
                 }
             }
             KeyCode::Char('r') => {
                 if let Some(server) = app.mcp_servers.get(app.mcp_selected) {
                     let name = server.name.clone();
-                    return Ok(Some(SendAction::McpReconnect { name }));
+                    return Some(SendAction::McpReconnect { name });
                 }
             }
             _ => {}
@@ -171,10 +167,8 @@ pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
             KeyCode::Backspace => {
                 app.mcp_add_name.pop();
             }
-            KeyCode::Char(c) => {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    app.mcp_add_name.push(c);
-                }
+            KeyCode::Char(c) if (c.is_alphanumeric() || c == '-' || c == '_') => {
+                app.mcp_add_name.push(c);
             }
             _ => {}
         },
@@ -193,11 +187,11 @@ pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
                                 let args_vec = args.to_vec();
                                 app.mcp_add_mode = McpAddMode::None;
                                 app.mcp_add_command.clear();
-                                return Ok(Some(SendAction::McpAdd {
+                                return Some(SendAction::McpAdd {
                                     name,
                                     command: command_str,
                                     args: args_vec,
-                                }));
+                                });
                             }
                         }
                         Err(error) => {
@@ -217,10 +211,10 @@ pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
             _ => {}
         },
     }
-    Ok(None)
+    None
 }
 
-pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match app.ssh_add_mode {
         SshAddMode::None => match code {
             KeyCode::Esc => {
@@ -243,9 +237,9 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
             }
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
                 if let Some(server) = app.config.ssh_servers.get(app.ssh_selected) {
-                    return Ok(Some(SendAction::SshRemove {
+                    return Some(SendAction::SshRemove {
                         name: server.name.clone(),
-                    }));
+                    });
                 }
             }
             _ => {}
@@ -260,10 +254,8 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
             KeyCode::Backspace => {
                 app.ssh_add_name.pop();
             }
-            KeyCode::Char(c) => {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    app.ssh_add_name.push(c);
-                }
+            KeyCode::Char(c) if (c.is_alphanumeric() || c == '-' || c == '_') => {
+                app.ssh_add_name.push(c);
             }
             _ => {}
         },
@@ -276,7 +268,7 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
                     app.ssh_add_mode = SshAddMode::None;
                     app.ssh_add_name.clear();
                     app.ssh_add_target.clear();
-                    return Ok(Some(SendAction::SshAdd { name, target }));
+                    return Some(SendAction::SshAdd { name, target });
                 }
             }
             KeyCode::Backspace => {
@@ -288,22 +280,20 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
             _ => {}
         },
     }
-    Ok(None)
+    None
 }
 
-pub fn handle_skill_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAction>> {
+pub fn handle_skill_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match app.skill_add_mode {
         SkillAddMode::None => match code {
             KeyCode::Esc => {
                 if app.skill_search.is_empty() {
                     app.mode = crate::tui::state::AppMode::Chat;
-                    app.skill_search.clear();
-                    app.skill_scroll = 0;
                 } else {
-                    app.skill_search.clear();
                     app.skill_selected = 0;
-                    app.skill_scroll = 0;
                 }
+                app.skill_search.clear();
+                app.skill_scroll = 0;
             }
             KeyCode::Up => {
                 if app.skill_selected > 0 {
@@ -332,14 +322,14 @@ pub fn handle_skill_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAc
                 let filtered = app.filtered_skills();
                 if let Some(skill) = filtered.get(app.skill_selected) {
                     let dir_name = skill.dir_name.clone();
-                    return Ok(Some(SendAction::SkillDelete { dir_name }));
+                    return Some(SendAction::SkillDelete { dir_name });
                 }
             }
             KeyCode::Delete => {
                 let filtered = app.filtered_skills();
                 if let Some(skill) = filtered.get(app.skill_selected) {
                     let dir_name = skill.dir_name.clone();
-                    return Ok(Some(SendAction::SkillDelete { dir_name }));
+                    return Some(SendAction::SkillDelete { dir_name });
                 }
             }
             KeyCode::Enter => {
@@ -366,19 +356,17 @@ pub fn handle_skill_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAc
                 if !app.skill_github_input.is_empty() {
                     let input = std::mem::take(&mut app.skill_github_input);
                     app.skill_add_mode = SkillAddMode::None;
-                    return Ok(Some(SendAction::SkillInstall { repo: input }));
+                    return Some(SendAction::SkillInstall { repo: input });
                 }
             }
             KeyCode::Backspace => {
                 app.skill_github_input.pop();
             }
-            KeyCode::Char(c) => {
-                if c.is_alphanumeric() || c == '-' || c == '_' || c == '/' {
-                    app.skill_github_input.push(c);
-                }
+            KeyCode::Char(c) if (c.is_alphanumeric() || c == '-' || c == '_' || c == '/') => {
+                app.skill_github_input.push(c);
             }
             _ => {}
         },
     }
-    Ok(None)
+    None
 }

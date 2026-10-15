@@ -7,24 +7,38 @@ use thiserror::Error;
 /// Errors that can occur when replaying chat history into LLM messages.
 #[derive(Debug, Error)]
 pub enum HistoryReplayError {
+    /// Tool history entry is missing `tool_call_id`.
     #[error("tool history entry is missing tool_call_id (content preview: {preview})")]
-    MissingToolCallId { preview: String },
+    MissingToolCallId {
+        /// First 100 characters of the offending entry.
+        preview: String,
+    },
+    /// Tool history entry is not a valid persisted tool event.
     #[error("tool history entry is not a valid persisted tool event")]
     InvalidToolEvent(#[source] serde_json::Error),
+    /// Tool event id does not match the message `tool_call_id`.
     #[error("tool event id '{event_id}' does not match message tool_call_id '{message_id}'")]
     ToolEventIdMismatch {
+        /// Id recorded in the tool event.
         event_id: String,
+        /// `tool_call_id` stored on the message.
         message_id: String,
     },
+    /// Tool start contains invalid JSON arguments.
     #[error("tool start '{tool_call_id}' contains invalid JSON arguments")]
     InvalidToolArguments {
+        /// Id of the malformed tool call.
         tool_call_id: String,
+        /// Underlying JSON parse error.
         #[source]
         source: serde_json::Error,
     },
+    /// Tool result could not be rendered for the model.
     #[error("tool result '{tool_call_id}' could not be rendered for the model")]
     RenderToolResult {
+        /// Id of the tool call whose result failed to render.
         tool_call_id: String,
+        /// Underlying render error.
         #[source]
         source: aither_core::Error,
     },
@@ -34,16 +48,24 @@ pub enum HistoryReplayError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "stage")]
 pub enum ToolEventRecord {
+    /// Tool call started.
     #[serde(rename = "start")]
     Start {
+        /// Tool call id.
         id: String,
+        /// Tool name.
         name: String,
+        /// Raw JSON arguments.
         arguments: String,
     },
+    /// Tool call completed.
     #[serde(rename = "end")]
     End {
+        /// Tool call id.
         id: String,
+        /// Tool name.
         name: String,
+        /// Rendered tool result.
         result: aither_core::llm::ToolResult,
     },
 }
@@ -62,20 +84,28 @@ pub struct SessionMetadata {
 /// Token/context stats attached to an assistant message.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessageStats {
+    /// Provider that served the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// Prompt token count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u32>,
+    /// Completion token count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u32>,
+    /// Total tokens billed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u32>,
+    /// Tokens served from the provider cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<u32>,
+    /// Tokens written to the provider cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
+    /// Model context window at request time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// Request wall-clock time in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
 }
@@ -84,11 +114,15 @@ pub struct ChatMessageStats {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
+    /// Message from the user.
     User,
+    /// Message produced by the model.
     Assistant,
+    /// System/context message.
     System,
     /// Hidden per-turn context stored for audit/debugging but filtered from normal UI recall.
     HiddenContext,
+    /// Tool event record.
     Tool,
     /// Agent requests permission to run a command.
     PermissionRequest,
@@ -112,6 +146,7 @@ pub struct SessionSummaryUpdate {
 }
 
 impl MessageRole {
+    /// Persisted `snake_case` string form.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
@@ -151,8 +186,12 @@ impl MessageRole {
             },
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl core::str::FromStr for MessageRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "user" => Ok(Self::User),
             "assistant" => Ok(Self::Assistant),
@@ -173,12 +212,17 @@ impl MessageRole {
 /// A single message in the chat history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Message role.
     pub role: MessageRole,
+    /// Message body (JSON payload for tool events).
     pub content: String,
+    /// Message timestamp, when recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<Timestamp>,
+    /// Tool call this message is the result of, when it is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Usage/context stats for assistant messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<ChatMessageStats>,
 }
@@ -313,6 +357,9 @@ impl ChatHistory {
     ///
     /// Interaction metadata stays filtered, while hidden context is restored as
     /// system context and tool messages keep their original tool-call IDs.
+    ///
+    /// # Errors
+    /// Returns [`HistoryReplayError`] when a persisted tool entry is malformed, has mismatched ids, or carries invalid JSON arguments.
     pub fn to_aither_messages(&self) -> Result<Vec<aither_core::llm::Message>, HistoryReplayError> {
         self.messages
             .iter()
@@ -321,17 +368,13 @@ impl ChatHistory {
                 match m.role {
                     MessageRole::User => Some(Ok(Message::user(&m.content))),
                     MessageRole::Assistant => Some(Ok(Message::assistant(&m.content))),
-                    MessageRole::System => Some(Ok(Message::system(&m.content))),
-                    MessageRole::HiddenContext => Some(Ok(Message::system(&m.content))),
+                    MessageRole::System | MessageRole::HiddenContext => {
+                        Some(Ok(Message::system(&m.content)))
+                    }
                     MessageRole::Tool => {
-                        let tool_call_id = match m.tool_call_id.as_deref() {
-                            Some(id) => id,
-                            None => {
-                                let preview: String = m.content.chars().take(100).collect();
-                                return Some(Err(HistoryReplayError::MissingToolCallId {
-                                    preview,
-                                }));
-                            }
+                        let Some(tool_call_id) = m.tool_call_id.as_deref() else {
+                            let preview: String = m.content.chars().take(100).collect();
+                            return Some(Err(HistoryReplayError::MissingToolCallId { preview }));
                         };
                         let event = match serde_json::from_str::<ToolEventRecord>(&m.content) {
                             Ok(event) => event,

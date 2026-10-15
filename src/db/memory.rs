@@ -5,6 +5,9 @@ use super::{ChatDb, ChatDbError, query};
 
 impl ChatDb {
     /// Store a push subscription from a browser.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn add_push_subscription(
         &self,
         id: &str,
@@ -34,6 +37,9 @@ impl ChatDb {
     }
 
     /// Remove a push subscription by endpoint.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn remove_push_subscription(&self, endpoint: &str) -> Result<(), ChatDbError> {
         query!(
             self.db,
@@ -46,6 +52,9 @@ impl ChatDb {
     }
 
     /// List all push subscriptions.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn list_push_subscriptions(
         &self,
     ) -> Result<Vec<push_subscriptions::Model>, ChatDbError> {
@@ -60,6 +69,9 @@ impl ChatDb {
     // ── Profile memories ──────────────────────────────────
 
     /// Get a profile memory by profile ID and type.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_profile_memory(
         &self,
         profile_id: &str,
@@ -76,6 +88,9 @@ impl ChatDb {
     }
 
     /// Get all memories for a profile.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_profile_memories(
         &self,
         profile_id: &str,
@@ -90,6 +105,9 @@ impl ChatDb {
     }
 
     /// Upsert a profile memory (insert or replace).
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn upsert_profile_memory(
         &self,
         profile_id: &str,
@@ -128,6 +146,9 @@ impl ChatDb {
     }
 
     /// Mark a profile memory refresh job dirty.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn mark_profile_memory_job_dirty(&self, profile_id: &str) -> Result<(), ChatDbError> {
         let updated_at = jiff::Timestamp::now().to_string();
         query!(
@@ -149,6 +170,9 @@ impl ChatDb {
     /// or before `refresh_cutoff`. New profiles get a short batching grace and
     /// become due once their dirty `updated_at` is at or before
     /// `initial_cutoff`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn list_due_profile_memory_jobs(
         &self,
         refresh_cutoff: &str,
@@ -166,6 +190,9 @@ impl ChatDb {
     }
 
     /// Mark a profile memory refresh job processed.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn mark_profile_memory_job_processed(
         &self,
         profile_id: &str,
@@ -189,6 +216,9 @@ impl ChatDb {
     // ── Session Tasks (DB-backed plan/todo) ──────────────────
 
     /// Get the tasks content for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_session_tasks(&self, session_id: &str) -> Result<Option<String>, ChatDbError> {
         #[derive(serde::Deserialize, skyzen::FromRow)]
         struct Row {
@@ -205,6 +235,9 @@ impl ChatDb {
     }
 
     /// Upsert the tasks content for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn set_session_tasks(
         &self,
         session_id: &str,
@@ -226,6 +259,9 @@ impl ChatDb {
     // ── Global Memory (DB-backed MEMORY.md replacement) ──────
 
     /// Get the global memory content.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_global_memory(&self) -> Result<Option<String>, ChatDbError> {
         #[derive(serde::Deserialize, skyzen::FromRow)]
         struct Row {
@@ -240,6 +276,9 @@ impl ChatDb {
     }
 
     /// Upsert the global memory content.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn set_global_memory(&self, content: &str) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         query!(

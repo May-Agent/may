@@ -10,7 +10,7 @@ const HEEL_BINARY_FILE: &str = "heel";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ManagedHeelAsset {
+pub struct ManagedHeelAsset {
     release_asset_name: &'static str,
     local_binary_name: &'static str,
 }
@@ -26,7 +26,7 @@ impl ManagedHeelAsset {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ManagedHeelError {
+pub enum ManagedHeelError {
     #[error("unsupported heel host target: os={os} arch={arch}")]
     UnsupportedHostTarget {
         os: &'static str,
@@ -105,7 +105,7 @@ struct ManagedHeelState {
 }
 
 /// How often to re-check the GitHub API for a new heel release (24 hours).
-const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
 
 /// Maps an OS/arch pair onto the managed heel release asset published for it.
 fn host_heel_asset(
@@ -141,11 +141,11 @@ fn host_heel_asset(
     }
 }
 
-pub(crate) fn current_host_heel_asset() -> Result<ManagedHeelAsset, ManagedHeelError> {
+pub fn current_host_heel_asset() -> Result<ManagedHeelAsset, ManagedHeelError> {
     host_heel_asset(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-pub(crate) fn linux_heel_asset_for_current_arch() -> Result<ManagedHeelAsset, ManagedHeelError> {
+pub fn linux_heel_asset_for_current_arch() -> Result<ManagedHeelAsset, ManagedHeelError> {
     match std::env::consts::ARCH {
         "x86_64" => Ok(ManagedHeelAsset {
             release_asset_name: "heel-x86_64-unknown-linux-gnu",
@@ -159,7 +159,7 @@ pub(crate) fn linux_heel_asset_for_current_arch() -> Result<ManagedHeelAsset, Ma
     }
 }
 
-pub(crate) async fn ensure_managed_heel_binary(
+pub async fn ensure_managed_heel_binary(
     install_root: &Path,
     asset: ManagedHeelAsset,
 ) -> Result<PathBuf, ManagedHeelError> {
@@ -175,24 +175,22 @@ pub(crate) async fn ensure_managed_heel_binary(
     let state_path = install_root.join(HEEL_RELEASE_STATE_FILE);
 
     // Fast path: if binary exists and was checked recently, skip the network call.
-    if binary_path.exists() {
-        if let Ok(Some(state)) = read_state(&state_path).await {
-            if let Some(ref checked_at) = state.last_checked_at {
-                if let Ok(ts) = checked_at.parse::<jiff::Timestamp>() {
-                    let elapsed = jiff::Timestamp::now().duration_since(ts);
-                    if elapsed
-                        < CHECK_INTERVAL
-                            .try_into()
-                            .unwrap_or(jiff::SignedDuration::ZERO)
-                    {
-                        tracing::debug!(
-                            binary = %binary_path.display(),
-                            "skipping heel update check (checked recently)"
-                        );
-                        return Ok(binary_path);
-                    }
-                }
-            }
+    if binary_path.exists()
+        && let Ok(Some(state)) = read_state(&state_path).await
+        && let Some(ref checked_at) = state.last_checked_at
+        && let Ok(ts) = checked_at.parse::<jiff::Timestamp>()
+    {
+        let elapsed = jiff::Timestamp::now().duration_since(ts);
+        if elapsed
+            < CHECK_INTERVAL
+                .try_into()
+                .unwrap_or(jiff::SignedDuration::ZERO)
+        {
+            tracing::debug!(
+                binary = %binary_path.display(),
+                "skipping heel update check (checked recently)"
+            );
+            return Ok(binary_path);
         }
     }
 

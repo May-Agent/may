@@ -16,6 +16,7 @@ use ratatui_image::protocol::StatefulProtocol;
 /// Terminal image support state.
 /// Created once at startup, before raw mode, and stored in App.
 /// Only created if terminal supports native graphics protocols (Kitty, iTerm2, Sixel).
+#[derive(Debug)]
 pub struct TerminalImageSupport {
     picker: Picker,
     protocol: ProtocolType,
@@ -96,6 +97,12 @@ pub struct ImageState {
     pub protocol: StatefulProtocol,
 }
 
+impl std::fmt::Debug for ImageState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageState").finish_non_exhaustive()
+    }
+}
+
 /// Render an image using the stateful protocol.
 pub fn render_image(frame: &mut Frame, area: Rect, state: &mut ImageState) {
     let image_widget = StatefulImage::default();
@@ -116,11 +123,7 @@ pub async fn fetch_image(url: &str) -> Option<Vec<u8>> {
         }
     } else {
         // Try to load as local file
-        let path = if url.starts_with("file://") {
-            &url[7..]
-        } else {
-            url
-        };
+        let path = url.strip_prefix("file://").unwrap_or(url);
         match async_fs::read(path).await {
             Ok(bytes) => bytes,
             Err(e) => {

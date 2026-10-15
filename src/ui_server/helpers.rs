@@ -17,7 +17,7 @@ use crate::session::{MayHomePaths, SessionPaths};
 use super::error::{bad_request_error, internal_error};
 use super::state::UiServerState;
 
-pub(super) async fn send_event<T: Serialize>(
+pub(super) async fn send_event<T: Serialize + Sync>(
     sender: &skyzen::responder::sse::Sender,
     kind: &str,
     data: &T,
@@ -45,12 +45,14 @@ pub(super) async fn load_session_paths(
                 .set_status(StatusCode::NOT_FOUND)
         })?;
     let home_paths = MayHomePaths::new(state.may_dir.clone());
-    let paths = match session.profile_id.as_deref() {
-        Some(profile_id) => home_paths
-            .profile_home(profile_id)
-            .session_paths(session_id),
-        None => home_paths.session_paths(session_id),
-    };
+    let paths = session.profile_id.as_deref().map_or_else(
+        || home_paths.session_paths(session_id),
+        |profile_id| {
+            home_paths
+                .profile_home(profile_id)
+                .session_paths(session_id)
+        },
+    );
     Ok(paths)
 }
 

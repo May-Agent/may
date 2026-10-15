@@ -7,6 +7,7 @@ use super::{
     SessionRuntimeSummary, TerminalRuntimeState,
 };
 
+/// Persists session runtime state and publishes UI events for changes.
 #[derive(Clone)]
 pub struct SessionRuntimeService {
     db: ChatDb,
@@ -21,10 +22,13 @@ impl std::fmt::Debug for SessionRuntimeService {
 }
 
 impl SessionRuntimeService {
+    /// Create the service over `db`, publishing change events on `ui_event_bus`.
+    #[must_use]
     pub const fn new(db: ChatDb, ui_event_bus: UiEventBus) -> Self {
         Self { db, ui_event_bus }
     }
 
+    /// Clone of the underlying database handle.
     #[must_use]
     pub fn db(&self) -> ChatDb {
         self.db.clone()
@@ -34,10 +38,15 @@ impl SessionRuntimeService {
         self.ui_event_bus.publish(topics);
     }
 
+    /// Publish a UI invalidation for `topics`.
     pub fn publish_ui_events(&self, topics: UiEventTopics) {
         self.publish_ui(topics);
     }
 
+    /// Load the persisted runtime summary for a session (default when absent).
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure or malformed rows.
     pub async fn get(
         &self,
         session_id: &str,
@@ -49,6 +58,10 @@ impl SessionRuntimeService {
             .unwrap_or_default())
     }
 
+    /// Persist a session's runtime state.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn set_state(
         &self,
         session_id: &str,
@@ -59,6 +72,10 @@ impl SessionRuntimeService {
         Ok(())
     }
 
+    /// Persist a session's plan-mode state.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn set_plan_state(
         &self,
         session_id: &str,
@@ -72,6 +89,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Append a pending user message to a session's queue.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn enqueue(
         &self,
         session_id: &str,
@@ -89,6 +110,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Runtime summaries for every session in a profile.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn list_for_profile(
         &self,
         profile_id: &str,
@@ -110,6 +135,10 @@ impl SessionRuntimeService {
         Ok(runtimes)
     }
 
+    /// Pop the next pending message eligible for dispatch.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn take_next_dispatchable(
         &self,
         session_id: &str,
@@ -122,6 +151,10 @@ impl SessionRuntimeService {
         Ok(next)
     }
 
+    /// Drop the pending immediate message without dispatching it.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn remove_pending_immediate(
         &self,
         session_id: &str,
@@ -131,6 +164,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Remove the queued message at `index`.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn remove_queued_at(
         &self,
         session_id: &str,
@@ -141,6 +178,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Record a permission request as blocking the session.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn set_waiting_permission(
         &self,
         session_id: &str,
@@ -151,6 +192,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Clear a session's blocking permission request.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn clear_waiting_permission_request(
         &self,
         session_id: &str,
@@ -164,6 +209,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Record a workspace request as blocking the session.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn set_waiting_workspace(
         &self,
         session_id: &str,
@@ -174,6 +223,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Record an ask-user request as blocking the session.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn set_waiting_ask_user(
         &self,
         session_id: &str,
@@ -185,6 +238,9 @@ impl SessionRuntimeService {
     }
 
     /// Atomically transition Running → Idle only if currently Running.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn clear_running_if_needed(
         &self,
         session_id: &str,
@@ -196,6 +252,10 @@ impl SessionRuntimeService {
         Ok(())
     }
 
+    /// Mark a peer as owning browser input for the session.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn set_browser_takeover_owner(
         &self,
         session_id: &str,
@@ -209,6 +269,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// End browser takeover for the session.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn clear_browser_takeover_owner(
         &self,
         session_id: &str,
@@ -222,6 +286,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Whether a peer currently owns the session's browser input.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn has_browser_takeover(
         &self,
         session_id: &str,
@@ -229,12 +297,20 @@ impl SessionRuntimeService {
         self.db.session_has_browser_takeover(session_id).await
     }
 
+    /// Session id currently under browser takeover, if any.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn find_browser_takeover_session(
         &self,
     ) -> Result<Option<String>, crate::db::ChatDbError> {
         self.db.find_browser_takeover_session().await
     }
 
+    /// Consume the takeover-ended alert flag for a session.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn take_browser_takeover_alert_pending(
         &self,
         session_id: &str,
@@ -249,6 +325,10 @@ impl SessionRuntimeService {
         Ok(pending)
     }
 
+    /// Persist terminal runtime state for a session.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn set_terminal_runtime(
         &self,
         session_id: &str,
@@ -262,6 +342,10 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Clear a session's terminal runtime state.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn clear_terminal_runtime(
         &self,
         session_id: &str,

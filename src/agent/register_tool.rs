@@ -91,7 +91,7 @@ impl<K: RegisterKind> RegisterTool<K> {
     }
 }
 
-fn normalize_path(args: RegisterPathArgs) -> aither_core::Result<String> {
+fn normalize_path(args: &RegisterPathArgs) -> aither_core::Result<String> {
     let path = args.path.trim();
     if path.is_empty() {
         return Err(RegisterToolError::EmptyPath.into());
@@ -115,7 +115,7 @@ impl<K: RegisterKind> Tool for RegisterTool<K> {
         let broker = self.broker.as_ref().ok_or(RegisterToolError::Unavailable {
             tool_name: K::TOOL_NAME,
         })?;
-        let path = normalize_path(args)?;
+        let path = normalize_path(&args)?;
         let request = RegisterRequest {
             session_id: self.session_id.clone(),
             path,
