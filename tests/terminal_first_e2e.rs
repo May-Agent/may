@@ -18,6 +18,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use may_agent::config::CommandPriority;
 use may_agent::config::{ProviderInstance, ProviderType};
 use may_agent::model_selector::ModelSelector;
 use may_agent::session::{SandboxResourceLayout, SessionId, initialize_session_persistence};
@@ -1641,4 +1643,188 @@ async fn ui_linux_runtime_has_heel_env_for_sandbox_stdin_detection() {
     let server = RunningUiServer::spawn(harness.home_path(), &[("HEEL_BIN", &heel_bin)]).await;
 
     server.stop().await;
+}
+
+/// Reads the kernel's view of a process on macOS: prints `parentNice
+/// parentIO childNice childIO` where the child is an exec'd copy of itself, so
+/// a run shows both the ambient priority and whether descendants inherit it.
+#[cfg(target_os = "macos")]
+const PRIORITY_PROBE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/priority_probe.rs"
+);
+
+/// The Linux counterpart of the macOS probe, printing the same four values.
+/// It is a shell script over system tools because the Linux sandbox executes
+/// only from system directories, never a binary the test compiled.
+#[cfg(target_os = "linux")]
+const PRIORITY_PROBE_SCRIPT: &str = include_str!("fixtures/priority_probe.sh");
+
+/// The shell command that prints `parentNice parentIO childNice childIO` for
+/// the process it runs as and for a child of it, the I/O value in the
+/// platform's kernel encoding. The macOS probe reads the disk I/O policy,
+/// which no system tool exposes, so it is compiled into the shared test-tmp
+/// root: ordinary read-only executable storage to the macOS sandbox, unlike
+/// the session-writable roots where exec is explicitly denied.
+#[cfg(target_os = "macos")]
+async fn priority_probe_command() -> String {
+    let probe_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("priority-probe");
+    async_fs::create_dir_all(&probe_dir)
+        .await
+        .expect("probe directory should be created");
+    let probe_binary = probe_dir.join("priority-probe");
+    let rustc_output = probe_binary.clone();
+    let compile = blocking::unblock(move || {
+        std::process::Command::new("rustc")
+            .arg("--edition")
+            .arg("2024")
+            .arg("-O")
+            .arg(PRIORITY_PROBE_PATH)
+            .arg("-o")
+            .arg(rustc_output)
+            .output()
+    })
+    .await
+    .expect("rustc should run");
+    assert!(
+        compile.status.success(),
+        "probe compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    shell_escape::escape(probe_binary.display().to_string().into()).into_owned()
+}
+
+/// See the macOS variant: on Linux the probe is the script itself, run by `sh`
+/// so its POSIX word splitting holds whatever shell the terminal tool uses.
+#[cfg(target_os = "linux")]
+async fn priority_probe_command() -> String {
+    let script = shell_escape::escape(PRIORITY_PROBE_SCRIPT.into());
+    format!("sh -c {script}")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn parse_priority_probe(stdout: &[u8]) -> [i32; 4] {
+    let text = String::from_utf8_lossy(stdout);
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let [a, b, c, d] = tokens
+        .into_iter()
+        .map(|token| token.parse::<i32>().expect("probe prints signed integers"))
+        .collect::<Vec<i32>>()
+        .try_into()
+        .expect("probe prints exactly four integers");
+    [a, b, c, d]
+}
+
+#[cfg(target_os = "macos")]
+const IO_UTILITY: i32 = 4; // IOPOL_UTILITY
+#[cfg(target_os = "macos")]
+const IO_BACKGROUND: i32 = 3; // IOPOL_THROTTLE
+#[cfg(target_os = "linux")]
+const IO_UTILITY: i32 = (2 << 13) | 7; // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 7)
+#[cfg(target_os = "linux")]
+const IO_BACKGROUND: i32 = 3 << 13; // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0)
+
+/// `may exec` under each configured command priority must apply the mapped
+/// CPU nice level and I/O policy, and the probe's own child must inherit both.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+#[serial]
+async fn exec_applies_local_command_priority() {
+    let heel_bin = required_heel_bin();
+    let probe = priority_probe_command().await;
+
+    // Host baseline first, through a shell exactly as the sandbox runs it: an
+    // unsandboxed probe's child inherits its priorities.
+    let probe_for_baseline = probe.clone();
+    let baseline_output = blocking::unblock(move || {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(probe_for_baseline)
+            .output()
+    })
+    .await
+    .expect("host probe should run");
+    assert!(
+        baseline_output.status.success(),
+        "host probe failed: {}",
+        String::from_utf8_lossy(&baseline_output.stderr)
+    );
+    let baseline = parse_priority_probe(&baseline_output.stdout);
+    let [baseline_nice, baseline_io] = [baseline[0], baseline[1]];
+    assert_eq!(
+        [baseline[2], baseline[3]],
+        [baseline_nice, baseline_io],
+        "the probe's own child must inherit its priorities"
+    );
+
+    // Independent kernel expectations per configured level — never derived
+    // from the mapping under test.
+    let cases: [(CommandPriority, i32, i32); 3] = [
+        (CommandPriority::Normal, baseline_nice, baseline_io),
+        (
+            CommandPriority::Low,
+            (baseline_nice + 10).min(19),
+            IO_UTILITY,
+        ),
+        (
+            CommandPriority::Lowest,
+            (baseline_nice + 19).min(19),
+            IO_BACKGROUND,
+        ),
+    ];
+
+    // The provider URL is unreachable by design: `may exec` reaches the
+    // terminal tool directly and never talks to a model.
+    let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
+    let binary = may_binary_path();
+
+    for (priority, expected_nice, expected_io) in cases {
+        let expected = [expected_nice, expected_io, expected_nice, expected_io];
+
+        let mut config = MayConfig::load_from(&harness.may_dir.join("config.toml"))
+            .await
+            .expect("harness config should load");
+        config.sandbox.command_priority = priority;
+        config
+            .save_to(&harness.may_dir.join("config.toml"))
+            .await
+            .expect("harness config should save");
+
+        let session = harness.create_session().await;
+
+        let script = probe.clone();
+        let session_id = session.id.clone();
+        let home = harness.home_path().to_path_buf();
+        let heel = heel_bin.clone();
+        let binary_path = binary.clone();
+        let output = blocking::unblock(move || {
+            std::process::Command::new(&binary_path)
+                .arg("exec")
+                .arg("--session")
+                .arg(&session_id)
+                .arg("--mode")
+                .arg("sandboxed")
+                .arg("--")
+                .arg(&script)
+                .env("HOME", &home)
+                .env("HEEL_BIN", &heel)
+                .output()
+        })
+        .await
+        .expect("may exec should run");
+        assert!(
+            output.status.success(),
+            "may exec at {priority:?} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let observed = parse_priority_probe(&output.stdout);
+
+        assert_eq!(
+            observed,
+            expected,
+            "{priority:?} must map to nice={expected_nice}, io={expected_io}: observed={observed:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

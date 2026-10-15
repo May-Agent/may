@@ -395,6 +395,7 @@ async fn build_exec_terminal_tool(
     let (terminal_tool, (resolved_provider, tool_dispatchers)) = futures_lite::future::try_zip(
         async {
             terminal_tool
+                .with_process_priority(may_config.sandbox.command_priority.process_priority())
                 .initialize_tools(&tool_distribution, &tools_dir)
                 .await
                 .map_err(ExecError::InitializeBaselineTools)

@@ -243,6 +243,7 @@ export const enUS = {
       logs: 'Activity',
       remote: 'Remote access',
       remoteServers: 'Remote servers',
+      execution: 'Command Priority',
     },
     language: {
       title: 'Interface language',
@@ -353,6 +354,14 @@ export const enUS = {
       elapsed: 'Elapsed',
       ok: 'OK',
       failed: 'Failed',
+    },
+    execution: {
+      title: 'Command Priority',
+      description: 'Controls CPU and disk scheduling for local and container commands. SSH commands are unaffected.',
+      normal: 'Normal',
+      low: 'Low (default)',
+      lowest: 'Lowest',
+      info: 'Lower priority changes scheduling under contention; it does not cap CPU usage.',
     },
     remote: {
       title: 'Remote access',

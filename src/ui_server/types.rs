@@ -1,4 +1,6 @@
-use crate::config::{BrowserBackendKind, ProviderType, RemoteAccessConfig, SshServerConfig};
+use crate::config::{
+    BrowserBackendKind, CommandPriority, ProviderType, RemoteAccessConfig, SshServerConfig,
+};
 use crate::network_policy::NetworkPolicyMode;
 use crate::session::{
     AttachmentKind, PendingUserMessage, PendingUserMessageMode, SessionPlanState,
@@ -1302,6 +1304,13 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct UiSandboxConfig {
+    #[schema(value_type = String)]
+    pub(crate) command_priority: CommandPriority,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct UiFullConfig {
     pub(crate) providers: Vec<UiProviderConfig>,
     pub(crate) models: UiModelsConfig,
@@ -1311,6 +1320,7 @@ pub struct UiFullConfig {
     pub(crate) max_iterations: usize,
     pub(crate) browser: UiBrowserConfig,
     pub(crate) remote_access: UiRemoteAccessConfig,
+    pub(crate) sandbox: UiSandboxConfig,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]

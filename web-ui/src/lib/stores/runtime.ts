@@ -12,6 +12,7 @@ import type {
 import { openUiEventStream } from '../api/events';
 import { useSessionsStore } from './sessions';
 import { useModelsStore } from './models';
+import { useConfigStore } from './config';
 import { useBrowserViewStore } from './browserView';
 import type { NotificationMailboxEntry } from '../api/notifications';
 
@@ -173,9 +174,10 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
             case 'heartbeat':
               break;
             case 'config':
-              // Provider/model configuration changed server-side; invalidate
-              // the cached models so the picker reflects the change without
-              // a manual refresh.
+              // Provider/model configuration changed server-side; refresh the
+              // shared config snapshot and invalidate the cached models so both
+              // reflect the change without a manual refresh.
+              useConfigStore.getState().setConfig(evt.payload);
               void useModelsStore.getState().refresh();
               break;
             case 'browser_status':
