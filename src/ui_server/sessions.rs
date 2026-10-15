@@ -401,6 +401,9 @@ pub(super) async fn delete_session(
         .map_err(internal_error)?
         .and_then(|session| session.profile_id);
     db.delete_session(&id).await.map_err(internal_error)?;
+    state
+        .tool_environments
+        .evict(&crate::session::SessionId::from_string(id.as_str()));
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     store
         .delete_session(&id, profile_id.as_deref())
@@ -416,6 +419,7 @@ pub(super) async fn delete_all_sessions(
     // Delete all from DB
     let db = state.db();
     db.delete_all_sessions().await.map_err(internal_error)?;
+    state.tool_environments.evict_all();
 
     // Clean up filesystem session directories
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));

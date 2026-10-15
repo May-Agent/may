@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aither_sandbox::ToolTarget;
 use askama::Template;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -17,12 +18,12 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use may_agent::MayConfig;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use may_agent::config::CommandPriority;
 use may_agent::config::{ProviderInstance, ProviderType};
 use may_agent::model_selector::ModelSelector;
 use may_agent::session::{SandboxResourceLayout, SessionId, initialize_session_persistence};
+use may_agent::{MayConfig, MayHomePaths};
 use serde_json::Value;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -56,6 +57,9 @@ enum MockChatScenario {
         delay: Duration,
     },
     TerminalRoundTrip,
+    /// Answers every agent turn with the same text, so one session can run
+    /// several turns against one mock server.
+    TextEveryTurn(String),
 }
 
 struct MockOpenAiServer {
@@ -151,6 +155,12 @@ impl MockScenarioState {
             verify_initial_tool_contract(request)?;
         }
         let response = match &self.scenario {
+            MockChatScenario::TextEveryTurn(text) => {
+                // Every rebuilt agent must still present the prepared tools,
+                // whether it prepared them or adopted them.
+                verify_initial_tool_contract(request)?;
+                MockHttpResponse::sse(text_stream_frames(vec![text.clone()], Duration::ZERO))
+            }
             MockChatScenario::SlowText { chunks, delay } => {
                 if self.request_index != 0 {
                     return Err(format!(
@@ -531,9 +541,33 @@ impl TestHarness {
             .expect("test config should be written");
 
         seed_container_heel_cache(&may_dir).await;
-        warm_may_binary().await;
+        futures_lite::future::zip(share_and_warm_tool_cache(&may_dir), warm_may_binary()).await;
 
         Self { home, may_dir }
+    }
+
+    /// Plain-text tracing output May writes under the test home's log
+    /// directory (the stderr copy carries ANSI styling).
+    async fn file_logs(&self) -> String {
+        let log_dir = self.may_dir.join("logs");
+        let mut entries = tokio::fs::read_dir(&log_dir)
+            .await
+            .expect("May log directory should exist");
+        let mut logs = String::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .expect("May log directory should be readable")
+        {
+            if entry.file_name().to_string_lossy().starts_with("may.log") {
+                logs.push_str(
+                    &tokio::fs::read_to_string(entry.path())
+                        .await
+                        .expect("May log file should be readable"),
+                );
+            }
+        }
+        logs
     }
 
     /// Session in the local profile. Terminal-first contract tests use this so
@@ -744,6 +778,38 @@ async fn seed_container_heel_cache(may_dir: &Path) {
         .await
         .expect("container heel release state should copy");
     }
+}
+
+/// Points the test home's tool cache at one cache shared by every test run
+/// and prepares the host's baseline tools in it through the embedded
+/// distribution, so the first hash-verified download happens here instead of
+/// inside a server's readiness deadline. Later runs reuse the cached artifacts.
+async fn share_and_warm_tool_cache(may_dir: &Path) {
+    let shared = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("may-tools");
+    tokio::fs::create_dir_all(&shared)
+        .await
+        .expect("shared tool cache dir should be created");
+    let home_paths = MayHomePaths::new(may_dir.to_path_buf());
+    #[cfg(unix)]
+    tokio::fs::symlink(&shared, home_paths.tools_dir())
+        .await
+        .expect("test home tool cache should link to the shared cache");
+    #[cfg(windows)]
+    tokio::fs::symlink_dir(&shared, home_paths.tools_dir())
+        .await
+        .expect("test home tool cache should link to the shared cache");
+    let bundle = may_agent::tools::embedded_distribution()
+        .expect("embedded distribution should validate")
+        .load(
+            &ToolTarget::native().expect("test host should have a tool target"),
+            &home_paths.tool_artifacts_dir(),
+        )
+        .await
+        .expect("baseline tool artifacts should download and verify");
+    bundle
+        .prepare_local(&home_paths.tool_runtimes_dir())
+        .await
+        .expect("baseline tools should prepare");
 }
 
 fn optional_heel_bin() -> Option<String> {
@@ -1483,6 +1549,79 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
     assert!(
         !task_id.trim().is_empty(),
         "terminal task id should not be empty"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn ui_chat_turns_on_one_session_prepare_tools_once() {
+    let mock =
+        MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("turn answered".to_string())).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let session_id = create_session_via_api(&client, &server.base_url).await;
+
+    for content in ["First turn.", "Second turn."] {
+        let response = client
+            .post(format!("{}/api/chat/stream", server.base_url))
+            .json(&serde_json::json!({
+                "sessionId": session_id,
+                "content": content
+            }))
+            .send()
+            .await
+            .expect("chat stream request should succeed");
+        let status = response.status();
+        if status != StatusCode::OK {
+            panic!(
+                "{content:?} was refused with {status}: {}; server logs:\n{}",
+                response
+                    .text()
+                    .await
+                    .expect("refusal body should be readable"),
+                server.logs().await
+            );
+        }
+        let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
+            .await
+            .expect("chat stream should finish before timeout");
+        assert!(
+            events.iter().any(|(kind, _)| kind == "done"),
+            "turn should complete with a done event; events: {events:?}; server logs:\n{}",
+            server.logs().await
+        );
+        wait_for_runtime_condition(
+            &client,
+            &server.base_url,
+            &session_id,
+            &server,
+            Duration::from_secs(10),
+            "session runtime to settle after the turn",
+            runtime_is_idle,
+        )
+        .await;
+    }
+
+    let logs = harness.file_logs().await;
+    let ready_lines = logs
+        .lines()
+        .filter(|line| line.contains("session tool environments ready"))
+        .filter(|line| line.contains(session_id.as_str()))
+        .collect::<Vec<_>>();
+    let prepared = ready_lines
+        .iter()
+        .filter(|line| line.contains("outcome=\"prepared\""))
+        .count();
+    let adopted = ready_lines
+        .iter()
+        .filter(|line| line.contains("outcome=\"adopted\""))
+        .count();
+    assert!(
+        prepared == 1 && adopted >= 1,
+        "only the first turn should prepare tools and later turns adopt them; readiness logs: {ready_lines:#?}"
     );
 
     server.stop().await;
