@@ -11,7 +11,9 @@ const MAILBOX_STATUS_PENDING: &str = "pending";
 const MAILBOX_STATUS_DELIVERED: &str = "delivered";
 const MAILBOX_STATUS_FAILED: &str = "failed";
 
-#[derive(Clone)]
+/// Delivers notifications over web push and tracks their delivery in the
+/// notification mailbox.
+#[derive(Debug, Clone)]
 pub struct NotificationService {
     db: ChatDb,
     manager: Arc<NotificationManager>,
@@ -19,6 +21,8 @@ pub struct NotificationService {
 }
 
 impl NotificationService {
+    /// Create a service backed by the chat database, a push [`NotificationManager`],
+    /// and the UI event bus used to publish mailbox changes.
     #[must_use]
     pub const fn new(
         db: ChatDb,
@@ -32,11 +36,18 @@ impl NotificationService {
         }
     }
 
+    /// Return the VAPID public key clients need to create push subscriptions.
     #[must_use]
     pub fn public_key(&self) -> &str {
         self.manager.public_key()
     }
 
+    /// Store a new web-push subscription for `endpoint`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`](crate::db::ChatDbError) when inserting the
+    /// subscription fails.
     pub async fn subscribe(
         &self,
         endpoint: &str,
@@ -50,10 +61,23 @@ impl NotificationService {
         Ok(())
     }
 
+    /// Remove the web-push subscription for `endpoint`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatDbError`](crate::db::ChatDbError) when the removal fails.
     pub async fn unsubscribe(&self, endpoint: &str) -> Result<(), crate::db::ChatDbError> {
         self.db.remove_push_subscription(endpoint).await
     }
 
+    /// Send a simple title/body notification to every stored subscription.
+    ///
+    /// Returns the number of subscriptions the payload was delivered to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationServiceError`] when the mailbox entry cannot be
+    /// persisted or the push transport fails; see [`Self::send_payload`].
     pub async fn send(&self, title: &str, body: &str) -> Result<usize, NotificationServiceError> {
         self.send_payload(NotificationPayload {
             notification_id: None,
@@ -66,6 +90,16 @@ impl NotificationService {
         .await
     }
 
+    /// Send `payload` to every stored subscription and record the outcome in the
+    /// notification mailbox.
+    ///
+    /// Returns the number of subscriptions the payload was delivered to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationServiceError::Db`] when recording the mailbox entry or
+    /// its delivery state fails, and [`NotificationServiceError::Notification`] when
+    /// the push transport rejects the payload.
     pub async fn send_payload(
         &self,
         mut payload: NotificationPayload,
@@ -125,6 +159,14 @@ impl NotificationService {
         }
     }
 
+    /// Redeliver mailbox entries still marked pending, claiming each entry so
+    /// concurrent processes do not double-send.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationServiceError::Db`] when listing, claiming, or updating
+    /// mailbox entries fails, and [`NotificationServiceError::InvalidXml`] when a
+    /// stored callback context block fails to parse.
     pub async fn redeliver_pending(&self) -> Result<(), NotificationServiceError> {
         let pending = self.db.list_pending_notification_mailbox_entries().await?;
         for item in pending {
@@ -191,12 +233,16 @@ impl NotificationService {
     }
 }
 
+/// Error type for notification delivery.
 #[derive(Debug, thiserror::Error)]
 pub enum NotificationServiceError {
+    /// Database error.
     #[error("database error: {0}")]
     Db(#[from] crate::db::ChatDbError),
+    /// Invalid context xml block.
     #[error("invalid context xml block: {0}")]
     InvalidXml(#[from] crate::xml::XmlBlockError),
+    /// Notification transport error.
     #[error("notification transport error: {0}")]
     Notification(#[from] crate::notification::NotificationError),
 }

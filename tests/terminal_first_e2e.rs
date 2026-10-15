@@ -91,9 +91,8 @@ impl MockOpenAiServer {
         let requests_for_task = requests.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(_) => break,
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
                 };
                 let io = TokioIo::new(stream);
                 let state = state.clone();
@@ -170,125 +169,117 @@ impl MockScenarioState {
                 }
                 MockHttpResponse::sse(text_stream_frames(chunks.clone(), *delay))
             }
-            MockChatScenario::TerminalRoundTrip => {
-                let response = match self.request_index {
-                    0 => MockHttpResponse::sse(vec![
+            MockChatScenario::TerminalRoundTrip => match self.request_index {
+                0 => MockHttpResponse::sse(vec![
+                    delayed_sse_frame(
+                        tool_call_chunk(
+                            "call-terminal",
+                            "terminal",
+                            &serde_json::json!({
+                                "description": "Ask the terminal for the user's name",
+                                "script": "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
+                                "mode": "sandboxed",
+                                "raw": true,
+                                "timeout": 0,
+                                "max_lines": 50
+                            }),
+                        ),
+                        Duration::from_millis(10),
+                    ),
+                    done_frame(Duration::from_millis(10)),
+                ]),
+                1 => {
+                    let task_id =
+                        terminal_task_id_from_latest_tool_output(request).ok_or_else(|| {
+                            "terminal tool result did not include a task_id".to_string()
+                        })?;
+                    self.task_id = Some(task_id.clone());
+                    let script = TerminalInputScript { task_id: &task_id }
+                        .render()
+                        .map_err(|error| error.to_string())?;
+                    MockHttpResponse::sse(vec![
                         delayed_sse_frame(
                             tool_call_chunk(
-                                "call-terminal",
+                                "call-terminal-input",
                                 "terminal",
                                 &serde_json::json!({
-                                    "description": "Ask the terminal for the user's name",
-                                    "script": "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
+                                    "description": "Send a name through terminal IPC",
+                                    "script": script,
                                     "mode": "sandboxed",
                                     "raw": true,
-                                    "timeout": 0,
+                                    "timeout": 10,
                                     "max_lines": 50
                                 }),
                             ),
-                            Duration::from_millis(10),
+                            Duration::from_millis(350),
                         ),
                         done_frame(Duration::from_millis(10)),
-                    ]),
-                    1 => {
-                        let task_id = terminal_task_id_from_latest_tool_output(request)
-                            .ok_or_else(|| {
-                                "terminal tool result did not include a task_id".to_string()
-                            })?;
-                        self.task_id = Some(task_id.clone());
-                        let script = TerminalInputScript { task_id: &task_id }
-                            .render()
-                            .map_err(|error| error.to_string())?;
-                        MockHttpResponse::sse(vec![
-                            delayed_sse_frame(
-                                tool_call_chunk(
-                                    "call-terminal-input",
-                                    "terminal",
-                                    &serde_json::json!({
-                                        "description": "Send a name through terminal IPC",
-                                        "script": script,
-                                        "mode": "sandboxed",
-                                        "raw": true,
-                                        "timeout": 10,
-                                        "max_lines": 50
-                                    }),
-                                ),
-                                Duration::from_millis(350),
-                            ),
-                            done_frame(Duration::from_millis(10)),
-                        ])
+                    ])
+                }
+                2 => {
+                    let input_result = latest_tool_output(request)
+                        .ok_or_else(|| "terminal input command result missing".to_string())?;
+                    if input_result.get("exit_code").and_then(Value::as_i64) != Some(0) {
+                        return Err(format!("terminal input IPC command failed: {input_result}"));
                     }
-                    2 => {
-                        let input_result = latest_tool_output(request)
-                            .ok_or_else(|| "terminal input command result missing".to_string())?;
-                        if input_result.get("exit_code").and_then(Value::as_i64) != Some(0) {
-                            return Err(format!(
-                                "terminal input IPC command failed: {input_result}"
-                            ));
-                        }
-                        let task_id = self
-                            .task_id
-                            .clone()
-                            .ok_or_else(|| "terminal task_id was not captured".to_string())?;
-                        let script = TerminalReadScript { task_id: &task_id }
-                            .render()
-                            .map_err(|error| error.to_string())?;
-                        MockHttpResponse::sse(vec![
-                            delayed_sse_frame(
-                                tool_call_chunk(
-                                    "call-terminal-read",
-                                    "terminal",
-                                    &serde_json::json!({
-                                        "description": "Read the reply through terminal IPC",
-                                        "script": script,
-                                        "mode": "sandboxed",
-                                        "raw": true,
-                                        "timeout": 10,
-                                        "max_lines": 50
-                                    }),
-                                ),
-                                Duration::from_millis(250),
+                    let task_id = self
+                        .task_id
+                        .clone()
+                        .ok_or_else(|| "terminal task_id was not captured".to_string())?;
+                    let script = TerminalReadScript { task_id: &task_id }
+                        .render()
+                        .map_err(|error| error.to_string())?;
+                    MockHttpResponse::sse(vec![
+                        delayed_sse_frame(
+                            tool_call_chunk(
+                                "call-terminal-read",
+                                "terminal",
+                                &serde_json::json!({
+                                    "description": "Read the reply through terminal IPC",
+                                    "script": script,
+                                    "mode": "sandboxed",
+                                    "raw": true,
+                                    "timeout": 10,
+                                    "max_lines": 50
+                                }),
                             ),
-                            done_frame(Duration::from_millis(10)),
-                        ])
+                            Duration::from_millis(250),
+                        ),
+                        done_frame(Duration::from_millis(10)),
+                    ])
+                }
+                3 => {
+                    let tool_output = latest_tool_output(request)
+                        .ok_or_else(|| "terminal read command result missing".to_string())?;
+                    if tool_output.get("exit_code").and_then(Value::as_i64) != Some(0) {
+                        return Err(format!("terminal read IPC command failed: {tool_output}"));
                     }
-                    3 => {
-                        let tool_output = latest_tool_output(request)
-                            .ok_or_else(|| "terminal read command result missing".to_string())?;
-                        if tool_output.get("exit_code").and_then(Value::as_i64) != Some(0) {
-                            return Err(format!("terminal read IPC command failed: {tool_output}"));
-                        }
-                        let text = tool_output
-                            .pointer("/stdout/content/text")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| {
-                                "terminal read command result missing stdout text".to_string()
-                            })?;
-                        if !text.contains("hello lexo") {
-                            return Err(format!(
-                                "terminal_read output did not contain terminal echo: {text}"
-                            ));
-                        }
-                        MockHttpResponse::sse(vec![
-                            delayed_sse_frame(
-                                text_chunk("terminal flow complete", None),
-                                Duration::from_millis(10),
-                            ),
-                            delayed_sse_frame(
-                                text_chunk("", Some("stop")),
-                                Duration::from_millis(10),
-                            ),
-                            done_frame(Duration::from_millis(10)),
-                        ])
-                    }
-                    other => {
+                    let text = tool_output
+                        .pointer("/stdout/content/text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            "terminal read command result missing stdout text".to_string()
+                        })?;
+                    if !text.contains("hello lexo") {
                         return Err(format!(
-                            "unexpected request index {other} for terminal round trip"
+                            "terminal_read output did not contain terminal echo: {text}"
                         ));
                     }
-                };
-                response
-            }
+                    MockHttpResponse::sse(vec![
+                        delayed_sse_frame(
+                            text_chunk("terminal flow complete", None),
+                            Duration::from_millis(10),
+                        ),
+                        delayed_sse_frame(text_chunk("", Some("stop")), Duration::from_millis(10)),
+                        done_frame(Duration::from_millis(10)),
+                    ])
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected request index {other} for terminal round trip"
+                    ));
+                }
+            },
         };
         self.request_index += 1;
         Ok(response)
@@ -342,7 +333,7 @@ struct MockSseFrame {
     data: String,
 }
 
-fn delayed_sse_frame(data: String, delay: Duration) -> MockSseFrame {
+const fn delayed_sse_frame(data: String, delay: Duration) -> MockSseFrame {
     MockSseFrame { delay, data }
 }
 
@@ -400,11 +391,11 @@ async fn handle_mock_openai_request(
     if request.method() == Method::GET && request.uri().path() == "/v1/models" {
         return Ok(json_response(
             StatusCode::OK,
-            serde_json::json!({
+            &serde_json::json!({
                 "data": [{
                     "id": TEST_MODEL,
                     "owned_by": "mock",
-                    "context_length": 128000
+                    "context_length": 128_000
                 }]
             }),
         ));
@@ -413,7 +404,7 @@ async fn handle_mock_openai_request(
     if request.method() != Method::POST || request.uri().path() != "/v1/chat/completions" {
         return Ok(json_response(
             StatusCode::NOT_FOUND,
-            serde_json::json!({ "error": "not found" }),
+            &serde_json::json!({ "error": "not found" }),
         ));
     }
 
@@ -449,7 +440,7 @@ async fn handle_mock_openai_request(
             Err(error) => {
                 return Ok(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": { "message": error } }),
+                    &serde_json::json!({ "error": { "message": error } }),
                 ));
             }
         }
@@ -486,7 +477,7 @@ async fn write_request_transcript(path: &Path, requests: &Arc<tokio::sync::Mutex
 
 fn json_response(
     status: StatusCode,
-    value: Value,
+    value: &Value,
 ) -> Response<http_body_util::combinators::BoxBody<Bytes, Infallible>> {
     let mut response = Response::new(Full::new(Bytes::from(value.to_string())).boxed());
     *response.status_mut() = status;
@@ -682,10 +673,11 @@ impl RunningUiServer {
                     self.logs().await
                 );
             }
-            let healthy = match client.get(&url).send().await {
-                Ok(response) => response.status().is_success(),
-                Err(_) => false,
-            };
+            let healthy = client
+                .get(&url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success());
             if healthy {
                 return;
             }
@@ -849,7 +841,7 @@ struct SseReader {
 }
 
 impl SseReader {
-    fn new(response: reqwest::Response) -> Self {
+    const fn new(response: reqwest::Response) -> Self {
         Self {
             response,
             buffer: String::new(),
@@ -871,16 +863,15 @@ impl SseReader {
                 .chunk()
                 .await
                 .expect("SSE response chunk should be readable");
-            match chunk {
-                Some(bytes) => self.buffer.push_str(&String::from_utf8_lossy(&bytes)),
-                None => {
-                    if self.buffer.trim().is_empty() {
-                        return None;
-                    }
-                    let event = parse_sse_block(self.buffer.as_str());
-                    self.buffer.clear();
-                    return Some(event);
+            if let Some(bytes) = chunk {
+                self.buffer.push_str(&String::from_utf8_lossy(&bytes));
+            } else {
+                if self.buffer.trim().is_empty() {
+                    return None;
                 }
+                let event = parse_sse_block(self.buffer.as_str());
+                self.buffer.clear();
+                return Some(event);
             }
         }
     }
@@ -911,10 +902,9 @@ async fn collect_sse_events(response: reqwest::Response) -> Vec<(String, Value)>
 fn split_sse_block(buffer: &str) -> Option<(TestSseEvent, String)> {
     let delimiter = if let Some(position) = buffer.find("\n\n") {
         (position, 2)
-    } else if let Some(position) = buffer.find("\r\n\r\n") {
-        (position, 4)
     } else {
-        return None;
+        let position = buffer.find("\r\n\r\n")?;
+        (position, 4)
     };
     let (position, width) = delimiter;
     let event = parse_sse_block(&buffer[..position]);
@@ -947,10 +937,9 @@ fn reserve_tcp_port() -> u16 {
 }
 
 fn runtime_is_idle(runtime: &Value) -> bool {
-    let state_idle = match runtime.get("state") {
-        None => true,
-        Some(state) => state.as_str() == Some("idle"),
-    };
+    let state_idle = runtime
+        .get("state")
+        .is_none_or(|state| state.as_str() == Some("idle"));
     let terminal_clear = runtime
         .get("interactions")
         .and_then(|interactions| interactions.get("terminal"))
@@ -1267,13 +1256,13 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .json()
         .await
         .expect("list sessions response should be valid JSON");
-    let ids = listed
+    let contains = listed
         .as_array()
         .expect("list sessions response should be an array")
         .iter()
         .filter_map(|session| session.get("id").and_then(Value::as_str))
-        .collect::<Vec<_>>();
-    assert!(ids.contains(&session_id.as_str()));
+        .any(|id| id == session_id.as_str());
+    assert!(contains);
 
     let update_response = client
         .put(format!("{}/api/sessions/{session_id}", server.base_url))
@@ -1398,12 +1387,11 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         .await
         .expect("cancelled chat stream should terminate promptly")
         .expect("chat task should join");
-    if !events.iter().any(|(kind, _)| kind == "text") {
-        panic!(
-            "stream should deliver partial text before cancellation; events: {events:?}; server logs:\n{}",
-            server.logs().await
-        );
-    }
+    assert!(
+        events.iter().any(|(kind, _)| kind == "text"),
+        "stream should deliver partial text before cancellation; events: {events:?}; server logs:\n{}",
+        server.logs().await
+    );
 
     wait_for_runtime_state_clear(
         &client,
@@ -1429,8 +1417,7 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         assistant_messages
             .iter()
             .any(|content| content.contains("alpha")),
-        "partial assistant text should be persisted after cancellation: {:?}",
-        assistant_messages
+        "partial assistant text should be persisted after cancellation: {assistant_messages:?}"
     );
 
     server.stop().await;
@@ -1575,16 +1562,15 @@ async fn ui_chat_turns_on_one_session_prepare_tools_once() {
             .await
             .expect("chat stream request should succeed");
         let status = response.status();
-        if status != StatusCode::OK {
-            panic!(
-                "{content:?} was refused with {status}: {}; server logs:\n{}",
-                response
-                    .text()
-                    .await
-                    .expect("refusal body should be readable"),
-                server.logs().await
-            );
-        }
+        assert!(
+            status == StatusCode::OK,
+            "{content:?} was refused with {status}: {}; server logs:\n{}",
+            response
+                .text()
+                .await
+                .expect("refusal body should be readable"),
+            server.logs().await
+        );
         let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
             .await
             .expect("chat stream should finish before timeout");
@@ -1697,17 +1683,16 @@ async fn priority_probe_command() -> String {
 /// See the macOS variant: on Linux the probe is the script itself, run by `sh`
 /// so its POSIX word splitting holds whatever shell the terminal tool uses.
 #[cfg(target_os = "linux")]
-async fn priority_probe_command() -> String {
+fn priority_probe_command() -> std::future::Ready<String> {
     let script = shell_escape::escape(PRIORITY_PROBE_SCRIPT.into());
-    format!("sh -c {script}")
+    std::future::ready(format!("sh -c {script}"))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn parse_priority_probe(stdout: &[u8]) -> [i32; 4] {
     let text = String::from_utf8_lossy(stdout);
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-    let [a, b, c, d] = tokens
-        .into_iter()
+    let [a, b, c, d] = text
+        .split_whitespace()
         .map(|token| token.parse::<i32>().expect("probe prints signed integers"))
         .collect::<Vec<i32>>()
         .try_into()

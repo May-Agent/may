@@ -18,12 +18,16 @@ struct SshInstallPermission<'a> {
     details: &'a str,
 }
 
+/// Authorizes `terminal` ssh-mode targets by asking the user through the
+/// ask-user broker.
+#[derive(Debug)]
 pub struct MaySshAuthorizer {
     broker: AskUserBroker,
     session_id: String,
 }
 
 impl MaySshAuthorizer {
+    /// Create an authorizer for `session_id` sharing `broker`.
     pub fn new(session_id: impl Into<String>, broker: AskUserBroker) -> Arc<Self> {
         Arc::new(Self {
             broker,

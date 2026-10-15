@@ -450,14 +450,14 @@ pub fn mapped_url_from_target(mapped_port: u16, target: &url::Url) -> String {
 }
 
 pub fn target_host_header(target: &url::Url, port: u16) -> String {
-    match target.port() {
-        Some(explicit) => format!("{}:{explicit}", target.host_str().unwrap_or("localhost")),
-        None => match target.scheme() {
+    target.port().map_or_else(
+        || match target.scheme() {
             "http" if port == 80 => target.host_str().unwrap_or("localhost").to_string(),
             "https" if port == 443 => target.host_str().unwrap_or("localhost").to_string(),
             _ => format!("{}:{port}", target.host_str().unwrap_or("localhost")),
         },
-    }
+        |explicit| format!("{}:{explicit}", target.host_str().unwrap_or("localhost")),
+    )
 }
 
 pub fn parse_local_proxy_target(

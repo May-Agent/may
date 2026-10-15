@@ -101,7 +101,7 @@ pub enum ToolEnvironmentCacheError {
 #[derive(Debug)]
 pub enum Acquired {
     /// Adopt this registry, prepared for an equal key.
-    Ready(ShellSessionRegistry),
+    Ready(Box<ShellSessionRegistry>),
     /// Prepare the environment and report the result through the lease.
     Prepare(PreparationLease),
 }
@@ -120,6 +120,11 @@ pub struct PreparationLease {
 
 impl PreparationLease {
     /// Caches the prepared registry for the leased session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lease's request channel was already taken, which cannot
+    /// happen through the public API.
     pub fn complete(mut self, registry: ShellSessionRegistry) {
         let requests = self
             .requests
@@ -239,7 +244,7 @@ struct Waiter {
 enum Slot {
     Ready {
         key: ToolEnvironmentKey,
-        registry: ShellSessionRegistry,
+        registry: Box<ShellSessionRegistry>,
     },
     Preparing {
         key: ToolEnvironmentKey,
@@ -343,7 +348,13 @@ impl CacheState {
             );
             return;
         };
-        self.slots.insert(session, Slot::Ready { key, registry });
+        self.slots.insert(
+            session,
+            Slot::Ready {
+                key,
+                registry: Box::new(registry),
+            },
+        );
         self.serve(waiters);
     }
 
@@ -441,7 +452,7 @@ mod tests {
         key: ToolEnvironmentKey,
     ) -> ShellSessionRegistry {
         match acquire(cache, session, key).await {
-            Acquired::Ready(registry) => registry,
+            Acquired::Ready(registry) => *registry,
             Acquired::Prepare(_) => panic!("expected the cached registry"),
         }
     }
@@ -463,9 +474,12 @@ mod tests {
         let b = server("b", "user@b");
         assert_eq!(
             local_key(&[a.clone(), b.clone()]),
-            local_key(&[b.clone(), a.clone()])
+            local_key(&[b, a.clone()])
         );
-        assert_ne!(local_key(&[a.clone()]), local_key(&[server("a", "user@c")]));
+        assert_ne!(
+            local_key(std::slice::from_ref(&a)),
+            local_key(&[server("a", "user@c")])
+        );
 
         let container =
             ToolEnvironmentKey::new(HomeBackend::container("c1", &route("10.0.0.1")), &[a])

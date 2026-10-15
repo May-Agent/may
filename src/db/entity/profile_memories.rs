@@ -3,8 +3,10 @@
 //! Stores preference and recency memory extracted from conversations
 //! by a fast LLM, maintained asynchronously.
 
+/// Per-profile memory row model.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::FromRow)]
 pub struct Model {
+    /// Memory row ID.
     pub id: String,
     /// Profile this memory belongs to.
     pub profile_id: String,
@@ -12,5 +14,6 @@ pub struct Model {
     pub memory_type: String,
     /// Memory content (markdown).
     pub content: String,
+    /// Last update timestamp (ISO 8601).
     pub updated_at: String,
 }

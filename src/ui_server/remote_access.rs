@@ -225,15 +225,15 @@ async fn run_remote_access_actor(
             Some(event) = event_rx.recv() => {
                 match event {
                     RemoteAccessEvent::Stdout(line) => {
-                        push_log(&mut runtime.status.recent_logs, line);
+                        push_log(&mut runtime.status.recent_logs, &line);
                     }
                     RemoteAccessEvent::Stderr(line) => {
                         runtime.last_stderr_line = Some(line.clone());
-                        push_log(&mut runtime.status.recent_logs, line);
+                        push_log(&mut runtime.status.recent_logs, &line);
                     }
                     RemoteAccessEvent::ReaderError(message) => {
                         runtime.status.last_error = Some(message.clone());
-                        push_log(&mut runtime.status.recent_logs, message);
+                        push_log(&mut runtime.status.recent_logs, &message);
                     }
                 }
                 publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
@@ -286,7 +286,7 @@ async fn sync_remote_access_runtime(
     has_local_profile: bool,
 ) -> Result<(), String> {
     runtime.status.enabled = config.enabled;
-    runtime.status.public_url = config.public_url.clone();
+    runtime.status.public_url.clone_from(&config.public_url);
 
     if !config.enabled {
         stop_remote_access_runtime(runtime, child, status_tx, ui_event_bus).await?;
@@ -298,7 +298,7 @@ async fn sync_remote_access_runtime(
         return Ok(());
     }
 
-    let launch_spec = validate_remote_access_config(config, has_local_profile)?;
+    let launch_spec = validate_remote_access_config(&config, has_local_profile)?;
     if child.is_some()
         && runtime
             .launch_spec
@@ -340,7 +340,7 @@ async fn sync_remote_access_runtime(
 
     push_log(
         &mut runtime.status.recent_logs,
-        format!("starting tunnel at {}", launch_spec.public_url),
+        &format!("starting tunnel at {}", launch_spec.public_url),
     );
     runtime.status.state = RemoteAccessState::Running;
     runtime.status.last_error = None;
@@ -374,7 +374,7 @@ async fn stop_remote_access_runtime(
 }
 
 fn validate_remote_access_config(
-    config: RemoteAccessConfig,
+    config: &RemoteAccessConfig,
     has_local_profile: bool,
 ) -> Result<RemoteAccessLaunchSpec, String> {
     if has_local_profile && !config.allow_local_environment {
@@ -436,7 +436,7 @@ fn spawn_remote_access_log_reader(
     });
 }
 
-fn push_log(logs: &mut Vec<String>, line: String) {
+fn push_log(logs: &mut Vec<String>, line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return;
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn rejects_local_environment_without_explicit_override() {
-        let error = validate_remote_access_config(base_config(), true)
+        let error = validate_remote_access_config(&base_config(), true)
             .expect_err("local profiles should be blocked by default");
         assert!(error.contains("allow_local_environment"));
     }
@@ -485,7 +485,7 @@ mod tests {
         config.allow_local_environment = true;
         config.public_url = Some("http://example.com".to_string());
         let error =
-            validate_remote_access_config(config, false).expect_err("http URL must be rejected");
+            validate_remote_access_config(&config, false).expect_err("http URL must be rejected");
         assert!(error.contains("https://"));
     }
 }

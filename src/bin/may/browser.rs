@@ -510,7 +510,7 @@ async fn stop_browser_service(
     match send_browser_service_request(socket_path, BrowserServiceRequest::Stop).await? {
         Some(BrowserServiceResponse::Stopped) | None => {
             if config.requires_managed_runtime() {
-                may_agent::container::browser::stop_managed_browser(config.port, &may_dir).await;
+                may_agent::container::browser::stop_managed_browser(config.port, may_dir).await;
             }
             Ok(())
         }
@@ -592,10 +592,9 @@ async fn try_fetch_browser_targets(
 async fn require_browser_targets(
     endpoint: &str,
 ) -> Result<Vec<BrowserTargetOutput>, BrowserCliError> {
-    match try_fetch_browser_targets(endpoint).await? {
-        Some(targets) => Ok(targets),
-        None => Err(BrowserCliError::BrowserNotRunning(endpoint.to_string())),
-    }
+    try_fetch_browser_targets(endpoint)
+        .await?
+        .ok_or_else(|| BrowserCliError::BrowserNotRunning(endpoint.to_string()))
 }
 
 async fn can_connect_to_browser_endpoint(endpoint: &str) -> Result<bool, BrowserCliError> {

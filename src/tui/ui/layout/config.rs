@@ -90,27 +90,39 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
         .map(|(idx, id)| {
             let prefix = if idx == state.selected { "> " } else { "  " };
             let instance = app.config.provider.get(id);
-            let status = if let Some(inst) = instance {
-                // For custom providers, show base_url
-                if let Some(ref base_url) = inst.base_url {
-                    // Truncate URL safely (unicode-safe)
-                    const URL_DISPLAY_MAX_CHARS: usize = 27;
+            let status = instance.map_or_else(
+                || "(unknown)".to_string(),
+                |inst| {
+                    // For custom providers, show base_url
+                    inst.base_url.as_ref().map_or_else(
+                        || {
+                            inst.api_key.as_ref().map_or_else(
+                                || {
+                                    if id == "copilot" {
+                                        "(OAuth)".to_string()
+                                    } else {
+                                        "(no API key)".to_string()
+                                    }
+                                },
+                                |key| {
+                                    let masked: String =
+                                        key.chars().take(4).collect::<String>() + "****";
+                                    format!("{masked} (configured)")
+                                },
+                            )
+                        },
+                        |base_url| {
+                            // Truncate URL safely (unicode-safe)
+                            const URL_DISPLAY_MAX_CHARS: usize = 27;
 
-                    match base_url.char_indices().nth(URL_DISPLAY_MAX_CHARS) {
-                        Some((pos, _)) => format!("{}...", &base_url[..pos]),
-                        None => base_url.clone(),
-                    }
-                } else if let Some(key) = &inst.api_key {
-                    let masked: String = key.chars().take(4).collect::<String>() + "****";
-                    format!("{masked} (configured)")
-                } else if id == "copilot" {
-                    "(OAuth)".to_string()
-                } else {
-                    "(no API key)".to_string()
-                }
-            } else {
-                "(unknown)".to_string()
-            };
+                            match base_url.char_indices().nth(URL_DISPLAY_MAX_CHARS) {
+                                Some((pos, _)) => format!("{}...", &base_url[..pos]),
+                                None => base_url.clone(),
+                            }
+                        },
+                    )
+                },
+            );
             let text = format!("{prefix}{id:<20} {status}");
             let style = if idx == state.selected {
                 Style::default()

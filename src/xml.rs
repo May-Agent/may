@@ -47,6 +47,11 @@ pub enum XmlBlockError {
 /// used to build context-payload XML for runtime injection. It returns
 /// a raw `String` so callers can post-process before wrapping the result
 /// in an [`XmlBlock`].
+///
+/// # Errors
+///
+/// Returns [`quick_xml::SeError`] when the root tag cannot be written or
+/// `value` fails to serialize.
 pub fn serialize_xml_block<T: Serialize>(
     tag: &str,
     value: &T,
@@ -60,6 +65,10 @@ pub fn serialize_xml_block<T: Serialize>(
 impl XmlBlock {
     /// Parse `value` into an [`XmlBlock`], trimming surrounding
     /// whitespace and rejecting empty input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XmlBlockError`] when the trimmed input is empty.
     pub fn parse(value: impl Into<String>) -> Result<Self, XmlBlockError> {
         let value = value.into();
         let trimmed = value.trim();

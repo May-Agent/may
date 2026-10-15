@@ -35,7 +35,9 @@ pub enum AppEvent {
     SessionDeleted {
         /// The session removed from the database, when deletion got that far.
         deleted: Option<crate::session::SessionId>,
+        /// Whether the deleted session was the active one.
         was_current: bool,
+        /// Refreshed session list after the delete, or the failure.
         result: Result<Vec<SessionSummary>, TuiError>,
     },
 
@@ -58,13 +60,19 @@ pub enum AppEvent {
 
     // ─── Image loading ────────────────────────────────────────────────
     /// Image fetch finished from URL (data=None means fetch failed)
-    ImageFetchResult { url: String, data: Option<Vec<u8>> },
+    ImageFetchResult {
+        /// URL the image was fetched from.
+        url: String,
+        /// Fetched image bytes; `None` when the fetch failed.
+        data: Option<Vec<u8>>,
+    },
 }
 
 /// Sender type for sending events back to the main loop.
 pub type EventSender = Sender<AppEvent>;
 
 /// Event handler that polls terminal events.
+#[derive(Debug)]
 pub struct EventHandler {
     rx: Receiver<AppEvent>,
     tx: EventSender,
@@ -72,6 +80,10 @@ pub struct EventHandler {
 
 impl EventHandler {
     /// Create a new event handler.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the spawned terminal-event polling thread fails to start.
     #[must_use]
     pub fn new() -> Self {
         let (tx, rx) = async_channel::unbounded();

@@ -13,27 +13,36 @@ use std::path::{Path, PathBuf};
 
 use aither_sandbox::{ContainerRuntimeKind, RuntimePreference};
 use bollard::Docker;
+#[cfg(target_os = "macos")]
 use tokio::process::Command;
+#[cfg(target_os = "macos")]
 use zenwave::ResponseExt;
 
 /// Error type for container operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ContainerError {
+    /// Docker API error.
     #[error("Docker API error: {0}")]
     Docker(#[from] bollard::errors::Error),
+    /// No container runtime found (tried `OrbStack`, Podman, Docker).
     #[error("No container runtime found (tried OrbStack, Podman, Docker)")]
     NoRuntime,
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[doc = "Managed tools failed integrity or read-only preparation."]
     #[error("baseline tools preparation failed: {0}")]
     Tools(#[from] aither_sandbox::ToolRuntimeError),
+    /// Container not found.
     #[error("Container not found: {0}")]
     NotFound(String),
+    /// Image build failed.
     #[error("Image build failed: {0}")]
     ImageBuildFailed(String),
+    /// Container runtime bootstrap failed.
     #[error("Container runtime bootstrap failed: {0}")]
     Bootstrap(String),
+    /// Managed Podman download requires explicit user approval before downloading binaries.
     #[error("Managed Podman download requires explicit user approval before downloading binaries")]
     ManagedPodmanDownloadApprovalRequired,
     /// The container exposes no gateway the host bridge can bind.
@@ -126,12 +135,17 @@ pub(crate) fn select_ipc_gateway(
 
 /// A detected and connected container runtime.
 pub struct ContainerRuntime {
+    /// Detected runtime kind.
     pub kind: ContainerRuntimeKind,
+    /// Bollard client connected to the runtime.
     pub client: Docker,
 }
 
+/// Options controlling container-runtime detection.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeDetectOptions {
+    /// Whether detection may download a managed Podman when no runtime is
+    /// found.
     pub allow_managed_podman_download: bool,
 }
 
@@ -156,7 +170,7 @@ impl ContainerRuntime {
     ///
     /// The bridge executes host IPC commands for whoever connects, so the
     /// bind is never a wildcard: on macOS and Windows hosts Docker Desktop,
-    /// OrbStack and Podman machine forward the gateway name to host loopback
+    /// `OrbStack` and Podman machine forward the gateway name to host loopback
     /// (see [`docker_desktop_ipc_route`]); on native Linux the bind is the
     /// container network's gateway as the host owns it.
     ///
@@ -174,11 +188,11 @@ impl ContainerRuntime {
     /// The Docker Desktop route: the container's own network is irrelevant
     /// because the engine VM forwards the gateway name to host loopback.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    async fn resolve_ipc_route(
+    fn resolve_ipc_route(
         &self,
         _container_id: &str,
-    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
-        Ok(docker_desktop_ipc_route(self.kind))
+    ) -> std::future::Ready<Result<aither_sandbox::ContainerIpcRoute, ContainerError>> {
+        std::future::ready(Ok(docker_desktop_ipc_route(self.kind)))
     }
 
     /// The native Linux route.
@@ -208,16 +222,21 @@ impl ContainerRuntime {
 
     /// Hosts that are neither Docker Desktop hosts nor native Linux.
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    async fn resolve_ipc_route(
+    fn resolve_ipc_route(
         &self,
         _container_id: &str,
-    ) -> Result<aither_sandbox::ContainerIpcRoute, ContainerError> {
-        Err(ContainerError::IpcRouteUnsupportedPlatform)
+    ) -> std::future::Ready<Result<aither_sandbox::ContainerIpcRoute, ContainerError>> {
+        std::future::ready(Err(ContainerError::IpcRouteUnsupportedPlatform))
     }
 
     /// Detect and connect to the best available container runtime.
     ///
     /// Default priority: `OrbStack` > Podman > Docker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError`] when no runtime can be found or reached,
+    /// including failures of a managed Podman bootstrap when one is attempted.
     pub async fn detect() -> Result<Self, ContainerError> {
         Self::detect_with_preference_and_options(
             RuntimePreference::default(),
@@ -227,6 +246,11 @@ impl ContainerRuntime {
     }
 
     /// Detect and connect to a container runtime using a specific selection order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError`] when none of the runtimes in `preference`'s
+    /// order can be found or reached.
     pub async fn detect_with_preference(
         preference: RuntimePreference,
     ) -> Result<Self, ContainerError> {
@@ -234,6 +258,14 @@ impl ContainerRuntime {
     }
 
     /// Detect and connect to a container runtime with explicit managed-runtime options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::NoRuntime`] when none of the candidates connect,
+    /// or the errors of managed Podman bootstrap —
+    /// [`ContainerError::Bootstrap`],
+    /// [`ContainerError::ManagedPodmanDownloadApprovalRequired`],
+    /// [`ContainerError::Io`] — when a managed download is attempted.
     pub async fn detect_with_preference_and_options(
         preference: RuntimePreference,
         options: RuntimeDetectOptions,
@@ -247,14 +279,26 @@ impl ContainerRuntime {
             }
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(rt) = Self::bootstrap_managed_podman(options).await? {
-                return Ok(rt);
-            }
-        }
+        Self::managed_runtime(options)
+            .await?
+            .ok_or(ContainerError::NoRuntime)
+    }
 
-        Err(ContainerError::NoRuntime)
+    /// Fall back to a May-managed Podman when no system runtime answered.
+    #[cfg(target_os = "macos")]
+    async fn managed_runtime(
+        options: RuntimeDetectOptions,
+    ) -> Result<Option<Self>, ContainerError> {
+        Self::bootstrap_managed_podman(options).await
+    }
+
+    /// No managed runtime exists off macOS, so the download option has nothing
+    /// to govern here.
+    #[cfg(not(target_os = "macos"))]
+    fn managed_runtime(
+        _options: RuntimeDetectOptions,
+    ) -> impl std::future::Future<Output = Result<Option<Self>, ContainerError>> {
+        std::future::ready(Ok(None))
     }
 
     /// Try connecting to a Docker-compatible endpoint: a Unix socket on Unix
@@ -309,12 +353,13 @@ impl ContainerRuntime {
 
 fn socket_candidates(kind: ContainerRuntimeKind) -> Vec<PathBuf> {
     match kind {
-        ContainerRuntimeKind::OrbStack => dirs::home_dir()
-            .map(|home| vec![home.join(".orbstack/run/docker.sock")])
-            .unwrap_or_else(|| {
+        ContainerRuntimeKind::OrbStack => dirs::home_dir().map_or_else(
+            || {
                 tracing::warn!("failed to resolve home directory while probing OrbStack socket");
                 Vec::new()
-            }),
+            },
+            |home| vec![home.join(".orbstack/run/docker.sock")],
+        ),
         ContainerRuntimeKind::Podman => {
             let mut candidates = Vec::new();
             if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
@@ -425,10 +470,18 @@ async fn extract_podman_binary(
     archive_name: &str,
     destination: &Path,
 ) -> Result<(), ContainerError> {
-    if archive_name.ends_with(".zip") {
+    let archive_name_lower = archive_name.to_ascii_lowercase();
+    let (stem, last_ext) = archive_name_lower
+        .rsplit_once('.')
+        .unwrap_or((archive_name_lower.as_str(), ""));
+    if last_ext == "zip" {
         return extract_podman_binary_from_zip(archive_path, destination).await;
     }
-    if archive_name.ends_with(".tar.gz") {
+    if last_ext == "gz"
+        && std::path::Path::new(stem)
+            .extension()
+            .is_some_and(|ext| ext == "tar")
+    {
         return extract_podman_binary_from_tar_gz(archive_path, destination).await;
     }
     Err(ContainerError::Bootstrap(format!(

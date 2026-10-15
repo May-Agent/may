@@ -4,13 +4,19 @@ use std::str::FromStr;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Storage/serde kind string for time-based triggers.
 pub const TRIGGER_KIND_TIME: &str = "time";
+/// Storage/serde kind string for event triggers.
 pub const TRIGGER_KIND_EVENT: &str = "event";
+/// Storage/serde kind string for webhook triggers.
 pub const TRIGGER_KIND_WEBHOOK: &str = "webhook";
 
+/// Trigger-type string for a single run at a fixed timestamp.
 pub const TRIGGER_TYPE_ONCE: &str = "once";
+/// Trigger-type string for a recurring cron schedule.
 pub const TRIGGER_TYPE_CRON: &str = "cron";
 
+/// Event name emitted when a chat turn finishes.
 pub const EVENT_CHAT_TURN_COMPLETED: &str = "chat.turn.completed";
 const WEBHOOK_ROUTE_PREFIX: &str = "/api/tasks/webhook/";
 
@@ -18,15 +24,20 @@ fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
     format!("{prefix}{error}")
 }
 
+/// How a task run is initiated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskTriggerKind {
+    /// Runs on a schedule (once or cron).
     Time,
+    /// Runs when a named event is emitted.
     Event,
+    /// Runs when its unique HTTP endpoint is called.
     Webhook,
 }
 
 impl TaskTriggerKind {
+    /// Persisted string form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -37,16 +48,20 @@ impl TaskTriggerKind {
     }
 }
 
+/// Shape of a time-based schedule.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum TimeTriggerType {
+    /// Single run at a fixed timestamp.
     Once,
+    /// Recurring run on a cron expression.
     Cron,
 }
 
 impl TimeTriggerType {
+    /// Persisted string form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -87,36 +102,54 @@ impl FromStr for TaskTriggerKind {
     }
 }
 
+/// Borrowed trigger definition as supplied by an API caller, before normalization.
 #[derive(Debug, Clone)]
 pub struct TaskTriggerInput<'a> {
+    /// Trigger kind string (`time`, `event`, or `webhook`).
     pub kind: &'a str,
+    /// Time trigger sub-type (`once`/`cron`); rejected for other kinds.
     pub trigger_type: Option<&'a str>,
+    /// One-shot ISO-8601 UTC timestamp for `once` triggers.
     pub run_at_utc: Option<&'a str>,
+    /// Cron expression (5 or 6 fields) for `cron` triggers.
     pub cron_utc: Option<&'a str>,
+    /// Event name for `event` triggers.
     pub event_name: Option<&'a str>,
 }
 
+/// Trigger definition as it arrives over the API, tagged by `kind`; normalized before persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskTriggerRequest {
+    /// Time-based schedule.
     Time {
+        /// `once` or `cron`.
         #[serde(rename = "triggerType")]
         trigger_type: TimeTriggerType,
+        /// One-shot timestamp for `once` triggers.
         #[serde(rename = "runAtUtc")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_at_utc: Option<String>,
+        /// Cron expression for `cron` triggers.
         #[serde(rename = "cronUtc")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cron_utc: Option<String>,
     },
+    /// Fired when a named event is emitted.
     Event {
+        /// Normalized event name.
         #[serde(rename = "eventName")]
         event_name: String,
     },
+    /// Fired by an HTTP call to the minted webhook path.
     Webhook,
 }
 
 impl TaskTriggerRequest {
+    /// Validate this request into a [`NormalizedTaskTrigger`].
+    ///
+    /// # Errors
+    /// Returns a human-readable message when the kind, timestamp, cron expression, or event name fails validation.
     pub fn normalize(&self) -> Result<NormalizedTaskTrigger, String> {
         match self {
             Self::Time {
@@ -131,7 +164,7 @@ impl TaskTriggerRequest {
             Self::Event { event_name } => {
                 normalize_event_trigger(None, None, None, Some(event_name.as_str()))
             }
-            Self::Webhook => normalize_trigger(TaskTriggerInput {
+            Self::Webhook => normalize_trigger(&TaskTriggerInput {
                 kind: TaskTriggerKind::Webhook.as_str(),
                 trigger_type: None,
                 run_at_utc: None,
@@ -142,14 +175,32 @@ impl TaskTriggerRequest {
     }
 }
 
+/// Trigger definition as stored in the database (`kind` plus a
+/// `trigger_type` payload).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersistedTaskTrigger {
-    Time { trigger_type: TimeTriggerType },
-    Event { event_name: String },
-    Webhook { token: String },
+    /// Time-based schedule.
+    Time {
+        /// `once` or `cron`.
+        trigger_type: TimeTriggerType,
+    },
+    /// Fired when a named event is emitted.
+    Event {
+        /// Normalized event name (`[a-z0-9._-]`).
+        event_name: String,
+    },
+    /// Fired by an HTTP call to the webhook path minted from `token`.
+    Webhook {
+        /// Secret token embedded in the webhook path.
+        token: String,
+    },
 }
 
 impl PersistedTaskTrigger {
+    /// Reconstruct a persisted trigger from the `(kind, trigger_type)` pair stored in the database.
+    ///
+    /// # Errors
+    /// Returns a message when `kind` or `trigger_type` is not recognized or fails per-kind validation.
     pub fn from_storage(kind: &str, trigger_type: &str) -> Result<Self, String> {
         match TaskTriggerKind::from_str(kind)? {
             TaskTriggerKind::Time => Ok(Self::Time {
@@ -164,6 +215,7 @@ impl PersistedTaskTrigger {
         }
     }
 
+    /// Kind of trigger this persisted value represents.
     #[must_use]
     pub const fn kind(&self) -> TaskTriggerKind {
         match self {
@@ -173,6 +225,7 @@ impl PersistedTaskTrigger {
         }
     }
 
+    /// Type payload stored alongside the kind: the time sub-type, event name, or webhook token.
     #[must_use]
     pub const fn storage_trigger_type(&self) -> &str {
         match self {
@@ -182,6 +235,7 @@ impl PersistedTaskTrigger {
         }
     }
 
+    /// Public webhook URL path for webhook triggers; `None` for other kinds.
     #[must_use]
     pub fn webhook_path(&self) -> Option<String> {
         match self {
@@ -190,6 +244,7 @@ impl PersistedTaskTrigger {
         }
     }
 
+    /// API-facing representation of this persisted trigger.
     #[must_use]
     pub fn response(
         &self,
@@ -213,6 +268,7 @@ impl PersistedTaskTrigger {
     }
 }
 
+/// Validated trigger definition produced by [`normalize_trigger`].
 #[derive(Debug, Clone)]
 pub struct NormalizedTaskTrigger {
     kind: TaskTriggerKind,
@@ -223,26 +279,34 @@ pub struct NormalizedTaskTrigger {
 }
 
 impl NormalizedTaskTrigger {
+    /// Persisted kind string.
     #[must_use]
     pub const fn kind_str(&self) -> &'static str {
         self.kind.as_str()
     }
 
+    /// Trigger kind.
     #[must_use]
     pub const fn kind(&self) -> TaskTriggerKind {
         self.kind
     }
 
+    /// One-shot UTC timestamp for `once` triggers.
     #[must_use]
     pub fn run_at(&self) -> Option<&str> {
         self.run_at.as_deref()
     }
 
+    /// Normalized cron expression for `cron` triggers.
     #[must_use]
     pub fn cron_expression(&self) -> Option<&str> {
         self.cron_expression.as_deref()
     }
 
+    /// Type payload stored alongside the kind; mints a fresh webhook token for webhook triggers.
+    ///
+    /// # Panics
+    /// Panics if the kind/field combination is not one produced by `normalize_trigger`; the fields are private, so this is an internal invariant violation.
     #[must_use]
     pub fn storage_trigger_type(&self) -> String {
         match (
@@ -257,6 +321,10 @@ impl NormalizedTaskTrigger {
         }
     }
 
+    /// Convert to the persisted form; mints a webhook token for webhook triggers.
+    ///
+    /// # Panics
+    /// Panics if the kind/field combination is not one produced by `normalize_trigger`; the fields are private, so this is an internal invariant violation.
     #[must_use]
     pub fn into_persisted(self) -> PersistedTaskTrigger {
         match (self.kind, self.time_trigger_type, self.event_name) {
@@ -274,76 +342,113 @@ impl NormalizedTaskTrigger {
     }
 }
 
+/// HTTP request data captured for a webhook invocation.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskWebhookRequest {
+    /// HTTP method (uppercase).
     pub method: String,
+    /// Request path.
     pub path: String,
+    /// Raw query string, when present.
     pub query: Option<String>,
+    /// Request headers, multi-valued per name.
     pub headers: BTreeMap<String, Vec<String>>,
+    /// Raw request body, base64-encoded.
     pub body_base64: String,
+    /// Body decoded as UTF-8 text when valid.
     pub body_text: Option<String>,
+    /// Body parsed as JSON when it is valid JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_json: Option<serde_json::Value>,
+    /// Caller socket address when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_addr: Option<String>,
+    /// Raw body length in bytes.
     pub body_size_bytes: usize,
 }
 
+/// A recorded task run and what triggered it, serialized tagged by `kind`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskInvocation {
+    /// Fired on a time schedule.
     Time {
+        /// `once` or `cron`.
         trigger_type: TimeTriggerType,
     },
+    /// Triggered directly by the user.
     Manual,
+    /// Fired by a named event.
     Event {
+        /// Event that fired.
         event_name: String,
+        /// Profile the emitting event was scoped to, if any.
         #[serde(skip_serializing_if = "Option::is_none")]
         profile_id: Option<String>,
+        /// Session the emitting event was scoped to, if any.
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
     },
+    /// Fired by an HTTP webhook call.
     Webhook {
+        /// Token the call authenticated with.
         token: String,
+        /// Captured HTTP request data.
         request: TaskWebhookRequest,
     },
 }
 
+/// API-facing view of a trigger definition, tagged by `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskTriggerResponse {
+    /// Time-based schedule.
     Time {
+        /// `once` or `cron`.
         #[serde(rename = "triggerType")]
         trigger_type: TimeTriggerType,
+        /// One-shot timestamp for `once` triggers.
         #[serde(rename = "runAtUtc")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_at_utc: Option<String>,
+        /// Cron expression for `cron` triggers.
         #[serde(rename = "cronUtc")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cron_utc: Option<String>,
     },
+    /// Fired when a named event is emitted.
     Event {
+        /// Normalized event name.
         #[serde(rename = "eventName")]
         event_name: String,
     },
+    /// Fired by an HTTP call to the minted webhook path.
     Webhook {
+        /// Secret token embedded in the path.
         token: String,
+        /// Computed public webhook path.
         #[serde(rename = "webhookPath")]
         webhook_path: String,
     },
 }
 
+/// Generate a fresh random webhook token.
 #[must_use]
 pub fn new_webhook_token() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// URL path a webhook trigger with `token` listens on.
 #[must_use]
 pub fn webhook_path(token: &str) -> String {
     format!("{WEBHOOK_ROUTE_PREFIX}{token}")
 }
 
-pub fn normalize_trigger(input: TaskTriggerInput<'_>) -> Result<NormalizedTaskTrigger, String> {
+/// Validate and normalize a [`TaskTriggerInput`] into a [`NormalizedTaskTrigger`].
+///
+/// # Errors
+/// Returns a human-readable message when the kind string is unknown, a field is set for the wrong kind, or a timestamp/cron/event value fails validation.
+pub fn normalize_trigger(input: &TaskTriggerInput<'_>) -> Result<NormalizedTaskTrigger, String> {
     let kind = TaskTriggerKind::from_str(input.kind)?;
     let trigger_type = normalize_optional(input.trigger_type);
     let run_at = normalize_optional(input.run_at_utc);
@@ -377,6 +482,10 @@ pub fn normalize_trigger(input: TaskTriggerInput<'_>) -> Result<NormalizedTaskTr
     }
 }
 
+/// Validate and canonicalize an ISO-8601 UTC timestamp, which must end in `Z`.
+///
+/// # Errors
+/// Returns a message when the value is not a valid UTC timestamp ending in `Z`.
 pub fn normalize_utc_timestamp(value: &str) -> Result<String, String> {
     let timestamp = value.trim();
     if !timestamp.ends_with('Z') {
@@ -387,6 +496,10 @@ pub fn normalize_utc_timestamp(value: &str) -> Result<String, String> {
         .map_err(|error| prefixed_error("invalid UTC timestamp: ", &error))
 }
 
+/// Validate and lowercase an event name; allowed characters are `[a-z0-9._-]`.
+///
+/// # Errors
+/// Returns a message when the name is empty or contains other characters.
 pub fn normalize_event_name(value: &str) -> Result<String, String> {
     let raw = value.trim().to_lowercase();
     if raw.is_empty() {
@@ -403,6 +516,10 @@ pub fn normalize_event_name(value: &str) -> Result<String, String> {
     Ok(raw)
 }
 
+/// Validate a cron expression; a 5-field expression is canonicalized to 6 fields with a leading `0` seconds field.
+///
+/// # Errors
+/// Returns a message when the field count is not 5 or 6, or the expression fails to parse.
 pub fn normalize_cron_expression(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     let field_count = trimmed.split_whitespace().count();
@@ -552,7 +669,7 @@ mod tests {
 
     #[test]
     fn normalize_trigger_derives_once_from_run_at() {
-        let normalized = normalize_trigger(TaskTriggerInput {
+        let normalized = normalize_trigger(&TaskTriggerInput {
             kind: "time",
             trigger_type: None,
             run_at_utc: Some("2026-03-12T01:02:03Z"),
@@ -583,7 +700,7 @@ mod tests {
 
     #[test]
     fn normalize_trigger_requires_event_name_field() {
-        let normalized = normalize_trigger(TaskTriggerInput {
+        let normalized = normalize_trigger(&TaskTriggerInput {
             kind: "event",
             trigger_type: None,
             run_at_utc: None,
@@ -597,7 +714,7 @@ mod tests {
 
     #[test]
     fn normalize_trigger_generates_webhook_token_on_storage() {
-        let normalized = normalize_trigger(TaskTriggerInput {
+        let normalized = normalize_trigger(&TaskTriggerInput {
             kind: "webhook",
             trigger_type: None,
             run_at_utc: None,
@@ -607,7 +724,7 @@ mod tests {
         .expect("webhook should normalize");
         let token = normalized.storage_trigger_type();
         assert_eq!(normalized.kind(), TaskTriggerKind::Webhook);
-        assert!(!token.is_empty());
+        assert_ne!(token, "");
         assert_eq!(webhook_path(&token), format!("/api/tasks/webhook/{token}"));
     }
 

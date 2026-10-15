@@ -13,16 +13,22 @@ use crate::config::{MayConfig, ProviderInstance, ProviderType};
 /// Error type for model fetching operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelFetchError {
+    /// Provider error.
     #[error("provider error: {0}")]
     Provider(String),
+    /// HTTP error.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+    /// Copilot not authenticated.
     #[error("Copilot not authenticated")]
     CopilotNotAuthenticated,
+    /// Copilot auth error.
     #[error("Copilot auth error: {0}")]
     CopilotAuth(#[from] crate::copilot::CopilotTokenError),
+    /// `ChatGPT` not authenticated.
     #[error("ChatGPT not authenticated")]
     ChatgptNotAuthenticated,
+    /// `ChatGPT` auth error.
     #[error("ChatGPT auth error: {0}")]
     ChatgptAuth(#[from] crate::chatgpt::ChatgptAuthError),
 }
@@ -111,7 +117,7 @@ pub async fn fetch_all_models(config: &MayConfig) -> Vec<FetchedModel> {
         .into_iter()
         .flat_map(|entry| {
             entry.models.into_iter().map(move |mut model| {
-                model.provider_id = entry.provider_id.clone();
+                model.provider_id.clone_from(&entry.provider_id);
                 model
             })
         })
@@ -278,7 +284,6 @@ async fn fetch_openai_compatible_models(
                 });
             let nickname = model
                 .description
-                .clone()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| model_id.clone());
 
@@ -320,6 +325,12 @@ struct OpenAiModelDescriptor {
     input_token_limit: Option<u32>,
 }
 
+/// Stable lowercase label for a model [`Ability`], used in listings.
+///
+/// # Panics
+///
+/// Panics on an [`Ability`] variant added without a corresponding label —
+/// keep the arm list in sync.
 #[must_use]
 pub fn ability_to_label(ability: Ability) -> String {
     match ability {
