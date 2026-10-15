@@ -777,8 +777,20 @@ pub struct UpdateSessionRequest {
     /// field absent → `None` (leave DB untouched);
     /// field present + `null` → `Some(NullableStringPatch::Null)` (clear to NULL);
     /// field present + string → `Some(NullableStringPatch::Set(s))` (set).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_patch")]
     pub(crate) reasoning_effort: Option<NullableStringPatch>,
+}
+
+/// Deserialize a field that is present in the body, keeping an explicit `null`
+/// as [`NullableStringPatch::Null`]; serde's `Option` impl would otherwise
+/// collapse it into `None`, which means "absent".
+fn deserialize_present_patch<'de, D>(
+    deserializer: D,
+) -> Result<Option<NullableStringPatch>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <NullableStringPatch as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// Tri-state payload for a nullable request field that is present in the JSON
@@ -1428,4 +1440,28 @@ pub struct LocalUrlMapRequest {
 #[serde(rename_all = "camelCase")]
 pub struct LocalUrlMapResponse {
     pub(crate) mapped_url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NullableStringPatch, UpdateSessionRequest};
+
+    fn reasoning_effort(body: &str) -> Option<NullableStringPatch> {
+        serde_json::from_str::<UpdateSessionRequest>(body)
+            .expect("update request parses")
+            .reasoning_effort
+    }
+
+    #[test]
+    fn update_session_reasoning_effort_keeps_absent_null_and_value_apart() {
+        assert!(reasoning_effort("{}").is_none());
+        assert!(matches!(
+            reasoning_effort(r#"{"reasoningEffort":null}"#),
+            Some(NullableStringPatch::Null)
+        ));
+        assert!(matches!(
+            reasoning_effort(r#"{"reasoningEffort":"high"}"#),
+            Some(NullableStringPatch::Set(value)) if value == "high"
+        ));
+    }
 }
