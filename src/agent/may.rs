@@ -104,6 +104,8 @@ pub struct MayAgentConfig {
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments kept across rebuilds of a session's agent.
     pub tool_environments: ToolEnvironmentCache,
+    /// Scheduling priority applied to commands this agent runs.
+    pub command_priority: crate::config::CommandPriority,
     /// The LLM provider.
     pub llm: CloudProvider,
     /// The concrete model identifier selected for this request.
@@ -210,7 +212,8 @@ impl MayAgent {
             )
             .await
             .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
-            .with_network_audit_log(network_audit);
+            .with_network_audit_log(network_audit)
+            .with_process_priority(config.command_priority.process_priority());
 
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
@@ -608,6 +611,7 @@ impl MayAgent {
         let config = MayAgentConfig {
             tool_distribution,
             tool_environments,
+            command_priority: may_config.sandbox.command_priority,
             llm,
             model_id: model.to_string(),
             provider_id,

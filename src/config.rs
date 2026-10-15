@@ -893,6 +893,53 @@ impl Default for RemoteAccessConfig {
     }
 }
 
+/// Scheduling priority applied to every command May runs.
+///
+/// Relative to the host: `Low` and `Lowest` yield CPU and disk bandwidth to
+/// interactive work instead of capping it. SSH commands are unaffected — the
+/// remote host owns its own scheduling.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandPriority {
+    /// Run at the host's own CPU and I/O priority.
+    Normal,
+    /// Yield under contention: `nice 10`, utility I/O.
+    #[default]
+    Low,
+    /// Yield most strongly under contention: `nice 19`, background I/O.
+    Lowest,
+}
+
+impl CommandPriority {
+    /// Maps the configured level onto the sandbox process priority.
+    #[must_use]
+    pub fn process_priority(self) -> aither_sandbox::ProcessPriority {
+        match self {
+            Self::Normal => aither_sandbox::ProcessPriority::default(),
+            Self::Low => aither_sandbox::ProcessPriority::new(
+                aither_sandbox::CpuPriority::Nice(
+                    aither_sandbox::NiceLevel::new(10).expect("configured nice level is valid"),
+                ),
+                aither_sandbox::IoPriority::Utility,
+            ),
+            Self::Lowest => aither_sandbox::ProcessPriority::new(
+                aither_sandbox::CpuPriority::Nice(
+                    aither_sandbox::NiceLevel::new(19).expect("configured nice level is valid"),
+                ),
+                aither_sandbox::IoPriority::Background,
+            ),
+        }
+    }
+}
+
+/// Local and container command sandboxing settings.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// Priority commands run at.
+    #[serde(default)]
+    pub command_priority: CommandPriority,
+}
+
 /// May agent configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MayConfig {
@@ -901,6 +948,9 @@ pub struct MayConfig {
     /// `0` means unlimited.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
+    /// Local and container command sandboxing settings.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
     /// Configured provider instances, keyed by ID.
     /// Example: `[provider.anthropic]`, `[provider.my-ollama]`
     #[serde(default)]
@@ -936,6 +986,7 @@ impl Default for MayConfig {
     fn default() -> Self {
         Self {
             max_iterations: default_max_iterations(),
+            sandbox: SandboxConfig::default(),
             provider: HashMap::new(),
             models: ModelsConfig::default(),
             preferences: Preferences::default(),
@@ -1153,6 +1204,65 @@ pub struct AvailableModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_priority_defaults_to_low() {
+        assert_eq!(
+            MayConfig::default().sandbox.command_priority,
+            CommandPriority::Low
+        );
+        let config: MayConfig = toml::from_str("").expect("a config without sandbox parses");
+        assert_eq!(config.sandbox.command_priority, CommandPriority::Low);
+    }
+
+    #[test]
+    fn command_priority_roundtrips_and_rejects_unknown() {
+        for (input, expected) in [
+            ("normal", CommandPriority::Normal),
+            ("low", CommandPriority::Low),
+            ("lowest", CommandPriority::Lowest),
+        ] {
+            let document = toml::to_string(&serde_json::json!({
+                "sandbox": { "command_priority": input }
+            }))
+            .expect("fixture serializes");
+            let config: MayConfig = toml::from_str(&document).expect("priority parses");
+            assert_eq!(config.sandbox.command_priority, expected);
+            let parsed: CommandPriority =
+                serde_json::from_value(serde_json::json!(input)).expect("json parses");
+            assert_eq!(parsed, expected);
+            assert_eq!(
+                serde_json::to_value(expected).expect("serializes"),
+                serde_json::json!(input)
+            );
+        }
+        let document = toml::to_string(&serde_json::json!({
+            "sandbox": { "command_priority": "urgent" }
+        }))
+        .expect("fixture serializes");
+        assert!(
+            toml::from_str::<MayConfig>(&document).is_err(),
+            "an unknown priority must be rejected"
+        );
+    }
+
+    #[test]
+    fn command_priority_maps_to_process_priority() {
+        use aither_sandbox::{CpuPriority, IoPriority};
+
+        assert!(CommandPriority::Normal.process_priority().is_normal());
+
+        let low = CommandPriority::Low.process_priority();
+        assert!(matches!(low.cpu(), CpuPriority::Nice(level) if level.get() == 10));
+        assert_eq!(low.io(), IoPriority::Utility);
+
+        let lowest = CommandPriority::Lowest.process_priority();
+        assert!(matches!(
+            lowest.cpu(),
+            CpuPriority::Nice(level) if level.get() == 19
+        ));
+        assert_eq!(lowest.io(), IoPriority::Background);
+    }
 
     #[test]
     fn test_default_config() {

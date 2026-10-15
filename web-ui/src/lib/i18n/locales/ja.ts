@@ -245,6 +245,7 @@ export const ja: Messages = {
       logs: 'アクティビティ',
       remote: 'リモートアクセス',
       remoteServers: 'リモートサーバー',
+      execution: 'コマンド優先度',
     },
     language: {
       title: 'インターフェース言語',
@@ -355,6 +356,14 @@ export const ja: Messages = {
       elapsed: '経過',
       ok: '成功',
       failed: '失敗',
+    },
+    execution: {
+      title: 'コマンド優先度',
+      description: 'ローカルおよびコンテナーのコマンドに対する CPU とディスクのスケジューリングを制御します。SSH コマンドには影響しません。',
+      normal: '標準',
+      low: '低（既定）',
+      lowest: '最低',
+      info: '優先度を下げると競合時のスケジューリングが変わりますが、CPU 使用率を制限するものではありません。',
     },
     remote: {
       title: 'リモートアクセス',

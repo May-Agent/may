@@ -1,3 +1,5 @@
+import type { UiConfigResponse } from './api/config';
+
 /** Machine-readable error codes (snake_case) emitted by the Rust backend. */
 export type ApiErrorCode =
   | 'bad_request'
@@ -369,7 +371,7 @@ export type BrowserLifecycleEvent =
 
 export type UiEvent =
   | { kind: 'heartbeat'; ok: boolean }
-  | { kind: 'config'; payload: unknown }
+  | { kind: 'config'; payload: UiConfigResponse }
   | { kind: 'browser_status'; payload: BrowserStatusPayload }
   | { kind: 'browser_lifecycle'; payload: BrowserLifecycleEvent }
   | { kind: 'profile_sessions'; payload: ProfileSessionsPayload }

@@ -26,7 +26,7 @@ use super::types::{
     LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest, SkillInfoDto,
     SkillInstallRequest, SseHeartbeat, SshServerRequest, UiAppearanceConfig, UiBrowserConfig,
     UiConfigResponse, UiFullConfig, UiModelsConfig, UiPreferencesConfig, UiProviderConfig,
-    UiRemoteAccessConfig,
+    UiRemoteAccessConfig, UiSandboxConfig,
 };
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -161,6 +161,9 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             }),
         },
         remote_access: UiRemoteAccessConfig::from(&config.remote_access),
+        sandbox: UiSandboxConfig {
+            command_priority: config.sandbox.command_priority,
+        },
     }
 }
 
@@ -270,6 +273,7 @@ async fn run_save_full_config(
                 .expect("ui config save must receive valid model selectors")
         });
         config.max_iterations = req.max_iterations;
+        config.sandbox.command_priority = req.sandbox.command_priority;
         config.browser.enabled = req.browser.enabled;
         config.browser.backend = req.browser.backend;
         config.browser.port = req.browser.port;
@@ -677,4 +681,33 @@ async fn poll_copilot_auth_event(device_code: &str) -> CopilotAuthEvent {
 pub(super) async fn copilot_logout() -> SkyResult<Json<ApiHealth>> {
     clear_copilot_credentials().await.map_err(internal_error)?;
     Ok(Json(ApiHealth { ok: true }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_ui_full_config;
+    use crate::config::{CommandPriority, MayConfig};
+
+    #[test]
+    fn full_config_serializes_sandbox_command_priority() {
+        let ui = serde_json::to_value(build_ui_full_config(&MayConfig::default()))
+            .expect("ui config serializes");
+        assert_eq!(ui["sandbox"]["commandPriority"], "low");
+
+        let mut config = MayConfig::default();
+        config.sandbox.command_priority = CommandPriority::Lowest;
+        let ui = serde_json::to_value(build_ui_full_config(&config)).expect("ui config serializes");
+        assert_eq!(ui["sandbox"]["commandPriority"], "lowest");
+    }
+
+    #[test]
+    fn full_config_rejects_an_unknown_command_priority() {
+        let mut ui = serde_json::to_value(build_ui_full_config(&MayConfig::default()))
+            .expect("ui config serializes");
+        ui["sandbox"]["commandPriority"] = serde_json::json!("urgent");
+        assert!(
+            serde_json::from_value::<super::UiFullConfig>(ui).is_err(),
+            "an unknown priority must be rejected"
+        );
+    }
 }
