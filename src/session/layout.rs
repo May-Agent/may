@@ -21,46 +21,55 @@ pub struct ProfileHomePaths {
 }
 
 impl MayHomePaths {
+    /// Layout rooted at `root` (typically `~/.may`).
     #[must_use]
     pub const fn new(root: PathBuf) -> Self {
         Self { root }
     }
 
+    /// Root directory of the layout.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Directory holding per-session data.
     #[must_use]
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")
     }
 
+    /// Directory holding per-profile data.
     #[must_use]
     pub fn profiles_dir(&self) -> PathBuf {
         self.root.join("profiles")
     }
 
+    /// Directory holding installed skills.
     #[must_use]
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join("skills")
     }
 
+    /// Directory holding registered subagents.
     #[must_use]
     pub fn subagents_dir(&self) -> PathBuf {
         self.root.join("subagents")
     }
 
+    /// Global memory file.
     #[must_use]
     pub fn memory_file(&self) -> PathBuf {
         self.root.join("MEMORY.md")
     }
 
+    /// Workspace config file.
     #[must_use]
     pub fn workspace_config(&self) -> PathBuf {
         self.root.join("workspace.toml")
     }
 
+    /// SQLite database file.
     #[must_use]
     pub fn db_file(&self) -> PathBuf {
         self.root.join("history.db")
@@ -86,26 +95,31 @@ impl MayHomePaths {
         self.tools_dir().join("runtimes")
     }
 
+    /// Browser runtime directory.
     #[must_use]
     pub fn browser_dir(&self) -> PathBuf {
         self.root.join("browser")
     }
 
+    /// Browser cache directory.
     #[must_use]
     pub fn browser_cache_dir(&self) -> PathBuf {
         self.browser_dir().join("cache")
     }
 
+    /// Browser profile (user data) directory.
     #[must_use]
     pub fn browser_profile_dir(&self) -> PathBuf {
         self.browser_dir().join("profile")
     }
 
+    /// Path layout for one session.
     #[must_use]
     pub fn session_paths(&self, session_id: &str) -> SessionPaths {
         SessionPaths::new(self.sessions_dir().join(session_id))
     }
 
+    /// Path layout for one profile's home dir.
     #[must_use]
     pub fn profile_home(&self, profile_id: &str) -> ProfileHomePaths {
         ProfileHomePaths {
@@ -115,31 +129,37 @@ impl MayHomePaths {
 }
 
 impl ProfileHomePaths {
+    /// Profile root directory.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Sessions directory under the profile root.
     #[must_use]
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")
     }
 
+    /// Skills directory under the profile root.
     #[must_use]
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join("skills")
     }
 
+    /// Subagents directory under the profile root.
     #[must_use]
     pub fn subagents_dir(&self) -> PathBuf {
         self.root.join("subagents")
     }
 
+    /// Workspace config under the profile root.
     #[must_use]
     pub fn workspace_config(&self) -> PathBuf {
         self.root.join("workspace.toml")
     }
 
+    /// Path layout for one session under this profile.
     #[must_use]
     pub fn session_paths(&self, session_id: &str) -> SessionPaths {
         SessionPaths::new(self.sessions_dir().join(session_id))
@@ -160,6 +180,9 @@ impl SessionPaths {
     }
 
     /// Home root containing this session and its profile-scoped resources.
+    ///
+    /// # Panics
+    /// Panics when the profile root has no parent (internal invariant).
     pub fn home_root(&self) -> PathBuf {
         self.root
             .parent()

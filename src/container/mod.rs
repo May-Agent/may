@@ -19,21 +19,28 @@ use zenwave::ResponseExt;
 /// Error type for container operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ContainerError {
+    /// Docker API error.
     #[error("Docker API error: {0}")]
     Docker(#[from] bollard::errors::Error),
+    /// No container runtime found (tried `OrbStack`, Podman, Docker).
     #[error("No container runtime found (tried OrbStack, Podman, Docker)")]
     NoRuntime,
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[doc = "Managed tools failed integrity or read-only preparation."]
     #[error("baseline tools preparation failed: {0}")]
     Tools(#[from] aither_sandbox::ToolRuntimeError),
+    /// Container not found.
     #[error("Container not found: {0}")]
     NotFound(String),
+    /// Image build failed.
     #[error("Image build failed: {0}")]
     ImageBuildFailed(String),
+    /// Container runtime bootstrap failed.
     #[error("Container runtime bootstrap failed: {0}")]
     Bootstrap(String),
+    /// Managed Podman download requires explicit user approval before downloading binaries.
     #[error("Managed Podman download requires explicit user approval before downloading binaries")]
     ManagedPodmanDownloadApprovalRequired,
     /// The container exposes no gateway the host bridge can bind.
@@ -156,7 +163,7 @@ impl ContainerRuntime {
     ///
     /// The bridge executes host IPC commands for whoever connects, so the
     /// bind is never a wildcard: on macOS and Windows hosts Docker Desktop,
-    /// OrbStack and Podman machine forward the gateway name to host loopback
+    /// `OrbStack` and Podman machine forward the gateway name to host loopback
     /// (see [`docker_desktop_ipc_route`]); on native Linux the bind is the
     /// container network's gateway as the host owns it.
     ///
@@ -309,12 +316,13 @@ impl ContainerRuntime {
 
 fn socket_candidates(kind: ContainerRuntimeKind) -> Vec<PathBuf> {
     match kind {
-        ContainerRuntimeKind::OrbStack => dirs::home_dir()
-            .map(|home| vec![home.join(".orbstack/run/docker.sock")])
-            .unwrap_or_else(|| {
+        ContainerRuntimeKind::OrbStack => dirs::home_dir().map_or_else(
+            || {
                 tracing::warn!("failed to resolve home directory while probing OrbStack socket");
                 Vec::new()
-            }),
+            },
+            |home| vec![home.join(".orbstack/run/docker.sock")],
+        ),
         ContainerRuntimeKind::Podman => {
             let mut candidates = Vec::new();
             if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {

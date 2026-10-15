@@ -11,12 +11,16 @@ use aither_agent::SubagentDefinition;
 /// Subagent management error.
 #[derive(Debug, thiserror::Error)]
 pub enum SubagentError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Invalid subagent path.
     #[error("Invalid subagent path: {0}")]
     InvalidPath(String),
+    /// Invalid subagent definition.
     #[error("Invalid subagent definition: {0}")]
     InvalidDefinition(String),
+    /// Subagent already exists.
     #[error("Subagent already exists: {0}")]
     AlreadyExists(String),
 }

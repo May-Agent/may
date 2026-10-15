@@ -24,13 +24,13 @@ pub enum PersistedMessageError {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PersistedMessage<'a> {
+pub struct PersistedMessage<'a> {
     row: &'a crate::db::entity::messages::Model,
     pub role: MessageRole,
     pub timestamp: Option<Timestamp>,
 }
 
-impl<'a> PersistedMessage<'a> {
+impl PersistedMessage<'_> {
     pub fn require_timestamp(&self) -> Result<&Timestamp, PersistedMessageError> {
         self.timestamp
             .as_ref()
@@ -45,13 +45,14 @@ impl<'a> TryFrom<&'a crate::db::entity::messages::Model> for PersistedMessage<'a
     type Error = PersistedMessageError;
 
     fn try_from(row: &'a crate::db::entity::messages::Model) -> Result<Self, Self::Error> {
-        let role = MessageRole::from_str(&row.role).map_err(|role| {
-            PersistedMessageError::InvalidRole {
-                session_id: row.session_id.clone(),
-                message_id: row.id,
-                role,
-            }
-        })?;
+        let role =
+            row.role
+                .parse::<MessageRole>()
+                .map_err(|role| PersistedMessageError::InvalidRole {
+                    session_id: row.session_id.clone(),
+                    message_id: row.id,
+                    role,
+                })?;
         let timestamp = row
             .timestamp
             .as_deref()

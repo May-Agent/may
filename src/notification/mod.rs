@@ -43,14 +43,19 @@ pub struct NotificationPayload {
 /// Error type for notification operations.
 #[derive(Debug, thiserror::Error)]
 pub enum NotificationError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Web push error.
     #[error("Web push error: {0}")]
     WebPush(#[from] WebPushError),
+    /// Database error.
     #[error("Database error: {0}")]
     Db(#[from] crate::db::ChatDbError),
+    /// PKCS8 encoding error.
     #[error("PKCS8 encoding error")]
     Pkcs8,
+    /// P256 key error.
     #[error("P256 key error: {0}")]
     P256Key(String),
 }
@@ -65,6 +70,14 @@ pub struct NotificationManager {
     db: ChatDb,
     /// Reusable HTTP client for push delivery.
     client: IsahcWebPushClient,
+}
+
+impl std::fmt::Debug for NotificationManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationManager")
+            .field("db", &self.db)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NotificationManager {

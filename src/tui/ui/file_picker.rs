@@ -19,6 +19,15 @@ pub struct FilePicker {
     matcher: Nucleo<PathBuf>,
 }
 
+impl std::fmt::Debug for FilePicker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilePicker")
+            .field("selected", &self.selected)
+            .field("all_files", &self.all_files)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FilePicker {
     /// Create a new file picker rooted at the given directory.
     #[must_use]

@@ -10,6 +10,7 @@ use streamdown_parser::{ParseEvent, Parser};
 pub const IMAGE_HEIGHT: usize = 8;
 
 /// Streaming markdown renderer with incremental parsing.
+#[derive(Debug)]
 pub struct StreamingMarkdown {
     /// The incremental parser (maintains state between chunks)
     parser: Parser,
@@ -500,7 +501,7 @@ mod tests {
         let mut md = StreamingMarkdown::new();
         md.push("# Hello\n\nWorld\n");
         let lines = md.lines();
-        assert!(!lines.is_empty());
+        assert_ne!(lines, []);
     }
 
     #[test]
@@ -508,11 +509,11 @@ mod tests {
         let mut md = StreamingMarkdown::new();
         md.push("# Head");
         // Incomplete line - not parsed yet
-        assert!(md.lines().is_empty());
+        assert_eq!(md.lines(), []);
 
         md.push("ing\n");
         // Now heading is complete
-        assert!(!md.lines().is_empty());
+        assert_ne!(md.lines(), []);
 
         md.push("Para");
         md.push("graph\n");
@@ -559,10 +560,6 @@ mod tests {
             .collect();
         tracing::debug!("HR test lines: {:?}", all_text);
         let has_rule = all_text.iter().any(|t| t.contains('─'));
-        assert!(
-            has_rule,
-            "Expected horizontal rule (─), got: {:?}",
-            all_text
-        );
+        assert!(has_rule, "Expected horizontal rule (─), got: {all_text:?}");
     }
 }

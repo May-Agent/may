@@ -6,6 +6,7 @@
 //! persisted and visible in the UI, and blocks the terminal tool
 //! until the user responds (or the request is interrupted).
 
+use std::future::Future;
 use std::sync::Arc;
 
 use aither_sandbox::{
@@ -28,8 +29,11 @@ pub struct PermissionRequestModeParseError {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionRequestMode {
+    /// Standard permission flow.
     Default,
+    /// Unsafe (unsandboxed) permission request.
     Unsafe,
+    /// Permission scoped to an SSH server.
     Ssh,
 }
 
@@ -80,7 +84,9 @@ impl From<TerminalMode> for PermissionRequestMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionHistoryMode {
+    /// Sandboxed-mode approval history.
     Sandboxed,
+    /// Unsafe-mode approval history.
     Unsafe,
 }
 
@@ -95,6 +101,7 @@ impl PermissionHistoryMode {
     }
 }
 
+/// A persisted permission-history mode string did not match a known variant.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown permission history mode: {value}")]
 pub struct PermissionHistoryModeParseError {
@@ -134,8 +141,11 @@ impl From<TerminalMode> for PermissionHistoryMode {
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionRequest {
+    /// Permission mode being requested.
     pub mode: PermissionRequestMode,
+    /// Script or command the request covers.
     pub script: String,
+    /// Session the request belongs to, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
 }
@@ -156,6 +166,7 @@ pub struct PermissionApprover {
 }
 
 impl PermissionApprover {
+    /// Create an approver with no session binding.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -166,6 +177,8 @@ impl PermissionApprover {
         }
     }
 
+    /// Return a copy bound to `session_id`.
+    #[must_use]
     pub fn for_session(&self, session_id: impl Into<String>) -> Self {
         Self {
             live_responses: self.live_responses.clone(),
@@ -175,6 +188,7 @@ impl PermissionApprover {
         }
     }
 
+    /// Attach the runtime service used to persist/surface requests.
     #[must_use]
     pub fn with_runtime_service(
         mut self,
@@ -184,18 +198,21 @@ impl PermissionApprover {
         self
     }
 
+    /// The attached runtime service, if any.
     #[must_use]
     pub fn runtime_service(&self) -> Option<Arc<crate::session::SessionRuntimeService>> {
         self.runtime_service.clone()
     }
 
+    /// Session id this approver is bound to, if any.
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
 
+    /// Mark this approver as unable to prompt interactively, with a reason.
     #[must_use]
-    pub fn without_interactive_approval(mut self, context: &'static str) -> Self {
+    pub const fn without_interactive_approval(mut self, context: &'static str) -> Self {
         self.approval_mode = ApprovalMode::Unavailable { context };
         self
     }
@@ -241,6 +258,10 @@ impl PermissionApprover {
         Ok(())
     }
 
+    /// Ask the user for permission and wait for a decision.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the request cannot be delivered or the wait is interrupted.
     pub async fn request_and_wait(
         &self,
         mode: TerminalMode,
@@ -281,6 +302,7 @@ impl PermissionApprover {
         rx.recv().await.map_err(|_| PermissionError::Interrupted)
     }
 
+    /// Deliver a decision for `request_id`; returns false if no matching pending request exists.
     #[must_use]
     pub fn respond(&self, request_id: &str, approved: bool) -> bool {
         self.live_responses.resolve(request_id, approved)
@@ -311,17 +333,18 @@ impl PermissionHandler for PermissionApprover {
         }
     }
 
-    async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
-        true
+    fn check_domain(&self, _domain: &str, _port: u16) -> impl Future<Output = bool> + Send {
+        std::future::ready(true)
     }
 
-    async fn will_wait_for_approval(&self, mode: TerminalMode, _script: &str) -> bool {
-        if matches!(self.approval_mode, ApprovalMode::Unavailable { .. }) {
-            return false;
-        }
-        match mode {
-            TerminalMode::Sandboxed => false,
-            TerminalMode::Unsafe => true,
-        }
+    fn will_wait_for_approval(
+        &self,
+        mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = bool> + Send {
+        std::future::ready(
+            !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
+                && matches!(mode, TerminalMode::Unsafe),
+        )
     }
 }

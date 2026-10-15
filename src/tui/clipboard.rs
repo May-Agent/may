@@ -73,7 +73,7 @@ impl ImageFormat {
     }
 
     #[must_use]
-    fn from_image_format(format: ImgFormat) -> Option<Self> {
+    const fn from_image_format(format: ImgFormat) -> Option<Self> {
         match format {
             ImgFormat::Png => Some(Self::Png),
             ImgFormat::Jpeg => Some(Self::Jpeg),
@@ -159,6 +159,7 @@ impl ClipboardPasteResult {
 }
 
 /// Image manager for handling pasted images.
+#[derive(Debug)]
 pub struct ImageManager {
     session_images_dir: PathBuf,
     counter: u32,
@@ -196,14 +197,19 @@ impl ImageManager {
 /// Image error.
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Clipboard error.
     #[error("Clipboard error: {0}")]
     Clipboard(String),
+    /// Image encoding error.
     #[error("Image encoding error: {0}")]
     Encoding(String),
+    /// Download error.
     #[error("Download error: {0}")]
     Download(String),
+    /// URL did not resolve to an image.
     #[error("URL did not resolve to an image: {0}")]
     NotImage(String),
 }
@@ -315,19 +321,18 @@ pub async fn download_image(url: &Url) -> Result<ClipboardImage, ImageError> {
     let format = match (format_from_header, format_from_bytes) {
         (Some(header), Some(bytes)) if header != bytes => {
             return Err(ImageError::Download(format!(
-                "image response format mismatch for {}: content-type={} bytes={:?}",
-                url, content_type, bytes
+                "image response format mismatch for {url}: content-type={content_type} bytes={bytes:?}"
             )));
         }
         (Some(header), _) => header,
         (None, Some(bytes)) => bytes,
         (None, None) => {
-            let path_hint = ImageFormat::from_url_path(url)
-                .map(|format| format.extension().to_string())
-                .unwrap_or_else(|| "none".to_string());
+            let path_hint = ImageFormat::from_url_path(url).map_or_else(
+                || "none".to_string(),
+                |format| format.extension().to_string(),
+            );
             return Err(ImageError::NotImage(format!(
-                "response content-type '{}' and bytes are not a supported image format (path hint: {})",
-                content_type, path_hint
+                "response content-type '{content_type}' and bytes are not a supported image format (path hint: {path_hint})"
             )));
         }
     };
@@ -375,6 +380,7 @@ mod tests {
 }
 
 /// Manager for pasted text content.
+#[derive(Debug)]
 pub struct TextManager {
     session_dir: PathBuf,
     counter: u32,

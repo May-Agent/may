@@ -16,22 +16,40 @@ use crate::db::{ChatDb, ChatDbError};
 /// Session management error.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
+    /// Home directory not found.
+    /// No usable home directory could be determined.
     #[error("Home directory not found")]
     NoHomeDir,
+    /// IO error.
+    /// Filesystem I/O failed.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Store error.
+    /// Session store operation failed.
     #[error("Store error: {0}")]
     Store(#[from] super::store::StoreError),
+    /// Database error.
+    /// Database operation failed.
     #[error("Database error: {0}")]
     Database(#[from] ChatDbError),
+    /// Session not found.
+    /// The referenced session does not exist.
     #[error("Session not found: {0}")]
     NotFound(String),
+    /// No active session.
+    /// No session is currently active.
     #[error("No active session")]
     NoActiveSession,
+    /// Bundle error.
+    /// Embedded resource bundle extraction failed.
     #[error("Bundle error: {0}")]
     Bundle(#[from] crate::bundle::BundleError),
+    /// Container runtime preparation failed.
+    /// Container runtime preparation failed.
     #[error("Container runtime preparation failed: {0}")]
     Container(#[from] crate::container::ContainerError),
+    /// Persisted message error.
+    /// A persisted message failed to decode.
     #[error("Persisted message error: {0}")]
     PersistedMessage(#[from] PersistedMessageError),
 }
@@ -44,6 +62,9 @@ pub struct SessionId(String);
 impl SessionId {
     /// Create a new random session ID using four words.
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if the embedded petname dictionary cannot produce an id.
     pub fn new() -> Self {
         let petnames = Petnames::default();
         let id = petnames
@@ -78,22 +99,27 @@ impl From<String> for SessionId {
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.0)
+        write!(f, "{}", self.0)
     }
 }
 
 /// A session representing a conversation with the agent.
+#[derive(Debug)]
 pub struct Session {
+    /// Unique session identifier.
     pub id: SessionId,
     pub title: Option<String>,
     /// Model bound to this session (set via /model command).
     pub model: Option<String>,
     /// Profile this session belongs to.
     pub profile_id: Option<String>,
+    /// In-memory chat history.
     pub history: ChatHistory,
     /// Directory where `TerminalTool` creates its working directory.
     pub sandbox_dir: PathBuf,
+    /// Creation timestamp.
     pub created_at: Timestamp,
+    /// Last update timestamp.
     pub updated_at: Timestamp,
     /// Whether this session has been persisted to disk.
     pub persisted: bool,
@@ -102,17 +128,25 @@ pub struct Session {
 /// Summary of a session for listing.
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
 pub struct SessionSummary {
+    /// Unique session identifier.
     pub id: SessionId,
     pub title: Option<String>,
     pub model: Option<String>,
     pub profile_id: Option<String>,
+    /// Whether the session is pinned in its profile.
     pub pinned: bool,
+    /// Whether the session has been auto-archived.
     pub archived: bool,
+    /// Folder the session is grouped in.
     pub folder_id: Option<String>,
+    /// Display order within the pinned section.
     pub pin_sort_order: Option<i32>,
+    /// Number of persisted messages.
     pub message_count: usize,
+    /// Creation timestamp.
     #[schema(value_type = Option<String>)]
     pub created_at: Option<Timestamp>,
+    /// Last update timestamp.
     #[schema(value_type = Option<String>)]
     pub updated_at: Option<Timestamp>,
     /// Content preview for searching (concatenated messages).
@@ -144,7 +178,8 @@ impl SessionSummary {
             archived: s.archived,
             folder_id: s.folder_id,
             pin_sort_order: s.pin_sort_order,
-            message_count: s.message_count as usize,
+            message_count: usize::try_from(s.message_count)
+                .expect("session row message_count must be non-negative"),
             created_at,
             updated_at,
             content_preview: s.preview.unwrap_or_default(),
@@ -188,6 +223,10 @@ fn map_db_message_stats(row: &crate::db::entity::messages::Model) -> Option<Chat
     }
 }
 
+/// Load the persisted chat history for a session from the database.
+///
+/// # Errors
+/// Returns [`SessionError`] on storage failure or malformed rows.
 pub async fn load_history_from_db(
     db: &ChatDb,
     session_id: &str,
@@ -205,8 +244,7 @@ pub async fn load_history_from_db(
     for msg in db_messages {
         let persisted = PersistedMessage::try_from(&msg)?;
         let role = persisted.role.clone();
-        let timestamp = persisted.timestamp.clone();
-        drop(persisted);
+        let timestamp = persisted.timestamp;
         let stats = map_db_message_stats(&msg);
 
         history.push(ChatMessage {
@@ -230,6 +268,9 @@ pub async fn list_summaries_from_db(db: &ChatDb) -> Result<Vec<SessionSummary>, 
     Ok(summarize_db_sessions(db, db_sessions).await?)
 }
 
+///
+/// # Errors
+/// Returns [`SessionError`] on storage failure or malformed rows.
 pub async fn summarize_db_sessions(
     db: &ChatDb,
     db_sessions: Vec<crate::db::entity::sessions::Model>,
@@ -250,6 +291,10 @@ pub async fn summarize_db_sessions(
     Ok(summaries)
 }
 
+/// Initialize on-disk session storage and the database under `may_dir`, returning the store, db, and default profile id.
+///
+/// # Errors
+/// Returns [`SessionError`] when directories cannot be created or the database/schema setup fails.
 pub async fn initialize_session_persistence(
     may_dir: &Path,
 ) -> Result<(SessionStore, ChatDb, String), SessionError> {
@@ -273,6 +318,10 @@ pub async fn initialize_session_persistence(
     Ok((store, db, default_profile_id))
 }
 
+/// Reconcile container mount-point layout for sessions whose profiles run in containers.
+///
+/// # Errors
+/// Returns [`SessionError`] on storage failure or when a session's layout cannot be reconciled.
 pub async fn reconcile_container_profile_sessions(
     store: &SessionStore,
     db: &ChatDb,
@@ -306,6 +355,7 @@ pub async fn reconcile_container_profile_sessions(
 }
 
 /// Manages sessions and their lifecycle.
+#[derive(Debug)]
 pub struct SessionManager {
     may_dir: PathBuf,
     store: SessionStore,
@@ -317,6 +367,9 @@ pub struct SessionManager {
 
 impl SessionManager {
     /// Create a new `SessionManager`, initializing ~/.may/ structure if needed.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NoHomeDir`] when no home directory exists, or [`SessionError`] when storage setup fails.
     pub async fn new() -> Result<Self, SessionError> {
         let may_dir = MayConfig::may_dir().map_err(|_| SessionError::NoHomeDir)?;
         let (store, db, default_profile_id) = initialize_session_persistence(&may_dir).await?;
@@ -344,11 +397,17 @@ impl SessionManager {
     }
 
     /// Create a new session in the current profile (lazy - not persisted until first message).
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] when the session cannot be created.
     pub fn create_session(&mut self) -> Result<&Session, SessionError> {
         self.create_session_with_model(None)
     }
 
     /// Create a new session with a specific model in the current profile.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] when the session cannot be created.
     pub fn create_session_with_model(
         &mut self,
         model: Option<String>,
@@ -357,6 +416,12 @@ impl SessionManager {
     }
 
     /// Create a new session with a specific model and profile.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] when the session cannot be created.
+    ///
+    /// # Panics
+    /// Panics if the freshly created session cannot be retrieved (internal invariant).
     pub fn create_session_in_profile(
         &mut self,
         model: Option<String>,
@@ -386,6 +451,9 @@ impl SessionManager {
 
     /// Ensure current session is persisted to disk and database.
     /// Call this before writing any data to the session.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NoActiveSession`] when no session is active, or [`SessionError`] on persistence failure.
     pub async fn ensure_persisted(&mut self) -> Result<(), SessionError> {
         let (session_id, title, model, profile_id, already_persisted) = {
             let session = self.current.as_ref().ok_or(SessionError::NoActiveSession)?;
@@ -428,6 +496,9 @@ impl SessionManager {
     }
 
     /// Load an existing session by ID (from database).
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NotFound`] when the session does not exist, or [`SessionError`] on storage/layout failure.
     pub async fn load_session(&mut self, id: &SessionId) -> Result<&Session, SessionError> {
         let db_session = self
             .db
@@ -474,6 +545,9 @@ impl SessionManager {
     }
 
     /// Force reconcile container mount-point layout for one persisted session.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] on storage failure or when the layout cannot be reconciled.
     pub async fn reconcile_container_layout_for_session(
         &self,
         id: &SessionId,
@@ -519,6 +593,9 @@ impl SessionManager {
     }
 
     /// Append a message to the current session (DB + in-memory).
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NoActiveSession`] when no session is active, or [`SessionError`] on persistence failure.
     pub async fn append_message(&mut self, message: ChatMessage) -> Result<(), SessionError> {
         self.ensure_persisted().await?;
 
@@ -534,6 +611,9 @@ impl SessionManager {
     }
 
     /// Attach usage/context stats to the latest assistant message.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] on persistence failure.
     pub async fn set_latest_assistant_stats(
         &mut self,
         stats: ChatMessageStats,
@@ -561,17 +641,26 @@ impl SessionManager {
     }
 
     /// List all sessions (from database).
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] on storage failure.
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, SessionError> {
         list_summaries_from_db(&self.db).await
     }
 
     /// Save current session state.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NoActiveSession`] when no session is active, or [`SessionError`] on persistence failure.
     pub async fn save_current(&mut self) -> Result<(), SessionError> {
         self.ensure_persisted().await?;
         Ok(())
     }
 
     /// Set title for the current session.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NoActiveSession`] when no session is active, or [`SessionError`] on persistence failure.
     pub async fn set_current_title(&mut self, title: String) -> Result<(), SessionError> {
         self.ensure_persisted().await?;
         let session = self.current.as_mut().ok_or(SessionError::NoActiveSession)?;
@@ -586,6 +675,9 @@ impl SessionManager {
     }
 
     /// Set model for the current session.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NoActiveSession`] when no session is active, or [`SessionError`] on persistence failure.
     pub async fn set_current_model(&mut self, model: String) -> Result<(), SessionError> {
         self.ensure_persisted().await?;
         let session = self.current.as_mut().ok_or(SessionError::NoActiveSession)?;
@@ -628,6 +720,9 @@ impl SessionManager {
     }
 
     /// Delete a session from both DB and filesystem.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NotFound`] when the session does not exist, or [`SessionError`] on storage failure.
     pub async fn delete_session(&mut self, id: &str) -> Result<(), SessionError> {
         let profile_id = self
             .db

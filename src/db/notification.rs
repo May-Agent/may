@@ -14,6 +14,9 @@ use super::{
 
 impl ChatDb {
     /// Insert a new mailbox notification entry.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn create_notification_mailbox_entry(
         &self,
         id: &str,
@@ -51,6 +54,9 @@ impl ChatDb {
     }
 
     /// Update mailbox delivery state after a send attempt.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn update_notification_mailbox_delivery(
         &self,
         id: &str,
@@ -79,6 +85,9 @@ impl ChatDb {
     }
 
     /// Return notifications that still need delivery attempts.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn list_pending_notification_mailbox_entries(
         &self,
     ) -> Result<Vec<notification_mailbox::Model>, ChatDbError> {
@@ -92,6 +101,9 @@ impl ChatDb {
 
     /// Atomically claim a pending notification for delivery (CAS: pending → delivering).
     /// Returns true if the claim succeeded, false if another process already claimed it.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn claim_pending_notification(&self, id: &str) -> Result<bool, ChatDbError> {
         let result = self
             .db
@@ -108,6 +120,9 @@ impl ChatDb {
     }
 
     /// Release a claimed notification back to pending (on send failure).
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn release_notification_claim(
         &self,
         id: &str,
@@ -126,6 +141,10 @@ impl ChatDb {
         Ok(())
     }
 
+    /// List mailbox notifications, newest first, up to `limit`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn list_notification_mailbox_entries(
         &self,
         limit: u64,
@@ -138,6 +157,10 @@ impl ChatDb {
             .await?)
     }
 
+    /// Fetch a single mailbox notification by id.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_notification_mailbox_entry(
         &self,
         id: &str,
@@ -150,6 +173,10 @@ impl ChatDb {
             .await?)
     }
 
+    /// Mark a notification as opened by the user.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn mark_notification_mailbox_opened(&self, id: &str) -> Result<(), ChatDbError> {
         self.db
             .query("UPDATE notification_mailbox SET status = ?, updated_at = ? WHERE id = ?")
@@ -161,6 +188,10 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Consume a notification's pending callback payload exactly once.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn consume_notification_callback(
         &self,
         id: &str,

@@ -33,6 +33,8 @@ pub struct Model {
     pub last_run_status: Option<String>,
     /// Last run output (truncated).
     pub last_run_output: Option<String>,
+    /// Creation timestamp (ISO 8601).
     pub created_at: String,
+    /// Last update timestamp (ISO 8601).
     pub updated_at: String,
 }

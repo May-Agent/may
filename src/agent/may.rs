@@ -47,6 +47,7 @@ use crate::workspace_request::WorkspaceRequestBroker;
 /// May agent error.
 #[derive(Debug, thiserror::Error)]
 pub enum MayAgentError {
+    /// Config error.
     #[error("Config error: {0}")]
     Config(#[from] crate::config::ConfigError),
     /// Baseline preparation failed before the agent became ready.
@@ -55,22 +56,31 @@ pub enum MayAgentError {
     /// The session's prepared tool environment could not be acquired.
     #[error(transparent)]
     ToolEnvironment(#[from] ToolEnvironmentCacheError),
+    /// Underlying Error error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// LLM error.
     #[error("LLM error: {0}")]
     Llm(String),
+    /// Sandbox error.
     #[error("Sandbox error: {0}")]
     Sandbox(String),
+    /// Agent error.
     #[error("Agent error: {0}")]
     Agent(#[from] AgentError),
+    /// Missing API key.
     #[error("Missing API key: {0}")]
     MissingApiKey(String),
+    /// Copilot token error.
     #[error("Copilot token error: {0}")]
     CopilotToken(#[from] crate::copilot::CopilotTokenError),
+    /// `ChatGPT` auth error.
     #[error("ChatGPT auth error: {0}")]
     ChatgptAuth(#[from] crate::chatgpt::ChatgptAuthError),
+    /// Workspace config error.
     #[error("Workspace config error: {0}")]
     Workspace(#[from] crate::workspace::WorkspaceConfigError),
+    /// MCP error.
     #[error("MCP error: {0}")]
     Mcp(#[from] crate::mcp::McpConnectionLoadError),
 }
@@ -82,6 +92,7 @@ pub enum MayAgentError {
 /// and reached per-command via the `terminal` tool's `mode: "ssh"` +
 /// `ssh_server_id: <name>` parameters. There is no remote-home variant: remote
 /// is a per-invocation routing choice, not a session-level environment.
+#[derive(Debug)]
 pub enum AgentEnvironment {
     /// Native macOS sandbox via heel.
     Local,
@@ -99,6 +110,7 @@ pub enum AgentEnvironment {
 }
 
 /// Configuration for creating a `MayAgent`.
+#[derive(Debug)]
 pub struct MayAgentConfig {
     /// Trusted baseline tool distribution used by every configured backend.
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
@@ -183,6 +195,17 @@ pub struct MayAgent {
     provider_id: String,
     model_context_window: Option<u32>,
     runtime_system_context: RuntimeSystemContext,
+}
+
+impl std::fmt::Debug for MayAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MayAgent")
+            .field("session_id", &self.session_id)
+            .field("sandbox_dir", &self.sandbox_dir)
+            .field("provider_id", &self.provider_id)
+            .field("model_context_window", &self.model_context_window)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MayAgent {

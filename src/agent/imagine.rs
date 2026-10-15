@@ -22,7 +22,7 @@ use crate::config::{MayConfig, ProviderInstance, ProviderType};
 /// Populated from [`resolve_image_generator_config`] when the agent
 /// starts; `None` means no image-generation model is configured and the
 /// tool will surface a friendly error to the agent on first call.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ImageGeneratorConfig {
     pub provider_id: String,
     pub provider: ProviderInstance,
@@ -39,7 +39,7 @@ pub struct ImagineArgs {
 }
 
 #[derive(Clone)]
-pub(crate) struct ImagineTool {
+pub struct ImagineTool {
     pub(crate) generator: Option<ImageGeneratorConfig>,
     pub(crate) artifacts_dir: PathBuf,
 }

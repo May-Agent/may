@@ -9,6 +9,9 @@ use super::{ChatDb, ChatDbError, query};
 
 impl ChatDb {
     /// Create a scheduled task.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] when the insert fails or the id collides.
     pub async fn create_scheduled_task(
         &self,
         params: CreateScheduledTaskParams<'_>,
@@ -63,6 +66,9 @@ impl ChatDb {
     }
 
     /// Get a scheduled task by ID.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RowNotFound`] when no task with `id` exists, or [`ChatDbError`] on storage failure.
     pub async fn get_scheduled_task(
         &self,
         id: &str,
@@ -75,6 +81,9 @@ impl ChatDb {
     }
 
     /// List all scheduled tasks, optionally filtered by profile.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn list_scheduled_tasks(
         &self,
         profile_id: Option<&str>,
@@ -100,6 +109,9 @@ impl ChatDb {
     }
 
     /// Update a scheduled task's mutable fields.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RowNotFound`] when no task with `id` exists, or [`ChatDbError`] on storage failure.
     pub async fn update_scheduled_task(
         &self,
         id: &str,
@@ -139,6 +151,9 @@ impl ChatDb {
     }
 
     /// Delete a scheduled task.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn delete_scheduled_task(&self, id: &str) -> Result<(), ChatDbError> {
         query!(self.db, "DELETE FROM scheduled_tasks WHERE id = ?", id)
             .execute()
@@ -147,6 +162,9 @@ impl ChatDb {
     }
 
     /// Approve a task for execution.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn approve_scheduled_task(&self, id: &str) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         query!(
@@ -161,6 +179,9 @@ impl ChatDb {
     }
 
     /// Record a task execution result.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn record_task_run(
         &self,
         id: &str,
@@ -182,6 +203,10 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Mark a task run as started and persist it.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn start_task_run(
         &self,
         id: &str,
@@ -208,6 +233,10 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Record the outcome of a task run and mark it finished.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn finish_task_run(
         &self,
         id: &str,
@@ -233,6 +262,9 @@ impl ChatDb {
     ///
     /// Due-ness is resolved by the scheduler runtime because it depends on
     /// trigger-kind-specific rules.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn list_due_tasks(&self) -> Result<Vec<scheduled_tasks::Model>, ChatDbError> {
         Ok(query!(
             self.db,
@@ -242,6 +274,10 @@ impl ChatDb {
         .await?)
     }
 
+    /// List tasks whose webhook trigger token matches `token`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn list_tasks_for_webhook(
         &self,
         token: &str,

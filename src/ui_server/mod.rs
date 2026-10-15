@@ -64,21 +64,18 @@ pub enum UiServerMode {
 }
 
 impl UiServerMode {
+    #[cfg(feature = "ui")]
+    const fn ensure_supported(self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "ui"))]
     fn ensure_supported(self) -> anyhow::Result<()> {
         match self {
             Self::Rest => Ok(()),
-            Self::Ui => {
-                #[cfg(feature = "ui")]
-                {
-                    Ok(())
-                }
-                #[cfg(not(feature = "ui"))]
-                {
-                    Err(anyhow!(
-                        "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
-                    ))
-                }
-            }
+            Self::Ui => Err(anyhow!(
+                "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+            )),
         }
     }
 }
@@ -139,7 +136,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
     let browser_manager = if config.browser.enabled {
         tracing::info!(backend = ?config.browser.backend, "Browser integration enabled");
         match crate::container::browser::prepare_browser_runtime(&config.browser, &may_dir).await {
-            Ok(_) => match crate::container::browser::BrowserManager::new(
+            Ok(()) => match crate::container::browser::BrowserManager::new(
                 config.browser.clone(),
                 may_dir.clone(),
                 crate::container::browser::BrowserLifecyclePublisher::new(
@@ -513,38 +510,6 @@ fn build_router(state: Arc<UiServerState>, mode: UiServerMode) -> Router {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::UiServerMode;
-
-    #[test]
-    fn rest_mode_is_always_supported() {
-        UiServerMode::Rest
-            .ensure_supported()
-            .expect("rest mode should always be available");
-    }
-
-    #[cfg(not(feature = "ui"))]
-    #[test]
-    fn ui_mode_requires_ui_feature() {
-        let error = UiServerMode::Ui
-            .ensure_supported()
-            .expect_err("ui mode should fail without the ui feature");
-        assert_eq!(
-            error.to_string(),
-            "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
-        );
-    }
-
-    #[cfg(feature = "ui")]
-    #[test]
-    fn ui_mode_is_supported_with_ui_feature() {
-        UiServerMode::Ui
-            .ensure_supported()
-            .expect("ui mode should work when the ui feature is enabled");
-    }
-}
-
 // ── System / Meta handlers ────────────────────────────────
 
 async fn health() -> SkyResult<Json<ApiHealth>> {
@@ -732,4 +697,36 @@ fn build_provider_models_response(
 
     providers.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
     ProviderModelsResponse { providers }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UiServerMode;
+
+    #[test]
+    fn rest_mode_is_always_supported() {
+        UiServerMode::Rest
+            .ensure_supported()
+            .expect("rest mode should always be available");
+    }
+
+    #[cfg(not(feature = "ui"))]
+    #[test]
+    fn ui_mode_requires_ui_feature() {
+        let error = UiServerMode::Ui
+            .ensure_supported()
+            .expect_err("ui mode should fail without the ui feature");
+        assert_eq!(
+            error.to_string(),
+            "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn ui_mode_is_supported_with_ui_feature() {
+        UiServerMode::Ui
+            .ensure_supported()
+            .expect("ui mode should work when the ui feature is enabled");
+    }
 }

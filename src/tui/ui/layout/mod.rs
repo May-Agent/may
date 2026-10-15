@@ -1,5 +1,7 @@
 //! Main layout for the TUI.
 
+use std::sync::atomic::Ordering;
+
 mod config;
 mod pickers;
 mod popups;
@@ -87,7 +89,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Build usage info for status
     let usage_info = app.usage.as_ref().and_then(|u| {
         u.prompt_tokens
-            .map(|pt| (u64::from(pt), app.context_window.map(|w| u64::from(w))))
+            .map(|pt| (u64::from(pt), app.context_window.map(u64::from)))
     });
 
     let images_supported = app.supports_images();
@@ -136,30 +138,32 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     );
 
     // Keep selection cache aligned with chat content and account for top padding.
+    let queue_ctx = if queue_messages.is_empty() {
+        None
+    } else {
+        Some(QueueContext {
+            messages: &queue_messages,
+        })
+    };
+    let status_ctx = StatusContext {
+        model: &app.model_display(),
+        usage: usage_info,
+        queue_count: app.queue.len(),
+        background_tasks: app.background_tasks,
+        processing: app.processing,
+        status_message: app.status.as_deref(),
+        profile_name: app.current_profile_name(),
+    };
     let plain_all_lines = chat::build_plain_wrapped_lines_unified(
         &app.chat,
         chat_area.width,
-        if queue_messages.is_empty() {
-            None
-        } else {
-            Some(QueueContext {
-                messages: &queue_messages,
-            })
-        },
+        queue_ctx.as_ref(),
         Some(InputContext {
             input: &app.input,
             cursor: app.cursor,
             attachments: &app.attachments,
         }),
-        Some(StatusContext {
-            model: &app.model_display(),
-            usage: usage_info,
-            queue_count: app.queue.len(),
-            background_tasks: app.background_tasks,
-            processing: app.processing,
-            status_message: app.status.as_deref(),
-            profile_name: app.current_profile_name(),
-        }),
+        Some(&status_ctx),
     );
 
     let view_h = chat_area.height as usize;
@@ -231,8 +235,8 @@ fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
 
     let base_scroll = if app.scroll == usize::MAX {
         app.content_height
-            .get()
-            .saturating_sub(app.view_height.get())
+            .load(Ordering::Relaxed)
+            .saturating_sub(app.view_height.load(Ordering::Relaxed))
     } else {
         app.scroll
     };
@@ -1140,18 +1144,18 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     frame.render_widget(List::new(items), chunks[1]);
 
     // Custom text input line
-    let chunk_idx_help;
-    if qs.custom_mode {
+
+    let chunk_idx_help = if qs.custom_mode {
         let input_line = Paragraph::new(Line::from(vec![
             Span::styled("  > ", Style::default().fg(Color::Cyan)),
             Span::styled(&qs.custom_text, Style::default().fg(Color::White)),
             Span::styled("_", Style::default().fg(Color::DarkGray)),
         ]));
         frame.render_widget(input_line, chunks[2]);
-        chunk_idx_help = 3;
+        3
     } else {
-        chunk_idx_help = 2;
-    }
+        2
+    };
 
     // Help text
     let nav = if state.is_multi() {
@@ -1250,7 +1254,7 @@ fn render_inline_images(
     }
 
     let view_height = chat_area.height as usize;
-    let content_height = app.content_height.get();
+    let content_height = app.content_height.load(Ordering::Relaxed);
 
     // Calculate offset the same way as render_impl does:
     // When content doesn't fill the screen, it renders at the BOTTOM of the

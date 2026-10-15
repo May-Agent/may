@@ -4,8 +4,8 @@ mod completion;
 mod config;
 mod model_picker;
 
-use std::cell::Cell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_channel::Receiver;
 use blocking::unblock;
@@ -47,6 +47,7 @@ use super::state::{
     detect_api_key_from_env,
 };
 /// Application state (UI only - agent managed externally).
+#[derive(Debug)]
 pub struct App {
     /// Session manager
     pub session_manager: SessionManager,
@@ -67,9 +68,9 @@ pub struct App {
     /// Whether chat input is shown (hidden during full-screen scroll)
     pub input_visible: bool,
     /// Last known content height (set during rendering for scroll normalization)
-    pub content_height: Cell<usize>,
+    pub content_height: AtomicUsize,
     /// View height (set during rendering for scroll normalization)
-    pub view_height: Cell<usize>,
+    pub view_height: AtomicUsize,
     /// Current mode
     pub mode: AppMode,
     /// Message queue
@@ -120,7 +121,7 @@ pub struct App {
     pub thinking_start: Option<std::time::Instant>,
     /// Copilot OAuth authentication status
     pub copilot_auth_status: Option<CopilotAuthStatus>,
-    /// ChatGPT OAuth authentication status
+    /// `ChatGPT` OAuth authentication status
     pub chatgpt_auth_status: Option<ChatgptAuthStatus>,
     /// Tier being edited in `TierModelPicker` mode
     pub tier_picker_tier: Option<ModelTier>,
@@ -295,8 +296,8 @@ impl App {
             chat: ChatStream::new(),
             scroll: usize::MAX, // Follow bottom by default
             input_visible: true,
-            content_height: Cell::new(0),
-            view_height: Cell::new(0),
+            content_height: AtomicUsize::new(0),
+            view_height: AtomicUsize::new(0),
             mode,
             queue: MessageQueue::new(),
             status,
@@ -525,8 +526,8 @@ impl App {
         self.tool_detail_scroll = 0;
         self.quit_pending = false;
         self.thinking_start = None;
-        self.content_height.set(0);
-        self.view_height.set(0);
+        self.content_height.store(0, Ordering::Relaxed);
+        self.view_height.store(0, Ordering::Relaxed);
         self.selection = None;
         self.rendered_plain_lines.clear();
         self.render_top_padding = 0;
@@ -546,16 +547,15 @@ impl App {
             }
         }
 
-        let session_dir = self
-            .session_manager
-            .current()
-            .map(|session| session.sandbox_dir.clone())
-            .unwrap_or_else(|| {
+        let session_dir = self.session_manager.current().map_or_else(
+            || {
                 panic!(
                     "current session missing while initializing session {}",
                     session_id.as_str()
                 )
-            });
+            },
+            |session| session.sandbox_dir.clone(),
+        );
         self.image_manager = Some(ImageManager::new(&session_dir));
         self.text_manager = Some(TextManager::new(&session_dir));
 
@@ -903,7 +903,7 @@ impl App {
         // Pinned items
         for item in &ps.pinned {
             match item {
-                PinnedItem::Session(s) => list.push(s.clone()),
+                PinnedItem::Session(s) => list.push((**s).clone()),
                 PinnedItem::Folder { sessions, .. } => {
                     list.extend(sessions.iter().cloned());
                 }
@@ -976,7 +976,7 @@ impl App {
         self.copilot_auth_status = Some(CopilotAuthStatus::Failed(error));
     }
 
-    /// Start the ChatGPT OAuth flow (initial "working" state).
+    /// Start the `ChatGPT` OAuth flow (initial "working" state).
     pub fn start_chatgpt_auth(&mut self) {
         self.mode = AppMode::ChatgptAuth;
         self.chatgpt_auth_status = Some(ChatgptAuthStatus::Working);
@@ -987,7 +987,7 @@ impl App {
         self.chatgpt_auth_status = Some(ChatgptAuthStatus::WaitingForCallback { url });
     }
 
-    /// Switch the ChatGPT auth screen to the device-flow variant.
+    /// Switch the `ChatGPT` auth screen to the device-flow variant.
     pub fn set_chatgpt_device_code(&mut self, user_code: String, verification_uri: String) {
         self.chatgpt_auth_status = Some(ChatgptAuthStatus::WaitingForUser {
             user_code,
@@ -995,12 +995,12 @@ impl App {
         });
     }
 
-    /// Mark ChatGPT auth as successful.
+    /// Mark `ChatGPT` auth as successful.
     pub fn chatgpt_auth_success(&mut self) {
         self.chatgpt_auth_status = Some(ChatgptAuthStatus::Success);
     }
 
-    /// Mark ChatGPT auth as failed.
+    /// Mark `ChatGPT` auth as failed.
     pub fn chatgpt_auth_failed(&mut self, error: String) {
         self.chatgpt_auth_status = Some(ChatgptAuthStatus::Failed(error));
     }
@@ -1157,8 +1157,8 @@ impl App {
     /// Largest scroll offset that still shows a full view of content.
     fn max_chat_scroll(&self) -> usize {
         self.content_height
-            .get()
-            .saturating_sub(self.view_height.get())
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.view_height.load(Ordering::Relaxed))
     }
 
     /// Scroll the chat view up by `lines`, leaving follow-bottom mode.
@@ -1195,7 +1195,10 @@ impl App {
 
     /// Lines to move for one page of keyboard scrolling.
     fn chat_scroll_page(&self) -> usize {
-        self.view_height.get().saturating_sub(1).max(1)
+        self.view_height
+            .load(Ordering::Relaxed)
+            .saturating_sub(1)
+            .max(1)
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
@@ -1225,10 +1228,8 @@ impl App {
                     self.selection = None;
                 }
             }
-            MouseEventKind::Down(MouseButton::Right) => {
-                if self.copy_selection_to_clipboard()? {
-                    self.status = Some("Copied selection".to_string());
-                }
+            MouseEventKind::Down(MouseButton::Right) if self.copy_selection_to_clipboard()? => {
+                self.status = Some("Copied selection".to_string());
             }
             _ => {}
         }
@@ -1242,8 +1243,8 @@ impl App {
         }
 
         let base_scroll = if self.scroll == usize::MAX {
-            let content_h = self.content_height.get();
-            let view_h = self.view_height.get();
+            let content_h = self.content_height.load(Ordering::Relaxed);
+            let view_h = self.view_height.load(Ordering::Relaxed);
             content_h.saturating_sub(view_h)
         } else {
             self.scroll
@@ -1645,7 +1646,7 @@ impl App {
                                     &id,
                                     super::ui::chat::ToolStatus::Done,
                                     None,
-                                    Some(out),
+                                    Some(out.as_str()),
                                 );
                             }
                             ToolEndKind::Error(err) => {
@@ -1699,7 +1700,7 @@ impl App {
     }
 
     /// Called when agent stream ends.
-    pub fn finish_processing(&mut self) {
+    pub const fn finish_processing(&mut self) {
         self.processing = false;
     }
 
@@ -1782,9 +1783,9 @@ pub enum SendAction {
         url: String,
         code: String,
     },
-    /// Start ChatGPT subscription OAuth authentication.
+    /// Start `ChatGPT` subscription OAuth authentication.
     StartChatgptAuth,
-    /// Open the ChatGPT authorization URL in a browser.
+    /// Open the `ChatGPT` authorization URL in a browser.
     OpenChatgptAuthUrl {
         url: String,
         /// Device-flow user code to copy to the clipboard (empty for browser flow).

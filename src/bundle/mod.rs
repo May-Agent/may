@@ -23,11 +23,13 @@ static CONTAINER_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/container");
 /// Bundle extraction error.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 /// Bundled resources manager.
+#[derive(Debug)]
 pub struct Bundle;
 
 impl Bundle {

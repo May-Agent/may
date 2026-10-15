@@ -20,10 +20,13 @@ const SESSION_FILE: &str = "copilot_session.json";
 /// Error type for Copilot token operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CopilotTokenError {
+    /// Failed to get May directory.
     #[error("Failed to get May directory: {0}")]
     MayDir(#[from] crate::config::ConfigError),
+    /// Credential store error.
     #[error("Credential store error: {0}")]
     Store(#[from] crate::auth_store::AuthStoreError),
+    /// Token exchange failed.
     #[error("Token exchange failed: {0}")]
     Exchange(#[from] aither_copilot::CopilotError),
 }
@@ -77,7 +80,7 @@ pub async fn clear_copilot_credentials() -> Result<(), CopilotTokenError> {
 /// Check if a Copilot token exists on disk.
 #[must_use]
 pub fn has_copilot_token() -> bool {
-    token_path().map(|p| p.exists()).unwrap_or(false)
+    token_path().is_ok_and(|p| p.exists())
 }
 
 /// Load cached session token from disk.
@@ -97,8 +100,7 @@ fn is_session_valid(token: &SessionToken) -> bool {
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs() as i64);
 
     // Add 60 second buffer to avoid edge cases
     token.expires_at > now + 60

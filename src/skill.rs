@@ -19,24 +19,34 @@ use crate::session::{MayHomePaths, ProfileHomePaths};
 /// Skill management error.
 #[derive(Debug, thiserror::Error)]
 pub enum SkillError {
+    /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// JSON error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// YAML error.
     #[error("YAML error: {0}")]
     Yaml(#[from] serde_yml::Error),
+    /// Git clone failed for.
     #[error("Git clone failed for {0}")]
     GitCloneFailed(String),
+    /// Repository has no skills/ directory.
     #[error("Repository has no skills/ directory")]
     NoSkillsDirectory,
+    /// Invalid repo format, expected owner/repo.
     #[error("Invalid repo format, expected owner/repo")]
     InvalidRepoFormat,
+    /// Skill not found.
     #[error("Skill not found: {0}")]
     NotFound(String),
+    /// Invalid skill path.
     #[error("Invalid skill path: {0}")]
     InvalidPath(String),
+    /// Invalid skill definition.
     #[error("Invalid skill definition: {0}")]
     InvalidDefinition(String),
+    /// Skill already exists.
     #[error("Skill already exists: {0}")]
     AlreadyExists(String),
 }

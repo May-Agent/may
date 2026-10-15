@@ -12,6 +12,9 @@ impl ChatDb {
     // ── Context Debug Snapshot ────────────────────────────────
 
     /// Upsert the latest context-debug snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn upsert_context_debug_snapshot(
         &self,
         session_id: &str,
@@ -117,6 +120,9 @@ impl ChatDb {
     }
 
     /// Load latest context-debug snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_context_debug_snapshot(
         &self,
         session_id: &str,
@@ -207,6 +213,9 @@ impl ChatDb {
     }
 
     /// Upsert the latest serialized agent context snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn upsert_session_context_snapshot(
         &self,
         session_id: &str,
@@ -229,6 +238,9 @@ impl ChatDb {
     }
 
     /// Load the serialized agent context snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn get_session_context_snapshot(
         &self,
         session_id: &str,
@@ -260,6 +272,9 @@ impl ChatDb {
     }
 
     /// Delete a persisted context snapshot for a session.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
     pub async fn delete_session_context_snapshot(
         &self,
         session_id: &str,

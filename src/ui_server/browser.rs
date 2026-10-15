@@ -31,7 +31,7 @@ pub(super) struct BrowserStatus {
 pub(super) struct WebRtcOfferRequest {
     sdp: String,
     /// Session that initiated the offer. Required so the actor's takeover
-    /// gate can match DataChannel input messages against the current
+    /// gate can match `DataChannel` input messages against the current
     /// owner; rejected as 400 if missing or empty.
     session_id: String,
 }
@@ -57,7 +57,7 @@ pub(super) struct BrowserResizeViewportRequest {
     device_scale_factor: f64,
 }
 
-fn default_dpr() -> f64 {
+const fn default_dpr() -> f64 {
     1.0
 }
 

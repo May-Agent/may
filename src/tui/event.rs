@@ -65,6 +65,7 @@ pub enum AppEvent {
 pub type EventSender = Sender<AppEvent>;
 
 /// Event handler that polls terminal events.
+#[derive(Debug)]
 pub struct EventHandler {
     rx: Receiver<AppEvent>,
     tx: EventSender,

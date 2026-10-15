@@ -7,12 +7,16 @@ use crate::db::{ChatDb, ChatDbError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PromptMentionError {
+    /// Failed to load session metadata.
     #[error("failed to load session metadata: {0}")]
     SessionLookup(#[from] ChatDbError),
+    /// File mention path must be relative.
     #[error("file mention path must be relative")]
     AbsolutePath,
+    /// File mention path traversal is not allowed.
     #[error("file mention path traversal is not allowed")]
     ParentTraversal,
+    /// Failed to serialize mention XML.
     #[error("failed to serialize mention XML: {0}")]
     Serialize(#[from] quick_xml::SeError),
 }
@@ -170,6 +174,7 @@ pub async fn build_file_mentions_xml(
     )?))
 }
 
+#[must_use]
 pub fn extract_session_mention_ids(content: &str) -> Vec<String> {
     extract_mention_candidates(content)
         .into_iter()
@@ -178,6 +183,7 @@ pub fn extract_session_mention_ids(content: &str) -> Vec<String> {
         .collect()
 }
 
+#[must_use]
 pub fn extract_file_mention_paths(content: &str) -> Vec<String> {
     extract_mention_candidates(content)
         .into_iter()
@@ -186,6 +192,7 @@ pub fn extract_file_mention_paths(content: &str) -> Vec<String> {
         .collect()
 }
 
+#[must_use]
 pub fn truncate_preview_with_limit(content: &str, max_chars: usize) -> String {
     let trimmed = content.trim();
     match trimmed.char_indices().nth(max_chars) {
@@ -264,7 +271,7 @@ fn scan_text_for_mentions(
     }
 }
 
-fn is_mention_boundary(bytes: &[u8], at_index: usize) -> bool {
+const fn is_mention_boundary(bytes: &[u8], at_index: usize) -> bool {
     if at_index == 0 {
         return true;
     }
@@ -275,7 +282,7 @@ fn is_mention_boundary(bytes: &[u8], at_index: usize) -> bool {
     )
 }
 
-fn is_mention_terminator(ch: char) -> bool {
+const fn is_mention_terminator(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
             ch,

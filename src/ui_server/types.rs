@@ -1142,7 +1142,7 @@ const MAX_ARTIFACT_TYPE_BYTES: usize = 64;
 pub struct ArtifactType(String);
 
 impl ArtifactType {
-    pub(crate) fn as_str(&self) -> &str {
+    pub(crate) const fn as_str(&self) -> &str {
         self.0.as_str()
     }
 }

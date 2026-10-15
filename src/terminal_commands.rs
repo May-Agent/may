@@ -21,14 +21,19 @@ use crate::embedding_provider::{EmbeddingModelResolution, MayEmbeddingModel};
 use crate::mcp::load_active_mcp_connections;
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
-#[derive(Clone)]
+/// Configuration for the `imagine` (image generation) IPC command.
+#[derive(Debug, Clone)]
 pub struct ImagineCommandConfig {
+    /// Generator settings; `None` disables the command.
     pub generator: Option<ImageGeneratorConfig>,
+    /// Directory generated artifacts are written to.
     pub artifacts_dir: PathBuf,
 }
 
-#[derive(Clone)]
+/// Dependencies every shared terminal IPC command needs from the host runtime.
+#[derive(Debug, Clone)]
 pub struct SharedTerminalCommandConfig<LLM> {
+    /// LLM handle used by commands that need a model.
     pub llm: LLM,
     /// Tier override for `ask --model flagship`; falls back to `llm`.
     pub ask_flagship: Option<LLM>,
@@ -36,19 +41,33 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub ask_balanced: Option<LLM>,
     /// Tier override for `ask --model fast` (the default tier); falls back to `llm`.
     pub ask_fast: Option<LLM>,
+    /// Session the commands run on behalf of.
     pub session_id: String,
+    /// `~/.may` data directory.
     pub may_dir: PathBuf,
+    /// Session sandbox working directory.
     pub sandbox_dir: PathBuf,
+    /// Resolved embedding model for semantic search.
     pub search_embedder: EmbeddingModelResolution,
+    /// Broker for `ask_user` prompts, when interactive.
     pub ask_user_broker: Option<AskUserBroker>,
+    /// Image-generation config, when enabled.
     pub imagine: Option<ImagineCommandConfig>,
+    /// Task runtime backing the `task` command.
     pub task_runtime: TaskRuntimeKind,
+    /// Broker for scheduled-task commands.
     pub task_broker: Option<TaskBroker>,
+    /// Broker for `notify` notifications.
     pub notify_broker: Option<NotifyBroker>,
+    /// Broker for `browser` commands.
     pub browser_broker: Option<BrowserBroker>,
+    /// Broker for skill registration.
     pub register_skills_broker: Option<RegisterBroker>,
+    /// Broker for subagent registration.
     pub register_subagents_broker: Option<RegisterBroker>,
+    /// Broker for workspace-access requests.
     pub workspace_request_broker: Option<WorkspaceRequestBroker>,
+    /// Factory producing per-call terminal tools.
     pub terminal_tool_factory: Option<TerminalToolFactory>,
     /// Request parameters the agent will run with. Provider-hosted web tools
     /// (`Parameters::hosted_web_search` / `hosted_web_fetch`) suppress the
@@ -57,6 +76,10 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub request_parameters: Parameters,
 }
 
+/// Register every shared IPC command on the terminal tool's command registry.
+///
+/// # Errors
+/// Returns the registry error when a command fails to register.
 pub async fn register_shared_terminal_commands<LLM>(
     builder: &mut ToolRegistryBuilder,
     config: SharedTerminalCommandConfig<LLM>,

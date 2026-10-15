@@ -463,9 +463,12 @@ mod tests {
         let b = server("b", "user@b");
         assert_eq!(
             local_key(&[a.clone(), b.clone()]),
-            local_key(&[b.clone(), a.clone()])
+            local_key(&[b, a.clone()])
         );
-        assert_ne!(local_key(&[a.clone()]), local_key(&[server("a", "user@c")]));
+        assert_ne!(
+            local_key(std::slice::from_ref(&a)),
+            local_key(&[server("a", "user@c")])
+        );
 
         let container =
             ToolEnvironmentKey::new(HomeBackend::container("c1", &route("10.0.0.1")), &[a])

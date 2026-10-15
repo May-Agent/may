@@ -1057,11 +1057,11 @@ where
     }
 }
 
-/// Run the ChatGPT subscription OAuth flow.
+/// Run the `ChatGPT` subscription OAuth flow.
 ///
 /// Uses the PKCE browser loopback on localhost:1455. Over SSH (where the
 /// redirect cannot reach this machine) or when the listener fails to bind,
-/// falls back to OpenAI's device-authorization flow.
+/// falls back to `OpenAI`'s device-authorization flow.
 async fn run_chatgpt_auth<B: Backend>(
     app: &mut App,
     events: &mut EventHandler,
@@ -1139,7 +1139,7 @@ where
     finish_chatgpt_auth(app, events, terminal, credentials).await
 }
 
-/// Device-authorization variant of the ChatGPT OAuth flow.
+/// Device-authorization variant of the `ChatGPT` OAuth flow.
 async fn run_chatgpt_device_auth<B: Backend>(
     app: &mut App,
     events: &mut EventHandler,
@@ -1186,7 +1186,7 @@ where
             match tokio::time::timeout(event_timeout, events.next()).await {
                 Ok(Some(event)) => {
                     if let Some(action) = app.handle_event(event)?
-                        && let SendAction::Quit = action
+                        && matches!(action, SendAction::Quit)
                     {
                         return Ok(());
                     }

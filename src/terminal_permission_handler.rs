@@ -44,7 +44,7 @@ impl TerminalPermissionHandler {
     }
 
     #[must_use]
-    pub fn for_exec(
+    pub const fn for_exec(
         session_id: String,
         runtime_service: Arc<SessionRuntimeService>,
         network_policy: Option<CompiledNetworkPolicy>,

@@ -16,6 +16,7 @@ use arrow_schema::{DataType, Field, Schema};
 use futures_lite::StreamExt;
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::Index;
+use lancedb::index::scalar::{BTreeIndexBuilder, FtsIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::{Table, connect};
 use regex::RegexBuilder;
@@ -42,21 +43,30 @@ const SEMANTIC_INDEX_FILE: &str = "session_index.semantic.redb";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionSearchMode {
+    /// Combine full-text and semantic ranking.
     Hybrid,
+    /// Plain substring match.
     Text,
+    /// Regular-expression match.
     Regex,
+    /// Lance FTS index search.
     Fulltext,
+    /// Fuzzy full-text search with typo tolerance.
     Fuzzy,
+    /// Embedding-similarity search.
     Semantic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionOutputMode {
+    /// Return grouped session summaries.
     Sessions,
+    /// Return matching messages flat.
     Messages,
 }
 
+/// Parsed arguments of a `session` tool call.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SessionArgs {
     /// Optional command-form input. Supported:
@@ -172,6 +182,7 @@ const fn default_fuzzy_distance() -> u32 {
     1
 }
 
+/// `session` tool: full-text/semantic search and inspection over session history.
 #[derive(Debug, Clone)]
 pub struct SessionTool {
     may_dir: PathBuf,
@@ -288,6 +299,7 @@ enum SessionCommandInput {
 }
 
 impl SessionTool {
+    /// Bind the tool to a session and embedder resolution.
     #[must_use]
     pub const fn new(
         may_dir: PathBuf,
@@ -370,7 +382,7 @@ fn apply_search_defaults(args: &mut SessionArgs, defaults: &SearchDefaults) {
     }
 }
 
-fn normalize_common_args(mut args: SessionArgs) -> aither_core::Result<SessionArgs> {
+fn normalize_common_args(mut args: SessionArgs) -> SessionArgs {
     args.limit = args.limit.clamp(1, 200);
     args.scan_limit = args.scan_limit.clamp(args.limit, 50_000);
     args.fuzzy_distance = args.fuzzy_distance.min(3);
@@ -396,7 +408,7 @@ fn normalize_common_args(mut args: SessionArgs) -> aither_core::Result<SessionAr
             args.fields = vec!["content".to_string()];
         }
     }
-    Ok(args)
+    args
 }
 
 async fn execute_plan(
@@ -470,8 +482,9 @@ async fn execute_search(
     let mut candidates = match args.search_mode {
         SessionSearchMode::Fulltext => run_full_text_query(&table, &args, false).await?,
         SessionSearchMode::Fuzzy => run_full_text_query(&table, &args, true).await?,
-        SessionSearchMode::Regex => run_plain_query(&table, &args).await?,
-        SessionSearchMode::Text => run_plain_query(&table, &args).await?,
+        SessionSearchMode::Regex | SessionSearchMode::Text => {
+            run_plain_query(&table, &args).await?
+        }
         SessionSearchMode::Hybrid => {
             if query_enabled {
                 let mut merged = Vec::new();
@@ -593,7 +606,7 @@ async fn execute_search(
     if total_matches > 0 && rows.is_empty() {
         return Err(SessionToolError::AllResultsAlreadyInContext);
     }
-    finalize_rows_with_total(rows, total_matches, &args)
+    finalize_rows_with_total(&rows, total_matches, &args)
 }
 
 /// Removes current-session hits whose content already appears in the exact
@@ -861,14 +874,14 @@ fn build_execution_plan(
             args.query = tokens.join(" ");
         }
         SessionCommandInput::RawQuery => {
-            if let Some(plan) = plan_from_raw_query(&args, defaults)? {
+            if let Some(plan) = plan_from_raw_query(&args, defaults) {
                 return Ok(plan);
             }
         }
     }
 
     apply_search_defaults(&mut args, defaults);
-    Ok(normalize_common_args(args).map(SessionExecutionPlan::Search)?)
+    Ok(SessionExecutionPlan::Search(normalize_common_args(args)))
 }
 
 async fn resolve_implicit_session_lookup(
@@ -921,9 +934,9 @@ fn plan_from_tokens(
         next_args.session_id = Some(session_id.clone());
         next_args.query = prompt;
         apply_search_defaults(&mut next_args, defaults);
-        return Ok(Some(
-            normalize_common_args(next_args).map(SessionExecutionPlan::Search)?,
-        ));
+        return Ok(Some(SessionExecutionPlan::Search(normalize_common_args(
+            next_args,
+        ))));
     }
 
     match first {
@@ -940,9 +953,9 @@ fn plan_from_tokens(
             let mut next_args = args.clone();
             next_args.query = prompt;
             apply_search_defaults(&mut next_args, defaults);
-            Ok(Some(
-                normalize_common_args(next_args).map(SessionExecutionPlan::Search)?,
-            ))
+            Ok(Some(SessionExecutionPlan::Search(normalize_common_args(
+                next_args,
+            ))))
         }
         "inspect" | "show" | "read" | "get" | "view" if tokens.len() == 2 => {
             let session_id = tokens
@@ -981,29 +994,29 @@ fn plan_from_tokens(
 fn plan_from_raw_query(
     args: &SessionArgs,
     defaults: &SearchDefaults,
-) -> Result<Option<SessionExecutionPlan>, SessionToolError> {
+) -> Option<SessionExecutionPlan> {
     let trimmed = args.query.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     let Some(first) = tokens.first().copied() else {
-        return Ok(None);
+        return None;
     };
 
     match first {
         "inspect" | "show" | "read" | "get" | "view" if tokens.len() == 2 => {
-            Ok(Some(SessionExecutionPlan::Inspect(SessionInspectRequest {
+            Some(SessionExecutionPlan::Inspect(SessionInspectRequest {
                 session_id: tokens[1].to_string(),
-            })))
+            }))
         }
-        "messages" if tokens.len() == 2 => Ok(Some(SessionExecutionPlan::Messages(
-            SessionMessagesRequest {
+        "messages" if tokens.len() == 2 => {
+            Some(SessionExecutionPlan::Messages(SessionMessagesRequest {
                 session_id: tokens[1].to_string(),
-            },
-        ))),
-        "list" if tokens.len() == 1 => Ok(Some(SessionExecutionPlan::List(SessionListRequest {
+            }))
+        }
+        "list" if tokens.len() == 1 => Some(SessionExecutionPlan::List(SessionListRequest {
             limit: args.limit.clamp(1, 200),
             offset: args.offset,
             include_current: args.include_current,
@@ -1014,8 +1027,8 @@ fn plan_from_raw_query(
             title_contains: args.title_contains.clone(),
             since: args.since.clone(),
             until: args.until.clone(),
-        }))),
-        _ => Ok(None),
+        })),
+        _ => None,
     }
 }
 
@@ -1118,7 +1131,7 @@ async fn compute_fingerprint(db: &ChatDb) -> Result<SessionIndexMeta, SessionToo
     let session_count = sessions.len();
     let total_messages: usize = sessions
         .iter()
-        .map(|s| s.message_count.max(0) as usize)
+        .map(|s| usize::try_from(s.message_count.max(0)).unwrap_or_default())
         .sum();
 
     let latest_updated_at = sessions
@@ -1179,20 +1192,20 @@ async fn ensure_index(
 
         for column in ["content", "title", "preview"] {
             table
-                .create_index(&[column], Index::FTS(Default::default()))
+                .create_index(&[column], Index::FTS(FtsIndexBuilder::default()))
                 .execute()
                 .await?;
         }
         table
-            .create_index(&["session_id"], Index::BTree(Default::default()))
+            .create_index(&["session_id"], Index::BTree(BTreeIndexBuilder::default()))
             .execute()
             .await?;
         table
-            .create_index(&["model"], Index::BTree(Default::default()))
+            .create_index(&["model"], Index::BTree(BTreeIndexBuilder::default()))
             .execute()
             .await?;
         table
-            .create_index(&["role"], Index::BTree(Default::default()))
+            .create_index(&["role"], Index::BTree(BTreeIndexBuilder::default()))
             .execute()
             .await?;
 
@@ -1728,7 +1741,7 @@ async fn run_semantic_query(
     if total_matches > 0 && rows.is_empty() {
         return Err(SessionToolError::AllResultsAlreadyInContext);
     }
-    finalize_rows_with_total(rows, total_matches, &args)
+    finalize_rows_with_total(&rows, total_matches, &args)
 }
 
 async fn read_rows_from_stream(
@@ -1755,20 +1768,22 @@ async fn read_rows_from_stream(
         let score_col = batch.column_by_name("_score");
         let scores = score_col
             .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
-            .map(|arr| {
-                (0..arr.len())
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            0.0
-                        } else {
-                            f64::from(arr.value(i))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec![0.0; batch.num_rows()]);
+            .map_or_else(
+                || vec![0.0; batch.num_rows()],
+                |arr| {
+                    (0..arr.len())
+                        .map(|i| {
+                            if arr.is_null(i) {
+                                0.0
+                            } else {
+                                f64::from(arr.value(i))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                },
+            );
 
-        for i in 0..batch.num_rows() {
+        for (i, score) in scores.iter().copied().enumerate().take(batch.num_rows()) {
             rows.push(SessionMatchRow {
                 session_id: session_id.value(i).to_string(),
                 profile_id: profile_id.value(i).to_string(),
@@ -1782,7 +1797,7 @@ async fn read_rows_from_stream(
                 updated_at: updated_at.value(i).to_string(),
                 message_id: message_id.value(i),
                 message_count: message_count.value(i),
-                score: scores[i],
+                score,
                 matched_by: Vec::new(),
             });
         }
@@ -1853,7 +1868,7 @@ fn truncate_text(input: &str, max_chars: usize) -> String {
 }
 
 fn finalize_rows_with_total(
-    rows: Vec<SessionMatchRow>,
+    rows: &[SessionMatchRow],
     total_matches: usize,
     args: &SessionArgs,
 ) -> Result<ToolResult, SessionToolError> {
@@ -2083,7 +2098,6 @@ mod tests {
                 current_session_id: "current".to_string(),
             },
         )
-        .expect("raw query plan should parse")
         .expect("inspect plan should be produced");
         let SessionExecutionPlan::Inspect(request) = plan else {
             panic!("expected inspect plan");

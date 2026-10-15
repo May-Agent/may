@@ -171,10 +171,8 @@ pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
             KeyCode::Backspace => {
                 app.mcp_add_name.pop();
             }
-            KeyCode::Char(c) => {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    app.mcp_add_name.push(c);
-                }
+            KeyCode::Char(c) if (c.is_alphanumeric() || c == '-' || c == '_') => {
+                app.mcp_add_name.push(c);
             }
             _ => {}
         },
@@ -260,10 +258,8 @@ pub fn handle_ssh_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendActi
             KeyCode::Backspace => {
                 app.ssh_add_name.pop();
             }
-            KeyCode::Char(c) => {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    app.ssh_add_name.push(c);
-                }
+            KeyCode::Char(c) if (c.is_alphanumeric() || c == '-' || c == '_') => {
+                app.ssh_add_name.push(c);
             }
             _ => {}
         },
@@ -372,10 +368,8 @@ pub fn handle_skill_key(app: &mut App, code: KeyCode) -> AppResult<Option<SendAc
             KeyCode::Backspace => {
                 app.skill_github_input.pop();
             }
-            KeyCode::Char(c) => {
-                if c.is_alphanumeric() || c == '-' || c == '_' || c == '/' {
-                    app.skill_github_input.push(c);
-                }
+            KeyCode::Char(c) if (c.is_alphanumeric() || c == '-' || c == '_' || c == '/') => {
+                app.skill_github_input.push(c);
             }
             _ => {}
         },

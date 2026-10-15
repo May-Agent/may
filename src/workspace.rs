@@ -42,10 +42,13 @@ pub struct WorkspaceConfig {
 /// Error type for workspace configuration operations.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceConfigError {
+    /// Failed to read workspace config.
     #[error("Failed to read workspace config: {0}")]
     Read(#[from] std::io::Error),
+    /// Failed to parse workspace config.
     #[error("Failed to parse workspace config: {0}")]
     Parse(#[from] toml::de::Error),
+    /// Failed to serialize workspace config.
     #[error("Failed to serialize workspace config: {0}")]
     Serialize(#[from] toml::ser::Error),
 }
@@ -104,6 +107,7 @@ impl WorkspaceConfig {
 }
 
 /// The complete workspace state for a May session.
+#[derive(Debug)]
 pub struct Workspace {
     /// Session sandbox directory (always read/write).
     pub sandbox: PathBuf,

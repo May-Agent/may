@@ -18,6 +18,7 @@ struct SshInstallPermission<'a> {
     details: &'a str,
 }
 
+#[derive(Debug)]
 pub struct MaySshAuthorizer {
     broker: AskUserBroker,
     session_id: String,

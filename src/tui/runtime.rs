@@ -17,56 +17,85 @@ use crate::{ChatDb, ChatMessage, MayAgent, MayConfig, SessionId, generate_sessio
 
 #[derive(Debug, thiserror::Error)]
 pub enum TuiRuntimeError {
+    /// Database error.
     #[error("database error: {0}")]
     Database(#[from] crate::db::ChatDbError),
+    /// Session error.
     #[error("session error: {0}")]
     Session(#[from] crate::session::SessionError),
+    /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Agent environment resolution failed.
     #[error("agent environment resolution failed: {0}")]
     ResolveAgentEnvironment(#[from] crate::agent::ResolveAgentEnvironmentError),
+    /// No active session.
     #[error("No active session")]
     NoActiveSession,
+    /// History replay failed.
     #[error("history replay failed: {0}")]
     HistoryReplay(#[from] crate::session::HistoryReplayError),
+    /// Invalid pending message timestamp.
     #[error("invalid pending message timestamp: {0}")]
     InvalidPendingMessageTimestamp(#[source] jiff::Error),
+    /// Persisted image attachment is missing content.
     #[error("persisted image attachment is missing content")]
     PersistedImageMissingContent,
+    /// Unsupported persisted attachment type in TUI runtime.
     #[error("unsupported persisted attachment type in TUI runtime: {0}")]
     UnsupportedPersistedAttachmentType(AttachmentKind),
+    /// Failed to convert path into file URL.
+    /// Path that could not be converted.
     #[error("failed to convert path into file URL: {path}")]
     FileUrlConversion { path: std::path::PathBuf },
+    /// Failed to parse attachment URL.
     #[error("failed to parse attachment URL {url}: {source}")]
     AttachmentUrlParse {
+        /// URL that failed to parse.
         url: String,
+        /// Underlying URL parse error.
         #[source]
         source: url::ParseError,
     },
+    /// Attachment URL is not a local file URL.
+    /// URL that is not a local `file://` URL.
     #[error("attachment URL is not a local file URL: {url}")]
     NonLocalAttachmentUrl { url: String },
+    /// Selected model is empty.
     #[error("Selected model is empty")]
     EmptySelectedModel,
+    /// No model configured.
     #[error("No model configured")]
     NoModelConfigured,
+    /// Location fetch failed.
     #[error("Location fetch failed: {0}")]
     LocationFetch(#[source] crate::location::LocationError),
+    /// Agent initialization failed.
     #[error("agent initialization failed: {0}")]
     MayAgent(#[from] crate::agent::MayAgentError),
+    /// Agent operation failed.
     #[error("agent operation failed: {0}")]
     Agent(#[from] aither_agent::AgentError),
+    /// Failed to convert attachment path to URL.
+    /// Path that could not be converted.
     #[error("Failed to convert attachment path to URL: {path}")]
     AttachmentPathToUrl { path: std::path::PathBuf },
+    /// Unable to determine attachment MIME type.
+    /// Path whose MIME type could not be determined.
     #[error("Unable to determine attachment MIME type: {path}")]
     UnknownAttachmentMediaType { path: std::path::PathBuf },
+    /// Failed to serialize paste XML.
     #[error("Failed to serialize paste XML: {0}")]
     SerializePasteXml(#[source] quick_xml::SeError),
+    /// Invalid data URL.
     #[error("invalid data URL")]
     InvalidDataUrl,
+    /// Failed to decode data URL.
     #[error("failed to decode data URL: {0}")]
     DecodeDataUrl(#[source] base64::DecodeError),
 }
 
+/// Session runtime facade used by the local TUI: queue state, pending interactions, and permission approval.
 #[derive(Debug, Clone)]
 pub struct LocalSessionRuntime {
     runtime_service: Arc<crate::session::SessionRuntimeService>,
@@ -75,6 +104,7 @@ pub struct LocalSessionRuntime {
 }
 
 impl LocalSessionRuntime {
+    /// Create the runtime facade backed by `db`.
     #[must_use]
     pub fn new(db: ChatDb) -> Self {
         let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
@@ -90,10 +120,12 @@ impl LocalSessionRuntime {
         }
     }
 
+    /// Restrict runtime behaviour for one-shot (non-interactive) execution.
     pub const fn enable_oneshot_restricted_mode(&mut self) {
         self.oneshot_restricted = true;
     }
 
+    /// Permission approver bound to `session_id`.
     #[must_use]
     pub fn permission_approver_for(
         &self,
@@ -126,6 +158,10 @@ impl LocalSessionRuntime {
         Ok(())
     }
 
+    /// Reconcile the app's queue view with persisted pending messages.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn sync_app_queue(
         &self,
         app: &mut App,
@@ -135,6 +171,10 @@ impl LocalSessionRuntime {
         self.replace_app_queue(app, runtime).await
     }
 
+    /// Append a message to the pending queue and sync the app state.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn enqueue_pending_message(
         &self,
         app: &mut App,
@@ -152,6 +192,10 @@ impl LocalSessionRuntime {
         self.replace_app_queue(app, runtime).await
     }
 
+    /// Take the next pending message eligible for dispatch.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn take_next_dispatchable(
         &self,
         app: &mut App,
@@ -169,6 +213,10 @@ impl LocalSessionRuntime {
         Ok(next)
     }
 
+    /// Mark a session as running.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn set_running(&self, session_id: &SessionId) -> Result<(), TuiRuntimeError> {
         self.runtime_service
             .set_state(
@@ -179,6 +227,10 @@ impl LocalSessionRuntime {
         Ok(())
     }
 
+    /// Clear the running flag when `expected` still holds it.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn clear_running_if_needed(
         &self,
         session_id: &SessionId,
@@ -189,6 +241,10 @@ impl LocalSessionRuntime {
         Ok(())
     }
 
+    /// Persist an ask-user request and surface it in the app.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn register_ask_user_request(
         &self,
         app: &mut App,
@@ -225,6 +281,10 @@ impl LocalSessionRuntime {
         Ok(request_id)
     }
 
+    /// Record the user's answers and clear the pending request.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_ask_user_response(
         &self,
         app: &mut App,
@@ -248,6 +308,10 @@ impl LocalSessionRuntime {
         Ok(())
     }
 
+    /// Persist a workspace-access request and surface it in the app.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn register_workspace_request(
         &self,
         app: &mut App,
@@ -281,6 +345,10 @@ impl LocalSessionRuntime {
         Ok(request_id)
     }
 
+    /// Record the workspace decision and clear the pending request.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_workspace_response(
         &self,
         app: &mut App,
@@ -304,6 +372,10 @@ impl LocalSessionRuntime {
         Ok(())
     }
 
+    /// Fetch the permission request blocking the session, if any.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn waiting_permission(
         &self,
         session_id: &SessionId,
@@ -315,6 +387,10 @@ impl LocalSessionRuntime {
             .waiting_permission)
     }
 
+    /// Record the permission decision and clear the pending request.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_permission_response(
         &self,
         app: &mut App,
@@ -606,6 +682,9 @@ impl RuntimeDeps {
     ///
     /// The previous session's worker is dropped at once; messages sent before
     /// the new worker is ready are queued for it.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the session cannot be created or the worker build fails.
     pub async fn begin_new_session(
         &self,
         app: &mut App,
@@ -645,6 +724,9 @@ impl RuntimeDeps {
     ///
     /// The previous session's worker is dropped at once; messages sent before
     /// the new worker is ready are queued for it.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the session cannot be loaded or the worker build fails.
     pub async fn begin_load_session(
         &self,
         app: &mut App,
@@ -668,6 +750,9 @@ impl RuntimeDeps {
 
     /// Starts building a worker for the current session on `model`; the
     /// current worker keeps serving until the new one is installed.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the worker build cannot start.
     pub fn begin_switch_model(
         &self,
         app: &App,
@@ -695,12 +780,16 @@ impl RuntimeDeps {
         app: &mut App,
         worker: &mut Option<AgentWorker>,
         build: &PendingWorkerBuild,
-        built: AgentWorker,
+        new_worker: AgentWorker,
     ) {
         app.set_current_model(build.model());
-        *worker = Some(built);
+        *worker = Some(new_worker);
     }
 
+    /// Start an agent turn for the current session.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when no session is active or the worker fails to start.
     pub async fn start_agent_task(
         &self,
         app: &mut App,
@@ -819,6 +908,10 @@ impl RuntimeDeps {
         })
     }
 
+    /// Append a message to the pending queue and sync the app state.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn enqueue_pending_message(
         &self,
         app: &mut App,
@@ -834,6 +927,10 @@ impl RuntimeDeps {
             .await
     }
 
+    /// Take the next pending message eligible for dispatch.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn take_next_dispatchable(
         &self,
         app: &mut App,
@@ -850,6 +947,10 @@ impl RuntimeDeps {
             .await
     }
 
+    /// Mark the app's current session as running.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError::NoActiveSession`] when no session is active, or [`TuiRuntimeError`] on storage failure.
     pub async fn mark_running(&self, app: &App) -> Result<(), TuiRuntimeError> {
         let session_id = app
             .session_manager
@@ -859,6 +960,10 @@ impl RuntimeDeps {
         self.local_runtime.set_running(&session_id).await
     }
 
+    /// Persist an ask-user request and surface it in the app.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn register_ask_user_request(
         &self,
         app: &mut App,
@@ -870,6 +975,10 @@ impl RuntimeDeps {
             .await
     }
 
+    /// Record the user's answers and clear the pending request.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_ask_user_response(
         &self,
         app: &mut App,
@@ -882,6 +991,10 @@ impl RuntimeDeps {
             .await
     }
 
+    /// Persist a workspace-access request and surface it in the app.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn register_workspace_request(
         &self,
         app: &mut App,
@@ -893,6 +1006,10 @@ impl RuntimeDeps {
             .await
     }
 
+    /// Record the workspace decision and clear the pending request.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_workspace_response(
         &self,
         app: &mut App,
@@ -905,6 +1022,10 @@ impl RuntimeDeps {
             .await
     }
 
+    /// Fetch the permission request blocking the session, if any.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn pending_permission(
         &self,
         app: &App,
@@ -919,6 +1040,10 @@ impl RuntimeDeps {
         self.local_runtime.waiting_permission(&session_id).await
     }
 
+    /// Record the permission decision and clear the pending request.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_permission_response(
         &self,
         app: &mut App,
@@ -1008,15 +1133,10 @@ fn prepare_message_content(
     for attachment in &msg.attachments {
         match attachment {
             Attachment::Image { path, .. } => {
-                let url = url::Url::from_file_path(path).map_err(|()| {
-                    TuiRuntimeError::AttachmentPathToUrl {
-                        path: path.to_path_buf(),
-                    }
-                })?;
+                let url = url::Url::from_file_path(path)
+                    .map_err(|()| TuiRuntimeError::AttachmentPathToUrl { path: path.clone() })?;
                 let media_type = mime_guess::from_path(path).first().ok_or_else(|| {
-                    TuiRuntimeError::UnknownAttachmentMediaType {
-                        path: path.to_path_buf(),
-                    }
+                    TuiRuntimeError::UnknownAttachmentMediaType { path: path.clone() }
                 })?;
                 attachment_urls.push(LlmAttachment::new(url, media_type));
             }
@@ -1148,26 +1268,23 @@ async fn build_worker_for_session(
     {
         let db_messages = db.get_messages(&session_id_string).await?;
         let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
-        match crate::session::history_delta_since_snapshot(
+        if let Some(delta) = crate::session::history_delta_since_snapshot(
             &history_messages,
             &db_ids,
             snapshot.last_message_db_id,
         ) {
-            Some(delta) => {
-                agent.restore_checkpoint(snapshot.checkpoint.clone())?;
-                for message in delta {
-                    agent.push_message(message);
-                }
+            agent.restore_checkpoint(snapshot.checkpoint.clone())?;
+            for message in delta {
+                agent.push_message(message);
             }
-            None => {
-                tracing::warn!(
-                    session_id = %session_id_string,
-                    "context snapshot anchor is stale, falling back to full history replay"
-                );
-                let _ = db.delete_session_context_snapshot(&session_id_string).await;
-                for message in history_messages {
-                    agent.push_message(message);
-                }
+        } else {
+            tracing::warn!(
+                session_id = %session_id_string,
+                "context snapshot anchor is stale, falling back to full history replay"
+            );
+            let _ = db.delete_session_context_snapshot(&session_id_string).await;
+            for message in history_messages {
+                agent.push_message(message);
             }
         }
     } else {

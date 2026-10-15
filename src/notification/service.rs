@@ -11,7 +11,7 @@ const MAILBOX_STATUS_PENDING: &str = "pending";
 const MAILBOX_STATUS_DELIVERED: &str = "delivered";
 const MAILBOX_STATUS_FAILED: &str = "failed";
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct NotificationService {
     db: ChatDb,
     manager: Arc<NotificationManager>,
@@ -193,10 +193,13 @@ impl NotificationService {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NotificationServiceError {
+    /// Database error.
     #[error("database error: {0}")]
     Db(#[from] crate::db::ChatDbError),
+    /// Invalid context xml block.
     #[error("invalid context xml block: {0}")]
     InvalidXml(#[from] crate::xml::XmlBlockError),
+    /// Notification transport error.
     #[error("notification transport error: {0}")]
     Notification(#[from] crate::notification::NotificationError),
 }

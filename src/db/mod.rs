@@ -1191,7 +1191,7 @@ mod tests {
             .sessions_requiring_pending_dispatch()
             .await
             .expect("pending dispatch lookup should succeed");
-        assert!(resumable.is_empty());
+        assert_eq!(resumable, [] as [std::string::String; 0]);
     }
 
     #[tokio::test]
