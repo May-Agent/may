@@ -4,7 +4,8 @@ use async_fs;
 use serde::{Deserialize, Serialize};
 use zenwave::Client;
 
-const HEEL_RELEASE_API_URL: &str = "https://api.github.com/repos/lexoliu/heel/releases/latest";
+/// GitHub release-metadata endpoint checked for the managed heel binary.
+pub const HEEL_RELEASE_API_URL: &str = "https://api.github.com/repos/lexoliu/heel/releases/latest";
 const HEEL_RELEASE_STATE_FILE: &str = "release-state.json";
 const HEEL_BINARY_FILE: &str = "heel";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -101,11 +102,11 @@ struct ManagedHeelState {
     release_tag: String,
     asset_name: String,
     #[serde(default)]
-    last_checked_at: Option<String>,
+    last_checked_at: Option<jiff::Timestamp>,
 }
 
 /// How often to re-check the GitHub API for a new heel release (24 hours).
-const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
+const CHECK_INTERVAL: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 
 /// Maps an OS/arch pair onto the managed heel release asset published for it.
 fn host_heel_asset(
@@ -162,6 +163,7 @@ pub fn linux_heel_asset_for_current_arch() -> Result<ManagedHeelAsset, ManagedHe
 pub async fn ensure_managed_heel_binary(
     install_root: &Path,
     asset: ManagedHeelAsset,
+    release_api_url: &str,
 ) -> Result<PathBuf, ManagedHeelError> {
     let binary_dir = install_root.join("bin");
     async_fs::create_dir_all(&binary_dir)
@@ -175,42 +177,19 @@ pub async fn ensure_managed_heel_binary(
     let state_path = install_root.join(HEEL_RELEASE_STATE_FILE);
 
     // Fast path: if binary exists and was checked recently, skip the network call.
-    if binary_path.exists()
-        && let Ok(Some(state)) = read_state(&state_path).await
-        && let Some(ref checked_at) = state.last_checked_at
-        && let Ok(ts) = checked_at.parse::<jiff::Timestamp>()
+    if binary_present_and_nonempty(&binary_path).await?
+        && let Some(state) = read_state(&state_path).await?
+        && let Some(checked_at) = state.last_checked_at
+        && jiff::Timestamp::now().duration_since(checked_at) < CHECK_INTERVAL
     {
-        let elapsed = jiff::Timestamp::now().duration_since(ts);
-        if elapsed
-            < CHECK_INTERVAL
-                .try_into()
-                .unwrap_or(jiff::SignedDuration::ZERO)
-        {
-            tracing::debug!(
-                binary = %binary_path.display(),
-                "skipping heel update check (checked recently)"
-            );
-            return Ok(binary_path);
-        }
+        tracing::debug!(
+            binary = %binary_path.display(),
+            "skipping heel update check (checked recently)"
+        );
+        return Ok(binary_path);
     }
 
-    // The release lookup is an update check, not a correctness requirement:
-    // when it fails (network down, GitHub rate limit) and a usable binary is
-    // already installed, keep serving the installed binary.
-    let release = match fetch_latest_release().await {
-        Ok(release) => release,
-        Err(error) => {
-            if binary_present_and_nonempty(&binary_path).await? {
-                tracing::warn!(
-                    error = %error,
-                    binary = %binary_path.display(),
-                    "heel release check failed; using existing managed binary"
-                );
-                return Ok(binary_path);
-            }
-            return Err(error);
-        }
-    };
+    let release = fetch_latest_release(release_api_url).await?;
     let release_asset = release
         .assets
         .iter()
@@ -230,15 +209,15 @@ pub async fn ensure_managed_heel_binary(
     .await?
     {
         // Binary is up-to-date — just refresh the check timestamp
-        let _ = write_state(
+        write_state(
             &state_path,
             &ManagedHeelState {
                 release_tag: release.tag_name,
                 asset_name: asset.release_asset_name().to_string(),
-                last_checked_at: Some(jiff::Timestamp::now().to_string()),
+                last_checked_at: Some(jiff::Timestamp::now()),
             },
         )
-        .await;
+        .await?;
         return Ok(binary_path);
     }
 
@@ -255,7 +234,7 @@ pub async fn ensure_managed_heel_binary(
         &ManagedHeelState {
             release_tag: release.tag_name,
             asset_name: release_asset.name,
-            last_checked_at: Some(jiff::Timestamp::now().to_string()),
+            last_checked_at: Some(jiff::Timestamp::now()),
         },
     )
     .await?;
@@ -263,10 +242,10 @@ pub async fn ensure_managed_heel_binary(
     Ok(binary_path)
 }
 
-async fn fetch_latest_release() -> Result<GithubRelease, ManagedHeelError> {
+async fn fetch_latest_release(release_api_url: &str) -> Result<GithubRelease, ManagedHeelError> {
     let mut backend = zenwave::client();
     let mut request = backend
-        .get(HEEL_RELEASE_API_URL)
+        .get(release_api_url)
         .map_err(ManagedHeelError::MetadataRequest)?
         .header("User-Agent", USER_AGENT)
         .map_err(ManagedHeelError::MetadataRequest)?;
@@ -444,7 +423,135 @@ async fn make_executable(_path: &Path) -> Result<(), ManagedHeelError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    fn test_asset() -> ManagedHeelAsset {
+        ManagedHeelAsset {
+            release_asset_name: "heel-test-asset",
+            local_binary_name: "heel",
+        }
+    }
+
+    fn release_json(base_url: &str, tag: &str) -> Vec<u8> {
+        serde_json::json!({
+            "tag_name": tag,
+            "assets": [{
+                "name": "heel-test-asset",
+                "browser_download_url": format!("{base_url}/heel-bin"),
+            }],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Binds a loopback port and immediately releases it, yielding a port that
+    /// refuses connections — used to prove a code path never reaches the
+    /// network.
+    fn refused_release_api_url() -> String {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|listener| listener.local_addr())
+            .expect("reserve loopback port")
+            .port();
+        format!("http://127.0.0.1:{port}/release")
+    }
+
+    fn bind_loopback() -> (std::net::TcpListener, String) {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("loopback listener address")
+        );
+        (listener, base_url)
+    }
+
+    /// Serves canned `(status, body)` responses keyed by request path on the
+    /// given listener. Returns a log of requested paths.
+    fn serve_routes(
+        listener: std::net::TcpListener,
+        routes: Vec<(String, u16, Vec<u8>)>,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let routes = Arc::new(routes);
+        let requests_in_thread = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let routes = routes.clone();
+                let requests = requests_in_thread.clone();
+                std::thread::spawn(move || {
+                    serve_connection(&mut stream, &routes, &requests);
+                });
+            }
+        });
+        requests
+    }
+
+    fn serve_connection(
+        stream: &mut std::net::TcpStream,
+        routes: &[(String, u16, Vec<u8>)],
+        requests: &Mutex<Vec<String>>,
+    ) {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("set read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let Ok(read) = stream.read(&mut buffer) else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.len() > 64 * 1024 {
+                return;
+            }
+        }
+        let request_line = request
+            .split(|byte| *byte == b'\n')
+            .next()
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .unwrap_or_default();
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("/")
+            .to_string();
+        requests.lock().expect("request log").push(path.clone());
+        let (status, body) = routes
+            .iter()
+            .find(|(route, ..)| *route == path)
+            .map_or_else(
+                || (404, b"not found".to_vec()),
+                |(_, status, body)| (*status, body.clone()),
+            );
+        let reason = match status {
+            200 => "OK",
+            500 => "Internal Server Error",
+            _ => "Not Found",
+        };
+        let head = format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        let _ = stream.write_all(&body);
+    }
+
+    fn install_binary_file(install_root: &Path, contents: &[u8]) -> PathBuf {
+        let binary_dir = install_root.join("bin");
+        std::fs::create_dir_all(&binary_dir).expect("create managed bin dir");
+        let binary_path = binary_dir.join("heel");
+        std::fs::write(&binary_path, contents).expect("write installed heel binary");
+        binary_path
+    }
 
     #[test]
     fn host_heel_asset_covers_every_published_target() {
@@ -507,7 +614,11 @@ mod tests {
         let state = ManagedHeelState {
             release_tag: "v1.2.3".to_string(),
             asset_name: "heel-x86_64-unknown-linux-gnu".to_string(),
-            last_checked_at: Some("2026-04-13T00:00:00Z".to_string()),
+            last_checked_at: Some(
+                "2026-04-13T00:00:00Z"
+                    .parse::<jiff::Timestamp>()
+                    .expect("valid timestamp"),
+            ),
         };
 
         futures_lite::future::block_on(async {
@@ -518,5 +629,136 @@ mod tests {
                 .expect("state exists");
             assert_eq!(parsed, state);
         });
+    }
+
+    #[tokio::test]
+    async fn failing_release_api_does_not_keep_installed_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let install_root = temp.path();
+        install_binary_file(install_root, b"stale-binary");
+
+        let (listener, base_url) = bind_loopback();
+        serve_routes(
+            listener,
+            vec![("/release".to_string(), 500, b"boom".to_vec())],
+        );
+
+        let error =
+            ensure_managed_heel_binary(install_root, test_asset(), &format!("{base_url}/release"))
+                .await
+                .expect_err("a failed release check must not fall back to the installed binary");
+        assert!(
+            matches!(
+                error,
+                ManagedHeelError::MetadataRequest(_) | ManagedHeelError::MetadataDecode(_)
+            ),
+            "expected the release-lookup error, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_release_api_does_not_keep_installed_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let install_root = temp.path();
+        install_binary_file(install_root, b"stale-binary");
+
+        ensure_managed_heel_binary(install_root, test_asset(), &refused_release_api_url())
+            .await
+            .expect_err("a refused release check must not fall back to the installed binary");
+    }
+
+    #[tokio::test]
+    async fn unrecorded_install_is_replaced_by_the_release_asset() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let install_root = temp.path();
+        install_binary_file(install_root, b"unrecorded-binary");
+        // No release-state.json: the installed binary was never verified.
+
+        let (listener, base_url) = bind_loopback();
+        let requests = serve_routes(
+            listener,
+            vec![
+                (
+                    "/release".to_string(),
+                    200,
+                    release_json(&base_url, "v9.9.9"),
+                ),
+                ("/heel-bin".to_string(), 200, b"fresh-heel-binary".to_vec()),
+            ],
+        );
+
+        let path =
+            ensure_managed_heel_binary(install_root, test_asset(), &format!("{base_url}/release"))
+                .await
+                .expect("unrecorded install must be replaced by the release asset");
+        assert_eq!(
+            std::fs::read(&path).expect("read installed binary"),
+            b"fresh-heel-binary"
+        );
+
+        let state: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(install_root.join(HEEL_RELEASE_STATE_FILE)).expect("read state file"),
+        )
+        .expect("state file must be valid JSON");
+        assert_eq!(state["release_tag"], "v9.9.9");
+        assert_eq!(state["asset_name"], "heel-test-asset");
+        assert!(state["last_checked_at"].is_string());
+
+        let requested = requests.lock().expect("request log").clone();
+        assert_eq!(
+            requested,
+            vec!["/release".to_string(), "/heel-bin".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_state_file_is_an_error_naming_its_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let install_root = temp.path();
+        install_binary_file(install_root, b"installed-binary");
+
+        for corrupt_state in [
+            &b"{ not json"[..],
+            &br#"{"release_tag":"v1","asset_name":"heel-test-asset","last_checked_at":"soon"}"#[..],
+        ] {
+            let state_path = install_root.join(HEEL_RELEASE_STATE_FILE);
+            std::fs::write(&state_path, corrupt_state).expect("write corrupt state");
+
+            // The API is unreachable: the corrupt state must fail before any
+            // network fallback could mask it.
+            let error =
+                ensure_managed_heel_binary(install_root, test_asset(), &refused_release_api_url())
+                    .await
+                    .expect_err("corrupt state must fail");
+            match error {
+                ManagedHeelError::StateParse { path, .. } => assert_eq!(path, state_path),
+                other => panic!("expected a state-parse error, got {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recently_checked_binary_skips_the_release_check() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let install_root = temp.path();
+        let binary_path = install_binary_file(install_root, b"current-binary");
+        write_state(
+            &install_root.join(HEEL_RELEASE_STATE_FILE),
+            &ManagedHeelState {
+                release_tag: "v9.9.9".to_string(),
+                asset_name: "heel-test-asset".to_string(),
+                last_checked_at: Some(jiff::Timestamp::now()),
+            },
+        )
+        .await
+        .expect("write state");
+
+        // The API is unreachable: success proves the fast path made no
+        // network call.
+        let path =
+            ensure_managed_heel_binary(install_root, test_asset(), &refused_release_api_url())
+                .await
+                .expect("recently checked binary must skip the release check");
+        assert_eq!(path, binary_path);
     }
 }
