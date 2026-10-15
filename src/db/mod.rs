@@ -1499,6 +1499,120 @@ mod tests {
         );
     }
 
+    /// Concurrent claims of distinct sessions on one database file must all
+    /// succeed: a claim never fails with a lock error because another
+    /// connection committed a write while it ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_session_run_lease_claims_never_hit_lock_errors() {
+        const SESSIONS: usize = 16;
+        const ROUNDS: usize = 25;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let session_ids = (0..SESSIONS)
+            .map(|index| format!("session-{index}"))
+            .collect::<Vec<_>>();
+        for session_id in &session_ids {
+            db.create_session(session_id, Some("Session"), Some("test-model"))
+                .await
+                .expect("session should persist");
+        }
+
+        let tasks = session_ids
+            .into_iter()
+            .map(|session_id| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    for round in 0..ROUNDS {
+                        let claimed = db
+                            .claim_session_run_lease(&session_id)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("claim {round} of {session_id} failed: {error}")
+                            });
+                        assert!(
+                            claimed,
+                            "claim {round} of {session_id} found the lease active"
+                        );
+                        db.release_session_run_lease(&session_id)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("release {round} of {session_id} failed: {error}")
+                            });
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            task.await.expect("claim task should not panic");
+        }
+    }
+
+    /// Concurrent dequeues of distinct sessions' pending messages on one
+    /// database file must all succeed and hand back every queued message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_pending_message_takes_never_hit_lock_errors() {
+        const SESSIONS: usize = 16;
+        const MESSAGES: usize = 10;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let session_ids = (0..SESSIONS)
+            .map(|index| format!("session-{index}"))
+            .collect::<Vec<_>>();
+        for session_id in &session_ids {
+            db.create_session(session_id, Some("Session"), Some("test-model"))
+                .await
+                .expect("session should persist");
+            for index in 0..MESSAGES {
+                db.push_queued_message(
+                    session_id,
+                    test_pending_message(
+                        &format!("message {index}"),
+                        PendingUserMessageMode::Queue,
+                    ),
+                )
+                .await
+                .expect("queued message should persist");
+            }
+        }
+
+        let tasks = session_ids
+            .into_iter()
+            .map(|session_id| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    for index in 0..MESSAGES {
+                        let message = db
+                            .take_next_pending_message(&session_id)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("take {index} of {session_id} failed: {error}")
+                            })
+                            .unwrap_or_else(|| {
+                                panic!("take {index} of {session_id} found no message")
+                            });
+                        assert_eq!(message.content, format!("message {index}"));
+                    }
+                    assert!(
+                        db.take_next_pending_message(&session_id)
+                            .await
+                            .expect("final take should succeed")
+                            .is_none(),
+                        "{session_id} should have no pending message left"
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            task.await.expect("take task should not panic");
+        }
+    }
+
     #[tokio::test]
     async fn session_run_lease_recovery_clears_stale_active_run() {
         let dir = tempdir().expect("temp dir should be created");
