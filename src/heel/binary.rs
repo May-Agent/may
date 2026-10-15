@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use super::release::{ManagedHeelError, current_host_heel_asset, ensure_managed_heel_binary};
+use super::release::{
+    HEEL_RELEASE_API_URL, ManagedHeelError, current_host_heel_asset, ensure_managed_heel_binary,
+};
 use crate::config::MayConfig;
 
 #[derive(Debug, thiserror::Error)]
@@ -75,9 +77,13 @@ fn heel_binary_name() -> String {
 async fn resolve_heel_binary() -> Result<PathBuf, HeelBinaryConfigurationError> {
     let may_dir = MayConfig::may_dir()?;
     let asset = current_host_heel_asset()?;
-    ensure_managed_heel_binary(&may_dir.join("heel").join("runtime"), asset)
-        .await
-        .map_err(HeelBinaryConfigurationError::from)
+    ensure_managed_heel_binary(
+        &may_dir.join("heel").join("runtime"),
+        asset,
+        HEEL_RELEASE_API_URL,
+    )
+    .await
+    .map_err(HeelBinaryConfigurationError::from)
 }
 
 fn search_path_for_binary(name: &str) -> Option<PathBuf> {
