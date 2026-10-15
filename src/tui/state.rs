@@ -92,7 +92,6 @@ impl std::fmt::Debug for AskUserState {
 /// Live `ask_user` interaction state (request id, question states, focus).
 pub struct AskUserState {
     /// Stable persisted request identifier.
-    /// Persisted request id.
     pub request_id: String,
     /// The original request (holds the response channel).
     pub request: AskUserRequest,
@@ -384,14 +383,12 @@ pub enum ConfigEditMode {
     #[default]
     None,
     /// Editing a text field (provider API key, base URL, etc.)
-    /// Editing a text field (provider API key, base URL, etc.)
     Text {
         /// Current text being edited.
         input: String,
         /// Cursor position within `input`, in characters.
         cursor: usize,
     },
-    /// Selecting from a list (provider type, model list)
     /// Selecting from a list (provider type, model list)
     List {
         /// Selectable items.

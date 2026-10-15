@@ -34,7 +34,7 @@ pub enum McpConnectionLoadError {
     /// Underlying `McpConfigError` error.
     #[error(transparent)]
     Config(#[from] McpConfigError),
-    /// Failed to connect MCP server ''.
+    /// Failed to connect to the MCP server.
     #[error("failed to connect MCP server '{server}': {source}")]
     Connect {
         /// Server name that failed.
@@ -242,10 +242,8 @@ impl McpConfig {
 #[derive(Debug)]
 pub enum McpConnectionState {
     /// Server is configured but not connected.
-    /// Not connected.
     Disconnected,
     /// Connection is in progress.
-    /// Connection in progress.
     Connecting,
     /// Server is connected and ready.
     Connected(Box<McpConnection>),
@@ -255,7 +253,6 @@ pub enum McpConnectionState {
 
 impl McpConnectionState {
     /// Check if the server is connected.
-    /// Whether the status is `Connected`.
     #[must_use]
     pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Connected(_))

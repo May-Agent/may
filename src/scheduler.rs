@@ -486,7 +486,6 @@ impl TaskRuntime {
     }
 
     /// Create a scheduled task requested by the in-chat `task` tool.
-    /// Persist a scheduled task created through the `task` tool, validating its script first.
     ///
     /// # Errors
     /// Returns an error message when the payload is malformed, script validation fails, or the insert errors.
@@ -589,7 +588,6 @@ impl TaskRuntime {
     }
 
     /// Check for due tasks and execute them.
-    /// Dispatch every active task whose time trigger is due.
     ///
     /// # Errors
     /// Returns [`crate::db::ChatDbError`] when task rows fail to load or spawn.
@@ -619,7 +617,6 @@ impl TaskRuntime {
     /// Dispatch event-triggered tasks.
     ///
     /// Returns the number of matching tasks that were started.
-    /// Run every enabled event-triggered task whose event name matches.
     ///
     /// # Errors
     /// Returns [`crate::db::ChatDbError`] on storage failure or task spawn failure.

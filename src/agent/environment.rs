@@ -23,12 +23,6 @@ pub enum ResolveAgentEnvironmentError {
     /// Invalid container profile image tag.
     #[error("invalid container profile image tag: {0}")]
     ContainerImageTag(crate::container::ContainerError),
-    /// Invalid container profile configuration.
-    #[error("invalid container profile configuration: {0}")]
-    ContainerProfileConfig(crate::container::ContainerError),
-    /// Invalid container mount configuration.
-    #[error("invalid container mount configuration: {0}")]
-    ContainerMountConfig(crate::container::ContainerError),
     /// Container image build failed.
     #[error("container image build failed: {0}")]
     EnsureContainerImage(crate::container::ContainerError),
@@ -46,7 +40,10 @@ pub enum ResolveAgentEnvironmentError {
 /// # Errors
 ///
 /// Returns [`ResolveAgentEnvironmentError`] when the profile requires a
-/// container environment but its model row is missing.
+/// container environment but its model row is missing, when no container
+/// runtime can be detected, when the profile's image tag is invalid, when the
+/// image fails to build, when the container fails to start, or when the
+/// container's IPC route cannot be resolved.
 pub async fn resolve_agent_environment_for_session(
     profile_environment: Option<ProfileEnvironment>,
     profile_model: Option<&profiles::Model>,

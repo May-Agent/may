@@ -100,12 +100,9 @@ pub enum ConfigError {
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
     /// Anthropic Claude models
-    /// Anthropic Messages API format.
-    /// Anthropic Claude models.
     #[default]
     Anthropic,
     /// `OpenAI` GPT models
-    /// `OpenAI` API format.
     OpenAI,
     /// Google Gemini models
     Google,
@@ -942,10 +939,10 @@ pub enum CommandPriority {
 
 impl CommandPriority {
     /// Maps the configured level onto the sandbox process priority.
-    #[must_use]
     ///
     /// # Panics
     /// Panics only if the compiled-in nice-level constants were somehow invalid (they are fixed at 10/19).
+    #[must_use]
     pub fn process_priority(self) -> aither_sandbox::ProcessPriority {
         match self {
             Self::Normal => aither_sandbox::ProcessPriority::default(),
@@ -1034,7 +1031,6 @@ impl Default for MayConfig {
 
 impl MayConfig {
     /// Get the May directory path (~/.may/).
-    /// Path of the `~/.may` data directory (not created here).
     ///
     /// # Errors
     /// Returns [`ConfigError`] when no home directory can be determined.
@@ -1045,7 +1041,6 @@ impl MayConfig {
     }
 
     /// Get the config file path (~/.may/config.toml).
-    /// Path of the `config.toml` under `~/.may`.
     ///
     /// # Errors
     /// Returns [`ConfigError`] when no home directory can be determined.
@@ -1054,7 +1049,6 @@ impl MayConfig {
     }
 
     /// Load configuration from ~/.may/config.toml or use defaults.
-    /// Load config from the default `config.toml` path, defaulting when absent.
     ///
     /// # Errors
     /// Returns [`ConfigError`] when the file exists but cannot be read or parsed.
@@ -1064,7 +1058,6 @@ impl MayConfig {
     }
 
     /// Load configuration from a specific path.
-    /// Load config from `path`, defaulting when the file is absent.
     ///
     /// # Errors
     /// Returns [`ConfigError`] when the file exists but cannot be read or parsed.
@@ -1082,7 +1075,6 @@ impl MayConfig {
     }
 
     /// Save configuration to ~/.may/config.toml.
-    /// Write the config to the default `config.toml` path.
     ///
     /// # Errors
     /// Returns [`ConfigError`] when serialization or the filesystem write fails.
@@ -1092,7 +1084,6 @@ impl MayConfig {
     }
 
     /// Save configuration to a specific path.
-    /// Write the config to `path`.
     ///
     /// # Errors
     /// Returns [`ConfigError`] when serialization or the filesystem write fails.

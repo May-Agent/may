@@ -76,12 +76,12 @@ impl AgentWorker {
     /// Start processing a prompt.
     ///
     /// Returns a handle to receive events from this run.
-    #[must_use]
     ///
     /// # Panics
     ///
     /// Panics when the worker command channel is already closed — the worker
     /// task has stopped unexpectedly.
+    #[must_use]
     pub fn run(
         &self,
         prompt: String,
@@ -106,12 +106,12 @@ impl AgentWorker {
     }
 
     /// Shutdown the worker task.
-    #[must_use]
     ///
     /// # Panics
     ///
     /// Panics when the worker command channel is already closed — the worker
     /// task has stopped unexpectedly.
+    #[must_use]
     pub fn compact(&self, focus: Option<String>) -> AgentHandle {
         const ERR_WORKER_CHANNEL_CLOSED: &str =
             include_str!("../texts/agent_worker_channel_closed.txt");

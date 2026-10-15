@@ -16,46 +16,45 @@ const AUTO_ARCHIVE_CUTOFF: jiff::SignedDuration = jiff::SignedDuration::from_hou
 /// - Not pinned
 /// - Not already archived
 /// - `updated_at` is older than 48 hours
-/// # Panics
-///
-/// Panics if the 48-hour cutoff subtraction overflows, which cannot happen
-/// on any realistic clock value.
 #[must_use]
 pub fn spawn_auto_archive(db: ChatDb) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(AUTO_ARCHIVE_INTERVAL);
-        // First tick completes immediately; skip it to avoid archiving on startup.
+    tokio::spawn(run_auto_archive(db))
+}
+
+/// Archive stale sessions every [`AUTO_ARCHIVE_INTERVAL`], forever.
+async fn run_auto_archive(db: ChatDb) {
+    let mut interval = tokio::time::interval(AUTO_ARCHIVE_INTERVAL);
+    // First tick completes immediately; skip it to avoid archiving on startup.
+    interval.tick().await;
+
+    loop {
         interval.tick().await;
 
-        loop {
-            interval.tick().await;
+        let cutoff = jiff::Timestamp::now()
+            .checked_sub(AUTO_ARCHIVE_CUTOFF)
+            .expect("48h subtraction should not overflow")
+            .to_string();
 
-            let cutoff = jiff::Timestamp::now()
-                .checked_sub(AUTO_ARCHIVE_CUTOFF)
-                .expect("48h subtraction should not overflow")
-                .to_string();
-
-            match db.sessions_needing_archive(&cutoff).await {
-                Ok(sessions) if sessions.is_empty() => {
-                    tracing::debug!("Auto-archive sweep: no stale sessions");
-                }
-                Ok(sessions) => {
-                    let count = sessions.len();
-                    for session in &sessions {
-                        if let Err(e) = db.archive_session(&session.id).await {
-                            tracing::warn!(
-                                session_id = %session.id,
-                                error = %e,
-                                "Failed to auto-archive session"
-                            );
-                        }
+        match db.sessions_needing_archive(&cutoff).await {
+            Ok(sessions) if sessions.is_empty() => {
+                tracing::debug!("Auto-archive sweep: no stale sessions");
+            }
+            Ok(sessions) => {
+                let count = sessions.len();
+                for session in &sessions {
+                    if let Err(e) = db.archive_session(&session.id).await {
+                        tracing::warn!(
+                            session_id = %session.id,
+                            error = %e,
+                            "Failed to auto-archive session"
+                        );
                     }
-                    tracing::info!(count, "Auto-archived stale sessions");
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Auto-archive sweep failed");
-                }
+                tracing::info!(count, "Auto-archived stale sessions");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Auto-archive sweep failed");
             }
         }
-    })
+    }
 }

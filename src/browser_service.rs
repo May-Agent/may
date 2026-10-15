@@ -16,8 +16,8 @@ pub enum BrowserCapturePersistError {
     /// Failed to prepare browser artifact directory.
     #[error("failed to prepare browser artifact directory: {source}")]
     CreateArtifactDirectory {
-        #[source]
         /// Underlying I/O failure.
+        #[source]
         source: std::io::Error,
     },
     /// Browser screenshot used an unsupported MIME type.
@@ -29,15 +29,15 @@ pub enum BrowserCapturePersistError {
     /// Failed to decode browser screenshot payload.
     #[error("failed to decode browser screenshot payload: {source}")]
     DecodeScreenshot {
-        #[source]
         /// Underlying base64 decode failure.
+        #[source]
         source: base64::DecodeError,
     },
     /// Failed to write browser artifact.
     #[error("failed to write browser artifact: {source}")]
     WriteArtifact {
-        #[source]
         /// Underlying write failure.
+        #[source]
         source: std::io::Error,
     },
 }

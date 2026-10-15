@@ -125,13 +125,13 @@ pub struct ProfileInfo {
     pub icon: Option<String>,
     /// Environment the profile's agents run in.
     pub environment: HomeEnvironment,
-    /// Persona name applied to the profile's agents.
+    /// Persona text folded into the system prompt.
     pub persona: Option<String>,
     /// User-tunable profile preferences.
     pub preferences: Option<ProfilePreferences>,
     /// Whether location context is injected for this profile.
     pub location_aware: bool,
-    /// Maximum sessions shown in the pinned section.
+    /// Maximum number of pinned sessions and folders.
     pub pinned_limit: i32,
     /// Display order among profiles.
     pub sort_order: i32,
