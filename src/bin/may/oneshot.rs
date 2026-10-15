@@ -20,6 +20,30 @@ use may_agent::workspace_request;
 
 use super::cli::OneShotArgs;
 
+/// Records a question for the current session, prompts on stderr and answers it.
+async fn answer_oneshot_question(
+    runtime_deps: &RuntimeDeps,
+    app: &mut App,
+    request: may_agent::ask_user::AskUserRequest,
+    stderr: &mut io::Stderr,
+) -> anyhow::Result<()> {
+    let session_id = app
+        .session_manager
+        .current()
+        .map(|session| session.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
+    let questions = request.args.request.clone().into_questions();
+    let request_id = runtime_deps
+        .register_ask_user_request(app, &session_id, &questions)
+        .await?;
+    let answers = prompt_oneshot_questions(&questions, stderr)?;
+    runtime_deps
+        .resolve_ask_user_response(app, &session_id, &request_id, &answers)
+        .await?;
+    request.respond(answers).map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     const ONESHOT_IDLE_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -41,6 +65,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     let (ask_user_broker, ask_user_queue) = ask_user::channel();
     let mut local_runtime = LocalSessionRuntime::new(app.session_manager.db().clone());
     local_runtime.enable_oneshot_restricted_mode();
+    let tool_distribution = std::sync::Arc::new(may_agent::tools::embedded_distribution()?);
     let tool_dispatchers = may_agent::tool_dispatch::ToolDispatchers::spawn(
         may_agent::tool_dispatch::ToolDispatchConfig {
             may_dir: app.session_manager.may_dir().to_path_buf(),
@@ -49,6 +74,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             browser_config: app.config.browser.clone(),
             network_policy: app.config.preferences.network_policy.clone(),
             ask_user_broker: ask_user_broker.clone(),
+            tool_distribution: tool_distribution.clone(),
         },
     )
     .await?;
@@ -58,13 +84,32 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         ask_user_broker,
         tool_dispatchers,
         std::sync::Arc::new(may_agent::location::LocationProvider::new()),
+        tool_distribution,
     )
     .with_oneshot_overrides(args.model.clone(), args.reasoning_effort);
 
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
     let mut worker: Option<AgentWorker> = None;
-    runtime_deps
-        .start_new_session(&mut app, &mut worker)
+    let mut build = runtime_deps
+        .begin_new_session(&mut app, &mut worker)
         .await?;
+    // Preparing the session's tool environments can ask for SSH consent, so
+    // questions are answered while the worker is built.
+    let built = loop {
+        let next = futures_lite::future::or(async { Ok(build.wait().await) }, async {
+            Err(ask_user_queue.next().await)
+        })
+        .await;
+        match next {
+            Ok(built) => break built?,
+            Err(Some(request)) => {
+                answer_oneshot_question(&runtime_deps, &mut app, request, &mut stderr).await?;
+            }
+            Err(None) => anyhow::bail!("ask-user channel closed while preparing the session"),
+        }
+    };
+    RuntimeDeps::install_worker(&mut app, &mut worker, &build, built);
     let worker = worker
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("oneshot worker was not initialized"))?;
@@ -72,8 +117,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = String::new();
     let mut active_tool_calls = std::collections::HashSet::<String>::new();
-    let mut stdout = io::stdout();
-    let mut stderr = io::stderr();
     runtime_deps.mark_running(&app).await?;
     let prompt = build_oneshot_prompt_with_mentions(&app, &args.prompt).await?;
     let handle = runtime_deps
@@ -146,20 +189,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         };
         match event {
             Event::AskUser(request) => {
-                let session_id = app
-                    .session_manager
-                    .current()
-                    .map(|session| session.id.clone())
-                    .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
-                let questions = request.args.request.clone().into_questions();
-                let request_id = runtime_deps
-                    .register_ask_user_request(&mut app, &session_id, &questions)
-                    .await?;
-                let answers = prompt_oneshot_questions(&questions, &mut stderr)?;
-                runtime_deps
-                    .resolve_ask_user_response(&mut app, &session_id, &request_id, &answers)
-                    .await?;
-                request.respond(answers).map_err(anyhow::Error::from)?;
+                answer_oneshot_question(&runtime_deps, &mut app, request, &mut stderr).await?;
             }
             Event::Workspace(request) => {
                 let session_id = app

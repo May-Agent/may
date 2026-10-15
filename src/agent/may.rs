@@ -1,6 +1,7 @@
 //! May agent wrapper around aither-agent.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aither_agent::{
     Agent, AgentError, AgentEvent, AgentKind, CompactResult, HCons, TerminalAgentBuilder,
@@ -47,6 +48,9 @@ use crate::workspace_request::WorkspaceRequestBroker;
 pub enum MayAgentError {
     #[error("Config error: {0}")]
     Config(#[from] crate::config::ConfigError),
+    /// Baseline preparation failed before the agent became ready.
+    #[error("Baseline tool initialization failed: {0}")]
+    ToolInitialization(#[from] aither_sandbox::ToolRuntimeError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("LLM error: {0}")]
@@ -81,8 +85,8 @@ pub enum AgentEnvironment {
     Container {
         /// Container ID from Docker.
         container_id: String,
-        /// Hostname reachable from the container for IPC back to the host.
-        container_ipc_host: String,
+        /// Route the container uses to reach the host's IPC bridge.
+        container_ipc_route: aither_sandbox::ContainerIpcRoute,
         /// Executor for running commands inside the container.
         container_exec: AnyContainerExec,
         /// Resolved browser CDP endpoint reachable from inside the container.
@@ -92,6 +96,8 @@ pub enum AgentEnvironment {
 
 /// Configuration for creating a `MayAgent`.
 pub struct MayAgentConfig {
+    /// Trusted baseline tool distribution used by every configured backend.
+    pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// The LLM provider.
     pub llm: CloudProvider,
     /// The concrete model identifier selected for this request.
@@ -342,8 +348,10 @@ impl MayAgent {
             builder = builder.with_skills(&skills_dir).await?;
             builder = builder.with_subagents(&subagents_dir).await?;
         }
+        // The builder's descriptions cover the terminal controls aither
+        // registers itself plus every shared command registered above.
         let base_system_prompt =
-            build_base_system_prompt(&shared_terminal_commands, &skills_dir, &subagents_dir)
+            build_base_system_prompt(builder.tool_descriptions(), &skills_dir, &subagents_dir)
                 .await?;
         builder = builder
             .system_prompt_raw(base_system_prompt)
@@ -413,7 +421,7 @@ impl MayAgent {
         match config.environment {
             AgentEnvironment::Container {
                 container_id,
-                container_ipc_host,
+                container_ipc_route,
                 container_exec,
                 browser_cdp_endpoint: cdp_endpoint,
             } => {
@@ -424,7 +432,7 @@ impl MayAgent {
                     builder.system_text(tag::CONTAINER_ENVIRONMENT_CONTEXT, container_context);
                 builder = builder.container_runtime(ContainerShellRuntime::new(
                     container_id,
-                    container_ipc_host,
+                    container_ipc_route,
                     container_exec,
                 ));
                 browser_cdp_endpoint = cdp_endpoint;
@@ -454,7 +462,29 @@ impl MayAgent {
 
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
-
+        tracing::debug!(
+            stage = "tool_preparation",
+            "preparing session tool environments"
+        );
+        let preparation_started = std::time::Instant::now();
+        let builder = builder
+            .initialize_tools(
+                &config.tool_distribution,
+                &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
+            )
+            .await
+            .inspect_err(|error| {
+                tracing::error!(
+                    stage = "tool_preparation",
+                    %error,
+                    "tool environment preparation failed"
+                );
+            })?;
+        tracing::debug!(
+            stage = "tool_preparation",
+            elapsed_ms = preparation_started.elapsed().as_millis(),
+            "session tool environments ready"
+        );
         let agent = builder.build();
 
         Ok(Self {
@@ -490,6 +520,7 @@ impl MayAgent {
         register_skills_broker: Option<RegisterBroker>,
         register_subagents_broker: Option<RegisterBroker>,
         environment: AgentEnvironment,
+        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
         provider_attempt: usize,
     ) -> Result<Self, MayAgentError> {
         let resolved_provider =
@@ -551,6 +582,7 @@ impl MayAgent {
         let ask_models =
             super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await;
         let config = MayAgentConfig {
+            tool_distribution,
             llm,
             model_id: model.to_string(),
             provider_id,
