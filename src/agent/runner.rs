@@ -251,8 +251,7 @@ async fn run_agent_prompt(
     event_tx: &Sender<TuiEvent>,
 ) -> bool {
     agent.sync_runtime_context().await;
-    let mut stream =
-        std::pin::pin!(agent.run_with_hidden_context(prompt, hidden_context, attachments,));
+    let mut stream = agent.run_with_hidden_context(prompt, hidden_context, attachments);
 
     loop {
         // Race between stream event and cancel command
