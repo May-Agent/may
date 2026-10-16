@@ -22,7 +22,9 @@ use hyper_util::rt::TokioIo;
 use may_agent::config::CommandPriority;
 use may_agent::config::{ProviderInstance, ProviderType};
 use may_agent::model_selector::ModelSelector;
-use may_agent::session::{SandboxResourceLayout, SessionId, initialize_session_persistence};
+use may_agent::session::{
+    SandboxResourceLayout, SessionId, SessionStore, initialize_session_persistence,
+};
 use may_agent::{MayConfig, MayHomePaths};
 use serde_json::Value;
 use serial_test::serial;
@@ -125,6 +127,18 @@ impl MockOpenAiServer {
     async fn request_count(&self) -> usize {
         self.requests.lock().await.len()
     }
+
+    /// The agent-turn requests received so far, in arrival order; session
+    /// title requests are left out.
+    async fn agent_requests(&self) -> Vec<Value> {
+        self.requests
+            .lock()
+            .await
+            .iter()
+            .filter(|request| !is_session_title_request(request))
+            .cloned()
+            .collect()
+    }
 }
 
 impl Drop for MockOpenAiServer {
@@ -177,7 +191,7 @@ impl MockScenarioState {
                             "terminal",
                             &serde_json::json!({
                                 "description": "Ask the terminal for the user's name",
-                                "script": "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
+                                "script": "printf 'cwd=%s\\n' \"$(pwd -P)\"; printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
                                 "mode": "sandboxed",
                                 "raw": true,
                                 "timeout": 0,
@@ -671,7 +685,7 @@ impl RunningUiServer {
             // keeping failed assertions diagnosable from captured logs.
             .env(
                 "RUST_LOG",
-                "aither_openai::client=debug,may_agent::ui_server::chat=debug",
+                "aither_openai::client=debug,may_agent::ui_server::chat=debug,may_agent::container=debug",
             )
             .stdin(Stdio::null())
             .stdout(StdStdio::from(log_file))
@@ -1148,11 +1162,209 @@ async fn expect_status(
     );
 }
 
-async fn create_session_via_api(client: &reqwest::Client, server: &RunningUiServer) -> String {
-    // Chat round-trip tests run in the local profile: the container-backed
-    // default profile would spend the assertions' timeout budget on
-    // first-run container provisioning.
-    let profile_id = local_profile_id_via_api(client, server).await;
+/// The profile environment a chat round-trip test runs its session in.
+#[derive(Debug, Clone, Copy)]
+enum ChatEnvironment {
+    /// The `local` profile: commands run on the host under heel.
+    Local,
+    /// The `work` profile: commands run inside the May workspace container.
+    /// It is container-backed like `daily` but not location-aware, so a turn
+    /// never performs a geolocation lookup.
+    ///
+    /// Its tests expect a container runtime on Linux (Docker on the CI
+    /// runners), where a missing runtime fails them; elsewhere they are
+    /// ignored unless requested.
+    Container,
+}
+
+/// Upper bound on building the May workspace image from the repository's
+/// container context on a cold runtime.
+const CONTAINER_IMAGE_BUILD_TIMEOUT: Duration = Duration::from_mins(20);
+
+/// Extra time a container session's first turn gets for starting its
+/// container and preparing the container's tool bundle before the model is
+/// first asked.
+const CONTAINER_FIRST_TURN_ALLOWANCE: Duration = Duration::from_secs(120);
+
+impl ChatEnvironment {
+    const fn profile_slug(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Container => "work",
+        }
+    }
+
+    /// Resolves the environment's profile on `server` and makes it ready for
+    /// chat the way the web UI does before opening a profile.
+    async fn prepare(
+        self,
+        harness: &TestHarness,
+        client: &reqwest::Client,
+        server: &RunningUiServer,
+    ) -> PreparedEnvironment {
+        let profile_id = profile_id_via_api(client, server, self.profile_slug()).await;
+        match self {
+            Self::Local => PreparedEnvironment::Local { profile_id },
+            Self::Container => {
+                let runtime = may_agent::container::ContainerRuntime::detect()
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "container-profile E2E tests need a reachable Docker-compatible \
+                             runtime (Docker at /var/run/docker.sock, rootless Podman, or \
+                             OrbStack): {error}"
+                        )
+                    });
+                // Listing a container profile's sessions builds its image
+                // from the bundled container context first.
+                let Ok(response) = tokio::time::timeout(
+                    CONTAINER_IMAGE_BUILD_TIMEOUT,
+                    client
+                        .get(format!(
+                            "{}/api/profiles/{profile_id}/sessions",
+                            server.base_url
+                        ))
+                        .send(),
+                )
+                .await
+                else {
+                    panic!(
+                        "container profile image was not ready within \
+                         {CONTAINER_IMAGE_BUILD_TIMEOUT:?}; server logs:\n{}",
+                        server.log.contents().await
+                    );
+                };
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => panic!(
+                        "container profile preparation request failed: {error}; server logs:\n{}",
+                        server.log.contents().await
+                    ),
+                };
+                expect_status(&server.log, response, StatusCode::OK).await;
+                let tool_distribution = may_agent::tools::embedded_distribution()
+                    .expect("embedded distribution should validate");
+                PreparedEnvironment::Container {
+                    profile_id,
+                    manager: may_agent::container::lifecycle::ContainerManager::new(
+                        Arc::new(runtime),
+                        harness.may_dir.clone(),
+                        Arc::new(tool_distribution),
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// A [`ChatEnvironment`] whose profile is ready to host chat sessions.
+enum PreparedEnvironment {
+    Local {
+        profile_id: String,
+    },
+    Container {
+        profile_id: String,
+        manager: may_agent::container::lifecycle::ContainerManager,
+    },
+}
+
+impl PreparedEnvironment {
+    fn profile_id(&self) -> &str {
+        match self {
+            Self::Local { profile_id } | Self::Container { profile_id, .. } => profile_id,
+        }
+    }
+
+    /// Extra time the first turn of a session gets before the model is asked.
+    const fn first_turn_allowance(&self) -> Duration {
+        match self {
+            Self::Local { .. } => Duration::ZERO,
+            Self::Container { .. } => CONTAINER_FIRST_TURN_ALLOWANCE,
+        }
+    }
+
+    /// The first line of the environment context May's system prompt carries
+    /// for this environment.
+    const fn context_heading(&self) -> &'static str {
+        match self {
+            Self::Local { .. } => "Environment: local (user's real machine)",
+            Self::Container { .. } => {
+                "Environment: container (managed runtime, not the user's host machine)"
+            }
+        }
+    }
+
+    /// The physical directory a session's terminal commands start in: the
+    /// session sandbox on the host, or its `/workspace` mount in a container.
+    async fn expected_workdir(&self, harness: &TestHarness, session_id: &str) -> String {
+        match self {
+            Self::Local { profile_id } => {
+                let sandbox = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
+                    .sandbox_dir(session_id, Some(profile_id));
+                tokio::fs::canonicalize(&sandbox)
+                    .await
+                    .expect("session sandbox directory should canonicalize")
+                    .display()
+                    .to_string()
+            }
+            Self::Container { .. } => "/workspace".to_string(),
+        }
+    }
+
+    /// Releases what the session left outside its test home: a container
+    /// session's container outlives the server that started it.
+    async fn release(self, harness: &TestHarness, session_id: &str) {
+        match self {
+            Self::Local { .. } => {}
+            Self::Container {
+                profile_id,
+                manager,
+            } => {
+                let (_store, db, _default_profile_id) =
+                    initialize_session_persistence(&harness.may_dir)
+                        .await
+                        .expect("session persistence should initialize");
+                let profile = db
+                    .get_profile(&profile_id)
+                    .await
+                    .expect("profile lookup should succeed")
+                    .expect("container profile should exist");
+                let name = may_agent::container::profile::container_name_for_profile_session(
+                    &profile,
+                    &SessionId::from_string(session_id),
+                );
+                let container_id = manager
+                    .resolve_container_id_by_name(&name)
+                    .await
+                    .expect("session container lookup should succeed")
+                    .unwrap_or_else(|| panic!("session container {name} should exist"));
+                manager
+                    .remove(&container_id)
+                    .await
+                    .expect("session container should be removed");
+            }
+        }
+    }
+}
+
+/// The concatenated system messages of a model request.
+fn system_text(request: &Value) -> String {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn create_session_via_api(
+    client: &reqwest::Client,
+    server: &RunningUiServer,
+    profile_id: &str,
+) -> String {
     let response = client
         .post(format!("{}/api/sessions", server.base_url))
         .json(&serde_json::json!({ "profileId": profile_id }))
@@ -1171,7 +1383,11 @@ async fn create_session_via_api(client: &reqwest::Client, server: &RunningUiServ
         .to_string()
 }
 
-async fn local_profile_id_via_api(client: &reqwest::Client, server: &RunningUiServer) -> String {
+async fn profile_id_via_api(
+    client: &reqwest::Client,
+    server: &RunningUiServer,
+    slug: &str,
+) -> String {
     let response = client
         .get(format!("{}/api/profiles", server.base_url))
         .send()
@@ -1186,9 +1402,9 @@ async fn local_profile_id_via_api(client: &reqwest::Client, server: &RunningUiSe
         .as_array()
         .expect("profiles response should be an array")
         .iter()
-        .find(|profile| profile.get("slug").and_then(Value::as_str) == Some("local"))
+        .find(|profile| profile.get("slug").and_then(Value::as_str) == Some(slug))
         .and_then(|profile| profile.get("id").and_then(Value::as_str))
-        .expect("default local profile should exist")
+        .unwrap_or_else(|| panic!("default profile `{slug}` should exist"))
         .to_string()
 }
 
@@ -1475,7 +1691,8 @@ async fn ui_server_error_logs_its_cause() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let profile_id = local_profile_id_via_api(&client, &server).await;
+    let profile_id =
+        profile_id_via_api(&client, &server, ChatEnvironment::Local.profile_slug()).await;
 
     // A regular file where the profile's sessions directory belongs makes
     // session directory creation fail with an I/O error.
@@ -1529,6 +1746,20 @@ async fn ui_server_error_logs_its_cause() {
 #[tokio::test]
 #[serial]
 async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
+    stream_stop_mid_response_persists_partial_assistant_text(ChatEnvironment::Local).await;
+}
+
+#[tokio::test]
+#[serial]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "container runtimes are expected only on Linux"
+)]
+async fn ui_stream_stop_mid_response_persists_partial_assistant_text_in_container() {
+    stream_stop_mid_response_persists_partial_assistant_text(ChatEnvironment::Container).await;
+}
+
+async fn stream_stop_mid_response_persists_partial_assistant_text(environment: ChatEnvironment) {
     let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
         chunks: vec![
             "alpha ".to_string(),
@@ -1541,7 +1772,8 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let session_id = create_session_via_api(&client, &server).await;
+    let environment = environment.prepare(&harness, &client, &server).await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
     let chat_task = tokio::spawn({
         let client = client.clone();
@@ -1563,14 +1795,17 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
         }
     });
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The session title request can arrive first, while the agent turn is
+    // still setting up its environment; the stop must land mid-turn.
+    let agent_request_timeout = Duration::from_secs(10) + environment.first_turn_allowance();
+    let deadline = Instant::now() + agent_request_timeout;
     loop {
-        if mock.request_count().await >= 1 {
+        if !mock.agent_requests().await.is_empty() {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "LLM request did not reach mock server within 10s; server logs:\n{}",
+            "agent turn request did not reach mock server within {agent_request_timeout:?}; server logs:\n{}",
             server.log.contents().await
         );
         sleep(Duration::from_millis(50)).await;
@@ -1618,16 +1853,36 @@ async fn ui_stream_stop_mid_response_persists_partial_assistant_text() {
     );
 
     server.stop().await;
+    environment.release(&harness, &session_id).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
+    terminal_and_terminal_input_round_trip(ChatEnvironment::Local).await;
+}
+
+/// The round trip runs its commands inside the session's container — they
+/// start in the `/workspace` mount and reach host IPC commands through the
+/// container's bridge route — and the model sees the container environment
+/// context.
+#[tokio::test]
+#[serial]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "container runtimes are expected only on Linux"
+)]
+async fn ui_chat_executes_terminal_and_terminal_input_round_trip_in_container() {
+    terminal_and_terminal_input_round_trip(ChatEnvironment::Container).await;
+}
+
+async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
     let mock = MockOpenAiServer::spawn(MockChatScenario::TerminalRoundTrip).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let session_id = create_session_via_api(&client, &server).await;
+    let environment = environment.prepare(&harness, &client, &server).await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
     let chat_task = tokio::spawn({
         let client = client.clone();
@@ -1653,7 +1908,7 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
         &client,
         &server,
         &session_id,
-        Duration::from_secs(10),
+        Duration::from_secs(10) + environment.first_turn_allowance(),
         "terminal runtime to expose taskId and outputFile",
         |runtime| {
             let terminal = runtime
@@ -1684,10 +1939,13 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
         "background output file should point into outputs dir: {output_file}"
     );
 
-    let events = tokio::time::timeout(Duration::from_secs(60), chat_task)
-        .await
-        .expect("chat stream should finish before timeout")
-        .expect("chat task should join");
+    let events = tokio::time::timeout(
+        Duration::from_secs(60) + environment.first_turn_allowance(),
+        chat_task,
+    )
+    .await
+    .expect("chat stream should finish before timeout")
+    .expect("chat task should join");
     let server_logs = server.log.contents().await;
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
@@ -1734,20 +1992,70 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip() {
         "terminal task id should not be empty"
     );
 
+    let agent_requests = mock.agent_requests().await;
+    let context_heading = environment.context_heading();
+    let first_request_system = system_text(
+        agent_requests
+            .first()
+            .expect("the turn should have asked the model"),
+    );
+    assert!(
+        first_request_system.contains(context_heading),
+        "the model request should carry the `{context_heading}` environment context; system text:\n{first_request_system}"
+    );
+    let terminal_output = agent_requests
+        .last()
+        .and_then(latest_tool_output)
+        .and_then(|output| {
+            output
+                .pointer("/stdout/content/text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .expect("the final model request should carry the terminal read output");
+    let expected_workdir = environment.expected_workdir(&harness, &session_id).await;
+    let expected_line = format!("cwd={expected_workdir}");
+    assert!(
+        terminal_output.lines().any(|line| line == expected_line),
+        "terminal commands should start in {expected_workdir}; terminal output: {terminal_output:?}"
+    );
+
     server.stop().await;
+    environment.release(&harness, &session_id).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn ui_chat_turns_on_one_session_prepare_tools_once() {
+    chat_turns_on_one_session_prepare_tools_once(ChatEnvironment::Local).await;
+}
+
+#[tokio::test]
+#[serial]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "container runtimes are expected only on Linux"
+)]
+async fn ui_chat_turns_on_one_session_prepare_tools_once_in_container() {
+    chat_turns_on_one_session_prepare_tools_once(ChatEnvironment::Container).await;
+}
+
+async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironment) {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("turn answered".to_string())).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let session_id = create_session_via_api(&client, &server).await;
+    let environment = environment.prepare(&harness, &client, &server).await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
-    for content in ["First turn.", "Second turn."] {
+    for (content, turn_timeout) in [
+        (
+            "First turn.",
+            Duration::from_secs(60) + environment.first_turn_allowance(),
+        ),
+        ("Second turn.", Duration::from_secs(60)),
+    ] {
         let response = client
             .post(format!("{}/api/chat/stream", server.base_url))
             .json(&serde_json::json!({
@@ -1767,7 +2075,7 @@ async fn ui_chat_turns_on_one_session_prepare_tools_once() {
                 .expect("refusal body should be readable"),
             server.log.contents().await
         );
-        let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
+        let events = tokio::time::timeout(turn_timeout, collect_sse_events(response))
             .await
             .expect("chat stream should finish before timeout");
         assert!(
@@ -1806,6 +2114,7 @@ async fn ui_chat_turns_on_one_session_prepare_tools_once() {
     );
 
     server.stop().await;
+    environment.release(&harness, &session_id).await;
 }
 
 #[tokio::test]
@@ -2010,7 +2319,10 @@ async fn ui_chat_reports_unreachable_provider_error() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let mut server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let session_id = create_session_via_api(&client, &server).await;
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
     let response = client
         .post(format!("{}/api/chat/stream", server.base_url))
