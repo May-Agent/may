@@ -2307,7 +2307,10 @@ async fn ui_chat_reports_unreachable_provider_error() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let mut server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let session_id = create_session_via_api(&client, &server).await;
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
     let response = client
         .post(format!("{}/api/chat/stream", server.base_url))
