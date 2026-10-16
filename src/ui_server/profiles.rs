@@ -13,7 +13,10 @@ use crate::db::{ChatDbError, CreateProfileParams, ProfileEnvironmentKind, Update
 use crate::profile::{ProfileInfo, ProfilePreferences, query_profile_sessions};
 use crate::ui_event_bus::UiEventTopics;
 
-use super::error::{bad_request_error, internal_error, json_ok_response, typed_error_response};
+use super::error::{
+    bad_request_error, internal_error, internal_error_message, json_ok_response,
+    typed_error_response,
+};
 use super::state::{ContainerPrepareStage, ContainerPrepareStatus, UiServerState};
 use super::types::ApiErrorCode;
 
@@ -67,12 +70,39 @@ impl From<skyzen::Error> for ContainerPrepareError {
     }
 }
 
+/// Make a profile's environment ready to host sessions.
+///
+/// Preparation drives the container runtime client, Tokio channels and a
+/// spawned progress task, so it runs on the server's Tokio runtime whatever
+/// runtime the caller's handler is polled on.
 pub(super) async fn ensure_profile_environment_ready(
     state: &Arc<UiServerState>,
-    db: &crate::db::ChatDb,
     profile_id: &str,
     allow_managed_podman_download: bool,
 ) -> Result<(), ContainerPrepareError> {
+    state
+        .tokio_handle
+        .spawn(prepare_profile_environment(
+            state.clone(),
+            profile_id.to_string(),
+            allow_managed_podman_download,
+        ))
+        .await
+        .map_err(|_| {
+            ContainerPrepareError::Sky(internal_error_message(
+                "profile environment preparation panicked before producing a response",
+            ))
+        })?
+}
+
+async fn prepare_profile_environment(
+    state: Arc<UiServerState>,
+    profile_id: String,
+    allow_managed_podman_download: bool,
+) -> Result<(), ContainerPrepareError> {
+    let state = &state;
+    let profile_id = profile_id.as_str();
+    let db = &state.db();
     let profile = db
         .get_profile(profile_id)
         .await
@@ -444,11 +474,8 @@ pub(super) async fn get_profile_sessions(
 ) -> SkyResult<skyzen::Response> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
-    let db = state.db();
-
     if let Err(err) =
-        ensure_profile_environment_ready(&state, &db, &id, query.allow_managed_podman_download)
-            .await
+        ensure_profile_environment_ready(&state, &id, query.allow_managed_podman_download).await
     {
         return match err {
             ContainerPrepareError::Domain { code, message } => Ok(typed_error_response(
@@ -460,7 +487,7 @@ pub(super) async fn get_profile_sessions(
         };
     }
 
-    let result = query_profile_sessions(&db, &id)
+    let result = query_profile_sessions(&state.db(), &id)
         .await
         .map_err(internal_error)?;
     json_ok_response(&result)
