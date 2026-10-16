@@ -69,7 +69,7 @@ async fn load_default_profile_sessions(
 ) {
     let db = state.db();
 
-    match ensure_profile_environment_ready(&state, &db, &profile_id, false).await {
+    match ensure_profile_environment_ready(&state, &profile_id, false).await {
         Ok(()) => match query_profile_sessions(&db, &profile_id).await {
             Ok(sessions) => (Some(sessions), None),
             Err(error) => unavailable_profile_sessions(&profile_id, None, error.to_string()),
