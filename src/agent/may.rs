@@ -1,6 +1,7 @@
 //! May agent wrapper around aither-agent.
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_agent::{
@@ -714,28 +715,35 @@ impl MayAgent {
     }
 
     /// Run a query and stream events.
+    ///
+    /// The run's state machine spans every agent turn and is tens of
+    /// kilobytes, so it is built on the heap here, in a frame that has
+    /// returned before the stream is first polled. A caller that pinned it in
+    /// place would carry it in its own future and, in debug builds, in the
+    /// stack frame of every poll down to the provider request.
     pub fn run(
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
-        self.inner.run(prompt, attachments)
+    ) -> Pin<Box<impl Stream<Item = Result<AgentEvent, AgentError>> + '_>> {
+        Box::pin(self.inner.run(prompt, attachments))
     }
 
-    /// Run a query and persist per-turn hidden context as a regular system message.
+    /// Run a query and persist per-turn hidden context as a regular system
+    /// message. The stream is boxed for the reason given on [`Self::run`].
     pub fn run_with_hidden_context(
         &mut self,
         prompt: &str,
         hidden_context: Option<&str>,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
+    ) -> Pin<Box<impl Stream<Item = Result<AgentEvent, AgentError>> + '_>> {
         if let Some(hidden_context) = hidden_context
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
             self.inner.push_message(LlmMessage::system(hidden_context));
         }
-        self.inner.run(prompt, attachments)
+        self.run(prompt, attachments)
     }
 
     /// One-shot query.

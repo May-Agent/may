@@ -1994,3 +1994,56 @@ async fn exec_applies_local_command_priority() {
         );
     }
 }
+
+/// A chat turn against a provider nobody listens on must end with the
+/// provider's error on the stream, and the server must survive it.
+#[tokio::test]
+#[serial]
+async fn ui_chat_reports_unreachable_provider_error() {
+    let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
+    let mut server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let session_id = create_session_via_api(&client, &server).await;
+
+    let response = client
+        .post(format!("{}/api/chat/stream", server.base_url))
+        .json(&serde_json::json!({
+            "sessionId": session_id,
+            "content": "Is anyone there?"
+        }))
+        .send()
+        .await
+        .expect("chat stream request should succeed");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "chat stream should open; server logs:\n{}",
+        server.log.contents().await
+    );
+    let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
+        .await
+        .expect("chat stream should finish before timeout");
+
+    let exit = server
+        .child
+        .try_wait()
+        .expect("ui server status should be readable");
+    assert!(
+        exit.is_none(),
+        "ui server exited with {exit:?} during the failing turn; server logs:\n{}",
+        server.log.contents().await
+    );
+    let Some((_, error)) = events.iter().find(|(kind, _)| kind == "error") else {
+        panic!("turn should end with an error event; events: {events:?}");
+    };
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .expect("error event should carry a message");
+    assert!(
+        message.contains("127.0.0.1:9"),
+        "error event should report the unreachable provider: {error}"
+    );
+
+    server.stop().await;
+}
