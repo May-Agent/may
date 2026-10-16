@@ -1227,8 +1227,13 @@ impl ChatEnvironment {
                         server.log.contents().await
                     );
                 };
-                let response =
-                    response.expect("container profile preparation request should succeed");
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => panic!(
+                        "container profile preparation request failed: {error}; server logs:\n{}",
+                        server.log.contents().await
+                    ),
+                };
                 expect_status(&server.log, response, StatusCode::OK).await;
                 let tool_distribution = may_agent::tools::embedded_distribution()
                     .expect("embedded distribution should validate");
