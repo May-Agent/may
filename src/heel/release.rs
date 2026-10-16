@@ -6,7 +6,7 @@ use zenwave::Client;
 
 /// GitHub release-metadata endpoint checked for the managed heel binary.
 pub const HEEL_RELEASE_API_URL: &str = "https://api.github.com/repos/lexoliu/heel/releases/latest";
-const HEEL_RELEASE_STATE_FILE: &str = "release-state.json";
+pub const HEEL_RELEASE_STATE_FILE: &str = "release-state.json";
 const HEEL_BINARY_FILE: &str = "heel";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
@@ -23,6 +23,33 @@ impl ManagedHeelAsset {
 
     pub(crate) const fn local_binary_name(self) -> &'static str {
         self.local_binary_name
+    }
+}
+
+/// Filesystem locations a managed heel install owns: the directory the
+/// binary lands in and the release-check state file.
+///
+/// They are separate inputs because the binary may live inside a directory
+/// whose contents are hashed — the container build context — while the
+/// state file is rewritten on every release check and must not perturb
+/// that hash.
+#[derive(Debug, Clone)]
+pub struct ManagedHeelInstall {
+    /// Directory the managed binary is written into.
+    pub binary_dir: PathBuf,
+    /// Path of the JSON file recording the installed release.
+    pub state_path: PathBuf,
+}
+
+impl ManagedHeelInstall {
+    /// The single-root layout: `<root>/bin` and
+    /// `<root>/release-state.json`.
+    #[must_use]
+    pub fn under(root: &Path) -> Self {
+        Self {
+            binary_dir: root.join("bin"),
+            state_path: root.join(HEEL_RELEASE_STATE_FILE),
+        }
     }
 }
 
@@ -161,24 +188,33 @@ pub fn linux_heel_asset_for_current_arch() -> Result<ManagedHeelAsset, ManagedHe
 }
 
 pub async fn ensure_managed_heel_binary(
-    install_root: &Path,
+    install: &ManagedHeelInstall,
     asset: ManagedHeelAsset,
     release_api_url: &str,
 ) -> Result<PathBuf, ManagedHeelError> {
-    let binary_dir = install_root.join("bin");
-    async_fs::create_dir_all(&binary_dir)
+    async_fs::create_dir_all(&install.binary_dir)
         .await
         .map_err(|source| ManagedHeelError::CreateDir {
-            path: binary_dir.clone(),
+            path: install.binary_dir.clone(),
+            source,
+        })?;
+    let state_dir = install
+        .state_path
+        .parent()
+        .expect("managed heel state path must name a file inside a directory");
+    async_fs::create_dir_all(state_dir)
+        .await
+        .map_err(|source| ManagedHeelError::CreateDir {
+            path: state_dir.to_path_buf(),
             source,
         })?;
 
-    let binary_path = binary_dir.join(asset.local_binary_name());
-    let state_path = install_root.join(HEEL_RELEASE_STATE_FILE);
+    let binary_path = install.binary_dir.join(asset.local_binary_name());
+    let state_path = &install.state_path;
 
     // Fast path: if binary exists and was checked recently, skip the network call.
     if binary_present_and_nonempty(&binary_path).await?
-        && let Some(state) = read_state(&state_path).await?
+        && let Some(state) = read_state(state_path).await?
         && let Some(checked_at) = state.last_checked_at
         && jiff::Timestamp::now().duration_since(checked_at) < CHECK_INTERVAL
     {
@@ -202,7 +238,7 @@ pub async fn ensure_managed_heel_binary(
 
     if binary_is_current(
         &binary_path,
-        &state_path,
+        state_path,
         &release.tag_name,
         asset.release_asset_name(),
     )
@@ -210,7 +246,7 @@ pub async fn ensure_managed_heel_binary(
     {
         // Binary is up-to-date — just refresh the check timestamp
         write_state(
-            &state_path,
+            state_path,
             &ManagedHeelState {
                 release_tag: release.tag_name,
                 asset_name: asset.release_asset_name().to_string(),
@@ -230,7 +266,7 @@ pub async fn ensure_managed_heel_binary(
     let bytes = download_asset_bytes(&release_asset).await?;
     install_binary(&binary_path, bytes.as_ref()).await?;
     write_state(
-        &state_path,
+        state_path,
         &ManagedHeelState {
             release_tag: release.tag_name,
             asset_name: release_asset.name,
@@ -643,8 +679,9 @@ mod tests {
             vec![("/release".to_string(), 500, b"boom".to_vec())],
         );
 
+        let install = ManagedHeelInstall::under(install_root);
         let error =
-            ensure_managed_heel_binary(install_root, test_asset(), &format!("{base_url}/release"))
+            ensure_managed_heel_binary(&install, test_asset(), &format!("{base_url}/release"))
                 .await
                 .expect_err("a failed release check must not fall back to the installed binary");
         assert!(
@@ -662,7 +699,8 @@ mod tests {
         let install_root = temp.path();
         install_binary_file(install_root, b"stale-binary");
 
-        ensure_managed_heel_binary(install_root, test_asset(), &refused_release_api_url())
+        let install = ManagedHeelInstall::under(install_root);
+        ensure_managed_heel_binary(&install, test_asset(), &refused_release_api_url())
             .await
             .expect_err("a refused release check must not fall back to the installed binary");
     }
@@ -687,8 +725,9 @@ mod tests {
             ],
         );
 
+        let install = ManagedHeelInstall::under(install_root);
         let path =
-            ensure_managed_heel_binary(install_root, test_asset(), &format!("{base_url}/release"))
+            ensure_managed_heel_binary(&install, test_asset(), &format!("{base_url}/release"))
                 .await
                 .expect("unrecorded install must be replaced by the release asset");
         assert_eq!(
@@ -726,8 +765,9 @@ mod tests {
 
             // The API is unreachable: the corrupt state must fail before any
             // network fallback could mask it.
+            let install = ManagedHeelInstall::under(install_root);
             let error =
-                ensure_managed_heel_binary(install_root, test_asset(), &refused_release_api_url())
+                ensure_managed_heel_binary(&install, test_asset(), &refused_release_api_url())
                     .await
                     .expect_err("corrupt state must fail");
             match error {
@@ -755,10 +795,56 @@ mod tests {
 
         // The API is unreachable: success proves the fast path made no
         // network call.
-        let path =
-            ensure_managed_heel_binary(install_root, test_asset(), &refused_release_api_url())
-                .await
-                .expect("recently checked binary must skip the release check");
+        let install = ManagedHeelInstall::under(install_root);
+        let path = ensure_managed_heel_binary(&install, test_asset(), &refused_release_api_url())
+            .await
+            .expect("recently checked binary must skip the release check");
         assert_eq!(path, binary_path);
+    }
+
+    #[tokio::test]
+    async fn container_layout_writes_state_outside_the_build_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let may_dir = temp.path();
+        let install = ManagedHeelInstall {
+            binary_dir: may_dir.join("container").join("heel").join("bin"),
+            state_path: may_dir.join("state").join("container-heel-release.json"),
+        };
+
+        let (listener, base_url) = bind_loopback();
+        serve_routes(
+            listener,
+            vec![
+                (
+                    "/release".to_string(),
+                    200,
+                    release_json(&base_url, "v9.9.9"),
+                ),
+                ("/heel-bin".to_string(), 200, b"fresh-heel-binary".to_vec()),
+            ],
+        );
+
+        let binary_path =
+            ensure_managed_heel_binary(&install, test_asset(), &format!("{base_url}/release"))
+                .await
+                .expect("container heel install should succeed");
+        assert_eq!(binary_path, install.binary_dir.join("heel"));
+
+        let context_dir = may_dir.join("container");
+        // The context hash covers every file beneath the build context, so
+        // the state file must land outside it — under `state/` — with its
+        // parent directory created on demand.
+        assert!(
+            install.state_path.is_file(),
+            "release state should be written at the state path"
+        );
+        assert!(!install.state_path.starts_with(&context_dir));
+        assert!(
+            !context_dir
+                .join("heel")
+                .join(HEEL_RELEASE_STATE_FILE)
+                .exists(),
+            "no release state may remain inside the build context"
+        );
     }
 }
