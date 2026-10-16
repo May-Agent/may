@@ -1,12 +1,13 @@
 //! Profile-driven container overrides (Dockerfile + mounts).
 
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use aither_sandbox::{ContainerImageSpec, MountSpec};
 use async_fs;
 use futures_lite::{StreamExt, io::AsyncReadExt};
+use sha2::Digest;
 
 use super::{ContainerError, image::MAY_IMAGE_TAG};
 use crate::db::entity::profiles;
@@ -121,15 +122,28 @@ pub async fn default_image_tag(
 
 async fn container_context_hash_hex(may_dir: &Path) -> Result<String, ContainerError> {
     let context_dir = may_dir.join("container");
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = sha2::Sha256::new();
     Box::pin(hash_path_recursive(&context_dir, &context_dir, &mut hasher)).await?;
-    Ok(format!("{:016x}", hasher.finish()))
+    // First 16 hex chars keep the tag at its previous length.
+    let mut tag = String::with_capacity(16);
+    for byte in &hasher.finalize()[..8] {
+        write!(tag, "{byte:02x}").expect("hex formatting into a String cannot fail");
+    }
+    Ok(tag)
+}
+
+/// Feed one length-prefixed field so adjacent fields cannot smear into each
+/// other. File contents stream unframed because a file's bytes are always
+/// the last field of its entry.
+fn feed_context_hash(hasher: &mut sha2::Sha256, field: &[u8]) {
+    hasher.update((field.len() as u64).to_le_bytes());
+    hasher.update(field);
 }
 
 async fn hash_path_recursive(
     root: &Path,
     path: &Path,
-    hasher: &mut std::collections::hash_map::DefaultHasher,
+    hasher: &mut sha2::Sha256,
 ) -> Result<(), ContainerError> {
     enum Pending {
         DirEntry(String),
@@ -140,8 +154,8 @@ async fn hash_path_recursive(
     while let Some(item) = stack.pop() {
         match item {
             Pending::DirEntry(name) => {
-                "dir-entry".hash(hasher);
-                name.hash(hasher);
+                feed_context_hash(hasher, b"dir-entry");
+                feed_context_hash(hasher, name.as_bytes());
             }
             Pending::Path(path) => {
                 let metadata = async_fs::metadata(&path).await?;
@@ -164,11 +178,14 @@ async fn hash_path_recursive(
                     continue;
                 }
 
-                "file".hash(hasher);
-                path.strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .hash(hasher);
+                feed_context_hash(hasher, b"file");
+                feed_context_hash(
+                    hasher,
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .as_bytes(),
+                );
 
                 let mut file = async_fs::File::open(&path).await?;
                 let mut buffer = [0_u8; 16 * 1024];
@@ -177,7 +194,7 @@ async fn hash_path_recursive(
                     if read == 0 {
                         break;
                     }
-                    buffer[..read].hash(hasher);
+                    hasher.update(&buffer[..read]);
                 }
             }
         }
@@ -322,6 +339,39 @@ mod tests {
             .expect("second hash");
 
         assert_ne!(first_hash, second_hash);
+    }
+
+    #[tokio::test]
+    async fn container_context_hash_ignores_release_state_outside_the_context() {
+        let may_dir = make_may_dir_with_container_context();
+        let first_hash = container_context_hash_hex(may_dir.path())
+            .await
+            .expect("first hash");
+        assert_eq!(first_hash.len(), 16, "tag keeps its previous length");
+
+        // The managed heel's release state lives outside the build context,
+        // so creating or rewriting it must not change the context hash.
+        let state_path = may_dir
+            .path()
+            .join("state")
+            .join("container-heel-release.json");
+        fs::create_dir_all(state_path.parent().expect("state path has a parent"))
+            .expect("create state dir");
+        fs::write(&state_path, r#"{"release_tag":"heel-v9.9.9"}"#).expect("write state");
+        let second_hash = container_context_hash_hex(may_dir.path())
+            .await
+            .expect("second hash");
+        fs::write(
+            &state_path,
+            r#"{"release_tag":"heel-v9.9.9","checked":"later"}"#,
+        )
+        .expect("rewrite state");
+        let third_hash = container_context_hash_hex(may_dir.path())
+            .await
+            .expect("third hash");
+
+        assert_eq!(first_hash, second_hash);
+        assert_eq!(first_hash, third_hash);
     }
 
     #[test]
