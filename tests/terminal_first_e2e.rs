@@ -610,9 +610,9 @@ impl TestHarness {
         self.home.path()
     }
 
-    /// The managed container heel's `release-state.json`, as stored.
+    /// The managed container heel's release state, as stored.
     async fn container_heel_state(&self) -> String {
-        async_fs::read_to_string(self.may_dir.join("container/heel/release-state.json"))
+        async_fs::read_to_string(self.may_dir.join("state/container-heel-release.json"))
             .await
             .expect("container heel release state should be readable")
     }
@@ -787,13 +787,16 @@ const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
 
 /// Stages the pinned container heel in the test home exactly as the product's
 /// managed install leaves it — `container/heel/bin/heel` plus a
-/// `release-state.json` checked just now — so the server's recent-check fast
-/// path never queries the GitHub release API.
+/// `state/container-heel-release.json` checked just now — so the server's
+/// recent-check fast path never queries the GitHub release API.
 async fn seed_container_heel(may_dir: &Path) {
     let source = pinned_container_heel().await;
-    let install_root = may_dir.join("container").join("heel");
-    let binary_path = install_root.join("bin").join("heel");
-    async_fs::create_dir_all(install_root.join("bin"))
+    let binary_path = may_dir
+        .join("container")
+        .join("heel")
+        .join("bin")
+        .join("heel");
+    async_fs::create_dir_all(binary_path.parent().expect("binary path has a parent"))
         .await
         .expect("container heel bin dir should be created");
     async_fs::copy(&source, &binary_path)
@@ -812,8 +815,12 @@ async fn seed_container_heel(may_dir: &Path) {
         "asset_name": CONTAINER_HEEL_ASSET.name,
         "last_checked_at": jiff::Timestamp::now(),
     });
+    let state_path = may_dir.join("state").join("container-heel-release.json");
+    async_fs::create_dir_all(state_path.parent().expect("state path has a parent"))
+        .await
+        .expect("container heel state dir should be created");
     async_fs::write(
-        install_root.join("release-state.json"),
+        &state_path,
         serde_json::to_vec(&state).expect("container heel release state should serialize"),
     )
     .await
