@@ -7,6 +7,7 @@ use self::tool_dispatch::{
 };
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1256,194 +1257,298 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: U
 ///
 /// Handles: retry logic, agent event processing, history persistence,
 /// request logging, and post-completion hooks.
-async fn run_agent_loop(
-    state: &Arc<UiServerState>,
-    req: &ChatRequest,
-    sink: &mut impl ChatSink,
-    cancel_rx: &async_channel::Receiver<()>,
+///
+/// The loop's future is tens of kilobytes, so it is built on the heap here,
+/// in a frame that has returned before it is first polled: a caller that
+/// boxed it itself would reserve room for it in its own poll frame, which a
+/// debug build keeps on the stack under every provider request.
+fn run_agent_loop<'a>(
+    state: &'a Arc<UiServerState>,
+    req: &'a ChatRequest,
+    sink: &'a mut impl ChatSink,
+    cancel_rx: &'a async_channel::Receiver<()>,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
-) -> Result<AgentRunResult, AgentLoopError> {
-    let mut attempt = 0usize;
-    let mut max_retries = 0usize;
-    let mut turn_hidden_context_xml: Option<String> = None;
+) -> Pin<Box<impl Future<Output = Result<AgentRunResult, AgentLoopError>> + 'a>> {
+    Box::pin(async move {
+        let mut attempt = 0usize;
+        let mut max_retries = 0usize;
+        let mut turn_hidden_context_xml: Option<String> = None;
 
-    loop {
-        let assistant_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_id = format!("assistant-{assistant_uuid}");
-        let started_at = Instant::now();
+        loop {
+            let assistant_uuid = uuid::Uuid::new_v4().to_string();
+            let assistant_id = format!("assistant-{assistant_uuid}");
+            let started_at = Instant::now();
 
-        if !sink.on_start(&req.session_id, &assistant_id).await {
-            return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
-        }
-        tracing::info!(
-            session_id = %req.session_id,
-            assistant_id = %assistant_id,
-            attempt,
-            elapsed_ms = elapsed_ms_saturating(&started_at),
-            "chat stream start sent"
-        );
-
-        let PreparedAgent {
-            session_id,
-            mut agent,
-            current_model,
-            provider_id,
-            profile_id,
-            hidden_context_xml,
-            prompt,
-            attachments,
-            provider_candidate_count,
-        } = match Box::pin(prepare_agent_for_request(
-            state,
-            req,
-            persist_user_message && attempt == 0,
-            use_persisted_context_snapshot,
-            attempt,
-        ))
-        .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let _ = sink
-                    .on_error(error.api_code(), &error.to_string(), false)
-                    .await;
-                return Err(error.into());
+            if !sink.on_start(&req.session_id, &assistant_id).await {
+                return Err(AgentLoopError::ClientDisconnectedBeforeStreamStart);
             }
-        };
-        tracing::info!(
-            session_id = %session_id,
-            assistant_id = %assistant_id,
-            model = %current_model,
-            provider_id = %provider_id,
-            attempt,
-            elapsed_ms = elapsed_ms_saturating(&started_at),
-            "chat agent prepared"
-        );
-        if attempt == 0 {
-            max_retries = provider_candidate_count.saturating_sub(1);
-        }
-        if let Some(hidden_context_xml) = hidden_context_xml {
-            turn_hidden_context_xml = Some(hidden_context_xml);
-        }
-        let model_context_window = agent.model_context_window().or_else(|| {
-            lookup_model_info(&current_model).and_then(aither_models::ModelEntry::max_input_tokens)
-        });
+            tracing::info!(
+                session_id = %req.session_id,
+                assistant_id = %assistant_id,
+                attempt,
+                elapsed_ms = elapsed_ms_saturating(&started_at),
+                "chat stream start sent"
+            );
 
-        let mut usage = Usage::default();
-        let mut segment_text = String::new(); // current text segment, flushed on tool calls
-        let mut full_text = String::new(); // accumulated full assistant text
-        let mut reasoning_text = String::new();
-        let mut terminal_snapshot = TerminalStateSnapshot::default();
-        let mut saw_tool_activity = false;
-        let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let mut pending_tool_streams: std::collections::HashMap<String, PendingToolStream> =
-            std::collections::HashMap::new();
-        let mut last_todo_hash: Option<u64> = None;
-        let tasks_db = state.db();
-        let tasks_session_id = req.session_id.clone();
-        let mut turn_persister = turn_persister::TurnPersister::new(session_id.as_str());
-
-        let mut terminal_error: Option<aither_agent::AgentError> = None;
-        let mut cancellation_reason: Option<&'static str> = None;
-        let mut browser_takeover_paused = false;
-        let mut first_agent_event_seen = false;
-        let mut first_visible_tool_seen = false;
-        let mut first_text_seen = false;
-        {
-            agent.sync_runtime_context().await;
-            let mut stream = std::pin::pin!(agent.run_with_hidden_context(
-                &prompt,
-                turn_hidden_context_xml.as_deref(),
+            let PreparedAgent {
+                session_id,
+                mut agent,
+                current_model,
+                provider_id,
+                profile_id,
+                hidden_context_xml,
+                prompt,
                 attachments,
-            ));
-            loop {
-                let next_event = tokio::select! {
-                    biased;
-                    cancel = cancel_rx.recv() => {
-                        if cancel == Ok(()) {
-                            cancellation_reason = Some("run cancelled by user");
-                        } else {
-                            cancellation_reason = Some("run cancellation channel closed unexpectedly");
+                provider_candidate_count,
+            } = match prepare_agent_for_request(
+                state,
+                req,
+                persist_user_message && attempt == 0,
+                use_persisted_context_snapshot,
+                attempt,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = sink
+                        .on_error(error.api_code(), &error.to_string(), false)
+                        .await;
+                    return Err(error.into());
+                }
+            };
+            tracing::info!(
+                session_id = %session_id,
+                assistant_id = %assistant_id,
+                model = %current_model,
+                provider_id = %provider_id,
+                attempt,
+                elapsed_ms = elapsed_ms_saturating(&started_at),
+                "chat agent prepared"
+            );
+            if attempt == 0 {
+                max_retries = provider_candidate_count.saturating_sub(1);
+            }
+            if let Some(hidden_context_xml) = hidden_context_xml {
+                turn_hidden_context_xml = Some(hidden_context_xml);
+            }
+            let model_context_window = agent.model_context_window().or_else(|| {
+                lookup_model_info(&current_model)
+                    .and_then(aither_models::ModelEntry::max_input_tokens)
+            });
+
+            let mut usage = Usage::default();
+            let mut segment_text = String::new(); // current text segment, flushed on tool calls
+            let mut full_text = String::new(); // accumulated full assistant text
+            let mut reasoning_text = String::new();
+            let mut terminal_snapshot = TerminalStateSnapshot::default();
+            let mut saw_tool_activity = false;
+            let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let mut pending_tool_streams: std::collections::HashMap<String, PendingToolStream> =
+                std::collections::HashMap::new();
+            let mut last_todo_hash: Option<u64> = None;
+            let tasks_db = state.db();
+            let tasks_session_id = req.session_id.clone();
+            let mut turn_persister = turn_persister::TurnPersister::new(session_id.as_str());
+
+            let mut terminal_error: Option<aither_agent::AgentError> = None;
+            let mut cancellation_reason: Option<&'static str> = None;
+            let mut browser_takeover_paused = false;
+            let mut first_agent_event_seen = false;
+            let mut first_visible_tool_seen = false;
+            let mut first_text_seen = false;
+            {
+                agent.sync_runtime_context().await;
+                let mut stream = agent.run_with_hidden_context(
+                    &prompt,
+                    turn_hidden_context_xml.as_deref(),
+                    attachments,
+                );
+                loop {
+                    let next_event = tokio::select! {
+                        biased;
+                        cancel = cancel_rx.recv() => {
+                            if cancel == Ok(()) {
+                                cancellation_reason = Some("run cancelled by user");
+                            } else {
+                                cancellation_reason = Some("run cancellation channel closed unexpectedly");
+                            }
+                            None
                         }
-                        None
-                    }
-                    next = stream.next() => next,
-                };
-                let Some(event) = next_event else {
-                    break;
-                };
-                match event {
-                    Ok(aither_agent::AgentEvent::Reasoning(text)) => {
-                        log_first_agent_event(
-                            &mut first_agent_event_seen,
-                            &started_at,
-                            session_id.as_str(),
-                            assistant_id.as_str(),
-                            "reasoning",
-                        );
-                        reasoning_text.push_str(&text);
-                        if !sink.on_reasoning(&text).await {
-                            cancellation_reason =
-                                Some("client disconnected during reasoning stream");
-                            break;
+                        next = stream.next() => next,
+                    };
+                    let Some(event) = next_event else {
+                        break;
+                    };
+                    match event {
+                        Ok(aither_agent::AgentEvent::Reasoning(text)) => {
+                            log_first_agent_event(
+                                &mut first_agent_event_seen,
+                                &started_at,
+                                session_id.as_str(),
+                                assistant_id.as_str(),
+                                "reasoning",
+                            );
+                            reasoning_text.push_str(&text);
+                            if !sink.on_reasoning(&text).await {
+                                cancellation_reason =
+                                    Some("client disconnected during reasoning stream");
+                                break;
+                            }
                         }
-                    }
-                    Ok(aither_agent::AgentEvent::Text(text)) => {
-                        log_first_agent_event(
-                            &mut first_agent_event_seen,
-                            &started_at,
-                            session_id.as_str(),
-                            assistant_id.as_str(),
-                            "text",
-                        );
-                        log_first_text_event(
-                            &mut first_text_seen,
-                            &started_at,
-                            session_id.as_str(),
-                            assistant_id.as_str(),
-                        );
-                        segment_text.push_str(&text);
-                        full_text.push_str(&text);
-                        if !sink.on_text(&text).await {
-                            cancellation_reason = Some("client disconnected during text stream");
-                            break;
+                        Ok(aither_agent::AgentEvent::Text(text)) => {
+                            log_first_agent_event(
+                                &mut first_agent_event_seen,
+                                &started_at,
+                                session_id.as_str(),
+                                assistant_id.as_str(),
+                                "text",
+                            );
+                            log_first_text_event(
+                                &mut first_text_seen,
+                                &started_at,
+                                session_id.as_str(),
+                                assistant_id.as_str(),
+                            );
+                            segment_text.push_str(&text);
+                            full_text.push_str(&text);
+                            if !sink.on_text(&text).await {
+                                cancellation_reason =
+                                    Some("client disconnected during text stream");
+                                break;
+                            }
                         }
-                    }
-                    Ok(aither_agent::AgentEvent::Usage(u)) => {
-                        usage = u;
-                    }
-                    Ok(aither_agent::AgentEvent::ToolCallDelta {
-                        id,
-                        name,
-                        arguments_fragment,
-                    }) => {
-                        log_first_agent_event(
-                            &mut first_agent_event_seen,
-                            &started_at,
-                            session_id.as_str(),
-                            assistant_id.as_str(),
-                            "tool_delta",
-                        );
-                        tracing::trace!(
-                            target: "may::chat::tool_delta",
-                            id = %id,
-                            name = %name,
-                            fragment = %arguments_fragment,
-                            "incoming ToolCallDelta from aither"
-                        );
-                        match normalize_tool_delta_for_sink(
-                            &mut pending_tool_streams,
-                            &id,
-                            &name,
-                            &arguments_fragment,
-                        ) {
-                            SinkToolEvent::Start {
+                        Ok(aither_agent::AgentEvent::Usage(u)) => {
+                            usage = u;
+                        }
+                        Ok(aither_agent::AgentEvent::ToolCallDelta {
+                            id,
+                            name,
+                            arguments_fragment,
+                        }) => {
+                            log_first_agent_event(
+                                &mut first_agent_event_seen,
+                                &started_at,
+                                session_id.as_str(),
+                                assistant_id.as_str(),
+                                "tool_delta",
+                            );
+                            tracing::trace!(
+                                target: "may::chat::tool_delta",
+                                id = %id,
+                                name = %name,
+                                fragment = %arguments_fragment,
+                                "incoming ToolCallDelta from aither"
+                            );
+                            match normalize_tool_delta_for_sink(
+                                &mut pending_tool_streams,
+                                &id,
+                                &name,
+                                &arguments_fragment,
+                            ) {
+                                SinkToolEvent::Start {
+                                    id,
+                                    name,
+                                    arguments,
+                                } => {
+                                    log_first_visible_tool_event(
+                                        &mut first_visible_tool_seen,
+                                        &started_at,
+                                        session_id.as_str(),
+                                        assistant_id.as_str(),
+                                        id.as_str(),
+                                        name.as_str(),
+                                        "synthetic_start_from_delta",
+                                    );
+                                    let summary = project_tool_summary_for_sink(
+                                        &pending_tool_streams,
+                                        &id,
+                                        &name,
+                                        Some(arguments.as_str()),
+                                    );
+                                    if !sink.on_tool_start(&id, &name, &arguments, summary).await {
+                                        cancellation_reason =
+                                            Some("client disconnected during tool stream");
+                                        break;
+                                    }
+                                }
+                                SinkToolEvent::Delta {
+                                    id,
+                                    name,
+                                    arguments_fragment,
+                                } => {
+                                    let summary = project_tool_summary_for_sink(
+                                        &pending_tool_streams,
+                                        &id,
+                                        &name,
+                                        None,
+                                    );
+                                    if !sink
+                                        .on_tool_delta(&id, &name, &arguments_fragment, summary)
+                                        .await
+                                    {
+                                        cancellation_reason =
+                                            Some("client disconnected during tool stream");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(aither_agent::AgentEvent::ToolCallStart {
+                            id,
+                            name,
+                            arguments,
+                        }) => {
+                            log_first_agent_event(
+                                &mut first_agent_event_seen,
+                                &started_at,
+                                session_id.as_str(),
+                                assistant_id.as_str(),
+                                "tool_start",
+                            );
+                            saw_tool_activity = true;
+                            if matches!(
+                                name.as_str(),
+                                "terminal" | "terminal_input" | "terminal_kill" | "terminal_read"
+                            ) {
+                                set_session_runtime_state(
+                                    state,
+                                    session_id.as_str(),
+                                    SessionRuntimeState::Running,
+                                )
+                                .await?;
+                            }
+                            // Buffer accumulated text segment before the tool call.
+                            if !segment_text.trim().is_empty() {
+                                turn_persister.push_assistant(segment_text.clone());
+                                segment_text.clear();
+                            }
+
+                            let record = ToolEventRecord::Start {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: arguments.clone(),
+                            };
+                            let serialized = serde_json::to_string(&record)
+                                .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
+                            turn_persister.push_tool_event(id.clone(), serialized);
+                            update_terminal_snapshot_from_tool_event(
+                                &mut terminal_snapshot,
+                                &record,
+                            );
+                            tool_arguments_by_id.insert(id.clone(), arguments.clone());
+                            if let Some(SinkToolEvent::Start {
                                 id,
                                 name,
                                 arguments,
-                            } => {
+                            }) = normalize_tool_start_for_sink(
+                                &mut pending_tool_streams,
+                                &id,
+                                &name,
+                                &arguments,
+                            ) {
                                 log_first_visible_tool_event(
                                     &mut first_visible_tool_seen,
                                     &started_at,
@@ -1451,7 +1556,7 @@ async fn run_agent_loop(
                                     assistant_id.as_str(),
                                     id.as_str(),
                                     name.as_str(),
-                                    "synthetic_start_from_delta",
+                                    "canonical_start",
                                 );
                                 let summary = project_tool_summary_for_sink(
                                     &pending_tool_streams,
@@ -1465,45 +1570,90 @@ async fn run_agent_loop(
                                     break;
                                 }
                             }
-                            SinkToolEvent::Delta {
-                                id,
-                                name,
-                                arguments_fragment,
-                            } => {
-                                let summary = project_tool_summary_for_sink(
-                                    &pending_tool_streams,
-                                    &id,
-                                    &name,
-                                    None,
-                                );
-                                if !sink
-                                    .on_tool_delta(&id, &name, &arguments_fragment, summary)
-                                    .await
-                                {
-                                    cancellation_reason =
-                                        Some("client disconnected during tool stream");
-                                    break;
-                                }
+                        }
+                        Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
+                            log_first_agent_event(
+                                &mut first_agent_event_seen,
+                                &started_at,
+                                session_id.as_str(),
+                                assistant_id.as_str(),
+                                "tool_end",
+                            );
+                            saw_tool_activity = true;
+                            if name == "terminal" && result_waits_for_terminal_input(&result) {
+                                set_session_runtime_state(
+                                    state,
+                                    session_id.as_str(),
+                                    SessionRuntimeState::WaitingTerminalInput,
+                                )
+                                .await?;
+                            }
+                            let record = ToolEventRecord::End {
+                                id: id.clone(),
+                                name: name.clone(),
+                                result: result.clone(),
+                            };
+                            let serialized = serde_json::to_string(&record)
+                                .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
+                            turn_persister.push_tool_event(id.clone(), serialized);
+                            update_terminal_snapshot_from_tool_event(
+                                &mut terminal_snapshot,
+                                &record,
+                            );
+                            let arguments = tool_arguments_by_id.remove(&id);
+                            let summary = project_tool_summary_for_sink(
+                                &pending_tool_streams,
+                                &id,
+                                &name,
+                                arguments.as_deref(),
+                            );
+                            pending_tool_streams.remove(&id);
+                            if !sink
+                                .on_tool_end(&id, &name, arguments.as_deref(), &result, summary)
+                                .await
+                            {
+                                cancellation_reason =
+                                    Some("client disconnected during tool stream");
+                                break;
+                            }
+
+                            // Check if tasks.md changed after tool execution.
+                            if let Some(checklist) = check_tasks_update(
+                                &tasks_db,
+                                &tasks_session_id,
+                                &mut last_todo_hash,
+                            )
+                            .await
+                                && !sink.on_todo_update(&checklist).await
+                            {
+                                cancellation_reason =
+                                    Some("client disconnected during todo update");
+                                break;
                             }
                         }
-                    }
-                    Ok(aither_agent::AgentEvent::ToolCallStart {
-                        id,
-                        name,
-                        arguments,
-                    }) => {
-                        log_first_agent_event(
-                            &mut first_agent_event_seen,
-                            &started_at,
-                            session_id.as_str(),
-                            assistant_id.as_str(),
-                            "tool_start",
-                        );
-                        saw_tool_activity = true;
-                        if matches!(
-                            name.as_str(),
-                            "terminal" | "terminal_input" | "terminal_kill" | "terminal_read"
-                        ) {
+                        Ok(aither_agent::AgentEvent::BackgroundTaskStarted {
+                            task_id,
+                            output_preview,
+                            output_file,
+                            reason,
+                        }) => {
+                            saw_tool_activity = true;
+                            set_terminal_runtime_state(
+                                state,
+                                session_id.as_str(),
+                                TerminalRuntimeState {
+                                    task_id: Some(task_id),
+                                    output_file: Some(output_file),
+                                    output_preview: Some(output_preview),
+                                    input_notice: None,
+                                    background_reason: Some(reason),
+                                },
+                            )
+                            .await?;
+                        }
+                        Ok(aither_agent::AgentEvent::BackgroundTaskCompleted { .. }) => {
+                            saw_tool_activity = true;
+                            clear_terminal_runtime_state(state, session_id.as_str()).await?;
                             set_session_runtime_state(
                                 state,
                                 session_id.as_str(),
@@ -1511,199 +1661,164 @@ async fn run_agent_loop(
                             )
                             .await?;
                         }
-                        // Buffer accumulated text segment before the tool call.
-                        if !segment_text.trim().is_empty() {
-                            turn_persister.push_assistant(segment_text.clone());
-                            segment_text.clear();
-                        }
-
-                        let record = ToolEventRecord::Start {
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments: arguments.clone(),
-                        };
-                        let serialized = serde_json::to_string(&record)
-                            .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
-                        turn_persister.push_tool_event(id.clone(), serialized);
-                        update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
-                        tool_arguments_by_id.insert(id.clone(), arguments.clone());
-                        if let Some(SinkToolEvent::Start {
-                            id,
-                            name,
-                            arguments,
-                        }) = normalize_tool_start_for_sink(
-                            &mut pending_tool_streams,
-                            &id,
-                            &name,
-                            &arguments,
-                        ) {
-                            log_first_visible_tool_event(
-                                &mut first_visible_tool_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                id.as_str(),
-                                name.as_str(),
-                                "canonical_start",
-                            );
-                            let summary = project_tool_summary_for_sink(
-                                &pending_tool_streams,
-                                &id,
-                                &name,
-                                Some(arguments.as_str()),
-                            );
-                            if !sink.on_tool_start(&id, &name, &arguments, summary).await {
-                                cancellation_reason =
-                                    Some("client disconnected during tool stream");
-                                break;
-                            }
-                        }
-                    }
-                    Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
-                        log_first_agent_event(
-                            &mut first_agent_event_seen,
-                            &started_at,
-                            session_id.as_str(),
-                            assistant_id.as_str(),
-                            "tool_end",
-                        );
-                        saw_tool_activity = true;
-                        if name == "terminal" && result_waits_for_terminal_input(&result) {
+                        Ok(aither_agent::AgentEvent::TerminalInputNeeded { task_id, notice }) => {
+                            saw_tool_activity = true;
                             set_session_runtime_state(
                                 state,
                                 session_id.as_str(),
                                 SessionRuntimeState::WaitingTerminalInput,
                             )
                             .await?;
+                            let current_terminal = state
+                                .runtime_service
+                                .get(session_id.as_str())
+                                .await?
+                                .interactions
+                                .terminal;
+                            set_terminal_runtime_state(
+                                state,
+                                session_id.as_str(),
+                                current_terminal.with_input_notice(task_id, notice),
+                            )
+                            .await?;
                         }
-                        let record = ToolEventRecord::End {
-                            id: id.clone(),
-                            name: name.clone(),
-                            result: result.clone(),
-                        };
-                        let serialized = serde_json::to_string(&record)
-                            .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
-                        turn_persister.push_tool_event(id.clone(), serialized);
-                        update_terminal_snapshot_from_tool_event(&mut terminal_snapshot, &record);
-                        let arguments = tool_arguments_by_id.remove(&id);
-                        let summary = project_tool_summary_for_sink(
-                            &pending_tool_streams,
-                            &id,
-                            &name,
-                            arguments.as_deref(),
-                        );
-                        pending_tool_streams.remove(&id);
-                        if !sink
-                            .on_tool_end(&id, &name, arguments.as_deref(), &result, summary)
-                            .await
-                        {
-                            cancellation_reason = Some("client disconnected during tool stream");
+                        Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
+                            terminal_error = Some(err);
                             break;
                         }
+                        Ok(_) => {}
+                    }
 
-                        // Check if tasks.md changed after tool execution.
-                        if let Some(checklist) =
-                            check_tasks_update(&tasks_db, &tasks_session_id, &mut last_todo_hash)
-                                .await
-                            && !sink.on_todo_update(&checklist).await
-                        {
-                            cancellation_reason = Some("client disconnected during todo update");
-                            break;
-                        }
-                    }
-                    Ok(aither_agent::AgentEvent::BackgroundTaskStarted {
-                        task_id,
-                        output_preview,
-                        output_file,
-                        reason,
-                    }) => {
-                        saw_tool_activity = true;
-                        set_terminal_runtime_state(
-                            state,
-                            session_id.as_str(),
-                            TerminalRuntimeState {
-                                task_id: Some(task_id),
-                                output_file: Some(output_file),
-                                output_preview: Some(output_preview),
-                                input_notice: None,
-                                background_reason: Some(reason),
-                            },
-                        )
-                        .await?;
-                    }
-                    Ok(aither_agent::AgentEvent::BackgroundTaskCompleted { .. }) => {
-                        saw_tool_activity = true;
-                        clear_terminal_runtime_state(state, session_id.as_str()).await?;
-                        set_session_runtime_state(
-                            state,
-                            session_id.as_str(),
-                            SessionRuntimeState::Running,
-                        )
-                        .await?;
-                    }
-                    Ok(aither_agent::AgentEvent::TerminalInputNeeded { task_id, notice }) => {
-                        saw_tool_activity = true;
-                        set_session_runtime_state(
-                            state,
-                            session_id.as_str(),
-                            SessionRuntimeState::WaitingTerminalInput,
-                        )
-                        .await?;
-                        let current_terminal = state
-                            .runtime_service
-                            .get(session_id.as_str())
-                            .await?
-                            .interactions
-                            .terminal;
-                        set_terminal_runtime_state(
-                            state,
-                            session_id.as_str(),
-                            current_terminal.with_input_notice(task_id, notice),
-                        )
-                        .await?;
-                    }
-                    Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
-                        terminal_error = Some(err);
+                    if is_takeover_active_for_session(state, &session_id).await {
+                        browser_takeover_paused = true;
                         break;
                     }
-                    Ok(_) => {}
-                }
-
-                if is_takeover_active_for_session(state, &session_id).await {
-                    browser_takeover_paused = true;
-                    break;
                 }
             }
-        }
 
-        // Browser takeover may have cancelled the stream before another agent
-        // event arrived, so classify the terminal state once more after the
-        // loop. This turns the immediate cancellation into a resumable
-        // takeover pause and preserves the post-takeover system alert.
-        if !browser_takeover_paused && is_takeover_active_for_session(state, &session_id).await {
-            browser_takeover_paused = true;
-            cancellation_reason = None;
-        }
+            // Browser takeover may have cancelled the stream before another agent
+            // event arrived, so classify the terminal state once more after the
+            // loop. This turns the immediate cancellation into a resumable
+            // takeover pause and preserves the post-takeover system alert.
+            if !browser_takeover_paused && is_takeover_active_for_session(state, &session_id).await
+            {
+                browser_takeover_paused = true;
+                cancellation_reason = None;
+            }
 
-        let log_base = RequestLogEntry::new(
-            session_id.as_str(),
-            &current_model,
-            &provider_id,
-            &usage,
-            model_context_window,
-        );
+            let log_base = RequestLogEntry::new(
+                session_id.as_str(),
+                &current_model,
+                &provider_id,
+                &usage,
+                model_context_window,
+            );
 
-        if browser_takeover_paused {
-            const TAKEOVER_PAUSED_MESSAGE: &str =
-                "Browser takeover is active for this session; model execution paused";
+            if browser_takeover_paused {
+                const TAKEOVER_PAUSED_MESSAGE: &str =
+                    "Browser takeover is active for this session; model execution paused";
 
-            persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
+                persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
+                if !segment_text.trim().is_empty() {
+                    turn_persister.push_assistant(segment_text.clone());
+                }
+
+                let has_assistant_text = !full_text.trim().is_empty();
+                let has_tool_activity =
+                    !terminal_snapshot.executions.is_empty() || saw_tool_activity;
+                if !has_assistant_text && has_tool_activity {
+                    turn_persister.push_assistant(String::new());
+                }
+
+                // Flush the entire turn atomically
+                turn_persister.flush(&state.db()).await?;
+                clear_terminal_runtime_state(state, session_id.as_str()).await?;
+
+                record_request_log(
+                    state,
+                    log_base.failure(elapsed_ms_saturating(&started_at), TAKEOVER_PAUSED_MESSAGE),
+                )
+                .await;
+                schedule_browser_takeover_resume(state, session_id.as_str()).await?;
+
+                return Err(AgentLoopError::BrowserTakeoverPaused(Box::new(
+                    AgentRunResult {
+                        assistant_id,
+                        full_text,
+                        reasoning_text,
+                        terminal_snapshot,
+                        usage,
+                        provider_id,
+                        model_context_window,
+                        elapsed_ms: elapsed_ms_saturating(&started_at),
+                    },
+                )));
+            }
+
+            // Handle terminal errors with provider failover.
+            if let Some(err) = terminal_error {
+                if err.is_retryable() && attempt < max_retries && full_text.trim().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(
+                        RETRY_BACKOFF_MS * (attempt as u64 + 1),
+                    ))
+                    .await;
+                    attempt += 1;
+                    continue;
+                }
+
+                let err_msg = err.to_string();
+                record_request_log(
+                    state,
+                    log_base.failure(elapsed_ms_saturating(&started_at), &err_msg),
+                )
+                .await;
+                let _ = sink
+                    .on_error(ApiErrorCode::InternalError, &err_msg, false)
+                    .await;
+                return Err(err.into());
+            }
+
+            if let Some(reason) = cancellation_reason {
+                if reason == "run cancelled by user" {
+                    let killed = agent.kill_running_terminal_jobs().await;
+                    tracing::info!(
+                        session_id = %session_id,
+                        killed,
+                        "stopped terminal jobs after user cancelled the run"
+                    );
+                    persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
+                }
+                if !segment_text.trim().is_empty() {
+                    turn_persister.push_assistant(segment_text.clone());
+                }
+                // Flush the entire turn atomically before returning
+                turn_persister.flush(&state.db()).await?;
+                record_request_log(
+                    state,
+                    log_base.failure(elapsed_ms_saturating(&started_at), reason),
+                )
+                .await;
+                return Err(AgentLoopError::Cancelled(reason));
+            }
+
+            // Buffer remaining text segment.
             if !segment_text.trim().is_empty() {
                 turn_persister.push_assistant(segment_text.clone());
             }
 
             let has_assistant_text = !full_text.trim().is_empty();
-            let has_tool_activity = !terminal_snapshot.executions.is_empty() || saw_tool_activity;
+            let has_terminal_output = !terminal_snapshot.executions.is_empty();
+            let has_tool_activity = has_terminal_output || saw_tool_activity;
+            if !has_assistant_text && !has_tool_activity {
+                let err = "Model returned an empty assistant response";
+                record_request_log(
+                    state,
+                    log_base.failure(elapsed_ms_saturating(&started_at), err),
+                )
+                .await;
+                let _ = sink.on_error(ApiErrorCode::InternalError, err, false).await;
+                return Err(AgentLoopError::EmptyAssistantResponse);
+            }
             if !has_assistant_text && has_tool_activity {
                 turn_persister.push_assistant(String::new());
             }
@@ -1712,127 +1827,35 @@ async fn run_agent_loop(
             turn_persister.flush(&state.db()).await?;
             clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
-            record_request_log(
+            let elapsed_ms = elapsed_ms_saturating(&started_at);
+            persist_latest_assistant_stats(
                 state,
-                log_base.failure(elapsed_ms_saturating(&started_at), TAKEOVER_PAUSED_MESSAGE),
+                &session_id,
+                &provider_id,
+                &usage,
+                model_context_window,
+                elapsed_ms,
             )
-            .await;
-            schedule_browser_takeover_resume(state, session_id.as_str()).await?;
+            .await?;
+            record_request_log(state, log_base.success(elapsed_ms)).await;
 
-            return Err(AgentLoopError::BrowserTakeoverPaused(Box::new(
-                AgentRunResult {
-                    assistant_id,
-                    full_text,
-                    reasoning_text,
-                    terminal_snapshot,
-                    usage,
-                    provider_id,
-                    model_context_window,
-                    elapsed_ms: elapsed_ms_saturating(&started_at),
-                },
-            )));
+            // Post-completion hooks
+            schedule_profile_memory_processing(state, profile_id.as_deref()).await;
+            title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
+            enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
+
+            return Ok(AgentRunResult {
+                assistant_id,
+                full_text,
+                reasoning_text,
+                terminal_snapshot,
+                usage,
+                provider_id,
+                model_context_window,
+                elapsed_ms,
+            });
         }
-
-        // Handle terminal errors with provider failover.
-        if let Some(err) = terminal_error {
-            if err.is_retryable() && attempt < max_retries && full_text.trim().is_empty() {
-                tokio::time::sleep(Duration::from_millis(
-                    RETRY_BACKOFF_MS * (attempt as u64 + 1),
-                ))
-                .await;
-                attempt += 1;
-                continue;
-            }
-
-            let err_msg = err.to_string();
-            record_request_log(
-                state,
-                log_base.failure(elapsed_ms_saturating(&started_at), &err_msg),
-            )
-            .await;
-            let _ = sink
-                .on_error(ApiErrorCode::InternalError, &err_msg, false)
-                .await;
-            return Err(err.into());
-        }
-
-        if let Some(reason) = cancellation_reason {
-            if reason == "run cancelled by user" {
-                let killed = agent.kill_running_terminal_jobs().await;
-                tracing::info!(
-                    session_id = %session_id,
-                    killed,
-                    "stopped terminal jobs after user cancelled the run"
-                );
-                persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
-            }
-            if !segment_text.trim().is_empty() {
-                turn_persister.push_assistant(segment_text.clone());
-            }
-            // Flush the entire turn atomically before returning
-            turn_persister.flush(&state.db()).await?;
-            record_request_log(
-                state,
-                log_base.failure(elapsed_ms_saturating(&started_at), reason),
-            )
-            .await;
-            return Err(AgentLoopError::Cancelled(reason));
-        }
-
-        // Buffer remaining text segment.
-        if !segment_text.trim().is_empty() {
-            turn_persister.push_assistant(segment_text.clone());
-        }
-
-        let has_assistant_text = !full_text.trim().is_empty();
-        let has_terminal_output = !terminal_snapshot.executions.is_empty();
-        let has_tool_activity = has_terminal_output || saw_tool_activity;
-        if !has_assistant_text && !has_tool_activity {
-            let err = "Model returned an empty assistant response";
-            record_request_log(
-                state,
-                log_base.failure(elapsed_ms_saturating(&started_at), err),
-            )
-            .await;
-            let _ = sink.on_error(ApiErrorCode::InternalError, err, false).await;
-            return Err(AgentLoopError::EmptyAssistantResponse);
-        }
-        if !has_assistant_text && has_tool_activity {
-            turn_persister.push_assistant(String::new());
-        }
-
-        // Flush the entire turn atomically
-        turn_persister.flush(&state.db()).await?;
-        clear_terminal_runtime_state(state, session_id.as_str()).await?;
-
-        let elapsed_ms = elapsed_ms_saturating(&started_at);
-        persist_latest_assistant_stats(
-            state,
-            &session_id,
-            &provider_id,
-            &usage,
-            model_context_window,
-            elapsed_ms,
-        )
-        .await?;
-        record_request_log(state, log_base.success(elapsed_ms)).await;
-
-        // Post-completion hooks
-        schedule_profile_memory_processing(state, profile_id.as_deref()).await;
-        title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
-        enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
-
-        return Ok(AgentRunResult {
-            assistant_id,
-            full_text,
-            reasoning_text,
-            terminal_snapshot,
-            usage,
-            provider_id,
-            model_context_window,
-            elapsed_ms,
-        });
-    }
+    })
 }
 
 async fn stream_chat_events(
@@ -1843,14 +1866,14 @@ async fn stream_chat_events(
 ) -> Result<(), crate::db::ChatDbError> {
     set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
     let mut sink = SseSink::new(sender.clone());
-    let result = Box::pin(run_agent_loop(
+    let result = run_agent_loop(
         &state,
         &req,
         &mut sink,
         run_registration.receiver(),
         true,
         true,
-    ))
+    )
     .await;
     let response_session_id = req.session_id.clone();
     match result {
@@ -1909,14 +1932,14 @@ async fn run_chat_collect_with_receiver(
         .map_err(internal_error)
         .map_err(ChatCollectError::from)?;
     let mut sink = CollectSink;
-    let result = Box::pin(run_agent_loop(
+    let result = run_agent_loop(
         &state,
         &req,
         &mut sink,
         cancel_rx,
         persist_user_message,
         use_persisted_context_snapshot,
-    ))
+    )
     .await;
     let takeover_paused = matches!(&result, Err(AgentLoopError::BrowserTakeoverPaused(_)));
     clear_running_state_if_needed(&state, &req.session_id)
@@ -2715,135 +2738,140 @@ fn build_tool_brokers(state: &Arc<UiServerState>, session_id: &SessionId) -> Too
     }
 }
 
-async fn prepare_agent_for_request(
-    state: &Arc<UiServerState>,
-    req: &ChatRequest,
+/// Resolves the session context and builds the agent for one chat turn.
+///
+/// Built on the heap for the reason given on [`run_agent_loop`].
+fn prepare_agent_for_request<'a>(
+    state: &'a Arc<UiServerState>,
+    req: &'a ChatRequest,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
     provider_attempt: usize,
-) -> Result<PreparedAgent, UiChatPreparationError> {
-    let ctx = Box::pin(resolve_session_context(
-        state,
-        req,
-        persist_user_message,
-        use_persisted_context_snapshot,
-    ))
-    .await?;
-    let (environment, location) = Box::pin(setup_agent_environment(state, &ctx)).await?;
-    let brokers = build_tool_brokers(state, &ctx.session_id);
+) -> Pin<Box<impl Future<Output = Result<PreparedAgent, UiChatPreparationError>> + 'a>> {
+    Box::pin(async move {
+        let ctx = Box::pin(resolve_session_context(
+            state,
+            req,
+            persist_user_message,
+            use_persisted_context_snapshot,
+        ))
+        .await?;
+        let (environment, location) = Box::pin(setup_agent_environment(state, &ctx)).await?;
+        let brokers = build_tool_brokers(state, &ctx.session_id);
 
-    let config = state.config_snapshot();
-    let mut agent = MayAgent::from_config_with_model_and_permissions(
-        &config,
-        crate::agent::MayAgentSessionInput {
-            sandbox_dir: ctx.sandbox_dir,
-            may_dir: state.may_dir.clone(),
-            cwd: state.cwd.clone(),
-            session_id: ctx.session_id.clone(),
-            workspace_request_broker: brokers.workspace,
-            ask_user_broker: brokers.ask_user,
-            db: state.db(),
-            model: &ctx.current_model,
-            reasoning_effort: ctx.reasoning_effort,
-            profile_id: ctx.profile_id.clone(),
-            permission_approver: Some(
-                state
-                    .permission_approver
-                    .for_session(ctx.session_id.as_str().to_string()),
-            ),
-            profile_persona: ctx.profile_persona,
-            profile_memories: ctx.profile_memories,
-            plan_state: ctx.plan_state,
-            location,
-            task_broker: Some(brokers.task),
-            notify_broker: Some(brokers.notify),
-            browser_broker: state.browser_manager().map(|_| brokers.browser),
-            register_skills_broker: Some(brokers.register_skills),
-            register_subagents_broker: Some(brokers.register_subagents),
-            environment,
-            tool_distribution: state.tool_distribution.clone(),
-            tool_environments: state.tool_environments.clone(),
-            provider_attempt,
-        },
-    )
-    .await
-    .map_err(UiChatPreparationError::BuildAgent)?;
+        let config = state.config_snapshot();
+        let mut agent = MayAgent::from_config_with_model_and_permissions(
+            &config,
+            crate::agent::MayAgentSessionInput {
+                sandbox_dir: ctx.sandbox_dir,
+                may_dir: state.may_dir.clone(),
+                cwd: state.cwd.clone(),
+                session_id: ctx.session_id.clone(),
+                workspace_request_broker: brokers.workspace,
+                ask_user_broker: brokers.ask_user,
+                db: state.db(),
+                model: &ctx.current_model,
+                reasoning_effort: ctx.reasoning_effort,
+                profile_id: ctx.profile_id.clone(),
+                permission_approver: Some(
+                    state
+                        .permission_approver
+                        .for_session(ctx.session_id.as_str().to_string()),
+                ),
+                profile_persona: ctx.profile_persona,
+                profile_memories: ctx.profile_memories,
+                plan_state: ctx.plan_state,
+                location,
+                task_broker: Some(brokers.task),
+                notify_broker: Some(brokers.notify),
+                browser_broker: state.browser_manager().map(|_| brokers.browser),
+                register_skills_broker: Some(brokers.register_skills),
+                register_subagents_broker: Some(brokers.register_subagents),
+                environment,
+                tool_distribution: state.tool_distribution.clone(),
+                tool_environments: state.tool_environments.clone(),
+                provider_attempt,
+            },
+        )
+        .await
+        .map_err(UiChatPreparationError::BuildAgent)?;
 
-    if let Some(snapshot) = ctx.context_snapshot.as_ref() {
-        // Try to restore from checkpoint with ID-based delta.
-        // If the snapshot anchor is stale, fall back to full history replay.
-        let db_messages = state
-            .db()
-            .get_messages(ctx.session_id.as_str())
-            .await
-            .map_err(UiChatPreparationError::LoadSession)?;
-        let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
-        if let Some(delta) = crate::session::history_delta_since_snapshot(
-            &ctx.history_messages,
-            &db_ids,
-            snapshot.last_message_db_id,
-        ) {
-            agent
-                .restore_checkpoint(snapshot.checkpoint.clone())
-                .map_err(UiChatPreparationError::RestoreCheckpoint)?;
-            for message in delta {
-                agent.push_message(message);
+        if let Some(snapshot) = ctx.context_snapshot.as_ref() {
+            // Try to restore from checkpoint with ID-based delta.
+            // If the snapshot anchor is stale, fall back to full history replay.
+            let db_messages = state
+                .db()
+                .get_messages(ctx.session_id.as_str())
+                .await
+                .map_err(UiChatPreparationError::LoadSession)?;
+            let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
+            if let Some(delta) = crate::session::history_delta_since_snapshot(
+                &ctx.history_messages,
+                &db_ids,
+                snapshot.last_message_db_id,
+            ) {
+                agent
+                    .restore_checkpoint(snapshot.checkpoint.clone())
+                    .map_err(UiChatPreparationError::RestoreCheckpoint)?;
+                for message in delta {
+                    agent.push_message(message);
+                }
+            } else {
+                tracing::warn!(
+                    session_id = %ctx.session_id.as_str(),
+                    "context snapshot anchor is stale, falling back to full history replay"
+                );
+                // Delete the stale snapshot so future requests don't hit this path
+                let _ = state
+                    .db()
+                    .delete_session_context_snapshot(ctx.session_id.as_str())
+                    .await;
+                for message in &ctx.history_messages {
+                    agent.push_message(message.clone());
+                }
             }
         } else {
-            tracing::warn!(
-                session_id = %ctx.session_id.as_str(),
-                "context snapshot anchor is stale, falling back to full history replay"
-            );
-            // Delete the stale snapshot so future requests don't hit this path
-            let _ = state
-                .db()
-                .delete_session_context_snapshot(ctx.session_id.as_str())
-                .await;
-            for message in &ctx.history_messages {
-                agent.push_message(message.clone());
+            for message in ctx.history_messages {
+                agent.push_message(message);
             }
         }
-    } else {
-        for message in ctx.history_messages {
-            agent.push_message(message);
-        }
-    }
 
-    let provider_id = agent.provider_id().to_string();
+        let provider_id = agent.provider_id().to_string();
 
-    let (prompt, attachments) =
-        Box::pin(build_prompt_and_attachments(state, req, &ctx.current_model))
-            .await
-            .map_err(UiChatPreparationError::BuildPrompt)?;
-    let preview_messages = agent
-        .preview_request_messages_with_hidden_context(
+        let (prompt, attachments) =
+            Box::pin(build_prompt_and_attachments(state, req, &ctx.current_model))
+                .await
+                .map_err(UiChatPreparationError::BuildPrompt)?;
+        let preview_messages = agent
+            .preview_request_messages_with_hidden_context(
+                &prompt,
+                ctx.hidden_context_xml.as_deref(),
+                attachments.iter().cloned(),
+            )
+            .await;
+        persist_context_debug_snapshot(
+            state,
+            &ctx.session_id,
+            &ctx.current_model,
+            &provider_id,
             &prompt,
-            ctx.hidden_context_xml.as_deref(),
-            attachments.iter().cloned(),
+            &attachments,
+            &preview_messages,
         )
-        .await;
-    persist_context_debug_snapshot(
-        state,
-        &ctx.session_id,
-        &ctx.current_model,
-        &provider_id,
-        &prompt,
-        &attachments,
-        &preview_messages,
-    )
-    .await
-    .map_err(UiChatPreparationError::PersistContextDebugSnapshot)?;
+        .await
+        .map_err(UiChatPreparationError::PersistContextDebugSnapshot)?;
 
-    Ok(PreparedAgent {
-        session_id: ctx.session_id,
-        agent,
-        current_model: ctx.current_model,
-        provider_id,
-        profile_id: ctx.profile_id,
-        hidden_context_xml: ctx.hidden_context_xml,
-        prompt,
-        attachments,
-        provider_candidate_count: ctx.provider_candidate_count,
+        Ok(PreparedAgent {
+            session_id: ctx.session_id,
+            agent,
+            current_model: ctx.current_model,
+            provider_id,
+            profile_id: ctx.profile_id,
+            hidden_context_xml: ctx.hidden_context_xml,
+            prompt,
+            attachments,
+            provider_candidate_count: ctx.provider_candidate_count,
+        })
     })
 }
 
