@@ -113,7 +113,7 @@ where
     let mut opts_builder = BuildImageOptionsBuilder::default().t(&spec.tag).rm(true);
 
     if let Some(ref dockerfile) = spec.dockerfile {
-        let relative = dockerfile_relative_to_context(dockerfile, &spec.context_dir)?;
+        let relative = dockerfile_relative_to_context(dockerfile, &spec.context_dir).await?;
         opts_builder = opts_builder.dockerfile(&relative);
     }
 
@@ -194,12 +194,18 @@ where
     build_image_with_progress(runtime, spec, on_progress).await
 }
 
-fn dockerfile_relative_to_context(
+/// Resolve `dockerfile` to the forward-slash path inside the build context
+/// that the build API expects, whatever the host's separator is.
+async fn dockerfile_relative_to_context(
     dockerfile: &Path,
     context_dir: &Path,
 ) -> Result<String, ContainerError> {
-    let context = context_dir.canonicalize()?;
-    let dockerfile_path = dockerfile.canonicalize()?;
+    let (context, dockerfile_path) = futures_lite::future::zip(
+        async_fs::canonicalize(context_dir),
+        async_fs::canonicalize(dockerfile),
+    )
+    .await;
+    let (context, dockerfile_path) = (context?, dockerfile_path?);
     let relative = dockerfile_path.strip_prefix(&context).map_err(|_| {
         ContainerError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -211,7 +217,18 @@ fn dockerfile_relative_to_context(
         ))
     })?;
 
-    Ok(relative.to_string_lossy().to_string())
+    let segments = relative
+        .components()
+        .map(|component| {
+            component.as_os_str().to_str().ok_or_else(|| {
+                ContainerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("dockerfile path {} is not UTF-8", relative.display()),
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(segments.join("/"))
 }
 
 /// Create a tar archive from a directory for the Docker build context.
@@ -224,4 +241,39 @@ fn create_tar_context(context_dir: &Path) -> Result<Vec<u8>, ContainerError> {
             "Failed to finalize tar archive: {e}"
         )))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nested_dockerfile_is_a_forward_slash_path_inside_the_context() {
+        let context = tempfile::TempDir::new().expect("context dir");
+        let nested = context.path().join("images").join("dev");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        let dockerfile = nested.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM scratch\n").expect("dockerfile");
+
+        let relative = dockerfile_relative_to_context(&dockerfile, context.path())
+            .await
+            .expect("dockerfile inside context");
+        assert_eq!(relative, "images/dev/Dockerfile");
+    }
+
+    #[tokio::test]
+    async fn dockerfile_outside_the_context_is_rejected() {
+        let context = tempfile::TempDir::new().expect("context dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let dockerfile = outside.path().join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM scratch\n").expect("dockerfile");
+
+        let error = dockerfile_relative_to_context(&dockerfile, context.path())
+            .await
+            .expect_err("dockerfile outside context must be rejected");
+        assert!(
+            error.to_string().contains("must be inside build context"),
+            "unexpected error: {error}"
+        );
+    }
 }
