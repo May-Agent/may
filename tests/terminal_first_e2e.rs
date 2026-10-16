@@ -685,7 +685,7 @@ impl RunningUiServer {
             // keeping failed assertions diagnosable from captured logs.
             .env(
                 "RUST_LOG",
-                "aither_openai::client=debug,may_agent::ui_server::chat=debug",
+                "aither_openai::client=debug,may_agent::ui_server::chat=debug,may_agent::container=debug",
             )
             .stdin(Stdio::null())
             .stdout(StdStdio::from(log_file))
