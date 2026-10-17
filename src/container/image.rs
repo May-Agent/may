@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use aither_sandbox::ContainerImageSpec;
-use bollard::query_parameters::{BuildImageOptionsBuilder, ListImagesOptionsBuilder};
 use blocking::unblock;
+use bollard::query_parameters::{BuildImageOptionsBuilder, ListImagesOptionsBuilder};
 use futures_lite::StreamExt;
 
 use super::{ContainerError, ContainerRuntime};
