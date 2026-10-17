@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use aither_sandbox::ContainerImageSpec;
 use bollard::query_parameters::{BuildImageOptionsBuilder, ListImagesOptionsBuilder};
+use blocking::unblock;
 use futures_lite::StreamExt;
 
 use super::{ContainerError, ContainerRuntime};
@@ -108,7 +109,8 @@ where
         format!("building image {}", spec.tag),
     ));
 
-    let tar_bytes = create_tar_context(&spec.context_dir)?;
+    let context_dir = spec.context_dir.clone();
+    let tar_bytes = unblock(move || create_tar_context(&context_dir)).await?;
 
     let mut opts_builder = BuildImageOptionsBuilder::default().t(&spec.tag).rm(true);
 
