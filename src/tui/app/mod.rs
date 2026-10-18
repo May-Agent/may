@@ -224,6 +224,8 @@ pub struct App {
     pub collapse_regions: Vec<super::ui::chat::ClickRegion>,
     /// Session background-job registry (set when the agent worker installs)
     pub job_registry: Option<aither_sandbox::JobRegistry>,
+    /// In-flight subagent runs for the session (list/cancel handle)
+    pub subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
     /// Latest job list shown in `AppMode::Jobs`
     pub jobs: Vec<aither_sandbox::JobInfo>,
     /// Selected row in `AppMode::Jobs`
@@ -401,6 +403,7 @@ impl App {
             render_top_padding: 0,
             collapse_regions: Vec::new(),
             job_registry: None,
+            subagent_runs: None,
             jobs: Vec::new(),
             jobs_selected: 0,
             jobs_refreshed: None,

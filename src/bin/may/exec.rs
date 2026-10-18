@@ -478,6 +478,7 @@ where
             register_skills_broker: None,
             register_subagents_broker: None,
             workspace_request_broker: None,
+            subagent_runs: aither_agent::specialized::SubagentRuns::default(),
             terminal_tool_factory: Some(terminal_tool_factory),
             // exec runs scripts without a model turn, so no provider-hosted
             // web tools exist here and the commands must stay registered.
