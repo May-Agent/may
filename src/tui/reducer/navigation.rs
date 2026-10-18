@@ -321,25 +321,59 @@ pub fn handle_help_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     None
 }
 
-/// Rewind picker: select a checkpoint and restore files to it.
+/// Number of restoration scopes the rewind picker offers.
+const REWIND_OPTIONS: usize = 2;
+
+/// Rewind picker: pick a prompt, then the restoration scope.
 pub fn handle_rewind_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let AppMode::Rewind(state) = &mut app.mode else {
         return None;
     };
+    if let Some(prompt_index) = state.options_for {
+        // Scope submenu: conversation only, or conversation and code.
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.option_selected = state.option_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if state.option_selected + 1 < REWIND_OPTIONS {
+                    state.option_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let restore_code = state.option_selected == 1;
+                let history_index = state.targets[prompt_index].history_index;
+                app.mode = AppMode::Chat;
+                return Some(SendAction::Rewind {
+                    history_index,
+                    restore_code,
+                });
+            }
+            KeyCode::Esc => {
+                state.options_for = None;
+                state.option_selected = 0;
+            }
+            _ => {}
+        }
+        return None;
+    }
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected = state.selected.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if state.selected + 1 < state.targets.len() {
+            // `targets.len()` is the trailing "(current)" entry.
+            if state.selected < state.targets.len() {
                 state.selected += 1;
             }
         }
         KeyCode::Enter => {
-            let target = state.targets[state.selected].tool_call_id.clone();
-            app.mode = AppMode::Chat;
-            if let Some(handle) = &app.file_diffs {
-                handle.request_rewind(&target);
+            if state.selected == state.targets.len() {
+                // "(current)": no rewind, just close.
+                app.mode = AppMode::Chat;
+            } else {
+                state.options_for = Some(state.selected);
+                state.option_selected = 0;
             }
         }
         KeyCode::Esc => {

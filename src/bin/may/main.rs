@@ -640,6 +640,7 @@ where
                     let is_esc = *key_code == KeyCode::Esc;
                     if is_ctrl_c || is_esc {
                         tracing::info!("Agent interrupted by user");
+                        app.last_esc_at = Some(std::time::Instant::now());
                         if let Some(handle) = agent_handle.take() {
                             handle.cancel();
                         }
@@ -682,6 +683,23 @@ where
                             purpose: WorkerBuildPurpose::Session,
                             build: runtime_deps.begin_load_session(app, worker, &id).await?,
                         });
+                    }
+                    Some(SendAction::Rewind {
+                        history_index,
+                        restore_code,
+                    }) => {
+                        if agent_handle.is_none() {
+                            worker_build = Some(WorkerBuild {
+                                purpose: WorkerBuildPurpose::Session,
+                                build: runtime_deps
+                                    .rewind_conversation(app, worker, history_index, restore_code)
+                                    .await?,
+                            });
+                        } else {
+                            app.chat.push_notice(
+                                "Wait for the current turn to finish before rewinding",
+                            );
+                        }
                     }
                     Some(SendAction::Send(msg)) => {
                         if agent_handle.is_none()

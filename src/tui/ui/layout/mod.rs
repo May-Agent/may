@@ -533,51 +533,141 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(list, popup_area);
 }
 
-/// Render the rewind checkpoint picker: every tool call that changed
-/// tracked files, oldest first. Enter restores files to the state before
-/// that call.
+/// Render the rewind picker. Stage one lists the session's user prompts
+/// with the file changes the turn each started produced, plus a trailing
+/// `(current)` entry; choosing a prompt opens stage two, which picks the
+/// restoration scope (conversation only, or conversation and code).
 fn render_rewind_popup(frame: &mut Frame, area: Rect, state: &RewindState) {
-    let popup_height = u16::try_from((state.targets.len() + 3).min(14)).unwrap_or(u16::MAX);
-    let popup_width = area.width.saturating_sub(8).clamp(40, 80);
+    if let Some(prompt_index) = state.options_for {
+        render_rewind_scope_popup(frame, area, state, prompt_index);
+        return;
+    }
+
+    let popup_height = u16::try_from((state.targets.len() * 2 + 4).min(18)).unwrap_or(u16::MAX);
+    let popup_width = area.width.saturating_sub(8).clamp(40, 88);
     let popup_area = centered_rect_exact(popup_width, popup_height, area);
 
     frame.render_widget(Clear, popup_area);
 
-    let items: Vec<ListItem> = state
-        .targets
+    let selected_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let normal_style = Style::default().fg(Color::White);
+    let mut items: Vec<ListItem> = Vec::with_capacity(state.targets.len() + 1);
+    for (idx, target) in state.targets.iter().enumerate() {
+        let prefix = if idx == state.selected { "> " } else { "  " };
+        let style = if idx == state.selected {
+            selected_style
+        } else {
+            normal_style
+        };
+        items.push(ListItem::new(vec![
+            Line::from(Span::styled(
+                format!("{prefix}{}", prompt_preview(&target.content)),
+                style,
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "    ± {} files (+{} −{})",
+                    target.files, target.additions, target.deletions
+                ),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]));
+    }
+    items.push(ListItem::new(Line::from(Span::styled(
+        if state.selected == state.targets.len() {
+            "> (current)"
+        } else {
+            "  (current)"
+        },
+        if state.selected == state.targets.len() {
+            selected_style
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+    ))));
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Rewind to before… (Enter select, Esc cancel)"),
+    );
+    frame.render_widget(list, popup_area);
+}
+
+/// First line of a prompt, truncated to one display row.
+fn prompt_preview(content: &str) -> String {
+    const MAX_CHARS: usize = 72;
+    let first = content.lines().next().unwrap_or_default().trim();
+    if first.chars().count() > MAX_CHARS {
+        let mut preview: String = first.chars().take(MAX_CHARS - 1).collect();
+        preview.push('…');
+        preview
+    } else {
+        first.to_string()
+    }
+}
+
+/// The two restoration scopes the rewind picker offers, with their hint line.
+const REWIND_SCOPE_OPTIONS: &[(&str, &str)] = &[
+    (
+        "Rewind conversation",
+        "messages only; keep the files as they are",
+    ),
+    (
+        "Rewind conversation and code",
+        "also restore tracked files to this prompt's checkpoint",
+    ),
+];
+
+/// Stage two of the rewind picker: how much of the turn to restore.
+fn render_rewind_scope_popup(
+    frame: &mut Frame,
+    area: Rect,
+    state: &RewindState,
+    prompt_index: usize,
+) {
+    let popup_height = 9u16;
+    let popup_width = area.width.saturating_sub(8).clamp(44, 72);
+    let popup_area = centered_rect_exact(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = REWIND_SCOPE_OPTIONS
         .iter()
         .enumerate()
-        .map(|(idx, target)| {
-            let prefix = if idx == state.selected { "> " } else { "  " };
-            let diff_stats = format!(
-                "± {} files (+{} −{})",
-                target.files, target.additions, target.deletions
-            );
-            let style = if idx == state.selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
+        .map(|(idx, (label, hint))| {
+            let selected = idx == state.option_selected;
             ListItem::new(vec![
                 Line::from(Span::styled(
-                    format!("{prefix}{}", target.command_preview),
-                    style,
+                    format!("{}{}", if selected { "> " } else { "  " }, label),
+                    if selected {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    },
                 )),
                 Line::from(Span::styled(
-                    format!("    {diff_stats}"),
+                    format!("    {hint}"),
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
         })
         .collect();
 
+    let prompt = state
+        .targets
+        .get(prompt_index)
+        .map_or_else(String::new, |t| prompt_preview(&t.content));
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
-            .title("Rewind to before… (Enter restore, Esc cancel)"),
+            .title(format!("{prompt} (Enter restore, Esc back)")),
     );
     frame.render_widget(list, popup_area);
 }
