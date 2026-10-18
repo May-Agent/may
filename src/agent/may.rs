@@ -252,6 +252,7 @@ pub struct MayAgent {
     model_context_window: Option<u32>,
     runtime_system_context: RuntimeSystemContext,
     job_registry: aither_sandbox::JobRegistry,
+    subagent_runs: aither_agent::specialized::SubagentRuns,
 }
 
 impl std::fmt::Debug for MayAgent {
@@ -301,6 +302,7 @@ impl MayAgent {
             .with_network_audit_log(network_audit)
             .with_process_priority(config.command_priority.process_priority());
         let job_registry = terminal_tool.job_registry();
+        let subagent_runs = aither_agent::specialized::SubagentRuns::default();
 
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
@@ -425,6 +427,7 @@ impl MayAgent {
                 workspace_request_broker: (!is_container)
                     .then_some(config.workspace_request_broker.clone()),
                 terminal_tool_factory: Some(terminal_command_factory),
+                subagent_runs: subagent_runs.clone(),
             },
         )
         .await?;
@@ -605,6 +608,7 @@ impl MayAgent {
             model_context_window: config.model_context_window,
             runtime_system_context,
             job_registry,
+            subagent_runs,
         })
     }
 
@@ -828,6 +832,13 @@ impl MayAgent {
         self.job_registry.clone()
     }
 
+    /// Registry of in-flight `subagent` command runs.
+    /// Cloneable handle — the TUI lists and cancels individual runs.
+    #[must_use]
+    pub fn subagent_runs(&self) -> aither_agent::specialized::SubagentRuns {
+        self.subagent_runs.clone()
+    }
+
     /// Selected provider ID for the current request.
     #[must_use]
     pub fn provider_id(&self) -> &str {
@@ -981,6 +992,7 @@ mod tests {
                 inner,
                 session_id,
                 job_registry,
+                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 sandbox_dir: temp.path().join("sandbox"),
                 provider_id: "chatgpt".to_string(),
                 model_context_window: None,
