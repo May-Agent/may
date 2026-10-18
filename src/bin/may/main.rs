@@ -375,6 +375,9 @@ where
     // Handle to a running agent task (if any)
     let mut agent_handle: Option<AgentHandle> = None;
 
+    // Handle to a `/context` measurement (deferred behind any running turn)
+    let mut context_handle: Option<AgentHandle> = None;
+
     // For title generation
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = String::new();
@@ -385,6 +388,7 @@ where
             Workspace(may_agent::workspace_request::WorkspaceRequest),
             WorkerBuilt(Box<Result<AgentWorker, may_agent::tui::runtime::TuiRuntimeError>>),
             Agent(TuiEvent),
+            Context(Option<TuiEvent>),
             Terminal(Box<AppEvent>),
         }
 
@@ -496,17 +500,29 @@ where
                                 futures_lite::future::pending().await
                             }
                         },
-                        async {
-                            let result = events.next().await;
-                            // Don't log ticks, too noisy
-                            if !matches!(result, Some(AppEvent::Tick)) {
-                                tracing::info!(
-                                    "events.next() RETURNED: {:?}",
-                                    result.as_ref().map(|_| "event")
-                                );
-                            }
-                            result.map(|event| Event::Terminal(Box::new(event)))
-                        },
+                        futures_lite::future::or(
+                            async {
+                                if let Some(ref handle) = context_handle {
+                                    // None means the report channel closed —
+                                    // surface it as an event so the handle is
+                                    // cleared instead of quitting the loop.
+                                    Some(Event::Context(handle.recv().await))
+                                } else {
+                                    futures_lite::future::pending().await
+                                }
+                            },
+                            async {
+                                let result = events.next().await;
+                                // Don't log ticks, too noisy
+                                if !matches!(result, Some(AppEvent::Tick)) {
+                                    tracing::info!(
+                                        "events.next() RETURNED: {:?}",
+                                        result.as_ref().map(|_| "event")
+                                    );
+                                }
+                                result.map(|event| Event::Terminal(Box::new(event)))
+                            },
+                        ),
                     ),
                 ),
             ),
@@ -520,6 +536,7 @@ where
                 Some(Event::Workspace(_)) => "Workspace",
                 Some(Event::WorkerBuilt(_)) => "WorkerBuilt",
                 Some(Event::Agent(_)) => "Agent",
+                Some(Event::Context(_)) => "Context",
                 Some(Event::Terminal(_)) => "Terminal",
                 None => "None",
             }
@@ -594,6 +611,10 @@ where
                                 .await;
                         }
                     }
+                    TuiEvent::ContextReport(_) => {
+                        // Reports arrive on the context channel; the agent
+                        // channel only carries them if the channels raced.
+                    }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {
                             app.status =
@@ -627,6 +648,18 @@ where
                             )
                             .await;
                     }
+                }
+            }
+
+            Event::Context(event) => {
+                context_handle = None;
+                match event {
+                    Some(TuiEvent::ContextReport(report)) => {
+                        app.chat.push_context_report(report);
+                        app.scroll = usize::MAX;
+                    }
+                    Some(TuiEvent::Error(err)) => app.chat.push_error(&err),
+                    _ => {}
                 }
             }
 
@@ -802,6 +835,16 @@ where
                             }
                         } else {
                             app.status = Some("Agent is busy".to_string());
+                        }
+                    }
+                    Some(SendAction::ContextReport) => {
+                        if let Some(w) = worker.as_ref() {
+                            if context_handle.is_none() {
+                                context_handle = Some(w.context_report());
+                            }
+                        } else {
+                            app.chat
+                                .push_notice("Agent is still starting — try again in a moment");
                         }
                     }
                     Some(SendAction::McpAdd {

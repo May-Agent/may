@@ -83,6 +83,16 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub subagent_tracker: SubagentTracker,
 }
 
+/// What [`register_shared_terminal_commands`] installed.
+#[derive(Debug, Default)]
+pub struct SharedTerminalCommands {
+    /// `(name, short description)` pairs for every registered command, in
+    /// registration order — rendered into the base-system `<commands>` index.
+    pub descriptions: Vec<(String, String)>,
+    /// Names of commands backed by MCP connections.
+    pub mcp_command_names: Vec<String>,
+}
+
 /// Register every shared IPC command on the terminal tool's command registry.
 ///
 /// # Errors
@@ -90,7 +100,7 @@ pub struct SharedTerminalCommandConfig<LLM> {
 pub async fn register_shared_terminal_commands<LLM>(
     builder: &mut ToolRegistryBuilder,
     config: SharedTerminalCommandConfig<LLM>,
-) -> Result<Vec<(String, String)>, crate::mcp::McpConnectionLoadError>
+) -> Result<SharedTerminalCommands, crate::mcp::McpConnectionLoadError>
 where
     LLM: LanguageModel + Clone + 'static,
 {
@@ -220,9 +230,11 @@ where
     };
     register_tool_with_description(builder, &mut descriptions, subagent_tool);
 
+    let mut mcp_command_names = Vec::new();
     for connection in load_active_mcp_connections(&config.may_dir).await? {
         let definitions = aither_mcp::register_terminal_commands(builder, connection);
         descriptions.extend(definitions.into_iter().map(|definition| {
+            mcp_command_names.push(definition.name().to_string());
             (
                 definition.name().to_string(),
                 short_description(definition.description()),
@@ -230,7 +242,10 @@ where
         }));
     }
 
-    Ok(descriptions)
+    Ok(SharedTerminalCommands {
+        descriptions,
+        mcp_command_names,
+    })
 }
 
 fn to_search_embedding_resolution(
@@ -354,7 +369,8 @@ mod tests {
             },
         )
         .await
-        .expect("commands should register");
+        .expect("commands should register")
+        .descriptions;
 
         let registry = builder.build(session_dir.join("outputs"));
         assert!(registry.is_tool_configured("ask_user"));
@@ -404,7 +420,8 @@ mod tests {
             },
         )
         .await
-        .expect("commands should register");
+        .expect("commands should register")
+        .descriptions;
 
         let registry = builder.build(session_dir.join("outputs"));
         assert!(!registry.is_tool_configured("ask_user"));
@@ -458,7 +475,8 @@ mod tests {
             },
         )
         .await
-        .expect("commands should register");
+        .expect("commands should register")
+        .descriptions;
 
         let registry = builder.build(session_dir.join("outputs"));
         assert!(!registry.is_tool_configured("websearch"));
@@ -500,7 +518,8 @@ mod tests {
             },
         )
         .await
-        .expect("commands should register");
+        .expect("commands should register")
+        .descriptions;
 
         let registry = builder.build(session_dir.join("outputs"));
         assert!(registry.is_tool_configured("websearch"));
