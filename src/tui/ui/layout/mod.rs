@@ -94,8 +94,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .map(|pt| (u64::from(pt), app.context_window.map(u64::from)))
     });
 
-    // Live decode rate for status (only while a response streams)
-    let decode_rate = (app.processing && app.config.preferences.show_decode_speed)
+    // Decode rate for the status bar: live while a response streams, then
+    // frozen at the finished turn's average until the next turn resets it.
+    let decode_rate = app
+        .config
+        .preferences
+        .show_decode_speed
         .then(|| app.decode_meter.rate())
         .flatten();
 
@@ -139,6 +143,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 decode_rate,
                 status_message: app.status.as_deref(),
                 profile_name: app.current_profile_name(),
+                spinner_frame: app.spinner_frame,
             }),
             images_supported,
             image_positions_out: Some(&mut image_positions),
@@ -162,6 +167,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         decode_rate,
         status_message: app.status.as_deref(),
         profile_name: app.current_profile_name(),
+        spinner_frame: app.spinner_frame,
     };
     let mut collapse_regions = Vec::new();
     let plain_all_lines = chat::build_plain_wrapped_lines_unified(

@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use ratatui::Frame;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::queue::Attachment;
 use super::markdown;
@@ -756,6 +756,8 @@ pub struct StatusContext<'a> {
     pub status_message: Option<&'a str>,
     /// Current profile name (shown in status bar).
     pub profile_name: Option<&'a str>,
+    /// Animation frame counter for the processing spinner.
+    pub spinner_frame: usize,
 }
 
 /// Queued message context for rendering queue indicator.
@@ -862,7 +864,7 @@ pub fn build_plain_wrapped_lines_unified(
         render_input_line(&mut tail, &ctx);
     }
     if let Some(ctx) = status_ctx {
-        render_status_line(&mut tail, ctx);
+        render_status_line(&mut tail, ctx, max_width);
     }
     for line in tail {
         out.append(&mut wrap_plain_line(&plain_text(&line), max_width));
@@ -1415,7 +1417,7 @@ fn render_impl(
 
     // Render status bar if provided
     if let Some(ref ctx) = status_ctx {
-        render_status_line(&mut lines, ctx);
+        render_status_line(&mut lines, ctx, area.width as usize);
     }
 
     // Export collected image positions for overlay rendering
@@ -1569,8 +1571,12 @@ fn render_queue_lines(lines: &mut Vec<Line<'_>>, ctx: &QueueContext<'_>, width: 
     }
 }
 
-/// Render the status bar into the lines vector.
-fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>) {
+/// Spinner glyphs cycled by `spinner_frame` while a run is in flight.
+const SPINNER_FRAMES: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
+
+/// Render the status bar into the lines vector. `width` is the render width;
+/// context usage is pinned to the right edge.
+fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width: usize) {
     // If there's a status message (like Ctrl+C hint), show it prominently
     if let Some(status) = ctx.status_message {
         lines.push(Line::from(Span::styled(
@@ -1591,20 +1597,6 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>) {
 
     parts.push(ctx.model.to_string());
 
-    // Add token usage info
-    if let Some((prompt_tokens, context_window)) = ctx.usage {
-        let used = format_number(usize::try_from(prompt_tokens).unwrap_or(usize::MAX));
-        if let Some(window) = context_window {
-            parts.push(format!(
-                "{}/{}",
-                used,
-                format_number(usize::try_from(window).unwrap_or(usize::MAX))
-            ));
-        } else {
-            parts.push(format!("{used}tok"));
-        }
-    }
-
     if let Some(rate) = ctx.decode_rate {
         if rate >= 100.0 {
             parts.push(format!("{rate:.0} tok/s"));
@@ -1622,15 +1614,37 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>) {
     }
 
     if ctx.processing {
-        parts.push("...".to_string());
+        parts.push(SPINNER_FRAMES[ctx.spinner_frame % SPINNER_FRAMES.len()].to_string());
     }
 
-    let status_text = parts.join(" | ");
+    // Context usage pinned to the right edge: `4.8K/1M`.
+    let usage_text = ctx.usage.map(|(prompt_tokens, context_window)| {
+        let used = format_number(usize::try_from(prompt_tokens).unwrap_or(usize::MAX));
+        match context_window {
+            Some(window) => format!(
+                "{}/{}",
+                used,
+                format_number(usize::try_from(window).unwrap_or(usize::MAX))
+            ),
+            None => used,
+        }
+    });
 
-    lines.push(Line::from(Span::styled(
-        status_text,
-        Style::default().fg(Color::Cyan),
-    )));
+    let status_text = parts.join(" | ");
+    let status_style = Style::default().fg(Color::Cyan);
+
+    if let Some(usage_text) = usage_text {
+        let pad = width
+            .saturating_sub(status_text.width() + usage_text.width())
+            .max(1);
+        lines.push(Line::from(vec![
+            Span::styled(status_text, status_style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(usage_text, status_style),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(status_text, status_style)));
+    }
 }
 
 /// Format large numbers with K/M suffix for readability.

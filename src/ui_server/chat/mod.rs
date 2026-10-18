@@ -422,15 +422,13 @@ impl ChatSink for CollectSink {
 /// Interval between `speed` events so fast providers don't flood the stream.
 const SPEED_EMIT_INTERVAL: Duration = Duration::from_millis(300);
 
-/// Feed streamed output bytes into `meter` and emit a `speed` event when the
-/// interval has elapsed. Returns the sink liveness flag, like the `on_*` calls.
-async fn note_output_and_emit_speed(
+/// Emit a `speed` event when the interval has elapsed and the meter has a
+/// stable reading. Returns the sink liveness flag, like the `on_*` calls.
+async fn emit_speed(
     sink: &mut impl ChatSink,
-    meter: &mut DecodeMeter,
+    meter: &DecodeMeter,
     last_emit: &mut Option<Instant>,
-    bytes: usize,
 ) -> bool {
-    meter.note_output(bytes);
     if last_emit.is_some_and(|t| t.elapsed() < SPEED_EMIT_INTERVAL) {
         return true;
     }
@@ -1441,14 +1439,8 @@ fn run_agent_loop<'a>(
                                     Some("client disconnected during reasoning stream");
                                 break;
                             }
-                            if !note_output_and_emit_speed(
-                                sink,
-                                &mut decode_meter,
-                                &mut last_speed_emit,
-                                text.len(),
-                            )
-                            .await
-                            {
+                            decode_meter.note_output(text.len());
+                            if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
                                 cancellation_reason =
                                     Some("client disconnected during reasoning stream");
                                 break;
@@ -1475,14 +1467,8 @@ fn run_agent_loop<'a>(
                                     Some("client disconnected during text stream");
                                 break;
                             }
-                            if !note_output_and_emit_speed(
-                                sink,
-                                &mut decode_meter,
-                                &mut last_speed_emit,
-                                text.len(),
-                            )
-                            .await
-                            {
+                            decode_meter.note_output(text.len());
+                            if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
                                 cancellation_reason =
                                     Some("client disconnected during text stream");
                                 break;
@@ -1511,14 +1497,8 @@ fn run_agent_loop<'a>(
                                 fragment = %arguments_fragment,
                                 "incoming ToolCallDelta from aither"
                             );
-                            if !note_output_and_emit_speed(
-                                sink,
-                                &mut decode_meter,
-                                &mut last_speed_emit,
-                                arguments_fragment.len(),
-                            )
-                            .await
-                            {
+                            decode_meter.note_tool_delta(&id, &arguments_fragment);
+                            if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
                                 cancellation_reason =
                                     Some("client disconnected during tool stream");
                                 break;
