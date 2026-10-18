@@ -180,6 +180,23 @@ impl LocalSessionRuntime {
         self.replace_app_queue(app, runtime).await
     }
 
+    /// Drop every persisted pending message for a session and refresh the
+    /// app's queue view. Rewind discards them with the rest of the future.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
+    pub async fn clear_pending(
+        &self,
+        app: &mut App,
+        session_id: &SessionId,
+    ) -> Result<(), TuiRuntimeError> {
+        let runtime = self
+            .runtime_service
+            .clear_pending_messages(session_id.as_str())
+            .await?;
+        self.replace_app_queue(app, runtime).await
+    }
+
     /// Append a message to the pending queue and sync the app state.
     ///
     /// # Errors
@@ -828,9 +845,13 @@ impl RuntimeDeps {
                 .await?;
         }
 
-        app.session_manager
+        let user_message_id = app
+            .session_manager
             .append_message(ChatMessage::user(&msg.content))
             .await?;
+        // Checkpoint the code at this prompt boundary so a later
+        // conversation-and-code rewind can restore it.
+        app.request_prompt_mark(user_message_id);
 
         let (prompt, image_urls) = prepare_message_content(&msg)?;
         app.start_processing(&msg);
@@ -889,6 +910,70 @@ impl RuntimeDeps {
                 assistant_response.to_string(),
             );
         }
+    }
+
+    /// Rewind the conversation to just before the user message at
+    /// `history_index`, optionally restoring tracked files to that
+    /// prompt's checkpoint, then start building a worker that replays the
+    /// truncated history.
+    ///
+    /// The prompt's text and attachments are placed back in the input for
+    /// editing; pending queued messages are dropped with the abandoned
+    /// timeline; the current worker is dropped since its context still
+    /// holds it.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when `history_index` does not identify
+    /// a user prompt, the persisted history cannot be truncated, or the
+    /// worker build cannot start.
+    pub async fn rewind_conversation(
+        &self,
+        app: &mut App,
+        worker: &mut Option<AgentWorker>,
+        history_index: usize,
+        restore_code: bool,
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        let Some((content, attachments, call_ids)) = app.chat.prompt_rewind_payload(history_index)
+        else {
+            return Err(crate::session::SessionError::NotFound(format!(
+                "no prompt at history position {history_index}"
+            ))
+            .into());
+        };
+        let point = app.session_manager.rewind_to_prompt(history_index).await?;
+
+        let session = app
+            .session_manager
+            .current()
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
+        let session_id = session.id.clone();
+        let sandbox_dir = session.sandbox_dir.clone();
+        let model = session.model.clone();
+
+        self.local_runtime.clear_pending(app, &session_id).await?;
+
+        if restore_code {
+            app.request_prompt_rewind(point.user_message_id, call_ids);
+        }
+
+        app.chat.truncate_prompt_at(history_index);
+        app.input = content;
+        app.input_char_count = app.input.chars().count();
+        app.cursor = app.input_char_count;
+        app.attachments = attachments;
+        app.chat.push_notice(&format!(
+            "⏪ rewound to before this prompt{}",
+            if restore_code {
+                " (conversation + code)"
+            } else {
+                " (conversation)"
+            }
+        ));
+        app.scroll = usize::MAX;
+
+        *worker = None;
+        let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
     }
 
     fn begin_worker_build(
@@ -1291,7 +1376,7 @@ async fn build_worker_for_session(
         crate::session::load_persisted_context_snapshot(&db, &session_id_string).await?
     {
         let db_messages = db.get_messages(&session_id_string).await?;
-        let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
+        let db_ids = crate::session::llm_row_ids(&db_messages);
         if let Some(delta) = crate::session::history_delta_since_snapshot(
             &history_messages,
             &db_ids,

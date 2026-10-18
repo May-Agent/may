@@ -164,6 +164,19 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Drop every pending message for a session.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn clear_pending_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self.db.clear_pending_messages(session_id).await?;
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
+        Ok(summary)
+    }
+
     /// Remove the queued message at `index`.
     ///
     /// # Errors
