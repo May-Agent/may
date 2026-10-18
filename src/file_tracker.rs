@@ -162,6 +162,29 @@ impl FileChangeTracker {
         Ok(true)
     }
 
+    /// Diff every root's worktree against its stored baseline WITHOUT
+    /// advancing baselines or recording checkpoints — a live view of the
+    /// running call's pending changes. The `snapshot` at call end still
+    /// attributes the same changes once.
+    #[must_use]
+    pub fn preview(&self) -> Vec<RootDiff> {
+        let mut diffs = Vec::new();
+        for root in &self.roots {
+            match preview_root(root) {
+                Ok(Some(diff)) => diffs.push(diff),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        worktree = %root.worktree.display(),
+                        %error,
+                        "file diff preview failed for root"
+                    );
+                }
+            }
+        }
+        diffs
+    }
+
     /// Advance every root's baseline and return the diffs accumulated since
     /// the previous snapshot, attributed to `tool_call_id`. Each change also
     /// records a rewind checkpoint: the tree the call started from.
@@ -372,17 +395,34 @@ fn snapshot_root(
     if tree == root.tree {
         return Ok(None);
     }
+    let diff = baseline_diff(root, &tree)?;
+    record_checkpoint(root, &root.tree, tool_call_id)?;
+    std::fs::write(root.git_dir.join(BASE_FILE), &tree)?;
+    root.tree = tree;
+    Ok(diff)
+}
+
+/// Refresh `root`'s index and diff the worktree against the stored baseline,
+/// leaving the baseline and checkpoints untouched.
+fn preview_root(root: &TrackedRoot) -> Result<Option<RootDiff>, TrackerError> {
+    let tree = write_tree(&root.git_dir, &root.worktree)?;
+    if tree == root.tree {
+        return Ok(None);
+    }
+    baseline_diff(root, &tree)
+}
+
+/// Diff `tree` against `root`'s stored baseline. `None` when the diff body is
+/// empty (e.g. mode-only churn the display cannot show).
+fn baseline_diff(root: &TrackedRoot, tree: &str) -> Result<Option<RootDiff>, TrackerError> {
     let text =
-        run_git(&root.git_dir, &root.worktree, &["diff", &root.tree, &tree]).map_err(|stderr| {
+        run_git(&root.git_dir, &root.worktree, &["diff", &root.tree, tree]).map_err(|stderr| {
             TrackerError::Command {
                 args: format!("diff {} {tree}", root.tree),
                 worktree: root.worktree.display().to_string(),
                 stderr,
             }
         })?;
-    record_checkpoint(root, &root.tree, tool_call_id)?;
-    std::fs::write(root.git_dir.join(BASE_FILE), &tree)?;
-    root.tree = tree;
     if text.is_empty() {
         // Tree hash changed without a visible diff (e.g. mode-only changes
         // on filesystems that normalize them) — nothing to show.
@@ -592,6 +632,45 @@ mod tests {
         let (_temp, _worktree, mut tracker) = tracker();
         assert!(snap(&mut tracker, "call-1").is_empty());
         assert!(snap(&mut tracker, "call-1").is_empty());
+    }
+
+    #[test]
+    fn preview_shows_pending_diff_without_moving_baseline() {
+        let (_temp, worktree, mut tracker) = tracker();
+
+        // No changes yet — nothing pending.
+        assert!(tracker.preview().is_empty());
+
+        fs::write(worktree.join("a.txt"), "one\n").expect("write");
+        let first = tracker.preview();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].files, 1);
+        assert_eq!(first[0].additions, 1);
+
+        // The baseline did not move: a second preview shows the same
+        // cumulative diff, not an incremental slice.
+        assert_eq!(tracker.preview().len(), 1);
+
+        // More changes accumulate into the same preview.
+        fs::write(worktree.join("a.txt"), "one\ntwo\n").expect("rewrite");
+        let second = tracker.preview();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].additions, 2);
+
+        // The final snapshot attributes the whole diff to the call once —
+        // previews never recorded a checkpoint, so the call's own snapshot
+        // is still the rewind anchor.
+        let diffs = snap(&mut tracker, "call-1");
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].additions, 2);
+
+        // Baseline advanced now; nothing pending.
+        assert!(tracker.preview().is_empty());
+
+        // Rewind restores the pre-call state even though previews ran.
+        let reverted = rewind_calls(&mut tracker, &["call-1"]);
+        assert_eq!(reverted.len(), 1);
+        assert!(!worktree.join("a.txt").exists());
     }
 
     #[test]

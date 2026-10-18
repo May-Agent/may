@@ -816,6 +816,7 @@ impl RuntimeDeps {
         app.job_registry = Some(new_worker.job_registry().clone());
         app.subagent_runs = Some(new_worker.subagent_runs().clone());
         app.btw_llm = Some(new_worker.btw_llm().clone());
+        app.subagent_tracker = new_worker.subagent_tracker().clone();
         *worker = Some(new_worker);
     }
 

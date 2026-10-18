@@ -657,10 +657,34 @@ impl ChatStream {
         }
     }
 
-    /// In-flight `subagent` invocations — running terminal calls whose
-    /// script invokes the subagent command. Returns `(id, agent, preview)`.
+    /// Attach file diffs to a terminal tool call.
+    pub fn update_tool_diff(&mut self, id: &str, diffs: Vec<crate::file_tracker::RootDiff>) {
+        for elem in &mut self.elements {
+            if let ChatElement::ToolCall {
+                id: tool_id,
+                display: ToolDisplay::Terminal { diffs: slot, .. },
+            } = elem
+                && tool_id == id
+            {
+                *slot = diffs;
+                break;
+            }
+        }
+    }
+
+    /// Whether the given tool call is still running.
     #[must_use]
-    pub fn running_subagents(&self) -> Vec<(String, String, String)> {
+    pub fn is_tool_running(&self, id: &str) -> bool {
+        self.elements.iter().any(|elem| {
+            matches!(elem, ChatElement::ToolCall { id: tool_id, display }
+                if tool_id == id && matches!(display.status(), ToolStatus::Running))
+        })
+    }
+
+    /// Running `terminal`-displayed calls as `(call id, command)` pairs —
+    /// the callers that can be bound to a job-registry entry for live output.
+    #[must_use]
+    pub fn running_terminal_calls(&self) -> Vec<(String, String)> {
         self.elements
             .iter()
             .filter_map(|elem| {
@@ -676,18 +700,7 @@ impl ChatStream {
                 else {
                     return None;
                 };
-                let mut words = command.split_whitespace();
-                if words.next() != Some("subagent") {
-                    return None;
-                }
-                let agent = words.next().unwrap_or("?").to_string();
-                let preview = words.collect::<Vec<_>>().join(" ");
-                let preview = preview
-                    .trim_matches('"')
-                    .chars()
-                    .take(60)
-                    .collect::<String>();
-                Some((id.clone(), agent, preview))
+                Some((id.clone(), command.clone()))
             })
             .collect()
     }
@@ -725,16 +738,28 @@ impl ChatStream {
         }
     }
 
-    /// Attach file diffs to a terminal tool call.
-    pub fn update_tool_diff(&mut self, id: &str, diffs: Vec<crate::file_tracker::RootDiff>) {
+    /// Append live output to a running terminal call's buffer. Creates the
+    /// `TerminalCallInfo` on first chunk; the running renderer already shows
+    /// `output` mid-run.
+    pub fn append_tool_output(&mut self, id: &str, chunk: &str) {
         for elem in &mut self.elements {
             if let ChatElement::ToolCall {
                 id: tool_id,
-                display: ToolDisplay::Terminal { diffs: slot, .. },
+                display:
+                    ToolDisplay::Terminal {
+                        command, output, ..
+                    },
             } = elem
                 && tool_id == id
             {
-                *slot = diffs;
+                match output {
+                    Some(info) => info.output.push_str(chunk),
+                    None => {
+                        *output = Some(
+                            TerminalCallInfo::new(command.clone()).with_output(chunk.to_string()),
+                        );
+                    }
+                }
                 break;
             }
         }
@@ -834,6 +859,17 @@ pub struct InputContext<'a> {
     pub attachments: &'a [Attachment],
 }
 
+/// One running background entry shown compactly in the status bar.
+#[derive(Debug)]
+pub struct StatusBackgroundItem {
+    /// Short label — subagent name or first command line.
+    pub label: String,
+    /// `true` for a `subagent` run, `false` for a terminal job.
+    pub subagent: bool,
+    /// Seconds since it started.
+    pub elapsed_secs: u64,
+}
+
 /// Status bar rendering context for combined view.
 #[derive(Debug)]
 pub struct StatusContext<'a> {
@@ -843,8 +879,8 @@ pub struct StatusContext<'a> {
     pub usage: Option<(u64, Option<u64>)>,
     /// Queued message count.
     pub queue_count: usize,
-    /// Background task count.
-    pub background_tasks: usize,
+    /// Running background entries (subagents and jobs).
+    pub background: &'a [StatusBackgroundItem],
     /// Whether currently processing.
     pub processing: bool,
     /// Live decode rate in tokens per second, when measurable.
@@ -1884,8 +1920,20 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         parts.push(format!("Q:{}", ctx.queue_count));
     }
 
-    if ctx.background_tasks > 0 {
-        parts.push(format!("BG:{}", ctx.background_tasks));
+    for item in ctx.background.iter().take(3) {
+        let icon = if item.subagent { "◉" } else { "●" };
+        parts.push(format!(
+            "{icon} {} {}",
+            item.label,
+            format_elapsed(item.elapsed_secs)
+        ));
+    }
+    let hidden = ctx.background.len().saturating_sub(3);
+    if hidden > 0 {
+        parts.push(format!("+{hidden}"));
+    }
+    if !ctx.background.is_empty() {
+        parts.push("↓ jobs".to_string());
     }
 
     if ctx.processing {
@@ -1922,8 +1970,20 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
     }
 }
 
+/// Format an elapsed duration compactly (`45s`, `2m05s`, `1h03m`).
+#[must_use]
+pub(crate) fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// Format large numbers with K/M suffix for readability.
-fn format_number(n: usize) -> String {
+pub(crate) fn format_number(n: usize) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
@@ -2402,7 +2462,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
+        ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
         build_plain_wrapped_lines_unified, render_input_line, render_tool_inline,
         terminal_mode_marker,
     };
@@ -2411,6 +2471,50 @@ mod tests {
     use aither_sandbox::TerminalExecutionMode;
     use ratatui::text::Line;
     use std::path::PathBuf;
+
+    #[test]
+    fn live_output_appends_to_running_terminal_call() {
+        let mut stream = ChatStream::new();
+        stream.push_tool(
+            "call-1".to_string(),
+            ToolDisplay::Terminal {
+                command: "echo hi".to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                expanded: false,
+            },
+        );
+
+        assert_eq!(
+            stream.running_terminal_calls(),
+            vec![("call-1".to_string(), "echo hi".to_string())]
+        );
+        assert!(stream.is_tool_running("call-1"));
+
+        stream.append_tool_output("call-1", "he");
+        stream.append_tool_output("call-1", "llo\nwor");
+        stream.append_tool_output("call-1", "ld\n");
+
+        let Some(ChatElement::ToolCall { display, .. }) = stream.elements.first() else {
+            panic!("tool call missing");
+        };
+        let ToolDisplay::Terminal {
+            output: Some(info), ..
+        } = display
+        else {
+            panic!("streamed output missing");
+        };
+        assert_eq!(info.command, "echo hi");
+        assert_eq!(info.output, "hello\nworld\n");
+
+        // A finished call leaves the running list and stops accepting
+        // late deltas via the running-only path.
+        stream.update_tool_with_output("call-1", ToolStatus::Done, None, Some("hello\nworld\n"));
+        assert_eq!(stream.running_terminal_calls(), Vec::new());
+        assert!(!stream.is_tool_running("call-1"));
+    }
 
     #[test]
     fn terminal_mode_marker_covers_every_backend() {

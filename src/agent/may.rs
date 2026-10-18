@@ -255,6 +255,7 @@ pub struct MayAgent {
     subagent_runs: aither_agent::specialized::SubagentRuns,
     /// Model clone reserved for `/btw` side questions.
     btw_llm: RequestParameterizedModel<CloudProvider>,
+    subagent_tracker: crate::agent::subagent_tracker::SubagentTracker,
 }
 
 impl std::fmt::Debug for MayAgent {
@@ -406,10 +407,12 @@ impl MayAgent {
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook);
         let terminal_command_factory = builder.terminal_tool_factory();
+        let subagent_tracker = crate::agent::subagent_tracker::SubagentTracker::default();
         let shared_terminal_commands = register_shared_terminal_commands(
             builder.tool_registry_mut(),
             SharedTerminalCommandConfig {
                 llm: terminal_command_llm,
+                subagent_tracker: subagent_tracker.clone(),
                 ask_flagship,
                 ask_balanced,
                 ask_fast,
@@ -615,6 +618,7 @@ impl MayAgent {
             job_registry,
             subagent_runs,
             btw_llm,
+            subagent_tracker,
         })
     }
 
@@ -852,6 +856,13 @@ impl MayAgent {
         self.btw_llm.clone()
     }
 
+    /// Tracker shared with this session's `subagent` IPC command — the TUI
+    /// reads live per-run stats off it for the jobs panel and status bar.
+    #[must_use]
+    pub fn subagent_tracker(&self) -> crate::agent::subagent_tracker::SubagentTracker {
+        self.subagent_tracker.clone()
+    }
+
     /// Selected provider ID for the current request.
     #[must_use]
     pub fn provider_id(&self) -> &str {
@@ -1011,6 +1022,7 @@ mod tests {
                 provider_id: "chatgpt".to_string(),
                 model_context_window: None,
                 runtime_system_context: RuntimeSystemContext::new(db, String::new()),
+                subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
             },
             temp,
         )

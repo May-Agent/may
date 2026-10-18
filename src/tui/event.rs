@@ -77,6 +77,15 @@ pub enum AppEvent {
         /// Whether the registry reported the job killed.
         ok: bool,
     },
+    /// Output fetch for the job open in `AppMode::JobDetail` finished.
+    JobDetailLoaded {
+        /// Refreshed job info, when the pid still exists.
+        job: Option<aither_sandbox::JobInfo>,
+        /// Buffered `(stdout, stderr)`, when the registry still serves it.
+        output: Option<(Vec<u8>, Vec<u8>)>,
+    },
+    /// Incremental terminal-output poll for running tool calls.
+    TerminalOutputs(Vec<TerminalOutputDelta>),
 
     // ─── /btw side question ─────────────────────────────────────────
     /// An answer chunk arrived for the `/btw` overlay.
@@ -85,6 +94,19 @@ pub enum AppEvent {
     BtwFinished,
     /// The `/btw` request failed.
     BtwFailed(String),
+}
+
+/// One incremental output read bound to a running terminal tool call.
+#[derive(Debug)]
+pub struct TerminalOutputDelta {
+    /// Tool call the output belongs to.
+    pub call_id: String,
+    /// Buffer cursor after this read; the caller stores it for the next poll.
+    pub cursor: usize,
+    /// Output bytes appended since the previous cursor.
+    pub bytes: Vec<u8>,
+    /// Job status at read time — a finished job unbinds the call.
+    pub status: aither_sandbox::JobStatus,
 }
 
 /// Sender type for sending events back to the main loop.
