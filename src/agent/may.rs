@@ -249,7 +249,11 @@ pub struct MayAgent {
     session_id: SessionId,
     sandbox_dir: PathBuf,
     provider_id: String,
+    model_id: String,
     model_context_window: Option<u32>,
+    /// IPC command names backed by MCP connections — lets `/context` split
+    /// the `<commands>` index into built-in vs MCP rows.
+    mcp_command_names: Vec<String>,
     runtime_system_context: RuntimeSystemContext,
     job_registry: aither_sandbox::JobRegistry,
     subagent_runs: aither_agent::specialized::SubagentRuns,
@@ -264,6 +268,7 @@ impl std::fmt::Debug for MayAgent {
             .field("session_id", &self.session_id)
             .field("sandbox_dir", &self.sandbox_dir)
             .field("provider_id", &self.provider_id)
+            .field("model_id", &self.model_id)
             .field("model_context_window", &self.model_context_window)
             .finish_non_exhaustive()
     }
@@ -439,7 +444,7 @@ impl MayAgent {
             },
         )
         .await?;
-        for (name, description) in &shared_terminal_commands {
+        for (name, description) in &shared_terminal_commands.descriptions {
             builder = builder.tool_description(name.clone(), description.clone());
         }
         if is_container {
@@ -613,7 +618,9 @@ impl MayAgent {
             session_id: config.session_id,
             sandbox_dir: actual_sandbox_dir,
             provider_id: config.provider_id,
+            model_id: config.model_id,
             model_context_window: config.model_context_window,
+            mcp_command_names: shared_terminal_commands.mcp_command_names,
             runtime_system_context,
             job_registry,
             subagent_runs,
@@ -823,6 +830,25 @@ impl MayAgent {
         preview
     }
 
+    /// Measure the context window for the `/context` command.
+    ///
+    /// Runtime system blocks are reconciled first, so the report describes
+    /// the same state the next request would be assembled from. Token counts
+    /// are estimates at ~4 bytes per token — the heuristic the agent itself
+    /// uses for context budgeting.
+    pub async fn context_report(&mut self) -> super::context_report::ContextReport {
+        self.sync_runtime_context().await;
+        let snapshot = self.inner.snapshot_context_window().await;
+        super::context_report::ContextReport::assemble(
+            &self.model_id,
+            &self.provider_id,
+            &self.mcp_command_names,
+            self.inner.context(),
+            &snapshot.metrics,
+            snapshot.phase,
+        )
+    }
+
     /// Get session ID.
     #[must_use]
     pub const fn session_id(&self) -> &SessionId {
@@ -1020,7 +1046,9 @@ mod tests {
                 btw_llm: llm,
                 sandbox_dir: temp.path().join("sandbox"),
                 provider_id: "chatgpt".to_string(),
+                model_id: "gpt-5".to_string(),
                 model_context_window: None,
+                mcp_command_names: Vec::new(),
                 runtime_system_context: RuntimeSystemContext::new(db, String::new()),
                 subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
             },
