@@ -8,7 +8,9 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=MAY_SKIP_WEB_UI_BUILD");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UI");
+    println!("cargo:rerun-if-changed=Cargo.lock");
 
+    emit_heel_lib_version();
     watch_web_ui_inputs();
 
     let enable_ui = std::env::var_os("CARGO_FEATURE_UI").is_some();
@@ -41,6 +43,37 @@ fn main() {
         Path::new("web-ui/dist/index.html").exists(),
         "web-ui build did not produce dist/index.html"
     );
+}
+
+/// The `heel` binary that executes sandbox IPC commands is provisioned
+/// separately from the `heel` library that generates those commands' shims,
+/// and the two must share a version: the library is pinned by `Cargo.lock`,
+/// so the managed-binary download requests the matching release tag.
+fn emit_heel_lib_version() {
+    let lockfile = fs::read_to_string("Cargo.lock").expect("Cargo.lock must be readable");
+    let version =
+        heel_version_in_lockfile(&lockfile).expect("Cargo.lock must contain the heel package");
+    println!("cargo:rustc-env=MAY_HEEL_LIB_VERSION={version}");
+}
+
+/// Extract the `version` field of the `heel` package entry.
+fn heel_version_in_lockfile(lockfile: &str) -> Option<String> {
+    let mut in_heel_package = false;
+    for line in lockfile.lines() {
+        if line.starts_with("[[") {
+            in_heel_package = false;
+        }
+        if line == "name = \"heel\"" {
+            in_heel_package = true;
+        } else if in_heel_package
+            && let Some(version) = line
+                .strip_prefix("version = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+        {
+            return Some(version.to_string());
+        }
+    }
+    None
 }
 
 fn watch_web_ui_inputs() {
