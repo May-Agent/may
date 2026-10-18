@@ -22,7 +22,9 @@ use aither_core::llm::{
 use futures_lite::Stream;
 
 use super::may::MayAgentError;
-use crate::config::{MayConfig, ModelTier, NativeToolsConfig, ProviderInstance, ProviderType};
+use crate::config::{
+    MayConfig, ModelTier, NativeToolsConfig, ProviderApi, ProviderInstance, ProviderType,
+};
 use crate::copilot::clear_copilot_credentials;
 use crate::embedding_provider::{EmbeddingModelResolution, resolve_embedding_model};
 use crate::model_selector::ModelSelector;
@@ -133,6 +135,13 @@ pub(super) fn request_parameters_for(
             // aither-models db has no entries for codex slugs, so the
             // Ability::WebSearch gate would always read false here.
             request_parameters.websearch = native.web_search || native.is_empty();
+        }
+        Some(ProviderType::Custom) => {
+            // Like ChatGPT, a custom endpoint's support is decided by the
+            // backend — config validation already guarantees `native_tools`
+            // only reaches this arm when the provider speaks the Responses
+            // API.
+            request_parameters.websearch = native.web_search;
         }
         _ => {}
     }
@@ -496,11 +505,11 @@ pub(super) async fn build_cloud_provider_from_instance(
                     "Base URL required for custom provider '{id}'"
                 ))
             })?;
-            OpenAI::new(api_key)
-                .with_base_url(url)
-                .with_model(model)
-                .with_chat_completions_api()
-                .into()
+            let client = OpenAI::new(api_key).with_base_url(url).with_model(model);
+            match instance.api {
+                Some(ProviderApi::Responses) => client.with_responses_api().into(),
+                _ => client.with_chat_completions_api().into(),
+            }
         }
     };
 
@@ -553,6 +562,35 @@ mod tests {
         fetch_only.native_tools.web_fetch = true;
         let parameters = request_parameters_for("chatgpt", Some(&fetch_only), "gpt-5", None);
         assert!(!parameters.websearch);
+    }
+
+    #[test]
+    fn request_parameters_for_custom_responses_honors_web_search() {
+        let mut instance =
+            ProviderInstance::new(ProviderType::Custom).with_base_url("http://127.0.0.1:8787/v1");
+        instance.api = Some(ProviderApi::Responses);
+        let parameters = request_parameters_for("swe2", Some(&instance), "swe-2-high", None);
+        assert!(!parameters.websearch);
+
+        instance.native_tools.web_search = true;
+        let parameters = request_parameters_for("swe2", Some(&instance), "swe-2-high", None);
+        assert!(parameters.websearch);
+    }
+
+    #[test]
+    fn provider_validation_rejects_native_tools_without_responses_api() {
+        let mut instance =
+            ProviderInstance::new(ProviderType::Custom).with_base_url("http://127.0.0.1:8787/v1");
+        instance.native_tools.web_search = true;
+        assert!(instance.validate("swe2").is_err());
+
+        instance.api = Some(ProviderApi::Responses);
+        assert!(instance.validate("swe2").is_ok());
+
+        // `api` on a non-custom provider is rejected as well.
+        let mut openai = ProviderInstance::new(ProviderType::OpenAI).with_api_key("key");
+        openai.api = Some(ProviderApi::Responses);
+        assert!(openai.validate("openai").is_err());
     }
 
     #[test]
