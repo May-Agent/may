@@ -100,6 +100,29 @@ pub enum ConfigError {
         /// Provider type the existing instance resolves to.
         actual: ProviderType,
     },
+    /// Invalid provider config.
+    #[error("invalid provider config for `{id}`: {reason}")]
+    InvalidProviderConfig {
+        /// Provider ID from the config section key.
+        id: String,
+        /// What is wrong with the configuration.
+        reason: String,
+    },
+}
+
+/// Wire API a `custom` provider speaks.
+///
+/// `Custom` providers default to the Chat Completions API; select
+/// `Responses` for backends that implement the `OpenAI` Responses API
+/// (required for provider-hosted tools such as `native_tools.web_search`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, skyzen::ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderApi {
+    /// `POST /v1/chat/completions`
+    #[default]
+    ChatCompletions,
+    /// `POST /v1/responses`
+    Responses,
 }
 
 /// LLM provider types.
@@ -423,6 +446,10 @@ pub struct ProviderInstance {
     /// Provider-native hosted tool toggles.
     #[serde(default, skip_serializing_if = "NativeToolsConfig::is_empty")]
     pub native_tools: NativeToolsConfig,
+    /// Wire API the provider speaks (custom providers only; defaults to
+    /// chat-completions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ProviderApi>,
     /// Base URL override (required for Custom, optional for others)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -444,6 +471,7 @@ impl Default for ProviderInstance {
             provider_type: None,
             api_key: None,
             native_tools: NativeToolsConfig::default(),
+            api: None,
             base_url: None,
             display_name: None,
             enabled: true,
@@ -500,6 +528,33 @@ impl ProviderInstance {
         self.display_name
             .clone()
             .unwrap_or_else(|| self.resolve_type(id).display_name().to_string())
+    }
+
+    /// Check this instance for consistency.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidProviderConfig`] when `api` is set on a
+    /// non-custom provider, or a `custom` provider enables `native_tools`
+    /// without selecting the Responses API.
+    pub fn validate(&self, id: &str) -> Result<(), ConfigError> {
+        let invalid = |reason: String| ConfigError::InvalidProviderConfig {
+            id: id.to_string(),
+            reason,
+        };
+        if self.api.is_some() && self.resolve_type(id) != ProviderType::Custom {
+            return Err(invalid(
+                "api is only supported for custom providers".to_string(),
+            ));
+        }
+        if self.resolve_type(id) == ProviderType::Custom
+            && !self.native_tools.is_empty()
+            && self.api != Some(ProviderApi::Responses)
+        {
+            return Err(invalid(
+                "native_tools requires api = \"responses\" on a custom provider".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Check if this instance is valid/complete.
@@ -1114,7 +1169,11 @@ impl MayConfig {
     /// # Errors
     /// Returns [`ConfigError`] when any section contains an invalid value.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.browser.validate()
+        self.browser.validate()?;
+        for (id, instance) in &self.provider {
+            instance.validate(id)?;
+        }
+        Ok(())
     }
 
     /// Check if configuration is complete enough to use.
