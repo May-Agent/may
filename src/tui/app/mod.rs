@@ -1491,8 +1491,8 @@ impl App {
                             .iter()
                             .find(|r| point.line >= r.start && point.line < r.end)
                     {
-                        let id = region.tool_call_id.clone();
-                        self.chat.toggle_tool_expanded(&id);
+                        let id = region.element_id.clone();
+                        self.chat.toggle_expanded(&id);
                     }
                 }
             }
@@ -1898,11 +1898,10 @@ impl App {
                     }
                     AgentEvent::Reasoning(chunk) => {
                         self.decode_meter.note_output(chunk.len());
-                        // Start or update thinking indicator
                         if self.thinking_start.is_none() {
                             self.thinking_start = Some(std::time::Instant::now());
-                            self.chat.start_thinking();
                         }
+                        self.chat.push_thinking(&chunk);
                         // Update thinking time
                         if let Some(start) = self.thinking_start {
                             let secs = start.elapsed().as_secs();
@@ -1921,6 +1920,7 @@ impl App {
                     } => {
                         self.chat.end_loading();
                         self.chat.end_text();
+                        self.thinking_start = None;
                         self.decode_meter.note_boundary();
                         let display = match parse_tool_start(&name, &arguments) {
                             ToolStartKind::Terminal { command, mode } => ToolDisplay::Terminal {

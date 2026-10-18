@@ -149,11 +149,11 @@ const COLLAPSE_COMMAND_LINES: usize = 3;
 const COLLAPSE_DIFF_LINES: usize = 8;
 
 /// A screen-row span (in `rendered_plain_lines` space) owned by one
-/// collapsible tool call — a click inside toggles its expansion.
+/// collapsible element — a click inside toggles its expansion.
 #[derive(Debug, Clone)]
 pub struct ClickRegion {
-    /// Tool call element ID.
-    pub tool_call_id: String,
+    /// Collapsible element ID (tool call or thinking block).
+    pub element_id: String,
     /// First covered row, inclusive.
     pub start: usize,
     /// One past the last covered row.
@@ -301,10 +301,17 @@ pub enum ChatElement {
         /// Spinner frame counter.
         frame: usize,
     },
-    /// Thinking indicator (for thinking models)
+    /// Thinking block (for thinking models): the streamed reasoning shown
+    /// live while the burst runs, then auto-collapsed behind its header.
     Thinking {
+        /// Stable ID for click hit-testing.
+        id: String,
+        /// Reasoning text received so far.
+        content: String,
         /// Seconds spent thinking.
         seconds: u64,
+        /// Open while reasoning streams; click the collapsed header to reopen.
+        expanded: bool,
     },
 }
 
@@ -314,6 +321,8 @@ impl ChatElement {}
 #[derive(Debug, Default)]
 pub struct ChatStream {
     elements: Vec<ChatElement>,
+    /// Counter generating thinking-block IDs.
+    next_thinking_id: usize,
 }
 
 impl ChatStream {
@@ -440,30 +449,53 @@ impl ChatStream {
         }
     }
 
-    /// Start thinking indicator.
+    /// Start thinking block.
     pub fn start_thinking(&mut self) {
         // Remove loading if present
         if matches!(self.elements.last(), Some(ChatElement::Loading { .. })) {
             self.elements.pop();
         }
-        self.elements.push(ChatElement::Thinking { seconds: 0 });
+        let id = self.next_thinking_id;
+        self.next_thinking_id += 1;
+        self.elements.push(ChatElement::Thinking {
+            id: format!("thinking-{id}"),
+            content: String::new(),
+            seconds: 0,
+            expanded: true,
+        });
+    }
+
+    /// Append streamed reasoning text to the open thinking block, starting a
+    /// new block when the previous burst already collapsed.
+    pub fn push_thinking(&mut self, chunk: &str) {
+        if !matches!(
+            self.elements.last(),
+            Some(ChatElement::Thinking { expanded: true, .. })
+        ) {
+            self.start_thinking();
+        }
+        if let Some(ChatElement::Thinking { content, .. }) = self.elements.last_mut() {
+            content.push_str(chunk);
+        }
     }
 
     /// Update thinking time.
     pub fn update_thinking(&mut self, seconds: u64) {
-        if let Some(ChatElement::Thinking { seconds: s }) = self.elements.last_mut() {
+        if let Some(ChatElement::Thinking { seconds: s, .. }) = self.elements.last_mut() {
             *s = seconds;
         }
     }
 
-    /// End loading/thinking state (called when first text arrives).
+    /// End loading/thinking state (called when the thinking burst ends or
+    /// first text arrives). Loading is transient and removed; thinking stays
+    /// as a collapsed block.
     pub fn end_loading(&mut self) {
-        // Remove loading or thinking element if present
-        if matches!(
-            self.elements.last(),
-            Some(ChatElement::Loading { .. } | ChatElement::Thinking { .. })
-        ) {
-            self.elements.pop();
+        match self.elements.last_mut() {
+            Some(ChatElement::Loading { .. }) => {
+                self.elements.pop();
+            }
+            Some(ChatElement::Thinking { expanded, .. }) => *expanded = false,
+            _ => {}
         }
     }
 
@@ -576,19 +608,29 @@ impl ChatStream {
         }
     }
 
-    /// Flip the expanded state of a collapsible tool call.
-    pub fn toggle_tool_expanded(&mut self, id: &str) {
+    /// Flip the expanded state of a collapsible element (tool call or
+    /// thinking block).
+    pub fn toggle_expanded(&mut self, id: &str) {
         for elem in &mut self.elements {
-            if let ChatElement::ToolCall {
-                id: tool_id,
-                display,
-            } = elem
-                && tool_id == id
-                && display.is_collapsible()
-                && let ToolDisplay::Terminal { expanded, .. } = display
-            {
-                *expanded = !*expanded;
-                break;
+            match elem {
+                ChatElement::ToolCall {
+                    id: tool_id,
+                    display,
+                } if tool_id == id && display.is_collapsible() => {
+                    if let ToolDisplay::Terminal { expanded, .. } = display {
+                        *expanded = !*expanded;
+                    }
+                    break;
+                }
+                ChatElement::Thinking {
+                    id: think_id,
+                    expanded,
+                    ..
+                } if think_id == id => {
+                    *expanded = !*expanded;
+                    break;
+                }
+                _ => {}
             }
         }
     }
@@ -841,11 +883,18 @@ pub fn build_plain_wrapped_lines_unified(
         for line in plain_lines_for_element(elem) {
             out.append(&mut wrap_plain_line(&plain_text(&line), max_width));
         }
-        if let ChatElement::ToolCall { id, display } = elem
-            && display.is_collapsible()
-        {
+        let collapsible_id = match elem {
+            ChatElement::ToolCall { id, display } if display.is_collapsible() => Some(id.clone()),
+            ChatElement::Thinking {
+                id,
+                expanded: false,
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        };
+        if let Some(element_id) = collapsible_id {
             regions.push(ClickRegion {
-                tool_call_id: id.clone(),
+                element_id,
                 start,
                 end: out.len(),
             });
@@ -938,13 +987,31 @@ fn plain_lines_for_element(elem: &ChatElement) -> Vec<Line<'static>> {
             };
             lines.push(Line::from(format!("{spinner} Waiting for response...")));
         }
-        ChatElement::Thinking { seconds } => {
-            let text = if *seconds == 0 {
-                "◐ Thinking...".to_string()
+        ChatElement::Thinking {
+            content,
+            seconds,
+            expanded,
+            ..
+        } => {
+            if *expanded {
+                let text = if *seconds == 0 {
+                    "◐ Thinking...".to_string()
+                } else {
+                    format!("◐ Thinking... ({seconds} sec)")
+                };
+                lines.push(Line::from(text));
+                for l in content.lines() {
+                    lines.push(Line::from(l.to_string()));
+                }
             } else {
-                format!("◐ Thinking... ({seconds} sec)")
-            };
-            lines.push(Line::from(text));
+                let text = if *seconds == 0 {
+                    "◐ Thought ▸".to_string()
+                } else {
+                    format!("◐ Thought for {seconds} sec ▸")
+                };
+                lines.push(Line::from(text));
+            }
+            lines.push(Line::from(""));
         }
     }
     lines
@@ -1386,17 +1453,38 @@ fn render_impl(
                 )));
             }
 
-            ChatElement::Thinking { seconds } => {
-                // Thinking indicator with time
-                let text = if *seconds == 0 {
-                    "◐ Thinking...".to_string()
+            ChatElement::Thinking {
+                content,
+                seconds,
+                expanded,
+                ..
+            } => {
+                let header = if *expanded {
+                    if *seconds == 0 {
+                        "◐ Thinking...".to_string()
+                    } else {
+                        format!("◐ Thinking... ({seconds} sec)")
+                    }
+                } else if *seconds == 0 {
+                    "◐ Thought ▸".to_string()
                 } else {
-                    format!("◐ Thinking... ({seconds} sec)")
+                    format!("◐ Thought for {seconds} sec ▸")
                 };
                 lines.push(Line::from(Span::styled(
-                    text,
+                    header,
                     Style::default().fg(Color::Magenta),
                 )));
+                if *expanded {
+                    for l in content.lines() {
+                        lines.push(Line::from(Span::styled(
+                            l.to_string(),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    }
+                }
+                lines.push(Line::from(""));
             }
         }
     }
@@ -2229,12 +2317,12 @@ mod tests {
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None).len(),
             2 // "$ a" + collapse hint
         );
-        chat.toggle_tool_expanded("t1");
+        chat.toggle_expanded("t1");
         assert_eq!(
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None).len(),
             4
         );
-        chat.toggle_tool_expanded("t1");
+        chat.toggle_expanded("t1");
         assert_eq!(
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None).len(),
             2
@@ -2250,9 +2338,49 @@ mod tests {
         let lines =
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, Some(&mut regions));
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].tool_call_id, "t1");
+        assert_eq!(regions[0].element_id, "t1");
         assert_eq!(regions[0].start, 0);
         assert_eq!(regions[0].end, 2);
         assert!(lines.len() >= 3);
+    }
+
+    #[test]
+    fn thinking_streams_then_collapses_and_reopens() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("step one\nstep two");
+        chat.update_thinking(3);
+        // While streaming, the header plus both content lines are visible.
+        let open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None);
+        assert_eq!(open.len(), 4); // header + 2 lines + trailing blank
+        assert!(open[0].contains("Thinking"));
+        assert!(open[1].contains("step one"));
+
+        // Burst end collapses to a single clickable header.
+        chat.end_loading();
+        let mut regions = Vec::new();
+        let collapsed =
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, Some(&mut regions));
+        assert_eq!(collapsed.len(), 2); // collapsed header + trailing blank
+        assert!(collapsed[0].contains("Thought for 3 sec"));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].element_id, "thinking-0");
+
+        // Clicking the header reopens the content.
+        chat.toggle_expanded("thinking-0");
+        let reopened = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None);
+        assert_eq!(reopened.len(), 4);
+        assert!(reopened[1].contains("step one"));
+    }
+
+    #[test]
+    fn new_reasoning_burst_starts_fresh_block() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("first");
+        chat.end_loading();
+        chat.push_text("answer");
+        chat.push_thinking("second");
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None);
+        assert!(lines[0].contains("Thought")); // first burst collapsed
+        assert!(lines.iter().any(|l| l.contains("second")));
     }
 }
