@@ -28,8 +28,6 @@ pub struct DecodeMeter {
     exact_tokens: u64,
     /// Output bytes streamed since the last `Usage` report.
     in_flight_bytes: u64,
-    /// Argument payload length last seen per tool call id.
-    tool_arg_lens: ahash::AHashMap<String, u64>,
 }
 
 impl DecodeMeter {
@@ -45,21 +43,6 @@ impl DecodeMeter {
         }
         self.burst_start.get_or_insert_with(Instant::now);
         self.in_flight_bytes += bytes as u64;
-    }
-
-    /// Record a `ToolCallDelta` payload for the call `id`.
-    ///
-    /// Providers emit `arguments_fragment` as the arguments accumulated so
-    /// far for the call, not an increment, so only the growth since the
-    /// previous fragment counts as newly decoded output.
-    pub fn note_tool_delta(&mut self, id: &str, arguments_fragment: &str) {
-        let prev = self.tool_arg_lens.entry(id.to_string()).or_insert(0);
-        let len = arguments_fragment.len() as u64;
-        if len > *prev {
-            let grown = usize::try_from(len - *prev).unwrap_or(usize::MAX);
-            *prev = len;
-            self.note_output(grown);
-        }
     }
 
     /// Close the current burst: the model stopped generating (tool-call
@@ -151,21 +134,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_deltas_count_incremental_growth() {
-        let mut meter = DecodeMeter::default();
-        // Providers send cumulative snapshots: 10, then 25, then a repeat.
-        meter.note_tool_delta("call-1", &"a".repeat(10));
-        meter.note_tool_delta("call-1", &"a".repeat(25));
-        meter.note_tool_delta("call-1", &"a".repeat(25));
-        meter.note_tool_delta("call-2", &"b".repeat(8));
-        assert_eq!(meter.tokens(), (10 + 15 + 8) / 4);
-    }
-
-    #[test]
     fn empty_output_does_not_start_burst() {
         let mut meter = DecodeMeter::default();
         meter.note_output(0);
-        meter.note_tool_delta("call-1", "");
+        meter.note_output(0);
         std::thread::sleep(MIN_MEASUREMENT + Duration::from_millis(50));
         meter.note_output(400);
         // The burst started at the first real byte, so elapsed is below the
