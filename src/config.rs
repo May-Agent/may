@@ -43,6 +43,7 @@
 //!
 //! [preferences]
 //! warn_on_model_change = true
+//! show_decode_speed = true
 //! ```
 
 use async_fs;
@@ -728,6 +729,9 @@ pub struct Preferences {
     /// Show token/context usage in chat UI.
     #[serde(default = "default_true")]
     pub show_token_usage: bool,
+    /// Show real-time decode speed (tok/s) while responses stream.
+    #[serde(default = "default_true")]
+    pub show_decode_speed: bool,
     /// Global network restriction settings.
     #[serde(default)]
     pub network_policy: NetworkPolicyConfig,
@@ -738,6 +742,7 @@ impl Default for Preferences {
         Self {
             warn_on_model_change: true,
             show_token_usage: true,
+            show_decode_speed: true,
             network_policy: NetworkPolicyConfig::default(),
         }
     }

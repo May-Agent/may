@@ -138,6 +138,7 @@ export const enUS = {
     artifactEmpty: 'No files generated yet',
     tasksEmpty: 'No tasks yet',
     contextUsage: '{used}% of {total} tokens used',
+    decodeSpeed: '{rate} tok/s',
     configGuard: {
       title: 'No provider enabled',
       body: 'Enable a provider in settings to start chatting.',
@@ -254,6 +255,10 @@ export const enUS = {
       light: 'Light',
       dark: 'Dark',
       system: 'System',
+    },
+    decodeSpeed: {
+      title: 'Decode speed',
+      description: 'Show live token generation speed while May responds.',
     },
     profiles: {
       title: 'Profiles',

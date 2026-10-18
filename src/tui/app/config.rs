@@ -151,6 +151,12 @@ impl App {
                             !self.config.preferences.warn_on_model_change;
                         self.persist_config_background();
                     }
+                    2 => {
+                        // Toggle show_decode_speed
+                        self.config.preferences.show_decode_speed =
+                            !self.config.preferences.show_decode_speed;
+                        self.persist_config_background();
+                    }
                     _ => {}
                 }
             }

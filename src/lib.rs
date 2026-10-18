@@ -21,6 +21,8 @@ pub mod container;
 pub mod copilot;
 /// SQLite persistence for sessions, messages, and app state.
 pub mod db;
+/// Live decode-speed measurement for streamed model output.
+pub mod decode_meter;
 /// Embedding provider resolution for retrieval tools.
 pub mod embedding_provider;
 mod file_tracker;

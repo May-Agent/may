@@ -392,7 +392,11 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
     let state = &app.config_state;
     let config = &app.config;
 
-    let pref_names = ["Max iterations", "Warn on model change"];
+    let pref_names = [
+        "Max iterations",
+        "Warn on model change",
+        "Show decode speed",
+    ];
     let pref_values: Vec<String> = vec![
         if config.max_iterations == 0 {
             "unlimited".to_string()
@@ -400,6 +404,7 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
             config.max_iterations.to_string()
         },
         config.preferences.warn_on_model_change.to_string(),
+        config.preferences.show_decode_speed.to_string(),
     ];
 
     let mut items: Vec<ListItem> = pref_names

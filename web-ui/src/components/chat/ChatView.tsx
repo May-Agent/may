@@ -86,6 +86,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   const streaming = activeTurn !== null || stopping;
   const configUsable = !configLoaded || isConfigUsable(config);
+  const showDecodeSpeed = config?.fullConfig.preferences.showDecodeSpeed ?? true;
   const reasoningEnabled =
     typeof active.reasoningEffort === 'string' &&
     active.reasoningEffort.length > 0 &&
@@ -148,13 +149,18 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                   key={msg.id}
                   turn={lastTurnForActive}
                   reasoningEnabled={reasoningEnabled}
+                  showDecodeSpeed={showDecodeSpeed}
                 />
               );
             }
             return <PersistedAssistant key={msg.id} message={msg} sessionId={active.id} />;
           })}
           {activeTurn && (
-            <AssistantTurn turn={activeTurn} reasoningEnabled={reasoningEnabled} />
+            <AssistantTurn
+              turn={activeTurn}
+              reasoningEnabled={reasoningEnabled}
+              showDecodeSpeed={showDecodeSpeed}
+            />
           )}
           {!activeTurn && lastTurn?.error && (
             <TurnErrorCard
