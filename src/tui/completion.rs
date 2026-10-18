@@ -35,7 +35,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model for this session"),
     ("/sandbox", "Open sandbox folder in Finder"),
     ("/compact", "Compact conversation history"),
-    ("/rewind", "Restore files to a per-call checkpoint"),
+    (
+        "/rewind",
+        "Rewind to an earlier prompt (conversation, optionally code too)",
+    ),
     ("/jobs", "Background jobs and running subagents"),
     ("/mcp", "Manage MCP servers"),
     ("/ssh", "Manage preconfigured SSH servers"),

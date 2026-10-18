@@ -42,20 +42,26 @@ pub enum AppMode {
     SkillManage,
     /// Profile switcher popup
     ProfileSelect,
-    /// Rewind picker: restore files to a per-call checkpoint
+    /// Rewind picker: restore the conversation (and optionally the code)
+    /// to the point before a user prompt
     Rewind(RewindState),
     /// Background jobs and running subagents viewer
     Jobs,
 }
 
-/// One rewindable checkpoint: a tool call that changed tracked files.
+/// One rewindable prompt: a user message plus the code changes the turn
+/// it started is known to have made.
 #[derive(Debug, Clone)]
-pub struct RewindTarget {
-    /// Tool call whose pre-call tree the rewind restores.
-    pub tool_call_id: String,
-    /// First line of the command that made the change.
-    pub command_preview: String,
-    /// Total files changed by this call (all roots).
+pub struct RewindPrompt {
+    /// Position of the persisted user message in session history; the
+    /// rewind cut point.
+    pub history_index: usize,
+    /// Full prompt text (restored into the input box on rewind).
+    pub content: String,
+    /// Attachments carried by the prompt (restored with the text).
+    pub attachments: Vec<crate::tui::queue::Attachment>,
+    /// Files changed by the turn this prompt started (all roots), when
+    /// the turn's tool calls are still in the stream.
     pub files: usize,
     /// Total added lines.
     pub additions: usize,
@@ -63,13 +69,19 @@ pub struct RewindTarget {
     pub deletions: usize,
 }
 
-/// Rewind picker state.
+/// Rewind picker state: first pick a prompt, then the restoration scope.
 #[derive(Debug)]
 pub struct RewindState {
-    /// Tool calls that produced diffs, oldest first.
-    pub targets: Vec<RewindTarget>,
-    /// Cursor position.
+    /// User prompts, oldest first.
+    pub targets: Vec<RewindPrompt>,
+    /// Cursor position; `targets.len()` is the trailing `(current)` entry,
+    /// which selects nothing and simply closes the picker.
     pub selected: usize,
+    /// Prompt the scope submenu is open for, if any.
+    pub options_for: Option<usize>,
+    /// Cursor position in the scope submenu (0 = conversation only,
+    /// 1 = conversation and code).
+    pub option_selected: usize,
 }
 
 /// Per-question interaction state.

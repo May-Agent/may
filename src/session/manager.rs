@@ -157,6 +157,18 @@ pub struct SessionSummary {
     pub runtime: SessionRuntimeSummary,
 }
 
+/// Where a prompt-level rewind truncated the conversation.
+#[derive(Debug, Clone, Copy)]
+pub struct RewindPoint {
+    /// Position in [`ChatHistory::messages`] where truncation began; the
+    /// prompt's hidden-context rows precede the user message and are
+    /// included in the cut.
+    pub cut_index: usize,
+    /// `messages` row id of the removed user message; it doubles as the
+    /// file-tracker prompt checkpoint key.
+    pub user_message_id: i64,
+}
+
 impl SessionSummary {
     /// Convert a DB session model to a summary.
     ///
@@ -604,20 +616,86 @@ impl SessionManager {
 
     /// Append a message to the current session (DB + in-memory).
     ///
+    /// Returns the persisted `messages` row id, which is stable for the
+    /// session's lifetime and usable as a history anchor.
+    ///
     /// # Errors
     /// Returns [`SessionError::NoActiveSession`] when no session is active, or [`SessionError`] on persistence failure.
-    pub async fn append_message(&mut self, message: ChatMessage) -> Result<(), SessionError> {
+    pub async fn append_message(&mut self, message: ChatMessage) -> Result<i64, SessionError> {
         self.ensure_persisted().await?;
 
         let session = self.current.as_mut().ok_or(SessionError::NoActiveSession)?;
         let session_id = session.id.as_str().to_string();
 
-        self.db.append_chat_message(&session_id, &message).await?;
+        let row = self.db.append_chat_message(&session_id, &message).await?;
 
         // Update in-memory history
         session.history.push(message);
 
-        Ok(())
+        Ok(i64::from(row.id))
+    }
+
+    /// Rewind the current session's conversation to just before the user
+    /// message at `prompt_index` (a position in
+    /// [`ChatHistory::messages`]). The user message, its attached hidden
+    /// context, and everything after it are deleted from the database and
+    /// from the in-memory history.
+    ///
+    /// Returns the truncation point and the deleted user message's row id;
+    /// the id doubles as the file-tracker prompt checkpoint key.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NoActiveSession`] when no session is active,
+    /// [`SessionError::NotFound`] when `prompt_index` does not point at a
+    /// user message or the persisted rows diverge from the in-memory
+    /// history, or [`SessionError`] on persistence failure.
+    pub async fn rewind_to_prompt(
+        &mut self,
+        prompt_index: usize,
+    ) -> Result<RewindPoint, SessionError> {
+        self.ensure_persisted().await?;
+
+        let session = self.current.as_mut().ok_or(SessionError::NoActiveSession)?;
+        let session_id = session.id.as_str().to_string();
+
+        if session
+            .history
+            .messages()
+            .get(prompt_index)
+            .is_none_or(|m| m.role != MessageRole::User)
+        {
+            return Err(SessionError::NotFound(format!(
+                "history position {prompt_index} is not a user message"
+            )));
+        }
+
+        // Hidden context rows injected for this prompt sit directly before
+        // it; they belong to the abandoned timeline too.
+        let mut cut = prompt_index;
+        while cut > 0 && session.history.messages()[cut - 1].role == MessageRole::HiddenContext {
+            cut -= 1;
+        }
+
+        let rows = self.db.get_messages(&session_id).await?;
+        if rows.len() < session.history.len()
+            || rows
+                .get(prompt_index)
+                .is_none_or(|row| row.role != MessageRole::User.as_str())
+        {
+            return Err(SessionError::NotFound(
+                "persisted history diverged from the in-memory history".to_string(),
+            ));
+        }
+        let user_message_id = i64::from(rows[prompt_index].id);
+        let from_id = i64::from(rows[cut].id);
+
+        self.db.delete_messages_from(&session_id, from_id).await?;
+        session.history.messages_mut().truncate(cut);
+
+        Ok(RewindPoint {
+            cut_index: cut,
+            user_message_id,
+        })
     }
 
     /// Attach usage/context stats to the latest assistant message.

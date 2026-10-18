@@ -164,6 +164,17 @@ impl MessageRole {
         }
     }
 
+    /// Whether a persisted row of this role replays into the LLM-visible
+    /// history (`ChatHistory::to_aither_messages`). Interaction rows are
+    /// metadata and produce no LLM message.
+    #[must_use]
+    pub const fn is_llm_visible(&self) -> bool {
+        matches!(
+            self,
+            Self::User | Self::Assistant | Self::System | Self::HiddenContext | Self::Tool
+        )
+    }
+
     #[must_use]
     pub(crate) const fn session_summary_update(&self) -> SessionSummaryUpdate {
         match self {
