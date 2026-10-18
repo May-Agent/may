@@ -56,7 +56,9 @@ pub(super) fn map_db_messages(
                     role: persisted.role.as_str().to_string(),
                     content: msg.content.clone(),
                     timestamp,
-                    attachments: Vec::new(),
+                    attachments: super::chat::api_attachments_from_persisted(
+                        persisted.attachments.clone(),
+                    ),
                     thinking: None,
                     is_streaming: Some(false),
                     is_thinking: Some(false),

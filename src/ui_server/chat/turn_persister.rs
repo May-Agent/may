@@ -61,6 +61,7 @@ impl TurnPersister {
             let chat_msg = ChatMessage {
                 role: msg.role.clone(),
                 content: msg.content.clone(),
+                attachments: Vec::new(),
                 timestamp: Some(jiff::Timestamp::now()),
                 tool_call_id: msg.tool_call_id.clone(),
                 stats: None,

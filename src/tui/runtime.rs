@@ -4,13 +4,11 @@ use aither_core::llm::{Attachment as LlmAttachment, model::ReasoningEffort};
 use async_channel::Sender;
 use base64::Engine;
 use executor_core::{DefaultExecutor, spawn};
-use serde::Serialize;
 
 use crate::agent::{AgentHandle, AgentWorker, spawn_worker};
 use crate::ask_user::{AskUserBroker, Question, QuestionAnswer};
 use crate::session::AttachmentKind;
 use crate::tool_dispatch::ToolDispatchers;
-use crate::tui::queue::{LARGE_PASTE_THRESHOLD, PASTE_TRUNCATE_LIMIT};
 use crate::tui::{App, Attachment, PendingMessage};
 use crate::workspace_request::WorkspaceRequestBroker;
 use crate::{ChatDb, ChatMessage, MayAgent, MayConfig, SessionId, generate_session_title};
@@ -529,7 +527,7 @@ fn persisted_attachment_from_tui(
     }
 }
 
-async fn tui_attachment_from_persisted(
+pub(super) async fn tui_attachment_from_persisted(
     attachment: crate::session::PersistedAttachment,
 ) -> Result<Attachment, TuiRuntimeError> {
     match attachment.attachment_type {
@@ -736,7 +734,8 @@ impl RuntimeDeps {
         };
 
         app.session_manager.ensure_persisted().await?;
-        app.init_session(&session_id, &messages, model.as_deref());
+        app.init_session(&session_id, &messages, model.as_deref())
+            .await;
         *worker = None;
         self.local_runtime.sync_app_queue(app, &session_id).await?;
 
@@ -770,7 +769,8 @@ impl RuntimeDeps {
         let session_model = session.model.clone();
         let messages: Vec<_> = session.history.messages().to_vec();
 
-        app.init_session(&session_id, &messages, session_model.as_deref());
+        app.init_session(&session_id, &messages, session_model.as_deref())
+            .await;
         *worker = None;
         self.local_runtime.sync_app_queue(app, &session_id).await?;
 
@@ -846,9 +846,17 @@ impl RuntimeDeps {
                 .await?;
         }
 
+        let persisted_attachments = msg
+            .attachments
+            .iter()
+            .map(persisted_attachment_from_tui)
+            .collect::<Result<Vec<_>, _>>()?;
         let user_message_id = app
             .session_manager
-            .append_message(ChatMessage::user(&msg.content))
+            .append_message(ChatMessage::user_with_attachments(
+                msg.content.clone(),
+                persisted_attachments,
+            ))
             .await?;
         // Checkpoint the code at this prompt boundary so a later
         // conversation-and-code rewind can restore it.
@@ -1255,8 +1263,8 @@ fn prepare_message_content(
                 content,
                 saved_path,
             } => {
-                let char_count = content.chars().count();
-                let xml = build_pasted_text_xml(content, char_count, saved_path.as_ref())?;
+                let xml = crate::xml::pasted_text_xml(content, saved_path.as_deref())
+                    .map_err(TuiRuntimeError::SerializePasteXml)?;
                 parts.push(format!("\n{xml}"));
             }
         }
@@ -1404,41 +1412,6 @@ async fn build_worker_for_session(
     }
 
     Ok(spawn_worker(DefaultExecutor, agent, db))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-struct PastedText {
-    #[serde(rename = "@chars")]
-    chars: usize,
-    #[serde(rename = "@truncated", skip_serializing_if = "Option::is_none")]
-    truncated: Option<bool>,
-    #[serde(rename = "@full_path", skip_serializing_if = "Option::is_none")]
-    full_path: Option<String>,
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-fn build_pasted_text_xml(
-    content: &str,
-    char_count: usize,
-    saved_path: Option<&std::path::PathBuf>,
-) -> Result<String, TuiRuntimeError> {
-    let (text_content, is_truncated) = if char_count > LARGE_PASTE_THRESHOLD {
-        let truncated: String = content.chars().take(PASTE_TRUNCATE_LIMIT).collect();
-        (truncated, true)
-    } else {
-        (content.to_string(), false)
-    };
-
-    let xml = PastedText {
-        chars: char_count,
-        truncated: is_truncated.then_some(true),
-        full_path: saved_path.map(|p| p.display().to_string()),
-        content: text_content,
-    };
-
-    quick_xml::se::to_string(&xml).map_err(TuiRuntimeError::SerializePasteXml)
 }
 
 /// Send an image-fetch result back to the TUI event loop; failures are logged

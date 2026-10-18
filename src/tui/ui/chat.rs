@@ -14,6 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::queue::Attachment;
 use super::markdown;
+use super::streaming_markdown::IMAGE_HEIGHT;
 
 /// Status of a tool call.
 #[derive(Debug, Clone)]
@@ -28,6 +29,16 @@ pub enum ToolStatus {
     Failed(String),
 }
 
+/// An image produced by a tool call, rendered as an overlay when the
+/// terminal supports inline graphics.
+#[derive(Debug, Clone)]
+pub struct ToolCallImage {
+    /// Key the image state is cached under.
+    pub key: String,
+    /// Label shown on the image placeholder header line.
+    pub label: String,
+}
+
 /// Information about a terminal command execution.
 #[derive(Debug, Clone)]
 pub struct TerminalCallInfo {
@@ -37,6 +48,8 @@ pub struct TerminalCallInfo {
     pub output: String,
     /// Path to full output if truncated/offloaded.
     pub output_file: Option<PathBuf>,
+    /// Image produced by this call, if any.
+    pub image: Option<ToolCallImage>,
 }
 
 impl TerminalCallInfo {
@@ -47,6 +60,7 @@ impl TerminalCallInfo {
             command,
             output: String::new(),
             output_file: None,
+            image: None,
         }
     }
 
@@ -61,6 +75,13 @@ impl TerminalCallInfo {
     #[must_use]
     pub fn with_output_file(mut self, path: PathBuf) -> Self {
         self.output_file = Some(path);
+        self
+    }
+
+    /// Set the image produced by this call.
+    #[must_use]
+    pub fn with_image(mut self, image: ToolCallImage) -> Self {
+        self.image = Some(image);
         self
     }
 
@@ -599,6 +620,7 @@ impl ChatStream {
                                 command: command.clone(),
                                 output: output_text.to_string(),
                                 output_file: None,
+                                image: None,
                             });
                         }
                     }
@@ -668,6 +690,39 @@ impl ChatStream {
                 Some((id.clone(), agent, preview))
             })
             .collect()
+    }
+
+    /// Attach an image to a tool call's terminal info (the latest call for
+    /// subagent tasks).
+    pub fn set_tool_image(&mut self, id: &str, image: ToolCallImage) {
+        for elem in &mut self.elements {
+            if let ChatElement::ToolCall {
+                id: tool_id,
+                display,
+            } = elem
+                && tool_id == id
+            {
+                match display {
+                    ToolDisplay::Search { terminal_info, .. }
+                    | ToolDisplay::Fetch { terminal_info, .. } => {
+                        if let Some(info) = terminal_info {
+                            info.image = Some(image);
+                        }
+                    }
+                    ToolDisplay::Task { terminal_calls, .. } => {
+                        if let Some(latest) = terminal_calls.last_mut() {
+                            latest.image = Some(image);
+                        }
+                    }
+                    ToolDisplay::Terminal { output, .. } => {
+                        if let Some(info) = output {
+                            info.image = Some(image);
+                        }
+                    }
+                }
+                break;
+            }
+        }
     }
 
     /// Attach file diffs to a terminal tool call.
@@ -872,6 +927,7 @@ pub fn build_plain_wrapped_lines_unified(
     input_ctx: Option<InputContext<'_>>,
     status_ctx: Option<&StatusContext<'_>>,
     regions_out: Option<&mut Vec<ClickRegion>>,
+    images_supported: bool,
 ) -> Vec<String> {
     if width == 0 {
         return Vec::new();
@@ -882,7 +938,7 @@ pub fn build_plain_wrapped_lines_unified(
 
     for elem in chat.active_elements() {
         let start = out.len();
-        for line in plain_lines_for_element(elem) {
+        for line in plain_lines_for_element(elem, images_supported) {
             out.append(&mut wrap_plain_line(&plain_text(&line), max_width));
         }
         let collapsible_id = match elem {
@@ -910,7 +966,7 @@ pub fn build_plain_wrapped_lines_unified(
         render_queue_lines(&mut tail, ctx, width);
     }
     if let Some(ctx) = input_ctx {
-        render_input_line(&mut tail, &ctx);
+        render_input_line(&mut tail, &ctx, images_supported, None);
     }
     if let Some(ctx) = status_ctx {
         render_status_line(&mut tail, ctx, max_width);
@@ -933,13 +989,101 @@ fn plain_text(line: &Line<'_>) -> String {
         .collect::<String>()
 }
 
+/// Push a `🖼` image placeholder block: a header line followed by
+/// `IMAGE_HEIGHT - 1` blank rows reserved for the graphics overlay.
+/// Returns the header row index, which the overlay uses as its anchor.
+fn push_image_rows(lines: &mut Vec<Line<'_>>, label: &str) -> usize {
+    let index = lines.len();
+    lines.push(Line::from(vec![
+        Span::styled("🖼 ", Style::default()),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    for _ in 1..IMAGE_HEIGHT {
+        lines.push(Line::from(""));
+    }
+    index
+}
+
+/// One-line text marker for an attachment, matching the historical markers.
+fn attachment_label(attachment: &Attachment) -> String {
+    match attachment {
+        Attachment::Image { .. } => "[image]".to_string(),
+        Attachment::FileReference { path } => format!("@{}", path.display()),
+        Attachment::PastedText {
+            content,
+            saved_path,
+        } => {
+            let char_count = content.chars().count();
+            saved_path.as_ref().map_or_else(
+                || format!("[pasted text: {char_count} chars]"),
+                |path| format!("[pasted text: {char_count} chars -> {}]", path.display()),
+            )
+        }
+    }
+}
+
+/// Push the display rows for one attachment. An image attachment becomes a
+/// placeholder block (registered in `positions` for the overlay) when the
+/// terminal supports graphics, otherwise its one-line marker.
+fn push_attachment_line(
+    lines: &mut Vec<Line<'_>>,
+    attachment: &Attachment,
+    images_supported: bool,
+    positions: Option<&mut Vec<(String, usize)>>,
+) {
+    if images_supported && let Attachment::Image { path, .. } = attachment {
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image");
+        let index = push_image_rows(lines, label);
+        if let Some(key) = attachment.image_cache_key()
+            && let Some(positions) = positions
+        {
+            positions.push((key, index));
+        }
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        attachment_label(attachment),
+        Style::default().fg(Color::DarkGray),
+    )));
+}
+
+/// Push the display rows for an image produced by a tool call. Emits the
+/// placeholder block only when the terminal supports graphics — the text
+/// preview already carries the `[image]` marker otherwise.
+fn push_tool_call_image(
+    lines: &mut Vec<Line<'_>>,
+    info: Option<&TerminalCallInfo>,
+    images_supported: bool,
+    positions: &mut Vec<(String, usize)>,
+) {
+    if !images_supported {
+        return;
+    }
+    if let Some(image) = info.and_then(|info| info.image.as_ref()) {
+        let index = push_image_rows(lines, &image.label);
+        positions.push((image.key.clone(), index));
+    }
+}
+
 /// Plain-text mirror of one chat element's styled rendering. Row count
 /// must track the styled output so selection rows and click regions
 /// align with what is on screen.
-fn plain_lines_for_element(elem: &ChatElement) -> Vec<Line<'static>> {
+fn plain_lines_for_element(elem: &ChatElement, images_supported: bool) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     match elem {
-        ChatElement::UserMessage { content, .. } => {
+        ChatElement::UserMessage {
+            content,
+            attachments,
+            ..
+        } => {
             for (i, line) in content.lines().enumerate() {
                 if i == 0 {
                     lines.push(Line::from(format!("> {line}")));
@@ -947,13 +1091,22 @@ fn plain_lines_for_element(elem: &ChatElement) -> Vec<Line<'static>> {
                     lines.push(Line::from(format!("  {line}")));
                 }
             }
+            for att in attachments {
+                push_attachment_line(&mut lines, att, images_supported, None);
+            }
             lines.push(Line::from(""));
         }
         ChatElement::AssistantText { content, .. } => {
-            lines.extend(markdown::render_markdown_with_config(
-                content,
-                markdown::ImageSupport::Disabled,
-            ));
+            let image_mode = if images_supported {
+                markdown::ImageSupport::Enabled
+            } else {
+                markdown::ImageSupport::Disabled
+            };
+            let mut md_lines = markdown::render_markdown_with_config(content, image_mode);
+            while md_lines.last().is_some_and(|l| l.spans.is_empty()) {
+                md_lines.pop();
+            }
+            lines.extend(md_lines);
             lines.push(Line::from(""));
         }
         ChatElement::Error { message } => {
@@ -961,7 +1114,7 @@ fn plain_lines_for_element(elem: &ChatElement) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
         }
         ChatElement::ToolCall { display, .. } => {
-            plain_tool_lines(display, &mut lines);
+            plain_tool_lines(display, &mut lines, images_supported);
         }
         ChatElement::TodoBlock { items } => {
             lines.push(Line::from("[todo] ────────────────────────────"));
@@ -1020,7 +1173,7 @@ fn plain_lines_for_element(elem: &ChatElement) -> Vec<Line<'static>> {
 }
 
 /// Plain-text mirror of `render_tool_inline` for one tool call.
-fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>) {
+fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, images_supported: bool) {
     match display {
         ToolDisplay::Search {
             query,
@@ -1047,6 +1200,11 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>) {
                     lines.push(Line::from(format!("    {line}")));
                 }
             }
+            if images_supported
+                && let Some(image) = terminal_info.as_ref().and_then(|info| info.image.as_ref())
+            {
+                push_image_rows(lines, &image.label);
+            }
         }
         ToolDisplay::Fetch {
             url,
@@ -1070,6 +1228,11 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>) {
                 for line in info.output_preview(2).lines() {
                     lines.push(Line::from(format!("    {line}")));
                 }
+            }
+            if images_supported
+                && let Some(image) = terminal_info.as_ref().and_then(|info| info.image.as_ref())
+            {
+                push_image_rows(lines, &image.label);
             }
         }
         ToolDisplay::Task {
@@ -1101,6 +1264,9 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>) {
                     for line in latest.output_preview(2).lines() {
                         lines.push(Line::from(format!("      {line}")));
                     }
+                }
+                if images_supported && let Some(image) = latest.image.as_ref() {
+                    push_image_rows(lines, &image.label);
                 }
             }
         }
@@ -1144,6 +1310,11 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>) {
                 for line in info.output_preview(3).lines() {
                     lines.push(Line::from(format!("  │ {line}")));
                 }
+            }
+            if images_supported
+                && let Some(image) = output.as_ref().and_then(|info| info.image.as_ref())
+            {
+                push_image_rows(lines, &image.label);
             }
             plain_diff_lines(diffs, *expanded, lines);
         }
@@ -1320,33 +1491,15 @@ fn render_impl(
                     }
                 }
 
-                // Attachments
+                // Attachments — images get a placeholder block the graphics
+                // overlay paints into; everything else is a one-line marker.
                 for att in attachments {
-                    let att_text = match att {
-                        Attachment::Image { .. } => "[image]".to_string(),
-                        Attachment::FileReference { path } => {
-                            format!("@{}", path.display())
-                        }
-                        Attachment::PastedText {
-                            content,
-                            saved_path,
-                        } => {
-                            let char_count = content.chars().count();
-                            saved_path.as_ref().map_or_else(
-                                || format!("[pasted text: {char_count} chars]"),
-                                |path| {
-                                    format!(
-                                        "[pasted text: {char_count} chars -> {}]",
-                                        path.display()
-                                    )
-                                },
-                            )
-                        }
-                    };
-                    lines.push(Line::from(Span::styled(
-                        att_text,
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                    push_attachment_line(
+                        &mut lines,
+                        att,
+                        images_supported,
+                        Some(&mut collected_image_positions),
+                    );
                 }
 
                 lines.push(Line::from(""));
@@ -1396,7 +1549,13 @@ fn render_impl(
 
             ChatElement::ToolCall { id, display } => {
                 let is_selected = selected_tool == Some(id.as_str());
-                render_tool_inline(&mut lines, display, is_selected);
+                render_tool_inline(
+                    &mut lines,
+                    display,
+                    is_selected,
+                    images_supported,
+                    &mut collected_image_positions,
+                );
             }
 
             ChatElement::TodoBlock { items } => {
@@ -1500,7 +1659,12 @@ fn render_impl(
 
     // Render input line if provided (for full-screen scroll mode)
     if let Some(ctx) = input_ctx {
-        render_input_line(&mut lines, &ctx);
+        render_input_line(
+            &mut lines,
+            &ctx,
+            images_supported,
+            Some(&mut collected_image_positions),
+        );
     }
 
     // Render status bar if provided
@@ -1560,8 +1724,31 @@ fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
 }
 
-/// Render the input line into the lines vector.
-fn render_input_line(lines: &mut Vec<Line<'_>>, ctx: &InputContext<'_>) {
+/// Render the input line into the lines vector. Attached images get a
+/// placeholder block above the input row — the overlay paints the preview
+/// into it — when the terminal supports graphics.
+fn render_input_line(
+    lines: &mut Vec<Line<'_>>,
+    ctx: &InputContext<'_>,
+    images_supported: bool,
+    mut image_positions: Option<&mut Vec<(String, usize)>>,
+) {
+    if images_supported {
+        for att in ctx.attachments {
+            if let Attachment::Image { path, .. } = att {
+                let label = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image");
+                let index = push_image_rows(lines, label);
+                if let Some(key) = att.image_cache_key()
+                    && let Some(positions) = image_positions.as_mut()
+                {
+                    positions.push((key, index));
+                }
+            }
+        }
+    }
     let mut spans = Vec::new();
 
     // Prompt
@@ -1757,7 +1944,13 @@ const fn terminal_mode_marker(mode: TerminalExecutionMode) -> &'static str {
     }
 }
 
-fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, is_selected: bool) {
+fn render_tool_inline<'a>(
+    lines: &mut Vec<Line<'a>>,
+    display: &'a ToolDisplay,
+    is_selected: bool,
+    images_supported: bool,
+    image_positions: &mut Vec<(String, usize)>,
+) {
     let selection_marker = if is_selected { "▶ " } else { "  " };
     let selection_style = if is_selected {
         Style::default().bg(Color::DarkGray)
@@ -1801,6 +1994,12 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                     )));
                 }
             }
+            push_tool_call_image(
+                lines,
+                terminal_info.as_ref(),
+                images_supported,
+                image_positions,
+            );
         }
         ToolDisplay::Fetch {
             url,
@@ -1835,6 +2034,12 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                     )));
                 }
             }
+            push_tool_call_image(
+                lines,
+                terminal_info.as_ref(),
+                images_supported,
+                image_positions,
+            );
         }
         ToolDisplay::Task {
             subagent,
@@ -1888,6 +2093,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                         )));
                     }
                 }
+                push_tool_call_image(lines, Some(latest), images_supported, image_positions);
             }
         }
         ToolDisplay::Terminal {
@@ -1962,6 +2168,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                     ]));
                 }
             }
+            push_tool_call_image(lines, output.as_ref(), images_supported, image_positions);
 
             render_diff_preview(lines, diffs, *expanded);
         }
@@ -2195,11 +2402,15 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatStream, ToolDisplay, ToolStatus, build_plain_wrapped_lines_unified, render_tool_inline,
+        ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
+        build_plain_wrapped_lines_unified, render_input_line, render_tool_inline,
         terminal_mode_marker,
     };
+    use crate::tui::queue::Attachment;
+    use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
     use aither_sandbox::TerminalExecutionMode;
     use ratatui::text::Line;
+    use std::path::PathBuf;
 
     #[test]
     fn terminal_mode_marker_covers_every_backend() {
@@ -2232,7 +2443,8 @@ mod tests {
                 expanded: false,
             };
             let mut lines: Vec<Line> = Vec::new();
-            render_tool_inline(&mut lines, &display, false);
+            let mut positions = Vec::new();
+            render_tool_inline(&mut lines, &display, false, true, &mut positions);
             let rendered: String = lines[0]
                 .spans
                 .iter()
@@ -2277,7 +2489,8 @@ mod tests {
         let mut display = terminal_display("one\ntwo\nthree\nfour\nfive");
         let text = {
             let mut lines: Vec<Line> = Vec::new();
-            render_tool_inline(&mut lines, &display, false);
+            let mut positions = Vec::new();
+            render_tool_inline(&mut lines, &display, false, true, &mut positions);
             rendered_text(&lines)
         };
         assert_eq!(text[0], "  $ one");
@@ -2290,7 +2503,8 @@ mod tests {
         *expanded = true;
         let text = {
             let mut lines: Vec<Line> = Vec::new();
-            render_tool_inline(&mut lines, &display, false);
+            let mut positions = Vec::new();
+            render_tool_inline(&mut lines, &display, false, true, &mut positions);
             rendered_text(&lines)
         };
         assert_eq!(text.len(), 5);
@@ -2316,7 +2530,8 @@ mod tests {
         };
         assert!(display.is_collapsible());
         let mut lines: Vec<Line> = Vec::new();
-        render_tool_inline(&mut lines, &display, false);
+        let mut positions = Vec::new();
+        render_tool_inline(&mut lines, &display, false, true, &mut positions);
         let text = rendered_text(&lines);
         // command line + summary with ▸ marker, no diff body
         assert_eq!(text.len(), 2);
@@ -2328,19 +2543,108 @@ mod tests {
         let mut chat = ChatStream::new();
         chat.push_tool("t1".to_string(), terminal_display("a\nb\nc\nd"));
         assert_eq!(
-            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None).len(),
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false).len(),
             2 // "$ a" + collapse hint
         );
         chat.toggle_expanded("t1");
         assert_eq!(
-            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None).len(),
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false).len(),
             4
         );
         chat.toggle_expanded("t1");
         assert_eq!(
-            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None).len(),
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false).len(),
             2
         );
+    }
+
+    fn image_attachment() -> Attachment {
+        Attachment::Image {
+            path: PathBuf::from("/tmp/shot.png"),
+            data: vec![0x89, 0x50, 0x4E, 0x47],
+        }
+    }
+
+    #[test]
+    fn user_image_reserves_placeholder_rows_when_supported() {
+        let mut chat = ChatStream::new();
+        chat.push_user("look", vec![image_attachment()], 0);
+
+        let supported = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, true);
+        assert_eq!(supported.len(), 2 + IMAGE_HEIGHT); // "> look" + header + blanks + trailing ""
+
+        let unsupported =
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert_eq!(unsupported.len(), 3); // "> look" + "[image]" + trailing ""
+        assert_eq!(unsupported[1], "[image]");
+    }
+
+    #[test]
+    fn input_preview_rows_appear_above_prompt() {
+        let attachments = vec![image_attachment()];
+        let ctx = InputContext {
+            input: "send it",
+            cursor: 7,
+            attachments: &attachments,
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        let mut positions = Vec::new();
+        render_input_line(&mut lines, &ctx, true, Some(&mut positions));
+
+        assert_eq!(lines.len(), IMAGE_HEIGHT + 1);
+        assert!(lines[0].spans[0].content.contains("🖼"));
+        assert_eq!(positions.len(), 1);
+        let prompt = lines.last().expect("input line");
+        assert_eq!(prompt.spans[0].content, "> ");
+    }
+
+    #[test]
+    fn input_without_image_support_shows_marker_only() {
+        let attachments = vec![image_attachment()];
+        let ctx = InputContext {
+            input: "send it",
+            cursor: 7,
+            attachments: &attachments,
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        render_input_line(&mut lines, &ctx, false, None);
+
+        assert_eq!(lines.len(), 1);
+        let rendered: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.contains("[image]"));
+    }
+
+    #[test]
+    fn tool_image_reserves_rows_and_registers_position() {
+        let mut display = terminal_display("screenshot");
+        let ToolDisplay::Terminal { output, .. } = &mut display else {
+            unreachable!()
+        };
+        *output = Some(
+            super::TerminalCallInfo::new("screenshot".to_string()).with_image(ToolCallImage {
+                key: "tool-image:t1".to_string(),
+                label: "shot.png".to_string(),
+            }),
+        );
+
+        let mut lines: Vec<Line> = Vec::new();
+        let mut positions = Vec::new();
+        render_tool_inline(&mut lines, &display, false, true, &mut positions);
+
+        assert_eq!(lines.len(), 1 + IMAGE_HEIGHT); // "$ screenshot" + image block
+        assert_eq!(positions, vec![("tool-image:t1".to_string(), 1)]);
+
+        // Without graphics support the block collapses to nothing — the text
+        // output already carries the [image] marker.
+        let mut lines: Vec<Line> = Vec::new();
+        let mut positions = Vec::new();
+        render_tool_inline(&mut lines, &display, false, false, &mut positions);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(positions, Vec::<(String, usize)>::new());
     }
 
     #[test]
@@ -2349,8 +2653,15 @@ mod tests {
         chat.push_tool("t1".to_string(), terminal_display("a\nb\nc\nd"));
         chat.push_tool("t2".to_string(), terminal_display("echo short"));
         let mut regions = Vec::new();
-        let lines =
-            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, Some(&mut regions));
+        let lines = build_plain_wrapped_lines_unified(
+            &chat,
+            80,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].element_id, "t1");
         assert_eq!(regions[0].start, 0);
@@ -2364,7 +2675,7 @@ mod tests {
         chat.push_thinking("step one\nstep two");
         chat.update_thinking(3);
         // While streaming, the header plus both content lines are visible.
-        let open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None);
+        let open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert_eq!(open.len(), 4); // header + 2 lines + trailing blank
         assert!(open[0].contains("Thinking"));
         assert!(open[1].contains("step one"));
@@ -2372,8 +2683,15 @@ mod tests {
         // Burst end collapses to a single clickable header.
         chat.end_loading();
         let mut regions = Vec::new();
-        let collapsed =
-            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, Some(&mut regions));
+        let collapsed = build_plain_wrapped_lines_unified(
+            &chat,
+            80,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
         assert_eq!(collapsed.len(), 2); // collapsed header + trailing blank
         assert!(collapsed[0].contains("Thought for 3 sec"));
         assert_eq!(regions.len(), 1);
@@ -2381,7 +2699,7 @@ mod tests {
 
         // Clicking the header reopens the content.
         chat.toggle_expanded("thinking-0");
-        let reopened = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None);
+        let reopened = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert_eq!(reopened.len(), 4);
         assert!(reopened[1].contains("step one"));
     }
@@ -2393,7 +2711,7 @@ mod tests {
         chat.end_loading();
         chat.push_text("answer");
         chat.push_thinking("second");
-        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None);
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert!(lines[0].contains("Thought")); // first burst collapsed
         assert!(lines.iter().any(|l| l.contains("second")));
     }
