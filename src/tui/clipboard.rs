@@ -225,6 +225,54 @@ pub enum ImageError {
     NotImage(String),
 }
 
+/// Encode an RGBA image as PNG with fast compression — encoding time sits on
+/// the paste latency path and the bytes are only persisted and uploaded.
+fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>, ImageError> {
+    use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+
+    let mut png_data = Vec::new();
+    PngEncoder::new_with_quality(&mut png_data, CompressionType::Fast, FilterType::Adaptive)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| ImageError::Encoding(e.to_string()))?;
+    Ok(png_data)
+}
+
+/// macOS: read already-encoded image bytes straight off the pasteboard.
+/// Screenshots and copied files usually offer `public.png` or `public.jpeg`,
+/// which skips the decode → RGBA → re-encode round trip entirely.
+#[cfg(target_os = "macos")]
+fn pasteboard_image() -> Option<ClipboardImage> {
+    use objc2_app_kit::NSPasteboard;
+    use objc2_foundation::NSString;
+
+    // Only formats the preview decode path (`image` crate: png, jpeg) and
+    // model uploads can use as-is; anything else goes through arboard, which
+    // decodes it natively.
+    const PASSTHROUGH: [(&str, ImageFormat); 2] = [
+        ("public.png", ImageFormat::Png),
+        ("public.jpeg", ImageFormat::Jpeg),
+    ];
+    let pasteboard = NSPasteboard::generalPasteboard();
+    for (uti, format) in PASSTHROUGH {
+        let data_type = NSString::from_str(uti);
+        if let Some(data) = pasteboard.dataForType(&data_type)
+            && !data.is_empty()
+        {
+            return Some(ClipboardImage {
+                data: data.to_vec(),
+                format,
+            });
+        }
+    }
+    None
+}
+
 /// Try to get an image from the clipboard.
 ///
 /// # Errors
@@ -233,6 +281,11 @@ pub enum ImageError {
 /// read, or [`ImageError::Encoding`] when the image cannot be encoded as PNG
 /// (including dimensions that do not fit into `u32`).
 pub fn get_clipboard_image() -> Result<Option<ClipboardImage>, ImageError> {
+    #[cfg(target_os = "macos")]
+    if let Some(image) = pasteboard_image() {
+        return Ok(Some(image));
+    }
+
     let mut clipboard = Clipboard::new().map_err(|e| ImageError::Clipboard(e.to_string()))?;
 
     // Try to get image from clipboard
@@ -252,14 +305,8 @@ pub fn get_clipboard_image() -> Result<Option<ClipboardImage>, ImageError> {
     let img = image::RgbaImage::from_raw(width, height, image_data.bytes.into_owned())
         .ok_or_else(|| ImageError::Encoding("Failed to create image buffer".to_string()))?;
 
-    // Encode as PNG
-    let mut png_data = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut png_data);
-    img.write_to(&mut cursor, ImgFormat::Png)
-        .map_err(|e| ImageError::Encoding(e.to_string()))?;
-
     Ok(Some(ClipboardImage {
-        data: png_data,
+        data: encode_png(&img)?,
         format: ImageFormat::Png,
     }))
 }
