@@ -562,6 +562,41 @@ impl ChatStream {
         }
     }
 
+    /// In-flight `subagent` invocations — running terminal calls whose
+    /// script invokes the subagent command. Returns `(id, agent, preview)`.
+    #[must_use]
+    pub fn running_subagents(&self) -> Vec<(String, String, String)> {
+        self.elements
+            .iter()
+            .filter_map(|elem| {
+                let ChatElement::ToolCall {
+                    id,
+                    display:
+                        ToolDisplay::Terminal {
+                            command,
+                            status: ToolStatus::Running,
+                            ..
+                        },
+                } = elem
+                else {
+                    return None;
+                };
+                let mut words = command.split_whitespace();
+                if words.next() != Some("subagent") {
+                    return None;
+                }
+                let agent = words.next().unwrap_or("?").to_string();
+                let preview = words.collect::<Vec<_>>().join(" ");
+                let preview = preview
+                    .trim_matches('"')
+                    .chars()
+                    .take(60)
+                    .collect::<String>();
+                Some((id.clone(), agent, preview))
+            })
+            .collect()
+    }
+
     /// Attach file diffs to a terminal tool call.
     pub fn update_tool_diff(&mut self, id: &str, diffs: Vec<crate::file_tracker::RootDiff>) {
         for elem in &mut self.elements {

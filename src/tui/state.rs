@@ -44,6 +44,8 @@ pub enum AppMode {
     ProfileSelect,
     /// Rewind picker: restore files to a per-call checkpoint
     Rewind(RewindState),
+    /// Background jobs and running subagents viewer
+    Jobs,
 }
 
 /// One rewindable checkpoint: a tool call that changed tracked files.

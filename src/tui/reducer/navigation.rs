@@ -400,3 +400,40 @@ pub fn handle_file_picker_key(app: &mut App, code: KeyCode) -> Option<SendAction
 
     None
 }
+
+/// Jobs panel: navigate, stop the selected row, refresh, close.
+pub fn handle_jobs_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let row_count = super::jobs_rows(app).len();
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.jobs_selected = app.jobs_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.jobs_selected + 1 < row_count {
+                app.jobs_selected += 1;
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('x') => {
+            let rows = super::jobs_rows(app);
+            match rows.get(app.jobs_selected) {
+                Some(super::JobRow::Job(job)) => match job.status {
+                    aither_sandbox::JobStatus::Running => app.kill_job(job.pid),
+                    _ => app.status = Some(format!("Job {} already finished", job.pid)),
+                },
+                Some(super::JobRow::Subagent { .. }) => {
+                    app.status = Some(
+                        "Subagent runs inside the agent turn — press Esc in chat to abort"
+                            .to_string(),
+                    );
+                }
+                None => {}
+            }
+        }
+        KeyCode::Char('r') => app.refresh_jobs(),
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = AppMode::Chat;
+        }
+        _ => {}
+    }
+    None
+}
