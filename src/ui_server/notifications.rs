@@ -169,8 +169,7 @@ pub(super) async fn consume_notification_callback(
                     crate::session::MessageRole::System,
                     context,
                     Some(now.as_str()),
-                    None,
-                    None,
+                    crate::db::MessageMeta::default(),
                 )
                 .await
                 .map_err(internal_error)?;
@@ -183,8 +182,7 @@ pub(super) async fn consume_notification_callback(
                     crate::session::MessageRole::Assistant,
                     welcome,
                     Some(now.as_str()),
-                    None,
-                    None,
+                    crate::db::MessageMeta::default(),
                 )
                 .await
                 .map_err(internal_error)?;
