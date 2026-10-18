@@ -1,11 +1,13 @@
 //! Session-scoped file-diff worker feeding the TUI chat stream.
 //!
 //! The tracker itself is synchronous git I/O, so it lives on a dedicated
-//! thread that owns it exclusively: request messages (snapshot requests at
-//! `ToolCallEnd`, root additions on workspace grants) arrive over one
-//! channel, produced diffs leave over another. Serializing every snapshot
-//! through a single worker keeps per-call attribution correct — two
-//! snapshots can never race and double-report the same change.
+//! thread that owns it exclusively: request messages (prompt marks at
+//! dispatch, snapshot requests at `ToolCallEnd`, root additions on
+//! workspace grants) arrive over one channel, produced diffs leave over
+//! another. Serializing every request through a single worker keeps
+//! per-call attribution and checkpoint ordering correct — two snapshots
+//! can never race and double-report the same change, and a prompt mark
+//! always precedes the checkpoints of the turn it begins.
 
 use std::path::PathBuf;
 
@@ -23,12 +25,12 @@ pub enum Outcome {
         /// Per-root diffs produced by the snapshot (empty roots omitted).
         diffs: Vec<RootDiff>,
     },
-    /// A rewind restored worktrees to a checkpoint. `diffs` carry the
-    /// revert diff (pre-rewind → restored) per affected root; empty means
-    /// the checkpoint was missing or the tree already matched.
+    /// A rewind restored worktrees to a prompt checkpoint. `diffs` carry
+    /// the revert diff (pre-rewind → restored) per affected root; empty
+    /// means no checkpoint applied or the tree already matched.
     Rewound {
-        /// Tool call whose checkpoint was restored.
-        tool_call_id: String,
+        /// Checkpoint key that was restored (`prompt:<message row id>`).
+        mark_id: String,
         /// Per-root revert diffs (empty roots omitted).
         diffs: Vec<RootDiff>,
     },
@@ -39,8 +41,18 @@ enum Request {
     AddRoot(TrackedRootSpec),
     /// Snapshot all roots and attribute any diff to this tool call.
     Snapshot(String),
-    /// Restore all roots to their state before this tool call.
-    Rewind(String),
+    /// Record the current tree of every root under this prompt mark
+    /// (`prompt:<message row id>`), taken at prompt dispatch.
+    Mark(String),
+    /// Restore all roots to the state recorded under this prompt mark,
+    /// falling back to the earliest checkpoint of `fallback_call_ids`
+    /// when the mark is absent.
+    Rewind {
+        /// Prompt mark to restore (`prompt:<message row id>`).
+        mark_id: String,
+        /// Tool calls of the rewound turns, used when no mark exists.
+        fallback_call_ids: Vec<String>,
+    },
 }
 
 /// Request side of the per-session diff worker. Dropping it ends the
@@ -101,16 +113,20 @@ impl FileDiffHandle {
                                 return;
                             }
                         }
-                        Request::Rewind(tool_call_id) => {
+                        Request::Mark(mark_id) => {
+                            tracker.mark_prompt(&mark_id);
+                        }
+                        Request::Rewind {
+                            mark_id,
+                            fallback_call_ids,
+                        } => {
                             // Send the outcome even when nothing reverted:
                             // the TUI needs a reply either way to report
                             // "no checkpoint" back to the user.
-                            let diffs = tracker.rewind(&tool_call_id);
+                            let diffs =
+                                tracker.rewind(&mark_id, &fallback_call_ids.into_iter().collect());
                             if result_tx
-                                .send_blocking(Outcome::Rewound {
-                                    tool_call_id,
-                                    diffs,
-                                })
+                                .send_blocking(Outcome::Rewound { mark_id, diffs })
                                 .is_err()
                             {
                                 return;
@@ -139,12 +155,28 @@ impl FileDiffHandle {
         }
     }
 
-    /// Ask the worker to restore all roots to their state before
-    /// `tool_call_id`.
-    pub fn request_rewind(&self, tool_call_id: &str) {
+    /// Ask the worker to record the current tree of every root under
+    /// `mark_id` (`prompt:<message row id>`), taken at prompt dispatch.
+    pub fn request_mark(&self, mark_id: &str) {
         if self
             .requests
-            .try_send(Request::Rewind(tool_call_id.to_string()))
+            .try_send(Request::Mark(mark_id.to_string()))
+            .is_err()
+        {
+            tracing::debug!("file diff worker is gone; prompt mark dropped");
+        }
+    }
+
+    /// Ask the worker to restore all roots to the state recorded under
+    /// `mark_id`, falling back to the earliest checkpoint of
+    /// `fallback_call_ids` when the mark is absent.
+    pub fn request_rewind(&self, mark_id: &str, fallback_call_ids: Vec<String>) {
+        if self
+            .requests
+            .try_send(Request::Rewind {
+                mark_id: mark_id.to_string(),
+                fallback_call_ids,
+            })
             .is_err()
         {
             tracing::debug!("file diff worker is gone; rewind dropped");

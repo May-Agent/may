@@ -138,8 +138,6 @@ pub enum ToolDisplay {
         output: Option<TerminalCallInfo>,
         /// File changes attributed to this call (one per tracked root).
         diffs: Vec<crate::file_tracker::RootDiff>,
-        /// Whether a later rewind restored the files this call touched.
-        rewound: bool,
         /// Long commands/diffs start collapsed; a click toggles this.
         expanded: bool,
     },
@@ -264,6 +262,10 @@ pub enum ChatElement {
         content: String,
         /// Attachments carried by the message.
         attachments: Vec<Attachment>,
+        /// Position of the persisted user message in
+        /// [`crate::session::ChatHistory::messages`]; anchors prompt-level
+        /// rewind.
+        history_index: usize,
     },
     /// Assistant text (streaming or complete)
     AssistantText {
@@ -321,11 +323,13 @@ impl ChatStream {
         Self::default()
     }
 
-    /// Add a user message.
-    pub fn push_user(&mut self, content: &str, attachments: Vec<Attachment>) {
+    /// Add a user message. `history_index` is the position of the
+    /// persisted user row in session history.
+    pub fn push_user(&mut self, content: &str, attachments: Vec<Attachment>, history_index: usize) {
         self.elements.push(ChatElement::UserMessage {
             content: content.to_string(),
             attachments,
+            history_index,
         });
     }
 
@@ -344,57 +348,84 @@ impl ChatStream {
         });
     }
 
-    /// Tool calls that produced file diffs, oldest first — the rewind
-    /// checkpoints the picker offers.
+    /// User prompts that can be rewound to, oldest first, each carrying
+    /// the file changes attributed to the turn it started (tool calls
+    /// between this prompt and the next).
     #[must_use]
-    pub fn tool_calls_with_diffs(&self) -> Vec<crate::tui::state::RewindTarget> {
-        self.elements
-            .iter()
-            .filter_map(|elem| {
-                let ChatElement::ToolCall {
-                    id,
-                    display: ToolDisplay::Terminal { command, diffs, .. },
-                } = elem
-                else {
-                    return None;
-                };
-                if diffs.is_empty() {
-                    return None;
+    pub fn rewind_targets(&self) -> Vec<crate::tui::state::RewindPrompt> {
+        let mut targets: Vec<crate::tui::state::RewindPrompt> = Vec::new();
+        for elem in &self.elements {
+            match elem {
+                ChatElement::UserMessage {
+                    content,
+                    attachments,
+                    history_index,
+                } => targets.push(crate::tui::state::RewindPrompt {
+                    history_index: *history_index,
+                    content: content.clone(),
+                    attachments: attachments.clone(),
+                    files: 0,
+                    additions: 0,
+                    deletions: 0,
+                }),
+                ChatElement::ToolCall {
+                    display: ToolDisplay::Terminal { diffs, .. },
+                    ..
+                } => {
+                    if let Some(target) = targets.last_mut() {
+                        target.files += diffs.iter().map(|d| d.files).sum::<usize>();
+                        target.additions += diffs.iter().map(|d| d.additions).sum::<usize>();
+                        target.deletions += diffs.iter().map(|d| d.deletions).sum::<usize>();
+                    }
                 }
-                Some(crate::tui::state::RewindTarget {
-                    tool_call_id: id.clone(),
-                    command_preview: command.lines().next().unwrap_or_default().to_string(),
-                    files: diffs.iter().map(|d| d.files).sum(),
-                    additions: diffs.iter().map(|d| d.additions).sum(),
-                    deletions: diffs.iter().map(|d| d.deletions).sum(),
-                })
-            })
-            .collect()
-    }
-
-    /// Flag every tool call with diffs from `tool_call_id` onward as
-    /// rewound. Returns how many calls were marked.
-    pub fn mark_rewound_from(&mut self, tool_call_id: &str) -> usize {
-        let start = self.elements.iter().position(
-            |elem| matches!(elem, ChatElement::ToolCall { id, .. } if id == tool_call_id),
-        );
-        let Some(start) = start else {
-            return 0;
-        };
-        let mut marked = 0;
-        for elem in &mut self.elements[start..] {
-            if let ChatElement::ToolCall {
-                display: ToolDisplay::Terminal { diffs, rewound, .. },
-                ..
-            } = elem
-                && !diffs.is_empty()
-                && !*rewound
-            {
-                *rewound = true;
-                marked += 1;
+                _ => {}
             }
         }
-        marked
+        targets
+    }
+
+    /// Everything a prompt-level rewind needs from the stream: the
+    /// prompt's own content and attachments (restored into the input for
+    /// editing) plus the ids of tool calls at or after it (file-restore
+    /// fallback when no prompt checkpoint exists). `None` when no user
+    /// message carries `history_index`.
+    #[must_use]
+    pub fn prompt_rewind_payload(
+        &self,
+        history_index: usize,
+    ) -> Option<(String, Vec<Attachment>, Vec<String>)> {
+        let pos = self.elements.iter().position(|elem| {
+            matches!(elem, ChatElement::UserMessage { history_index: idx, .. } if *idx == history_index)
+        })?;
+        let ChatElement::UserMessage {
+            content,
+            attachments,
+            ..
+        } = &self.elements[pos]
+        else {
+            return None;
+        };
+        let call_ids = self.elements[pos..]
+            .iter()
+            .filter_map(|elem| match elem {
+                ChatElement::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        Some((content.clone(), attachments.clone(), call_ids))
+    }
+
+    /// Drop the user message at `history_index` and every element after
+    /// it — the stream's half of a conversation rewind. `false` when no
+    /// user message carries `history_index`.
+    pub fn truncate_prompt_at(&mut self, history_index: usize) -> bool {
+        let Some(pos) = self.elements.iter().position(|elem| {
+            matches!(elem, ChatElement::UserMessage { history_index: idx, .. } if *idx == history_index)
+        }) else {
+            return false;
+        };
+        self.elements.truncate(pos);
+        true
     }
 
     /// Start loading indicator.
@@ -1010,7 +1041,6 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>) {
             status,
             output,
             diffs,
-            rewound,
             expanded,
         } => {
             let status_text = match status {
@@ -1046,7 +1076,7 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>) {
                     lines.push(Line::from(format!("  │ {line}")));
                 }
             }
-            plain_diff_lines(diffs, *expanded, *rewound, lines);
+            plain_diff_lines(diffs, *expanded, lines);
         }
     }
 }
@@ -1055,7 +1085,6 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>) {
 fn plain_diff_lines(
     diffs: &[crate::file_tracker::RootDiff],
     expanded: bool,
-    rewound: bool,
     lines: &mut Vec<Line<'static>>,
 ) {
     const PREVIEW_LINES: usize = 8;
@@ -1064,13 +1093,12 @@ fn plain_diff_lines(
 
     for (index, diff) in diffs.iter().enumerate() {
         let summary = format!(
-            "± {} file{} (+{} −{}){}{}",
+            "± {} file{} (+{} −{}){}",
             diff.files,
             if diff.files == 1 { "" } else { "s" },
             diff.additions,
             diff.deletions,
             if collapsed { " ▸" } else { "" },
-            if rewound { " (rewound)" } else { "" },
         );
         if diffs.len() > 1 {
             lines.push(Line::from(format!(
@@ -1209,6 +1237,7 @@ fn render_impl(
             ChatElement::UserMessage {
                 content,
                 attachments,
+                ..
             } => {
                 // User message with > prefix
                 for (i, line) in content.lines().enumerate() {
@@ -1765,7 +1794,6 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             status,
             output,
             diffs,
-            rewound,
             expanded,
         } => {
             let status_text = match status {
@@ -1833,7 +1861,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 }
             }
 
-            render_diff_preview(lines, diffs, *expanded, *rewound);
+            render_diff_preview(lines, diffs, *expanded);
         }
     }
 }
@@ -1855,12 +1883,11 @@ fn diff_line_style(line: &str) -> Style {
 
 /// Render a compact per-root diff summary plus a capped tinted preview
 /// under an inline terminal tool call. Long diffs collapse to their
-/// summary until `expanded`; `rewound` dims them and adds a marker.
+/// summary until `expanded`.
 fn render_diff_preview<'a>(
     lines: &mut Vec<Line<'a>>,
     diffs: &'a [crate::file_tracker::RootDiff],
     expanded: bool,
-    rewound: bool,
 ) {
     const PREVIEW_LINES: usize = 8;
 
@@ -1876,11 +1903,6 @@ fn render_diff_preview<'a>(
             diff.deletions,
             if collapsed { " ▸" } else { "" },
         );
-        let summary = if rewound {
-            format!("{summary} (rewound)")
-        } else {
-            summary
-        };
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -1889,11 +1911,7 @@ fn render_diff_preview<'a>(
                 } else {
                     summary
                 },
-                if rewound {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::Yellow)
-                },
+                Style::default().fg(Color::Yellow),
             ),
         ]));
         if collapsed {
@@ -2109,7 +2127,6 @@ mod tests {
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
-                rewound: false,
                 expanded: false,
             };
             let mut lines: Vec<Line> = Vec::new();
@@ -2130,7 +2147,6 @@ mod tests {
             status: ToolStatus::Done,
             output: None,
             diffs: Vec::new(),
-            rewound: false,
             expanded: false,
         }
     }
@@ -2194,7 +2210,6 @@ mod tests {
                 additions: 12,
                 deletions: 0,
             }],
-            rewound: false,
             expanded: false,
         };
         assert!(display.is_collapsible());

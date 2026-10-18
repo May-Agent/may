@@ -14,7 +14,7 @@ mod store;
 
 pub use context_snapshot::{
     PersistContextSnapshotError, PersistedContextSnapshot, checkpoint_from_hook,
-    history_delta_since_snapshot, load_persisted_context_snapshot,
+    history_delta_since_snapshot, llm_row_ids, load_persisted_context_snapshot,
     parse_persisted_context_snapshot, persist_agent_context_snapshot, persist_checkpoint_from_hook,
 };
 pub use history::{
@@ -23,7 +23,7 @@ pub use history::{
 };
 pub use layout::{MayHomePaths, ProfileHomePaths, SessionPaths};
 pub use manager::{
-    Session, SessionError, SessionId, SessionManager, SessionSummary,
+    RewindPoint, Session, SessionError, SessionId, SessionManager, SessionSummary,
     initialize_session_persistence, list_summaries_from_db, load_history_from_db,
     reconcile_container_profile_sessions, summarize_db_sessions,
 };

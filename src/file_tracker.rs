@@ -11,6 +11,7 @@
 //! shadow repository, so reopening a session continues tracking from the
 //! state the last session left behind instead of re-attributing old changes.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -83,9 +84,13 @@ pub enum TrackerError {
 /// Name of the file inside each shadow `GIT_DIR` holding the last tree hash.
 const BASE_FILE: &str = "diff-base";
 
-/// Name of the file listing rewind checkpoints: `<tree>\t<tool_call_id>`
-/// per line, where `tree` is the state the call started from — the tree a
-/// rewind to "before this call" restores.
+/// Name of the file listing rewind checkpoints: `<tree>\t<id>` per line.
+/// Entries are written by [`FileChangeTracker::snapshot`] — `id` is the
+/// tool call that produced the change and `tree` is the state the call
+/// started from — and by [`FileChangeTracker::mark_prompt`], where `id`
+/// is `prompt:<message row id>` and `tree` is the state when the user
+/// prompt was dispatched. Restoring either kind gives the code state at
+/// that point.
 const CHECKPOINTS_FILE: &str = "checkpoints";
 
 #[derive(Debug)]
@@ -183,17 +188,40 @@ impl FileChangeTracker {
         diffs
     }
 
-    /// Restore every root to the state it had before `tool_call_id` ran.
+    /// Record a prompt checkpoint: the tree every root has right now,
+    /// keyed by `mark_id` (`prompt:<message row id>`). Unlike
+    /// [`Self::snapshot`], the baseline is untouched — the mark is a pure
+    /// lookup point for a later [`Self::rewind`].
     ///
-    /// Rewinding is point-in-time: later changes are undone too. Returns the
-    /// revert diff per affected root (empty when the call left no checkpoint
-    /// or the root already matches the checkpoint). The baseline moves to the
-    /// restored tree so later diffs measure from the rewound state.
+    /// Roots whose git operations fail are logged and skipped.
+    pub fn mark_prompt(&mut self, mark_id: &str) {
+        for root in &mut self.roots {
+            if let Err(error) = mark_root(root, mark_id) {
+                tracing::warn!(
+                    worktree = %root.worktree.display(),
+                    %error,
+                    "prompt checkpoint failed for root"
+                );
+            }
+        }
+    }
+
+    /// Restore every root to the state it had at `mark_id`
+    /// (`prompt:<message row id>`). When a root holds no such mark — for
+    /// example a prompt written before marks existed — it falls back to
+    /// the earliest checkpoint attributed to any call id in
+    /// `fallback_call_ids` (the calls of the rewound turns, in log order),
+    /// which is the same pre-turn tree.
+    ///
+    /// Rewinding is point-in-time: later changes are undone too. Returns
+    /// the revert diff per affected root (empty when no checkpoint applies
+    /// or the root already matches it). The baseline moves to the restored
+    /// tree so later diffs measure from the rewound state.
     #[must_use]
-    pub fn rewind(&mut self, tool_call_id: &str) -> Vec<RootDiff> {
+    pub fn rewind(&mut self, mark_id: &str, fallback_call_ids: &HashSet<String>) -> Vec<RootDiff> {
         let mut diffs = Vec::new();
         for root in &mut self.roots {
-            match rewind_root(root, tool_call_id) {
+            match rewind_root(root, mark_id, fallback_call_ids) {
                 Ok(Some(diff)) => diffs.push(diff),
                 Ok(None) => {}
                 Err(error) => {
@@ -370,23 +398,31 @@ fn snapshot_root(
     }))
 }
 
-/// Append `<tree>\t<tool_call_id>` to the root's checkpoint log. `tree` is
-/// the state before the call — the tree a rewind restores.
+/// Record `tree` as a prompt checkpoint keyed by `mark_id`. The tree is
+/// refreshed from the worktree, so changes no tool call was attributed
+/// (hand edits, background jobs) are captured too.
+fn mark_root(root: &TrackedRoot, mark_id: &str) -> Result<(), TrackerError> {
+    let tree = write_tree(&root.git_dir, &root.worktree)?;
+    record_checkpoint(root, &tree, mark_id)
+}
+
+/// Append `<tree>\t<id>` to the root's checkpoint log. `tree` is the state
+/// before the call or prompt the id names — the tree a rewind restores.
 fn record_checkpoint(
     root: &TrackedRoot,
     tree_before: &str,
-    tool_call_id: &str,
+    checkpoint_id: &str,
 ) -> Result<(), TrackerError> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(root.git_dir.join(CHECKPOINTS_FILE))?;
-    writeln!(file, "{tree_before}\t{tool_call_id}")?;
+    writeln!(file, "{tree_before}\t{checkpoint_id}")?;
     Ok(())
 }
 
-/// Read the root's checkpoint log as `(tree, tool_call_id)` pairs.
+/// Read the root's checkpoint log as `(tree, checkpoint_id)` pairs.
 fn read_checkpoints(root: &TrackedRoot) -> Result<Vec<(String, String)>, TrackerError> {
     let content = match std::fs::read_to_string(root.git_dir.join(CHECKPOINTS_FILE)) {
         Ok(content) => content,
@@ -400,17 +436,25 @@ fn read_checkpoints(root: &TrackedRoot) -> Result<Vec<(String, String)>, Tracker
         .collect())
 }
 
-/// Restore `root`'s worktree to the checkpoint recorded for
-/// `tool_call_id`, returning the revert diff (current → restored). `None`
-/// when the call left no checkpoint on this root or nothing differs.
+/// Restore `root`'s worktree to the checkpoint recorded for `mark_id`, or
+/// to the earliest checkpoint attributed to a call in `fallback_call_ids`
+/// when the mark is absent. Returns the revert diff (current → restored),
+/// `None` when no checkpoint applies or nothing differs.
 fn rewind_root(
     root: &mut TrackedRoot,
-    tool_call_id: &str,
+    mark_id: &str,
+    fallback_call_ids: &HashSet<String>,
 ) -> Result<Option<RootDiff>, TrackerError> {
-    let Some(target) = read_checkpoints(root)?
-        .into_iter()
-        .find(|(_, id)| id == tool_call_id)
-        .map(|(tree, _)| tree)
+    let checkpoints = read_checkpoints(root)?;
+    let Some(target) = checkpoints
+        .iter()
+        .find(|(_, id)| id == mark_id)
+        .or_else(|| {
+            checkpoints
+                .iter()
+                .find(|(_, id)| fallback_call_ids.contains(id))
+        })
+        .map(|(tree, _)| tree.clone())
     else {
         return Ok(None);
     };
@@ -599,6 +643,13 @@ mod tests {
         assert!(snap(&mut tracker, "call-1").is_empty());
     }
 
+    fn rewind_calls(tracker: &mut FileChangeTracker, ids: &[&str]) -> Vec<RootDiff> {
+        tracker.rewind(
+            "prompt:no-such-mark",
+            &ids.iter().map(|id| (*id).to_string()).collect(),
+        )
+    }
+
     #[test]
     fn rewind_restores_modified_and_added_files() {
         let (_temp, worktree, mut tracker) = tracker();
@@ -609,7 +660,7 @@ mod tests {
         fs::write(worktree.join("new.txt"), "added\n").expect("add");
         assert_eq!(snap(&mut tracker, "call-2").len(), 1);
 
-        let reverted = tracker.rewind("call-2");
+        let reverted = rewind_calls(&mut tracker, &["call-2"]);
 
         assert_eq!(reverted.len(), 1);
         assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "one\n");
@@ -627,7 +678,7 @@ mod tests {
         fs::remove_file(worktree.join("keep.txt")).expect("remove");
         assert_eq!(snap(&mut tracker, "call-2").len(), 1);
 
-        let reverted = tracker.rewind("call-2");
+        let reverted = rewind_calls(&mut tracker, &["call-2"]);
 
         assert_eq!(reverted.len(), 1);
         assert_eq!(
@@ -642,7 +693,7 @@ mod tests {
         fs::write(worktree.join("x.txt"), "data\n").expect("write");
         snap(&mut tracker, "call-1");
 
-        assert!(tracker.rewind("no-such-call").is_empty());
+        assert!(rewind_calls(&mut tracker, &[]).is_empty());
         assert_eq!(
             fs::read_to_string(worktree.join("x.txt")).unwrap(),
             "data\n"
@@ -658,10 +709,51 @@ mod tests {
         fs::write(worktree.join("later.txt"), "later\n").expect("write");
         snap(&mut tracker, "call-2");
 
-        // Rewinding call-1 restores the state at tracker init.
-        let reverted = tracker.rewind("call-1");
+        // Rewinding to the first call restores the state at tracker init.
+        let reverted = rewind_calls(&mut tracker, &["call-1", "call-2"]);
         assert_eq!(reverted.len(), 1);
         assert!(!worktree.join("seed.txt").exists());
         assert!(!worktree.join("later.txt").exists());
+    }
+
+    #[test]
+    fn prompt_mark_restores_state_at_dispatch() {
+        let (_temp, worktree, mut tracker) = tracker();
+        fs::write(worktree.join("a.txt"), "one\n").expect("write");
+        snap(&mut tracker, "call-1");
+
+        // User prompt dispatched: mark the pre-turn tree.
+        tracker.mark_prompt("prompt:7");
+
+        // Later changes — including ones no tool call is attributed.
+        fs::write(worktree.join("a.txt"), "changed\n").expect("rewrite");
+        fs::write(worktree.join("new.txt"), "added\n").expect("add");
+
+        let reverted = tracker.rewind("prompt:7", &HashSet::new());
+
+        assert_eq!(reverted.len(), 1);
+        assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "one\n");
+        assert!(!worktree.join("new.txt").exists());
+        // Baseline moved back: the undo is not re-reported.
+        assert!(snap(&mut tracker, "call-2").is_empty());
+    }
+
+    #[test]
+    fn prompt_mark_takes_precedence_over_call_fallback() {
+        let (_temp, worktree, mut tracker) = tracker();
+        fs::write(worktree.join("a.txt"), "one\n").expect("write");
+        snap(&mut tracker, "call-1");
+
+        tracker.mark_prompt("prompt:7");
+        fs::write(worktree.join("b.txt"), "two\n").expect("write");
+        snap(&mut tracker, "call-2");
+
+        // The mark wins over the call fallback: b.txt was written after the
+        // prompt was dispatched, so rewinding removes it.
+        let reverted = tracker.rewind("prompt:7", &HashSet::from(["call-2".to_string()]));
+
+        assert_eq!(reverted.len(), 1);
+        assert!(!worktree.join("b.txt").exists());
+        assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "one\n");
     }
 }

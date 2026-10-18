@@ -915,6 +915,35 @@ impl ChatDb {
         self.load_session_runtime_summary(session_id).await
     }
 
+    /// Remove every pending message (steer and queued) for a session.
+    /// Used when a conversation rewind discards the timeline those
+    /// messages belonged to.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    pub async fn clear_pending_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_attachments WHERE message_id IN (SELECT id FROM session_pending_message_entries WHERE session_id = ?)",
+            session_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_entries WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
     /// Remove a queued message by its position in the queue.
     ///
     /// # Errors
