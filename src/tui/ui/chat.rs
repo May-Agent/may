@@ -138,6 +138,8 @@ pub enum ToolDisplay {
         output: Option<TerminalCallInfo>,
         /// File changes attributed to this call (one per tracked root).
         diffs: Vec<crate::file_tracker::RootDiff>,
+        /// Whether a later rewind restored the files this call touched.
+        rewound: bool,
     },
 }
 
@@ -255,6 +257,11 @@ pub enum ChatElement {
         /// Error text shown in the stream.
         message: String,
     },
+    /// Neutral system notice (e.g. rewind result)
+    Notice {
+        /// Notice text shown in the stream.
+        message: String,
+    },
     /// Loading indicator (waiting for LLM response)
     Loading {
         /// Spinner frame counter.
@@ -295,6 +302,67 @@ impl ChatStream {
         self.elements.push(ChatElement::Error {
             message: message.to_string(),
         });
+    }
+
+    /// Add a neutral system notice.
+    pub fn push_notice(&mut self, message: &str) {
+        self.end_text();
+        self.elements.push(ChatElement::Notice {
+            message: message.to_string(),
+        });
+    }
+
+    /// Tool calls that produced file diffs, oldest first — the rewind
+    /// checkpoints the picker offers.
+    #[must_use]
+    pub fn tool_calls_with_diffs(&self) -> Vec<crate::tui::state::RewindTarget> {
+        self.elements
+            .iter()
+            .filter_map(|elem| {
+                let ChatElement::ToolCall {
+                    id,
+                    display: ToolDisplay::Terminal { command, diffs, .. },
+                } = elem
+                else {
+                    return None;
+                };
+                if diffs.is_empty() {
+                    return None;
+                }
+                Some(crate::tui::state::RewindTarget {
+                    tool_call_id: id.clone(),
+                    command_preview: command.lines().next().unwrap_or_default().to_string(),
+                    files: diffs.iter().map(|d| d.files).sum(),
+                    additions: diffs.iter().map(|d| d.additions).sum(),
+                    deletions: diffs.iter().map(|d| d.deletions).sum(),
+                })
+            })
+            .collect()
+    }
+
+    /// Flag every tool call with diffs from `tool_call_id` onward as
+    /// rewound. Returns how many calls were marked.
+    pub fn mark_rewound_from(&mut self, tool_call_id: &str) -> usize {
+        let start = self.elements.iter().position(
+            |elem| matches!(elem, ChatElement::ToolCall { id, .. } if id == tool_call_id),
+        );
+        let Some(start) = start else {
+            return 0;
+        };
+        let mut marked = 0;
+        for elem in &mut self.elements[start..] {
+            if let ChatElement::ToolCall {
+                display: ToolDisplay::Terminal { diffs, rewound, .. },
+                ..
+            } = elem
+                && !diffs.is_empty()
+                && !*rewound
+            {
+                *rewound = true;
+                marked += 1;
+            }
+        }
+        marked
     }
 
     /// Start loading indicator.
@@ -689,6 +757,10 @@ fn build_plain_chat_lines(chat: &ChatStream) -> Vec<Line<'static>> {
                 lines.push(Line::from(format!("error: {message}")));
                 lines.push(Line::from(""));
             }
+            ChatElement::Notice { message } => {
+                lines.push(Line::from(message.clone()));
+                lines.push(Line::from(""));
+            }
             ChatElement::ToolCall { .. }
             | ChatElement::TodoBlock { .. }
             | ChatElement::Loading { .. }
@@ -947,6 +1019,14 @@ fn render_impl(
                 lines.push(Line::from(vec![
                     Span::styled("✗ ", Style::default().fg(Color::Red)),
                     Span::styled(message, Style::default().fg(Color::Red)),
+                ]));
+                lines.push(Line::from(""));
+            }
+
+            ChatElement::Notice { message } => {
+                lines.push(Line::from(vec![
+                    Span::styled("◈ ", Style::default().fg(Color::Cyan)),
+                    Span::styled(message, Style::default().fg(Color::DarkGray)),
                 ]));
                 lines.push(Line::from(""));
             }
@@ -1365,6 +1445,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             status,
             output,
             diffs,
+            rewound,
         } => {
             let status_text = match status {
                 ToolStatus::Running => Some("running".to_string()),
@@ -1420,7 +1501,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 }
             }
 
-            render_diff_preview(lines, diffs);
+            render_diff_preview(lines, diffs, *rewound);
         }
     }
 }
@@ -1442,7 +1523,11 @@ fn diff_line_style(line: &str) -> Style {
 
 /// Render a compact per-root diff summary plus a capped tinted preview
 /// under an inline terminal tool call.
-fn render_diff_preview<'a>(lines: &mut Vec<Line<'a>>, diffs: &'a [crate::file_tracker::RootDiff]) {
+fn render_diff_preview<'a>(
+    lines: &mut Vec<Line<'a>>,
+    diffs: &'a [crate::file_tracker::RootDiff],
+    rewound: bool,
+) {
     const PREVIEW_LINES: usize = 8;
 
     for (index, diff) in diffs.iter().enumerate() {
@@ -1453,6 +1538,11 @@ fn render_diff_preview<'a>(lines: &mut Vec<Line<'a>>, diffs: &'a [crate::file_tr
             diff.additions,
             diff.deletions,
         );
+        let summary = if rewound {
+            format!("{summary} (rewound)")
+        } else {
+            summary
+        };
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -1461,7 +1551,11 @@ fn render_diff_preview<'a>(lines: &mut Vec<Line<'a>>, diffs: &'a [crate::file_tr
                 } else {
                     summary
                 },
-                Style::default().fg(Color::Yellow),
+                if rewound {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
             ),
         ]));
 
@@ -1671,6 +1765,7 @@ mod tests {
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
+                rewound: false,
             };
             let mut lines: Vec<Line> = Vec::new();
             render_tool_inline(&mut lines, &display, false);
