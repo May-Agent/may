@@ -12,6 +12,8 @@ pub mod completion;
 pub mod error;
 /// Terminal event polling and app event channel.
 pub mod event;
+/// Per-session file-diff worker feeding tool-call diffs to the chat stream.
+pub mod file_diff;
 /// Persistent input history.
 pub mod history;
 /// Pending message and attachment types.
