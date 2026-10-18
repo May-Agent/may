@@ -140,10 +140,42 @@ pub enum ToolDisplay {
         diffs: Vec<crate::file_tracker::RootDiff>,
         /// Whether a later rewind restored the files this call touched.
         rewound: bool,
+        /// Long commands/diffs start collapsed; a click toggles this.
+        expanded: bool,
     },
 }
 
+/// Multi-line commands longer than this collapse to their first line.
+const COLLAPSE_COMMAND_LINES: usize = 3;
+/// Diffs with more lines than this collapse to their `±` summary.
+const COLLAPSE_DIFF_LINES: usize = 8;
+
+/// A screen-row span (in `rendered_plain_lines` space) owned by one
+/// collapsible tool call — a click inside toggles its expansion.
+#[derive(Debug, Clone)]
+pub struct ClickRegion {
+    /// Tool call element ID.
+    pub tool_call_id: String,
+    /// First covered row, inclusive.
+    pub start: usize,
+    /// One past the last covered row.
+    pub end: usize,
+}
+
 impl ToolDisplay {
+    /// Whether this call's body is long enough to be collapsible.
+    #[must_use]
+    pub fn is_collapsible(&self) -> bool {
+        match self {
+            Self::Terminal { command, diffs, .. } => {
+                command.lines().count() > COLLAPSE_COMMAND_LINES
+                    || diffs.iter().map(|d| d.text.lines().count()).sum::<usize>()
+                        > COLLAPSE_DIFF_LINES
+            }
+            Self::Search { .. } | Self::Fetch { .. } | Self::Task { .. } => false,
+        }
+    }
+
     /// Get the most recent terminal call for this tool.
     #[must_use]
     pub fn latest_terminal(&self) -> Option<&TerminalCallInfo> {
@@ -513,6 +545,23 @@ impl ChatStream {
         }
     }
 
+    /// Flip the expanded state of a collapsible tool call.
+    pub fn toggle_tool_expanded(&mut self, id: &str) {
+        for elem in &mut self.elements {
+            if let ChatElement::ToolCall {
+                id: tool_id,
+                display,
+            } = elem
+                && tool_id == id
+                && display.is_collapsible()
+                && let ToolDisplay::Terminal { expanded, .. } = display
+            {
+                *expanded = !*expanded;
+                break;
+            }
+        }
+    }
+
     /// Attach file diffs to a terminal tool call.
     pub fn update_tool_diff(&mut self, id: &str, diffs: Vec<crate::file_tracker::RootDiff>) {
         for elem in &mut self.elements {
@@ -700,7 +749,9 @@ pub fn render_unified(
     render_impl(frame, area, chat, scroll, ctx.into());
 }
 
-/// Build plain wrapped lines for selection/copy from unified viewport content.
+/// Build plain wrapped lines for selection/copy from unified viewport
+/// content. When `regions_out` is given, it also reports the row span of
+/// every collapsible tool call for click hit-testing.
 #[must_use]
 pub fn build_plain_wrapped_lines_unified(
     chat: &ChatStream,
@@ -708,83 +759,307 @@ pub fn build_plain_wrapped_lines_unified(
     queue_ctx: Option<&QueueContext<'_>>,
     input_ctx: Option<InputContext<'_>>,
     status_ctx: Option<&StatusContext<'_>>,
+    regions_out: Option<&mut Vec<ClickRegion>>,
 ) -> Vec<String> {
     if width == 0 {
         return Vec::new();
     }
+    let max_width = width as usize;
+    let mut out: Vec<String> = Vec::new();
+    let mut regions = Vec::new();
 
-    let mut lines: Vec<Line<'static>> = build_plain_chat_lines(chat);
+    for elem in chat.active_elements() {
+        let start = out.len();
+        for line in plain_lines_for_element(elem) {
+            out.append(&mut wrap_plain_line(&plain_text(&line), max_width));
+        }
+        if let ChatElement::ToolCall { id, display } = elem
+            && display.is_collapsible()
+        {
+            regions.push(ClickRegion {
+                tool_call_id: id.clone(),
+                start,
+                end: out.len(),
+            });
+        }
+    }
 
+    let mut tail: Vec<Line<'static>> = Vec::new();
     if let Some(ctx) = queue_ctx
         && !ctx.messages.is_empty()
     {
-        render_queue_lines(&mut lines, ctx, width);
+        render_queue_lines(&mut tail, ctx, width);
     }
-
     if let Some(ctx) = input_ctx {
-        render_input_line(&mut lines, &ctx);
+        render_input_line(&mut tail, &ctx);
     }
-
     if let Some(ctx) = status_ctx {
-        render_status_line(&mut lines, ctx);
+        render_status_line(&mut tail, ctx);
+    }
+    for line in tail {
+        out.append(&mut wrap_plain_line(&plain_text(&line), max_width));
     }
 
-    paragraph_to_wrapped_plain(lines, width)
+    if let Some(slot) = regions_out {
+        *slot = regions;
+    }
+    out
 }
 
-fn build_plain_chat_lines(chat: &ChatStream) -> Vec<Line<'static>> {
+/// Plain text of a styled line (span contents concatenated).
+fn plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+}
+
+/// Plain-text mirror of one chat element's styled rendering. Row count
+/// must track the styled output so selection rows and click regions
+/// align with what is on screen.
+fn plain_lines_for_element(elem: &ChatElement) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for elem in chat.active_elements() {
-        match elem {
-            ChatElement::UserMessage { content, .. } => {
-                for (i, line) in content.lines().enumerate() {
-                    if i == 0 {
-                        lines.push(Line::from(format!("> {line}")));
-                    } else {
-                        lines.push(Line::from(format!("  {line}")));
-                    }
+    match elem {
+        ChatElement::UserMessage { content, .. } => {
+            for (i, line) in content.lines().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(format!("> {line}")));
+                } else {
+                    lines.push(Line::from(format!("  {line}")));
                 }
-                lines.push(Line::from(""));
             }
-            ChatElement::AssistantText { content, .. } => {
-                lines.extend(markdown::render_markdown_with_config(
-                    content,
-                    markdown::ImageSupport::Disabled,
-                ));
-                lines.push(Line::from(""));
+            lines.push(Line::from(""));
+        }
+        ChatElement::AssistantText { content, .. } => {
+            lines.extend(markdown::render_markdown_with_config(
+                content,
+                markdown::ImageSupport::Disabled,
+            ));
+            lines.push(Line::from(""));
+        }
+        ChatElement::Error { message } => {
+            lines.push(Line::from(format!("✗ {message}")));
+            lines.push(Line::from(""));
+        }
+        ChatElement::ToolCall { display, .. } => {
+            plain_tool_lines(display, &mut lines);
+        }
+        ChatElement::TodoBlock { items } => {
+            lines.push(Line::from("[todo] ────────────────────────────"));
+            for item in items {
+                let marker = match item.status {
+                    TodoStatus::Pending => "[ ]",
+                    TodoStatus::InProgress => "[>]",
+                    TodoStatus::Completed => "[x]",
+                };
+                lines.push(Line::from(format!("  {marker} {}", item.content)));
             }
-            ChatElement::Error { message } => {
-                lines.push(Line::from(format!("error: {message}")));
-                lines.push(Line::from(""));
-            }
-            ChatElement::Notice { message } => {
-                lines.push(Line::from(message.clone()));
-                lines.push(Line::from(""));
-            }
-            ChatElement::ToolCall { .. }
-            | ChatElement::TodoBlock { .. }
-            | ChatElement::Loading { .. }
-            | ChatElement::Thinking { .. } => {}
+            lines.push(Line::from("─────────────────────────────────────"));
+            lines.push(Line::from(""));
+        }
+        ChatElement::Notice { message } => {
+            lines.push(Line::from(message.clone()));
+            lines.push(Line::from(""));
+        }
+        ChatElement::Loading { frame } => {
+            let spinner = match frame % 4 {
+                0 => "⠋",
+                1 => "⠙",
+                2 => "⠹",
+                _ => "⠸",
+            };
+            lines.push(Line::from(format!("{spinner} Waiting for response...")));
+        }
+        ChatElement::Thinking { seconds } => {
+            let text = if *seconds == 0 {
+                "◐ Thinking...".to_string()
+            } else {
+                format!("◐ Thinking... ({seconds} sec)")
+            };
+            lines.push(Line::from(text));
         }
     }
     lines
 }
 
-fn paragraph_to_wrapped_plain(lines: Vec<Line>, width: u16) -> Vec<String> {
-    let mut out = Vec::new();
-    let max_width = width as usize;
-
-    for line in lines {
-        let plain = line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>();
-        let mut wrapped = wrap_plain_line(&plain, max_width);
-        out.append(&mut wrapped);
+/// Plain-text mirror of `render_tool_inline` for one tool call.
+fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>) {
+    match display {
+        ToolDisplay::Search {
+            query,
+            status,
+            results,
+            terminal_info,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => "...".to_string(),
+                ToolStatus::Done => results.map_or(String::new(), |n| format!("{n} results")),
+                ToolStatus::SearchDone(n) => format!("{n} results"),
+                ToolStatus::Failed(e) => format!("failed: {e}"),
+            };
+            let query_display = if status_text.is_empty() {
+                format!("\"{query}\"")
+            } else {
+                format!("\"{query}\" {status_text}")
+            };
+            lines.push(Line::from(format!("  [search] {query_display}")));
+            if let Some(info) = terminal_info
+                && !info.output.is_empty()
+            {
+                for line in info.output_preview(2).lines() {
+                    lines.push(Line::from(format!("    {line}")));
+                }
+            }
+        }
+        ToolDisplay::Fetch {
+            url,
+            status,
+            terminal_info,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => "...",
+                ToolStatus::Done | ToolStatus::SearchDone(_) => "",
+                ToolStatus::Failed(_) => "failed",
+            };
+            let url_display = if status_text.is_empty() {
+                url.clone()
+            } else {
+                format!("{url} {status_text}")
+            };
+            lines.push(Line::from(format!("  [fetch] {url_display}")));
+            if let Some(info) = terminal_info
+                && !info.output.is_empty()
+            {
+                for line in info.output_preview(2).lines() {
+                    lines.push(Line::from(format!("    {line}")));
+                }
+            }
+        }
+        ToolDisplay::Task {
+            subagent,
+            prompt,
+            status,
+            terminal_calls,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => "...",
+                ToolStatus::Done | ToolStatus::SearchDone(_) => "",
+                ToolStatus::Failed(_) => "failed",
+            };
+            let prompt_preview = match prompt.char_indices().nth(50) {
+                Some((pos, _)) => format!("{}...", &prompt[..pos]),
+                None => prompt.clone(),
+            };
+            let prompt_display = if status_text.is_empty() {
+                prompt_preview
+            } else {
+                format!("{prompt_preview} {status_text}")
+            };
+            lines.push(Line::from(format!(
+                "  [subagent:{subagent}] {prompt_display}"
+            )));
+            if let Some(latest) = terminal_calls.last() {
+                lines.push(Line::from(format!("    $ {}", latest.command_preview(60))));
+                if !latest.output.is_empty() {
+                    for line in latest.output_preview(2).lines() {
+                        lines.push(Line::from(format!("      {line}")));
+                    }
+                }
+            }
+        }
+        ToolDisplay::Terminal {
+            command,
+            mode,
+            status,
+            output,
+            diffs,
+            rewound,
+            expanded,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => Some("running".to_string()),
+                ToolStatus::Done => None,
+                ToolStatus::SearchDone(n) => Some(format!("{n} results")),
+                ToolStatus::Failed(e) => Some(format!("failed: {e}")),
+            };
+            let mode_prefix = terminal_mode_marker(*mode);
+            let mut command_lines = command.lines();
+            if let Some(first) = command_lines.next() {
+                lines.push(Line::from(format!("  {mode_prefix}$ {first}")));
+                let hidden = command.lines().count() - 1;
+                if !*expanded && command.lines().count() > COLLAPSE_COMMAND_LINES {
+                    lines.push(Line::from(format!(
+                        "  ▸ … {hidden} more lines — click to expand"
+                    )));
+                } else {
+                    for line in command_lines {
+                        lines.push(Line::from(format!("  │ {line}")));
+                    }
+                }
+            } else {
+                lines.push(Line::from(format!("  {mode_prefix}$")));
+            }
+            if let Some(status) = status_text {
+                lines.push(Line::from(format!("  ↳ {status}")));
+            }
+            if let Some(info) = output
+                && !info.output.is_empty()
+            {
+                for line in info.output_preview(3).lines() {
+                    lines.push(Line::from(format!("  │ {line}")));
+                }
+            }
+            plain_diff_lines(diffs, *expanded, *rewound, lines);
+        }
     }
+}
 
-    out
+/// Plain-text mirror of `render_diff_preview`.
+fn plain_diff_lines(
+    diffs: &[crate::file_tracker::RootDiff],
+    expanded: bool,
+    rewound: bool,
+    lines: &mut Vec<Line<'static>>,
+) {
+    const PREVIEW_LINES: usize = 8;
+    let total: usize = diffs.iter().map(|d| d.text.lines().count()).sum();
+    let collapsed = !expanded && total > COLLAPSE_DIFF_LINES;
+
+    for (index, diff) in diffs.iter().enumerate() {
+        let summary = format!(
+            "± {} file{} (+{} −{}){}{}",
+            diff.files,
+            if diff.files == 1 { "" } else { "s" },
+            diff.additions,
+            diff.deletions,
+            if collapsed { " ▸" } else { "" },
+            if rewound { " (rewound)" } else { "" },
+        );
+        if diffs.len() > 1 {
+            lines.push(Line::from(format!(
+                "  {summary} in {}",
+                diff.root.display()
+            )));
+        } else {
+            lines.push(Line::from(format!("  {summary}")));
+        }
+        if collapsed {
+            continue;
+        }
+        let count = diff.text.lines().count();
+        for line in diff.text.lines().take(PREVIEW_LINES) {
+            lines.push(Line::from(format!("  │ {line}")));
+        }
+        if count > PREVIEW_LINES {
+            lines.push(Line::from(format!(
+                "  │ … {} more diff lines",
+                count - PREVIEW_LINES
+            )));
+        }
+        if index + 1 < diffs.len() {
+            lines.push(Line::from(""));
+        }
+    }
 }
 
 fn wrap_plain_line(line: &str, max_width: usize) -> Vec<String> {
@@ -1446,6 +1721,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             output,
             diffs,
             rewound,
+            expanded,
         } => {
             let status_text = match status {
                 ToolStatus::Running => Some("running".to_string()),
@@ -1465,12 +1741,23 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                     Span::styled(first.to_string(), selection_style),
                 ]));
 
-                for line in command_lines {
+                let hidden = command.lines().count() - 1;
+                if !*expanded && command.lines().count() > COLLAPSE_COMMAND_LINES {
                     lines.push(Line::from(vec![
                         Span::raw("  "),
-                        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(line.to_string(), selection_style),
+                        Span::styled(
+                            format!("▸ … {hidden} more lines — click to expand"),
+                            Style::default().fg(Color::DarkGray).italic(),
+                        ),
                     ]));
+                } else {
+                    for line in command_lines {
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(line.to_string(), selection_style),
+                        ]));
+                    }
                 }
             } else {
                 lines.push(Line::from(vec![
@@ -1501,7 +1788,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                 }
             }
 
-            render_diff_preview(lines, diffs, *rewound);
+            render_diff_preview(lines, diffs, *expanded, *rewound);
         }
     }
 }
@@ -1522,21 +1809,27 @@ fn diff_line_style(line: &str) -> Style {
 }
 
 /// Render a compact per-root diff summary plus a capped tinted preview
-/// under an inline terminal tool call.
+/// under an inline terminal tool call. Long diffs collapse to their
+/// summary until `expanded`; `rewound` dims them and adds a marker.
 fn render_diff_preview<'a>(
     lines: &mut Vec<Line<'a>>,
     diffs: &'a [crate::file_tracker::RootDiff],
+    expanded: bool,
     rewound: bool,
 ) {
     const PREVIEW_LINES: usize = 8;
 
+    let total: usize = diffs.iter().map(|d| d.text.lines().count()).sum();
+    let collapsed = !expanded && total > COLLAPSE_DIFF_LINES;
+
     for (index, diff) in diffs.iter().enumerate() {
         let summary = format!(
-            "± {} file{} (+{} −{})",
+            "± {} file{} (+{} −{}){}",
             diff.files,
             if diff.files == 1 { "" } else { "s" },
             diff.additions,
             diff.deletions,
+            if collapsed { " ▸" } else { "" },
         );
         let summary = if rewound {
             format!("{summary} (rewound)")
@@ -1558,6 +1851,9 @@ fn render_diff_preview<'a>(
                 },
             ),
         ]));
+        if collapsed {
+            continue;
+        }
 
         let total = diff.text.lines().count();
         for line in diff.text.lines().take(PREVIEW_LINES) {
@@ -1733,7 +2029,10 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 }
 #[cfg(test)]
 mod tests {
-    use super::{ToolDisplay, ToolStatus, render_tool_inline, terminal_mode_marker};
+    use super::{
+        ChatStream, ToolDisplay, ToolStatus, build_plain_wrapped_lines_unified, render_tool_inline,
+        terminal_mode_marker,
+    };
     use aither_sandbox::TerminalExecutionMode;
     use ratatui::text::Line;
 
@@ -1766,6 +2065,7 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 rewound: false,
+                expanded: false,
             };
             let mut lines: Vec<Line> = Vec::new();
             render_tool_inline(&mut lines, &display, false);
@@ -1776,5 +2076,123 @@ mod tests {
                 .collect();
             assert_eq!(rendered, format!("  {marker}$ echo hi"));
         }
+    }
+
+    fn terminal_display(command: &str) -> ToolDisplay {
+        ToolDisplay::Terminal {
+            command: command.to_string(),
+            mode: TerminalExecutionMode::Default,
+            status: ToolStatus::Done,
+            output: None,
+            diffs: Vec::new(),
+            rewound: false,
+            expanded: false,
+        }
+    }
+
+    fn rendered_text(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collapsible_only_when_long() {
+        assert!(!terminal_display("echo hi").is_collapsible());
+        assert!(!terminal_display("a\nb\nc").is_collapsible());
+        assert!(terminal_display("a\nb\nc\nd").is_collapsible());
+    }
+
+    #[test]
+    fn collapsed_command_shows_hint_then_expands() {
+        let mut display = terminal_display("one\ntwo\nthree\nfour\nfive");
+        let text = {
+            let mut lines: Vec<Line> = Vec::new();
+            render_tool_inline(&mut lines, &display, false);
+            rendered_text(&lines)
+        };
+        assert_eq!(text[0], "  $ one");
+        assert!(text[1].contains("4 more lines"));
+        assert_eq!(text.len(), 2);
+
+        let ToolDisplay::Terminal { expanded, .. } = &mut display else {
+            unreachable!()
+        };
+        *expanded = true;
+        let text = {
+            let mut lines: Vec<Line> = Vec::new();
+            render_tool_inline(&mut lines, &display, false);
+            rendered_text(&lines)
+        };
+        assert_eq!(text.len(), 5);
+        assert_eq!(text[4], "  │ five");
+    }
+
+    #[test]
+    fn collapsed_diff_shows_summary_only() {
+        let body = "+line\n".repeat(12);
+        let display = ToolDisplay::Terminal {
+            command: "echo hi".to_string(),
+            mode: TerminalExecutionMode::Default,
+            status: ToolStatus::Done,
+            output: None,
+            diffs: vec![crate::file_tracker::RootDiff {
+                root: std::path::PathBuf::from("/tmp/root"),
+                text: body,
+                files: 1,
+                additions: 12,
+                deletions: 0,
+            }],
+            rewound: false,
+            expanded: false,
+        };
+        assert!(display.is_collapsible());
+        let mut lines: Vec<Line> = Vec::new();
+        render_tool_inline(&mut lines, &display, false);
+        let text = rendered_text(&lines);
+        // command line + summary with ▸ marker, no diff body
+        assert_eq!(text.len(), 2);
+        assert!(text[1].contains("± 1 file (+12 −0) ▸"));
+    }
+
+    #[test]
+    fn toggle_expands_and_collapses() {
+        let mut chat = ChatStream::new();
+        chat.push_tool("t1".to_string(), terminal_display("a\nb\nc\nd"));
+        assert_eq!(
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None).len(),
+            2 // "$ a" + collapse hint
+        );
+        chat.toggle_tool_expanded("t1");
+        assert_eq!(
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None).len(),
+            4
+        );
+        chat.toggle_tool_expanded("t1");
+        assert_eq!(
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn click_region_covers_collapsible_call() {
+        let mut chat = ChatStream::new();
+        chat.push_tool("t1".to_string(), terminal_display("a\nb\nc\nd"));
+        chat.push_tool("t2".to_string(), terminal_display("echo short"));
+        let mut regions = Vec::new();
+        let lines =
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, Some(&mut regions));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].tool_call_id, "t1");
+        assert_eq!(regions[0].start, 0);
+        assert_eq!(regions[0].end, 2);
+        assert!(lines.len() >= 3);
     }
 }
