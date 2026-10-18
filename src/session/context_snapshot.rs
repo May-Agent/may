@@ -35,6 +35,24 @@ pub fn checkpoint_from_hook(ctx: &CheckpointContext<'_>) -> AgentCheckpoint {
     }
 }
 
+/// `messages` row ids of the rows that produce LLM history messages.
+///
+/// Row order is kept — the `db_message_ids` argument of
+/// [`history_delta_since_snapshot`]. Rows of interaction roles carry no
+/// LLM message and must not shift the index alignment.
+#[must_use]
+pub fn llm_row_ids(db_messages: &[crate::db::entity::messages::Model]) -> Vec<i64> {
+    db_messages
+        .iter()
+        .filter(|row| {
+            row.role
+                .parse::<crate::session::MessageRole>()
+                .is_ok_and(|role| role.is_llm_visible())
+        })
+        .map(|row| i64::from(row.id))
+        .collect()
+}
+
 /// Compute the history messages that were added after the snapshot was taken.
 ///
 /// `db_message_ids` should be the `id` column of each row returned by

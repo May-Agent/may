@@ -2893,7 +2893,7 @@ fn prepare_agent_for_request<'a>(
                 .get_messages(ctx.session_id.as_str())
                 .await
                 .map_err(UiChatPreparationError::LoadSession)?;
-            let db_ids: Vec<i64> = db_messages.iter().map(|m| i64::from(m.id)).collect();
+            let db_ids = crate::session::llm_row_ids(&db_messages);
             if let Some(delta) = crate::session::history_delta_since_snapshot(
                 &ctx.history_messages,
                 &db_ids,
