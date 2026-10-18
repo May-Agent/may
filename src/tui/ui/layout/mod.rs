@@ -156,6 +156,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         status_message: app.status.as_deref(),
         profile_name: app.current_profile_name(),
     };
+    let mut collapse_regions = Vec::new();
     let plain_all_lines = chat::build_plain_wrapped_lines_unified(
         &app.chat,
         chat_area.width,
@@ -166,11 +167,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             attachments: &app.attachments,
         }),
         Some(&status_ctx),
+        Some(&mut collapse_regions),
     );
 
     let view_h = chat_area.height as usize;
     app.render_top_padding = view_h.saturating_sub(plain_all_lines.len());
     app.rendered_plain_lines = plain_all_lines;
+    app.collapse_regions = collapse_regions;
 
     if app.selection.is_some() {
         render_text_selection_overlay(frame, chat_area, app);

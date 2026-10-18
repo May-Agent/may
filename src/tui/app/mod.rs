@@ -210,6 +210,8 @@ pub struct App {
     pub rendered_plain_lines: Vec<String>,
     /// Top padding rows added when viewport is taller than rendered content
     pub render_top_padding: usize,
+    /// Row spans of collapsible tool calls in `rendered_plain_lines` space
+    pub collapse_regions: Vec<super::ui::chat::ClickRegion>,
 }
 
 impl App {
@@ -376,6 +378,7 @@ impl App {
             selection: None,
             rendered_plain_lines: Vec::new(),
             render_top_padding: 0,
+            collapse_regions: Vec::new(),
         })
     }
 
@@ -669,6 +672,7 @@ impl App {
         self.selection = None;
         self.rendered_plain_lines.clear();
         self.render_top_padding = 0;
+        self.collapse_regions.clear();
 
         // Load chat history into display
         self.chat = ChatStream::new();
@@ -1368,6 +1372,17 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.selection.as_ref().is_some_and(TextSelection::is_empty) {
                     self.selection = None;
+                    // A press/release without a drag is a click: toggle the
+                    // collapsed state of the tool call under the cursor.
+                    if let Some(point) = self.mouse_to_selection_point(mouse)
+                        && let Some(region) = self
+                            .collapse_regions
+                            .iter()
+                            .find(|r| point.line >= r.start && point.line < r.end)
+                    {
+                        let id = region.tool_call_id.clone();
+                        self.chat.toggle_tool_expanded(&id);
+                    }
                 }
             }
             MouseEventKind::Down(MouseButton::Right) if self.copy_selection_to_clipboard()? => {
@@ -1790,6 +1805,7 @@ impl App {
                                 output: None,
                                 diffs: Vec::new(),
                                 rewound: false,
+                                expanded: false,
                             },
                             ToolStartKind::Generic { name, arguments } => ToolDisplay::Terminal {
                                 command: format!("{name} {arguments}"),
@@ -1798,6 +1814,7 @@ impl App {
                                 output: None,
                                 diffs: Vec::new(),
                                 rewound: false,
+                                expanded: false,
                             },
                         };
                         self.chat.push_tool(id, display);
