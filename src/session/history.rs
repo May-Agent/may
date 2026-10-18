@@ -42,6 +42,14 @@ pub enum HistoryReplayError {
         #[source]
         source: aither_core::Error,
     },
+    /// A persisted attachment could not be replayed into model form.
+    #[error("attachment '{name}' could not be replayed: {reason}")]
+    InvalidAttachment {
+        /// Display name of the offending attachment.
+        name: String,
+        /// Why the attachment could not be replayed.
+        reason: String,
+    },
 }
 
 /// Durable tool lifecycle record stored in chat history.
@@ -227,6 +235,9 @@ pub struct ChatMessage {
     pub role: MessageRole,
     /// Message body (JSON payload for tool events).
     pub content: String,
+    /// Attachments the message carried (images, file references, pastes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<super::runtime::PersistedAttachment>,
     /// Message timestamp, when recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<Timestamp>,
@@ -241,9 +252,18 @@ pub struct ChatMessage {
 impl ChatMessage {
     /// Create a new user message.
     pub fn user(content: impl Into<String>) -> Self {
+        Self::user_with_attachments(content, Vec::new())
+    }
+
+    /// Create a new user message carrying attachments.
+    pub fn user_with_attachments(
+        content: impl Into<String>,
+        attachments: Vec<super::runtime::PersistedAttachment>,
+    ) -> Self {
         Self {
             role: MessageRole::User,
             content: content.into(),
+            attachments,
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: None,
@@ -255,6 +275,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::Assistant,
             content: content.into(),
+            attachments: Vec::new(),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: None,
@@ -266,6 +287,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::Assistant,
             content: content.into(),
+            attachments: Vec::new(),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: Some(stats),
@@ -277,6 +299,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::System,
             content: content.into(),
+            attachments: Vec::new(),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: None,
@@ -288,6 +311,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::Tool,
             content: content.into(),
+            attachments: Vec::new(),
             timestamp: Some(Timestamp::now()),
             tool_call_id: Some(tool_call_id.into()),
             stats: None,
@@ -302,6 +326,7 @@ impl ChatMessage {
         Self {
             role: MessageRole::HiddenContext,
             content: content.into(),
+            attachments: Vec::new(),
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: None,
@@ -377,7 +402,7 @@ impl ChatHistory {
             .filter_map(|m| {
                 use aither_core::llm::Message;
                 match m.role {
-                    MessageRole::User => Some(Ok(Message::user(&m.content))),
+                    MessageRole::User => Some(replay_user_message(m)),
                     MessageRole::Assistant => Some(Ok(Message::assistant(&m.content))),
                     MessageRole::System | MessageRole::HiddenContext => {
                         Some(Ok(Message::system(&m.content)))
@@ -451,6 +476,111 @@ impl ChatHistory {
             })
             .collect()
     }
+}
+
+fn invalid_attachment(
+    attachment: &super::runtime::PersistedAttachment,
+    reason: impl std::fmt::Display,
+) -> HistoryReplayError {
+    HistoryReplayError::InvalidAttachment {
+        name: attachment.name.clone(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Resolve a persisted attachment's `file://` URL to a local path.
+fn attachment_local_path(
+    attachment: &super::runtime::PersistedAttachment,
+) -> Result<std::path::PathBuf, HistoryReplayError> {
+    url::Url::parse(&attachment.url)
+        .map_err(|error| invalid_attachment(attachment, format!("invalid url: {error}")))?
+        .to_file_path()
+        .map_err(|()| invalid_attachment(attachment, "url is not a local file"))
+}
+
+/// Rebuild the model-facing user message a persisted [`ChatMessage`]
+/// represents: pasted text becomes its XML block, file references their
+/// marker line, and binary attachments become typed LLM attachments —
+/// mirroring what the frontends sent at send time.
+fn replay_user_message(
+    message: &ChatMessage,
+) -> Result<aither_core::llm::Message, HistoryReplayError> {
+    use super::runtime::AttachmentKind;
+    use std::fmt::Write as _;
+
+    let mut content = message.content.clone();
+    let mut attachments: Vec<aither_core::llm::Attachment> = Vec::new();
+    for attachment in &message.attachments {
+        match attachment.attachment_type {
+            AttachmentKind::Text => {
+                let text = match attachment.text_content.as_deref() {
+                    Some(text) => text.to_string(),
+                    None => std::fs::read_to_string(attachment_local_path(attachment)?).map_err(
+                        |error| {
+                            invalid_attachment(attachment, format!("read pasted text: {error}"))
+                        },
+                    )?,
+                };
+                let saved_path = attachment_local_path(attachment).ok();
+                let xml = crate::xml::pasted_text_xml(&text, saved_path.as_deref())
+                    .map_err(|error| invalid_attachment(attachment, error))?;
+                let _ = write!(content, "\n{xml}");
+            }
+            AttachmentKind::File => {
+                let label = attachment_local_path(attachment).map_or_else(
+                    |_| attachment.url.clone(),
+                    |path| path.display().to_string(),
+                );
+                let _ = write!(content, "\n[File reference: {label}]");
+            }
+            AttachmentKind::Image
+            | AttachmentKind::Document
+            | AttachmentKind::Pdf
+            | AttachmentKind::Audio
+            | AttachmentKind::Video => {
+                let url = attachment_url(attachment)?;
+                let mime = attachment_media_type(attachment, &url)?;
+                attachments.push(aither_core::llm::Attachment::new(url, mime));
+            }
+        }
+    }
+    Ok(aither_core::llm::Message::user(&content).with_attachments(attachments))
+}
+
+/// Resolve the URL to hand the provider for a binary attachment. The
+/// recorded `file://` URL wins while the file still exists; otherwise the
+/// inline `data:` URL is used when one was stored.
+fn attachment_url(
+    attachment: &super::runtime::PersistedAttachment,
+) -> Result<url::Url, HistoryReplayError> {
+    let url = url::Url::parse(&attachment.url)
+        .map_err(|error| invalid_attachment(attachment, format!("invalid url: {error}")))?;
+    let file_gone = url.to_file_path().is_ok_and(|path| !path.exists());
+    if !file_gone {
+        return Ok(url);
+    }
+    attachment
+        .upload_data_url
+        .as_deref()
+        .and_then(|raw| url::Url::parse(raw).ok())
+        .ok_or_else(|| invalid_attachment(attachment, "file missing and no stored bytes"))
+}
+
+fn attachment_media_type(
+    attachment: &super::runtime::PersistedAttachment,
+    url: &url::Url,
+) -> Result<mime::Mime, HistoryReplayError> {
+    mime_guess::from_path(&attachment.name)
+        .first()
+        .or_else(|| mime_guess::from_path(url.path()).first())
+        .or_else(|| {
+            // data:<media-type>;base64,... — the payload prefix carries the
+            // type when the file path and name do not.
+            (url.scheme() == "data")
+                .then(|| url.path().split([',', ';']).next().unwrap_or_default())
+                .and_then(|media_type| media_type.parse().ok())
+        })
+        .ok_or_else(|| invalid_attachment(attachment, "unknown media type"))
 }
 
 #[cfg(test)]

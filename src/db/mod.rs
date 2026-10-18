@@ -29,6 +29,7 @@ pub use common::{
     StoredSessionContextSnapshot, UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
+pub use message::MessageMeta;
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
@@ -66,6 +67,7 @@ impl ChatDb {
         Self::ensure_profile_preference_columns(&db).await?;
         Self::ensure_session_runtime_columns(&db).await?;
         Self::ensure_session_columns(&db).await?;
+        Self::ensure_message_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Ok(Self { db })
@@ -82,6 +84,23 @@ impl ChatDb {
 
         if !existing.contains("reasoning_effort") {
             query!(db, "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT")
+                .execute()
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_message_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "PRAGMA table_info(messages)")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        let existing = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        if !existing.contains("attachments") {
+            query!(db, "ALTER TABLE messages ADD COLUMN attachments TEXT")
                 .execute()
                 .await?;
         }

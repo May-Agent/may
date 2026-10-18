@@ -62,6 +62,54 @@ pub fn serialize_xml_block<T: Serialize>(
     Ok(output)
 }
 
+/// Threshold (chars) above which a pasted-text attachment is truncated for
+/// the model and expected to live in a saved file.
+pub const LARGE_PASTE_THRESHOLD: usize = 4000;
+
+/// Maximum chars shown in LLM context for large pastes.
+pub const PASTE_TRUNCATE_LIMIT: usize = 2000;
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct PastedText {
+    #[serde(rename = "@chars")]
+    chars: usize,
+    #[serde(rename = "@truncated", skip_serializing_if = "Option::is_none")]
+    truncated: Option<bool>,
+    #[serde(rename = "@full_path", skip_serializing_if = "Option::is_none")]
+    full_path: Option<String>,
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+/// Build the pasted-text XML block a user message contributes to the prompt.
+///
+/// Content longer than [`LARGE_PASTE_THRESHOLD`] chars is truncated to
+/// [`PASTE_TRUNCATE_LIMIT`] and `saved_path` is referenced via `full_path`.
+///
+/// # Errors
+///
+/// Returns [`quick_xml::SeError`] when the block fails to serialize.
+pub fn pasted_text_xml(
+    content: &str,
+    saved_path: Option<&std::path::Path>,
+) -> Result<String, quick_xml::SeError> {
+    let char_count = content.chars().count();
+    let (text_content, is_truncated) = if char_count > LARGE_PASTE_THRESHOLD {
+        let truncated: String = content.chars().take(PASTE_TRUNCATE_LIMIT).collect();
+        (truncated, true)
+    } else {
+        (content.to_string(), false)
+    };
+
+    quick_xml::se::to_string(&PastedText {
+        chars: char_count,
+        truncated: is_truncated.then_some(true),
+        full_path: saved_path.map(|p| p.display().to_string()),
+        content: text_content,
+    })
+}
+
 impl XmlBlock {
     /// Parse `value` into an [`XmlBlock`], trimming surrounding
     /// whitespace and rejecting empty input.
