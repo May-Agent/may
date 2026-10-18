@@ -24,6 +24,10 @@ pub enum Outcome {
         tool_call_id: String,
         /// Per-root diffs produced by the snapshot (empty roots omitted).
         diffs: Vec<RootDiff>,
+        /// `true` for the per-call `snapshot` at call end (authoritative),
+        /// `false` for a live `preview` — previews apply only while the call
+        /// still runs so a late preview cannot clobber the final diff.
+        final_snapshot: bool,
     },
     /// A rewind restored worktrees to a prompt checkpoint. `diffs` carry
     /// the revert diff (pre-rewind → restored) per affected root; empty
@@ -44,6 +48,9 @@ enum Request {
     /// Record the current tree of every root under this prompt mark
     /// (`prompt:<message row id>`), taken at prompt dispatch.
     Mark(String),
+    /// Diff the pending (baseline → now) state for a call still running —
+    /// baselines and checkpoints stay put.
+    Preview(String),
     /// Restore all roots to the state recorded under this prompt mark,
     /// falling back to the earliest checkpoint of `fallback_call_ids`
     /// when the mark is absent.
@@ -107,6 +114,7 @@ impl FileDiffHandle {
                                     .send_blocking(Outcome::Diff {
                                         tool_call_id,
                                         diffs,
+                                        final_snapshot: true,
                                     })
                                     .is_err()
                             {
@@ -115,6 +123,19 @@ impl FileDiffHandle {
                         }
                         Request::Mark(mark_id) => {
                             tracker.mark_prompt(&mark_id);
+                        }
+                        Request::Preview(tool_call_id) => {
+                            let diffs = tracker.preview();
+                            if result_tx
+                                .send_blocking(Outcome::Diff {
+                                    tool_call_id,
+                                    diffs,
+                                    final_snapshot: false,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                         Request::Rewind {
                             mark_id,
@@ -152,6 +173,18 @@ impl FileDiffHandle {
             .is_err()
         {
             tracing::debug!("file diff worker is gone; snapshot dropped");
+        }
+    }
+
+    /// Ask the worker for a live preview of the pending diff — baselines do
+    /// not move, so this is safe to repeat while `tool_call_id` runs.
+    pub fn request_preview(&self, tool_call_id: &str) {
+        if self
+            .requests
+            .try_send(Request::Preview(tool_call_id.to_string()))
+            .is_err()
+        {
+            tracing::debug!("file diff worker is gone; preview dropped");
         }
     }
 

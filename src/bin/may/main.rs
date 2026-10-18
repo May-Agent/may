@@ -631,7 +631,9 @@ where
             }
 
             Event::Terminal(terminal_event) => {
-                // Check for interrupt during agent processing
+                // Interrupt only from plain chat mode — while a popup or
+                // dialog is open, Esc/Ctrl+C belong to that view's own
+                // handler (Esc closes it instead of aborting the agent).
                 if agent_handle.is_some()
                     && matches!(app.mode, may_agent::tui::AppMode::Chat)
                     && let AppEvent::Key(key_code, modifiers) = &*terminal_event

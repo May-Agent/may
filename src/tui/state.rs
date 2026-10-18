@@ -47,6 +47,8 @@ pub enum AppMode {
     Rewind(RewindState),
     /// Background jobs and running subagents viewer
     Jobs,
+    /// Detail view of one background job or subagent run
+    JobDetail(JobDetailState),
     /// `/btw` side-question overlay: answered outside conversation history
     Btw(BtwState),
 }
@@ -66,6 +68,50 @@ pub struct BtwState {
     pub error: Option<String>,
     /// Scroll offset (lines) for long answers.
     pub scroll: u16,
+}
+
+/// What the job-detail view is showing.
+#[derive(Debug, Clone, Copy)]
+pub enum JobDetailTarget {
+    /// A background terminal job — output is fetched live by pid.
+    Job(u32),
+    /// A tracked `subagent` run — stats refresh from the tracker.
+    Subagent(u64),
+}
+
+/// State for the job/subagent detail view.
+#[derive(Debug)]
+pub struct JobDetailState {
+    /// Which entry the view follows.
+    pub target: JobDetailTarget,
+    /// Latest job info for a `Job` target; `None` once the pid is gone.
+    pub job: Option<aither_sandbox::JobInfo>,
+    /// Latest buffered `(stdout, stderr)` for a `Job` target.
+    pub output: Option<(Vec<u8>, Vec<u8>)>,
+    /// Latest snapshot for a `Subagent` target; kept after the run ends.
+    pub subagent: Option<crate::agent::SubagentRunSnapshot>,
+    /// Whether the followed entry has finished.
+    pub finished: bool,
+    /// Scroll offset into the rendered body.
+    pub scroll: usize,
+    /// Last time the view refreshed its data.
+    pub refreshed: Option<std::time::Instant>,
+}
+
+impl JobDetailState {
+    /// Empty detail state for `target`.
+    #[must_use]
+    pub const fn new(target: JobDetailTarget) -> Self {
+        Self {
+            target,
+            job: None,
+            output: None,
+            subagent: None,
+            finished: false,
+            scroll: 0,
+            refreshed: None,
+        }
+    }
 }
 
 /// One rewindable prompt: a user message plus the code changes the turn

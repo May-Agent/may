@@ -435,7 +435,7 @@ pub fn handle_file_picker_key(app: &mut App, code: KeyCode) -> Option<SendAction
     None
 }
 
-/// Jobs panel: navigate, stop the selected row, refresh, close.
+/// Jobs panel: navigate, open the selected row's detail, stop, refresh, close.
 pub fn handle_jobs_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let row_count = super::jobs_rows(app).len();
     match code {
@@ -447,30 +447,20 @@ pub fn handle_jobs_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
                 app.jobs_selected += 1;
             }
         }
-        KeyCode::Enter | KeyCode::Char('x') => {
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            let rows = super::jobs_rows(app);
+            if let Some(row) = rows.get(app.jobs_selected) {
+                app.open_job_detail(row.detail_target());
+            }
+        }
+        KeyCode::Char('x') => {
             let rows = super::jobs_rows(app);
             match rows.get(app.jobs_selected) {
                 Some(super::JobRow::Job(job)) => match job.status {
                     aither_sandbox::JobStatus::Running => app.kill_job(job.pid),
                     _ => app.status = Some(format!("Job {} already finished", job.pid)),
                 },
-                Some(super::JobRow::Subagent { agent, .. }) => {
-                    let hit = app.subagent_runs.as_ref().and_then(|runs| {
-                        runs.list()
-                            .into_iter()
-                            .find(|run| run.subagent == *agent)
-                            .map(|run| (run.id, runs.clone()))
-                    });
-                    match hit {
-                        Some((id, runs)) if runs.cancel(id) => {
-                            app.status = Some(format!("Stopping subagent {agent}…"));
-                        }
-                        _ => {
-                            app.status =
-                                Some(format!("No live registry entry for subagent {agent}"));
-                        }
-                    }
-                }
+                Some(super::JobRow::Subagent(run)) => app.cancel_subagent(run),
                 None => {}
             }
         }
@@ -507,6 +497,40 @@ pub fn handle_btw_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
         }
         KeyCode::Down | KeyCode::Char('j') if !awaiting_question => {
             state.scroll = state.scroll.saturating_add(1);
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Job detail view: scroll output, stop a running job, refresh, back to Jobs.
+pub fn handle_job_detail_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::JobDetail(state) = &mut app.mode else {
+        return None;
+    };
+    match code {
+        KeyCode::Esc | KeyCode::Char('q' | 'h') | KeyCode::Left => {
+            app.mode = AppMode::Jobs;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.scroll = state.scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.scroll += 1;
+        }
+        KeyCode::Char('g') => state.scroll = 0,
+        KeyCode::Char('G') => state.scroll = usize::MAX,
+        KeyCode::Char('r') => app.refresh_job_detail(),
+        KeyCode::Char('x') => {
+            if let crate::tui::state::JobDetailTarget::Job(pid) = state.target {
+                match state.job.as_ref().map(|j| &j.status) {
+                    Some(aither_sandbox::JobStatus::Running) => app.kill_job(pid),
+                    Some(_) => app.status = Some(format!("Job {pid} already finished")),
+                    None => {}
+                }
+            } else if let Some(run) = state.subagent.clone() {
+                app.cancel_subagent(&run);
+            }
         }
         _ => {}
     }
