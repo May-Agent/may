@@ -4,8 +4,8 @@ use std::path::Path;
 
 use super::ContainerError;
 use crate::heel::release::{
-    HEEL_RELEASE_API_URL, HEEL_RELEASE_STATE_FILE, ManagedHeelInstall, ensure_managed_heel_binary,
-    linux_heel_asset_for_current_arch,
+    HEEL_RELEASE_STATE_FILE, HEEL_RELEASE_TAG, HEEL_RELEASES_API_URL, ManagedHeelInstall,
+    ensure_managed_heel_binary, linux_heel_asset_for_current_arch,
 };
 
 /// The container heel layout: the binary inside the Docker build context at
@@ -47,7 +47,8 @@ pub async fn ensure_container_heel_binary(may_dir: &Path) -> Result<(), Containe
     ensure_managed_heel_binary(
         &container_heel_install(may_dir),
         asset,
-        HEEL_RELEASE_API_URL,
+        HEEL_RELEASE_TAG,
+        HEEL_RELEASES_API_URL,
     )
     .await
     .map(|_| ())
