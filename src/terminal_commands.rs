@@ -15,6 +15,7 @@ use crate::agent::imagine::ImagineTool;
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
 use crate::agent::session_tool::SessionTool;
+use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
 use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::embedding_provider::{EmbeddingModelResolution, MayEmbeddingModel};
@@ -77,6 +78,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// redundant `websearch` / `webfetch` commands so the model has a single
     /// search path.
     pub request_parameters: Parameters,
+    /// Tracker the `subagent` command reports each invocation to — the host
+    /// UI reads live per-run stats off it.
+    pub subagent_tracker: SubagentTracker,
 }
 
 /// Register every shared IPC command on the terminal tool's command registry.
@@ -195,7 +199,7 @@ where
     }
 
     let subagent_tool = {
-        let tool = SubagentTool::new(config.llm)
+        let tool = SubagentTool::new(UsageObservedModel::new(config.llm))
             .with_runs(config.subagent_runs)
             .with_builtins()
             .with_base_dir(&config.sandbox_dir);
@@ -207,11 +211,12 @@ where
             ),
             SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
         ]);
-        if let Some(factory) = config.terminal_tool_factory {
+        let tool = if let Some(factory) = config.terminal_tool_factory {
             tool.with_terminal_tool_factory(factory)
         } else {
             tool
-        }
+        };
+        TrackedSubagentTool::new(tool, config.subagent_tracker)
     };
     register_tool_with_description(builder, &mut descriptions, subagent_tool);
 
@@ -344,6 +349,7 @@ mod tests {
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 terminal_tool_factory: None,
+                subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
             },
         )
@@ -393,6 +399,7 @@ mod tests {
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 terminal_tool_factory: None,
+                subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
             },
         )
@@ -446,6 +453,7 @@ mod tests {
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 terminal_tool_factory: None,
+                subagent_tracker: SubagentTracker::default(),
                 request_parameters,
             },
         )
@@ -487,6 +495,7 @@ mod tests {
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 terminal_tool_factory: None,
+                subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
             },
         )

@@ -21,7 +21,8 @@ use ratatui::Frame;
 use super::super::app::App;
 use super::super::completion::CompletionMode;
 use super::super::state::{
-    AppMode, AskUserState, BtwState, ChatgptAuthStatus, CopilotAuthStatus, RewindState,
+    AppMode, AskUserState, BtwState, ChatgptAuthStatus, CopilotAuthStatus, JobDetailState,
+    JobDetailTarget, RewindState,
 };
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 use crate::workspace_request::WorkspaceRequest;
@@ -106,6 +107,36 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let images_supported = app.supports_images();
     let chat_area = area;
 
+    // Running background entries for the status bar: tracked subagents first,
+    // then running terminal jobs.
+    let mut background_items: Vec<chat::StatusBackgroundItem> = app
+        .subagent_tracker
+        .running()
+        .into_iter()
+        .map(|run| chat::StatusBackgroundItem {
+            elapsed_secs: run.elapsed_secs(),
+            label: run.agent,
+            subagent: true,
+        })
+        .collect();
+    background_items.extend(
+        app.jobs
+            .iter()
+            .filter(|job| matches!(job.status, aither_sandbox::JobStatus::Running))
+            .map(|job| chat::StatusBackgroundItem {
+                label: job
+                    .script
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(24)
+                    .collect(),
+                subagent: false,
+                elapsed_secs: job.started_at.elapsed().as_secs(),
+            }),
+    );
+
     // Collect image positions during rendering
     let mut image_positions: Vec<(String, usize)> = Vec::new();
 
@@ -138,7 +169,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 model: &app.model_display(),
                 usage: usage_info,
                 queue_count: app.queue.len(),
-                background_tasks: app.background_tasks,
+                background: &background_items,
                 processing: app.processing,
                 decode_rate,
                 status_message: app.status.as_deref(),
@@ -162,7 +193,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         model: &app.model_display(),
         usage: usage_info,
         queue_count: app.queue.len(),
-        background_tasks: app.background_tasks,
+        background: &background_items,
         processing: app.processing,
         decode_rate,
         status_message: app.status.as_deref(),
@@ -231,7 +262,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_rewind_popup(frame, area, state);
         }
         AppMode::Jobs => {
-            render_jobs_popup(frame, area, app);
+            render_jobs_panel(frame, area, app);
+        }
+        AppMode::JobDetail(ref state) => {
+            render_job_detail(frame, area, state);
         }
         AppMode::Btw(ref state) => {
             render_btw_popup(frame, area, state);
@@ -682,16 +716,17 @@ fn render_rewind_scope_popup(
     frame.render_widget(list, popup_area);
 }
 
-/// Jobs panel: running subagents and background terminal jobs.
-fn render_jobs_popup(frame: &mut Frame, area: Rect, app: &App) {
+/// Jobs panel: bottom-anchored drawer listing running subagents and
+/// background terminal jobs.
+fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
     use crate::tui::reducer::{JobRow, jobs_rows};
 
     let rows = jobs_rows(app);
-    let popup_height = u16::try_from((rows.len() * 2 + 3).clamp(6, 20)).unwrap_or(u16::MAX);
-    let popup_width = area.width.saturating_sub(8).clamp(50, 96);
-    let popup_area = centered_rect_exact(popup_width, popup_height, area);
+    let needed = u16::try_from(rows.len() * 2 + 3).unwrap_or(u16::MAX);
+    let panel_height = needed.clamp(6, area.height.saturating_sub(4).clamp(6, 16));
+    let panel_area = bottom_rect(area.width, panel_height, area);
 
-    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Clear, panel_area);
 
     let items: Vec<ListItem> = rows
         .iter()
@@ -707,10 +742,34 @@ fn render_jobs_popup(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::White)
             };
             let (title, detail) = match row {
-                JobRow::Subagent { agent, preview, .. } => (
-                    format!("{prefix}◉ subagent {agent}"),
-                    format!("    {preview}  — running in this turn"),
-                ),
+                JobRow::Subagent(run) => {
+                    let preview: String = run
+                        .prompt
+                        .trim()
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect();
+                    (
+                        format!("{prefix}◉ subagent {}", run.agent),
+                        format!(
+                            "    {} · {} tok (in {}, out {}) · {}",
+                            chat::format_elapsed(run.elapsed_secs()),
+                            chat::format_number(
+                                usize::try_from(run.total_tokens()).unwrap_or(usize::MAX)
+                            ),
+                            chat::format_number(
+                                usize::try_from(run.prompt_tokens).unwrap_or(usize::MAX)
+                            ),
+                            chat::format_number(
+                                usize::try_from(run.completion_tokens).unwrap_or(usize::MAX)
+                            ),
+                            preview,
+                        ),
+                    )
+                }
                 JobRow::Job(job) => {
                     let (icon, status) = match &job.status {
                         aither_sandbox::JobStatus::Running => ("●", "running".to_string()),
@@ -722,12 +781,15 @@ fn render_jobs_popup(frame: &mut Frame, area: Rect, app: &App) {
                         }
                         aither_sandbox::JobStatus::Killed => ("■", "killed".to_string()),
                     };
-                    let secs = job.started_at.elapsed().as_secs();
                     let first_line = job.script.lines().next().unwrap_or("");
                     let cmd: String = first_line.chars().take(60).collect();
                     (
                         format!("{prefix}{icon} pid {} · {cmd}", job.pid),
-                        format!("    {status} · {secs}s · task {}", job.task_id),
+                        format!(
+                            "    {status} · {} · task {}",
+                            chat::format_elapsed(job.started_at.elapsed().as_secs()),
+                            job.task_id
+                        ),
                     )
                 }
             };
@@ -741,7 +803,7 @@ fn render_jobs_popup(frame: &mut Frame, area: Rect, app: &App) {
     let title = if rows.is_empty() {
         "Jobs & subagents — none running (Esc close)"
     } else {
-        "Jobs & subagents (↑↓ select, Enter/x stop, r refresh, Esc close)"
+        "Jobs & subagents (↑↓ select · Enter open · x stop · r refresh · Esc close)"
     };
     let list = List::new(items).block(
         Block::default()
@@ -749,7 +811,134 @@ fn render_jobs_popup(frame: &mut Frame, area: Rect, app: &App) {
             .border_style(Style::default().fg(Color::Cyan))
             .title(title),
     );
-    frame.render_widget(list, popup_area);
+    frame.render_widget(list, panel_area);
+}
+
+/// Job/subagent detail: bottom drawer with live stats or buffered output.
+fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState) {
+    let (title, body): (String, Vec<Line<'_>>) = match state.target {
+        JobDetailTarget::Job(pid) => {
+            let title = state.job.as_ref().map_or_else(
+                || format!("job {pid} — gone"),
+                |job| {
+                    let status = match &job.status {
+                        aither_sandbox::JobStatus::Running => format!(
+                            "running · {}",
+                            chat::format_elapsed(job.started_at.elapsed().as_secs())
+                        ),
+                        aither_sandbox::JobStatus::Completed { exit_code } => {
+                            format!("exit {exit_code}")
+                        }
+                        aither_sandbox::JobStatus::Failed { error } => format!("failed: {error}"),
+                        aither_sandbox::JobStatus::Killed => "killed".to_string(),
+                    };
+                    format!(
+                        "job {} · {} — {status}",
+                        job.pid,
+                        job.script
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(48)
+                            .collect::<String>(),
+                    )
+                },
+            );
+            let mut lines: Vec<Line<'_>> = Vec::new();
+            if let Some((stdout, stderr)) = &state.output {
+                lines.extend(
+                    String::from_utf8_lossy(stdout)
+                        .lines()
+                        .map(|line| Line::from(line.to_string())),
+                );
+                if !stderr.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "── stderr ──".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    lines.extend(
+                        String::from_utf8_lossy(stderr)
+                            .lines()
+                            .map(|line| Line::from(line.to_string())),
+                    );
+                }
+            }
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "(no buffered output)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            (title, lines)
+        }
+        JobDetailTarget::Subagent(_) => state.subagent.as_ref().map_or_else(
+            || {
+                (
+                    "subagent — gone".to_string(),
+                    vec![Line::from(Span::styled(
+                        "(finished)",
+                        Style::default().fg(Color::DarkGray),
+                    ))],
+                )
+            },
+            |run| {
+                let status = if state.finished {
+                    "finished"
+                } else {
+                    "running"
+                };
+                let title = format!(
+                    "subagent {} — {status} · {} · {} tok (in {}, out {}) · {} req",
+                    run.agent,
+                    chat::format_elapsed(run.elapsed_secs()),
+                    chat::format_number(usize::try_from(run.total_tokens()).unwrap_or(usize::MAX)),
+                    chat::format_number(usize::try_from(run.prompt_tokens).unwrap_or(usize::MAX)),
+                    chat::format_number(
+                        usize::try_from(run.completion_tokens).unwrap_or(usize::MAX)
+                    ),
+                    run.requests,
+                );
+                let mut lines = vec![Line::from(Span::styled(
+                    "prompt:",
+                    Style::default().fg(Color::DarkGray),
+                ))];
+                lines.extend(run.prompt.lines().map(|line| Line::from(line.to_string())));
+                (title, lines)
+            },
+        ),
+    };
+
+    let needed = u16::try_from(body.len() + 3).unwrap_or(u16::MAX);
+    let panel_height = needed.clamp(8, area.height.saturating_sub(2));
+    let panel_area = bottom_rect(area.width, panel_height, area);
+    frame.render_widget(Clear, panel_area);
+
+    let inner_height = usize::from(panel_height.saturating_sub(2));
+    let scroll = state.scroll.min(body.len().saturating_sub(inner_height));
+    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(
+            "{title} (Esc back · ↑↓ scroll · x stop · r refresh)"
+        ));
+    frame.render_widget(
+        Paragraph::new(body).block(block).scroll((scroll, 0)),
+        panel_area,
+    );
+}
+
+/// A rect of `width`/`height` anchored to the bottom edge of `area`.
+fn bottom_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height - height,
+        width: width.min(area.width),
+        height,
+    }
 }
 
 fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState) {
