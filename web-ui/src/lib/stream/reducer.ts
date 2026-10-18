@@ -52,6 +52,8 @@ export interface TurnState {
   todo: { items: SseTodoItem[]; total: number; completed: number } | null;
   error: TurnErrorState | null;
   status: 'streaming' | 'done';
+  /** Latest decode-rate sample reported by the backend, in tokens/second. */
+  tokensPerSecond: number | null;
   lastSeq: number;
 }
 
@@ -71,6 +73,7 @@ export function emptyTurn(
     todo: null,
     error: null,
     status: 'streaming',
+    tokensPerSecond: null,
     lastSeq: 0,
   };
 }
@@ -254,6 +257,9 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
 
     case 'ping':
       return { ...state, lastSeq: event.seq };
+
+    case 'speed':
+      return { ...state, tokensPerSecond: event.tokensPerSecond, lastSeq: event.seq };
   }
 }
 

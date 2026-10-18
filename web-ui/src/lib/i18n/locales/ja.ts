@@ -140,6 +140,7 @@ export const ja: Messages = {
     artifactEmpty: '生成されたファイルはまだありません',
     tasksEmpty: 'タスクはまだありません',
     contextUsage: '{total} トークンのうち {used}% を使用',
+    decodeSpeed: '{rate} tok/s',
     configGuard: {
       title: 'プロバイダが有効化されていません',
       body: '設定でプロバイダを有効化するとチャットを開始できます。',
@@ -256,6 +257,10 @@ export const ja: Messages = {
       light: 'ライト',
       dark: 'ダーク',
       system: 'システム',
+    },
+    decodeSpeed: {
+      title: 'デコード速度',
+      description: 'May の応答中にトークン生成速度をリアルタイム表示します。',
     },
     profiles: {
       title: 'プロファイル',

@@ -46,6 +46,7 @@ export interface UiModelsConfig {
 export interface UiPreferencesConfig {
   warnOnModelChange: boolean;
   showTokenUsage: boolean;
+  showDecodeSpeed: boolean;
   networkPolicyMode: NetworkPolicyMode;
   networkPolicyHosts: string[];
 }

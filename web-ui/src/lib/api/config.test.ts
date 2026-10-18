@@ -33,6 +33,7 @@ function makeConfig(): UiFullConfig {
     preferences: {
       warnOnModelChange: true,
       showTokenUsage: true,
+      showDecodeSpeed: true,
       networkPolicyMode: 'disabled',
       networkPolicyHosts: [],
     },

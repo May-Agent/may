@@ -140,6 +140,7 @@ export const zhHant: Messages = {
     artifactEmpty: '尚未產生任何檔案',
     tasksEmpty: '尚無任務',
     contextUsage: '已使用 {total} 中 {used}% 的 token',
+    decodeSpeed: '{rate} tok/s',
     configGuard: {
       title: '尚未啟用任何服務供應商',
       body: '請到設定中啟用一個服務供應商即可開始對話。',
@@ -256,6 +257,10 @@ export const zhHant: Messages = {
       light: '淺色',
       dark: '深色',
       system: '跟隨系統',
+    },
+    decodeSpeed: {
+      title: 'Decode 速度',
+      description: '在 May 回覆時即時顯示 token 產生速度。',
     },
     profiles: {
       title: '設定檔',
