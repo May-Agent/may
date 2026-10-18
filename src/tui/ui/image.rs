@@ -5,7 +5,6 @@
 //!
 //! The Picker must be initialized before entering raw mode and is stored in App state.
 
-use image::DynamicImage;
 use ratatui::prelude::*;
 
 use ratatui::Frame;
@@ -74,20 +73,6 @@ impl TerminalImageSupport {
     pub const fn picker(&self) -> &Picker {
         &self.picker
     }
-
-    /// Create an `ImageState` from image data.
-    #[must_use]
-    pub fn create_image_state(&self, image: DynamicImage) -> ImageState {
-        let protocol = self.picker.new_resize_protocol(image);
-        ImageState { protocol }
-    }
-
-    /// Create an `ImageState` from raw bytes.
-    #[must_use]
-    pub fn create_image_state_from_bytes(&self, data: &[u8]) -> Option<ImageState> {
-        let image = image::load_from_memory(data).ok()?;
-        Some(self.create_image_state(image))
-    }
 }
 
 /// Image state for rendering.
@@ -101,6 +86,16 @@ impl std::fmt::Debug for ImageState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImageState").finish_non_exhaustive()
     }
+}
+
+/// Decode image bytes into an [`ImageState`] for `picker`. CPU-bound for
+/// large images — run on a worker thread, not the render loop.
+#[must_use]
+pub fn decode_image_state(picker: &Picker, data: &[u8]) -> Option<ImageState> {
+    let image = image::load_from_memory(data).ok()?;
+    Some(ImageState {
+        protocol: picker.new_resize_protocol(image),
+    })
 }
 
 /// Render an image using the stateful protocol.

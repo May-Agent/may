@@ -163,6 +163,12 @@ arrow-schema = "56.2"
 similar = "3.1.1"
 dunce = "1.0.5"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip
+# that arboard's get_image performs on every clipboard image.
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+
 [dev-dependencies]
 serial_test = "3"
 tokio-test = "0.4"
