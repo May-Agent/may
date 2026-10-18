@@ -492,14 +492,15 @@ fn normalize_tool_delta_for_sink(
         pending.name.clear();
         pending.name.push_str(name);
     }
-    let arguments_fragment =
-        merge_tool_arguments(&mut pending.buffered_arguments, arguments_fragment);
+    // `arguments_fragment` is a true increment: append to the call's buffer
+    // and forward it verbatim.
+    pending.buffered_arguments.push_str(arguments_fragment);
 
     if pending.emitted_start_to_sink {
         return SinkToolEvent::Delta {
             id: id.to_string(),
             name: pending.name.clone(),
-            arguments_fragment,
+            arguments_fragment: arguments_fragment.to_string(),
         };
     }
 
@@ -546,6 +547,8 @@ fn normalize_tool_start_for_sink(
     })
 }
 
+/// Diff a `ToolCallStart` arguments snapshot against what deltas already
+/// buffered; returns the suffix that hasn't streamed yet.
 fn merge_tool_arguments(buffered_arguments: &mut String, incoming: &str) -> String {
     if incoming.is_empty() || incoming == buffered_arguments {
         return String::new();
@@ -1497,7 +1500,7 @@ fn run_agent_loop<'a>(
                                 fragment = %arguments_fragment,
                                 "incoming ToolCallDelta from aither"
                             );
-                            decode_meter.note_tool_delta(&id, &arguments_fragment);
+                            decode_meter.note_output(arguments_fragment.len());
                             if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
                                 cancellation_reason =
                                     Some("client disconnected during tool stream");
@@ -3097,14 +3100,12 @@ mod tests {
         assert!(snapshot.checkpoint.context.is_empty());
     }
 
-    /// aither's `OpenAI` adapter emits `ToolCallDelta` where `arguments_fragment`
-    /// is the CUMULATIVE argument string so far (see `aither/openai/src/client.rs`
-    /// line 1099–1104). `normalize_tool_delta_for_sink` MUST decompose these
-    /// cumulative snapshots into true incremental suffixes so the frontend can
-    /// concatenate them into valid JSON. A regression here would drop the
-    /// opening `{"` and break every tool summary.
+    /// aither emits `ToolCallDelta` with `arguments_fragment` as a true
+    /// increment. `normalize_tool_delta_for_sink` forwards them verbatim so the
+    /// frontend can concatenate them into valid JSON. A regression here would
+    /// drop the opening `{"` and break every tool summary.
     #[test]
-    fn cumulative_tool_deltas_decompose_into_incremental_suffixes() {
+    fn tool_deltas_emit_incremental_fragments_verbatim() {
         let mut pending = HashMap::new();
 
         // OutputItemAdded fires an initial empty delta — becomes Start(args="").
@@ -3118,7 +3119,7 @@ mod tests {
             }
         );
 
-        // First real cumulative snapshot carries `{"description`.
+        // Each delta is already an increment and passes through verbatim.
         let e2 = super::normalize_tool_delta_for_sink(
             &mut pending,
             "tool-1",
@@ -3134,35 +3135,14 @@ mod tests {
             }
         );
 
-        // Next cumulative: previous prefix is extended — emit only the suffix.
-        let e3 = super::normalize_tool_delta_for_sink(
-            &mut pending,
-            "tool-1",
-            "terminal",
-            "{\"description\":\"Get",
-        );
+        let e3 =
+            super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "terminal", "\":\"Get");
         assert_eq!(
             e3,
             super::SinkToolEvent::Delta {
                 id: "tool-1".to_string(),
                 name: "terminal".to_string(),
                 arguments_fragment: "\":\"Get".to_string(),
-            }
-        );
-
-        // Re-sending the same cumulative string is a no-op (empty fragment).
-        let e4 = super::normalize_tool_delta_for_sink(
-            &mut pending,
-            "tool-1",
-            "terminal",
-            "{\"description\":\"Get",
-        );
-        assert_eq!(
-            e4,
-            super::SinkToolEvent::Delta {
-                id: "tool-1".to_string(),
-                name: "terminal".to_string(),
-                arguments_fragment: String::new(),
             }
         );
     }
@@ -3251,7 +3231,7 @@ mod tests {
     }
 
     #[test]
-    fn accumulated_argument_snapshots_are_emitted_as_suffixes() {
+    fn tool_delta_fragments_pass_through_verbatim() {
         let mut pending = HashMap::new();
 
         let first = super::normalize_tool_delta_for_sink(
@@ -3262,33 +3242,28 @@ mod tests {
         );
         assert!(matches!(first, super::SinkToolEvent::Start { .. }));
 
-        let second = super::normalize_tool_delta_for_sink(
-            &mut pending,
-            "tool-1",
-            "terminal",
-            "{\"command\":\"date",
-        );
+        let second =
+            super::normalize_tool_delta_for_sink(&mut pending, "tool-1", "terminal", "date\"}");
         assert_eq!(
             second,
             super::SinkToolEvent::Delta {
                 id: "tool-1".to_string(),
                 name: "terminal".to_string(),
-                arguments_fragment: "date".to_string(),
+                arguments_fragment: "date\"}".to_string(),
             }
         );
 
-        let duplicate = super::normalize_tool_delta_for_sink(
-            &mut pending,
-            "tool-1",
-            "terminal",
-            "{\"command\":\"date",
-        );
+        // A fragment that happens to equal the buffer so far is still an
+        // increment and must not be swallowed.
+        let mut pending = HashMap::new();
+        super::normalize_tool_delta_for_sink(&mut pending, "t", "x", "ab");
+        let dup = super::normalize_tool_delta_for_sink(&mut pending, "t", "x", "ab");
         assert_eq!(
-            duplicate,
+            dup,
             super::SinkToolEvent::Delta {
-                id: "tool-1".to_string(),
-                name: "terminal".to_string(),
-                arguments_fragment: String::new(),
+                id: "t".to_string(),
+                name: "x".to_string(),
+                arguments_fragment: "ab".to_string(),
             }
         );
     }
