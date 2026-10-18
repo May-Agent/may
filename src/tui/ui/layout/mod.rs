@@ -94,6 +94,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .map(|pt| (u64::from(pt), app.context_window.map(u64::from)))
     });
 
+    // Live decode rate for status (only while a response streams)
+    let decode_rate = (app.processing && app.config.preferences.show_decode_speed)
+        .then(|| app.decode_meter.rate())
+        .flatten();
+
     let images_supported = app.supports_images();
     let chat_area = area;
 
@@ -131,6 +136,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 queue_count: app.queue.len(),
                 background_tasks: app.background_tasks,
                 processing: app.processing,
+                decode_rate,
                 status_message: app.status.as_deref(),
                 profile_name: app.current_profile_name(),
             }),
@@ -153,6 +159,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         queue_count: app.queue.len(),
         background_tasks: app.background_tasks,
         processing: app.processing,
+        decode_rate,
         status_message: app.status.as_deref(),
         profile_name: app.current_profile_name(),
     };

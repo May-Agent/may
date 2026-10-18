@@ -149,6 +149,8 @@ pub struct App {
     pub pending_attachment_jobs: usize,
     /// Cumulative token usage for current session
     pub usage: Option<aither_core::llm::Usage>,
+    /// Decode-speed measurement for the streaming response
+    pub decode_meter: crate::decode_meter::DecodeMeter,
     /// Context window size for current model
     pub context_window: Option<u32>,
     /// Current model being used by the agent
@@ -345,6 +347,7 @@ impl App {
             pending_paste_results: std::collections::VecDeque::new(),
             pending_attachment_jobs: 0,
             usage: None,
+            decode_meter: crate::decode_meter::DecodeMeter::default(),
             context_window: None,
             current_model: None,
             mcp_servers: Vec::new(),
@@ -1738,6 +1741,7 @@ impl App {
     pub fn start_processing(&mut self, msg: &PendingMessage) {
         self.processing = true;
         self.thinking_start = None;
+        self.decode_meter.reset();
 
         // Add user message to chat
         self.chat.push_user(&msg.content, msg.attachments.clone());
@@ -1759,11 +1763,13 @@ impl App {
                         // End loading/thinking state and start assistant text
                         self.chat.end_loading();
                         self.thinking_start = None;
+                        self.decode_meter.note_output(chunk.len());
                         self.chat.push_text(&chunk);
                         self.scroll = usize::MAX;
                         self.input_visible = true;
                     }
-                    AgentEvent::Reasoning(_) => {
+                    AgentEvent::Reasoning(chunk) => {
+                        self.decode_meter.note_output(chunk.len());
                         // Start or update thinking indicator
                         if self.thinking_start.is_none() {
                             self.thinking_start = Some(std::time::Instant::now());
@@ -1775,6 +1781,11 @@ impl App {
                             self.chat.update_thinking(secs);
                         }
                     }
+                    AgentEvent::ToolCallDelta {
+                        arguments_fragment, ..
+                    } => {
+                        self.decode_meter.note_output(arguments_fragment.len());
+                    }
                     AgentEvent::ToolCallStart {
                         id,
                         name,
@@ -1782,6 +1793,7 @@ impl App {
                     } => {
                         self.chat.end_loading();
                         self.chat.end_text();
+                        self.decode_meter.note_boundary();
                         let display = match parse_tool_start(&name, &arguments) {
                             ToolStartKind::Terminal { command, mode } => ToolDisplay::Terminal {
                                 command,
@@ -1829,12 +1841,14 @@ impl App {
                         // Just finalize the message
                         self.chat.end_loading();
                         self.chat.end_text();
+                        self.decode_meter.note_boundary();
                         self.scroll = usize::MAX;
                         self.input_visible = true;
                         // Signal that processing is complete
                         return true;
                     }
                     AgentEvent::Usage(u) => {
+                        self.decode_meter.note_usage(u.completion_tokens);
                         // Accumulate token usage
                         if let Some(ref mut usage) = self.usage {
                             usage.accumulate(&u);
@@ -1849,6 +1863,7 @@ impl App {
             }
             Err(e) => {
                 tracing::error!("Agent error: {}", e);
+                self.decode_meter.note_boundary();
                 // Display error to user
                 self.chat.end_loading();
                 self.chat.push_error(&format!("{e}"));

@@ -51,9 +51,11 @@ use super::title_generation;
 use super::types::{
     ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
     RequestLogEntry, RequestStats, SessionRuntimeResponse, SseChunkEvent, SseDoneEvent,
-    SseErrorEvent, SsePingEvent, SseStartEvent, SseTodoUpdateEvent, SseToolDeltaEvent,
-    SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord, ToolVariant,
+    SseErrorEvent, SsePingEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent,
+    SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
+    ToolVariant,
 };
+use crate::decode_meter::DecodeMeter;
 
 fn stopped_terminal_tool_result() -> ToolResult {
     ToolResult::json(&TerminalResult {
@@ -135,6 +137,7 @@ trait ChatSink {
         &mut self,
         checklist: &crate::todo_parser::TodoChecklist,
     ) -> impl Future<Output = bool> + Send;
+    fn on_speed(&mut self, tokens_per_second: f64) -> impl Future<Output = bool> + Send;
     fn on_error(
         &mut self,
         code: ApiErrorCode,
@@ -328,6 +331,20 @@ impl ChatSink for SseSink {
         send_event(&self.sender, "todo_update", &event).await
     }
 
+    async fn on_speed(&mut self, tokens_per_second: f64) -> bool {
+        let seq = self.next_seq();
+        send_event(
+            &self.sender,
+            "speed",
+            &SseSpeedEvent {
+                seq,
+                turn_id: &self.turn_id,
+                tokens_per_second,
+            },
+        )
+        .await
+    }
+
     async fn on_error(&mut self, code: ApiErrorCode, message: &str, retryable: bool) -> bool {
         let seq = self.next_seq();
         send_event(
@@ -394,9 +411,34 @@ impl ChatSink for CollectSink {
     ) -> impl Future<Output = bool> + Send {
         std::future::ready(true)
     }
+    fn on_speed(&mut self, _: f64) -> impl Future<Output = bool> + Send {
+        std::future::ready(true)
+    }
     fn on_error(&mut self, _: ApiErrorCode, _: &str, _: bool) -> impl Future<Output = bool> + Send {
         std::future::ready(true)
     }
+}
+
+/// Interval between `speed` events so fast providers don't flood the stream.
+const SPEED_EMIT_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Feed streamed output bytes into `meter` and emit a `speed` event when the
+/// interval has elapsed. Returns the sink liveness flag, like the `on_*` calls.
+async fn note_output_and_emit_speed(
+    sink: &mut impl ChatSink,
+    meter: &mut DecodeMeter,
+    last_emit: &mut Option<Instant>,
+    bytes: usize,
+) -> bool {
+    meter.note_output(bytes);
+    if last_emit.is_some_and(|t| t.elapsed() < SPEED_EMIT_INTERVAL) {
+        return true;
+    }
+    let Some(rate) = meter.rate() else {
+        return true;
+    };
+    *last_emit = Some(Instant::now());
+    sink.on_speed(rate).await
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1339,6 +1381,8 @@ fn run_agent_loop<'a>(
             });
 
             let mut usage = Usage::default();
+            let mut decode_meter = DecodeMeter::default();
+            let mut last_speed_emit: Option<Instant> = None;
             let mut segment_text = String::new(); // current text segment, flushed on tool calls
             let mut full_text = String::new(); // accumulated full assistant text
             let mut reasoning_text = String::new();
@@ -1397,6 +1441,18 @@ fn run_agent_loop<'a>(
                                     Some("client disconnected during reasoning stream");
                                 break;
                             }
+                            if !note_output_and_emit_speed(
+                                sink,
+                                &mut decode_meter,
+                                &mut last_speed_emit,
+                                text.len(),
+                            )
+                            .await
+                            {
+                                cancellation_reason =
+                                    Some("client disconnected during reasoning stream");
+                                break;
+                            }
                         }
                         Ok(aither_agent::AgentEvent::Text(text)) => {
                             log_first_agent_event(
@@ -1419,8 +1475,21 @@ fn run_agent_loop<'a>(
                                     Some("client disconnected during text stream");
                                 break;
                             }
+                            if !note_output_and_emit_speed(
+                                sink,
+                                &mut decode_meter,
+                                &mut last_speed_emit,
+                                text.len(),
+                            )
+                            .await
+                            {
+                                cancellation_reason =
+                                    Some("client disconnected during text stream");
+                                break;
+                            }
                         }
                         Ok(aither_agent::AgentEvent::Usage(u)) => {
+                            decode_meter.note_usage(u.completion_tokens);
                             usage = u;
                         }
                         Ok(aither_agent::AgentEvent::ToolCallDelta {
@@ -1442,6 +1511,18 @@ fn run_agent_loop<'a>(
                                 fragment = %arguments_fragment,
                                 "incoming ToolCallDelta from aither"
                             );
+                            if !note_output_and_emit_speed(
+                                sink,
+                                &mut decode_meter,
+                                &mut last_speed_emit,
+                                arguments_fragment.len(),
+                            )
+                            .await
+                            {
+                                cancellation_reason =
+                                    Some("client disconnected during tool stream");
+                                break;
+                            }
                             match normalize_tool_delta_for_sink(
                                 &mut pending_tool_streams,
                                 &id,
@@ -1509,6 +1590,7 @@ fn run_agent_loop<'a>(
                                 "tool_start",
                             );
                             saw_tool_activity = true;
+                            decode_meter.note_boundary();
                             if matches!(
                                 name.as_str(),
                                 "terminal" | "terminal_input" | "terminal_kill" | "terminal_read"
@@ -1696,6 +1778,8 @@ fn run_agent_loop<'a>(
                 }
             }
 
+            decode_meter.note_boundary();
+
             // Browser takeover may have cancelled the stream before another agent
             // event arrived, so classify the terminal state once more after the
             // loop. This turns the immediate cancellation into a resumable
@@ -1826,6 +1910,11 @@ fn run_agent_loop<'a>(
             // Flush the entire turn atomically
             turn_persister.flush(&state.db()).await?;
             clear_terminal_runtime_state(state, session_id.as_str()).await?;
+
+            // Final sample carries the exact rate now that Usage has arrived.
+            if let Some(rate) = decode_meter.rate() {
+                let _ = sink.on_speed(rate).await;
+            }
 
             let elapsed_ms = elapsed_ms_saturating(&started_at);
             persist_latest_assistant_stats(

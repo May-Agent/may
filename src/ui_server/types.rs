@@ -183,6 +183,15 @@ pub struct SsePingEvent<'a> {
     pub(crate) turn_id: &'a str,
 }
 
+/// Live decode-speed sample emitted while model output streams.
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SseSpeedEvent<'a> {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: &'a str,
+    pub(crate) tokens_per_second: f64,
+}
+
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseTodoUpdateEvent {
@@ -1294,6 +1303,7 @@ pub struct UiModelsConfig {
 pub struct UiPreferencesConfig {
     pub(crate) warn_on_model_change: bool,
     pub(crate) show_token_usage: bool,
+    pub(crate) show_decode_speed: bool,
     #[schema(value_type = String)]
     pub(crate) network_policy_mode: NetworkPolicyMode,
     pub(crate) network_policy_hosts: Vec<String>,

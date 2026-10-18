@@ -635,6 +635,8 @@ pub struct StatusContext<'a> {
     pub background_tasks: usize,
     /// Whether currently processing.
     pub processing: bool,
+    /// Live decode rate in tokens per second, when measurable.
+    pub decode_rate: Option<f64>,
     /// Optional status message.
     pub status_message: Option<&'a str>,
     /// Current profile name (shown in status bar).
@@ -1261,6 +1263,14 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>) {
             ));
         } else {
             parts.push(format!("{used}tok"));
+        }
+    }
+
+    if let Some(rate) = ctx.decode_rate {
+        if rate >= 100.0 {
+            parts.push(format!("{rate:.0} tok/s"));
+        } else {
+            parts.push(format!("{rate:.1} tok/s"));
         }
     }
 
