@@ -1,4 +1,4 @@
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, Zap } from 'lucide-react';
 import type { TurnState } from '@/lib/stream/reducer';
 import { MessageText } from './MessageText';
 import { ReasoningBlock } from './ReasoningBlock';
@@ -9,9 +9,18 @@ import { useTranslation } from '@/lib/i18n';
 interface AssistantTurnProps {
   turn: TurnState;
   reasoningEnabled?: boolean;
+  showDecodeSpeed?: boolean;
 }
 
-export function AssistantTurn({ turn, reasoningEnabled = false }: AssistantTurnProps) {
+function formatRate(rate: number): string {
+  return rate >= 100 ? Math.round(rate).toString() : rate.toFixed(1);
+}
+
+export function AssistantTurn({
+  turn,
+  reasoningEnabled = false,
+  showDecodeSpeed = true,
+}: AssistantTurnProps) {
   const streaming = turn.status === 'streaming';
   const { t } = useTranslation();
 
@@ -49,6 +58,12 @@ export function AssistantTurn({ turn, reasoningEnabled = false }: AssistantTurnP
       })}
       {turn.todo && (
         <TodoBlock items={turn.todo.items} total={turn.todo.total} completed={turn.todo.completed} />
+      )}
+      {showDecodeSpeed && turn.tokensPerSecond != null && (
+        <div className="flex items-center gap-1.5 text-xs tabular-nums text-muted-foreground">
+          <Zap className="size-3" />
+          <span>{t('chat.decodeSpeed', { rate: formatRate(turn.tokensPerSecond) })}</span>
+        </div>
       )}
       {streaming && !hasAnySegment && !turn.todo && !turn.reasoning && (
         <div className="flex items-center gap-2 text-sm text-muted-foreground">

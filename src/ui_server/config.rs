@@ -134,6 +134,7 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
         preferences: UiPreferencesConfig {
             warn_on_model_change: config.preferences.warn_on_model_change,
             show_token_usage: config.preferences.show_token_usage,
+            show_decode_speed: config.preferences.show_decode_speed,
             network_policy_mode: config.preferences.network_policy.mode,
             network_policy_hosts: config.preferences.network_policy.hosts.clone(),
         },
@@ -271,6 +272,7 @@ async fn run_save_full_config(
         config.models.embedding_dimensions = req.models.embedding_dimensions;
         config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
         config.preferences.show_token_usage = req.preferences.show_token_usage;
+        config.preferences.show_decode_speed = req.preferences.show_decode_speed;
         config.preferences.network_policy.mode = req.preferences.network_policy_mode;
         config.preferences.network_policy.hosts = req
             .preferences
