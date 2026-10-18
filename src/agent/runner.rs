@@ -25,7 +25,7 @@ use executor_core::{Executor, Task};
 use futures_lite::StreamExt;
 
 use crate::MayAgent;
-use crate::agent::RequestParameterizedModel;
+use crate::agent::{ContextReport, RequestParameterizedModel};
 use crate::db::ChatDb;
 
 /// Events sent from the agent background task to the TUI.
@@ -35,6 +35,8 @@ pub enum TuiEvent {
     Agent(Result<AgentEvent, aither_agent::AgentError>),
     /// Compaction request finished.
     Compacted(Result<Option<CompactResult>, aither_agent::AgentError>),
+    /// Context-window measurement for `/context` is ready.
+    ContextReport(ContextReport),
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.
@@ -55,6 +57,8 @@ enum WorkerCommand {
         focus: Option<String>,
         event_tx: Sender<TuiEvent>,
     },
+    /// Measure the context window for `/context`.
+    ContextReport { event_tx: Sender<TuiEvent> },
     /// Cancel current processing.
     Cancel,
     /// Shutdown the worker.
@@ -127,6 +131,29 @@ impl AgentWorker {
         let (event_tx, event_rx) = unbounded();
         self.command_tx
             .try_send(WorkerCommand::Compact { focus, event_tx })
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
+        AgentHandle {
+            event_rx,
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
+    /// Request a context-window report for `/context`.
+    ///
+    /// Issued while a turn is in flight, the measurement is deferred by the
+    /// worker and answers with the post-turn context once the turn ends.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
+    #[must_use]
+    pub fn context_report(&self) -> AgentHandle {
+        const ERR_WORKER_CHANNEL_CLOSED: &str =
+            include_str!("../texts/agent_worker_channel_closed.txt");
+        let (event_tx, event_rx) = unbounded();
+        self.command_tx
+            .try_send(WorkerCommand::ContextReport { event_tx })
             .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
         AgentHandle {
             event_rx,
@@ -213,7 +240,12 @@ pub fn spawn_worker<E: Executor + 'static>(
     let subagent_tracker = agent.subagent_tracker();
 
     executor
-        .spawn(run_worker(agent, command_rx, snapshot_db))
+        .spawn(run_worker(
+            agent,
+            command_rx,
+            command_tx.clone(),
+            snapshot_db,
+        ))
         .detach();
 
     AgentWorker {
@@ -226,7 +258,12 @@ pub fn spawn_worker<E: Executor + 'static>(
 }
 
 /// The worker loop that owns and runs the agent.
-async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>, snapshot_db: ChatDb) {
+async fn run_worker(
+    mut agent: MayAgent,
+    command_rx: Receiver<WorkerCommand>,
+    command_tx: Sender<WorkerCommand>,
+    snapshot_db: ChatDb,
+) {
     loop {
         // Wait for a command
         let Ok(command) = command_rx.recv().await else {
@@ -247,6 +284,7 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>, sn
                     hidden_context.as_deref(),
                     attachments,
                     &command_rx,
+                    &command_tx,
                     &event_tx,
                 ))
                 .await;
@@ -274,6 +312,11 @@ async fn run_worker(mut agent: MayAgent, command_rx: Receiver<WorkerCommand>, sn
                 let _ = event_tx.send(TuiEvent::Compacted(result)).await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }
+            WorkerCommand::ContextReport { event_tx } => {
+                let report = agent.context_report().await;
+                let _ = event_tx.send(TuiEvent::ContextReport(report)).await;
+                let _ = event_tx.send(TuiEvent::Complete).await;
+            }
             WorkerCommand::Cancel => {
                 // No active processing, ignore
             }
@@ -291,6 +334,7 @@ async fn run_agent_prompt(
     hidden_context: Option<&str>,
     attachments: Vec<Attachment>,
     command_rx: &Receiver<WorkerCommand>,
+    command_tx: &Sender<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
 ) -> bool {
     agent.sync_runtime_context().await;
@@ -309,16 +353,28 @@ async fn run_agent_prompt(
             },
             async {
                 // Check for cancel command (non-blocking peek then async recv)
-                if let Ok(cmd) = command_rx.try_recv()
-                    && matches!(cmd, WorkerCommand::Cancel | WorkerCommand::Shutdown)
-                {
-                    return None;
+                if let Ok(cmd) = command_rx.try_recv() {
+                    match cmd {
+                        WorkerCommand::Cancel | WorkerCommand::Shutdown => return None,
+                        // The run stream borrows the agent, so a context
+                        // report cannot be measured mid-turn — requeue it to
+                        // answer with the post-turn context.
+                        WorkerCommand::ContextReport { event_tx } => {
+                            let _ = command_tx.try_send(WorkerCommand::ContextReport { event_tx });
+                        }
+                        // Ignore new run/compact commands during processing
+                        WorkerCommand::Run { .. } | WorkerCommand::Compact { .. } => {}
+                    }
                 }
                 // Wait for cancel (this will also catch shutdown)
                 loop {
                     if let Ok(cmd) = command_rx.recv().await {
                         match cmd {
                             WorkerCommand::Cancel | WorkerCommand::Shutdown => return None,
+                            WorkerCommand::ContextReport { event_tx } => {
+                                let _ =
+                                    command_tx.try_send(WorkerCommand::ContextReport { event_tx });
+                            }
                             WorkerCommand::Run { .. } | WorkerCommand::Compact { .. } => {
                                 // Ignore new run/compact commands during processing
                                 continue;

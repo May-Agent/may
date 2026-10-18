@@ -2207,6 +2207,7 @@ impl App {
             }
             "/quit" => Some(SendAction::Quit),
             "/compact" => Some(SendAction::Compact(None)),
+            "/context" => Some(SendAction::ContextReport),
             "/mcp" => {
                 self.mode = AppMode::McpManage;
                 None
@@ -2374,6 +2375,9 @@ impl App {
         self.input_char_count = 0;
 
         let trimmed = content.trim();
+        if trimmed == "/context" && attachments.is_empty() {
+            return SendAction::ContextReport;
+        }
         if let Some(rest) = trimmed.strip_prefix("/compact")
             && attachments.is_empty()
         {
@@ -2652,6 +2656,8 @@ pub enum SendAction {
     SwitchModel(String),
     /// Compact the conversation history with optional focus hint.
     Compact(Option<String>),
+    /// Measure and display context-window usage.
+    ContextReport,
     /// MCP server management actions.
     McpAdd {
         /// Name of the MCP server to add.

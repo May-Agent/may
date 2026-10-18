@@ -35,6 +35,7 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model for this session"),
     ("/sandbox", "Open sandbox folder in Finder"),
     ("/compact", "Compact conversation history"),
+    ("/context", "Show context window usage"),
     (
         "/rewind",
         "Rewind to an earlier prompt (conversation, optionally code too)",
