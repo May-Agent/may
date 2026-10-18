@@ -321,6 +321,35 @@ pub fn handle_help_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     None
 }
 
+/// Rewind picker: select a checkpoint and restore files to it.
+pub fn handle_rewind_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::Rewind(state) = &mut app.mode else {
+        return None;
+    };
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.selected = state.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.selected + 1 < state.targets.len() {
+                state.selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            let target = state.targets[state.selected].tool_call_id.clone();
+            app.mode = AppMode::Chat;
+            if let Some(handle) = &app.file_diffs {
+                handle.request_rewind(&target);
+            }
+        }
+        KeyCode::Esc => {
+            app.mode = AppMode::Chat;
+        }
+        _ => {}
+    }
+    None
+}
+
 pub fn handle_tool_detail_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => {
