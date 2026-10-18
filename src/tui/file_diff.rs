@@ -13,13 +13,25 @@ use async_channel::{Receiver, Sender};
 
 use crate::file_tracker::{FileChangeTracker, RootDiff, TrackedRootSpec};
 
-/// A finished snapshot: diffs attributable to one tool call.
+/// A finished worker operation.
 #[derive(Debug)]
-pub struct DiffOutcome {
-    /// Tool call the diff belongs to.
-    pub tool_call_id: String,
-    /// Per-root diffs produced by the snapshot (empty roots omitted).
-    pub diffs: Vec<RootDiff>,
+pub enum Outcome {
+    /// Snapshot produced diffs attributable to one tool call.
+    Diff {
+        /// Tool call the diff belongs to.
+        tool_call_id: String,
+        /// Per-root diffs produced by the snapshot (empty roots omitted).
+        diffs: Vec<RootDiff>,
+    },
+    /// A rewind restored worktrees to a checkpoint. `diffs` carry the
+    /// revert diff (pre-rewind → restored) per affected root; empty means
+    /// the checkpoint was missing or the tree already matched.
+    Rewound {
+        /// Tool call whose checkpoint was restored.
+        tool_call_id: String,
+        /// Per-root revert diffs (empty roots omitted).
+        diffs: Vec<RootDiff>,
+    },
 }
 
 enum Request {
@@ -27,6 +39,8 @@ enum Request {
     AddRoot(TrackedRootSpec),
     /// Snapshot all roots and attribute any diff to this tool call.
     Snapshot(String),
+    /// Restore all roots to their state before this tool call.
+    Rewind(String),
 }
 
 /// Request side of the per-session diff worker. Dropping it ends the
@@ -35,7 +49,7 @@ enum Request {
 pub struct FileDiffHandle {
     session_id: String,
     requests: Sender<Request>,
-    results: Receiver<DiffOutcome>,
+    results: Receiver<Outcome>,
 }
 
 impl FileDiffHandle {
@@ -55,7 +69,7 @@ impl FileDiffHandle {
         roots: Vec<TrackedRootSpec>,
     ) -> Option<Self> {
         let (requests, request_rx) = async_channel::unbounded::<Request>();
-        let (result_tx, results) = async_channel::unbounded::<DiffOutcome>();
+        let (result_tx, results) = async_channel::unbounded::<Outcome>();
         let thread_name = format!("file-diff-{session_id}");
         std::thread::Builder::new()
             .name(thread_name)
@@ -75,14 +89,29 @@ impl FileDiffHandle {
                             }
                         }
                         Request::Snapshot(tool_call_id) => {
-                            let diffs = tracker.snapshot();
+                            let diffs = tracker.snapshot(&tool_call_id);
                             if !diffs.is_empty()
                                 && result_tx
-                                    .send_blocking(DiffOutcome {
+                                    .send_blocking(Outcome::Diff {
                                         tool_call_id,
                                         diffs,
                                     })
                                     .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Request::Rewind(tool_call_id) => {
+                            // Send the outcome even when nothing reverted:
+                            // the TUI needs a reply either way to report
+                            // "no checkpoint" back to the user.
+                            let diffs = tracker.rewind(&tool_call_id);
+                            if result_tx
+                                .send_blocking(Outcome::Rewound {
+                                    tool_call_id,
+                                    diffs,
+                                })
+                                .is_err()
                             {
                                 return;
                             }
@@ -110,6 +139,18 @@ impl FileDiffHandle {
         }
     }
 
+    /// Ask the worker to restore all roots to their state before
+    /// `tool_call_id`.
+    pub fn request_rewind(&self, tool_call_id: &str) {
+        if self
+            .requests
+            .try_send(Request::Rewind(tool_call_id.to_string()))
+            .is_err()
+        {
+            tracing::debug!("file diff worker is gone; rewind dropped");
+        }
+    }
+
     /// Ask the worker to track an additional directory.
     pub fn request_add_root(&self, spec: TrackedRootSpec) {
         if self.requests.try_send(Request::AddRoot(spec)).is_err() {
@@ -117,9 +158,9 @@ impl FileDiffHandle {
         }
     }
 
-    /// Drain all finished diffs without blocking.
+    /// Drain all finished outcomes without blocking.
     #[must_use]
-    pub fn drain(&self) -> Vec<DiffOutcome> {
+    pub fn drain(&self) -> Vec<Outcome> {
         let mut outcomes = Vec::new();
         while let Ok(outcome) = self.results.try_recv() {
             outcomes.push(outcome);

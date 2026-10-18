@@ -42,6 +42,32 @@ pub enum AppMode {
     SkillManage,
     /// Profile switcher popup
     ProfileSelect,
+    /// Rewind picker: restore files to a per-call checkpoint
+    Rewind(RewindState),
+}
+
+/// One rewindable checkpoint: a tool call that changed tracked files.
+#[derive(Debug, Clone)]
+pub struct RewindTarget {
+    /// Tool call whose pre-call tree the rewind restores.
+    pub tool_call_id: String,
+    /// First line of the command that made the change.
+    pub command_preview: String,
+    /// Total files changed by this call (all roots).
+    pub files: usize,
+    /// Total added lines.
+    pub additions: usize,
+    /// Total deleted lines.
+    pub deletions: usize,
+}
+
+/// Rewind picker state.
+#[derive(Debug)]
+pub struct RewindState {
+    /// Tool calls that produced diffs, oldest first.
+    pub targets: Vec<RewindTarget>,
+    /// Cursor position.
+    pub selected: usize,
 }
 
 /// Per-question interaction state.
