@@ -1,6 +1,6 @@
 use crate::config::{
-    BrowserBackendKind, CommandPriority, NativeToolsConfig, ProviderType, RemoteAccessConfig,
-    SshServerConfig,
+    BrowserBackendKind, CommandPriority, NativeToolsConfig, ProviderApi, ProviderType,
+    RemoteAccessConfig, SshServerConfig,
 };
 use crate::network_policy::NetworkPolicyMode;
 use crate::session::{
@@ -1285,6 +1285,10 @@ pub struct UiProviderConfig {
     pub(crate) display_name: Option<String>,
     pub(crate) enabled: bool,
     pub(crate) native_tools: UiNativeToolsConfig,
+    /// Wire API a `custom` provider speaks; must round-trip the config save or
+    /// `api = "responses"` is silently dropped on every UI write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) api: Option<ProviderApi>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]

@@ -98,6 +98,7 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             display_name: instance.display_name.clone(),
             enabled: instance.enabled,
             native_tools: UiNativeToolsConfig::from(&instance.native_tools),
+            api: instance.api,
         })
         .collect::<Vec<_>>();
     providers.sort_by(|a, b| a.id.cmp(&b.id));
@@ -202,6 +203,7 @@ fn provider_map_from_ui(
             instance.display_name = p.display_name.clone().filter(|v| !v.trim().is_empty());
             instance.enabled = p.enabled;
             instance.native_tools = NativeToolsConfig::from(&p.native_tools);
+            instance.api = p.api;
             (p.id.clone(), instance)
         })
         .collect()
@@ -726,6 +728,28 @@ mod tests {
         assert!(openai.native_tools.web_search);
         assert!(openai.native_tools.web_fetch);
         assert_eq!(openai.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn full_config_save_roundtrip_preserves_responses_api() {
+        let mut config = MayConfig::default();
+        let mut instance =
+            ProviderInstance::new(ProviderType::Custom).with_base_url("http://127.0.0.1:8787/v1");
+        instance.api = Some(crate::config::ProviderApi::Responses);
+        instance.native_tools.web_search = true;
+        config.upsert_provider("swe2", instance);
+
+        let ui = serde_json::to_value(build_ui_full_config(&config)).expect("ui config serializes");
+        assert_eq!(ui["providers"][0]["api"], "responses");
+
+        let saved: super::UiFullConfig =
+            serde_json::from_value(ui).expect("ui config deserializes");
+        let providers = provider_map_from_ui(&saved.providers);
+        let swe2 = providers.get("swe2").expect("provider survives a save");
+        assert_eq!(swe2.api, Some(crate::config::ProviderApi::Responses));
+        assert!(swe2.native_tools.web_search);
+        swe2.validate("swe2")
+            .expect("the saved provider stays valid");
     }
 
     #[test]

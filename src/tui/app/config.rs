@@ -339,6 +339,18 @@ impl App {
                     // Reset edit mode
                     self.config_state.edit_mode = ConfigEditMode::None;
 
+                    // Editing an existing provider keeps the fields this form
+                    // does not expose (`api`, `native_tools`, `display_name`,
+                    // `enabled`); a new provider starts from defaults.
+                    let mut instance = if was_editing
+                        && let Some(ref old_name) = orig_name
+                        && let Some(existing) = self.config.provider.get(old_name)
+                    {
+                        existing.clone()
+                    } else {
+                        crate::config::ProviderInstance::new(ProviderType::Custom)
+                    };
+
                     // If editing existing and name changed, remove old entry
                     if was_editing
                         && let Some(ref old_name) = orig_name
@@ -347,8 +359,6 @@ impl App {
                         self.config.provider.remove(old_name);
                     }
 
-                    // Create new provider instance
-                    let mut instance = crate::config::ProviderInstance::new(ProviderType::Custom);
                     instance.base_url = Some(base_url_val);
                     instance.api_key = api_key_val;
                     self.config.upsert_provider(&name_val, instance);
