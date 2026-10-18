@@ -796,6 +796,7 @@ impl RuntimeDeps {
         new_worker: AgentWorker,
     ) {
         app.set_current_model(build.model());
+        app.job_registry = Some(new_worker.job_registry().clone());
         *worker = Some(new_worker);
     }
 
