@@ -157,6 +157,8 @@ pub struct App {
     pub usage: Option<aither_core::llm::Usage>,
     /// Decode-speed measurement for the streaming response
     pub decode_meter: crate::decode_meter::DecodeMeter,
+    /// Spinner animation frame for the status-line processing indicator
+    pub spinner_frame: usize,
     /// Context window size for current model
     pub context_window: Option<u32>,
     /// Current model being used by the agent
@@ -365,6 +367,7 @@ impl App {
             pending_attachment_jobs: 0,
             usage: None,
             decode_meter: crate::decode_meter::DecodeMeter::default(),
+            spinner_frame: 0,
             context_window: None,
             current_model: None,
             mcp_servers: Vec::new(),
@@ -1910,9 +1913,11 @@ impl App {
                         }
                     }
                     AgentEvent::ToolCallDelta {
-                        arguments_fragment, ..
+                        id,
+                        arguments_fragment,
+                        ..
                     } => {
-                        self.decode_meter.note_output(arguments_fragment.len());
+                        self.decode_meter.note_tool_delta(&id, &arguments_fragment);
                     }
                     AgentEvent::ToolCallStart {
                         id,
