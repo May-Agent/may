@@ -212,6 +212,14 @@ pub struct App {
     pub render_top_padding: usize,
     /// Row spans of collapsible tool calls in `rendered_plain_lines` space
     pub collapse_regions: Vec<super::ui::chat::ClickRegion>,
+    /// Session background-job registry (set when the agent worker installs)
+    pub job_registry: Option<aither_sandbox::JobRegistry>,
+    /// Latest job list shown in `AppMode::Jobs`
+    pub jobs: Vec<aither_sandbox::JobInfo>,
+    /// Selected row in `AppMode::Jobs`
+    pub jobs_selected: usize,
+    /// Last jobs refresh (panel auto-refreshes on tick while open)
+    pub jobs_refreshed: Option<std::time::Instant>,
 }
 
 impl App {
@@ -379,6 +387,10 @@ impl App {
             rendered_plain_lines: Vec::new(),
             render_top_padding: 0,
             collapse_regions: Vec::new(),
+            job_registry: None,
+            jobs: Vec::new(),
+            jobs_selected: 0,
+            jobs_refreshed: None,
         })
     }
 
@@ -513,6 +525,45 @@ impl App {
             if files == 1 { "" } else { "s" },
             if marked == 1 { "" } else { "s" },
         ));
+    }
+
+    /// Re-fetch the session's background jobs from the registry.
+    pub fn refresh_jobs(&mut self) {
+        let Some(registry) = self.job_registry.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let _ = tx.send(AppEvent::JobsLoaded(registry.list().await)).await;
+        })
+        .detach();
+        self.jobs_refreshed = Some(std::time::Instant::now());
+    }
+
+    /// Kill a background job by pid, then refresh the panel.
+    pub fn kill_job(&mut self, pid: u32) {
+        let Some(registry) = self.job_registry.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let ok = registry.kill(pid).await;
+            let _ = tx.send(AppEvent::JobKilled { pid, ok }).await;
+            let _ = tx.send(AppEvent::JobsLoaded(registry.list().await)).await;
+        })
+        .detach();
+    }
+
+    /// Open the jobs/subagents panel.
+    pub fn open_jobs(&mut self) {
+        if self.job_registry.is_none() {
+            self.chat
+                .push_error("No active session — jobs list unavailable");
+            return;
+        }
+        self.mode = AppMode::Jobs;
+        self.jobs_selected = 0;
+        self.refresh_jobs();
     }
 
     /// Check if configuration is complete.
@@ -673,6 +724,8 @@ impl App {
         self.rendered_plain_lines.clear();
         self.render_top_padding = 0;
         self.collapse_regions.clear();
+        self.jobs.clear();
+        self.jobs_selected = 0;
 
         // Load chat history into display
         self.chat = ChatStream::new();
@@ -973,6 +1026,7 @@ impl App {
                 self, code,
             )),
             AppMode::Rewind(_) => Ok(super::reducer::navigation::handle_rewind_key(self, code)),
+            AppMode::Jobs => Ok(super::reducer::navigation::handle_jobs_key(self, code)),
         }
     }
 
@@ -1553,6 +1607,10 @@ impl App {
                         selected: 0,
                     });
                 }
+                None
+            }
+            "/jobs" => {
+                self.open_jobs();
                 None
             }
             "/quit" => Some(SendAction::Quit),

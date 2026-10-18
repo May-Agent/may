@@ -26,6 +26,14 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                     app.chat.update_thinking(secs);
                 }
             }
+            // Live-refresh the jobs panel once per second while open.
+            if matches!(app.mode, AppMode::Jobs)
+                && app
+                    .jobs_refreshed
+                    .is_none_or(|t| t.elapsed().as_secs() >= 1)
+            {
+                app.refresh_jobs();
+            }
             Ok(None)
         }
         AppEvent::Resize(_, _) => Ok(None),
@@ -165,5 +173,53 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.handle_image_fetch_result(url, data);
             Ok(None)
         }
+
+        AppEvent::JobsLoaded(jobs) => {
+            app.jobs = jobs;
+            let row_count = jobs_rows(app).len();
+            if app.jobs_selected >= row_count && app.jobs_selected > 0 {
+                app.jobs_selected = row_count.saturating_sub(1);
+            }
+            Ok(None)
+        }
+        AppEvent::JobKilled { pid, ok } => {
+            app.status = Some(if ok {
+                format!("Killed job {pid}")
+            } else {
+                format!("Job {pid} already finished")
+            });
+            Ok(None)
+        }
     }
+}
+
+/// Rows of the jobs panel: running subagents first, then registry jobs
+/// (running before finished).
+pub fn jobs_rows(app: &App) -> Vec<JobRow> {
+    let mut rows: Vec<JobRow> = app
+        .chat
+        .running_subagents()
+        .into_iter()
+        .map(|(id, agent, preview)| JobRow::Subagent { id, agent, preview })
+        .collect();
+    let mut jobs: Vec<aither_sandbox::JobInfo> = app.jobs.clone();
+    jobs.sort_by_key(|job| !matches!(job.status, aither_sandbox::job_registry::JobStatus::Running));
+    rows.extend(jobs.into_iter().map(JobRow::Job));
+    rows
+}
+
+/// One selectable row in the jobs panel.
+#[derive(Debug)]
+pub enum JobRow {
+    /// A foreground `subagent` invocation still inside the agent run.
+    Subagent {
+        /// Tool call element ID.
+        id: String,
+        /// Subagent name.
+        agent: String,
+        /// Prompt preview.
+        preview: String,
+    },
+    /// A background terminal job from the registry.
+    Job(aither_sandbox::JobInfo),
 }

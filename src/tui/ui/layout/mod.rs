@@ -216,6 +216,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         AppMode::Rewind(ref state) => {
             render_rewind_popup(frame, area, state);
         }
+        AppMode::Jobs => {
+            render_jobs_popup(frame, area, app);
+        }
         _ => {}
     }
 
@@ -568,6 +571,76 @@ fn render_rewind_popup(frame: &mut Frame, area: Rect, state: &RewindState) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title("Rewind to before… (Enter restore, Esc cancel)"),
+    );
+    frame.render_widget(list, popup_area);
+}
+
+/// Jobs panel: running subagents and background terminal jobs.
+fn render_jobs_popup(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::tui::reducer::{JobRow, jobs_rows};
+
+    let rows = jobs_rows(app);
+    let popup_height = u16::try_from((rows.len() * 2 + 3).clamp(6, 20)).unwrap_or(u16::MAX);
+    let popup_width = area.width.saturating_sub(8).clamp(50, 96);
+    let popup_area = centered_rect_exact(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let prefix = if idx == app.jobs_selected { "> " } else { "  " };
+            let selected = idx == app.jobs_selected;
+            let title_style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let (title, detail) = match row {
+                JobRow::Subagent { agent, preview, .. } => (
+                    format!("{prefix}◉ subagent {agent}"),
+                    format!("    {preview}  — running in this turn"),
+                ),
+                JobRow::Job(job) => {
+                    let (icon, status) = match &job.status {
+                        aither_sandbox::JobStatus::Running => ("●", "running".to_string()),
+                        aither_sandbox::JobStatus::Completed { exit_code } => {
+                            ("✓", format!("exit {exit_code}"))
+                        }
+                        aither_sandbox::JobStatus::Failed { error } => {
+                            ("✗", format!("failed: {error}"))
+                        }
+                        aither_sandbox::JobStatus::Killed => ("■", "killed".to_string()),
+                    };
+                    let secs = job.started_at.elapsed().as_secs();
+                    let first_line = job.script.lines().next().unwrap_or("");
+                    let cmd: String = first_line.chars().take(60).collect();
+                    (
+                        format!("{prefix}{icon} pid {} · {cmd}", job.pid),
+                        format!("    {status} · {secs}s · task {}", job.task_id),
+                    )
+                }
+            };
+            ListItem::new(vec![
+                Line::from(Span::styled(title, title_style)),
+                Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
+            ])
+        })
+        .collect();
+
+    let title = if rows.is_empty() {
+        "Jobs & subagents — none running (Esc close)"
+    } else {
+        "Jobs & subagents (↑↓ select, Enter/x stop, r refresh, Esc close)"
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title),
     );
     frame.render_widget(list, popup_area);
 }
