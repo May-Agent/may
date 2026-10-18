@@ -82,9 +82,10 @@ pub use aither_agent::ask_user;
 pub use aither_agent::workspace_request;
 
 pub use agent::{
-    AgentEnvironment, MayAgent, PermissionApprover, PermissionHistoryMode, PermissionRequest,
-    PermissionRequestMode, ResolveAgentEnvironmentError, ResolvedProviderRuntime, TaskRuntimeKind,
-    generate_session_title, resolve_agent_environment_for_session, resolve_provider_runtime,
+    AgentEnvironment, ContextCategory, ContextCategoryRow, ContextReport, MayAgent,
+    PermissionApprover, PermissionHistoryMode, PermissionRequest, PermissionRequestMode,
+    ResolveAgentEnvironmentError, ResolvedProviderRuntime, TaskRuntimeKind, generate_session_title,
+    resolve_agent_environment_for_session, resolve_provider_runtime,
 };
 pub use config::MayConfig;
 pub use db::ChatDb;

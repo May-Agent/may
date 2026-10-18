@@ -1,6 +1,7 @@
 //! May agent implementation.
 
 pub(crate) mod browser_tool;
+mod context_report;
 mod environment;
 mod hooks;
 pub(crate) mod imagine;
@@ -22,6 +23,7 @@ pub mod tool_environment_cache;
 pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
 };
+pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use imagine::ImageGeneratorConfig;
 pub use may::{

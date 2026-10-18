@@ -256,7 +256,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            Event::Agent(TuiEvent::Compacted(_)) => {}
+            Event::Agent(TuiEvent::Compacted(_) | TuiEvent::ContextReport(_)) => {}
             Event::Agent(TuiEvent::Error(error)) => {
                 let _ = writeln!(stderr, "[error] {error}");
                 runtime_deps

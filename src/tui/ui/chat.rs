@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use aither_agent::ContextWindowPhase;
 use aither_sandbox::TerminalExecutionMode;
 use ratatui::{
     prelude::*,
@@ -15,6 +16,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::super::queue::Attachment;
 use super::markdown;
 use super::streaming_markdown::IMAGE_HEIGHT;
+use crate::agent::ContextReport;
 
 /// Status of a tool call.
 #[derive(Debug, Clone)]
@@ -334,6 +336,8 @@ pub enum ChatElement {
         /// Open while reasoning streams; click the collapsed header to reopen.
         expanded: bool,
     },
+    /// `/context` report — estimated context-window usage per category.
+    ContextReport(ContextReport),
 }
 
 impl ChatElement {}
@@ -376,6 +380,12 @@ impl ChatStream {
         self.elements.push(ChatElement::Notice {
             message: message.to_string(),
         });
+    }
+
+    /// Add a `/context` usage report.
+    pub fn push_context_report(&mut self, report: ContextReport) {
+        self.end_text();
+        self.elements.push(ChatElement::ContextReport(report));
     }
 
     /// User prompts that can be rewound to, oldest first, each carrying
@@ -1073,6 +1083,95 @@ fn push_tool_call_image(
     }
 }
 
+/// Styled lines for a `/context` report block, shared by the rendered
+/// chat and its plain-text mirror so row counts stay aligned.
+fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let value_style = Style::default().fg(Color::Cyan);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "◆ Context usage",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  ·  {} ({})", report.model_id, report.provider_id),
+            dim,
+        ),
+    ]));
+    let percent = if report.window_tokens > 0 {
+        report.used_tokens as f64 / report.window_tokens as f64 * 100.0
+    } else {
+        0.0
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(
+                "  {}/{}",
+                format_number(report.used_tokens),
+                format_number(report.window_tokens)
+            ),
+            value_style.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" tokens ({percent:.0}%, estimated)"), dim),
+    ]));
+    lines.push(Line::from(""));
+
+    let label_width = report
+        .categories
+        .iter()
+        .map(|row| row.kind.label().len())
+        .max()
+        .unwrap_or_default()
+        .max("Autocompact".len());
+    for row in &report.categories {
+        let mut spans = vec![
+            Span::raw(format!("  {:<label_width$}", row.kind.label())),
+            Span::styled(format!("{:>7}", format_number(row.tokens)), value_style),
+        ];
+        if let Some(detail) = &row.detail {
+            spans.push(Span::styled(format!("   {detail}"), dim));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw(format!("  {:<label_width$}", "Free space")),
+        Span::styled(
+            format!("{:>7}", format_number(report.free_tokens)),
+            value_style,
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw(format!("  {:<label_width$}", "Autocompact")),
+        Span::styled(
+            format!("{:>7}", format_number(report.autocompact_buffer_tokens)),
+            value_style,
+        ),
+        Span::styled(
+            format!(
+                "   reserved above {:.0}%",
+                report.autocompact_trigger * 100.0
+            ),
+            dim,
+        ),
+    ]));
+    if report.phase != ContextWindowPhase::Stable {
+        lines.push(Line::from(vec![
+            Span::styled("  phase: ", dim),
+            Span::styled(
+                format!("{:?}", report.phase),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines
+}
+
 /// Plain-text mirror of one chat element's styled rendering. Row count
 /// must track the styled output so selection rows and click regions
 /// align with what is on screen.
@@ -1132,6 +1231,9 @@ fn plain_lines_for_element(elem: &ChatElement, images_supported: bool) -> Vec<Li
         ChatElement::Notice { message } => {
             lines.push(Line::from(message.clone()));
             lines.push(Line::from(""));
+        }
+        ChatElement::ContextReport(report) => {
+            lines.extend(context_report_lines(report));
         }
         ChatElement::Loading { frame } => {
             let spinner = match frame % 4 {
@@ -1598,6 +1700,10 @@ fn render_impl(
                     Span::styled(message, Style::default().fg(Color::DarkGray)),
                 ]));
                 lines.push(Line::from(""));
+            }
+
+            ChatElement::ContextReport(report) => {
+                lines.extend(context_report_lines(report));
             }
 
             ChatElement::Loading { frame } => {
