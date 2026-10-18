@@ -59,12 +59,13 @@ pub enum AppEvent {
     ConfigSaved(Result<(), TuiError>),
 
     // ─── Image loading ────────────────────────────────────────────────
-    /// Image fetch finished from URL (data=None means fetch failed)
-    ImageFetchResult {
-        /// URL the image was fetched from.
-        url: String,
-        /// Fetched image bytes; `None` when the fetch failed.
-        data: Option<Vec<u8>>,
+    /// Image bytes decoded into a renderable state on a worker thread.
+    /// `state=None` means fetch or decode failed for `key`.
+    ImageDecoded {
+        /// Cache key the decoded image belongs to.
+        key: String,
+        /// Ready-to-render protocol state; `None` when fetch/decode failed.
+        state: Option<super::ui::image::ImageState>,
     },
 
     // ─── Background jobs ─────────────────────────────────────────────

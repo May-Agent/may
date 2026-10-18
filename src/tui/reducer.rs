@@ -170,8 +170,8 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
-        AppEvent::ImageFetchResult { url, data } => {
-            app.handle_image_fetch_result(url, data);
+        AppEvent::ImageDecoded { key, state } => {
+            app.handle_image_decoded(key, state);
             Ok(None)
         }
 

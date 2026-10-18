@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use aither_core::llm::{Attachment as LlmAttachment, model::ReasoningEffort};
-use async_channel::Sender;
 use base64::Engine;
 use executor_core::{DefaultExecutor, spawn};
 
@@ -1412,17 +1411,4 @@ async fn build_worker_for_session(
     }
 
     Ok(spawn_worker(DefaultExecutor, agent, db))
-}
-
-/// Send an image-fetch result back to the TUI event loop; failures are logged
-/// and swallowed because the attachment is optional.
-pub async fn send_image_fetch_event(
-    event_tx: &Sender<crate::tui::AppEvent>,
-    url: String,
-    data: Option<Vec<u8>>,
-) {
-    let event = crate::tui::AppEvent::ImageFetchResult { url, data };
-    if let Err(e) = event_tx.send(event).await {
-        tracing::warn!("Failed to send image fetch event: {}", e);
-    }
 }

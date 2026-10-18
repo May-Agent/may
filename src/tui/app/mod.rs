@@ -666,10 +666,15 @@ impl App {
         targets
     }
 
-    /// Spawn a background task trying each candidate target in order and
-    /// reporting the result under `key`.
+    /// Spawn a background task trying each candidate target in order,
+    /// decoding the fetched bytes into an [`ImageState`] off the render
+    /// thread and reporting it under `key`.
     fn spawn_image_fetch(&mut self, key: String, targets: Vec<String>) {
+        let Some(ref support) = self.image_support else {
+            return;
+        };
         self.image_fetching.insert(key.clone());
+        let picker = support.picker().clone();
         let tx = self.event_tx.clone();
         tracing::debug!("Starting image fetch: {} (targets: {:?})", key, targets);
         spawn(async move {
@@ -685,49 +690,58 @@ impl App {
             } else {
                 tracing::debug!("Image fetch returned None: {}", key);
             }
-
-            if let Err(e) = tx.send(AppEvent::ImageFetchResult { url: key, data }).await {
-                tracing::warn!("Failed to send ImageFetchResult event: {}", e);
+            let state = match data {
+                Some(bytes) => {
+                    unblock(move || super::ui::image::decode_image_state(&picker, &bytes)).await
+                }
+                None => None,
+            };
+            if let Err(e) = tx.send(AppEvent::ImageDecoded { key, state }).await {
+                tracing::warn!("Failed to send ImageDecoded event: {}", e);
             }
         })
         .detach();
     }
 
-    /// Handle image fetch completion event.
-    pub(super) fn handle_image_fetch_result(&mut self, url: String, data: Option<Vec<u8>>) {
-        self.image_fetching.remove(&url);
-
-        let Some(bytes) = data else {
-            tracing::debug!("Image fetch failed for URL: {}", url);
-            self.image_failed.insert(url);
+    /// Decode image bytes into an [`ImageState`] on a worker thread and
+    /// deliver it through the event channel under `key`. No-op when the
+    /// terminal lacks graphics support, the key is already cached or in
+    /// flight, or a previous attempt failed.
+    fn spawn_image_decode(&mut self, key: String, data: Vec<u8>) {
+        let Some(ref support) = self.image_support else {
             return;
         };
-
-        tracing::debug!("Image fetched: url={}, {} bytes", url, bytes.len());
-        if !self.cache_image_bytes(&url, &bytes) {
-            tracing::debug!("Failed to create image state from bytes: {}", url);
+        if self.image_cache.contains_key(&key)
+            || self.image_failed.contains(&key)
+            || !self.image_fetching.insert(key.clone())
+        {
+            return;
         }
+        let picker = support.picker().clone();
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let state = unblock(move || super::ui::image::decode_image_state(&picker, &data)).await;
+            if let Err(e) = tx.send(AppEvent::ImageDecoded { key, state }).await {
+                tracing::warn!("Failed to send ImageDecoded event: {}", e);
+            }
+        })
+        .detach();
     }
 
-    /// Decode raw image bytes into the cache under `key`. No-op when the
-    /// terminal lacks graphics support, the key is already cached, or the
-    /// key previously failed. Returns whether a usable state now exists.
-    fn cache_image_bytes(&mut self, key: &str, data: &[u8]) -> bool {
-        let Some(ref support) = self.image_support else {
-            return false;
-        };
-        if self.image_cache.contains_key(key) {
-            return true;
-        }
-        if self.image_failed.contains(key) {
-            return false;
-        }
-        if let Some(state) = support.create_image_state_from_bytes(data) {
-            self.image_cache.insert(key.to_string(), state);
-            true
+    /// Handle a finished image fetch/decode: cache the renderable state or
+    /// mark the key failed so it is not retried.
+    pub(super) fn handle_image_decoded(
+        &mut self,
+        key: String,
+        state: Option<super::ui::image::ImageState>,
+    ) {
+        self.image_fetching.remove(&key);
+        if let Some(state) = state {
+            tracing::debug!("Image decoded: {}", key);
+            self.image_cache.insert(key, state);
         } else {
-            self.image_failed.insert(key.to_string());
-            false
+            tracing::debug!("Image fetch/decode failed for {}", key);
+            self.image_failed.insert(key);
         }
     }
 
@@ -743,11 +757,11 @@ impl App {
         let key = format!("tool-image:{tool_call_id}");
         match image {
             Kind::Bytes(bytes) => {
-                self.cache_image_bytes(&key, &bytes)
-                    .then_some(super::ui::chat::ToolCallImage {
-                        key,
-                        label: "image".to_string(),
-                    })
+                self.spawn_image_decode(key.clone(), bytes);
+                Some(super::ui::chat::ToolCallImage {
+                    key,
+                    label: "image".to_string(),
+                })
             }
             Kind::Stored { url, path } => {
                 let label = std::path::Path::new(if path.is_empty() { &url } else { &path })
@@ -865,13 +879,16 @@ impl App {
         {
             if let Attachment::Image { path, data } = attachment {
                 let key = path.display().to_string();
-                if !self.image_cache.contains_key(&key) && !self.image_failed.contains(&key) {
+                if !self.image_cache.contains_key(&key)
+                    && !self.image_failed.contains(&key)
+                    && !self.image_fetching.contains(&key)
+                {
                     seeds.push((key, data.clone()));
                 }
             }
         }
         for (key, data) in seeds {
-            self.cache_image_bytes(&key, &data);
+            self.spawn_image_decode(key, data);
         }
     }
 
