@@ -20,6 +20,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         AppEvent::Key(code, modifiers) => app.handle_key(code, modifiers),
         AppEvent::Tick => {
             if app.processing {
+                app.spinner_frame = app.spinner_frame.wrapping_add(1);
                 app.chat.tick_loading();
                 if let Some(start) = app.thinking_start {
                     let secs = start.elapsed().as_secs();
