@@ -402,6 +402,9 @@ where
             app.model_fetch_rx = None;
         }
 
+        // Apply finished file diffs to their tool-call blocks (non-blocking)
+        app.poll_file_diffs();
+
         // Check for clipboard paste results (non-blocking)
         if let Some(ref mut rx) = app.clipboard_rx {
             match rx.try_recv() {

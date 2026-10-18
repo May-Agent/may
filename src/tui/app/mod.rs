@@ -26,6 +26,7 @@ use super::clipboard::{
 use super::completion::{Completion, CompletionMode};
 use super::error::{AppResult, TuiError};
 use super::event::{AppEvent, EventSender};
+use super::file_diff::FileDiffHandle;
 use super::history::InputHistory;
 use super::queue::{Attachment, LARGE_PASTE_THRESHOLD, MessageQueue, PendingMessage};
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
@@ -138,6 +139,8 @@ pub struct App {
     pub tier_picker_loading: bool,
     /// Receiver for fetched models (oneshot)
     pub model_fetch_rx: Option<Receiver<Vec<FetchedModel>>>,
+    /// Per-session file-diff worker (rebuilt on session switch)
+    pub file_diffs: Option<FileDiffHandle>,
     /// Receiver for clipboard paste resolution (oneshot)
     pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, TuiError>>>,
     /// Pending paste results waiting to be handled
@@ -337,6 +340,7 @@ impl App {
             tier_picker_query: String::new(),
             tier_picker_loading: false,
             model_fetch_rx: None,
+            file_diffs: None,
             clipboard_rx: None,
             pending_paste_results: std::collections::VecDeque::new(),
             pending_attachment_jobs: 0,
@@ -383,6 +387,99 @@ impl App {
             let _ = tx.send(AppEvent::ConfigSaved(result)).await;
         })
         .detach();
+    }
+
+    /// Create or rebuild the file-diff worker for the current session.
+    ///
+    /// The worker tracks the session sandbox plus every writable workspace
+    /// dir. Container-profile sessions are skipped: their writes land
+    /// inside the container where host-side git cannot see them.
+    fn ensure_file_diffs(&mut self) {
+        let Some(session) = self.session_manager.current() else {
+            self.file_diffs = None;
+            return;
+        };
+        let session_id = session.id.as_str().to_string();
+        if self
+            .file_diffs
+            .as_ref()
+            .is_some_and(|handle| handle.session_id() == session_id)
+        {
+            return;
+        }
+
+        let is_container = session
+            .profile_id
+            .as_deref()
+            .or(self.current_profile_id.as_deref())
+            .and_then(|pid| self.profiles.iter().find(|profile| profile.id == pid))
+            .is_some_and(|profile| {
+                matches!(
+                    profile.environment.kind(),
+                    crate::profile::ProfileEnvironment::Container { .. }
+                )
+            });
+        if is_container {
+            self.file_diffs = None;
+            return;
+        }
+
+        let session_paths = crate::session::SessionPaths::new(session.sandbox_dir.clone());
+        let mut roots = vec![
+            crate::file_tracker::TrackedRootSpec::new(session.sandbox_dir.clone())
+                .exclude("filebase")
+                .exclude("tmp")
+                .exclude("outputs")
+                .exclude("skills")
+                .exclude("subagents"),
+        ];
+        if let Ok(config) =
+            crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config())
+        {
+            roots.extend(
+                config
+                    .workdirs
+                    .iter()
+                    .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
+                    .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
+            );
+        }
+        self.file_diffs =
+            FileDiffHandle::start(session_id, session_paths.root().join("filebase"), roots);
+    }
+
+    /// Ask the diff worker to attribute pending file changes to
+    /// `tool_call_id`.
+    fn request_file_diff(&mut self, tool_call_id: &str) {
+        self.ensure_file_diffs();
+        if let Some(handle) = &self.file_diffs {
+            handle.request_snapshot(tool_call_id);
+        }
+    }
+
+    /// Begin tracking a workspace directory the user just granted access
+    /// to. The baseline is taken at grant time, so only later writes are
+    /// attributed to the agent.
+    pub fn track_workspace_dir(&mut self, path: &std::path::Path) {
+        self.ensure_file_diffs();
+        if let Some(handle) = &self.file_diffs {
+            handle.request_add_root(crate::file_tracker::TrackedRootSpec::new(
+                path.to_path_buf(),
+            ));
+        }
+    }
+
+    /// Apply finished file diffs to their tool-call blocks. Called once per
+    /// event-loop iteration.
+    pub fn poll_file_diffs(&mut self) {
+        let outcomes = match &self.file_diffs {
+            Some(handle) => handle.drain(),
+            None => return,
+        };
+        for outcome in outcomes {
+            self.chat
+                .update_tool_diff(&outcome.tool_call_id, outcome.diffs);
+        }
     }
 
     /// Check if configuration is complete.
@@ -1647,12 +1744,14 @@ impl App {
                                 mode,
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
+                                diffs: Vec::new(),
                             },
                             ToolStartKind::Generic { name, arguments } => ToolDisplay::Terminal {
                                 command: format!("{name} {arguments}"),
                                 mode: aither_sandbox::TerminalExecutionMode::Default,
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
+                                diffs: Vec::new(),
                             },
                         };
                         self.chat.push_tool(id, display);
@@ -1677,6 +1776,7 @@ impl App {
                                 );
                             }
                         }
+                        self.request_file_diff(&id);
                     }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events
