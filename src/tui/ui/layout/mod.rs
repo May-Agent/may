@@ -20,7 +20,9 @@ use ratatui::Frame;
 
 use super::super::app::App;
 use super::super::completion::CompletionMode;
-use super::super::state::{AppMode, AskUserState, ChatgptAuthStatus, CopilotAuthStatus};
+use super::super::state::{
+    AppMode, AskUserState, ChatgptAuthStatus, CopilotAuthStatus, RewindState,
+};
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 use crate::workspace_request::WorkspaceRequest;
 
@@ -207,6 +209,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         AppMode::ProfileSelect => {
             render_profile_select_popup(frame, area, app);
+        }
+        AppMode::Rewind(ref state) => {
+            render_rewind_popup(frame, area, state);
         }
         _ => {}
     }
@@ -511,6 +516,55 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title("Select Model"),
+    );
+    frame.render_widget(list, popup_area);
+}
+
+/// Render the rewind checkpoint picker: every tool call that changed
+/// tracked files, oldest first. Enter restores files to the state before
+/// that call.
+fn render_rewind_popup(frame: &mut Frame, area: Rect, state: &RewindState) {
+    let popup_height = u16::try_from((state.targets.len() + 3).min(14)).unwrap_or(u16::MAX);
+    let popup_width = area.width.saturating_sub(8).clamp(40, 80);
+    let popup_area = centered_rect_exact(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = state
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(idx, target)| {
+            let prefix = if idx == state.selected { "> " } else { "  " };
+            let diff_stats = format!(
+                "± {} files (+{} −{})",
+                target.files, target.additions, target.deletions
+            );
+            let style = if idx == state.selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(vec![
+                Line::from(Span::styled(
+                    format!("{prefix}{}", target.command_preview),
+                    style,
+                )),
+                Line::from(Span::styled(
+                    format!("    {diff_stats}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Rewind to before… (Enter restore, Esc cancel)"),
     );
     frame.render_widget(list, popup_area);
 }
