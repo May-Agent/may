@@ -454,11 +454,22 @@ pub fn handle_jobs_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
                     aither_sandbox::JobStatus::Running => app.kill_job(job.pid),
                     _ => app.status = Some(format!("Job {} already finished", job.pid)),
                 },
-                Some(super::JobRow::Subagent { .. }) => {
-                    app.status = Some(
-                        "Subagent runs inside the agent turn — press Esc in chat to abort"
-                            .to_string(),
-                    );
+                Some(super::JobRow::Subagent { agent, .. }) => {
+                    let hit = app.subagent_runs.as_ref().and_then(|runs| {
+                        runs.list()
+                            .into_iter()
+                            .find(|run| run.subagent == *agent)
+                            .map(|run| (run.id, runs.clone()))
+                    });
+                    match hit {
+                        Some((id, runs)) if runs.cancel(id) => {
+                            app.status = Some(format!("Stopping subagent {agent}…"));
+                        }
+                        _ => {
+                            app.status =
+                                Some(format!("No live registry entry for subagent {agent}"));
+                        }
+                    }
                 }
                 None => {}
             }
