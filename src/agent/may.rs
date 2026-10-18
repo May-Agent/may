@@ -251,6 +251,7 @@ pub struct MayAgent {
     provider_id: String,
     model_context_window: Option<u32>,
     runtime_system_context: RuntimeSystemContext,
+    job_registry: aither_sandbox::JobRegistry,
 }
 
 impl std::fmt::Debug for MayAgent {
@@ -299,6 +300,7 @@ impl MayAgent {
             .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
             .with_network_audit_log(network_audit)
             .with_process_priority(config.command_priority.process_priority());
+        let job_registry = terminal_tool.job_registry();
 
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
@@ -602,6 +604,7 @@ impl MayAgent {
             provider_id: config.provider_id,
             model_context_window: config.model_context_window,
             runtime_system_context,
+            job_registry,
         })
     }
 
@@ -818,6 +821,13 @@ impl MayAgent {
         self.sandbox_dir.clone()
     }
 
+    /// Background-job registry shared with this session's terminal tool.
+    /// Cloneable handle — the TUI polls it for `/jobs` and kills by pid.
+    #[must_use]
+    pub fn job_registry(&self) -> aither_sandbox::JobRegistry {
+        self.job_registry.clone()
+    }
+
     /// Selected provider ID for the current request.
     #[must_use]
     pub fn provider_id(&self) -> &str {
@@ -964,10 +974,13 @@ mod tests {
             .hook(ContextSnapshotHook::new(None, &session_id))
             .hook(PendingSteerHook::new(None, &session_id))
             .build();
+        let (job_registry, service) = aither_sandbox::job_registry::job_registry_channel();
+        tokio::spawn(service.serve());
         (
             MayAgent {
                 inner,
                 session_id,
+                job_registry,
                 sandbox_dir: temp.path().join("sandbox"),
                 provider_id: "chatgpt".to_string(),
                 model_context_window: None,

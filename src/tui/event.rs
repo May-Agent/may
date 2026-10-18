@@ -66,6 +66,17 @@ pub enum AppEvent {
         /// Fetched image bytes; `None` when the fetch failed.
         data: Option<Vec<u8>>,
     },
+
+    // ─── Background jobs ─────────────────────────────────────────────
+    /// Job list refreshed from the session's `JobRegistry`.
+    JobsLoaded(Vec<aither_sandbox::JobInfo>),
+    /// A kill request finished; `true` when the job accepted it.
+    JobKilled {
+        /// Process ID the kill targeted.
+        pid: u32,
+        /// Whether the registry reported the job killed.
+        ok: bool,
+    },
 }
 
 /// Sender type for sending events back to the main loop.

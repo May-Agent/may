@@ -64,6 +64,8 @@ enum WorkerCommand {
 pub struct AgentWorker {
     /// Sender for commands to the worker.
     command_tx: Sender<WorkerCommand>,
+    /// Background-job registry shared with the session's terminal tool.
+    job_registry: aither_sandbox::JobRegistry,
 }
 
 impl std::fmt::Debug for AgentWorker {
@@ -129,6 +131,12 @@ impl AgentWorker {
     pub fn shutdown(&self) {
         let _ = self.command_tx.try_send(WorkerCommand::Shutdown);
     }
+
+    /// Registry of background terminal jobs for this worker's session.
+    #[must_use]
+    pub const fn job_registry(&self) -> &aither_sandbox::JobRegistry {
+        &self.job_registry
+    }
 }
 
 impl Drop for AgentWorker {
@@ -174,12 +182,16 @@ pub fn spawn_worker<E: Executor + 'static>(
     snapshot_db: ChatDb,
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
+    let job_registry = agent.job_registry();
 
     executor
         .spawn(run_worker(agent, command_rx, snapshot_db))
         .detach();
 
-    AgentWorker { command_tx }
+    AgentWorker {
+        command_tx,
+        job_registry,
+    }
 }
 
 /// The worker loop that owns and runs the agent.
