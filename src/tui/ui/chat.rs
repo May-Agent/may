@@ -136,6 +136,8 @@ pub enum ToolDisplay {
         status: ToolStatus,
         /// The output from this command.
         output: Option<TerminalCallInfo>,
+        /// File changes attributed to this call (one per tracked root).
+        diffs: Vec<crate::file_tracker::RootDiff>,
     },
 }
 
@@ -438,6 +440,21 @@ impl ChatStream {
                         }
                     }
                 }
+                break;
+            }
+        }
+    }
+
+    /// Attach file diffs to a terminal tool call.
+    pub fn update_tool_diff(&mut self, id: &str, diffs: Vec<crate::file_tracker::RootDiff>) {
+        for elem in &mut self.elements {
+            if let ChatElement::ToolCall {
+                id: tool_id,
+                display: ToolDisplay::Terminal { diffs: slot, .. },
+            } = elem
+                && tool_id == id
+            {
+                *slot = diffs;
                 break;
             }
         }
@@ -1347,6 +1364,7 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
             mode,
             status,
             output,
+            diffs,
         } => {
             let status_text = match status {
                 ToolStatus::Running => Some("running".to_string()),
@@ -1401,6 +1419,72 @@ fn render_tool_inline<'a>(lines: &mut Vec<Line<'a>>, display: &'a ToolDisplay, i
                     ]));
                 }
             }
+
+            render_diff_preview(lines, diffs);
+        }
+    }
+}
+
+/// Style one unified-diff line by its leading marker.
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with("+++") || line.starts_with("---") {
+        Style::default().fg(Color::DarkGray).bold()
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with("@@") {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// Render a compact per-root diff summary plus a capped tinted preview
+/// under an inline terminal tool call.
+fn render_diff_preview<'a>(lines: &mut Vec<Line<'a>>, diffs: &'a [crate::file_tracker::RootDiff]) {
+    const PREVIEW_LINES: usize = 8;
+
+    for (index, diff) in diffs.iter().enumerate() {
+        let summary = format!(
+            "± {} file{} (+{} −{})",
+            diff.files,
+            if diff.files == 1 { "" } else { "s" },
+            diff.additions,
+            diff.deletions,
+        );
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                if diffs.len() > 1 {
+                    format!("{summary} in {}", diff.root.display())
+                } else {
+                    summary
+                },
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+
+        let total = diff.text.lines().count();
+        for line in diff.text.lines().take(PREVIEW_LINES) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(line.to_string(), diff_line_style(line)),
+            ]));
+        }
+        if total > PREVIEW_LINES {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("… {} more diff lines", total - PREVIEW_LINES),
+                    Style::default().fg(Color::DarkGray).italic(),
+                ),
+            ]));
+        }
+        if index + 1 < diffs.len() {
+            lines.push(Line::from(""));
         }
     }
 }
@@ -1502,6 +1586,34 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         }
     }
 
+    // File changes attributed to this call
+    if let ToolDisplay::Terminal { diffs, .. } = display
+        && !diffs.is_empty()
+    {
+        for (index, diff) in diffs.iter().enumerate() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "─── Changes in {} ({} file{}, +{} −{}) ───",
+                    diff.root.display(),
+                    diff.files,
+                    if diff.files == 1 { "" } else { "s" },
+                    diff.additions,
+                    diff.deletions,
+                ),
+                Style::default().fg(Color::Blue),
+            )));
+            for line in diff.text.lines() {
+                lines.push(Line::from(Span::styled(
+                    line.to_string(),
+                    diff_line_style(line),
+                )));
+            }
+            if index + 1 < diffs.len() {
+                lines.push(Line::from(""));
+            }
+        }
+    }
+
     // Help text at bottom
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -1558,6 +1670,7 @@ mod tests {
                 mode,
                 status: ToolStatus::Done,
                 output: None,
+                diffs: Vec::new(),
             };
             let mut lines: Vec<Line> = Vec::new();
             render_tool_inline(&mut lines, &display, false);

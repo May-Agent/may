@@ -23,6 +23,7 @@ pub mod copilot;
 pub mod db;
 /// Embedding provider resolution for retrieval tools.
 pub mod embedding_provider;
+mod file_tracker;
 mod fs_utils;
 mod heel;
 mod live_response;
