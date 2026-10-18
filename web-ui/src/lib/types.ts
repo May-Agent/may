@@ -298,6 +298,14 @@ export interface SsePing {
   turnId: string;
 }
 
+/** Live decode-speed sample emitted while model output streams. */
+export interface SseSpeed {
+  kind: 'speed';
+  seq: number;
+  turnId: string;
+  tokensPerSecond: number;
+}
+
 export type ChatStreamEvent =
   | SseStart
   | SseText
@@ -308,7 +316,8 @@ export type ChatStreamEvent =
   | SseTodoUpdate
   | SseError
   | SseDone
-  | SsePing;
+  | SsePing
+  | SseSpeed;
 
 // ── UI event stream /api/events ─────────────────────────────
 
