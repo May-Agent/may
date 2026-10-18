@@ -34,8 +34,8 @@ pub use permission::{
     PermissionRequestMode, PermissionRequestModeParseError,
 };
 pub use provider::{
-    ResolvedProviderRuntime, build_fast_provider_chain, provider_candidate_count,
-    resolve_provider_runtime,
+    RequestParameterizedModel, ResolvedProviderRuntime, build_fast_provider_chain,
+    provider_candidate_count, resolve_provider_runtime,
 };
 pub use runner::{AgentHandle, AgentWorker, TuiEvent, spawn_worker};
 pub use task_tool::{
