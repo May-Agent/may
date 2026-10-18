@@ -31,4 +31,6 @@ pub struct Model {
     pub context_window: Option<i32>,
     /// Request wall-clock time in milliseconds.
     pub elapsed_ms: Option<i64>,
+    /// JSON-serialized attachment records, when the message carries any.
+    pub attachments: Option<String>,
 }

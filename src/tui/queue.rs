@@ -8,12 +8,6 @@ use jiff::Timestamp;
 use crate::session::PendingUserMessageMode;
 use crate::xml::XmlBlock;
 
-/// Threshold for auto-saving pasted text to file (chars).
-pub const LARGE_PASTE_THRESHOLD: usize = 4000;
-
-/// Maximum chars shown in LLM context for large pastes.
-pub const PASTE_TRUNCATE_LIMIT: usize = 2000;
-
 /// An attachment to a message.
 #[derive(Debug, Clone)]
 pub enum Attachment {
@@ -36,6 +30,18 @@ pub enum Attachment {
         /// Path to saved file (for large pastes)
         saved_path: Option<PathBuf>,
     },
+}
+
+impl Attachment {
+    /// Stable key under which this attachment's image bytes live in the
+    /// terminal image cache. `None` for non-image attachments.
+    #[must_use]
+    pub fn image_cache_key(&self) -> Option<String> {
+        match self {
+            Self::Image { path, .. } => Some(path.display().to_string()),
+            Self::FileReference { .. } | Self::PastedText { .. } => None,
+        }
+    }
 }
 
 /// A pending message in the queue.

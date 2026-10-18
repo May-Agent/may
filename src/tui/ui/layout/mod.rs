@@ -181,6 +181,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }),
         Some(&status_ctx),
         Some(&mut collapse_regions),
+        images_supported,
     );
 
     let view_h = chat_area.height as usize;

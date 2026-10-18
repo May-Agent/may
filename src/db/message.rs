@@ -12,11 +12,22 @@ use crate::session::{ChatMessage, ChatMessageStats, MessageRole};
 
 use super::common::{
     AssistantCacheUsageSummary, AssistantCacheUsageSummaryRow, I64ValueRow, MessageStatsParams,
-    message_stats_params_from_chat_stats, overflow_error, row_not_found, to_i32, to_i64_from_u64,
-    to_u64, to_usize,
+    message_stats_params_from_chat_stats, overflow_error, row_not_found, storage_error, to_i32,
+    to_i64_from_u64, to_u64, to_usize,
 };
 use super::entity::messages;
 use super::{ChatDb, ChatDbError, query, truncate_preview};
+
+/// Optional columns carried by an appended message row.
+#[derive(Debug, Default)]
+pub struct MessageMeta<'a> {
+    /// Tool call this message is the result of.
+    pub tool_call_id: Option<&'a str>,
+    /// Usage/context stats for assistant messages.
+    pub stats: Option<&'a MessageStatsParams>,
+    /// Serialized attachment records (JSON), when the message carries them.
+    pub attachments: Option<&'a str>,
+}
 
 impl ChatDb {
     /// Append a message to a session. Updates session preview and message count.
@@ -29,9 +40,13 @@ impl ChatDb {
         role: MessageRole,
         content: &str,
         timestamp: Option<&str>,
-        tool_call_id: Option<&str>,
-        stats: Option<&MessageStatsParams>,
+        meta: MessageMeta<'_>,
     ) -> Result<messages::Model, ChatDbError> {
+        let MessageMeta {
+            tool_call_id,
+            stats,
+            attachments,
+        } = meta;
         let now = jiff::Timestamp::now().to_string();
         let prompt_tokens = stats
             .and_then(|s| s.prompt_tokens)
@@ -66,7 +81,7 @@ impl ChatDb {
         let role_str = role.as_str();
         let model = query!(
             self.db,
-            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
             session_id,
             role_str,
             content,
@@ -79,7 +94,8 @@ impl ChatDb {
             cache_read_tokens,
             cache_write_tokens,
             context_window,
-            elapsed_ms
+            elapsed_ms,
+            attachments
         )
         .fetch_one::<messages::Model>()
         .await?;
@@ -112,7 +128,7 @@ impl ChatDb {
         let role_str = role.as_str();
         let model = query!(
             tx,
-            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
             session_id,
             role_str,
             "",
@@ -125,7 +141,8 @@ impl ChatDb {
             Option::<i32>::None,
             Option::<i32>::None,
             Option::<i32>::None,
-            Option::<i64>::None
+            Option::<i64>::None,
+            Option::<String>::None
         )
         .fetch_one::<messages::Model>()
         .await?;
@@ -415,13 +432,25 @@ impl ChatDb {
             .stats
             .as_ref()
             .map(message_stats_params_from_chat_stats);
+        let attachments = if message.attachments.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&message.attachments).map_err(|error| {
+                    storage_error(format!("failed to serialize message attachments: {error}"))
+                })?,
+            )
+        };
         self.append_message(
             session_id,
             message.role.clone(),
             &message.content,
             timestamp.as_deref(),
-            message.tool_call_id.as_deref(),
-            stats.as_ref(),
+            MessageMeta {
+                tool_call_id: message.tool_call_id.as_deref(),
+                stats: stats.as_ref(),
+                attachments: attachments.as_deref(),
+            },
         )
         .await
     }

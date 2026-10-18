@@ -792,7 +792,7 @@ fn request_has_visible_user_input(req: &ChatRequest) -> bool {
     !req.content.trim().is_empty() || !req.attachments.is_empty()
 }
 
-fn api_attachments_from_persisted(
+pub fn api_attachments_from_persisted(
     attachments: Vec<PersistedAttachment>,
 ) -> Vec<super::types::ApiAttachment> {
     attachments
@@ -2522,9 +2522,15 @@ async fn resolve_session_context(
                 .map_err(UiChatPreparationError::UpdateSessionTitle)?;
             state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
         }
-        db.append_chat_message(session_id.as_str(), &ChatMessage::user(req.content.clone()))
-            .await
-            .map_err(UiChatPreparationError::AppendUserMessage)?;
+        db.append_chat_message(
+            session_id.as_str(),
+            &ChatMessage::user_with_attachments(
+                req.content.clone(),
+                persisted_attachments(req.attachments.clone()),
+            ),
+        )
+        .await
+        .map_err(UiChatPreparationError::AppendUserMessage)?;
     }
 
     let sandbox_dir = SessionStore::new(MayHomePaths::new(state.may_dir.clone()))

@@ -257,11 +257,13 @@ pub async fn load_history_from_db(
         let persisted = PersistedMessage::try_from(&msg)?;
         let role = persisted.role.clone();
         let timestamp = persisted.timestamp;
+        let attachments = persisted.attachments;
         let stats = map_db_message_stats(&msg);
 
         history.push(ChatMessage {
             role,
             content: msg.content,
+            attachments,
             timestamp,
             tool_call_id: msg.tool_call_id,
             stats,

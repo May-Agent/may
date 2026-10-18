@@ -28,9 +28,10 @@ use super::error::{AppResult, TuiError};
 use super::event::{AppEvent, EventSender};
 use super::file_diff::FileDiffHandle;
 use super::history::InputHistory;
-use super::queue::{Attachment, LARGE_PASTE_THRESHOLD, MessageQueue, PendingMessage};
+use super::queue::{Attachment, MessageQueue, PendingMessage};
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
+use crate::xml::LARGE_PASTE_THRESHOLD;
 
 /// User-facing message shown when a tool response cannot be sent to the session.
 pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../../texts/tool_response_send_failed.txt");
@@ -214,6 +215,8 @@ pub struct App {
     pub image_cache: ahash::AHashMap<String, super::ui::image::ImageState>,
     /// URLs currently being fetched (to avoid duplicate requests)
     pub image_fetching: ahash::AHashSet<String>,
+    /// Image keys that failed to fetch or decode (avoids retry loops)
+    pub image_failed: ahash::AHashSet<String>,
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
     /// Plain text render cache used for selection copy
@@ -398,6 +401,7 @@ impl App {
             image_support,
             image_cache: ahash::AHashMap::new(),
             image_fetching: ahash::AHashSet::new(),
+            image_failed: ahash::AHashSet::new(),
             selection: None,
             rendered_plain_lines: Vec::new(),
             render_top_padding: 0,
@@ -629,46 +633,64 @@ impl App {
         if self.image_cache.contains_key(url) {
             return true;
         }
-        // Already fetching?
-        if self.image_fetching.contains(url) {
+        // Already fetching or already failed?
+        if self.image_fetching.contains(url) || self.image_failed.contains(url) {
             return false;
         }
         // Check if terminal supports images
         if self.image_support.is_none() {
             return false;
         }
-        // Mark as fetching
-        self.image_fetching.insert(url.to_string());
+        let targets = self.image_fetch_targets(url);
+        self.spawn_image_fetch(url.to_string(), targets);
+        false
+    }
 
-        // Spawn background fetch task
-        let url_owned = url.to_string();
+    /// Resolve an image reference to fetch candidates. Remote and absolute
+    /// references map to themselves; a sandbox-relative path (for example
+    /// `artifacts/x.png` from a tool result) is resolved against the session
+    /// sandbox directory first, then the process working directory.
+    fn image_fetch_targets(&self, url: &str) -> Vec<String> {
+        if url.starts_with("http://")
+            || url.starts_with("https://")
+            || url.starts_with("file://")
+            || std::path::Path::new(url).is_absolute()
+        {
+            return vec![url.to_string()];
+        }
+        let mut targets = Vec::with_capacity(2);
+        if let Some(session) = self.session_manager.current() {
+            targets.push(session.sandbox_dir.join(url).to_string_lossy().into_owned());
+        }
+        targets.push(url.to_string());
+        targets
+    }
+
+    /// Spawn a background task trying each candidate target in order and
+    /// reporting the result under `key`.
+    fn spawn_image_fetch(&mut self, key: String, targets: Vec<String>) {
+        self.image_fetching.insert(key.clone());
         let tx = self.event_tx.clone();
-        tracing::debug!("Starting image fetch: {}", url);
+        tracing::debug!("Starting image fetch: {} (targets: {:?})", key, targets);
         spawn(async move {
-            let data = super::ui::image::fetch_image(&url_owned).await;
+            let mut data = None;
+            for target in &targets {
+                if let Some(bytes) = super::ui::image::fetch_image(target).await {
+                    data = Some(bytes);
+                    break;
+                }
+            }
             if let Some(ref bytes) = data {
-                tracing::debug!(
-                    "Image fetch succeeded: {} ({} bytes)",
-                    url_owned,
-                    bytes.len()
-                );
+                tracing::debug!("Image fetch succeeded: {} ({} bytes)", key, bytes.len());
             } else {
-                tracing::debug!("Image fetch returned None: {}", url_owned);
+                tracing::debug!("Image fetch returned None: {}", key);
             }
 
-            if let Err(e) = tx
-                .send(AppEvent::ImageFetchResult {
-                    url: url_owned,
-                    data,
-                })
-                .await
-            {
+            if let Err(e) = tx.send(AppEvent::ImageFetchResult { url: key, data }).await {
                 tracing::warn!("Failed to send ImageFetchResult event: {}", e);
             }
         })
         .detach();
-
-        false
     }
 
     /// Handle image fetch completion event.
@@ -677,21 +699,106 @@ impl App {
 
         let Some(bytes) = data else {
             tracing::debug!("Image fetch failed for URL: {}", url);
+            self.image_failed.insert(url);
             return;
         };
 
         tracing::debug!("Image fetched: url={}, {} bytes", url, bytes.len());
-        let Some(ref support) = self.image_support else {
-            tracing::debug!("No image support, not caching: {}", url);
-            return;
-        };
-
-        if let Some(state) = support.create_image_state_from_bytes(&bytes) {
-            tracing::debug!("Image cached successfully: {}", url);
-            self.image_cache.insert(url, state);
-        } else {
+        if !self.cache_image_bytes(&url, &bytes) {
             tracing::debug!("Failed to create image state from bytes: {}", url);
         }
+    }
+
+    /// Decode raw image bytes into the cache under `key`. No-op when the
+    /// terminal lacks graphics support, the key is already cached, or the
+    /// key previously failed. Returns whether a usable state now exists.
+    fn cache_image_bytes(&mut self, key: &str, data: &[u8]) -> bool {
+        let Some(ref support) = self.image_support else {
+            return false;
+        };
+        if self.image_cache.contains_key(key) {
+            return true;
+        }
+        if self.image_failed.contains(key) {
+            return false;
+        }
+        if let Some(state) = support.create_image_state_from_bytes(data) {
+            self.image_cache.insert(key.to_string(), state);
+            true
+        } else {
+            self.image_failed.insert(key.to_string());
+            false
+        }
+    }
+
+    /// Decode a tool-produced image into the cache (or queue its fetch) and
+    /// return the [`ToolCallImage`] to attach to the call's display info.
+    fn install_tool_image(
+        &mut self,
+        tool_call_id: &str,
+        image: super::agent_event_adapter::ToolImage,
+    ) -> Option<super::ui::chat::ToolCallImage> {
+        use super::agent_event_adapter::ToolImage as Kind;
+        self.image_support.as_ref()?;
+        let key = format!("tool-image:{tool_call_id}");
+        match image {
+            Kind::Bytes(bytes) => {
+                self.cache_image_bytes(&key, &bytes)
+                    .then_some(super::ui::chat::ToolCallImage {
+                        key,
+                        label: "image".to_string(),
+                    })
+            }
+            Kind::Stored { url, path } => {
+                let label = std::path::Path::new(if path.is_empty() { &url } else { &path })
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                let mut targets = if url.is_empty() {
+                    Vec::new()
+                } else {
+                    self.image_fetch_targets(&url)
+                };
+                if !path.is_empty() {
+                    targets.push(path);
+                }
+                if targets.is_empty() {
+                    return None;
+                }
+                self.spawn_image_fetch(key.clone(), targets);
+                Some(super::ui::chat::ToolCallImage { key, label })
+            }
+        }
+    }
+
+    /// Recover an image produced by the `imagine` command: it writes into
+    /// the session artifacts dir and replies with a bare relative path.
+    fn imagine_result_image(
+        &self,
+        tool_call_id: &str,
+        output: &str,
+    ) -> Option<super::agent_event_adapter::ToolImage> {
+        let Some(ToolDisplay::Terminal { command, .. }) = self.chat.get_tool(tool_call_id) else {
+            return None;
+        };
+        if command.split_whitespace().next() != Some("imagine") {
+            return None;
+        }
+        let trimmed = output.trim();
+        if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let is_image = mime_guess::from_path(trimmed)
+            .first()
+            .is_some_and(|mime| mime.type_() == mime::IMAGE);
+        if !is_image {
+            return None;
+        }
+        Some(super::agent_event_adapter::ToolImage::Stored {
+            url: trimmed.to_string(),
+            path: trimmed.to_string(),
+        })
     }
 
     /// Check if terminal supports image rendering.
@@ -705,6 +812,8 @@ impl App {
     }
 
     /// Scan chat content for images and request fetches for any not yet cached.
+    /// Also decodes in-hand attachment bytes — pending paste previews and
+    /// user-message images — into the cache.
     pub fn scan_and_fetch_images(&mut self) {
         use super::ui::chat::ChatElement;
         use super::ui::markdown::extract_images;
@@ -737,6 +846,33 @@ impl App {
         for url in urls {
             self.request_image(&url);
         }
+
+        // Seed the cache directly from attachment bytes already in hand —
+        // pending paste attachments and image attachments on user messages.
+        let mut seeds: Vec<(String, Vec<u8>)> = Vec::new();
+        for attachment in
+            self.attachments
+                .iter()
+                .chain(
+                    self.chat
+                        .active_elements()
+                        .iter()
+                        .flat_map(|elem| match elem {
+                            ChatElement::UserMessage { attachments, .. } => attachments.as_slice(),
+                            _ => &[],
+                        }),
+                )
+        {
+            if let Attachment::Image { path, data } = attachment {
+                let key = path.display().to_string();
+                if !self.image_cache.contains_key(&key) && !self.image_failed.contains(&key) {
+                    seeds.push((key, data.clone()));
+                }
+            }
+        }
+        for (key, data) in seeds {
+            self.cache_image_bytes(&key, &data);
+        }
     }
 
     /// Initialize for a session (sets up image manager and status).
@@ -748,7 +884,7 @@ impl App {
     ///
     /// Panics if the session manager has no current session while a session is
     /// being initialized.
-    pub fn init_session(
+    pub async fn init_session(
         &mut self,
         session_id: &SessionId,
         messages: &[ChatMessage],
@@ -777,13 +913,37 @@ impl App {
         self.collapse_regions.clear();
         self.jobs.clear();
         self.jobs_selected = 0;
+        self.image_cache.clear();
+        self.image_fetching.clear();
+        self.image_failed.clear();
 
         // Load chat history into display
         self.chat = ChatStream::new();
         for (history_index, msg) in messages.iter().enumerate() {
             match msg.role {
                 MessageRole::User => {
-                    self.chat.push_user(&msg.content, vec![], history_index);
+                    let restored = futures_util::future::join_all(msg.attachments.iter().map(
+                        |att| async move {
+                            super::runtime::tui_attachment_from_persisted(att.clone())
+                                .await
+                                .map_err(|error| (att.name.clone(), error))
+                        },
+                    ))
+                    .await;
+                    let mut attachments = Vec::with_capacity(restored.len());
+                    for result in restored {
+                        match result {
+                            Ok(attachment) => attachments.push(attachment),
+                            Err((name, error)) => {
+                                tracing::warn!("failed to restore attachment {name}: {error}");
+                                attachments.push(Attachment::FileReference {
+                                    path: PathBuf::from(&name),
+                                });
+                            }
+                        }
+                    }
+                    self.chat
+                        .push_user(&msg.content, attachments, history_index);
                 }
                 MessageRole::Assistant => {
                     self.chat.push_text(&msg.content);
@@ -1954,12 +2114,20 @@ impl App {
                         let feedback = parse_tool_end(&result);
                         match feedback {
                             ToolEndKind::Output(out) => {
+                                let image = out
+                                    .image
+                                    .or_else(|| self.imagine_result_image(&id, &out.text));
                                 self.chat.update_tool_with_output(
                                     &id,
                                     super::ui::chat::ToolStatus::Done,
                                     None,
-                                    Some(out.as_str()),
+                                    Some(out.text.as_str()),
                                 );
+                                if let Some(image) = image
+                                    && let Some(image) = self.install_tool_image(&id, image)
+                                {
+                                    self.chat.set_tool_image(&id, image);
+                                }
                             }
                             ToolEndKind::Error(err) => {
                                 self.chat.update_tool_with_output(
