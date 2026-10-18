@@ -223,22 +223,22 @@ opt-level = 3
 opt-level = 3
 
 [patch.crates-io]
-aither-agent = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-attachments = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-browser = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-claude = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-cloud = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-codex = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-copilot = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-core = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-derive = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-gemini = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-mcp = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-models = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-openai = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-rag = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-sandbox = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-search = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-skills = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-webfetch = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
-aither-websearch = { git = "https://github.com/lexoliu/aither", rev = "ec24e76" }
+aither-agent = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-attachments = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-browser = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-claude = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-cloud = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-codex = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-copilot = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-core = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-derive = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-gemini = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-mcp = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-models = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-openai = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-rag = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-sandbox = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-search = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-skills = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-webfetch = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-websearch = { git = "https://github.com/lexoliu/aither", branch = "dev" }

@@ -1915,11 +1915,9 @@ impl App {
                         }
                     }
                     AgentEvent::ToolCallDelta {
-                        id,
-                        arguments_fragment,
-                        ..
+                        arguments_fragment, ..
                     } => {
-                        self.decode_meter.note_tool_delta(&id, &arguments_fragment);
+                        self.decode_meter.note_output(arguments_fragment.len());
                     }
                     AgentEvent::ToolCallStart {
                         id,
