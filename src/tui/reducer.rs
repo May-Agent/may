@@ -26,14 +26,29 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                     let secs = start.elapsed().as_secs();
                     app.chat.update_thinking(secs);
                 }
+                // Bind running terminal calls to their jobs and poll live
+                // output + file-diff previews.
+                app.poll_live_output();
             }
-            // Live-refresh the jobs panel once per second while open.
-            if matches!(app.mode, AppMode::Jobs)
+            // Live-refresh the jobs list once per second while the panel is
+            // open — and while anything runs in the background so the status
+            // bar reflects it. Also refresh while the agent processes so
+            // live-output binding sees fresh jobs.
+            let jobs_wanted = matches!(app.mode, AppMode::Jobs | AppMode::JobDetail(_))
+                || app.processing
+                || app.has_running_background();
+            if jobs_wanted
                 && app
                     .jobs_refreshed
                     .is_none_or(|t| t.elapsed().as_secs() >= 1)
             {
                 app.refresh_jobs();
+            }
+            // Same cadence for an open job/subagent detail view.
+            if let AppMode::JobDetail(state) = &app.mode
+                && state.refreshed.is_none_or(|t| t.elapsed().as_secs() >= 1)
+            {
+                app.refresh_job_detail();
             }
             Ok(None)
         }
@@ -191,6 +206,38 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             });
             Ok(None)
         }
+        AppEvent::JobDetailLoaded { job, output } => {
+            if let AppMode::JobDetail(state) = &mut app.mode
+                && let super::state::JobDetailTarget::Job(pid) = state.target
+                && job.as_ref().is_none_or(|loaded| loaded.pid == pid)
+            {
+                state.job = job;
+                state.output = output;
+            }
+            Ok(None)
+        }
+        AppEvent::TerminalOutputs(deltas) => {
+            for delta in deltas {
+                // A call that already ended dropped its binding at
+                // ToolCallEnd — the final result is authoritative, so a
+                // delta arriving late is dropped rather than appended.
+                let Some(read) = app.live_reads.get_mut(&delta.call_id) else {
+                    continue;
+                };
+                read.cursor = delta.cursor;
+                read.pending.extend_from_slice(&delta.bytes);
+                let complete = super::app::utf8_complete_len(&read.pending);
+                let bytes: Vec<u8> = read.pending.drain(..complete).collect();
+                if !matches!(delta.status, aither_sandbox::JobStatus::Running) {
+                    app.live_reads.remove(&delta.call_id);
+                }
+                if !bytes.is_empty() {
+                    app.chat
+                        .append_tool_output(&delta.call_id, &String::from_utf8_lossy(&bytes));
+                }
+            }
+            Ok(None)
+        }
         AppEvent::BtwDelta(text) => {
             if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
                 state.answer.push_str(&text);
@@ -219,10 +266,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
 /// (running before finished).
 pub fn jobs_rows(app: &App) -> Vec<JobRow> {
     let mut rows: Vec<JobRow> = app
-        .chat
-        .running_subagents()
+        .subagent_tracker
+        .running()
         .into_iter()
-        .map(|(id, agent, preview)| JobRow::Subagent { id, agent, preview })
+        .map(JobRow::Subagent)
         .collect();
     let mut jobs: Vec<aither_sandbox::JobInfo> = app.jobs.clone();
     jobs.sort_by_key(|job| !matches!(job.status, aither_sandbox::job_registry::JobStatus::Running));
@@ -233,15 +280,19 @@ pub fn jobs_rows(app: &App) -> Vec<JobRow> {
 /// One selectable row in the jobs panel.
 #[derive(Debug)]
 pub enum JobRow {
-    /// A foreground `subagent` invocation still inside the agent run.
-    Subagent {
-        /// Tool call element ID.
-        id: String,
-        /// Subagent name.
-        agent: String,
-        /// Prompt preview.
-        preview: String,
-    },
+    /// A `subagent` IPC call in flight, with live counters.
+    Subagent(crate::agent::SubagentRunSnapshot),
     /// A background terminal job from the registry.
     Job(aither_sandbox::JobInfo),
+}
+
+impl JobRow {
+    /// `JobDetailTarget` selecting this row's detail view.
+    #[must_use]
+    pub const fn detail_target(&self) -> super::state::JobDetailTarget {
+        match self {
+            Self::Subagent(run) => super::state::JobDetailTarget::Subagent(run.run_id),
+            Self::Job(job) => super::state::JobDetailTarget::Job(job.pid),
+        }
+    }
 }

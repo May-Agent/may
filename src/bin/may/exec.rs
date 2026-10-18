@@ -483,6 +483,8 @@ where
             // exec runs scripts without a model turn, so no provider-hosted
             // web tools exist here and the commands must stay registered.
             request_parameters: aither_core::llm::model::Parameters::default(),
+            // exec has no UI reader; the tracker still records harmlessly.
+            subagent_tracker: may_agent::agent::SubagentTracker::default(),
         },
     )
     .await

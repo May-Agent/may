@@ -16,6 +16,8 @@ mod search_match;
 pub mod session_tool;
 /// Authorization for `terminal` ssh-mode targets.
 pub mod ssh_authorizer;
+/// Live tracking of `subagent` command invocations.
+pub mod subagent_tracker;
 pub(crate) mod task_tool;
 pub mod tool_environment_cache;
 
@@ -38,6 +40,9 @@ pub use provider::{
     provider_candidate_count, resolve_provider_runtime,
 };
 pub use runner::{AgentHandle, AgentWorker, TuiEvent, spawn_worker};
+pub use subagent_tracker::{
+    SubagentRunSnapshot, SubagentTracker, TrackedSubagentTool, UsageObservedModel,
+};
 pub use task_tool::{
     TaskBroker, TaskCreateRequest, TaskCreateResult, TaskRuntimeKind, channel as task_channel,
 };

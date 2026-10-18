@@ -71,6 +71,8 @@ pub struct AgentWorker {
     subagent_runs: aither_agent::specialized::SubagentRuns,
     /// Model clone for `/btw` side questions.
     btw_llm: RequestParameterizedModel<aither_cloud::CloudProvider>,
+    /// Tracker shared with the session's `subagent` IPC command.
+    subagent_tracker: crate::agent::SubagentTracker,
 }
 
 impl std::fmt::Debug for AgentWorker {
@@ -154,6 +156,12 @@ impl AgentWorker {
     pub const fn btw_llm(&self) -> &RequestParameterizedModel<aither_cloud::CloudProvider> {
         &self.btw_llm
     }
+
+    /// Live tracker of this worker's `subagent` command invocations.
+    #[must_use]
+    pub const fn subagent_tracker(&self) -> &crate::agent::SubagentTracker {
+        &self.subagent_tracker
+    }
 }
 
 impl Drop for AgentWorker {
@@ -202,6 +210,7 @@ pub fn spawn_worker<E: Executor + 'static>(
     let job_registry = agent.job_registry();
     let subagent_runs = agent.subagent_runs();
     let btw_llm = agent.btw_llm();
+    let subagent_tracker = agent.subagent_tracker();
 
     executor
         .spawn(run_worker(agent, command_rx, snapshot_db))
@@ -212,6 +221,7 @@ pub fn spawn_worker<E: Executor + 'static>(
         job_registry,
         subagent_runs,
         btw_llm,
+        subagent_tracker,
     }
 }
 

@@ -83,8 +83,6 @@ pub struct App {
     pub queue: MessageQueue,
     /// Status message
     pub status: Option<String>,
-    /// Background task count
-    pub background_tasks: usize,
     /// Whether agent is currently processing
     pub processing: bool,
     /// File picker state (when in `FilePicker` mode)
@@ -237,6 +235,44 @@ pub struct App {
     pub jobs_selected: usize,
     /// Last jobs refresh (panel auto-refreshes on tick while open)
     pub jobs_refreshed: Option<std::time::Instant>,
+    /// Live tracker of `subagent` runs, shared with the session worker's
+    /// `subagent` IPC command (set when the agent worker installs)
+    pub subagent_tracker: crate::agent::SubagentTracker,
+    /// Running terminal calls bound to registry jobs for live output.
+    pub live_reads: std::collections::HashMap<String, LiveRead>,
+    /// Last time file-diff previews were requested for running calls.
+    pub diff_preview_at: Option<std::time::Instant>,
+}
+
+/// Live-output read state for a running terminal call bound to a
+/// job-registry task.
+#[derive(Debug)]
+pub struct LiveRead {
+    /// Registry task the call was bound to.
+    pub task_id: String,
+    /// Byte cursor into the task's output buffer.
+    pub cursor: usize,
+    /// Trailing bytes of an incomplete multi-byte UTF-8 sequence, held for
+    /// the next chunk so the live preview never shows mojibake.
+    pub pending: Vec<u8>,
+}
+
+/// Length of `buf`'s longest prefix that ends on a UTF-8 boundary —
+/// everything except a possibly incomplete trailing multi-byte sequence.
+pub(super) fn utf8_complete_len(buf: &[u8]) -> usize {
+    let mut valid = 0;
+    loop {
+        match std::str::from_utf8(&buf[valid..]) {
+            Ok(_) => return buf.len(),
+            Err(error) => {
+                valid += error.valid_up_to();
+                match error.error_len() {
+                    Some(bad) => valid += bad,
+                    None => return valid,
+                }
+            }
+        }
+    }
 }
 
 impl App {
@@ -337,7 +373,6 @@ impl App {
             mode,
             queue: MessageQueue::new(),
             status,
-            background_tasks: 0,
             processing: false,
             file_picker: None,
             image_manager: None,
@@ -414,6 +449,9 @@ impl App {
             jobs: Vec::new(),
             jobs_selected: 0,
             jobs_refreshed: None,
+            subagent_tracker: crate::agent::SubagentTracker::default(),
+            live_reads: std::collections::HashMap::new(),
+            diff_preview_at: None,
         })
     }
 
@@ -558,8 +596,13 @@ impl App {
                 super::file_diff::Outcome::Diff {
                     tool_call_id,
                     diffs,
+                    final_snapshot,
                 } => {
-                    self.chat.update_tool_diff(&tool_call_id, diffs);
+                    // A preview only applies while its call still runs — a
+                    // late preview must not clobber the final snapshot.
+                    if final_snapshot || self.chat.is_tool_running(&tool_call_id) {
+                        self.chat.update_tool_diff(&tool_call_id, diffs);
+                    }
                 }
                 super::file_diff::Outcome::Rewound { diffs, .. } => {
                     self.apply_rewind_result(&diffs);
@@ -596,6 +639,30 @@ impl App {
         })
         .detach();
         self.jobs_refreshed = Some(std::time::Instant::now());
+    }
+
+    /// Cancel the subagent run matching a tracked snapshot. The tool's own
+    /// registry keys runs by its internal id; both registries record the run
+    /// back-to-back, so the earliest name+prompt match is the same
+    /// invocation.
+    pub fn cancel_subagent(&mut self, run: &crate::agent::SubagentRunSnapshot) {
+        let agent = run.agent.clone();
+        let prompt = run.prompt.clone();
+        let hit = self.subagent_runs.as_ref().and_then(|runs| {
+            runs.list()
+                .into_iter()
+                .filter(|info| info.subagent == agent && info.prompt == prompt)
+                .min_by_key(|info| info.id)
+                .map(|info| (info.id, runs.clone()))
+        });
+        match hit {
+            Some((id, runs)) if runs.cancel(id) => {
+                self.status = Some(format!("Stopping subagent {}…", run.agent));
+            }
+            _ => {
+                self.status = Some(format!("No live registry entry for subagent {}", run.agent));
+            }
+        }
     }
 
     /// Kill a background job by pid, then refresh the panel.
@@ -742,6 +809,156 @@ impl App {
         self.mode = AppMode::Jobs;
         self.jobs_selected = 0;
         self.refresh_jobs();
+    }
+
+    /// Whether any background job or tracked subagent is currently running.
+    #[must_use]
+    pub fn has_running_background(&self) -> bool {
+        !self.subagent_tracker.running().is_empty()
+            || self
+                .jobs
+                .iter()
+                .any(|job| matches!(job.status, aither_sandbox::JobStatus::Running))
+    }
+
+    /// Poll live output and file-diff previews for running terminal calls —
+    /// the streaming half of tool-call rendering. Runs on each tick while
+    /// the agent processes.
+    pub fn poll_live_output(&mut self) {
+        // Drop bindings whose call left the Running state (end, failure,
+        // interrupt); the remaining reads still refresh on status.
+        self.live_reads
+            .retain(|call_id, _| self.chat.is_tool_running(call_id));
+
+        if let Some(registry) = self.job_registry.clone() {
+            // Bind each unbound running call to the newest unbound running
+            // job executing the same script. Two concurrent calls with an
+            // identical script bind in order of `started_at`.
+            let mut bound: std::collections::HashSet<String> = self
+                .live_reads
+                .values()
+                .map(|read| read.task_id.clone())
+                .collect();
+            for (call_id, command) in self.chat.running_terminal_calls() {
+                if self.live_reads.contains_key(&call_id) {
+                    continue;
+                }
+                let job = self
+                    .jobs
+                    .iter()
+                    .filter(|job| {
+                        matches!(job.status, aither_sandbox::JobStatus::Running)
+                            && job.script.trim() == command.trim()
+                            && !bound.contains(&job.task_id)
+                    })
+                    .max_by_key(|job| job.started_at);
+                if let Some(job) = job {
+                    bound.insert(job.task_id.clone());
+                    self.live_reads.insert(
+                        call_id,
+                        LiveRead {
+                            task_id: job.task_id.clone(),
+                            cursor: 0,
+                            pending: Vec::new(),
+                        },
+                    );
+                }
+            }
+
+            if !self.live_reads.is_empty() {
+                let tx = self.event_tx.clone();
+                let reads: Vec<(String, String, usize)> = self
+                    .live_reads
+                    .iter()
+                    .map(|(call_id, read)| (call_id.clone(), read.task_id.clone(), read.cursor))
+                    .collect();
+                spawn(async move {
+                    let mut deltas = Vec::with_capacity(reads.len());
+                    for (call_id, task_id, cursor) in reads {
+                        if let Ok(delta) = registry.terminal_read(&task_id, cursor, 64 * 1024).await
+                        {
+                            deltas.push(super::event::TerminalOutputDelta {
+                                call_id,
+                                cursor: delta.cursor,
+                                bytes: delta.bytes,
+                                status: delta.status,
+                            });
+                        }
+                    }
+                    let _ = tx.send(AppEvent::TerminalOutputs(deltas)).await;
+                })
+                .detach();
+            }
+        }
+
+        // Live file-diff previews at ~1s cadence while calls run.
+        if self
+            .diff_preview_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            self.ensure_file_diffs();
+            if let Some(handle) = &self.file_diffs {
+                for (call_id, _) in self.chat.running_terminal_calls() {
+                    handle.request_preview(&call_id);
+                }
+            }
+            self.diff_preview_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Open the detail view for one jobs-panel row.
+    pub fn open_job_detail(&mut self, target: crate::tui::state::JobDetailTarget) {
+        let mut state = crate::tui::state::JobDetailState::new(target);
+        match target {
+            crate::tui::state::JobDetailTarget::Job(pid) => {
+                state.job = self.jobs.iter().find(|job| job.pid == pid).cloned();
+                state.finished = state.job.is_none();
+            }
+            crate::tui::state::JobDetailTarget::Subagent(run_id) => {
+                state.subagent = self.subagent_tracker.get(run_id);
+                state.finished = state.subagent.is_none();
+            }
+        }
+        self.mode = AppMode::JobDetail(state);
+        self.refresh_job_detail();
+    }
+
+    /// Refresh the data behind an open `AppMode::JobDetail` view.
+    ///
+    /// `Job` targets fetch through the registry (async, lands via
+    /// `AppEvent::JobDetailLoaded`); `Subagent` targets re-read the shared
+    /// tracker synchronously.
+    pub fn refresh_job_detail(&mut self) {
+        let AppMode::JobDetail(state) = &mut self.mode else {
+            return;
+        };
+        let target = state.target;
+        match target {
+            crate::tui::state::JobDetailTarget::Job(pid) => {
+                let Some(registry) = self.job_registry.clone() else {
+                    state.finished = true;
+                    return;
+                };
+                let tx = self.event_tx.clone();
+                spawn(async move {
+                    let (job, output) =
+                        futures_lite::future::zip(registry.get(pid), registry.terminal_output(pid))
+                            .await;
+                    let _ = tx.send(AppEvent::JobDetailLoaded { job, output }).await;
+                })
+                .detach();
+            }
+            crate::tui::state::JobDetailTarget::Subagent(run_id) => {
+                match self.subagent_tracker.get(run_id) {
+                    Some(snapshot) => {
+                        state.subagent = Some(snapshot);
+                        state.finished = false;
+                    }
+                    None => state.finished = true,
+                }
+            }
+        }
+        state.refreshed = Some(std::time::Instant::now());
     }
 
     /// Check if configuration is complete.
@@ -1022,7 +1239,6 @@ impl App {
         self.queue = MessageQueue::new();
         self.status = None;
         self.processing = false;
-        self.background_tasks = 0;
         self.selected_tool = None;
         self.selected_tool_index = 0;
         self.tool_detail_scroll = 0;
@@ -1039,6 +1255,11 @@ impl App {
         self.image_cache.clear();
         self.image_fetching.clear();
         self.image_failed.clear();
+        self.jobs_refreshed = None;
+        self.subagent_runs = None;
+        self.subagent_tracker = crate::agent::SubagentTracker::default();
+        self.live_reads.clear();
+        self.diff_preview_at = None;
 
         // Load chat history into display
         self.chat = ChatStream::new();
@@ -1361,6 +1582,9 @@ impl App {
             )),
             AppMode::Rewind(_) => Ok(super::reducer::navigation::handle_rewind_key(self, code)),
             AppMode::Jobs => Ok(super::reducer::navigation::handle_jobs_key(self, code)),
+            AppMode::JobDetail(_) => Ok(super::reducer::navigation::handle_job_detail_key(
+                self, code,
+            )),
             AppMode::Btw(_) => Ok(super::reducer::navigation::handle_btw_key(self, code)),
         }
     }
@@ -1631,6 +1855,10 @@ impl App {
                     self.input = entry.to_string();
                     self.input_char_count = self.input.chars().count();
                     self.cursor = self.input_char_count;
+                } else if self.job_registry.is_some() {
+                    // ↓ past the newest history entry opens the background
+                    // jobs/subagents panel (status bar hint: "↓ jobs").
+                    self.open_jobs();
                 }
             }
             // Mouse capture + alternate screen swallow native terminal
@@ -2264,6 +2492,7 @@ impl App {
                                 );
                             }
                         }
+                        self.live_reads.remove(&id);
                         self.request_file_diff(&id);
                     }
                     AgentEvent::Complete { .. } => {
@@ -2471,4 +2700,36 @@ pub enum SendAction {
         /// Whether to restore tracked files to the prompt's checkpoint.
         restore_code: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf8_complete_len;
+
+    #[test]
+    fn utf8_complete_len_holds_only_incomplete_trailing_sequence() {
+        assert_eq!(utf8_complete_len(b"hello"), 5);
+        assert_eq!(utf8_complete_len(b""), 0);
+
+        // é (2-byte) split mid-sequence — the second byte is held back.
+        let split = "é".as_bytes();
+        let buf = [b"hi", &split[..1]].concat();
+        assert_eq!(utf8_complete_len(&buf), 2);
+        let buf = [b"hi", split].concat();
+        assert_eq!(utf8_complete_len(&buf), 4);
+
+        // 4-byte emoji split at 1, 2 and 3 bytes — all held.
+        let emoji = "🦀".as_bytes();
+        for cut in 1..emoji.len() {
+            let buf = [b"x", &emoji[..cut]].concat();
+            assert_eq!(utf8_complete_len(&buf), 1, "cut {cut}");
+        }
+        let buf = [b"x", emoji].concat();
+        assert_eq!(utf8_complete_len(&buf), 5);
+
+        // A genuinely invalid byte mid-buffer is skipped, not held; only a
+        // trailing incomplete sequence shortens the prefix.
+        let buf = [b"ok".as_slice(), &[0xff], b"!", &emoji[..2]].concat();
+        assert_eq!(utf8_complete_len(&buf), 4);
+    }
 }
