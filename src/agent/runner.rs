@@ -66,6 +66,8 @@ pub struct AgentWorker {
     command_tx: Sender<WorkerCommand>,
     /// Background-job registry shared with the session's terminal tool.
     job_registry: aither_sandbox::JobRegistry,
+    /// Registry of in-flight `subagent` command runs.
+    subagent_runs: aither_agent::specialized::SubagentRuns,
 }
 
 impl std::fmt::Debug for AgentWorker {
@@ -137,6 +139,12 @@ impl AgentWorker {
     pub const fn job_registry(&self) -> &aither_sandbox::JobRegistry {
         &self.job_registry
     }
+
+    /// Registry of in-flight subagent runs — list or cancel them.
+    #[must_use]
+    pub const fn subagent_runs(&self) -> &aither_agent::specialized::SubagentRuns {
+        &self.subagent_runs
+    }
 }
 
 impl Drop for AgentWorker {
@@ -183,6 +191,7 @@ pub fn spawn_worker<E: Executor + 'static>(
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let job_registry = agent.job_registry();
+    let subagent_runs = agent.subagent_runs();
 
     executor
         .spawn(run_worker(agent, command_rx, snapshot_db))
@@ -191,6 +200,7 @@ pub fn spawn_worker<E: Executor + 'static>(
     AgentWorker {
         command_tx,
         job_registry,
+        subagent_runs,
     }
 }
 
