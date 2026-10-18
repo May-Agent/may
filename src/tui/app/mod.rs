@@ -469,17 +469,47 @@ impl App {
         }
     }
 
-    /// Apply finished file diffs to their tool-call blocks. Called once per
-    /// event-loop iteration.
+    /// Apply finished file diffs and rewind results to their tool-call
+    /// blocks. Called once per event-loop iteration.
     pub fn poll_file_diffs(&mut self) {
         let outcomes = match &self.file_diffs {
             Some(handle) => handle.drain(),
             None => return,
         };
         for outcome in outcomes {
-            self.chat
-                .update_tool_diff(&outcome.tool_call_id, outcome.diffs);
+            match outcome {
+                super::file_diff::Outcome::Diff {
+                    tool_call_id,
+                    diffs,
+                } => {
+                    self.chat.update_tool_diff(&tool_call_id, diffs);
+                }
+                super::file_diff::Outcome::Rewound {
+                    tool_call_id,
+                    diffs,
+                } => {
+                    self.apply_rewind_result(&tool_call_id, &diffs);
+                }
+            }
         }
+    }
+
+    /// Show the result of a completed rewind in the chat stream.
+    fn apply_rewind_result(&mut self, tool_call_id: &str, diffs: &[crate::file_tracker::RootDiff]) {
+        if diffs.is_empty() {
+            self.chat
+                .push_notice("Rewind: nothing changed — checkpoint missing or files already match");
+            return;
+        }
+        let marked = self.chat.mark_rewound_from(tool_call_id);
+        let files: usize = diffs.iter().map(|d| d.files).sum();
+        let additions: usize = diffs.iter().map(|d| d.additions).sum();
+        let deletions: usize = diffs.iter().map(|d| d.deletions).sum();
+        self.chat.push_notice(&format!(
+            "⏪ rewound {files} file{} (+{additions} −{deletions}) across {marked} call{}",
+            if files == 1 { "" } else { "s" },
+            if marked == 1 { "" } else { "s" },
+        ));
     }
 
     /// Check if configuration is complete.
@@ -938,6 +968,7 @@ impl App {
             AppMode::ProfileSelect => Ok(super::reducer::navigation::handle_profile_select_key(
                 self, code,
             )),
+            AppMode::Rewind(_) => Ok(super::reducer::navigation::handle_rewind_key(self, code)),
         }
     }
 
@@ -1496,6 +1527,19 @@ impl App {
                 self.mode = AppMode::ModelSelect;
                 None
             }
+            "/rewind" => {
+                let targets = self.chat.tool_calls_with_diffs();
+                if targets.is_empty() {
+                    self.chat
+                        .push_notice("No file changes to rewind in this session");
+                } else {
+                    self.mode = AppMode::Rewind(crate::tui::state::RewindState {
+                        targets,
+                        selected: 0,
+                    });
+                }
+                None
+            }
             "/quit" => Some(SendAction::Quit),
             "/compact" => Some(SendAction::Compact(None)),
             "/mcp" => {
@@ -1745,6 +1789,7 @@ impl App {
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
                                 diffs: Vec::new(),
+                                rewound: false,
                             },
                             ToolStartKind::Generic { name, arguments } => ToolDisplay::Terminal {
                                 command: format!("{name} {arguments}"),
@@ -1752,6 +1797,7 @@ impl App {
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
                                 diffs: Vec::new(),
+                                rewound: false,
                             },
                         };
                         self.chat.push_tool(id, display);
