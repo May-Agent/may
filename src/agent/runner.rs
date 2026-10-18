@@ -25,6 +25,7 @@ use executor_core::{Executor, Task};
 use futures_lite::StreamExt;
 
 use crate::MayAgent;
+use crate::agent::RequestParameterizedModel;
 use crate::db::ChatDb;
 
 /// Events sent from the agent background task to the TUI.
@@ -68,6 +69,8 @@ pub struct AgentWorker {
     job_registry: aither_sandbox::JobRegistry,
     /// Registry of in-flight `subagent` command runs.
     subagent_runs: aither_agent::specialized::SubagentRuns,
+    /// Model clone for `/btw` side questions.
+    btw_llm: RequestParameterizedModel<aither_cloud::CloudProvider>,
 }
 
 impl std::fmt::Debug for AgentWorker {
@@ -145,6 +148,12 @@ impl AgentWorker {
     pub const fn subagent_runs(&self) -> &aither_agent::specialized::SubagentRuns {
         &self.subagent_runs
     }
+
+    /// Model clone for `/btw` side questions.
+    #[must_use]
+    pub const fn btw_llm(&self) -> &RequestParameterizedModel<aither_cloud::CloudProvider> {
+        &self.btw_llm
+    }
 }
 
 impl Drop for AgentWorker {
@@ -192,6 +201,7 @@ pub fn spawn_worker<E: Executor + 'static>(
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let job_registry = agent.job_registry();
     let subagent_runs = agent.subagent_runs();
+    let btw_llm = agent.btw_llm();
 
     executor
         .spawn(run_worker(agent, command_rx, snapshot_db))
@@ -201,6 +211,7 @@ pub fn spawn_worker<E: Executor + 'static>(
         command_tx,
         job_registry,
         subagent_runs,
+        btw_llm,
     }
 }
 

@@ -482,3 +482,33 @@ pub fn handle_jobs_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     }
     None
 }
+
+/// Keys inside the `/btw` overlay: type a question, Enter asks it, then the
+/// answer scrolls; Esc/q always closes the overlay back to chat.
+pub fn handle_btw_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::Btw(state) = &mut app.mode else {
+        return None;
+    };
+    let awaiting_question = !state.loading && !state.done;
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') if !awaiting_question => {
+            app.mode = AppMode::Chat;
+        }
+        KeyCode::Esc => {
+            app.mode = AppMode::Chat;
+        }
+        KeyCode::Enter if awaiting_question => app.submit_btw(),
+        KeyCode::Char(c) if awaiting_question => state.input.push(c),
+        KeyCode::Backspace if awaiting_question => {
+            state.input.pop();
+        }
+        KeyCode::Up | KeyCode::Char('k') if !awaiting_question => {
+            state.scroll = state.scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if !awaiting_question => {
+            state.scroll = state.scroll.saturating_add(1);
+        }
+        _ => {}
+    }
+    None
+}
