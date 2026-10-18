@@ -35,6 +35,9 @@ use super::ui::file_picker::FilePicker;
 /// User-facing message shown when a tool response cannot be sent to the session.
 pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../../texts/tool_response_send_failed.txt");
 
+/// Two Esc presses within this window open the rewind picker.
+const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// Convert a character index to a byte index in a string.
 pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
@@ -119,6 +122,9 @@ pub struct App {
     pub cwd: PathBuf,
     /// Whether quit confirmation is pending (Ctrl+C pressed once)
     pub quit_pending: bool,
+    /// When the last Esc was handled in chat mode; a second Esc inside the
+    /// window opens the rewind picker.
+    pub last_esc_at: Option<std::time::Instant>,
     /// When thinking started (for thinking models)
     pub thinking_start: Option<std::time::Instant>,
     /// Copilot OAuth authentication status
@@ -342,6 +348,7 @@ impl App {
             needs_setup,
             cwd,
             quit_pending: false,
+            last_esc_at: None,
             thinking_start: None,
             copilot_auth_status: None,
             chatgpt_auth_status: None,
@@ -475,6 +482,45 @@ impl App {
         }
     }
 
+    /// Record the current tree of every tracked root as the checkpoint
+    /// for the prompt being dispatched — the state "before this prompt"
+    /// that a conversation-and-code rewind restores.
+    pub fn request_prompt_mark(&mut self, message_db_id: i64) {
+        self.ensure_file_diffs();
+        if let Some(handle) = &self.file_diffs {
+            handle.request_mark(&format!("prompt:{message_db_id}"));
+        }
+    }
+
+    /// Ask the diff worker to restore every tracked root to the tree
+    /// recorded at prompt dispatch. `fallback_call_ids` are the tool
+    /// calls of the rewound turns; the earliest of their checkpoints
+    /// applies when the prompt mark does not exist.
+    pub fn request_prompt_rewind(&mut self, message_db_id: i64, fallback_call_ids: Vec<String>) {
+        self.ensure_file_diffs();
+        if let Some(handle) = &self.file_diffs {
+            handle.request_rewind(&format!("prompt:{message_db_id}"), fallback_call_ids);
+        }
+    }
+
+    /// Open the rewind picker listing the session's user prompts.
+    /// Returns `false` when there is nothing to rewind to.
+    pub fn open_rewind_picker(&mut self) -> bool {
+        let targets = self.chat.rewind_targets();
+        if targets.is_empty() {
+            return false;
+        }
+        let selected = targets.len();
+        self.mode = AppMode::Rewind(crate::tui::state::RewindState {
+            targets,
+            // The trailing "(current)" entry is selected first.
+            selected,
+            options_for: None,
+            option_selected: 0,
+        });
+        true
+    }
+
     /// Begin tracking a workspace directory the user just granted access
     /// to. The baseline is taken at grant time, so only later writes are
     /// attributed to the agent.
@@ -502,31 +548,27 @@ impl App {
                 } => {
                     self.chat.update_tool_diff(&tool_call_id, diffs);
                 }
-                super::file_diff::Outcome::Rewound {
-                    tool_call_id,
-                    diffs,
-                } => {
-                    self.apply_rewind_result(&tool_call_id, &diffs);
+                super::file_diff::Outcome::Rewound { diffs, .. } => {
+                    self.apply_rewind_result(&diffs);
                 }
             }
         }
     }
 
-    /// Show the result of a completed rewind in the chat stream.
-    fn apply_rewind_result(&mut self, tool_call_id: &str, diffs: &[crate::file_tracker::RootDiff]) {
+    /// Show the result of a completed code rewind in the chat stream.
+    fn apply_rewind_result(&mut self, diffs: &[crate::file_tracker::RootDiff]) {
         if diffs.is_empty() {
-            self.chat
-                .push_notice("Rewind: nothing changed — checkpoint missing or files already match");
+            self.chat.push_notice(
+                "Rewind: files unchanged — no code checkpoint applies or files already match",
+            );
             return;
         }
-        let marked = self.chat.mark_rewound_from(tool_call_id);
         let files: usize = diffs.iter().map(|d| d.files).sum();
         let additions: usize = diffs.iter().map(|d| d.additions).sum();
         let deletions: usize = diffs.iter().map(|d| d.deletions).sum();
         self.chat.push_notice(&format!(
-            "⏪ rewound {files} file{} (+{additions} −{deletions}) across {marked} call{}",
+            "⏪ restored {files} file{} (+{additions} −{deletions})",
             if files == 1 { "" } else { "s" },
-            if marked == 1 { "" } else { "s" },
         ));
     }
 
@@ -732,10 +774,10 @@ impl App {
 
         // Load chat history into display
         self.chat = ChatStream::new();
-        for msg in messages {
+        for (history_index, msg) in messages.iter().enumerate() {
             match msg.role {
                 MessageRole::User => {
-                    self.chat.push_user(&msg.content, vec![]);
+                    self.chat.push_user(&msg.content, vec![], history_index);
                 }
                 MessageRole::Assistant => {
                     self.chat.push_text(&msg.content);
@@ -1320,10 +1362,22 @@ impl App {
             KeyCode::Esc => {
                 if self.completion.is_active() {
                     self.completion.cancel();
-                } else if !self.input.is_empty() {
-                    self.input.clear();
-                    self.cursor = 0;
-                    self.input_char_count = 0;
+                    self.last_esc_at = Some(std::time::Instant::now());
+                } else if self
+                    .last_esc_at
+                    .is_some_and(|at| at.elapsed() <= DOUBLE_ESC_WINDOW)
+                    && !self.processing
+                    && self.open_rewind_picker()
+                {
+                    // Esc Esc: open the rewind picker.
+                    self.last_esc_at = None;
+                } else {
+                    self.last_esc_at = Some(std::time::Instant::now());
+                    if !self.input.is_empty() {
+                        self.input.clear();
+                        self.cursor = 0;
+                        self.input_char_count = 0;
+                    }
                 }
             }
             KeyCode::Tab => {
@@ -1600,15 +1654,11 @@ impl App {
                 None
             }
             "/rewind" => {
-                let targets = self.chat.tool_calls_with_diffs();
-                if targets.is_empty() {
+                if self.processing {
                     self.chat
-                        .push_notice("No file changes to rewind in this session");
-                } else {
-                    self.mode = AppMode::Rewind(crate::tui::state::RewindState {
-                        targets,
-                        selected: 0,
-                    });
+                        .push_notice("Wait for the current turn to finish before rewinding");
+                } else if !self.open_rewind_picker() {
+                    self.chat.push_notice("No prompts to rewind to");
                 }
                 None
             }
@@ -1816,8 +1866,13 @@ impl App {
         self.thinking_start = None;
         self.decode_meter.reset();
 
-        // Add user message to chat
-        self.chat.push_user(&msg.content, msg.attachments.clone());
+        // Add user message to chat; the persisted row was appended last,
+        // so it sits at the end of session history.
+        let history_index = self.session_manager.current().map_or(0, |session| {
+            session.history.messages().len().saturating_sub(1)
+        });
+        self.chat
+            .push_user(&msg.content, msg.attachments.clone(), history_index);
 
         // Scroll to bottom
         self.scroll = usize::MAX;
@@ -1874,7 +1929,6 @@ impl App {
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
                                 diffs: Vec::new(),
-                                rewound: false,
                                 expanded: false,
                             },
                             ToolStartKind::Generic { name, arguments } => ToolDisplay::Terminal {
@@ -1883,7 +1937,6 @@ impl App {
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
                                 diffs: Vec::new(),
-                                rewound: false,
                                 expanded: false,
                             },
                         };
@@ -2107,5 +2160,13 @@ pub enum SendAction {
     SkillDelete {
         /// Directory name of the skill to delete.
         dir_name: String,
+    },
+    /// Rewind the conversation to before the user message at
+    /// `history_index`, optionally restoring the code too.
+    Rewind {
+        /// Position of the target user message in session history.
+        history_index: usize,
+        /// Whether to restore tracked files to the prompt's checkpoint.
+        restore_code: bool,
     },
 }

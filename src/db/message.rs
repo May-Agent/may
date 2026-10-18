@@ -525,6 +525,88 @@ impl ChatDb {
         .await?)
     }
 
+    /// Delete every message in `session_id` whose id is `from_id` or later,
+    /// together with its structured satellite rows, then refresh the
+    /// session's preview, message count, and `updated_at`. Used to rewind a
+    /// conversation back to an earlier prompt boundary.
+    ///
+    /// Returns the number of deleted `messages` rows.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn delete_messages_from(
+        &self,
+        session_id: &str,
+        from_id: i64,
+    ) -> Result<u64, ChatDbError> {
+        const SATELLITE_TABLES: &[&str] = &[
+            "message_permission_requests",
+            "message_permission_responses",
+            "message_workspace_requests",
+            "message_workspace_responses",
+            "message_ask_user_requests",
+            "message_ask_user_request_questions",
+            "message_ask_user_request_options",
+            "message_ask_user_responses",
+            "message_ask_user_response_answers",
+            "message_ask_user_response_selected_options",
+        ];
+        let mut tx = self.db.begin().await?;
+        for table in SATELLITE_TABLES {
+            let sql = format!(
+                "DELETE FROM {table} WHERE message_id IN (SELECT id FROM messages WHERE session_id = ? AND id >= ?)"
+            );
+            query!(tx, sql.as_str(), session_id, from_id)
+                .execute()
+                .await?;
+        }
+        let deleted = query!(
+            tx,
+            "DELETE FROM messages WHERE session_id = ? AND id >= ?",
+            session_id,
+            from_id
+        )
+        .execute()
+        .await?
+        .rows_written;
+        let preview_row = query!(
+            tx,
+            "SELECT content AS value FROM messages WHERE session_id = ? AND role IN (?, ?, ?) ORDER BY id DESC LIMIT 1",
+            session_id,
+            MessageRole::User.as_str(),
+            MessageRole::Assistant.as_str(),
+            MessageRole::System.as_str()
+        )
+        .fetch_optional::<super::common::StringValueRow>()
+        .await?;
+        let count_row = query!(
+            tx,
+            "SELECT COUNT(*) AS value FROM messages WHERE session_id = ? AND role IN (?, ?, ?)",
+            session_id,
+            MessageRole::User.as_str(),
+            MessageRole::Assistant.as_str(),
+            MessageRole::System.as_str()
+        )
+        .fetch_one::<I64ValueRow>()
+        .await?;
+        query!(
+            tx,
+            "UPDATE sessions SET message_count = ?, preview = ?, updated_at = ? WHERE id = ?",
+            to_i32(
+                u32::try_from(count_row.value)
+                    .map_err(|error| overflow_error("message_count", &error))?,
+                "message_count",
+            )?,
+            preview_row.map(|row| truncate_preview(&row.value)),
+            jiff::Timestamp::now().to_string(),
+            session_id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
     /// Return the highest `messages.id` for a session, or `None` if empty.
     ///
     /// # Errors
