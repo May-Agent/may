@@ -24,6 +24,8 @@ export interface UiNativeToolsConfig {
   webFetch: boolean;
 }
 
+export type ProviderApi = 'chat-completions' | 'responses';
+
 export interface UiProviderConfig {
   id: string;
   providerType: ProviderType;
@@ -32,6 +34,7 @@ export interface UiProviderConfig {
   displayName?: string | null;
   enabled: boolean;
   nativeTools: UiNativeToolsConfig;
+  api?: ProviderApi | null;
 }
 
 export interface UiModelsConfig {
