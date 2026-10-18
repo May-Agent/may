@@ -253,6 +253,8 @@ pub struct MayAgent {
     runtime_system_context: RuntimeSystemContext,
     job_registry: aither_sandbox::JobRegistry,
     subagent_runs: aither_agent::specialized::SubagentRuns,
+    /// Model clone reserved for `/btw` side questions.
+    btw_llm: RequestParameterizedModel<CloudProvider>,
 }
 
 impl std::fmt::Debug for MayAgent {
@@ -361,6 +363,9 @@ impl MayAgent {
 
         // Clone LLM for terminal IPC commands before moving it into the builder.
         let terminal_command_llm = llm.clone();
+        // `/btw` side questions run through this clone — separate from the
+        // agent's own model so a side query never joins the agent's history.
+        let btw_llm = llm.clone();
         // Ask-tier models arrive already wrapped in the parameters of their
         // own provider instances.
         let ask_flagship = config.ask_models.flagship.clone();
@@ -609,6 +614,7 @@ impl MayAgent {
             runtime_system_context,
             job_registry,
             subagent_runs,
+            btw_llm,
         })
     }
 
@@ -839,6 +845,13 @@ impl MayAgent {
         self.subagent_runs.clone()
     }
 
+    /// Model clone for `/btw` side questions — shares the agent's provider
+    /// but runs outside the agent, so answers never enter its history.
+    #[must_use]
+    pub fn btw_llm(&self) -> RequestParameterizedModel<CloudProvider> {
+        self.btw_llm.clone()
+    }
+
     /// Selected provider ID for the current request.
     #[must_use]
     pub fn provider_id(&self) -> &str {
@@ -981,7 +994,7 @@ mod tests {
             )),
             Parameters::default(),
         );
-        let inner = Agent::builder(llm)
+        let inner = Agent::builder(llm.clone())
             .hook(ContextSnapshotHook::new(None, &session_id))
             .hook(PendingSteerHook::new(None, &session_id))
             .build();
@@ -993,6 +1006,7 @@ mod tests {
                 session_id,
                 job_registry,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                btw_llm: llm,
                 sandbox_dir: temp.path().join("sandbox"),
                 provider_id: "chatgpt".to_string(),
                 model_context_window: None,

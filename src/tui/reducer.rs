@@ -191,6 +191,27 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             });
             Ok(None)
         }
+        AppEvent::BtwDelta(text) => {
+            if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
+                state.answer.push_str(&text);
+            }
+            Ok(None)
+        }
+        AppEvent::BtwFinished => {
+            if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
+                state.loading = false;
+                state.done = true;
+            }
+            Ok(None)
+        }
+        AppEvent::BtwFailed(error) => {
+            if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
+                state.loading = false;
+                state.done = true;
+                state.error = Some(error);
+            }
+            Ok(None)
+        }
     }
 }
 

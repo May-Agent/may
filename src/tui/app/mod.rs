@@ -226,6 +226,8 @@ pub struct App {
     pub job_registry: Option<aither_sandbox::JobRegistry>,
     /// In-flight subagent runs for the session (list/cancel handle)
     pub subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
+    /// Model clone for `/btw` side questions (outside conversation history).
+    pub btw_llm: Option<crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>>,
     /// Latest job list shown in `AppMode::Jobs`
     pub jobs: Vec<aither_sandbox::JobInfo>,
     /// Selected row in `AppMode::Jobs`
@@ -404,6 +406,7 @@ impl App {
             collapse_regions: Vec::new(),
             job_registry: None,
             subagent_runs: None,
+            btw_llm: None,
             jobs: Vec::new(),
             jobs_selected: 0,
             jobs_refreshed: None,
@@ -603,6 +606,126 @@ impl App {
             let _ = tx.send(AppEvent::JobsLoaded(registry.list().await)).await;
         })
         .detach();
+    }
+
+    /// Open the `/btw` side-question overlay.
+    pub fn open_btw(&mut self) {
+        if self.btw_llm.is_none() {
+            self.chat
+                .push_notice("No model available for /btw — start a session first");
+            return;
+        }
+        self.mode = AppMode::Btw(super::state::BtwState::default());
+    }
+
+    /// Submit the question typed in the `/btw` overlay. Streams the answer
+    /// back through [`AppEvent`]s; nothing touches the conversation history.
+    pub fn submit_btw(&mut self) {
+        let (AppMode::Btw(state), Some(llm)) = (&self.mode, self.btw_llm.clone()) else {
+            return;
+        };
+        let question = state.input.trim().to_string();
+        if question.is_empty() || state.loading {
+            return;
+        }
+        let messages = self.btw_messages(&question);
+        let tx = self.event_tx.clone();
+        if let AppMode::Btw(state) = &mut self.mode {
+            state.loading = true;
+        }
+        spawn(async move {
+            use aither_core::LanguageModel;
+            use futures_lite::StreamExt;
+            let request = aither_core::llm::LLMRequest::new(messages);
+            let mut stream = std::pin::pin!(llm.respond(request));
+            let mut failed = false;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(aither_core::llm::Event::Text(text)) => {
+                        if tx.send(AppEvent::BtwDelta(text)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        failed = true;
+                        let _ = tx.send(AppEvent::BtwFailed(error.to_string())).await;
+                        break;
+                    }
+                }
+            }
+            if !failed {
+                let _ = tx.send(AppEvent::BtwFinished).await;
+            }
+        })
+        .detach();
+    }
+
+    /// System prompt for `/btw`: answer once, no tools, no side effects.
+    const BTW_SYSTEM: &'static str = "This is a side question from the user. \
+        Answer it directly in a single response. You share the conversation \
+        context but are a separate, lightweight instance — the main agent is \
+        NOT interrupted and keeps working. You have NO tools available and \
+        there will be no follow-up turns: never promise to take any action.";
+
+    /// Chat elements the `/btw` request sees, oldest first. Bounded to the
+    /// most recent entries so the overlay stays cheap on long sessions.
+    const BTW_CONTEXT_ELEMENTS: usize = 24;
+
+    /// Build the `/btw` request: system contract, recent chat as context,
+    /// then the question itself.
+    fn btw_messages(&self, question: &str) -> Vec<aither_core::llm::Message> {
+        use super::ui::chat::{ChatElement, ToolDisplay};
+        use aither_core::llm::Message;
+
+        let mut messages = vec![Message::system(Self::BTW_SYSTEM)];
+        for element in self
+            .chat
+            .elements()
+            .iter()
+            .rev()
+            .take(Self::BTW_CONTEXT_ELEMENTS)
+        {
+            let message = match element {
+                ChatElement::UserMessage { content, .. } => Some(Message::user(content.as_str())),
+                ChatElement::AssistantText { content, .. } => {
+                    (!content.is_empty()).then(|| Message::assistant(content.as_str()))
+                }
+                ChatElement::ToolCall { display, .. } => {
+                    let summary = match display {
+                        ToolDisplay::Terminal {
+                            command, output, ..
+                        } => {
+                            let mut text = format!("ran terminal command:\n{command}");
+                            if let Some(info) = output
+                                && !info.output.is_empty()
+                            {
+                                let tail: String = info.output.chars().take(600).collect();
+                                text.push_str("\noutput:\n");
+                                text.push_str(&tail);
+                            }
+                            text
+                        }
+                        ToolDisplay::Search { query, .. } => format!("web search: {query}"),
+                        ToolDisplay::Fetch { url, .. } => format!("fetched {url}"),
+                        ToolDisplay::Task {
+                            subagent, prompt, ..
+                        } => format!("delegated to subagent {subagent}: {prompt}"),
+                    };
+                    Some(Message::assistant(summary))
+                }
+                _ => None,
+            };
+            if let Some(message) = message {
+                messages.push(message);
+            }
+        }
+        // History was gathered newest-first; flip it back to chronological.
+        let (system, history) = messages.split_first().expect("system message present");
+        let mut ordered = vec![system.clone()];
+        ordered.extend(history.iter().rev().cloned());
+        ordered.push(Message::user(question));
+        ordered
     }
 
     /// Open the jobs/subagents panel.
@@ -1078,6 +1201,7 @@ impl App {
             )),
             AppMode::Rewind(_) => Ok(super::reducer::navigation::handle_rewind_key(self, code)),
             AppMode::Jobs => Ok(super::reducer::navigation::handle_jobs_key(self, code)),
+            AppMode::Btw(_) => Ok(super::reducer::navigation::handle_btw_key(self, code)),
         }
     }
 
@@ -1670,6 +1794,10 @@ impl App {
             }
             "/jobs" => {
                 self.open_jobs();
+                None
+            }
+            "/btw" => {
+                self.open_btw();
                 None
             }
             "/quit" => Some(SendAction::Quit),

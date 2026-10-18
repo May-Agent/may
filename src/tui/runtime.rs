@@ -815,6 +815,7 @@ impl RuntimeDeps {
         app.set_current_model(build.model());
         app.job_registry = Some(new_worker.job_registry().clone());
         app.subagent_runs = Some(new_worker.subagent_runs().clone());
+        app.btw_llm = Some(new_worker.btw_llm().clone());
         *worker = Some(new_worker);
     }
 
