@@ -40,6 +40,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "Rewind to an earlier prompt (conversation, optionally code too)",
     ),
     ("/jobs", "Background jobs and running subagents"),
+    (
+        "/btw",
+        "Ask a side question without touching conversation history",
+    ),
     ("/mcp", "Manage MCP servers"),
     ("/ssh", "Manage preconfigured SSH servers"),
     ("/skill", "Manage installed skills"),

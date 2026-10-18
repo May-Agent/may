@@ -21,7 +21,7 @@ use ratatui::Frame;
 use super::super::app::App;
 use super::super::completion::CompletionMode;
 use super::super::state::{
-    AppMode, AskUserState, ChatgptAuthStatus, CopilotAuthStatus, RewindState,
+    AppMode, AskUserState, BtwState, ChatgptAuthStatus, CopilotAuthStatus, RewindState,
 };
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 use crate::workspace_request::WorkspaceRequest;
@@ -232,6 +232,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         AppMode::Jobs => {
             render_jobs_popup(frame, area, app);
+        }
+        AppMode::Btw(ref state) => {
+            render_btw_popup(frame, area, state);
         }
         _ => {}
     }
@@ -747,6 +750,82 @@ fn render_jobs_popup(frame: &mut Frame, area: Rect, app: &App) {
             .title(title),
     );
     frame.render_widget(list, popup_area);
+}
+
+fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState) {
+    let awaiting_question = !state.loading && !state.done;
+    let answer_height = if awaiting_question { 5u16 } else { 14u16 };
+    let popup_width = area.width.saturating_sub(10).clamp(50, 90);
+    let popup_area = centered_rect_exact(popup_width, answer_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = if awaiting_question {
+        "btw — side question (not in history)"
+    } else {
+        "btw — side question"
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if awaiting_question {
+        lines.push(Line::from(Span::styled(
+            format!("> {}▌", state.input),
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Ask a quick question about this session — Enter ask · Esc close",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("> {}", state.input),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(""));
+        if state.answer.is_empty() && state.loading {
+            lines.push(Line::from(Span::styled(
+                "thinking…",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for line in state.answer.lines() {
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::White),
+            )));
+        }
+        if state.loading {
+            lines.push(Line::from(Span::styled(
+                "▌",
+                Style::default().fg(Color::White),
+            )));
+        }
+        if let Some(error) = &state.error {
+            lines.push(Line::from(Span::styled(
+                format!("error: {error}"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        if state.done {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Esc/q close · ↑↓ scroll",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((state.scroll, 0));
+    frame.render_widget(paragraph, inner);
 }
 
 /// Helper to create a centered rect.

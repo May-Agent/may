@@ -77,6 +77,14 @@ pub enum AppEvent {
         /// Whether the registry reported the job killed.
         ok: bool,
     },
+
+    // ─── /btw side question ─────────────────────────────────────────
+    /// An answer chunk arrived for the `/btw` overlay.
+    BtwDelta(String),
+    /// The `/btw` request finished streaming.
+    BtwFinished,
+    /// The `/btw` request failed.
+    BtwFailed(String),
 }
 
 /// Sender type for sending events back to the main loop.

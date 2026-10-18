@@ -47,6 +47,25 @@ pub enum AppMode {
     Rewind(RewindState),
     /// Background jobs and running subagents viewer
     Jobs,
+    /// `/btw` side-question overlay: answered outside conversation history
+    Btw(BtwState),
+}
+
+/// `/btw` overlay state: type a question, stream a one-off answer.
+#[derive(Debug, Clone, Default)]
+pub struct BtwState {
+    /// Question text being typed, then the submitted question.
+    pub input: String,
+    /// Answer streamed back so far.
+    pub answer: String,
+    /// A request is in flight.
+    pub loading: bool,
+    /// The request finished (answer complete) or failed.
+    pub done: bool,
+    /// Failure text when the request failed.
+    pub error: Option<String>,
+    /// Scroll offset (lines) for long answers.
+    pub scroll: u16,
 }
 
 /// One rewindable prompt: a user message plus the code changes the turn

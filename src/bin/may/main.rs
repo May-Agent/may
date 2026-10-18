@@ -633,6 +633,7 @@ where
             Event::Terminal(terminal_event) => {
                 // Check for interrupt during agent processing
                 if agent_handle.is_some()
+                    && matches!(app.mode, may_agent::tui::AppMode::Chat)
                     && let AppEvent::Key(key_code, modifiers) = &*terminal_event
                 {
                     let is_ctrl_c = *key_code == KeyCode::Char('c')
