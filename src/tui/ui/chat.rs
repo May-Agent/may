@@ -17,6 +17,7 @@ use super::super::queue::Attachment;
 use super::markdown;
 use super::streaming_markdown::IMAGE_HEIGHT;
 use crate::agent::ContextReport;
+use crate::todo_parser::TodoChecklistItem;
 
 /// Status of a tool call.
 #[derive(Debug, Clone)]
@@ -256,26 +257,6 @@ impl ToolDisplay {
     }
 }
 
-/// Status of a todo item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TodoStatus {
-    /// Todo not started.
-    Pending,
-    /// Todo in progress.
-    InProgress,
-    /// Todo completed.
-    Completed,
-}
-
-/// A todo item.
-#[derive(Debug, Clone)]
-pub struct TodoItem {
-    /// Todo text.
-    pub content: String,
-    /// Item status.
-    pub status: TodoStatus,
-}
-
 /// An element in the chat stream.
 #[derive(Debug, Clone)]
 pub enum ChatElement {
@@ -307,7 +288,7 @@ pub enum ChatElement {
     /// Todo block
     TodoBlock {
         /// Todo items.
-        items: Vec<TodoItem>,
+        items: Vec<TodoChecklistItem>,
     },
     /// Error message
     Error {
@@ -791,7 +772,7 @@ impl ChatStream {
     }
 
     /// Set the todo block (replaces previous).
-    pub fn set_todos(&mut self, items: Vec<TodoItem>) {
+    pub fn set_todos(&mut self, items: Vec<TodoChecklistItem>) {
         // Remove existing todo block
         self.elements
             .retain(|e| !matches!(e, ChatElement::TodoBlock { .. }));
@@ -1254,12 +1235,8 @@ fn plain_lines_for_element(elem: &ChatElement, images_supported: bool) -> Vec<Li
         ChatElement::TodoBlock { items } => {
             lines.push(Line::from("[todo] ────────────────────────────"));
             for item in items {
-                let marker = match item.status {
-                    TodoStatus::Pending => "[ ]",
-                    TodoStatus::InProgress => "[>]",
-                    TodoStatus::Completed => "[x]",
-                };
-                lines.push(Line::from(format!("  {marker} {}", item.content)));
+                let marker = if item.checked { "[x]" } else { "[ ]" };
+                lines.push(Line::from(format!("  {marker} {}", item.text)));
             }
             lines.push(Line::from("─────────────────────────────────────"));
             lines.push(Line::from(""));
@@ -1703,14 +1680,14 @@ fn render_impl(
                 )));
 
                 for item in items {
-                    let (marker, style) = match item.status {
-                        TodoStatus::Pending => ("[ ]", Style::default()),
-                        TodoStatus::InProgress => ("[>]", Style::default().fg(Color::Yellow)),
-                        TodoStatus::Completed => ("[x]", Style::default().fg(Color::DarkGray)),
+                    let (marker, style) = if item.checked {
+                        ("[x]", Style::default().fg(Color::DarkGray))
+                    } else {
+                        ("[ ]", Style::default())
                     };
                     lines.push(Line::from(vec![
                         Span::styled(format!("  {marker} "), style),
-                        Span::styled(&item.content, style),
+                        Span::styled(&item.text, style),
                     ]));
                 }
 
@@ -2924,5 +2901,38 @@ mod tests {
         let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert!(lines[0].contains("Thought")); // first burst collapsed
         assert!(lines.iter().any(|l| l.contains("second")));
+    }
+
+    /// A tasks.md document parsed into a checklist feeds the todo block —
+    /// the same path `refresh_todos` uses after tool calls and on session
+    /// load.
+    #[test]
+    fn set_todos_renders_parsed_session_checklist() {
+        let checklist =
+            crate::todo_parser::TodoChecklist::parse("- [x] write report\n- [ ] ship it\n");
+        let mut chat = ChatStream::new();
+        chat.push_text("earlier content");
+        chat.end_text();
+        chat.set_todos(checklist.items.clone());
+
+        let items = chat
+            .elements()
+            .iter()
+            .find_map(|element| match element {
+                ChatElement::TodoBlock { items } => Some(items),
+                _ => None,
+            })
+            .expect("a non-empty checklist should produce a todo block");
+        assert_eq!(items, &checklist.items);
+
+        // A subsequent parse replaces the previous block rather than
+        // stacking a second one.
+        chat.set_todos(Vec::new());
+        assert!(
+            chat.elements()
+                .iter()
+                .all(|element| !matches!(element, ChatElement::TodoBlock { .. })),
+            "an empty checklist should remove the todo block"
+        );
     }
 }

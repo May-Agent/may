@@ -213,49 +213,6 @@ impl ChatDb {
         Ok(())
     }
 
-    // ── Session Tasks (DB-backed plan/todo) ──────────────────
-
-    /// Get the tasks content for a session.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
-    pub async fn get_session_tasks(&self, session_id: &str) -> Result<Option<String>, ChatDbError> {
-        #[derive(serde::Deserialize, skyzen::FromRow)]
-        struct Row {
-            content: String,
-        }
-        Ok(query!(
-            self.db,
-            "SELECT content FROM session_tasks WHERE session_id = ?",
-            session_id
-        )
-        .fetch_optional::<Row>()
-        .await?
-        .map(|r| r.content))
-    }
-
-    /// Upsert the tasks content for a session.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
-    pub async fn set_session_tasks(
-        &self,
-        session_id: &str,
-        content: &str,
-    ) -> Result<(), ChatDbError> {
-        let now = jiff::Timestamp::now().to_string();
-        query!(
-            self.db,
-            "INSERT INTO session_tasks (session_id, content, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-            session_id,
-            content,
-            now
-        )
-        .execute()
-        .await?;
-        Ok(())
-    }
-
     // ── Global Memory (DB-backed MEMORY.md replacement) ──────
 
     /// Get the global memory content.

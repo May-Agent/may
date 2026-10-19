@@ -62,7 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_network_access_logs_timestamp ON network_access_l
 CREATE INDEX IF NOT EXISTS idx_network_access_logs_session ON network_access_logs(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_session_pending_permissions_session ON session_pending_permissions(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_pending_workspace_session ON session_pending_workspace(session_id);
-CREATE TABLE IF NOT EXISTS session_tasks (session_id TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at TEXT NOT NULL);
+DROP TABLE IF EXISTS session_tasks;
 CREATE TABLE IF NOT EXISTS global_memory (id INTEGER PRIMARY KEY CHECK (id = 1), content TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS profile_remote_servers (profile_id TEXT NOT NULL, ssh_server_name TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, PRIMARY KEY (profile_id, ssh_server_name));
 CREATE INDEX IF NOT EXISTS idx_profile_remote_servers_profile ON profile_remote_servers(profile_id, sort_order);
