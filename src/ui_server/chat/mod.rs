@@ -1394,8 +1394,8 @@ fn run_agent_loop<'a>(
             let mut pending_tool_streams: std::collections::HashMap<String, PendingToolStream> =
                 std::collections::HashMap::new();
             let mut last_todo_hash: Option<u64> = None;
-            let tasks_db = state.db();
-            let tasks_session_id = req.session_id.clone();
+            let session_paths =
+                session_paths_for_session(state, profile_id.as_deref(), &session_id);
             let mut turn_persister = turn_persister::TurnPersister::new(session_id.as_str());
 
             let mut terminal_error: Option<aither_agent::AgentError> = None;
@@ -1683,12 +1683,8 @@ fn run_agent_loop<'a>(
                             }
 
                             // Check if tasks.md changed after tool execution.
-                            if let Some(checklist) = check_tasks_update(
-                                &tasks_db,
-                                &tasks_session_id,
-                                &mut last_todo_hash,
-                            )
-                            .await
+                            if let Some(checklist) =
+                                check_tasks_update(&session_paths, &mut last_todo_hash).await
                                 && !sink.on_todo_update(&checklist).await
                             {
                                 cancellation_reason =
@@ -2956,13 +2952,19 @@ fn prepare_agent_for_request<'a>(
 /// Read tasks.md and return the parsed checklist if its content changed since the last check.
 /// The sink is responsible for wrapping it in the SSE envelope with `seq/turn_id`.
 async fn check_tasks_update(
-    db: &crate::db::ChatDb,
-    session_id: &str,
+    paths: &SessionPaths,
     last_hash: &mut Option<u64>,
 ) -> Option<crate::todo_parser::TodoChecklist> {
     use std::hash::{Hash, Hasher};
 
-    let content = db.get_session_tasks(session_id).await.ok()??;
+    let content = match paths.tasks_content().await {
+        Ok(Some(content)) => content,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(path = %paths.tasks_path().display(), error = %error, "failed to read session tasks.md");
+            return None;
+        }
+    };
     let mut hasher = std::hash::DefaultHasher::new();
     content.hash(&mut hasher);
     let hash = hasher.finish();
@@ -3305,6 +3307,58 @@ mod tests {
                 name: "terminal".to_string(),
                 arguments: "{\"command\":\"date\"}".to_string(),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn check_tasks_update_reads_tasks_file_and_dedupes_unchanged_content() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let paths = crate::session::SessionPaths::new(dir.path().to_path_buf());
+        let tasks_path = paths.tasks_path();
+        let mut last_hash = None;
+
+        // A missing file yields no update.
+        assert!(
+            super::check_tasks_update(&paths, &mut last_hash)
+                .await
+                .is_none()
+        );
+
+        // A model-side write produces the parsed checklist once.
+        async_fs::write(&tasks_path, "- [x] done\n- [ ] pending\n")
+            .await
+            .expect("tasks.md should be written");
+        let checklist = super::check_tasks_update(&paths, &mut last_hash)
+            .await
+            .expect("a written tasks.md should produce a checklist");
+        assert_eq!(checklist.total(), 2);
+        assert_eq!(checklist.completed(), 1);
+
+        // The same content is deduplicated by hash.
+        assert!(
+            super::check_tasks_update(&paths, &mut last_hash)
+                .await
+                .is_none()
+        );
+
+        // A further model-side write produces an updated checklist.
+        async_fs::write(&tasks_path, "- [ ] new task\n")
+            .await
+            .expect("tasks.md should be rewritten");
+        let checklist = super::check_tasks_update(&paths, &mut last_hash)
+            .await
+            .expect("a changed tasks.md should produce a new checklist");
+        assert_eq!(checklist.total(), 1);
+        assert_eq!(checklist.items[0].text, "new task");
+
+        // A document without checklist items produces no update.
+        async_fs::write(&tasks_path, "just prose\n")
+            .await
+            .expect("tasks.md should be rewritten");
+        assert!(
+            super::check_tasks_update(&paths, &mut last_hash)
+                .await
+                .is_none()
         );
     }
 }
