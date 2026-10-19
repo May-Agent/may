@@ -62,6 +62,10 @@ enum MockChatScenario {
     /// Answers every agent turn with the same text, so one session can run
     /// several turns against one mock server.
     TextEveryTurn(String),
+    /// First turn writes `tasks.md` through the terminal tool; every later
+    /// request gets a plain text reply, so follow-up turns can probe what
+    /// the model side injects from the file.
+    WritesTasksFile,
 }
 
 struct MockOpenAiServer {
@@ -294,10 +298,58 @@ impl MockScenarioState {
                     ));
                 }
             },
+            MockChatScenario::WritesTasksFile => {
+                // The run loop keeps the model going while the injected
+                // `<tasks>` document has unchecked items, so the mock
+                // finishes the checklist whenever it sees one and replies
+                // with plain text once everything is checked.
+                let script = match tasks_injection(request) {
+                    None if self.request_index == 0 => Some(TASKS_PARTIAL_SCRIPT),
+                    Some(tasks) if tasks.contains("- [ ]") => Some(TASKS_DONE_SCRIPT),
+                    _ => None,
+                };
+                match script {
+                    Some(script) => MockHttpResponse::sse(vec![
+                        delayed_sse_frame(
+                            tool_call_chunk(
+                                &format!("call-tasks-md-{}", self.request_index),
+                                "terminal",
+                                &serde_json::json!({
+                                    "description": "Record the plan in tasks.md",
+                                    "script": script,
+                                    "mode": "sandboxed",
+                                    "raw": true,
+                                    "timeout": 10,
+                                    "max_lines": 50
+                                }),
+                            ),
+                            Duration::from_millis(10),
+                        ),
+                        done_frame(Duration::from_millis(10)),
+                    ]),
+                    None => MockHttpResponse::sse(text_stream_frames(
+                        vec!["tasks recorded".to_string()],
+                        Duration::from_millis(10),
+                    )),
+                }
+            }
         };
         self.request_index += 1;
         Ok(response)
     }
+}
+
+const TASKS_PARTIAL_SCRIPT: &str = "printf -- '- [x] write report\\n- [ ] ship it\\n' > tasks.md";
+const TASKS_DONE_SCRIPT: &str = "printf -- '- [x] write report\\n- [x] ship it\\n' > tasks.md";
+
+/// The `<tasks>` system message the run loop injects from `tasks.md`.
+fn tasks_injection(request: &Value) -> Option<&str> {
+    request
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .rfind(|content| content.starts_with("<tasks>"))
 }
 
 fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
@@ -1680,6 +1732,133 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
     expect_status(&server.log, missing_response, StatusCode::NOT_FOUND).await;
 
     server.stop().await;
+}
+
+/// `tasks.md` in the session directory is the single source of truth: a
+/// model-side write streams a `todo_update` and is served by `GET /tasks`,
+/// while `PUT /tasks` lands on disk where the next model request's tasks
+/// injection reads it.
+#[tokio::test]
+#[serial]
+async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
+    const MODEL_WRITTEN: &str = "- [x] write report\n- [x] ship it\n";
+    const REWRITTEN: &str = "- [ ] rewritten plan\n";
+
+    let mock = MockOpenAiServer::spawn(MockChatScenario::WritesTasksFile).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
+        .sandbox_dir(&session_id, Some(environment.profile_id()));
+
+    let response = client
+        .post(format!("{}/api/chat/stream", server.base_url))
+        .json(&serde_json::json!({
+            "sessionId": session_id,
+            "content": "Plan the work in tasks.md."
+        }))
+        .send()
+        .await
+        .expect("chat stream request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let events = collect_sse_events(response).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "chat stream should complete; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+
+    // The tool-end tasks check parsed the freshly written file and pushed
+    // its checklist down the stream.
+    let todo_update = events
+        .iter()
+        .find(|(kind, _)| kind == "todo_update")
+        .expect("a tool call writing tasks.md should emit todo_update");
+    assert_eq!(
+        todo_update.1.get("items"),
+        Some(&serde_json::json!([
+            { "text": "write report", "checked": true },
+            { "text": "ship it", "checked": false },
+        ])),
+        "todo_update should carry the parsed tasks.md items: {todo_update:?}"
+    );
+
+    // GET serves the file the model wrote.
+    let tasks_url = format!("{}/api/sessions/{session_id}/tasks", server.base_url);
+    let response = client
+        .get(&tasks_url)
+        .send()
+        .await
+        .expect("get tasks request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let payload: Value = response
+        .json()
+        .await
+        .expect("tasks payload should be valid JSON");
+    assert_eq!(
+        payload.get("content").and_then(Value::as_str),
+        Some(MODEL_WRITTEN)
+    );
+
+    // PUT lands on disk, where the next model request's injection reads it.
+    let response = client
+        .put(&tasks_url)
+        .json(&serde_json::json!({ "content": REWRITTEN, "planState": "disabled" }))
+        .send()
+        .await
+        .expect("put tasks request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let payload: Value = response
+        .json()
+        .await
+        .expect("put tasks response should be valid JSON");
+    assert_eq!(
+        payload.get("content").and_then(Value::as_str),
+        Some(REWRITTEN)
+    );
+    assert_eq!(
+        payload.get("planState").and_then(Value::as_str),
+        Some("disabled")
+    );
+    let on_disk = tokio::fs::read_to_string(sandbox_dir.join("tasks.md"))
+        .await
+        .expect("PUT should have written the canonical tasks.md");
+    assert_eq!(on_disk, REWRITTEN);
+
+    // A follow-up turn proves the injection reads the file: the rewritten
+    // content shows up in the next model request.
+    let response = client
+        .post(format!("{}/api/chat/stream", server.base_url))
+        .json(&serde_json::json!({
+            "sessionId": session_id,
+            "content": "Continue."
+        }))
+        .send()
+        .await
+        .expect("second chat stream request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let events = collect_sse_events(response).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "second chat stream should complete; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+    let requests = mock.agent_requests().await;
+    let injected = requests
+        .iter()
+        .filter_map(tasks_injection)
+        .any(|tasks| tasks.contains("rewritten plan"));
+    assert!(
+        injected,
+        "the next model request should inject the PUT-written tasks.md"
+    );
+
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
 }
 
 /// A 500's response body is redacted, so the server log is the only place its
