@@ -250,6 +250,23 @@ impl SessionPaths {
         self.root.join("tasks.md")
     }
 
+    /// Contents of the session's `tasks.md`; `Ok(None)` when absent.
+    ///
+    /// The file is the canonical task document — the model edits it inside
+    /// the session sandbox and every reader (run loop, REST surface, TUI)
+    /// goes through this read so all of them observe the same bytes.
+    ///
+    /// # Errors
+    /// Returns the underlying IO error when the read fails for a reason
+    /// other than the file being absent.
+    pub async fn tasks_content(&self) -> std::io::Result<Option<String>> {
+        match async_fs::read_to_string(self.tasks_path()).await {
+            Ok(content) => Ok(Some(content)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Workspace configuration scoped to the session home/profile home.
     #[must_use]
     pub fn workspace_config(&self) -> PathBuf {

@@ -221,7 +221,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 }
                 render_oneshot_event(&mut stderr, &result)?;
                 let run_failed = result.is_err();
-                let ended = app.handle_agent_event(result);
+                let ended = app.handle_agent_event(result).await;
                 if ended {
                     runtime_deps
                         .finish_agent_task(
