@@ -19,17 +19,17 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
 # Aither framework
-aither-core = { version = "0.9.2" }
-aither-agent = { version = "0.9.2", features = ["mcp", "websearch", "webfetch", "skills"] }
-aither-sandbox = { version = "0.9.2" }
-aither-cloud = { version = "0.9.2" }
-aither-rag = { version = "0.9.2" }
-aither-copilot = { version = "0.9.2" }
-aither-codex = { version = "0.9.2" }
-aither-models = { version = "0.9.2" }
-aither-mcp = { version = "0.9.2" }
-aither-browser = { version = "0.9.2" }
-aither-search = { version = "0.9.2" }
+aither-core = { version = "0.10" }
+aither-agent = { version = "0.10", features = ["mcp", "websearch", "webfetch", "skills"] }
+aither-sandbox = { version = "0.10" }
+aither-cloud = { version = "0.10" }
+aither-rag = { version = "0.10" }
+aither-copilot = { version = "0.10" }
+aither-codex = { version = "0.10" }
+aither-models = { version = "0.10" }
+aither-mcp = { version = "0.10" }
+aither-browser = { version = "0.10" }
+aither-search = { version = "0.10" }
 
 # Container runtime (Docker/OrbStack/Podman)
 bollard = "0.21"
@@ -227,24 +227,3 @@ opt-level = 3
 
 [profile.dev.package.tar]
 opt-level = 3
-
-[patch.crates-io]
-aither-agent = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-attachments = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-browser = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-claude = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-cloud = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-codex = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-copilot = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-core = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-derive = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-gemini = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-mcp = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-models = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-openai = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-rag = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-sandbox = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-search = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-skills = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-webfetch = { git = "https://github.com/lexoliu/aither", branch = "dev" }
-aither-websearch = { git = "https://github.com/lexoliu/aither", branch = "dev" }
