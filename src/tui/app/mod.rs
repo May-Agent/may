@@ -1325,6 +1325,7 @@ impl App {
         );
         self.image_manager = Some(ImageManager::new(&session_dir));
         self.text_manager = Some(TextManager::new(&session_dir));
+        self.refresh_todos().await;
 
         // Reset usage tracking for new session
         self.usage = None;
@@ -2425,8 +2426,31 @@ impl App {
         self.chat.start_loading();
     }
 
+    /// Re-read the session's canonical `tasks.md` and refresh the todo
+    /// block. `async_fs` keeps the filesystem IO off the UI thread.
+    async fn refresh_todos(&mut self) {
+        let Some(session) = self.session_manager.current() else {
+            return;
+        };
+        let paths = self
+            .session_manager
+            .store()
+            .session_paths(session.id.as_str(), session.profile_id.as_deref());
+        match paths.tasks_content().await {
+            Ok(content) => {
+                let checklist = crate::todo_parser::TodoChecklist::parse(
+                    content.as_deref().unwrap_or_default(),
+                );
+                self.chat.set_todos(checklist.items);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to read session tasks.md");
+            }
+        }
+    }
+
     /// Handle an agent event. Returns true if stream ended.
-    pub fn handle_agent_event(&mut self, result: Result<AgentEvent, AgentError>) -> bool {
+    pub async fn handle_agent_event(&mut self, result: Result<AgentEvent, AgentError>) -> bool {
         match result {
             Ok(event) => {
                 match event {
@@ -2515,6 +2539,7 @@ impl App {
                         }
                         self.live_reads.remove(&id);
                         self.request_file_diff(&id);
+                        self.refresh_todos().await;
                     }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events

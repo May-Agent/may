@@ -599,7 +599,7 @@ where
                         if let Ok(AgentEvent::Text(ref text)) = result {
                             assistant_response.push_str(text);
                         }
-                        let ended = app.handle_agent_event(result);
+                        let ended = app.handle_agent_event(result).await;
                         if ended {
                             runtime_deps
                                 .finish_agent_task(

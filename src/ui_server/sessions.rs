@@ -143,14 +143,14 @@ pub(super) async fn get_session_tasks(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let db = state.db();
+    let paths = super::helpers::load_session_paths(&state, &id).await?;
     let runtime = state
         .runtime_service
         .get(&id)
         .await
         .map_err(internal_error)?;
-    let content = db
-        .get_session_tasks(&id)
+    let content = paths
+        .tasks_content()
         .await
         .map_err(internal_error)?
         .unwrap_or_default();
@@ -186,8 +186,8 @@ pub(super) async fn save_session_tasks(
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let db = state.db();
-    db.set_session_tasks(&id, &payload.content)
+    let paths = super::helpers::load_session_paths(&state, &id).await?;
+    async_fs::write(paths.tasks_path(), &payload.content)
         .await
         .map_err(internal_error)?;
     let runtime = state
@@ -195,13 +195,8 @@ pub(super) async fn save_session_tasks(
         .set_plan_state(&id, payload.plan_state)
         .await
         .map_err(internal_error)?;
-    let content = db
-        .get_session_tasks(&id)
-        .await
-        .map_err(internal_error)?
-        .unwrap_or_default();
     Ok(Json(SessionTasksPayload {
-        content,
+        content: payload.content,
         plan_state: runtime.plan_state,
     }))
 }
