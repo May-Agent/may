@@ -448,7 +448,7 @@ pub fn build_terminal_runtime_context(
             "tasks.md - canonical task/plan document for long-running work".to_string(),
         ],
         command_rules: vec![
-            "The only native execution tool is `terminal`. `terminal_kill`, `terminal_input`, and `terminal_read` manage background terminal jobs. Higher-level capabilities are terminal CLI commands exposed through the IPC bridge rather than extra native tools; rely on runtime tool descriptions and command `--help` output instead of assuming a static command list.".to_string(),
+            "The native tools are `terminal`, which executes commands, and `terminal_kill`, `terminal_input`, and `terminal_read`, which manage its background jobs. Higher-level capabilities are terminal CLI commands exposed through the IPC bridge rather than extra native tools; rely on runtime tool descriptions and command `--help` output instead of assuming a static command list.".to_string(),
             "Issue at most one tool call per assistant turn. If you need multiple operations or parallel work, compose them inside one terminal command with shell control flow, pipelines, or background jobs instead of emitting multiple tool calls in the same response.".to_string(),
             "Read a selected skill completely before acting on it. The terminal call that reads the skill must finish before any task command that depends on those instructions.".to_string(),
             "IPC-backed commands are only valid when executed inside this profile's home environment. If you get a system-reminder because you tried to call a non-existent direct tool, immediately retry through `terminal` with the corresponding CLI command.".to_string(),
