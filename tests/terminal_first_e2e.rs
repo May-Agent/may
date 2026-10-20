@@ -357,10 +357,23 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
         .get("tools")
         .and_then(Value::as_array)
         .ok_or_else(|| "initial model request has no native tool definitions".to_string())?;
-    if tools.len() != 1
-        || tools[0].pointer("/function/name").and_then(Value::as_str) != Some("terminal")
+    let mut names = tools
+        .iter()
+        .map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| format!("native tool definition without a name: {tools:?}"))?;
+    names.sort_unstable();
+    if names
+        != [
+            "terminal",
+            "terminal_input",
+            "terminal_kill",
+            "terminal_read",
+        ]
     {
-        return Err(format!("expected only the native terminal tool: {tools:?}"));
+        return Err(format!(
+            "expected the native terminal tool and its controls: {names:?}"
+        ));
     }
     Ok(())
 }
