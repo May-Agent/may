@@ -18,6 +18,8 @@
 //! └──────────────┘                     └───────────────────────┘
 //! ```
 
+use std::future::Future;
+
 use aither_agent::{AgentEvent, CompactResult};
 use aither_core::llm::Attachment;
 use async_channel::{Receiver, Sender, unbounded};
@@ -278,7 +280,7 @@ async fn run_worker(
                 attachments,
                 event_tx,
             } => {
-                let completed = Box::pin(run_agent_prompt(
+                let outcome = Box::pin(run_agent_prompt(
                     &mut agent,
                     &prompt,
                     hidden_context.as_deref(),
@@ -288,29 +290,51 @@ async fn run_worker(
                     &event_tx,
                 ))
                 .await;
-                if completed {
-                    let session_id = agent.session_id().as_str().to_string();
-                    let _ = crate::session::persist_agent_context_snapshot(
-                        &snapshot_db,
-                        &session_id,
-                        &mut agent,
-                    )
-                    .await;
+                match outcome {
+                    WorkOutcome::Finished(()) => {
+                        let session_id = agent.session_id().as_str().to_string();
+                        let _ = crate::session::persist_agent_context_snapshot(
+                            &snapshot_db,
+                            &session_id,
+                            &mut agent,
+                        )
+                        .await;
+                    }
+                    WorkOutcome::Cancelled => {}
+                    WorkOutcome::Shutdown => break,
                 }
             }
             WorkerCommand::Compact { focus, event_tx } => {
-                let result = agent.compact(focus.as_deref()).await;
-                if result.is_ok() {
-                    let session_id = agent.session_id().as_str().to_string();
-                    let _ = crate::session::persist_agent_context_snapshot(
-                        &snapshot_db,
-                        &session_id,
-                        &mut agent,
-                    )
-                    .await;
+                match race_against_commands(
+                    agent.compact(focus.as_deref()),
+                    &command_rx,
+                    &command_tx,
+                )
+                .await
+                {
+                    WorkOutcome::Finished(result) => {
+                        if result.is_ok() {
+                            let session_id = agent.session_id().as_str().to_string();
+                            let _ = crate::session::persist_agent_context_snapshot(
+                                &snapshot_db,
+                                &session_id,
+                                &mut agent,
+                            )
+                            .await;
+                        }
+                        let _ = event_tx.send(TuiEvent::Compacted(result)).await;
+                        let _ = event_tx.send(TuiEvent::Complete).await;
+                    }
+                    WorkOutcome::Cancelled => {
+                        // The compact future was dropped before it could
+                        // mutate the conversation; Complete settles the TUI.
+                        let _ = event_tx.send(TuiEvent::Complete).await;
+                    }
+                    WorkOutcome::Shutdown => {
+                        let _ = event_tx.send(TuiEvent::Complete).await;
+                        break;
+                    }
                 }
-                let _ = event_tx.send(TuiEvent::Compacted(result)).await;
-                let _ = event_tx.send(TuiEvent::Complete).await;
             }
             WorkerCommand::ContextReport { event_tx } => {
                 let report = agent.context_report().await;
@@ -327,6 +351,52 @@ async fn run_worker(
     }
 }
 
+/// How in-flight work ended relative to the worker command channel.
+enum WorkOutcome<T> {
+    /// The work produced its value before a command interrupted it.
+    Finished(T),
+    /// `Cancel` interrupted the work; the worker returns to idle.
+    Cancelled,
+    /// `Shutdown` or a closed command channel interrupted the work; the
+    /// worker loop must stop.
+    Shutdown,
+}
+
+/// Race `work` against the worker command channel.
+///
+/// `Cancel` and `Shutdown` end the race early and drop `work` where it
+/// stands. A `ContextReport` received meanwhile is held and requeued once
+/// the race ends, so it is answered when the worker is idle again — the
+/// in-flight work borrows the agent, so a report cannot be measured
+/// mid-turn, and requeueing it during the race would hand it straight back
+/// to this loop. `Run` and `Compact` commands arriving mid-work are ignored.
+async fn race_against_commands<F: Future>(
+    work: F,
+    command_rx: &Receiver<WorkerCommand>,
+    command_tx: &Sender<WorkerCommand>,
+) -> WorkOutcome<F::Output> {
+    let mut deferred = Vec::new();
+    let outcome = futures_lite::future::or(async { WorkOutcome::Finished(work.await) }, async {
+        loop {
+            let Ok(command) = command_rx.recv().await else {
+                // Channel closed — every sender is gone; stop the worker.
+                return WorkOutcome::Shutdown;
+            };
+            match command {
+                WorkerCommand::Cancel => return WorkOutcome::Cancelled,
+                WorkerCommand::Shutdown => return WorkOutcome::Shutdown,
+                WorkerCommand::ContextReport { event_tx } => deferred.push(event_tx),
+                WorkerCommand::Run { .. } | WorkerCommand::Compact { .. } => {}
+            }
+        }
+    })
+    .await;
+    for event_tx in deferred {
+        let _ = command_tx.try_send(WorkerCommand::ContextReport { event_tx });
+    }
+    outcome
+}
+
 /// Run a single prompt and stream events.
 async fn run_agent_prompt(
     agent: &mut MayAgent,
@@ -336,84 +406,40 @@ async fn run_agent_prompt(
     command_rx: &Receiver<WorkerCommand>,
     command_tx: &Sender<WorkerCommand>,
     event_tx: &Sender<TuiEvent>,
-) -> bool {
+) -> WorkOutcome<()> {
     agent.sync_runtime_context().await;
     let mut stream = agent.run_with_hidden_context(prompt, hidden_context, attachments);
 
     loop {
-        // Race between stream event and cancel command
-        let event = futures_lite::future::or(
-            async {
-                stream
-                    .next()
-                    .await
-                    .map_or(Some(TuiEvent::Complete), |result| {
-                        Some(TuiEvent::Agent(result))
-                    })
-            },
-            async {
-                // Check for cancel command (non-blocking peek then async recv)
-                if let Ok(cmd) = command_rx.try_recv() {
-                    match cmd {
-                        WorkerCommand::Cancel | WorkerCommand::Shutdown => return None,
-                        // The run stream borrows the agent, so a context
-                        // report cannot be measured mid-turn — requeue it to
-                        // answer with the post-turn context.
-                        WorkerCommand::ContextReport { event_tx } => {
-                            let _ = command_tx.try_send(WorkerCommand::ContextReport { event_tx });
-                        }
-                        // Ignore new run/compact commands during processing
-                        WorkerCommand::Run { .. } | WorkerCommand::Compact { .. } => {}
-                    }
-                }
-                // Wait for cancel (this will also catch shutdown)
-                loop {
-                    if let Ok(cmd) = command_rx.recv().await {
-                        match cmd {
-                            WorkerCommand::Cancel | WorkerCommand::Shutdown => return None,
-                            WorkerCommand::ContextReport { event_tx } => {
-                                let _ =
-                                    command_tx.try_send(WorkerCommand::ContextReport { event_tx });
-                            }
-                            WorkerCommand::Run { .. } | WorkerCommand::Compact { .. } => {
-                                // Ignore new run/compact commands during processing
-                                continue;
-                            }
-                        }
-                    }
-                    // Channel closed
-                    return None;
-                }
-            },
-        )
-        .await;
-
-        match event {
-            Some(TuiEvent::Complete) => {
-                let _ = event_tx.send(TuiEvent::Complete).await;
-                return true;
-            }
-            Some(tui_event) => {
-                if event_tx.send(tui_event).await.is_err() {
+        // Race between the next stream event and a cancel command
+        match race_against_commands(stream.next(), command_rx, command_tx).await {
+            WorkOutcome::Finished(Some(result)) => {
+                if event_tx.send(TuiEvent::Agent(result)).await.is_err() {
                     // Receiver dropped, stop processing
-                    return false;
+                    return WorkOutcome::Cancelled;
                 }
             }
-            None => {
-                // Cancelled
-                break;
+            WorkOutcome::Finished(None) => {
+                let _ = event_tx.send(TuiEvent::Complete).await;
+                return WorkOutcome::Finished(());
+            }
+            WorkOutcome::Cancelled => break,
+            WorkOutcome::Shutdown => {
+                let _ = event_tx.send(TuiEvent::Complete).await;
+                return WorkOutcome::Shutdown;
             }
         }
     }
 
     // Send completion after cancel so TUI knows processing stopped
     let _ = event_tx.send(TuiEvent::Complete).await;
-    false
+    WorkOutcome::Cancelled
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ContextCategory;
 
     #[test]
     fn test_agent_handle_cancel() {
@@ -425,5 +451,134 @@ mod tests {
             command_tx,
         };
         handle.cancel();
+    }
+
+    /// Cancelling an in-flight compaction drops the compact future: the
+    /// worker goes back to idle and the conversation is left untouched.
+    ///
+    /// The agent's model is an `OpenAI` client pointed at a stub HTTP server
+    /// that answers `GET /models` (so `profile()` falls back to the
+    /// aither-models registry) but accepts a completion request and never
+    /// responds — from the agent's side the model's stream never yields.
+    #[tokio::test]
+    async fn cancel_during_compact_returns_worker_to_idle() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub server");
+        let addr = listener.local_addr().expect("stub server addr");
+        // Notified once the completion request arrives — proof that the
+        // compaction is in flight against the model.
+        let (request_tx, request_rx) = unbounded::<()>();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let request_tx = request_tx.clone();
+                tokio::spawn(async move {
+                    let mut head = [0u8; 2048];
+                    let read = socket.read(&mut head).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&head[..read]);
+                    if request
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.contains("/models"))
+                    {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    let _ = request_tx.send(()).await;
+                    // Hold the connection open without answering.
+                    futures_lite::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let llm = crate::agent::RequestParameterizedModel::new(
+            aither_cloud::CloudProvider::OpenAI(
+                aither_cloud::openai::OpenAI::builder("test-key")
+                    .base_url(format!("http://{addr}"))
+                    .model("gpt-5")
+                    .no_retry()
+                    .build(),
+            ),
+            aither_core::llm::model::Parameters::default(),
+        );
+        let (mut agent, temp) = crate::agent::may::test_agent(llm, "openai", "gpt-5").await;
+        agent.push_message(aither_core::llm::Message::user("first turn"));
+        agent.push_message(aither_core::llm::Message::assistant("first answer"));
+
+        let db = crate::db::ChatDb::open(&temp.path().join("worker.db"))
+            .await
+            .expect("open worker db");
+        let worker = spawn_worker(executor_core::DefaultExecutor, agent, db);
+
+        // Baseline report: the worker answers while idle, and the Messages
+        // row captures the conversation footprint compaction must preserve.
+        let baseline = context_report(&worker, TIMEOUT).await;
+
+        let compact_handle = worker.compact(None);
+        tokio::time::timeout(TIMEOUT, request_rx.recv())
+            .await
+            .expect("compact request never reached the stub server")
+            .expect("stub server request channel closed");
+
+        compact_handle.cancel();
+        match tokio::time::timeout(TIMEOUT, compact_handle.recv()).await {
+            Ok(Some(TuiEvent::Complete)) => {}
+            other => panic!("expected Complete after cancel, got {other:?}"),
+        }
+        // Nothing further is sent on a cancelled compaction.
+        assert!(
+            matches!(
+                tokio::time::timeout(TIMEOUT, compact_handle.recv()).await,
+                Ok(None)
+            ),
+            "compaction channel must close after Complete"
+        );
+
+        // A following command is served right away, and the conversation is
+        // unchanged.
+        let after = context_report(&worker, TIMEOUT).await;
+        assert_eq!(
+            messages_row(&baseline),
+            messages_row(&after),
+            "cancelled compaction must leave the conversation untouched"
+        );
+
+        worker.shutdown();
+    }
+
+    /// The `Messages` row of a context report: estimated tokens plus the
+    /// "N messages" detail.
+    fn messages_row(report: &ContextReport) -> (usize, Option<String>) {
+        report
+            .categories
+            .iter()
+            .find(|row| row.kind == ContextCategory::Messages)
+            .map(|row| (row.tokens, row.detail.clone()))
+            .expect("context report carries a Messages row")
+    }
+
+    /// Issue a `/context` command and wait for its report — served only once
+    /// the worker is idle.
+    async fn context_report(worker: &AgentWorker, timeout: std::time::Duration) -> ContextReport {
+        let handle = worker.context_report();
+        let report = async {
+            match handle.recv().await {
+                Some(TuiEvent::ContextReport(report)) => {
+                    report.expect("context report should assemble")
+                }
+                Some(other) => panic!("unexpected event before context report: {other:?}"),
+                None => panic!("context report channel closed"),
+            }
+        };
+        tokio::time::timeout(timeout, report)
+            .await
+            .expect("context report timed out — worker never became idle")
     }
 }

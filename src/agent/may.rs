@@ -1031,57 +1031,65 @@ fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
         .map_or(input, |(idx, _)| &input[..idx])
 }
 
+/// Builds a `MayAgent` around the given model for tests. Hooks are
+/// constructed without a live database, which makes them no-ops.
+#[cfg(test)]
+pub async fn test_agent(
+    llm: RequestParameterizedModel<CloudProvider>,
+    provider_id: &str,
+    model_id: &str,
+) -> (MayAgent, tempfile::TempDir) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db = crate::db::ChatDb::open(&temp.path().join("history.db"))
+        .await
+        .expect("open test db");
+    let session_id = SessionId::new();
+    let inner = Agent::builder(llm.clone())
+        .hook(ContextSnapshotHook::new(None, &session_id))
+        .hook(PendingSteerHook::new(None, &session_id))
+        .build();
+    let (job_registry, service) = aither_sandbox::job_registry::job_registry_channel();
+    tokio::spawn(service.serve());
+    (
+        MayAgent {
+            inner,
+            session_id,
+            job_registry,
+            subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+            btw_llm: llm,
+            sandbox_dir: temp.path().join("sandbox"),
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            model_context_window: None,
+            mcp_command_names: Vec::new(),
+            runtime_system_context: RuntimeSystemContext::new(db, String::new()),
+            subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
+        },
+        temp,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use aither_core::llm::Role;
 
     use super::*;
 
-    /// Builds a `MayAgent` backed by a `Codex` provider — its `profile()` is a
-    /// static `aither-models` lookup, so initialization never touches the
-    /// network. Hooks are constructed without a live database, which makes
-    /// them no-ops.
-    async fn test_agent() -> (MayAgent, tempfile::TempDir) {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let db = crate::db::ChatDb::open(&temp.path().join("history.db"))
-            .await
-            .expect("open test db");
-        let session_id = SessionId::new();
-        let llm = RequestParameterizedModel::new(
+    /// A `Codex` provider — its `profile()` is a static `aither-models`
+    /// lookup, so initialization never touches the network.
+    fn codex_llm() -> RequestParameterizedModel<CloudProvider> {
+        RequestParameterizedModel::new(
             CloudProvider::Codex(aither_cloud::codex::Codex::new(
                 aither_cloud::codex::auth::CodexCredentials::new("test-access", "test-refresh"),
                 "gpt-5",
             )),
             Parameters::default(),
-        );
-        let inner = Agent::builder(llm.clone())
-            .hook(ContextSnapshotHook::new(None, &session_id))
-            .hook(PendingSteerHook::new(None, &session_id))
-            .build();
-        let (job_registry, service) = aither_sandbox::job_registry::job_registry_channel();
-        tokio::spawn(service.serve());
-        (
-            MayAgent {
-                inner,
-                session_id,
-                job_registry,
-                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
-                btw_llm: llm,
-                sandbox_dir: temp.path().join("sandbox"),
-                provider_id: "chatgpt".to_string(),
-                model_id: "gpt-5".to_string(),
-                model_context_window: None,
-                mcp_command_names: Vec::new(),
-                runtime_system_context: RuntimeSystemContext::new(db, String::new()),
-                subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
-            },
-            temp,
         )
     }
 
     #[tokio::test]
     async fn preview_with_hidden_context_leaves_conversation_untouched() {
-        let (mut agent, _temp) = test_agent().await;
+        let (mut agent, _temp) = test_agent(codex_llm(), "chatgpt", "gpt-5").await;
         agent.push_message(LlmMessage::user("first turn"));
         agent.push_message(LlmMessage::assistant("first answer"));
         let before = agent.inner.history();
@@ -1119,8 +1127,8 @@ mod tests {
 
     #[tokio::test]
     async fn preview_with_hidden_context_matches_run_position_on_fresh_agent() {
-        let (mut preview_agent, _temp) = test_agent().await;
-        let (mut run_agent, _temp2) = test_agent().await;
+        let (mut preview_agent, _temp) = test_agent(codex_llm(), "chatgpt", "gpt-5").await;
+        let (mut run_agent, _temp2) = test_agent(codex_llm(), "chatgpt", "gpt-5").await;
 
         let preview = preview_agent
             .preview_request_messages_with_hidden_context(
