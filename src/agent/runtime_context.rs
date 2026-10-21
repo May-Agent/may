@@ -14,7 +14,8 @@
 //! workspace prefix stays cached.
 
 use aither_agent::SubagentDefinition;
-use aither_core::llm::model::Ability;
+use aither_core::llm::model::{Ability, Parameters};
+use aither_core::llm::tool::ToolDefinition;
 use askama::Template;
 
 use super::may::{AgentEnvironment, MayAgentConfig, MayAgentError};
@@ -346,6 +347,12 @@ struct BaseSystemCommand {
 }
 
 #[derive(Clone)]
+struct BaseSystemNativeTool {
+    name: String,
+    description: String,
+}
+
+#[derive(Clone)]
 struct BaseSystemSkill {
     dir_name: String,
     name: String,
@@ -361,6 +368,10 @@ struct BaseSystemSubagent {
 #[derive(Clone, Template)]
 #[template(path = "base_system.md", escape = "none")]
 struct BaseSystemTemplate {
+    native_tools: Vec<BaseSystemNativeTool>,
+    has_hosted_web_search: bool,
+    has_hosted_web_fetch: bool,
+    has_browser_command: bool,
     has_commands: bool,
     commands: Vec<BaseSystemCommand>,
     has_skills: bool,
@@ -524,6 +535,8 @@ pub fn build_container_environment_context(cwd: &std::path::Path) -> String {
 
 pub async fn build_base_system_prompt(
     shared_terminal_commands: &[(String, String)],
+    native_tool_definitions: &[ToolDefinition],
+    request_parameters: &Parameters,
     skills_dir: &std::path::Path,
     subagents_dir: &std::path::Path,
 ) -> Result<String, MayAgentError> {
@@ -535,6 +548,29 @@ pub async fn build_base_system_prompt(
         })
         .collect::<Vec<_>>();
     commands.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut native_tools = native_tool_definitions
+        .iter()
+        .map(|definition| BaseSystemNativeTool {
+            name: definition.name().to_string(),
+            description: crate::terminal_commands::short_description(definition.description()),
+        })
+        .collect::<Vec<_>>();
+    let has_hosted_web_search = request_parameters.hosted_web_search();
+    let has_hosted_web_fetch = request_parameters.hosted_web_fetch();
+    if has_hosted_web_search {
+        native_tools.push(BaseSystemNativeTool {
+            name: "web_search".to_string(),
+            description: "Provider-hosted web search".to_string(),
+        });
+    }
+    if has_hosted_web_fetch {
+        native_tools.push(BaseSystemNativeTool {
+            name: "web_fetch".to_string(),
+            description: "Provider-hosted URL fetch".to_string(),
+        });
+    }
+    let has_browser_command = commands.iter().any(|command| command.name == "browser");
 
     let skills = SkillManager::from_skills_dir(skills_dir.to_path_buf())
         .list_skills()
@@ -554,6 +590,10 @@ pub async fn build_base_system_prompt(
     subagents.sort_by(|left, right| left.id.cmp(&right.id));
 
     let template = BaseSystemTemplate {
+        native_tools,
+        has_hosted_web_search,
+        has_hosted_web_fetch,
+        has_browser_command,
         has_commands: !commands.is_empty(),
         commands,
         has_skills: !skills.is_empty(),
@@ -733,7 +773,43 @@ fn proc_root_fs_type() -> Option<String> {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{RuntimeSystemContext, build_memory_context_content, tag};
+    use aither_core::llm::model::Parameters;
+    use aither_core::llm::tool::ToolDefinition;
+
+    use super::{
+        RuntimeSystemContext, build_base_system_prompt, build_memory_context_content, tag,
+    };
+
+    fn native_tool_definitions() -> Vec<ToolDefinition> {
+        [
+            (
+                "terminal",
+                "Execute terminal commands in a sandboxed environment.",
+            ),
+            (
+                "terminal_kill",
+                "Terminate a background terminal task by its task id.",
+            ),
+            (
+                "terminal_input",
+                "Send input to a background terminal task that is waiting on stdin.",
+            ),
+            (
+                "terminal_read",
+                "Read incremental output from a background terminal task.",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, description)| {
+            ToolDefinition::from_parts(
+                name.into(),
+                description.into(),
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+            .expect("tool definition schema should be valid")
+        })
+        .collect()
+    }
 
     fn test_db() -> crate::db::ChatDb {
         let dir = tempdir().expect("temp dir should be created");
@@ -863,6 +939,101 @@ mod tests {
             without_workdirs_fingerprint,
             context.stable_prefix_fingerprint(),
             "adding workdirs block must change the fingerprint",
+        );
+    }
+
+    fn render_base_system_prompt(
+        commands: &[(String, String)],
+        request_parameters: &Parameters,
+    ) -> String {
+        let dir = tempdir().expect("temp dir should be created");
+        tokio_test::block_on(build_base_system_prompt(
+            commands,
+            &native_tool_definitions(),
+            request_parameters,
+            dir.path(),
+            dir.path(),
+        ))
+        .expect("base system prompt should render")
+    }
+
+    #[test]
+    fn base_system_prompt_lists_native_tools() {
+        let prompt = render_base_system_prompt(&[], &Parameters::default());
+
+        let native_section = prompt
+            .split("<native_tools>")
+            .nth(1)
+            .and_then(|rest| rest.split("</native_tools>").next())
+            .expect("native tools section should render");
+        for name in [
+            "terminal",
+            "terminal_kill",
+            "terminal_input",
+            "terminal_read",
+        ] {
+            assert!(
+                native_section.contains(&format!("- {name}:")),
+                "native tool '{name}' missing: {native_section}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_system_prompt_advertises_hosted_web_search_and_fetch() {
+        let commands = vec![("browser".to_string(), "Drive the browser".to_string())];
+        let mut parameters = Parameters::default();
+        parameters.native_tools.claude.web_search = true;
+        parameters.native_tools.claude.web_fetch = true;
+
+        let prompt = render_base_system_prompt(&commands, &parameters);
+
+        let native_section = prompt
+            .split("<native_tools>")
+            .nth(1)
+            .and_then(|rest| rest.split("</native_tools>").next())
+            .expect("native tools section should render");
+        assert!(native_section.contains("- web_search:"), "{native_section}");
+        assert!(native_section.contains("- web_fetch:"), "{native_section}");
+        assert!(prompt.contains("Use `web_search` to look up current information"));
+        assert!(prompt.contains("Use `web_fetch` to read a known URL"));
+        assert!(prompt.contains(
+            "The `browser` command is for interacting with pages or reaching what search and fetch cannot"
+        ));
+    }
+
+    #[test]
+    fn base_system_prompt_keeps_web_commands_when_hosted_tools_off() {
+        let commands = vec![
+            ("browser".to_string(), "Drive the browser".to_string()),
+            ("websearch".to_string(), "Search the web".to_string()),
+            ("webfetch".to_string(), "Fetch a URL".to_string()),
+        ];
+
+        let prompt = render_base_system_prompt(&commands, &Parameters::default());
+
+        let native_section = prompt
+            .split("<native_tools>")
+            .nth(1)
+            .and_then(|rest| rest.split("</native_tools>").next())
+            .expect("native tools section should render");
+        assert!(!native_section.contains("web_search"), "{native_section}");
+        assert!(!native_section.contains("web_fetch"), "{native_section}");
+        assert!(!prompt.contains("look up current information"));
+        let commands_section = prompt
+            // The tool architecture mentions `<commands>` inline, so match the
+            // tag on its own line.
+            .split("\n<commands>\n")
+            .nth(1)
+            .and_then(|rest| rest.split("</commands>").next())
+            .expect("commands section should render");
+        assert!(
+            commands_section.contains("- websearch: Search the web"),
+            "{commands_section}"
+        );
+        assert!(
+            commands_section.contains("- webfetch: Fetch a URL"),
+            "{commands_section}"
         );
     }
 }

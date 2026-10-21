@@ -654,9 +654,13 @@ where
             Event::Context(event) => {
                 context_handle = None;
                 match event {
-                    Some(TuiEvent::ContextReport(report)) => {
+                    Some(TuiEvent::ContextReport(Ok(report))) => {
                         app.chat.push_context_report(report);
                         app.scroll = usize::MAX;
+                    }
+                    Some(TuiEvent::ContextReport(Err(err))) => {
+                        app.chat
+                            .push_error(&format!("Context report failed: {err}"));
                     }
                     Some(TuiEvent::Error(err)) => app.chat.push_error(&err),
                     _ => {}
