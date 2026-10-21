@@ -162,7 +162,7 @@ where
             .respond(request.with_parameters(self.parameters.clone()))
     }
 
-    async fn profile(&self) -> ModelProfile {
+    async fn profile(&self) -> Result<ModelProfile, M::Error> {
         self.inner.profile().await
     }
 }

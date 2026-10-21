@@ -36,7 +36,7 @@ pub enum TuiEvent {
     /// Compaction request finished.
     Compacted(Result<Option<CompactResult>, aither_agent::AgentError>),
     /// Context-window measurement for `/context` is ready.
-    ContextReport(ContextReport),
+    ContextReport(Result<ContextReport, aither_agent::AgentError>),
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.
