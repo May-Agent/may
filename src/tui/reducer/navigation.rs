@@ -49,7 +49,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                 set_active_profile(app, app.profiles[next_idx].id.clone());
                 app.archived_expanded = false;
                 app.refresh_profile_sessions();
-                app.status = Some("Switching profile...".to_string());
+                app.set_status("Switching profile...");
             }
         }
         KeyCode::BackTab => {
@@ -68,7 +68,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                 set_active_profile(app, app.profiles[next_idx].id.clone());
                 app.archived_expanded = false;
                 app.refresh_profile_sessions();
-                app.status = Some("Switching profile...".to_string());
+                app.set_status("Switching profile...");
             }
         }
         KeyCode::Backspace => {
@@ -170,7 +170,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                                     .await;
                             })
                             .detach();
-                            app.status = Some("Deleting session...".to_string());
+                            app.set_status("Deleting session...");
                         }
                         return None;
                     }
@@ -224,10 +224,10 @@ fn toggle_pin(app: &mut App) {
         }
     })
     .detach();
-    app.status = Some(if is_pinned {
-        "Unpinning session...".to_string()
+    app.set_status(if is_pinned {
+        "Unpinning session..."
     } else {
-        "Pinning session...".to_string()
+        "Pinning session..."
     });
 }
 
@@ -268,10 +268,10 @@ fn toggle_archive(app: &mut App) {
         }
     })
     .detach();
-    app.status = Some(if is_archived {
-        "Unarchiving session...".to_string()
+    app.set_status(if is_archived {
+        "Unarchiving session..."
     } else {
-        "Archiving session...".to_string()
+        "Archiving session..."
     });
 }
 
@@ -458,7 +458,7 @@ pub fn handle_jobs_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
             match rows.get(app.jobs_selected) {
                 Some(super::JobRow::Job(job)) => match job.status {
                     aither_sandbox::JobStatus::Running => app.kill_job(job.pid),
-                    _ => app.status = Some(format!("Job {} already finished", job.pid)),
+                    _ => app.set_status(format!("Job {} already finished", job.pid)),
                 },
                 Some(super::JobRow::Subagent(run)) => app.cancel_subagent(run),
                 None => {}
@@ -525,7 +525,7 @@ pub fn handle_job_detail_key(app: &mut App, code: KeyCode) -> Option<SendAction>
             if let crate::tui::state::JobDetailTarget::Job(pid) = state.target {
                 match state.job.as_ref().map(|j| &j.status) {
                     Some(aither_sandbox::JobStatus::Running) => app.kill_job(pid),
-                    Some(_) => app.status = Some(format!("Job {pid} already finished")),
+                    Some(_) => app.set_status(format!("Job {pid} already finished")),
                     None => {}
                 }
             } else if let Some(run) = state.subagent.clone() {

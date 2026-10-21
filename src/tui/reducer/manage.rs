@@ -198,7 +198,7 @@ pub fn handle_mcp_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
                         Err(error) => {
                             let mut message = String::from("Invalid MCP command line: ");
                             message.push_str(error.to_string().as_str());
-                            app.status = Some(message);
+                            app.set_status(message);
                         }
                     }
                 }

@@ -172,7 +172,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 background: &background_items,
                 processing: app.processing,
                 decode_rate,
-                status_message: app.status.as_deref(),
+                status_message: app.status_text(),
                 profile_name: app.current_profile_name(),
                 spinner_frame: app.spinner_frame,
             }),
@@ -196,7 +196,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         background: &background_items,
         processing: app.processing,
         decode_rate,
-        status_message: app.status.as_deref(),
+        status_message: app.status_text(),
         profile_name: app.current_profile_name(),
         spinner_frame: app.spinner_frame,
     };
