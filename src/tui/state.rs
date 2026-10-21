@@ -400,6 +400,48 @@ impl TextSelection {
     }
 }
 
+/// A status-line notice. A notice with a deadline is transient and clears
+/// itself once the deadline passes; one without persists until replaced.
+#[derive(Debug, Clone)]
+pub struct StatusNotice {
+    /// Text shown in the status line.
+    pub text: String,
+    /// Deadline after which the notice clears; `None` means persistent.
+    pub expires_at: Option<std::time::Instant>,
+}
+
+impl StatusNotice {
+    /// A notice that stays until something replaces or clears it.
+    pub fn persistent(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: None,
+        }
+    }
+
+    /// A notice that clears itself `lifetime` after creation.
+    pub fn transient(text: impl Into<String>, lifetime: std::time::Duration) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: Some(std::time::Instant::now() + lifetime),
+        }
+    }
+
+    /// Whether the notice's deadline passed at `now`.
+    #[must_use]
+    pub fn expired(&self, now: std::time::Instant) -> bool {
+        self.expires_at.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Drop the notice in `slot` once its deadline has passed. Event-loop
+    /// ticks call this so a transient notice disappears without user input.
+    pub fn clear_expired(slot: &mut Option<Self>, now: std::time::Instant) {
+        if slot.as_ref().is_some_and(|notice| notice.expired(now)) {
+            *slot = None;
+        }
+    }
+}
+
 /// MCP add server mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum McpAddMode {
@@ -633,4 +675,34 @@ pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'stat
         }
     }
     None
+}
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::StatusNotice;
+
+    #[test]
+    fn transient_notice_clears_after_expiry() {
+        let mut status = Some(StatusNotice::transient(
+            "Copied selection",
+            Duration::from_secs(2),
+        ));
+
+        // Before the deadline the notice stays.
+        StatusNotice::clear_expired(&mut status, Instant::now());
+        assert!(status.is_some());
+
+        // Past the deadline the same sweep drops it.
+        StatusNotice::clear_expired(&mut status, Instant::now() + Duration::from_secs(3));
+        assert!(status.is_none());
+    }
+
+    #[test]
+    fn persistent_notice_does_not_expire() {
+        let mut status = Some(StatusNotice::persistent("^C Press Ctrl+C again to exit"));
+
+        StatusNotice::clear_expired(&mut status, Instant::now() + Duration::from_secs(3600));
+        assert!(status.is_some());
+    }
 }

@@ -307,7 +307,7 @@ struct WorkerBuild {
 fn report_startup_failure(app: &mut may_agent::tui::App, error: &impl std::fmt::Display) {
     tracing::warn!("Initial session start failed: {}", error);
     app.mode = may_agent::tui::AppMode::Chat;
-    app.status = Some(format!(
+    app.set_status(format!(
         "Session start failed: {error} (open /config to fix provider/model)"
     ));
 }
@@ -337,7 +337,7 @@ async fn finish_worker_build(
     if matches!(purpose, WorkerBuildPurpose::SwitchModel) {
         let model = build.model().to_string();
         tracing::info!("Switched model to: {}", model);
-        app.status = Some(format!("Model: {model}"));
+        app.set_status(format!("Model: {model}"));
         if let Err(e) = app.session_manager.set_current_model(model.clone()).await {
             tracing::warn!("Failed to save model to session: {}", e);
         }
@@ -617,11 +617,13 @@ where
                     }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {
-                            app.status =
-                                Some(format!("Compacted {} messages", stats.messages_compacted));
+                            app.set_status(format!(
+                                "Compacted {} messages",
+                                stats.messages_compacted
+                            ));
                         }
                         Ok(None) => {
-                            app.status = Some("Nothing to compact".to_string());
+                            app.set_status("Nothing to compact");
                         }
                         Err(err) => {
                             app.chat.push_error(&format!("Compaction failed: {err}"));
@@ -683,7 +685,7 @@ where
                     if is_esc && let Some(runs) = &app.subagent_runs {
                         let stopped = runs.cancel_all();
                         if stopped > 0 {
-                            app.status = Some(format!(
+                            app.set_status(format!(
                                 "Stopped {stopped} subagent{} — Esc again to abort turn",
                                 if stopped == 1 { "" } else { "s" }
                             ));
@@ -834,11 +836,11 @@ where
                         if agent_handle.is_none() {
                             if let Some(w) = worker.as_ref() {
                                 app.processing = true;
-                                app.status = Some("Compacting conversation...".to_string());
+                                app.set_status("Compacting conversation...");
                                 agent_handle = Some(w.compact(focus));
                             }
                         } else {
-                            app.status = Some("Agent is busy".to_string());
+                            app.set_status("Agent is busy");
                         }
                     }
                     Some(SendAction::ContextReport) => {
@@ -864,7 +866,7 @@ where
                         };
                         match mcp_manager.add_server(&name, config).await {
                             Ok(()) => {
-                                app.status = Some(format!("Added MCP server: {name}"));
+                                app.set_status(format!("Added MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
                                 tracing::info!("Added MCP server: {}", name);
                             }
@@ -878,7 +880,7 @@ where
                     Some(SendAction::McpRemove { name }) => {
                         match mcp_manager.remove_server(&name).await {
                             Ok(()) => {
-                                app.status = Some(format!("Removed MCP server: {name}"));
+                                app.set_status(format!("Removed MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
                                 if app.mcp_selected >= app.mcp_servers.len()
                                     && !app.mcp_servers.is_empty()
@@ -897,7 +899,7 @@ where
                     Some(SendAction::McpReconnect { name }) => {
                         match mcp_manager.reconnect(&name).await {
                             Ok(()) => {
-                                app.status = Some(format!("Reconnected to MCP server: {name}"));
+                                app.set_status(format!("Reconnected to MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
                                 tracing::info!("Reconnected to MCP server: {}", name);
                             }
@@ -919,7 +921,7 @@ where
                             let err_msg = format!("Failed to save SSH server: {e}");
                             app.chat.push_error(&err_msg);
                         } else {
-                            app.status = Some(format!("Added SSH server: {name}"));
+                            app.set_status(format!("Added SSH server: {name}"));
                             if app.ssh_selected + 1 < app.config.ssh_servers.len() {
                                 app.ssh_selected = app.config.ssh_servers.len() - 1;
                             }
@@ -931,7 +933,7 @@ where
                                 let err_msg = format!("Failed to save SSH config: {e}");
                                 app.chat.push_error(&err_msg);
                             } else {
-                                app.status = Some(format!("Removed SSH server: {name}"));
+                                app.set_status(format!("Removed SSH server: {name}"));
                                 if app.ssh_selected >= app.config.ssh_servers.len()
                                     && !app.config.ssh_servers.is_empty()
                                 {
@@ -973,7 +975,7 @@ where
                             .current_profile_id()
                             .map(ToOwned::to_owned)
                             .expect("session manager must always have a current profile");
-                        app.status = Some(format!("Installing from {repo}..."));
+                        app.set_status(format!("Installing from {repo}..."));
                         spawn(async move {
                             let home_paths = may_agent::MayHomePaths::new(may_dir);
                             let manager = SkillManager::from_profile_home(
@@ -1006,7 +1008,7 @@ where
                             .current_profile_id()
                             .map(ToOwned::to_owned)
                             .expect("session manager must always have a current profile");
-                        app.status = Some(format!("Deleting {dir_name}..."));
+                        app.set_status(format!("Deleting {dir_name}..."));
                         spawn(async move {
                             let home_paths = may_agent::MayHomePaths::new(may_dir);
                             let manager = SkillManager::from_profile_home(
