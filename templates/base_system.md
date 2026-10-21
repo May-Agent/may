@@ -1,5 +1,15 @@
 <tool_architecture>
-Native tool: `terminal`.
+<native_tools>
+{% for tool in native_tools %}
+- {{ tool.name }}: {{ tool.description }}
+{% endfor %}
+{% if has_hosted_web_search %}Use `web_search` to look up current information.
+{% endif %}
+{% if has_hosted_web_fetch %}Use `web_fetch` to read a known URL.
+{% endif %}
+{% if has_browser_command && (has_hosted_web_search || has_hosted_web_fetch) %}The `browser` command is for interacting with pages or reaching what search and fetch cannot.
+{% endif %}
+</native_tools>
 Everything listed in `<commands>` is a CLI command that must run inside `terminal`.
 Do not invent direct tool calls for CLI commands.
 `terminal` calls are stateless.
