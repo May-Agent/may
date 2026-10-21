@@ -100,8 +100,13 @@ pub struct ContextReport {
 
 /// Result of splitting the `base_system` block into its marked sections.
 struct BaseSystemCarve {
-    /// Everything outside the `<commands>`/`<skills>`/`<subagents>` spans.
+    /// Everything outside the `<native_tools>`/`<commands>`/`<skills>`/
+    /// `<subagents>` spans.
     architecture_chars: usize,
+    /// `<native_tools>` span bytes.
+    native_tool_chars: usize,
+    /// Item count in `<native_tools>`.
+    native_tool_count: usize,
     /// `<commands>` span bytes attributed to built-in commands.
     command_chars: usize,
     /// `- name: …` item lines in `<commands>` that are not MCP tools.
@@ -133,6 +138,8 @@ impl ContextReport {
     ) -> Self {
         let mut system_prompt_chars = 0usize;
         let mut memory_chars = 0usize;
+        let mut native_tool_chars = 0usize;
+        let mut native_tool_count = 0usize;
         let mut command_chars = 0usize;
         let mut mcp_chars = 0usize;
         let mut command_count = 0usize;
@@ -147,6 +154,8 @@ impl ContextReport {
                 BASE_SYSTEM_TAG => {
                     let carved = carve_base_system(content, mcp_command_names);
                     system_prompt_chars += carved.architecture_chars;
+                    native_tool_chars += carved.native_tool_chars;
+                    native_tool_count += carved.native_tool_count;
                     command_chars += carved.command_chars;
                     mcp_chars += carved.mcp_chars;
                     command_count += carved.command_count;
@@ -184,8 +193,8 @@ impl ContextReport {
             (ContextCategory::SystemPrompt, system_prompt_chars, None),
             (
                 ContextCategory::SystemTools,
-                terminal_tool_definition_chars(),
-                None,
+                terminal_tool_definition_chars() + native_tool_chars,
+                Some(format!("{native_tool_count} tools")),
             ),
             (
                 ContextCategory::Commands,
@@ -275,6 +284,8 @@ fn command_line_name(item: &str) -> &str {
 fn carve_base_system(content: &str, mcp_command_names: &[String]) -> BaseSystemCarve {
     let mut carved = BaseSystemCarve {
         architecture_chars: content.len(),
+        native_tool_chars: 0,
+        native_tool_count: 0,
         command_chars: 0,
         command_count: 0,
         mcp_chars: 0,
@@ -285,6 +296,12 @@ fn carve_base_system(content: &str, mcp_command_names: &[String]) -> BaseSystemC
         subagent_count: 0,
     };
 
+    if let Some((start, end)) = section_span(content, "native_tools") {
+        let section = &content[start..end];
+        carved.native_tool_chars = section.len();
+        carved.native_tool_count = section_items(section).count();
+        carved.architecture_chars -= section.len();
+    }
     if let Some((start, end)) = section_span(content, "commands") {
         let section = &content[start..end];
         // Section wrapper (tags, blank lines) counts toward the built-in
@@ -361,7 +378,7 @@ mod tests {
     }
 
     fn base_system_block() -> &'static str {
-        "<tool_architecture>\nNative tool: `terminal`.\n</tool_architecture>\n\n\
+        "<tool_architecture>\n<native_tools>\n- terminal: Execute terminal commands.\n- terminal_kill: Terminate a background task.\n</native_tools>\n</tool_architecture>\n\n\
          <commands>\n\n- ask: Ask a fast model.\n- github_pr: Open a PR.\n- jira_view: View an issue.\n\n</commands>\n\n\
          <skills>\n\n- pdf: read `skills/pdf/SKILL.md` when the request matches this skill. Handle PDFs.\n\n</skills>\n\n\
          <subagents>\nInvoke with `subagent`.\n\n- researcher: Research things.\n\n</subagents>"
@@ -444,6 +461,21 @@ mod tests {
             .find(|row| row.kind == ContextCategory::CustomAgents)
             .expect("agents row");
         assert_eq!(agents.detail.as_deref(), Some("1 agents"));
+
+        // The `<native_tools>` section lands on System tools alongside the
+        // wire `terminal` definition estimate.
+        let native_span = &base_system_block()[base_system_block().find("<native_tools>").unwrap()
+            ..base_system_block().find("</native_tools>").unwrap() + "</native_tools>".len()];
+        let system_tools = report
+            .categories
+            .iter()
+            .find(|row| row.kind == ContextCategory::SystemTools)
+            .expect("system tools row");
+        assert_eq!(system_tools.detail.as_deref(), Some("2 tools"));
+        assert_eq!(
+            system_tools.tokens,
+            (terminal_tool_definition_chars() + native_span.len()) / 4
+        );
 
         // Skill reminders land on Skills, other reminders on Messages.
         let skills_span = &base_system_block()[base_system_block().find("<skills>").unwrap()
