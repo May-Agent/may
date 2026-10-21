@@ -39,6 +39,10 @@ pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../../texts/tool_response
 /// Two Esc presses within this window open the rewind picker.
 const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// How long a transient status notice (e.g. "Copied selection") stays on
+/// screen before it clears itself.
+const STATUS_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Convert a character index to a byte index in a string.
 pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
@@ -49,7 +53,7 @@ pub use aither_agent::{AgentError, AgentEvent};
 
 use super::state::{
     ActiveTextInput, AppMode, ChatgptAuthStatus, ConfigEditMode, ConfigState, CopilotAuthStatus,
-    McpAddMode, PasteFilter, SelectionPoint, SkillAddMode, SshAddMode, TextSelection,
+    McpAddMode, PasteFilter, SelectionPoint, SkillAddMode, SshAddMode, StatusNotice, TextSelection,
     detect_api_key_from_env,
 };
 /// Application state (UI only - agent managed externally).
@@ -81,8 +85,8 @@ pub struct App {
     pub mode: AppMode,
     /// Message queue
     pub queue: MessageQueue,
-    /// Status message
-    pub status: Option<String>,
+    /// Status-line notice; a transient one clears once its deadline passes.
+    pub status: Option<StatusNotice>,
     /// Whether agent is currently processing
     pub processing: bool,
     /// File picker state (when in `FilePicker` mode)
@@ -355,7 +359,10 @@ impl App {
                 .iter()
                 .map(|(id, _)| id.as_str())
                 .collect();
-            Some(format!("Auto-configured from env: {}", names.join(", ")))
+            Some(StatusNotice::persistent(format!(
+                "Auto-configured from env: {}",
+                names.join(", ")
+            )))
         };
 
         Ok(Self {
@@ -657,10 +664,10 @@ impl App {
         });
         match hit {
             Some((id, runs)) if runs.cancel(id) => {
-                self.status = Some(format!("Stopping subagent {}…", run.agent));
+                self.set_status(format!("Stopping subagent {}…", run.agent));
             }
             _ => {
-                self.status = Some(format!("No live registry entry for subagent {}", run.agent));
+                self.set_status(format!("No live registry entry for subagent {}", run.agent));
             }
         }
     }
@@ -1352,6 +1359,26 @@ impl App {
         super::reducer::reduce_event(self, event)
     }
 
+    /// Show a status notice that stays until replaced or cleared.
+    pub fn set_status(&mut self, text: impl Into<String>) {
+        self.status = Some(StatusNotice::persistent(text));
+    }
+
+    /// Show a status notice that clears itself after [`STATUS_NOTICE_TTL`].
+    pub fn set_transient_status(&mut self, text: impl Into<String>) {
+        self.status = Some(StatusNotice::transient(text, STATUS_NOTICE_TTL));
+    }
+
+    /// Text for the status line; `None` once a transient notice's deadline
+    /// passed, even before the next tick sweeps it.
+    #[must_use]
+    pub fn status_text(&self) -> Option<&str> {
+        self.status
+            .as_ref()
+            .filter(|notice| !notice.expired(std::time::Instant::now()))
+            .map(|notice| notice.text.as_str())
+    }
+
     /// Get the currently active text input field, if any.
     const fn active_text_input(&mut self) -> Option<ActiveTextInput<'_>> {
         // Check mode-specific inputs first
@@ -1458,7 +1485,7 @@ impl App {
         if matches!(self.mode, AppMode::Chat)
             && (text.contains('\n') || text.len() > LARGE_PASTE_THRESHOLD)
         {
-            self.status = Some("Saving pasted text...".to_string());
+            self.set_status("Saving pasted text...");
             self.enqueue_paste_result(Ok(ClipboardPasteResult::text(text)));
             return None;
         }
@@ -1517,7 +1544,7 @@ impl App {
                 KeyCode::Char('c') => {
                     if self.copy_selection_to_clipboard()? {
                         self.quit_pending = false;
-                        self.status = Some("Copied selection".to_string());
+                        self.set_transient_status("Copied selection");
                         return Ok(None);
                     }
 
@@ -1532,7 +1559,7 @@ impl App {
                     self.input_char_count = 0;
                     self.attachments.clear();
                     self.completion.cancel();
-                    self.status = Some("^C Press Ctrl+C again to exit".to_string());
+                    self.set_status("^C Press Ctrl+C again to exit");
                     return Ok(None);
                 }
                 KeyCode::Char('q') => return Ok(Some(SendAction::Quit)),
@@ -1668,7 +1695,7 @@ impl App {
             }
         })
         .detach();
-        self.status = Some("Loading sessions...".to_string());
+        self.set_status("Loading sessions...");
     }
 
     /// Build a flat session list from profile sessions for navigation.
@@ -1820,7 +1847,7 @@ impl App {
                     return None;
                 }
                 if self.has_pending_attachments() {
-                    self.status = Some("Waiting for attachments to finish...".to_string());
+                    self.set_status("Waiting for attachments to finish...");
                     return None;
                 }
                 // Send as message (slash commands only work from menu selection)
@@ -1925,7 +1952,7 @@ impl App {
                 }
                 if self.processing && (!self.input.is_empty() || !self.attachments.is_empty()) {
                     if self.has_pending_attachments() {
-                        self.status = Some("Waiting for attachments to finish...".to_string());
+                        self.set_status("Waiting for attachments to finish...");
                         return None;
                     }
                     return Some(self.prepare_message(PendingUserMessageMode::Queue));
@@ -2033,7 +2060,7 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Right) if self.copy_selection_to_clipboard()? => {
-                self.status = Some("Copied selection".to_string());
+                self.set_transient_status("Copied selection");
             }
             _ => {}
         }
@@ -2236,7 +2263,7 @@ impl App {
                         .await;
                 })
                 .detach();
-                self.status = Some("Loading skills...".to_string());
+                self.set_status("Loading skills...");
                 None
             }
             _ => None,
@@ -2273,13 +2300,13 @@ impl App {
         let result = match result {
             Ok(result) => result,
             Err(e) => {
-                self.status = Some(format!("Clipboard paste failed: {e}"));
+                self.set_status(format!("Clipboard paste failed: {e}"));
                 return Ok(());
             }
         };
 
         if result.is_empty() {
-            self.status = Some("Clipboard is empty".to_string());
+            self.set_status("Clipboard is empty");
             return Ok(());
         }
 
@@ -2294,7 +2321,7 @@ impl App {
                 path,
                 data: image.data,
             });
-            self.status = Some("Image attached".to_string());
+            self.set_status("Image attached");
             return Ok(());
         }
 
@@ -2313,7 +2340,7 @@ impl App {
                 content: text,
                 saved_path,
             });
-            self.status = Some("Text attached".to_string());
+            self.set_status("Text attached");
             return Ok(());
         }
 
@@ -2323,14 +2350,14 @@ impl App {
     /// Handle paste (Ctrl+V) - check for image or text in clipboard.
     fn handle_paste(&mut self) {
         if self.clipboard_rx.is_some() {
-            self.status = Some("Clipboard paste already in progress".to_string());
+            self.set_status("Clipboard paste already in progress");
             return;
         }
 
         let (tx, rx) = async_channel::bounded(1);
         self.clipboard_rx = Some(rx);
         self.pending_attachment_jobs = self.pending_attachment_jobs.saturating_add(1);
-        self.status = Some("Reading clipboard...".to_string());
+        self.set_status("Reading clipboard...");
 
         spawn(async move {
             let result = match unblock(read_clipboard).await {

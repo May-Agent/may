@@ -7,7 +7,7 @@ pub(super) mod navigation;
 use super::app::{App, SendAction};
 use super::error::AppResult;
 use super::event::AppEvent;
-use super::state::AppMode;
+use super::state::{AppMode, StatusNotice};
 
 /// Reduce a single UI event into state transitions and optional actions.
 ///
@@ -19,6 +19,9 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
     match event {
         AppEvent::Key(code, modifiers) => app.handle_key(code, modifiers),
         AppEvent::Tick => {
+            // Sweep a transient status notice whose deadline passed; the tick
+            // cadence bounds how long an expired notice can linger.
+            StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
             if app.processing {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
                 app.chat.tick_loading();
@@ -181,7 +184,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             if let Err(error) = result {
                 app.chat
                     .push_error(&format!("Failed to save config: {error}"));
-                app.status = Some("Config save failed".to_string());
+                app.set_status("Config save failed");
             }
             Ok(None)
         }
@@ -199,7 +202,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
         AppEvent::JobKilled { pid, ok } => {
-            app.status = Some(if ok {
+            app.set_status(if ok {
                 format!("Killed job {pid}")
             } else {
                 format!("Job {pid} already finished")
