@@ -454,11 +454,17 @@ impl MayAgent {
             builder = builder.with_skills(&skills_dir).await?;
             builder = builder.with_subagents(&subagents_dir).await?;
         }
-        // The builder's descriptions cover the terminal controls aither
-        // registers itself plus every shared command registered above.
-        let base_system_prompt =
-            build_base_system_prompt(builder.tool_descriptions(), &skills_dir, &subagents_dir)
-                .await?;
+        // The builder's descriptions cover every shared command registered
+        // above; the native tool surface comes from the same builder.
+        let native_tool_definitions = builder.native_tool_definitions();
+        let base_system_prompt = build_base_system_prompt(
+            builder.tool_descriptions(),
+            &native_tool_definitions,
+            &config.request_parameters,
+            &skills_dir,
+            &subagents_dir,
+        )
+        .await?;
         builder = builder
             .system_prompt_raw(base_system_prompt)
             // Shell runtime depends on the home environment. SSH remains a
@@ -781,11 +787,16 @@ impl MayAgent {
     }
 
     /// Preview the exact request message sequence for the next turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the model profiles cannot be fetched
+    /// during initialization.
     pub async fn preview_request_messages(
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> Vec<LlmMessage> {
+    ) -> Result<Vec<LlmMessage>, AgentError> {
         self.sync_runtime_context().await;
         self.inner
             .preview_request_messages(prompt, attachments)
@@ -799,12 +810,17 @@ impl MayAgent {
     /// conversation tail. The preview is assembled against a fork of the
     /// context installed for the duration of the call, so the live
     /// conversation is never mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the model profiles cannot be fetched
+    /// during initialization.
     pub async fn preview_request_messages_with_hidden_context(
         &mut self,
         prompt: &str,
         hidden_context: Option<&str>,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> Vec<LlmMessage> {
+    ) -> Result<Vec<LlmMessage>, AgentError> {
         self.sync_runtime_context().await;
         // aither populates the static system blocks into `Agent::context`
         // during the first request assembly; they must land on the live
@@ -812,7 +828,7 @@ impl MayAgent {
         // by that same first assembly, so a missing profile means the context
         // has not been initialized yet.
         if self.inner.profile().is_none() {
-            self.inner.snapshot_context_window().await;
+            self.inner.snapshot_context_window().await?;
         }
         let mut preview_context = self.inner.context().fork();
         if let Some(hidden_context) = hidden_context
@@ -836,17 +852,24 @@ impl MayAgent {
     /// the same state the next request would be assembled from. Token counts
     /// are estimates at ~4 bytes per token — the heuristic the agent itself
     /// uses for context budgeting.
-    pub async fn context_report(&mut self) -> super::context_report::ContextReport {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the model profiles cannot be fetched
+    /// during initialization.
+    pub async fn context_report(
+        &mut self,
+    ) -> Result<super::context_report::ContextReport, AgentError> {
         self.sync_runtime_context().await;
-        let snapshot = self.inner.snapshot_context_window().await;
-        super::context_report::ContextReport::assemble(
+        let snapshot = self.inner.snapshot_context_window().await?;
+        Ok(super::context_report::ContextReport::assemble(
             &self.model_id,
             &self.provider_id,
             &self.mcp_command_names,
             self.inner.context(),
             &snapshot.metrics,
             snapshot.phase,
-        )
+        ))
     }
 
     /// Get session ID.
@@ -1069,7 +1092,8 @@ mod tests {
                 Some("hidden facts"),
                 Vec::<LlmAttachment>::new(),
             )
-            .await;
+            .await
+            .expect("preview should succeed");
 
         assert_eq!(agent.inner.history(), before);
         // The hidden context sits immediately before the user prompt, exactly
@@ -1104,7 +1128,8 @@ mod tests {
                 Some("hidden facts"),
                 Vec::<LlmAttachment>::new(),
             )
-            .await;
+            .await
+            .expect("preview should succeed");
 
         // The same sequence `run_with_hidden_context` would send: history,
         // hidden system message, then the user prompt, with generated
@@ -1125,7 +1150,8 @@ mod tests {
         run_agent.push_message(LlmMessage::system("hidden facts"));
         let run_preview = run_agent
             .preview_request_messages("hi", Vec::<LlmAttachment>::new())
-            .await;
+            .await
+            .expect("preview should succeed");
         assert_eq!(preview, run_preview);
     }
 }
