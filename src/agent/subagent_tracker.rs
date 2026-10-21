@@ -244,7 +244,7 @@ where
         })
     }
 
-    fn profile(&self) -> impl Future<Output = Profile> + Send {
+    fn profile(&self) -> impl Future<Output = Result<Profile, M::Error>> + Send {
         self.inner.profile()
     }
 }

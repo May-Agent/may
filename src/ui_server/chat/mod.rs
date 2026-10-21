@@ -2256,6 +2256,8 @@ enum UiChatPreparationError {
     RestoreCheckpoint(#[source] aither_agent::AgentError),
     #[error("failed to build prompt attachments: {0}")]
     BuildPrompt(skyzen::Error),
+    #[error("failed to preview request messages: {0}")]
+    PreviewRequest(#[source] aither_agent::AgentError),
     #[error("failed to persist context debug snapshot: {0}")]
     PersistContextDebugSnapshot(#[source] crate::db::ChatDbError),
 }
@@ -2293,6 +2295,7 @@ impl UiChatPreparationError {
             | Self::BuildAgent(_)
             | Self::RestoreCheckpoint(_)
             | Self::BuildPrompt(_)
+            | Self::PreviewRequest(_)
             | Self::PersistContextDebugSnapshot(_)
             | Self::HistoryReplay(_) => ApiErrorCode::InternalError,
         }
@@ -2922,7 +2925,8 @@ fn prepare_agent_for_request<'a>(
                 ctx.hidden_context_xml.as_deref(),
                 attachments.iter().cloned(),
             )
-            .await;
+            .await
+            .map_err(UiChatPreparationError::PreviewRequest)?;
         persist_context_debug_snapshot(
             state,
             &ctx.session_id,
