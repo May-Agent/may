@@ -4,7 +4,7 @@
 //! new lines as they arrive, maintaining parser state between chunks.
 
 use ratatui::prelude::*;
-use streamdown_parser::{ParseEvent, Parser};
+use streamdown_parser::{InlineElement, InlineParser, ParseEvent, Parser};
 
 /// Height reserved for inline images (in terminal lines).
 pub const IMAGE_HEIGHT: usize = 8;
@@ -14,6 +14,9 @@ pub const IMAGE_HEIGHT: usize = 8;
 pub struct StreamingMarkdown {
     /// The incremental parser (maintains state between chunks)
     parser: Parser,
+    /// Inline parser for block contents the block parser leaves raw
+    /// (list items, blockquote lines, table cells, headings)
+    inline_parser: InlineParser,
     /// Raw content accumulated so far
     content: String,
     /// Number of complete lines already parsed
@@ -45,6 +48,7 @@ impl StreamingMarkdown {
     pub fn new() -> Self {
         Self {
             parser: Parser::new(),
+            inline_parser: InlineParser::new(),
             content: String::new(),
             parsed_line_count: 0,
             rendered: Vec::new(),
@@ -61,6 +65,7 @@ impl StreamingMarkdown {
     pub fn with_image_support(images_supported: bool) -> Self {
         Self {
             parser: Parser::new(),
+            inline_parser: InlineParser::new(),
             content: String::new(),
             parsed_line_count: 0,
             rendered: Vec::new(),
@@ -106,6 +111,7 @@ impl StreamingMarkdown {
     /// Clear all content and reset parser state.
     pub fn clear(&mut self) {
         self.parser = Parser::new();
+        self.inline_parser.reset();
         self.content.clear();
         self.parsed_line_count = 0;
         self.rendered.clear();
@@ -167,6 +173,39 @@ impl StreamingMarkdown {
         self.inline_open = false;
     }
 
+    /// Record any images among `elements` in `images`/`image_positions`,
+    /// positioned at rendered line `line_index`.
+    fn record_inline_images(&mut self, elements: &[InlineElement], line_index: usize) {
+        for elem in elements {
+            if let InlineElement::Image { alt, url } = elem {
+                tracing::debug!("InlineElement::Image detected: alt={}, url={}", alt, url);
+                self.images.push((alt.clone(), url.clone()));
+                self.image_positions.push((url.clone(), line_index));
+            }
+        }
+    }
+
+    /// Parse raw inline markdown carried by a block event into spans.
+    ///
+    /// Each element's own style is layered over `base_style`, so inline
+    /// modifiers combine with the block's style and an element's own colour
+    /// (link, inline code) wins over the block's. Images are recorded for
+    /// the line that is about to be pushed (`self.rendered.len()`).
+    fn block_inline_spans(&mut self, content: &str, base_style: Style) -> Vec<Span<'static>> {
+        self.inline_parser.reset();
+        let elements = self.inline_parser.parse(content);
+        let line_index = self.rendered.len();
+        self.record_inline_images(&elements, line_index);
+        elements
+            .into_iter()
+            .map(|elem| {
+                let span = render_inline_element(elem);
+                let style = base_style.patch(span.style);
+                span.style(style)
+            })
+            .collect()
+    }
+
     /// Render a parse event to output lines.
     fn render_event(&mut self, event: ParseEvent) {
         match event {
@@ -222,13 +261,7 @@ impl StreamingMarkdown {
                 } else {
                     self.rendered.len()
                 };
-                for elem in &elements {
-                    if let streamdown_parser::InlineElement::Image { alt, url } = elem {
-                        tracing::debug!("InlineElement::Image detected: alt={}, url={}", alt, url);
-                        self.images.push((alt.clone(), url.clone()));
-                        self.image_positions.push((url.clone(), line_index));
-                    }
-                }
+                self.record_inline_images(&elements, line_index);
                 for elem in elements {
                     self.push_inline_span(render_inline_element(elem));
                 }
@@ -255,15 +288,8 @@ impl StreamingMarkdown {
                         .add_modifier(Modifier::BOLD),
                     _ => Style::default().add_modifier(Modifier::BOLD),
                 };
-                let prefix = if level > 1 {
-                    format!("{} ", "#".repeat(level as usize))
-                } else {
-                    String::new()
-                };
-                self.rendered.push(Line::from(vec![
-                    Span::styled(prefix, style.fg(Color::DarkGray)),
-                    Span::styled(content, style),
-                ]));
+                let spans = self.block_inline_spans(&content, style);
+                self.rendered.push(Line::from(spans));
                 self.rendered.push(Line::from(""));
             }
             ParseEvent::CodeBlockStart { language, .. } => {
@@ -312,28 +338,24 @@ impl StreamingMarkdown {
                     | streamdown_parser::ListBullet::PlusExpand => "• ".to_string(),
                     streamdown_parser::ListBullet::Ordered(n) => format!("{n}. "),
                 };
-                self.rendered.push(Line::from(vec![
-                    Span::styled(
-                        format!("{indent_str}{bullet_str}"),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::raw(content),
-                ]));
+                let mut spans = vec![Span::styled(
+                    format!("{indent_str}{bullet_str}"),
+                    Style::default().fg(Color::Cyan),
+                )];
+                spans.extend(self.block_inline_spans(&content, Style::default()));
+                self.rendered.push(Line::from(spans));
             }
             ParseEvent::BlockquoteStart { .. } => {
                 self.end_inline_line();
             }
             ParseEvent::BlockquoteLine(line) => {
                 self.end_inline_line();
-                self.rendered.push(Line::from(vec![
-                    Span::styled("┃ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        line,
-                        Style::default()
-                            .fg(Color::Gray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ]));
+                let style = Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC);
+                let mut spans = vec![Span::styled("┃ ", Style::default().fg(Color::DarkGray))];
+                spans.extend(self.block_inline_spans(&line, style));
+                self.rendered.push(Line::from(spans));
             }
             ParseEvent::HorizontalRule => {
                 self.end_inline_line();
@@ -345,15 +367,13 @@ impl StreamingMarkdown {
             }
             ParseEvent::TableHeader(cells) => {
                 self.end_inline_line();
-                let spans: Vec<Span> = cells
-                    .into_iter()
-                    .map(|c| {
-                        Span::styled(
-                            format!("│ {c} "),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        )
-                    })
-                    .collect();
+                let style = Style::default().add_modifier(Modifier::BOLD);
+                let mut spans = Vec::new();
+                for cell in cells {
+                    spans.push(Span::styled("│ ", style));
+                    spans.extend(self.block_inline_spans(&cell, style));
+                    spans.push(Span::styled(" ", style));
+                }
                 self.rendered.push(Line::from(spans));
             }
             ParseEvent::TableSeparator => {
@@ -365,10 +385,12 @@ impl StreamingMarkdown {
             }
             ParseEvent::TableRow(cells) => {
                 self.end_inline_line();
-                let spans: Vec<Span> = cells
-                    .into_iter()
-                    .map(|c| Span::raw(format!("│ {c} ")))
-                    .collect();
+                let mut spans = Vec::new();
+                for cell in cells {
+                    spans.push(Span::raw("│ "));
+                    spans.extend(self.block_inline_spans(&cell, Style::default()));
+                    spans.push(Span::raw(" "));
+                }
                 self.rendered.push(Line::from(spans));
             }
             ParseEvent::Newline => {
@@ -549,5 +571,129 @@ mod tests {
         tracing::debug!("HR test lines: {:?}", all_text);
         let has_rule = all_text.iter().any(|t| t.contains('─'));
         assert!(has_rule, "Expected horizontal rule (─), got: {all_text:?}");
+    }
+
+    fn flattened_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    fn all_spans<'a>(lines: &'a [Line<'static>]) -> impl Iterator<Item = &'a Span<'static>> {
+        lines.iter().flat_map(|l| l.spans.iter())
+    }
+
+    fn has_modifier(lines: &[Line<'static>], modifier: Modifier) -> bool {
+        all_spans(lines).any(|s| s.style.add_modifier.contains(modifier))
+    }
+
+    #[test]
+    fn test_list_item_inline_markdown() {
+        let mut md = StreamingMarkdown::new();
+        md.push("- **bold** and *italic* and `code` and [link](https://example.com)\n");
+        let lines = md.lines();
+        let text = flattened_text(lines);
+        assert!(!text.contains("**"), "raw bold markers in: {text}");
+        assert!(!text.contains('`'), "raw code markers in: {text}");
+        assert!(text.contains("bold"), "missing bold text in: {text}");
+        assert!(
+            has_modifier(lines, Modifier::BOLD),
+            "no BOLD span in: {lines:?}"
+        );
+        assert!(
+            has_modifier(lines, Modifier::ITALIC),
+            "no ITALIC span in: {lines:?}"
+        );
+        assert!(
+            has_modifier(lines, Modifier::UNDERLINED),
+            "no link span in: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_list_item_cjk_bold() {
+        let mut md = StreamingMarkdown::new();
+        md.push("- **SpaceX**：上季营收\n");
+        let lines = md.lines();
+        let text = flattened_text(lines);
+        assert!(!text.contains("**"), "raw bold markers in: {text}");
+        assert!(text.contains("SpaceX"), "missing bold text in: {text}");
+        assert!(text.contains("：上季营收"), "missing CJK text in: {text}");
+        assert!(
+            has_modifier(lines, Modifier::BOLD),
+            "no BOLD span in: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_blockquote_inline_markdown() {
+        let mut md = StreamingMarkdown::new();
+        md.push("> **quoted** text\n");
+        let lines = md.lines();
+        let text = flattened_text(lines);
+        assert!(!text.contains("**"), "raw bold markers in: {text}");
+        assert!(text.contains("quoted"), "missing bold text in: {text}");
+        assert!(
+            has_modifier(lines, Modifier::BOLD),
+            "no BOLD span in: {lines:?}"
+        );
+        assert!(
+            has_modifier(lines, Modifier::ITALIC),
+            "no ITALIC base style in: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_table_inline_markdown() {
+        let mut md = StreamingMarkdown::new();
+        md.push("| **head** | plain |\n|---|---|\n| *it* | `c` |\n");
+        md.flush();
+        let lines = md.lines();
+        let text = flattened_text(lines);
+        assert!(!text.contains("**"), "raw bold markers in: {text}");
+        assert!(text.contains("head"), "missing header text in: {text}");
+        assert!(
+            has_modifier(lines, Modifier::BOLD),
+            "no BOLD span in: {lines:?}"
+        );
+        assert!(
+            has_modifier(lines, Modifier::ITALIC),
+            "no ITALIC span in: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_heading_inline_markdown() {
+        let mut md = StreamingMarkdown::new();
+        md.push("## **Title** rest\n");
+        let lines = md.lines();
+        let text = flattened_text(lines);
+        assert!(!text.contains("**"), "raw bold markers in: {text}");
+        assert!(!text.contains('#'), "literal heading prefix in: {text}");
+        assert!(text.contains("Title"), "missing heading text in: {text}");
+        assert!(
+            has_modifier(lines, Modifier::BOLD),
+            "no BOLD span in: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_block_inline_image_recorded() {
+        let mut md = StreamingMarkdown::new();
+        md.push("- ![diagram](https://example.com/diagram.png)\n");
+        let images = md.images();
+        assert_eq!(
+            images,
+            vec![(
+                "diagram".to_string(),
+                "https://example.com/diagram.png".to_string()
+            )]
+        );
+        assert_eq!(
+            md.image_positions(),
+            &[("https://example.com/diagram.png".to_string(), 0)]
+        );
     }
 }
