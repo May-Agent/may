@@ -354,28 +354,24 @@ fn map_call(call_id: String, name: &str, input: &str) -> ToolCall {
                 .or_else(|| arg("command"))
                 .unwrap_or(input)
                 .to_string();
-            terminal_call(call_id, name, command)
+            terminal_call(call_id, name, &command)
         }
         "write_stdin" => terminal_call(
             call_id,
             "write to a running terminal session",
-            arg("chars").unwrap_or(input).to_string(),
+            arg("chars").unwrap_or(input),
         ),
         "apply_patch" => terminal_call(
             call_id,
             "apply_patch",
-            format!(
+            &format!(
                 "apply_patch <<'PATCH'\n{}\nPATCH",
                 arg("input").unwrap_or(input)
             ),
         ),
         "exec" => {
             // The codex `exec` tool runs a JS orchestration script verbatim.
-            terminal_call(
-                call_id,
-                "exec orchestration script",
-                input.to_string(),
-            )
+            terminal_call(call_id, "exec orchestration script", input)
         }
         _ => comment_call(call_id, name, &args),
     }
