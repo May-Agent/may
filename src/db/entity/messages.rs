@@ -33,4 +33,10 @@ pub struct Model {
     pub elapsed_ms: Option<i64>,
     /// JSON-serialized attachment records, when the message carries any.
     pub attachments: Option<String>,
+    /// JSON-serialized provider reasoning state carried by an assistant
+    /// message (`Vec<aither_core::llm::ReasoningState>`).
+    pub reasoning: Option<String>,
+    /// JSON-serialized tool calls carried by an assistant message
+    /// (`Vec<aither_core::llm::ToolCall>`).
+    pub tool_calls: Option<String>,
 }
