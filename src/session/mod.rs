@@ -4,6 +4,7 @@
 
 mod context_snapshot;
 pub(crate) mod history;
+pub mod import;
 pub mod layout;
 mod manager;
 pub(crate) mod persisted_message;
