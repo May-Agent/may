@@ -259,6 +259,28 @@ pub async fn load_history_from_db(
         let timestamp = persisted.timestamp;
         let attachments = persisted.attachments;
         let stats = map_db_message_stats(&msg);
+        let reasoning = msg
+            .reasoning
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|source| PersistedMessageError::InvalidAttachments {
+                session_id: msg.session_id.clone(),
+                message_id: msg.id,
+                source,
+            })?
+            .unwrap_or_default();
+        let tool_calls = msg
+            .tool_calls
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|source| PersistedMessageError::InvalidAttachments {
+                session_id: msg.session_id.clone(),
+                message_id: msg.id,
+                source,
+            })?
+            .unwrap_or_default();
 
         history.push(ChatMessage {
             role,
@@ -267,6 +289,8 @@ pub async fn load_history_from_db(
             timestamp,
             tool_call_id: msg.tool_call_id,
             stats,
+            reasoning,
+            tool_calls,
         });
     }
 
