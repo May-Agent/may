@@ -45,6 +45,14 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "/btw",
         "Ask a side question without touching conversation history",
     ),
+    (
+        "/resume-codex",
+        "Import a Codex transcript into a new session",
+    ),
+    (
+        "/resume-claude",
+        "Import a Claude Code transcript into a new session",
+    ),
     ("/mcp", "Manage MCP servers"),
     ("/ssh", "Manage preconfigured SSH servers"),
     ("/skill", "Manage installed skills"),

@@ -33,6 +33,9 @@ pub enum TuiRuntimeError {
     /// History replay failed.
     #[error("history replay failed: {0}")]
     HistoryReplay(#[from] crate::session::HistoryReplayError),
+    /// Foreign transcript import failed.
+    #[error("import failed: {0}")]
+    Import(#[from] crate::session::import::ImportError),
     /// Invalid pending message timestamp.
     #[error("invalid pending message timestamp: {0}")]
     InvalidPendingMessageTimestamp(#[source] jiff::Error),
@@ -774,6 +777,85 @@ impl RuntimeDeps {
         self.local_runtime.sync_app_queue(app, &session_id).await?;
 
         let selected_model = SelectedModel::resolve(&app.config, session_model.as_deref())?;
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+    }
+
+    /// Import a foreign agent transcript into a fresh session and start
+    /// building its worker.
+    ///
+    /// The transcript is located and parsed off the event loop, then the new
+    /// session is seeded with the converted messages and a provenance note.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the transcript cannot be found or
+    /// parsed, or when session/worker setup fails.
+    pub async fn begin_import_session(
+        &self,
+        app: &mut App,
+        worker: &mut Option<AgentWorker>,
+        source: crate::session::import::ForeignAgent,
+        query: &str,
+    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        let query_owned = query.to_string();
+        let mut imported =
+            blocking::unblock(move || crate::session::import::import(source, &query_owned)).await?;
+
+        let model = imported.model.clone();
+        let (sandbox_dir, session_id, imported_count) = {
+            let session = app
+                .session_manager
+                .create_session_with_model(model.clone())?;
+            (
+                session.sandbox_dir.clone(),
+                session.id.clone(),
+                imported.messages.len(),
+            )
+        };
+        app.session_manager.ensure_persisted().await?;
+        app.session_manager
+            .set_current_title(imported.title.clone())
+            .await?;
+
+        // Persist image payloads the parser decoded into the session dir,
+        // then fix the attachment URLs to their real paths.
+        for (rel, bytes) in &imported.files {
+            let path = sandbox_dir.join(rel);
+            if let Some(parent) = path.parent() {
+                async_fs::create_dir_all(parent).await?;
+            }
+            async_fs::write(&path, bytes).await?;
+        }
+        let provenance = serde_json::json!({
+            "kind": "imported_session",
+            "source": source.label(),
+            "source_session_id": imported.source_id,
+            "source_path": imported.source_path.display().to_string(),
+            "source_cwd": imported.cwd,
+            "note": "This session continues an imported foreign-agent transcript. Prior tool calls appear as `terminal` calls; reasoning state was preserved verbatim.",
+        });
+        app.session_manager
+            .append_message(ChatMessage::hidden_context(provenance.to_string()))
+            .await?;
+        for message in imported.messages.drain(..) {
+            app.session_manager.append_message(message).await?;
+        }
+
+        let messages: Vec<_> = app
+            .session_manager
+            .current()
+            .map(|session| session.history.messages().to_vec())
+            .unwrap_or_default();
+        app.init_session(&session_id, &messages, model.as_deref())
+            .await;
+        app.chat.push_notice(&format!(
+            "Imported {imported_count} messages from {} session {}",
+            source.label(),
+            imported.source_id
+        ));
+        *worker = None;
+        self.local_runtime.sync_app_queue(app, &session_id).await?;
+
+        let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
         self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
     }
 
