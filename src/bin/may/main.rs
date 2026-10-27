@@ -739,6 +739,22 @@ where
                             build: runtime_deps.begin_load_session(app, worker, &id).await?,
                         });
                     }
+                    Some(SendAction::ResumeImport { source, query }) => {
+                        match runtime_deps
+                            .begin_import_session(app, worker, source, &query)
+                            .await
+                        {
+                            Ok(build) => {
+                                worker_build = Some(WorkerBuild {
+                                    purpose: WorkerBuildPurpose::Session,
+                                    build,
+                                });
+                            }
+                            Err(error) => {
+                                app.chat.push_error(&format!("{error}"));
+                            }
+                        }
+                    }
                     Some(SendAction::Rewind {
                         history_index,
                         restore_code,

@@ -247,6 +247,12 @@ pub struct ChatMessage {
     /// Usage/context stats for assistant messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<ChatMessageStats>,
+    /// Provider reasoning state carried by an assistant message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning: Vec<aither_core::llm::ReasoningState>,
+    /// Tool calls carried by an assistant message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<aither_core::llm::ToolCall>,
 }
 
 impl ChatMessage {
@@ -267,6 +273,8 @@ impl ChatMessage {
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: None,
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -279,6 +287,8 @@ impl ChatMessage {
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: None,
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -291,6 +301,8 @@ impl ChatMessage {
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: Some(stats),
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -303,6 +315,8 @@ impl ChatMessage {
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: None,
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -315,6 +329,8 @@ impl ChatMessage {
             timestamp: Some(Timestamp::now()),
             tool_call_id: Some(tool_call_id.into()),
             stats: None,
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -330,6 +346,8 @@ impl ChatMessage {
             timestamp: Some(Timestamp::now()),
             tool_call_id: None,
             stats: None,
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -403,7 +421,11 @@ impl ChatHistory {
                 use aither_core::llm::Message;
                 match m.role {
                     MessageRole::User => Some(replay_user_message(m)),
-                    MessageRole::Assistant => Some(Ok(Message::assistant(&m.content))),
+                    MessageRole::Assistant => Some(Ok(Message::assistant_with_reasoning(
+                        m.content.clone(),
+                        m.tool_calls.clone(),
+                        m.reasoning.clone(),
+                    ))),
                     MessageRole::System | MessageRole::HiddenContext => {
                         Some(Ok(Message::system(&m.content)))
                     }
