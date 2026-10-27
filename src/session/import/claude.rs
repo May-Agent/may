@@ -7,6 +7,7 @@
 //! `isMeta`/`type`-metadata records carry no conversation.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
 use aither_core::llm::{ReasoningState, ToolCall, ToolResult};
@@ -26,14 +27,14 @@ fn shq(s: &str) -> String {
 /// Map a Claude `tool_use` to a `terminal` call with a shell-equivalent script.
 fn map_call(id: &str, name: &str, input: &Value) -> ToolCall {
     let s = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("");
-    let call = |desc: &str, script: String| terminal_call(id.to_string(), desc, script);
+    let call = |desc: &str, script: &str| terminal_call(id.to_string(), desc, script);
     match name {
         "Bash" => call(
             input
                 .get("description")
                 .and_then(Value::as_str)
                 .unwrap_or("shell command"),
-            s("command").to_string(),
+            s("command"),
         ),
         "Read" => {
             let path = s("file_path");
@@ -47,11 +48,11 @@ fn map_call(id: &str, name: &str, input: &Value) -> ToolCall {
                 (Some(offset), None) => format!("sed -n '{},$p' {}", offset + 1, shq(path)),
                 _ => format!("cat -n {}", shq(path)),
             };
-            call(&format!("read {path}"), script)
+            call(&format!("read {path}"), &script)
         }
         "Write" => call(
             &format!("write {}", s("file_path")),
-            format!(
+            &format!(
                 "cat > {} <<'MAY_IMPORT_EOF'\n{}\nMAY_IMPORT_EOF",
                 shq(s("file_path")),
                 s("content")
@@ -100,14 +101,14 @@ fn map_call(id: &str, name: &str, input: &Value) -> ToolCall {
                 script.push(' ');
                 script.push_str(&shq(s("path")));
             }
-            call(&format!("grep {}", s("pattern")), script)
+            call(&format!("grep {}", s("pattern")), &script)
         }
         "Glob" => call(
             &format!("glob {}", s("pattern")),
-            format!("rg --files {} --glob {}", shq(s("path")), shq(s("pattern"))),
+            &format!("rg --files {} --glob {}", shq(s("path")), shq(s("pattern"))),
         ),
-        "WebSearch" => call("websearch", format!("websearch {}", shq(s("query")))),
-        "WebFetch" => call("webfetch", format!("webfetch {}", shq(s("url")))),
+        "WebSearch" => call("websearch", &format!("websearch {}", shq(s("query")))),
+        "WebFetch" => call("webfetch", &format!("webfetch {}", shq(s("url")))),
         _ => comment_call(id.to_string(), name, input),
     }
 }
@@ -127,16 +128,15 @@ fn edit_script(id: &str, path: &str, edits: &[Edit]) -> ToolCall {
     );
     for edit in edits {
         let count = if edit.all { "-1" } else { "1" };
-        use std::fmt::Write as _;
-        let _ = write!(
+        let _ = writeln!(
             body,
-            "s = s.replace({}, {}, {count})\n",
+            "s = s.replace({}, {}, {count})",
             serde_json::to_string(edit.old).unwrap_or_default(),
             serde_json::to_string(edit.new).unwrap_or_default(),
         );
     }
     body.push_str("p.write_text(s)\nMAY_EDIT_EOF");
-    terminal_call(id.to_string(), &format!("edit {path}"), body)
+    terminal_call(id.to_string(), &format!("edit {path}"), &body)
 }
 
 /// Flatten a `tool_result` block's content to text.

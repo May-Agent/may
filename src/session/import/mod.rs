@@ -208,7 +208,7 @@ fn parse_ts(value: Option<&str>) -> Option<Timestamp> {
 }
 
 /// Build a `terminal` tool call for an imported call.
-pub(super) fn terminal_call(id: String, description: &str, script: String) -> ToolCall {
+pub(super) fn terminal_call(id: String, description: &str, script: &str) -> ToolCall {
     ToolCall::new(
         id,
         "terminal",
@@ -228,7 +228,7 @@ pub(super) fn comment_call(id: String, name: &str, arguments: &serde_json::Value
     terminal_call(
         id,
         &format!("{name} (imported, not re-runnable)"),
-        format!("# {name} {args}"),
+        &format!("# {name} {args}"),
     )
 }
 
@@ -312,8 +312,7 @@ pub(super) fn derive_title(source: ForeignAgent, messages: &[ChatMessage]) -> St
                 .iter()
                 .any(|prefix| m.content.starts_with(prefix))
         })
-        .map(|m| m.content.as_str())
-        .unwrap_or("imported session");
+        .map_or("imported session", |m| m.content.as_str());
     let line = first.lines().next().unwrap_or(first).trim();
     let truncated: String = line.chars().take(60).collect();
     let truncated = if line.chars().count() > 60 {
