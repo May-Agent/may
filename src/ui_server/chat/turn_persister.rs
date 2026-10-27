@@ -65,6 +65,8 @@ impl TurnPersister {
                 timestamp: Some(jiff::Timestamp::now()),
                 tool_call_id: msg.tool_call_id.clone(),
                 stats: None,
+                reasoning: Vec::new(),
+                tool_calls: Vec::new(),
             };
             let row = db.append_chat_message(&self.session_id, &chat_msg).await?;
             last_id = Some(i64::from(row.id));

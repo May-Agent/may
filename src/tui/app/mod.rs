@@ -2233,6 +2233,14 @@ impl App {
                 self.open_btw();
                 None
             }
+            "/resume-codex" | "/resume-claude" => {
+                // These take a session id argument — leave the command in the
+                // input so the user can type it, rather than executing now.
+                self.input = format!("{cmd} ");
+                self.input_char_count = self.input.chars().count();
+                self.cursor = self.input_char_count;
+                None
+            }
             "/quit" => Some(SendAction::Quit),
             "/compact" => Some(SendAction::Compact(None)),
             "/context" => Some(SendAction::ContextReport),
@@ -2414,6 +2422,20 @@ impl App {
                 return SendAction::Compact(None);
             }
             return SendAction::Compact(Some(focus.to_string()));
+        }
+        for (cmd, source) in [
+            ("/resume-codex", crate::session::import::ForeignAgent::Codex),
+            (
+                "/resume-claude",
+                crate::session::import::ForeignAgent::Claude,
+            ),
+        ] {
+            if trimmed == cmd || trimmed.starts_with(&format!("{cmd} ")) {
+                return SendAction::ResumeImport {
+                    source,
+                    query: trimmed[cmd.len()..].trim().to_string(),
+                };
+            }
         }
 
         let msg = PendingMessage {
@@ -2766,6 +2788,13 @@ pub enum SendAction {
     SkillDelete {
         /// Directory name of the skill to delete.
         dir_name: String,
+    },
+    /// Import a Codex/Claude transcript into a new session.
+    ResumeImport {
+        /// Which agent's transcript to parse.
+        source: crate::session::import::ForeignAgent,
+        /// Session id, id prefix, or transcript path.
+        query: String,
     },
     /// Rewind the conversation to before the user message at
     /// `history_index`, optionally restoring the code too.
