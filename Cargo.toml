@@ -162,6 +162,7 @@ arrow-array = "56.2"
 arrow-schema = "56.2"
 similar = "3.1.1"
 dunce = "1.0.5"
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip

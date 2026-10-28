@@ -6,10 +6,12 @@ COMMANDS
   /session      Switch sessions
   /config       Provider settings
   /clear        Clear chat
+  /secret K V   Store a secret in the OS keychain
   /quit         Exit
 
 SHORTCUTS
   Enter         Send message
+  ! command     Run a bash command in may's environment
   Ctrl+v        Paste image
   Ctrl+c        Quit
   Up/Down       History / Scroll chat
@@ -20,3 +22,6 @@ SHORTCUTS
 
 Type a message and press Enter to chat.
 Type @ to attach files.
+Prefix a message with ! to run it as a bash command; its
+masked output is returned to the agent. Never type secrets
+in bash mode — use /secret instead.
