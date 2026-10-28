@@ -142,12 +142,30 @@ impl Workspace {
         config_path: PathBuf,
     ) -> Result<Self, WorkspaceConfigError> {
         let config = WorkspaceConfig::load(&config_path)?;
-        Ok(Self {
+        let mut workspace = Self {
             sandbox,
             cwd,
             config,
             config_path,
-        })
+        };
+        // The launch directory is trusted for the session (same model as
+        // `claude --add-dir`): persist it so permission checks, file-diff
+        // tracking and sandbox mounts all see the same grant.
+        let cwd = workspace.cwd.clone();
+        let cwd_in_sandbox = cwd
+            .canonicalize()
+            .is_ok_and(|c| {
+                c.starts_with(
+                    workspace
+                        .sandbox
+                        .canonicalize()
+                        .unwrap_or_else(|_| workspace.sandbox.clone()),
+                )
+            });
+        if !cwd_in_sandbox && !workspace.config.has_write_access(&cwd) {
+            workspace.add_workdir(cwd, Some("launch directory".to_string()))?;
+        }
+        Ok(workspace)
     }
 
     /// Add a working directory (requires user approval).

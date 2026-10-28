@@ -110,6 +110,8 @@ pub struct LocalSessionRuntime {
     runtime_service: Arc<crate::session::SessionRuntimeService>,
     permission_approver: crate::agent::PermissionApprover,
     oneshot_restricted: bool,
+    auto_approve: bool,
+    extra_workspace_dirs: Vec<std::path::PathBuf>,
 }
 
 impl LocalSessionRuntime {
@@ -126,6 +128,8 @@ impl LocalSessionRuntime {
             runtime_service,
             permission_approver,
             oneshot_restricted: false,
+            auto_approve: false,
+            extra_workspace_dirs: Vec::new(),
         }
     }
 
@@ -134,12 +138,35 @@ impl LocalSessionRuntime {
         self.oneshot_restricted = true;
     }
 
+    /// Auto-approve every permission request (`--yolo`).
+    pub const fn enable_auto_approve(&mut self) {
+        self.auto_approve = true;
+    }
+
+    /// Extra directories trusted read-write for this runtime's sessions
+    /// (`--add-dir`).
+    pub fn set_extra_workspace_dirs(&mut self, dirs: Vec<std::path::PathBuf>) {
+        self.extra_workspace_dirs = dirs;
+    }
+
+    /// Extra workspace dirs granted at launch.
+    #[must_use]
+    pub fn extra_workspace_dirs(&self) -> &[std::path::PathBuf] {
+        &self.extra_workspace_dirs
+    }
+
     /// Permission approver bound to `session_id`.
     #[must_use]
     pub fn permission_approver_for(
         &self,
         session_id: &SessionId,
     ) -> crate::agent::PermissionApprover {
+        if self.auto_approve {
+            return self
+                .permission_approver
+                .for_session(session_id.as_str().to_string())
+                .always_approve();
+        }
         if self.oneshot_restricted {
             return self
                 .permission_approver
@@ -1428,6 +1455,8 @@ async fn build_worker_for_session(
         &may_dir,
         &sandbox_dir,
         &session_id,
+        Some(cwd.as_path()),
+        deps.local_runtime.extra_workspace_dirs(),
         &deps.tool_distribution,
     ))
     .await
@@ -1447,6 +1476,7 @@ async fn build_worker_for_session(
             reasoning_effort,
             profile_id: profile_model.as_ref().map(|profile| profile.id.clone()),
             permission_approver: Some(permission_approver),
+            extra_workspace_dirs: deps.local_runtime.extra_workspace_dirs().to_vec(),
             profile_persona,
             profile_memories,
             plan_state: runtime.plan_state,

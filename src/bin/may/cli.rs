@@ -26,6 +26,10 @@ pub struct OneShotArgs {
     pub prompt: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Additional directories trusted read-write for the session.
+    pub add_dirs: Vec<std::path::PathBuf>,
+    /// Auto-approve every permission request.
+    pub yolo: bool,
 }
 
 /// Parsed `may exec` invocation.
@@ -70,7 +74,7 @@ pub enum BrowserCliCommand {
 
 impl OneShotArgs {
     pub const fn help_text() -> &'static str {
-        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may ui [args...]\n       may rest [args...]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
+        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] [--add-dir <path>]... [--yolo] <prompt>\n       may ui [args...]\n       may rest [args...]\n\nOne-shot mode streams assistant text to stdout and process events to stderr. The launch directory is trusted read-write by default; --add-dir trusts additional directories and --yolo auto-approves permission requests."
     }
 }
 
@@ -339,6 +343,8 @@ fn parse_oneshot_args(args: &[String]) -> OneShotArgs {
     let mut prompt_parts = Vec::new();
     let mut model = None;
     let mut reasoning_effort = None;
+    let mut add_dirs = Vec::new();
+    let mut yolo = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -358,6 +364,17 @@ fn parse_oneshot_args(args: &[String]) -> OneShotArgs {
                 reasoning_effort = Some(parse_reasoning_effort(value));
                 index += 2;
             }
+            "--add-dir" => {
+                let value = args
+                    .get(index + 1)
+                    .unwrap_or_else(|| panic!("--add-dir requires a value"));
+                add_dirs.push(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            "--yolo" => {
+                yolo = true;
+                index += 1;
+            }
             value => {
                 prompt_parts.push(value.to_string());
                 index += 1;
@@ -372,6 +389,8 @@ fn parse_oneshot_args(args: &[String]) -> OneShotArgs {
         prompt,
         model,
         reasoning_effort,
+        add_dirs,
+        yolo,
     }
 }
 
@@ -482,6 +501,8 @@ mod tests {
                 prompt: "fix the bug".to_string(),
                 model: None,
                 reasoning_effort: None,
+                add_dirs: Vec::new(),
+                yolo: false,
             })
         );
     }
@@ -557,6 +578,8 @@ mod tests {
                 prompt: "inspect repo".to_string(),
                 model: Some("gpt-5.4".to_string()),
                 reasoning_effort: Some(ReasoningEffort::Low),
+                add_dirs: Vec::new(),
+                yolo: false,
             })
         );
     }

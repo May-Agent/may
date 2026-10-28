@@ -2715,6 +2715,13 @@ async fn setup_agent_environment(
             for mount in extra_mounts {
                 launch_spec = launch_spec.with_mount(mount);
             }
+            for mount in crate::container::profile::workspace_mounts(
+                &ctx.sandbox_dir,
+                Some(state.cwd.as_path()),
+                &[],
+            ) {
+                launch_spec = launch_spec.with_mount(mount);
+            }
             for env in extra_env {
                 launch_spec = launch_spec.with_env(env);
             }
@@ -2855,6 +2862,7 @@ fn prepare_agent_for_request<'a>(
                         .permission_approver
                         .for_session(ctx.session_id.as_str().to_string()),
                 ),
+                extra_workspace_dirs: Vec::new(),
                 profile_persona: ctx.profile_persona,
                 profile_memories: ctx.profile_memories,
                 plan_state: ctx.plan_state,

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
@@ -51,6 +51,8 @@ pub async fn resolve_agent_environment_for_session(
     may_dir: &Path,
     sandbox_dir: &Path,
     session_id: &SessionId,
+    cwd: Option<&Path>,
+    extra_workspace_dirs: &[PathBuf],
     tool_distribution: &Arc<aither_sandbox::ToolDistribution>,
 ) -> Result<AgentEnvironment, ResolveAgentEnvironmentError> {
     match profile_environment {
@@ -97,6 +99,13 @@ pub async fn resolve_agent_environment_for_session(
         sandbox_dir.to_path_buf(),
     );
     for mount in extra_mounts {
+        launch_spec = launch_spec.with_mount(mount);
+    }
+    for mount in crate::container::profile::workspace_mounts(
+        sandbox_dir,
+        cwd,
+        extra_workspace_dirs,
+    ) {
         launch_spec = launch_spec.with_mount(mount);
     }
 

@@ -151,6 +151,8 @@ pub struct MayAgentConfig {
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,
+    /// Extra launch-granted directories mounted read-write (`--add-dir`).
+    pub extra_workspace_dirs: Vec<PathBuf>,
     /// Execution environment (local heel sandbox or container).
     pub environment: AgentEnvironment,
     /// Optional profile persona overlay injected into the agent context.
@@ -208,6 +210,8 @@ pub struct MayAgentSessionInput<'a> {
     pub profile_id: Option<String>,
     /// Optional permission approver handling interactive approval.
     pub permission_approver: Option<PermissionApprover>,
+    /// Extra launch-granted directories mounted read-write (`--add-dir`).
+    pub extra_workspace_dirs: Vec<PathBuf>,
     /// Optional profile persona overlay injected into the agent context.
     pub profile_persona: Option<String>,
     /// Optional profile memories injected as read-only context.
@@ -294,6 +298,32 @@ impl MayAgent {
         .await
         .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
 
+        let session_paths = SessionPaths::new(config.sandbox_dir.clone());
+
+        // Create workspace with permissions (only used for local environment context)
+        let workspace = MayWorkspace::new(
+            config.sandbox_dir.clone(),
+            config.cwd.clone(),
+            session_paths.workspace_config(),
+        )?;
+
+        // Mount workspace grants into the terminal sandbox: read-only dirs
+        // become readable mounts, read-write dirs writable mounts; cwd lands
+        // in the read-write set because `MayWorkspace::new` trusts it.
+        let readable = workspace
+            .config
+            .workdirs
+            .iter()
+            .filter(|dir| dir.permission == crate::workspace::Permission::ReadOnly)
+            .map(|dir| dir.path.clone());
+        let writable = workspace
+            .config
+            .workdirs
+            .iter()
+            .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
+            .map(|dir| dir.path.clone())
+            .chain(config.extra_workspace_dirs.iter().cloned());
+
         // Create the terminal command tool in the sandbox dir.
         let terminal_tool: TerminalTool<TerminalPermissionHandler, DefaultExecutor> =
             TerminalTool::new_exact(
@@ -308,18 +338,11 @@ impl MayAgent {
             .await
             .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
             .with_network_audit_log(network_audit)
-            .with_process_priority(config.command_priority.process_priority());
+            .with_process_priority(config.command_priority.process_priority())
+            .with_readable_paths(readable)
+            .with_writable_paths(writable);
         let job_registry = terminal_tool.job_registry();
         let subagent_runs = aither_agent::specialized::SubagentRuns::default();
-
-        let session_paths = SessionPaths::new(config.sandbox_dir.clone());
-
-        // Create workspace with permissions (only used for local environment context)
-        let workspace = MayWorkspace::new(
-            config.sandbox_dir.clone(),
-            config.cwd.clone(),
-            session_paths.workspace_config(),
-        )?;
 
         let ssh_servers: Vec<SshServer> = config
             .ssh_servers
@@ -659,6 +682,7 @@ impl MayAgent {
             reasoning_effort,
             profile_id,
             permission_approver,
+            extra_workspace_dirs,
             profile_persona,
             profile_memories,
             plan_state,
@@ -719,6 +743,7 @@ impl MayAgent {
             image_generator: resolve_image_generator_config(may_config),
             ssh_servers,
             permission_approver,
+            extra_workspace_dirs,
             environment,
             profile_persona,
             profile_memories,
