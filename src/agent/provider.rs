@@ -17,7 +17,7 @@ use aither_cloud::{
 use aither_core::LanguageModel;
 use aither_core::llm::{
     Event as LlmEvent, LLMRequest,
-    model::{Ability, Parameters, Profile as ModelProfile, ReasoningEffort},
+    model::{Ability, OpenAIPromptCache, Parameters, Profile as ModelProfile, ReasoningEffort},
 };
 use futures_lite::Stream;
 
@@ -28,6 +28,7 @@ use crate::config::{
 use crate::copilot::clear_copilot_credentials;
 use crate::embedding_provider::{EmbeddingModelResolution, resolve_embedding_model};
 use crate::model_selector::ModelSelector;
+use crate::session::manager::SessionId;
 
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
 
@@ -94,12 +95,17 @@ impl<M> RequestParameterizedModel<M> {
 /// for the provider type `provider_id` resolves to, gated by the model's own
 /// abilities.
 ///
+/// Requests to OpenAI-API provider types also carry `session_id` as the
+/// `prompt_cache_key`, so a provider grouping prompt caching by key sees all
+/// calls of one session (subagent sessions have their own id) as related.
+///
 /// `instance` is `None` when `provider_id` is absent from the config.
 pub(super) fn request_parameters_for(
     provider_id: &str,
     instance: Option<&ProviderInstance>,
     model_id: &str,
     reasoning_effort: Option<ReasoningEffort>,
+    session_id: &SessionId,
 ) -> Parameters {
     let mut request_parameters = Parameters::default();
     if let Some(reasoning_effort) = reasoning_effort {
@@ -144,6 +150,15 @@ pub(super) fn request_parameters_for(
             request_parameters.websearch = native.web_search;
         }
         _ => {}
+    }
+    if matches!(
+        provider_type,
+        Some(ProviderType::OpenAI | ProviderType::Chatgpt | ProviderType::Custom)
+    ) {
+        request_parameters.cache.openai = Some(OpenAIPromptCache {
+            key: Some(session_id.as_str().to_string()),
+            ..OpenAIPromptCache::default()
+        });
     }
     request_parameters
 }
@@ -255,6 +270,7 @@ pub async fn resolve_ask_tier_models(
     config: &MayConfig,
     session_provider_id: &str,
     session_model_id: &str,
+    session_id: &SessionId,
 ) -> Result<AskTierModels, MayAgentError> {
     let (flagship, balanced, fast) = futures_util::future::try_join3(
         resolve_ask_tier_model(
@@ -262,18 +278,21 @@ pub async fn resolve_ask_tier_models(
             ModelTier::Advanced,
             session_provider_id,
             session_model_id,
+            session_id,
         ),
         resolve_ask_tier_model(
             config,
             ModelTier::Balanced,
             session_provider_id,
             session_model_id,
+            session_id,
         ),
         resolve_ask_tier_model(
             config,
             ModelTier::Fast,
             session_provider_id,
             session_model_id,
+            session_id,
         ),
     )
     .await?;
@@ -293,6 +312,7 @@ async fn resolve_ask_tier_model(
     tier: ModelTier,
     session_provider_id: &str,
     session_model_id: &str,
+    session_id: &SessionId,
 ) -> Result<Option<RequestParameterizedModel<CloudProvider>>, MayAgentError> {
     let Some(selector) = config.default_model_for_tier(tier) else {
         return Ok(None);
@@ -316,7 +336,13 @@ async fn resolve_ask_tier_model(
         })?;
     Ok(Some(RequestParameterizedModel::new(
         llm,
-        request_parameters_for(provider_id, Some(instance), selector.model_id(), None),
+        request_parameters_for(
+            provider_id,
+            Some(instance),
+            selector.model_id(),
+            None,
+            session_id,
+        ),
     )))
 }
 
@@ -542,6 +568,7 @@ mod tests {
             Some(&instance),
             "gemini-3-flash-preview",
             Some(ReasoningEffort::High),
+            &SessionId::new(),
         );
 
         assert!(parameters.websearch);
@@ -554,13 +581,20 @@ mod tests {
     #[test]
     fn request_parameters_for_chatgpt_defaults_web_search_on() {
         let instance = ProviderInstance::new(ProviderType::Chatgpt);
-        let parameters = request_parameters_for("chatgpt", Some(&instance), "gpt-5", None);
+        let parameters =
+            request_parameters_for("chatgpt", Some(&instance), "gpt-5", None, &SessionId::new());
         assert!(parameters.websearch);
 
         // An explicitly configured `native_tools` section drops the default.
         let mut fetch_only = ProviderInstance::new(ProviderType::Chatgpt);
         fetch_only.native_tools.web_fetch = true;
-        let parameters = request_parameters_for("chatgpt", Some(&fetch_only), "gpt-5", None);
+        let parameters = request_parameters_for(
+            "chatgpt",
+            Some(&fetch_only),
+            "gpt-5",
+            None,
+            &SessionId::new(),
+        );
         assert!(!parameters.websearch);
     }
 
@@ -569,12 +603,49 @@ mod tests {
         let mut instance =
             ProviderInstance::new(ProviderType::Custom).with_base_url("http://127.0.0.1:8787/v1");
         instance.api = Some(ProviderApi::Responses);
-        let parameters = request_parameters_for("swe2", Some(&instance), "swe-2-high", None);
+        let parameters = request_parameters_for(
+            "swe2",
+            Some(&instance),
+            "swe-2-high",
+            None,
+            &SessionId::new(),
+        );
         assert!(!parameters.websearch);
 
         instance.native_tools.web_search = true;
-        let parameters = request_parameters_for("swe2", Some(&instance), "swe-2-high", None);
+        let parameters = request_parameters_for(
+            "swe2",
+            Some(&instance),
+            "swe-2-high",
+            None,
+            &SessionId::new(),
+        );
         assert!(parameters.websearch);
+    }
+
+    #[test]
+    fn request_parameters_carry_session_id_as_prompt_cache_key() {
+        let key = |provider_id: &str, instance: &ProviderInstance, session: &SessionId| {
+            request_parameters_for(provider_id, Some(instance), "gpt-5", None, session)
+                .cache
+                .openai
+                .and_then(|cache| cache.key)
+        };
+        let first = SessionId::new();
+        let second = SessionId::new();
+        assert_ne!(first, second);
+
+        let swe2 = ProviderInstance::new(ProviderType::Custom);
+        let chatgpt = ProviderInstance::new(ProviderType::Chatgpt);
+        let openai = ProviderInstance::new(ProviderType::OpenAI);
+        for (id, instance) in [("swe2", &swe2), ("chatgpt", &chatgpt), ("openai", &openai)] {
+            assert_eq!(key(id, instance, &first).as_deref(), Some(first.as_str()));
+            assert_eq!(key(id, instance, &second).as_deref(), Some(second.as_str()));
+        }
+
+        // Non-OpenAI provider types carry no OpenAI cache key.
+        let anthropic = ProviderInstance::new(ProviderType::Anthropic);
+        assert_eq!(key("anthropic", &anthropic, &first), None);
     }
 
     #[test]
@@ -604,6 +675,7 @@ mod tests {
             Some(&instance),
             "claude-sonnet-4-5-20250929",
             None,
+            &SessionId::new(),
         );
         assert!(parameters.native_tools.claude.web_search);
         assert!(parameters.native_tools.claude.web_fetch);
@@ -616,6 +688,7 @@ mod tests {
             Some(&instance),
             "claude-haiku-4-5-20251001",
             None,
+            &SessionId::new(),
         );
         assert!(!parameters.native_tools.claude.web_search);
         assert!(parameters.native_tools.claude.web_fetch);
@@ -646,9 +719,14 @@ mod tests {
             .models
             .add_model(ModelTier::Balanced, "gemini-3-flash-preview", "google");
 
-        let models = resolve_ask_tier_models(&config, "google", "gemini-3-flash-preview")
-            .await
-            .expect("tier models resolve");
+        let models = resolve_ask_tier_models(
+            &config,
+            "google",
+            "gemini-3-flash-preview",
+            &SessionId::new(),
+        )
+        .await
+        .expect("tier models resolve");
 
         let fast = models.fast.expect("fast tier model is built");
         let parameters = fast.parameters();
@@ -676,9 +754,14 @@ mod tests {
             .models
             .add_model(ModelTier::Fast, "some-model", "ghost");
 
-        let error = resolve_ask_tier_models(&config, "google", "gemini-3-flash-preview")
-            .await
-            .expect_err("an unknown tier provider must fail resolution");
+        let error = resolve_ask_tier_models(
+            &config,
+            "google",
+            "gemini-3-flash-preview",
+            &SessionId::new(),
+        )
+        .await
+        .expect_err("an unknown tier provider must fail resolution");
 
         let message = error.to_string();
         assert!(message.contains("Fast"), "{message}");
