@@ -976,9 +976,6 @@ pub struct TerminalInteractionResponse {
     pub(crate) output_file: Option<String>,
     pub(crate) output_preview: Option<String>,
     pub(crate) input_notice: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<serde_json::Value>)]
-    pub(crate) background_reason: Option<aither_sandbox::BackgroundReason>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, skyzen::ToSchema)]
@@ -1002,7 +999,6 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
                     output_file: summary.interactions.terminal.output_file,
                     output_preview: summary.interactions.terminal.output_preview,
                     input_notice: summary.interactions.terminal.input_notice,
-                    background_reason: summary.interactions.terminal.background_reason,
                 },
             },
             queued_count: summary.queued_count,
