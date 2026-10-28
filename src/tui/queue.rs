@@ -57,6 +57,10 @@ pub struct PendingMessage {
     pub queued_at: Timestamp,
     /// Whether this should steer the running agent or wait in the queue.
     pub delivery_mode: PendingUserMessageMode,
+    /// ID of an existing chat element already rendering this message (a
+    /// bash-mode terminal block); `start_processing` then skips the user
+    /// bubble. Transient — not persisted with the queue.
+    pub display: Option<String>,
 }
 
 /// Message queue for concurrent user input.
@@ -136,6 +140,7 @@ mod tests {
             attachments: Vec::new(),
             queued_at: Timestamp::now(),
             delivery_mode: mode,
+            display: None,
         }
     }
 
