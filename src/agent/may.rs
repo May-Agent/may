@@ -693,6 +693,7 @@ impl MayAgent {
             may_config.provider.get(&provider_id),
             model,
             reasoning_effort,
+            &session_id,
         );
 
         let ssh_servers = crate::profile::resolve_attached_ssh_servers(
@@ -708,7 +709,8 @@ impl MayAgent {
         })?;
 
         let ask_models =
-            super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await?;
+            super::provider::resolve_ask_tier_models(may_config, &provider_id, model, &session_id)
+                .await?;
         let secrets =
             crate::secrets::Secrets::load(&crate::secrets::SecretStore::new(&may_dir), may_config);
         let config = MayAgentConfig {
