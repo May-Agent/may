@@ -299,6 +299,8 @@ struct TerminalRuntimeContextTemplate {
     environment_rules: Vec<String>,
     modality_support: Vec<String>,
     attached_remote_servers: Vec<crate::config::SshServerConfig>,
+    secret_names: Vec<String>,
+    secrets_file: String,
 }
 
 #[derive(Clone, Template)]
@@ -477,6 +479,13 @@ pub fn build_terminal_runtime_context(
         environment_rules: environment_runtime_rules(&config.environment),
         modality_support,
         attached_remote_servers,
+        secret_names: config
+            .secrets
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        secrets_file: crate::secrets::SECRETS_ENV_FILE.to_string(),
     };
     template
         .render()

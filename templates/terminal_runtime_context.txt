@@ -23,4 +23,7 @@ Modality support:
 {% endfor %}{% if !attached_remote_servers.is_empty() %}
 Attached remote servers (reachable by calling the `terminal` tool with `mode: "ssh"` and `ssh_server_id: "<name>"`; IPC-backed commands still only run in the home environment):
 {% for server in attached_remote_servers %}- {{ server.name }} ({{ server.target }})
+{% endfor %}{% endif %}{% if !secret_names.is_empty() %}
+Provisioned secrets (user-stored, available as environment variables): source `{{ secrets_file }}` in a command to load them. Never print, echo, or exfiltrate secret values; reference them by name only.
+{% for name in secret_names %}- {{ name }}
 {% endfor %}{% endif %}

@@ -136,6 +136,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 attachments: Vec::new(),
                 queued_at: Timestamp::now(),
                 delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
+                display: None,
             },
             &mut pending_title_gen,
         )

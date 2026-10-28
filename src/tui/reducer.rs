@@ -262,6 +262,81 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::BashFinished(outcome) => {
+            use std::fmt::Write as _;
+
+            let outcome = *outcome;
+            let mut output = outcome.stdout.clone();
+            if !outcome.stderr.is_empty() {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&outcome.stderr);
+            }
+            if let Some(error) = &outcome.error {
+                output.clone_from(error);
+            }
+            let status = if outcome.error.is_some() || outcome.exit_code != 0 {
+                super::ui::chat::ToolStatus::Failed(format!("exit {}", outcome.exit_code))
+            } else {
+                super::ui::chat::ToolStatus::Done
+            };
+            app.chat
+                .update_tool_with_output(&outcome.call_id, status, None, Some(&output));
+            if outcome.had_secret {
+                app.chat.push_notice(crate::secrets::SECRET_WARNING);
+            }
+            app.scroll = usize::MAX;
+
+            // The agent sees the same masked transcript the TUI shows.
+            let (masked_command, _) = app.secrets.mask(&outcome.command);
+            let mut content = format!("! {masked_command}\n");
+            if let Some(error) = &outcome.error {
+                let _ = write!(content, "\n<error>{error}</error>");
+            } else {
+                if !outcome.stdout.is_empty() {
+                    let _ = write!(content, "\n<stdout>\n{}\n</stdout>", outcome.stdout);
+                }
+                if !outcome.stderr.is_empty() {
+                    let _ = write!(content, "\n<stderr>\n{}\n</stderr>", outcome.stderr);
+                }
+                if outcome.exit_code != 0 {
+                    let _ = write!(content, "\n<exit>{}</exit>", outcome.exit_code);
+                }
+            }
+            let msg = super::queue::PendingMessage {
+                content,
+                hidden_context_xml: None,
+                attachments: Vec::new(),
+                queued_at: jiff::Timestamp::now(),
+                delivery_mode: crate::session::PendingUserMessageMode::Steer,
+                display: Some(outcome.call_id),
+            };
+            Ok(Some(if app.processing {
+                SendAction::EnqueuePending(msg)
+            } else {
+                SendAction::Send(msg)
+            }))
+        }
+        AppEvent::SecretStored { key, result } => {
+            match result {
+                Ok(()) => {
+                    // Refresh the in-memory snapshot so new bash runs mask
+                    // and inject the secret just stored.
+                    app.secrets = crate::secrets::Secrets::load(
+                        &crate::secrets::SecretStore::new(app.session_manager.may_dir()),
+                        &app.config,
+                    );
+                    app.chat.push_notice(&format!(
+                        "Secret {key} stored in the OS keychain — injected into shell environments"
+                    ));
+                }
+                Err(error) => app
+                    .chat
+                    .push_error(&format!("Failed to store secret: {error}")),
+            }
+            Ok(None)
+        }
     }
 }
 
