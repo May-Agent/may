@@ -112,11 +112,6 @@ pub struct TerminalRuntimeState {
     /// Notice shown to the user about pending terminal input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_notice: Option<String>,
-    /// Why the command was promoted to the background (populated when the
-    /// runtime state reflects a live terminal task).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<serde_json::Value>)]
-    pub background_reason: Option<aither_sandbox::BackgroundReason>,
 }
 
 impl TerminalRuntimeState {
@@ -127,7 +122,6 @@ impl TerminalRuntimeState {
             && self.output_file.is_none()
             && self.output_preview.is_none()
             && self.input_notice.is_none()
-            && self.background_reason.is_none()
     }
 
     /// Return a copy with `input_notice` (and `task_id`, when provided) set.

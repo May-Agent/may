@@ -138,7 +138,8 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         args.allow_runtime_install,
         tool_distribution,
     )
-    .await?;
+    .await?
+    .with_foreground_limit(std::time::Duration::from_secs(args.timeout));
 
     let output = terminal_tool
         .call(
@@ -149,7 +150,6 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
                 ssh_server_id: args.ssh_server_id,
                 expect: OutputFormat::Text,
                 resolution: aither_sandbox::MediaResolution::Auto,
-                timeout: args.timeout,
                 max_lines: args.max_lines,
                 raw: args.raw,
             },

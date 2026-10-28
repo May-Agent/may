@@ -700,7 +700,7 @@ where
                         }
                         app.status = None;
                         // Clean up loading/streaming state before adding interrupt message
-                        app.chat.end_loading();
+                        app.chat.collapse_thinking();
                         app.chat.end_text();
                         app.chat.push_text("\n\n[Interrupted]");
                         app.chat.end_text();
