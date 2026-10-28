@@ -181,6 +181,9 @@ pub struct MayAgentConfig {
     pub request_parameters: Parameters,
     /// Database handle for runtime memory/state lookups.
     pub db: crate::db::ChatDb,
+    /// Keychain secrets snapshot: injected into the session env file and
+    /// listed by name in the terminal runtime context.
+    pub secrets: crate::secrets::Secrets,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -313,6 +316,13 @@ impl MayAgent {
         let subagent_runs = aither_agent::specialized::SubagentRuns::default();
 
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
+
+        // Provision the session env file the shell sources for stored
+        // secrets (`/secret`); refreshed in place on every build.
+        let secrets_file = session_paths.root().join(crate::secrets::SECRETS_ENV_FILE);
+        if let Err(error) = crate::secrets::write_env_file(&secrets_file, &config.secrets).await {
+            tracing::warn!(%error, "failed to write session secrets env file");
+        }
 
         // Create workspace with permissions (only used for local environment context)
         let workspace = MayWorkspace::new(
@@ -699,6 +709,8 @@ impl MayAgent {
 
         let ask_models =
             super::provider::resolve_ask_tier_models(may_config, &provider_id, model).await?;
+        let secrets =
+            crate::secrets::Secrets::load(&crate::secrets::SecretStore::new(&may_dir), may_config);
         let config = MayAgentConfig {
             tool_distribution,
             tool_environments,
@@ -728,6 +740,7 @@ impl MayAgent {
                 .network_policy
                 .compile()
                 .map_err(|error| MayAgentError::Sandbox(error.to_string()))?,
+            secrets,
             location,
             task_broker,
             notify_broker,

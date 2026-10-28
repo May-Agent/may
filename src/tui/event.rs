@@ -95,6 +95,36 @@ pub enum AppEvent {
     BtwFinished,
     /// The `/btw` request failed.
     BtwFailed(String),
+
+    // ─── bash mode / secrets ───────────────────────────────────────
+    /// A bash-mode command finished; output is already masked.
+    BashFinished(Box<BashOutcome>),
+    /// A `/secret` write to the keychain completed.
+    SecretStored {
+        /// Env name that was stored.
+        key: String,
+        /// Store outcome.
+        result: Result<(), String>,
+    },
+}
+
+/// Masked result of a bash-mode command, ready for display and the agent.
+#[derive(Debug)]
+pub struct BashOutcome {
+    /// Chat element id (`bash-*`) showing the run.
+    pub call_id: String,
+    /// The raw command as typed (unmasked — the run already happened).
+    pub command: String,
+    /// Captured stdout (masked).
+    pub stdout: String,
+    /// Captured stderr (masked).
+    pub stderr: String,
+    /// Process exit code; `-1` when the signal had none.
+    pub exit_code: i32,
+    /// A secret was detected in the command or its output.
+    pub had_secret: bool,
+    /// Spawn/capture failure message, when the command never ran.
+    pub error: Option<String>,
 }
 
 /// One incremental output read bound to a running terminal tool call.
