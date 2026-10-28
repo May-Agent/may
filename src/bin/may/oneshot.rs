@@ -495,10 +495,14 @@ fn render_oneshot_event(
             | AgentEvent::TurnComplete { .. }
             | AgentEvent::Checkpoint { .. }
             | AgentEvent::Complete { .. }
+            | AgentEvent::BuiltInToolResult { .. }
             | AgentEvent::Text(_),
         ) => {}
         Ok(AgentEvent::ToolCallStart { name, .. }) => {
             writeln!(stderr, "Tool: {name}")?;
+        }
+        Ok(AgentEvent::BuiltInToolCall { tool, .. }) => {
+            writeln!(stderr, "Tool: {tool}")?;
         }
         Ok(AgentEvent::ToolCallEnd { name, result, .. }) => {
             if result.is_error() {
@@ -520,21 +524,6 @@ fn render_oneshot_event(
         }
         Ok(AgentEvent::BackgroundTaskCompleted { task_id, .. }) => {
             writeln!(stderr, "Background task completed: {task_id}")?;
-        }
-        Ok(AgentEvent::TerminalInputNeeded { task_id, notice }) => {
-            writeln!(
-                stderr,
-                "Terminal input needed{}: {}",
-                task_id
-                    .as_deref()
-                    .map(|id| {
-                        let mut text = String::from(" for ");
-                        text.push_str(id);
-                        text
-                    })
-                    .unwrap_or_default(),
-                notice,
-            )?;
         }
         Ok(AgentEvent::RunPaused { reason, .. }) => {
             writeln!(stderr, "Paused: {reason:?}")?;

@@ -286,7 +286,12 @@ where
     type Res = ToolResult;
 
     async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
-        let (run, _guard) = self.tracker.begin(&args.subagent, &args.prompt);
+        // `prompt_file` carries the task text now; read it for the run's
+        // display label, falling back to the path itself if it is gone.
+        let prompt = async_fs::read_to_string(&args.prompt_file)
+            .await
+            .unwrap_or_else(|_| args.prompt_file.clone());
+        let (run, _guard) = self.tracker.begin(&args.subagent, &prompt);
         ACTIVE_RUN.scope(run, self.inner.call(args, cx)).await
     }
 }

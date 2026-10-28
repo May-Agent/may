@@ -65,7 +65,6 @@ impl ChatDb {
         let db = SkyDb::connect_sqlite(&url).await?;
         Self::initialize_schema(&db).await?;
         Self::ensure_profile_preference_columns(&db).await?;
-        Self::ensure_session_runtime_columns(&db).await?;
         Self::ensure_session_columns(&db).await?;
         Self::ensure_message_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
@@ -153,26 +152,6 @@ impl ChatDb {
             count,
             "migrated legacy remote profiles to local home + attached SSH servers",
         );
-        Ok(())
-    }
-
-    async fn ensure_session_runtime_columns(db: &SkyDb) -> Result<(), ChatDbError> {
-        let columns = query!(db, "PRAGMA table_info(session_runtimes)")
-            .fetch_all::<SqliteTableInfoRow>()
-            .await?;
-        let existing = columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-
-        if !existing.contains("terminal_background_reason") {
-            query!(
-                db,
-                "ALTER TABLE session_runtimes ADD COLUMN terminal_background_reason TEXT"
-            )
-            .execute()
-            .await?;
-        }
         Ok(())
     }
 
@@ -1310,7 +1289,6 @@ mod tests {
             output_file: Some("outputs/amber-forest-thunder-pearl.txt".to_string()),
             output_preview: Some("preview".to_string()),
             input_notice: Some("input needed".to_string()),
-            background_reason: None,
         };
         db.write_session_runtime(session_id, &runtime)
             .await
