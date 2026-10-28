@@ -1277,6 +1277,9 @@ impl TaskRuntime {
         for mount in extra_mounts {
             launch_spec = launch_spec.with_mount(mount);
         }
+        for mount in crate::container::profile::workspace_mounts(&workspace_dir, None, &[]) {
+            launch_spec = launch_spec.with_mount(mount);
+        }
         let container_id = container_manager
             .ensure_running(&launch_spec)
             .await

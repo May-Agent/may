@@ -122,6 +122,8 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         &context.may_dir,
         &context.sandbox_dir,
         &context.session_id,
+        None,
+        &[],
         &tool_distribution,
     )
     .await

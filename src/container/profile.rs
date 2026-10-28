@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use aither_sandbox::{ContainerImageSpec, MountSpec};
+use aither_sandbox::{ContainerImageSpec, ContainerPath, MountSpec};
 use async_fs;
 use futures_lite::{StreamExt, io::AsyncReadExt};
 use sha2::Digest;
@@ -53,6 +53,53 @@ pub fn mounts_for_profile(preferences: Option<ContainerProfilePreferences>) -> V
             }
         };
         mounts.push(spec);
+    }
+    mounts
+}
+
+/// Build mount specs for session workspace grants: the launch directory,
+/// persisted workdir grants and launch-time extra dirs — each bound at its
+/// own absolute host path inside the container.
+#[must_use]
+pub fn workspace_mounts(
+    sandbox_dir: &Path,
+    cwd: Option<&Path>,
+    extra_workspace_dirs: &[PathBuf],
+) -> Vec<MountSpec> {
+    let workspace_config =
+        crate::session::SessionPaths::new(sandbox_dir.to_path_buf()).workspace_config();
+    let workdirs = crate::workspace::WorkspaceConfig::load(&workspace_config)
+        .map(|config| config.workdirs)
+        .unwrap_or_default();
+    let sandbox = sandbox_dir
+        .canonicalize()
+        .unwrap_or_else(|_| sandbox_dir.to_path_buf());
+    let mut mounted = std::collections::HashSet::new();
+    let mut mounts = Vec::new();
+    let mut grant = |path: &Path, writable: bool| {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if path.starts_with(&sandbox) || !mounted.insert(path.clone()) {
+            return;
+        }
+        let container_path =
+            ContainerPath::new(path.display().to_string()).expect("workspace path is absolute");
+        mounts.push(if writable {
+            MountSpec::read_write(path, container_path)
+        } else {
+            MountSpec::read_only(path, container_path)
+        });
+    };
+    if let Some(cwd) = cwd {
+        grant(cwd, true);
+    }
+    for dir in workdirs {
+        grant(
+            &dir.path,
+            dir.permission == crate::workspace::Permission::ReadWrite,
+        );
+    }
+    for dir in extra_workspace_dirs {
+        grant(dir, true);
     }
     mounts
 }
