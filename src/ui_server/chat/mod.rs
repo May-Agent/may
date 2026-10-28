@@ -64,7 +64,7 @@ fn stopped_terminal_tool_result() -> ToolResult {
         exit_code: 130,
         task_id: None,
         status: Some("stopped".to_string()),
-        background_reason: None,
+        notice: None,
     })
     .expect("stopped terminal tool result must serialize")
 }
@@ -1696,7 +1696,6 @@ fn run_agent_loop<'a>(
                             task_id,
                             output_preview,
                             output_file,
-                            reason,
                         }) => {
                             saw_tool_activity = true;
                             set_terminal_runtime_state(
@@ -1707,7 +1706,6 @@ fn run_agent_loop<'a>(
                                     output_file: Some(output_file),
                                     output_preview: Some(output_preview),
                                     input_notice: None,
-                                    background_reason: Some(reason),
                                 },
                             )
                             .await?;
@@ -1719,27 +1717,6 @@ fn run_agent_loop<'a>(
                                 state,
                                 session_id.as_str(),
                                 SessionRuntimeState::Running,
-                            )
-                            .await?;
-                        }
-                        Ok(aither_agent::AgentEvent::TerminalInputNeeded { task_id, notice }) => {
-                            saw_tool_activity = true;
-                            set_session_runtime_state(
-                                state,
-                                session_id.as_str(),
-                                SessionRuntimeState::WaitingTerminalInput,
-                            )
-                            .await?;
-                            let current_terminal = state
-                                .runtime_service
-                                .get(session_id.as_str())
-                                .await?
-                                .interactions
-                                .terminal;
-                            set_terminal_runtime_state(
-                                state,
-                                session_id.as_str(),
-                                current_terminal.with_input_notice(task_id, notice),
                             )
                             .await?;
                         }

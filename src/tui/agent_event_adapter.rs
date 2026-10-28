@@ -247,7 +247,7 @@ mod tests {
             exit_code: 0,
             task_id: None,
             status: None,
-            background_reason: None,
+            notice: None,
         })
         .expect("serialize terminal result")
     }
