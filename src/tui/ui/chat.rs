@@ -165,6 +165,18 @@ pub enum ToolDisplay {
         /// Long commands/diffs start collapsed; a click toggles this.
         expanded: bool,
     },
+    /// Provider-hosted (server-side) tool call — the provider executes it,
+    /// the harness only observes start and result events.
+    Builtin {
+        /// Hosted tool name (e.g. `web_search`).
+        tool: String,
+        /// Invocation detail — query, URL or code — as announced at start.
+        detail: String,
+        /// Call status.
+        status: ToolStatus,
+        /// Result summary once the provider reports it.
+        output: Option<String>,
+    },
 }
 
 /// Multi-line commands longer than this collapse to their first line.
@@ -194,7 +206,9 @@ impl ToolDisplay {
                     || diffs.iter().map(|d| d.text.lines().count()).sum::<usize>()
                         > COLLAPSE_DIFF_LINES
             }
-            Self::Search { .. } | Self::Fetch { .. } | Self::Task { .. } => false,
+            Self::Search { .. } | Self::Fetch { .. } | Self::Task { .. } | Self::Builtin { .. } => {
+                false
+            }
         }
     }
 
@@ -207,6 +221,7 @@ impl ToolDisplay {
             }
             Self::Task { terminal_calls, .. } => terminal_calls.last(),
             Self::Terminal { output, .. } => output.as_ref(),
+            Self::Builtin { .. } => None,
         }
     }
 
@@ -219,6 +234,7 @@ impl ToolDisplay {
             }
             Self::Task { terminal_calls, .. } => terminal_calls.iter().collect(),
             Self::Terminal { output, .. } => output.iter().collect(),
+            Self::Builtin { .. } => Vec::new(),
         }
     }
 
@@ -229,7 +245,8 @@ impl ToolDisplay {
             Self::Search { status, .. }
             | Self::Fetch { status, .. }
             | Self::Task { status, .. }
-            | Self::Terminal { status, .. } => status,
+            | Self::Terminal { status, .. }
+            | Self::Builtin { status, .. } => status,
         }
     }
 
@@ -247,6 +264,7 @@ impl ToolDisplay {
             Self::Fetch { .. } => "fetch",
             Self::Task { subagent, .. } => subagent,
             Self::Terminal { .. } => "terminal",
+            Self::Builtin { tool, .. } => tool,
         }
     }
 
@@ -299,11 +317,6 @@ pub enum ChatElement {
     Notice {
         /// Notice text shown in the stream.
         message: String,
-    },
-    /// Loading indicator (waiting for LLM response)
-    Loading {
-        /// Spinner frame counter.
-        frame: usize,
     },
     /// Thinking block (for thinking models): the streamed reasoning shown
     /// live while the burst runs, then auto-collapsed behind its header.
@@ -449,24 +462,8 @@ impl ChatStream {
         true
     }
 
-    /// Start loading indicator.
-    pub fn start_loading(&mut self) {
-        self.elements.push(ChatElement::Loading { frame: 0 });
-    }
-
-    /// Update loading animation frame.
-    pub fn tick_loading(&mut self) {
-        if let Some(ChatElement::Loading { frame }) = self.elements.last_mut() {
-            *frame = (*frame + 1) % 4;
-        }
-    }
-
     /// Start thinking block.
     pub fn start_thinking(&mut self) {
-        // Remove loading if present
-        if matches!(self.elements.last(), Some(ChatElement::Loading { .. })) {
-            self.elements.pop();
-        }
         let id = self.next_thinking_id;
         self.next_thinking_id += 1;
         self.elements.push(ChatElement::Thinking {
@@ -498,16 +495,11 @@ impl ChatStream {
         }
     }
 
-    /// End loading/thinking state (called when the thinking burst ends or
-    /// first text arrives). Loading is transient and removed; thinking stays
-    /// as a collapsed block.
-    pub fn end_loading(&mut self) {
-        match self.elements.last_mut() {
-            Some(ChatElement::Loading { .. }) => {
-                self.elements.pop();
-            }
-            Some(ChatElement::Thinking { expanded, .. }) => *expanded = false,
-            _ => {}
+    /// Collapse the open thinking block (called when the reasoning burst
+    /// ends or first text arrives). The block stays as a collapsed header.
+    pub fn collapse_thinking(&mut self) {
+        if let Some(ChatElement::Thinking { expanded, .. }) = self.elements.last_mut() {
+            *expanded = false;
         }
     }
 
@@ -548,6 +540,47 @@ impl ChatStream {
         // End any current text block first
         self.end_text();
         self.elements.push(ChatElement::ToolCall { id, display });
+    }
+
+    /// Record a provider-hosted tool call the model just invoked.
+    pub fn push_builtin(&mut self, id: String, tool: String, detail: String) {
+        self.end_text();
+        self.elements.push(ChatElement::ToolCall {
+            id,
+            display: ToolDisplay::Builtin {
+                tool,
+                detail,
+                status: ToolStatus::Running,
+                output: None,
+            },
+        });
+    }
+
+    /// Mark a provider-hosted call complete. Providers that emit a result
+    /// without a matching call event get a completed entry appended instead.
+    pub fn finish_builtin(&mut self, id: &str, tool: &str, result: String) {
+        for elem in &mut self.elements {
+            if let ChatElement::ToolCall {
+                id: tool_id,
+                display: ToolDisplay::Builtin { status, output, .. },
+            } = elem
+                && tool_id == id
+            {
+                *status = ToolStatus::Done;
+                *output = Some(result);
+                return;
+            }
+        }
+        self.end_text();
+        self.elements.push(ChatElement::ToolCall {
+            id: id.to_string(),
+            display: ToolDisplay::Builtin {
+                tool: tool.to_string(),
+                detail: String::new(),
+                status: ToolStatus::Done,
+                output: Some(result),
+            },
+        });
     }
 
     /// Update a tool's status and output by ID.
@@ -613,6 +646,16 @@ impl ChatStream {
                                 output_file: None,
                                 image: None,
                             });
+                        }
+                    }
+                    ToolDisplay::Builtin {
+                        status: s,
+                        output: out,
+                        ..
+                    } => {
+                        *s = status;
+                        if let Some(output_text) = output {
+                            *out = Some(output_text.to_string());
                         }
                     }
                 }
@@ -723,6 +766,8 @@ impl ChatStream {
                             info.image = Some(image);
                         }
                     }
+                    // Provider-hosted calls carry no terminal info to attach.
+                    ToolDisplay::Builtin { .. } => {}
                 }
                 break;
             }
@@ -861,6 +906,35 @@ pub struct StatusBackgroundItem {
     pub elapsed_secs: u64,
 }
 
+/// What the run is doing right now, for the activity line above the
+/// status bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityPhase {
+    /// The model is reasoning or the run is waiting on its next output.
+    Thinking,
+    /// The model is producing output or a tool is executing.
+    Working,
+}
+
+impl ActivityPhase {
+    /// Lowercase label shown before the spinner.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Thinking => "thinking",
+            Self::Working => "working",
+        }
+    }
+}
+
+/// Live activity indicator rendered on the line above the status bar.
+#[derive(Debug, Clone, Copy)]
+pub struct ActivityContext {
+    /// `thinking` while reasoning/waiting, `working` while producing.
+    pub phase: ActivityPhase,
+    /// Output tokens produced so far this turn.
+    pub tokens: u64,
+}
+
 /// Status bar rendering context for combined view.
 #[derive(Debug)]
 pub struct StatusContext<'a> {
@@ -872,15 +946,16 @@ pub struct StatusContext<'a> {
     pub queue_count: usize,
     /// Running background entries (subagents and jobs).
     pub background: &'a [StatusBackgroundItem],
-    /// Whether currently processing.
-    pub processing: bool,
     /// Live decode rate in tokens per second, when measurable.
     pub decode_rate: Option<f64>,
     /// Optional status message.
     pub status_message: Option<&'a str>,
-    /// Current profile name (shown in status bar).
-    pub profile_name: Option<&'a str>,
-    /// Animation frame counter for the processing spinner.
+    /// Current working directory shown in the status bar (`~` for home).
+    pub cwd: &'a str,
+    /// Live activity indicator for the line above the status bar; `None`
+    /// when no run is in flight.
+    pub activity: Option<ActivityContext>,
+    /// Animation frame counter for the activity spinner.
     pub spinner_frame: usize,
 }
 
@@ -1248,15 +1323,6 @@ fn plain_lines_for_element(elem: &ChatElement, images_supported: bool) -> Vec<Li
         ChatElement::ContextReport(report) => {
             lines.extend(context_report_lines(report));
         }
-        ChatElement::Loading { frame } => {
-            let spinner = match frame % 4 {
-                0 => "⠋",
-                1 => "⠙",
-                2 => "⠹",
-                _ => "⠸",
-            };
-            lines.push(Line::from(format!("{spinner} Waiting for response...")));
-        }
         ChatElement::Thinking {
             content,
             seconds,
@@ -1432,6 +1498,30 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, image
                 push_image_rows(lines, &image.label);
             }
             plain_diff_lines(diffs, *expanded, lines);
+        }
+        ToolDisplay::Builtin {
+            tool,
+            detail,
+            status,
+            output,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => "running...".to_string(),
+                ToolStatus::Done => String::new(),
+                ToolStatus::SearchDone(n) => format!("{n} results"),
+                ToolStatus::Failed(e) => format!("failed: {e}"),
+            };
+            let header = if status_text.is_empty() {
+                format!("  [{tool}] {detail}")
+            } else {
+                format!("  [{tool}] {detail} {status_text}")
+            };
+            lines.push(Line::from(header.trim_end().to_string()));
+            if let Some(out) = output {
+                for line in out.lines().take(3) {
+                    lines.push(Line::from(format!("    {line}")));
+                }
+            }
         }
     }
 }
@@ -1719,20 +1809,6 @@ fn render_impl(
                 lines.extend(context_report_lines(report));
             }
 
-            ChatElement::Loading { frame } => {
-                // Animated loading indicator
-                let spinner = match frame % 4 {
-                    0 => "⠋",
-                    1 => "⠙",
-                    2 => "⠹",
-                    _ => "⠸",
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("{spinner} Waiting for response..."),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-
             ChatElement::Thinking {
                 content,
                 seconds,
@@ -1968,9 +2044,42 @@ fn render_queue_lines(lines: &mut Vec<Line<'_>>, ctx: &QueueContext<'_>, width: 
 /// Spinner glyphs cycled by `spinner_frame` while a run is in flight.
 const SPINNER_FRAMES: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
 
+/// Format a turn's output-token count for the activity line
+/// (`340 tokens`, `1.3k tokens`).
+fn format_turn_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M tokens", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k tokens", tokens as f64 / 1_000.0)
+    } else if tokens == 1 {
+        "1 token".to_string()
+    } else {
+        format!("{tokens} tokens")
+    }
+}
+
 /// Render the status bar into the lines vector. `width` is the render width;
 /// context usage is pinned to the right edge.
 fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width: usize) {
+    // Live activity sits on its own line above the bar: what the model is
+    // doing plus how much it has produced this turn.
+    if let Some(activity) = ctx.activity {
+        let spinner = SPINNER_FRAMES[ctx.spinner_frame % SPINNER_FRAMES.len()];
+        let text = if activity.tokens == 0 {
+            format!("{} {spinner}", activity.phase.label())
+        } else {
+            format!(
+                "{} {spinner} ({})",
+                activity.phase.label(),
+                format_turn_tokens(activity.tokens)
+            )
+        };
+        lines.push(Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     // If there's a status message (like Ctrl+C hint), show it prominently
     if let Some(status) = ctx.status_message {
         lines.push(Line::from(Span::styled(
@@ -1980,16 +2089,7 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         return;
     }
 
-    let mut parts = Vec::new();
-
-    // Show profile name if not the default "Default"
-    if let Some(name) = ctx.profile_name
-        && name != "Default"
-    {
-        parts.push(name.to_string());
-    }
-
-    parts.push(ctx.model.to_string());
+    let mut parts = vec![ctx.cwd.to_string(), ctx.model.to_string()];
 
     if let Some(rate) = ctx.decode_rate {
         if rate >= 100.0 {
@@ -2017,10 +2117,6 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
     }
     if !ctx.background.is_empty() {
         parts.push("↓ jobs".to_string());
-    }
-
-    if ctx.processing {
-        parts.push(SPINNER_FRAMES[ctx.spinner_frame % SPINNER_FRAMES.len()].to_string());
     }
 
     // Context usage pinned to the right edge: `4.8K/1M`.
@@ -2315,6 +2411,37 @@ fn render_tool_inline<'a>(
 
             render_diff_preview(lines, diffs, *expanded);
         }
+        ToolDisplay::Builtin {
+            tool,
+            detail,
+            status,
+            output,
+        } => {
+            let status_text = match status {
+                ToolStatus::Running => "running...".to_string(),
+                ToolStatus::Done => String::new(),
+                ToolStatus::SearchDone(n) => format!("{n} results"),
+                ToolStatus::Failed(e) => format!("failed: {e}"),
+            };
+            let detail_display = if status_text.is_empty() {
+                detail.clone()
+            } else {
+                format!("{detail} {status_text}")
+            };
+            lines.push(Line::from(vec![
+                Span::raw(selection_marker),
+                Span::styled(format!("[{tool}] "), Style::default().fg(Color::Magenta)),
+                Span::styled(detail_display, selection_style),
+            ]));
+            if let Some(out) = output {
+                for line in out.lines().take(3) {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {line}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+        }
     }
 }
 
@@ -2412,6 +2539,9 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         } => format!("Subagent:{subagent} - {prompt}"),
         ToolDisplay::Terminal { command, mode, .. } => {
             format!("{}$ {command}", terminal_mode_marker(*mode))
+        }
+        ToolDisplay::Builtin { tool, detail, .. } => {
+            format!("{tool}: {detail}")
         }
     };
 
@@ -2868,7 +2998,7 @@ mod tests {
         assert!(open[1].contains("step one"));
 
         // Burst end collapses to a single clickable header.
-        chat.end_loading();
+        chat.collapse_thinking();
         let mut regions = Vec::new();
         let collapsed = build_plain_wrapped_lines_unified(
             &chat,
@@ -2895,7 +3025,7 @@ mod tests {
     fn new_reasoning_burst_starts_fresh_block() {
         let mut chat = ChatStream::new();
         chat.push_thinking("first");
-        chat.end_loading();
+        chat.collapse_thinking();
         chat.push_text("answer");
         chat.push_thinking("second");
         let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);

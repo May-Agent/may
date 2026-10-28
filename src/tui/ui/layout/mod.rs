@@ -137,6 +137,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             }),
     );
 
+    // Working directory shown in the status bar (`~` for the user home).
+    let cwd_label = app.cwd_label();
+
     // Collect image positions during rendering
     let mut image_positions: Vec<(String, usize)> = Vec::new();
 
@@ -170,10 +173,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 usage: usage_info,
                 queue_count: app.queue.len(),
                 background: &background_items,
-                processing: app.processing,
                 decode_rate,
                 status_message: app.status_text(),
-                profile_name: app.current_profile_name(),
+                cwd: cwd_label.as_str(),
+                activity: app.processing.then_some(chat::ActivityContext {
+                    phase: app.activity_phase,
+                    tokens: app.decode_meter.tokens(),
+                }),
                 spinner_frame: app.spinner_frame,
             }),
             images_supported,
@@ -194,10 +200,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         usage: usage_info,
         queue_count: app.queue.len(),
         background: &background_items,
-        processing: app.processing,
         decode_rate,
         status_message: app.status_text(),
-        profile_name: app.current_profile_name(),
+        cwd: cwd_label.as_str(),
+        activity: app.processing.then_some(chat::ActivityContext {
+            phase: app.activity_phase,
+            tokens: app.decode_meter.tokens(),
+        }),
         spinner_frame: app.spinner_frame,
     };
     let mut collapse_regions = Vec::new();
