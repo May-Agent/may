@@ -2715,6 +2715,13 @@ async fn setup_agent_environment(
             for mount in extra_mounts {
                 launch_spec = launch_spec.with_mount(mount);
             }
+            for mount in crate::container::profile::workspace_mounts(
+                &ctx.sandbox_dir,
+                Some(state.cwd.as_path()),
+                &[],
+            ) {
+                launch_spec = launch_spec.with_mount(mount);
+            }
             for env in extra_env {
                 launch_spec = launch_spec.with_env(env);
             }

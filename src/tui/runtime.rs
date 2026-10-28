@@ -1455,6 +1455,8 @@ async fn build_worker_for_session(
         &may_dir,
         &sandbox_dir,
         &session_id,
+        Some(cwd.as_path()),
+        deps.local_runtime.extra_workspace_dirs(),
         &deps.tool_distribution,
     ))
     .await
