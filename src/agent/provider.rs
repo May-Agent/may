@@ -22,13 +22,13 @@ use aither_core::llm::{
 use futures_lite::Stream;
 
 use super::may::MayAgentError;
+use crate::SessionId;
 use crate::config::{
     MayConfig, ModelTier, NativeToolsConfig, ProviderApi, ProviderInstance, ProviderType,
 };
 use crate::copilot::clear_copilot_credentials;
 use crate::embedding_provider::{EmbeddingModelResolution, resolve_embedding_model};
 use crate::model_selector::ModelSelector;
-use crate::session::manager::SessionId;
 
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
 
