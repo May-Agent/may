@@ -484,6 +484,7 @@ async fn pending_message_from_runtime(
             .parse()
             .map_err(TuiRuntimeError::InvalidPendingMessageTimestamp)?,
         delivery_mode: message.delivery_mode,
+        display: None,
     })
 }
 

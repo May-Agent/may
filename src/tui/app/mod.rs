@@ -246,6 +246,8 @@ pub struct App {
     pub live_reads: std::collections::HashMap<String, LiveRead>,
     /// Last time file-diff previews were requested for running calls.
     pub diff_preview_at: Option<std::time::Instant>,
+    /// Loaded secret values for bash-mode masking and env injection.
+    pub secrets: crate::secrets::Secrets,
 }
 
 /// Live-output read state for a running terminal call bound to a
@@ -365,6 +367,11 @@ impl App {
             )))
         };
 
+        let secrets = crate::secrets::Secrets::load(
+            &crate::secrets::SecretStore::new(session_manager.may_dir()),
+            &config,
+        );
+
         Ok(Self {
             session_manager,
             config,
@@ -459,6 +466,7 @@ impl App {
             subagent_tracker: crate::agent::SubagentTracker::default(),
             live_reads: std::collections::HashMap::new(),
             diff_preview_at: None,
+            secrets,
         })
     }
 
@@ -1850,6 +1858,17 @@ impl App {
                     self.set_status("Waiting for attachments to finish...");
                     return None;
                 }
+                // `!` prefix: bash mode — run the command locally and send
+                // its masked transcript to the agent.
+                if self.input.starts_with('!') {
+                    return self.submit_bash();
+                }
+                // `/secret KEY VALUE` stores to the keychain; it must never
+                // enter input history or the persisted transcript.
+                if self.input.trim() == "/secret" || self.input.trim_start().starts_with("/secret ")
+                {
+                    return self.submit_secret();
+                }
                 // Send as message (slash commands only work from menu selection)
                 if !self.input.is_empty() || !self.attachments.is_empty() {
                     return Some(self.prepare_message(PendingUserMessageMode::Steer));
@@ -2233,9 +2252,9 @@ impl App {
                 self.open_btw();
                 None
             }
-            "/resume-codex" | "/resume-claude" => {
-                // These take a session id argument — leave the command in the
-                // input so the user can type it, rather than executing now.
+            "/resume-codex" | "/resume-claude" | "/secret" => {
+                // These take arguments — leave the command in the input so
+                // the user can type them, rather than executing now.
                 self.input = format!("{cmd} ");
                 self.input_char_count = self.input.chars().count();
                 self.cursor = self.input_char_count;
@@ -2397,6 +2416,69 @@ impl App {
         .detach();
     }
 
+    /// Submit the input as a bash-mode command: strip `!`, run it in may's
+    /// environment, and show a running terminal block for it.
+    fn submit_bash(&mut self) -> Option<SendAction> {
+        let command = self.input[1..].trim().to_string();
+        self.input.clear();
+        self.cursor = 0;
+        self.input_char_count = 0;
+        if command.is_empty() {
+            return None;
+        }
+
+        let (masked, had_secret) = self.secrets.mask(&command);
+        self.history.push(format!("! {masked}"));
+        self.history.save();
+        if had_secret {
+            self.chat.push_notice(crate::secrets::SECRET_WARNING);
+        }
+
+        let id = format!("bash-{}", uuid::Uuid::new_v4());
+        self.chat.push_tool(
+            id.clone(),
+            ToolDisplay::Terminal {
+                command: format!("! {masked}"),
+                mode: aither_sandbox::TerminalExecutionMode::Default,
+                status: super::ui::chat::ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                expanded: false,
+            },
+        );
+        self.scroll = usize::MAX;
+        Some(SendAction::RunBash {
+            call_id: id,
+            command,
+        })
+    }
+
+    /// Parse `/secret KEY VALUE` and store it in the OS keychain. The value
+    /// is cleared from the input without touching input history or the
+    /// transcript.
+    fn submit_secret(&mut self) -> Option<SendAction> {
+        let line = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        self.input_char_count = 0;
+        let rest = line.trim_start()["/secret".len()..].trim();
+        let Some((key, value)) = rest.split_once(char::is_whitespace) else {
+            self.chat
+                .push_error("usage: /secret KEY VALUE — stores VALUE in the OS keychain");
+            return None;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            self.chat
+                .push_error("usage: /secret KEY VALUE — stores VALUE in the OS keychain");
+            return None;
+        }
+        Some(SendAction::StoreSecret {
+            key: key.to_string(),
+            value: value.to_string(),
+        })
+    }
+
     /// Prepare a message for sending, returning the action.
     fn prepare_message(&mut self, delivery_mode: PendingUserMessageMode) -> SendAction {
         // Add to history before clearing (only if non-empty and not just whitespace)
@@ -2444,6 +2526,7 @@ impl App {
             attachments,
             queued_at: jiff::Timestamp::now(),
             delivery_mode,
+            display: None,
         };
 
         if self.processing {
@@ -2460,12 +2543,15 @@ impl App {
         self.decode_meter.reset();
 
         // Add user message to chat; the persisted row was appended last,
-        // so it sits at the end of session history.
-        let history_index = self.session_manager.current().map_or(0, |session| {
-            session.history.messages().len().saturating_sub(1)
-        });
-        self.chat
-            .push_user(&msg.content, msg.attachments.clone(), history_index);
+        // so it sits at the end of session history. A bash-mode run already
+        // rendered its own terminal block, so it skips the user bubble.
+        if msg.display.is_none() {
+            let history_index = self.session_manager.current().map_or(0, |session| {
+                session.history.messages().len().saturating_sub(1)
+            });
+            self.chat
+                .push_user(&msg.content, msg.attachments.clone(), history_index);
+        }
 
         // Scroll to bottom
         self.scroll = usize::MAX;
@@ -2803,6 +2889,20 @@ pub enum SendAction {
         history_index: usize,
         /// Whether to restore tracked files to the prompt's checkpoint.
         restore_code: bool,
+    },
+    /// Run a bash-mode (`!`) command in may's environment.
+    RunBash {
+        /// Chat element id (`bash-*`) already rendering this run.
+        call_id: String,
+        /// The raw command to execute.
+        command: String,
+    },
+    /// Store a secret in the OS keychain and refresh the session env file.
+    StoreSecret {
+        /// Environment variable name.
+        key: String,
+        /// Secret value — never persisted to transcript or input history.
+        value: String,
     },
 }
 
