@@ -1414,7 +1414,6 @@ async fn run_terminal_command(
                 ssh_server_id,
                 expect: OutputFormat::Text,
                 resolution: aither_sandbox::MediaResolution::Auto,
-                timeout: 300,
                 max_lines: 800,
                 raw: false,
             },
