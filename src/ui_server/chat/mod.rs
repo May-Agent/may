@@ -2855,6 +2855,7 @@ fn prepare_agent_for_request<'a>(
                         .permission_approver
                         .for_session(ctx.session_id.as_str().to_string()),
                 ),
+                extra_workspace_dirs: Vec::new(),
                 profile_persona: ctx.profile_persona,
                 profile_memories: ctx.profile_memories,
                 plan_state: ctx.plan_state,

@@ -153,6 +153,8 @@ pub struct PermissionRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalMode {
     Interactive,
+    /// Auto-approve every request without prompting (`--yolo`).
+    Auto,
     Unavailable { context: &'static str },
 }
 
@@ -217,6 +219,13 @@ impl PermissionApprover {
         self
     }
 
+    /// Approve every permission request without asking (`--yolo`).
+    #[must_use]
+    pub const fn always_approve(mut self) -> Self {
+        self.approval_mode = ApprovalMode::Auto;
+        self
+    }
+
     fn unavailable_error(mode: TerminalMode, context: &'static str) -> PermissionError {
         PermissionError::Denied(format!(
             "sandbox blocked {} execution; approval is required to escalate this command, but approval is unavailable in {context}",
@@ -267,6 +276,9 @@ impl PermissionApprover {
         mode: TerminalMode,
         script: String,
     ) -> Result<bool, PermissionError> {
+        if let ApprovalMode::Auto = self.approval_mode {
+            return Ok(true);
+        }
         if let ApprovalMode::Unavailable { context } = self.approval_mode {
             return Err(Self::unavailable_error(mode, context));
         }
@@ -343,7 +355,7 @@ impl PermissionHandler for PermissionApprover {
         _script: &str,
     ) -> impl Future<Output = bool> + Send {
         std::future::ready(
-            !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
+            matches!(self.approval_mode, ApprovalMode::Interactive)
                 && matches!(mode, TerminalMode::Unsafe),
         )
     }

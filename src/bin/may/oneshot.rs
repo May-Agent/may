@@ -69,6 +69,10 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     let (ask_user_broker, ask_user_queue) = ask_user::channel();
     let mut local_runtime = LocalSessionRuntime::new(app.session_manager.db().clone());
     local_runtime.enable_oneshot_restricted_mode();
+    if args.yolo {
+        local_runtime.enable_auto_approve();
+    }
+    local_runtime.set_extra_workspace_dirs(args.add_dirs.clone());
     let tool_distribution = std::sync::Arc::new(may_agent::tools::embedded_distribution()?);
     let tool_dispatchers = may_agent::tool_dispatch::ToolDispatchers::spawn(
         may_agent::tool_dispatch::ToolDispatchConfig {
