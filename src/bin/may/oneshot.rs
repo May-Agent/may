@@ -495,10 +495,14 @@ fn render_oneshot_event(
             | AgentEvent::TurnComplete { .. }
             | AgentEvent::Checkpoint { .. }
             | AgentEvent::Complete { .. }
+            | AgentEvent::BuiltInToolResult { .. }
             | AgentEvent::Text(_),
         ) => {}
         Ok(AgentEvent::ToolCallStart { name, .. }) => {
             writeln!(stderr, "Tool: {name}")?;
+        }
+        Ok(AgentEvent::BuiltInToolCall { tool, .. }) => {
+            writeln!(stderr, "Tool: {tool}")?;
         }
         Ok(AgentEvent::ToolCallEnd { name, result, .. }) => {
             if result.is_error() {
