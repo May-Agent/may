@@ -51,8 +51,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         Agent(TuiEvent),
     }
 
-    const ONESHOT_IDLE_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
     let (event_tx, _event_rx) = async_channel::unbounded();
     let mut app = App::new(event_tx, None).await?;
     if !app.is_configured() {
@@ -123,7 +121,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
 
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = String::new();
-    let mut active_tool_calls = std::collections::HashSet::<String>::new();
     runtime_deps.mark_running(&app).await?;
     let prompt = build_oneshot_prompt_with_mentions(&app, &args.prompt).await?;
     let handle = runtime_deps
@@ -161,30 +158,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 async { handle.recv().await.map(Event::Agent) },
             ),
         );
-        let next = if assistant_response.is_empty() || !active_tool_calls.is_empty() {
-            event_future.await
-        } else if let Ok(event) =
-            tokio::time::timeout(ONESHOT_IDLE_FINISH_TIMEOUT, event_future).await
-        {
-            event
-        } else {
-            if let Some(handle) = agent_handle.take() {
-                handle.cancel();
-            }
-            runtime_deps
-                .finish_agent_task(
-                    &mut app,
-                    &mut agent_handle,
-                    &mut pending_title_gen,
-                    &assistant_response,
-                )
-                .await;
-            if !assistant_response.ends_with('\n') {
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
-            }
-            return Ok(());
-        };
+        let next = event_future.await;
         let Some(event) = next else {
             break;
         };
@@ -208,12 +182,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 request.respond(approved).map_err(anyhow::Error::from)?;
             }
             Event::Agent(TuiEvent::Agent(result)) => {
-                if let Ok(AgentEvent::ToolCallStart { id, .. }) = &result {
-                    active_tool_calls.insert(id.clone());
-                }
-                if let Ok(AgentEvent::ToolCallEnd { id, .. }) = &result {
-                    active_tool_calls.remove(id);
-                }
                 if let Ok(AgentEvent::Text(ref text)) = result {
                     assistant_response.push_str(text);
                     stdout.write_all(text.as_bytes())?;
