@@ -48,6 +48,8 @@ pub mod profile;
 pub mod prompt_mentions;
 /// Scheduled task execution.
 pub mod scheduler;
+
+pub mod secrets;
 /// Session model, history, and on-disk layout.
 pub mod session;
 /// Agent skill discovery and management.

@@ -53,6 +53,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "/resume-claude",
         "Import a Claude Code transcript into a new session",
     ),
+    (
+        "/secret",
+        "Store a secret in the OS keychain (injected into shell env)",
+    ),
     ("/mcp", "Manage MCP servers"),
     ("/ssh", "Manage preconfigured SSH servers"),
     ("/skill", "Manage installed skills"),
