@@ -366,6 +366,7 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
     if names
         != [
             "terminal",
+            "terminal_background",
             "terminal_input",
             "terminal_kill",
             "terminal_read",
