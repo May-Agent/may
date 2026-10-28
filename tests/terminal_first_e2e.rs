@@ -188,17 +188,20 @@ impl MockScenarioState {
                 MockHttpResponse::sse(text_stream_frames(chunks.clone(), *delay))
             }
             MockChatScenario::TerminalRoundTrip => match self.request_index {
+                // The command blocks on `read`, so it runs as a background
+                // job: `terminal` foreground calls are killed at their bound,
+                // never promoted.
                 0 => MockHttpResponse::sse(vec![
                     delayed_sse_frame(
                         tool_call_chunk(
                             "call-terminal",
-                            "terminal",
+                            "terminal_background",
                             &serde_json::json!({
                                 "description": "Ask the terminal for the user's name",
                                 "script": "printf 'cwd=%s\\n' \"$(pwd -P)\"; printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
                                 "mode": "sandboxed",
                                 "raw": true,
-                                "timeout": 0,
+                                "timeout": 60,
                                 "max_lines": 50
                             }),
                         ),
