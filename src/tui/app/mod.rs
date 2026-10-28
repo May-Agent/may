@@ -160,8 +160,10 @@ pub struct App {
     pub usage: Option<aither_core::llm::Usage>,
     /// Decode-speed measurement for the streaming response
     pub decode_meter: crate::decode_meter::DecodeMeter,
-    /// Spinner animation frame for the status-line processing indicator
+    /// Spinner animation frame for the activity indicator above the status bar
     pub spinner_frame: usize,
+    /// What the in-flight run is doing (thinking vs. producing output)
+    pub activity_phase: crate::tui::ui::chat::ActivityPhase,
     /// Context window size for current model
     pub context_window: Option<u32>,
     /// Current model being used by the agent
@@ -424,6 +426,7 @@ impl App {
             usage: None,
             decode_meter: crate::decode_meter::DecodeMeter::default(),
             spinner_frame: 0,
+            activity_phase: crate::tui::ui::chat::ActivityPhase::Thinking,
             context_window: None,
             current_model: None,
             mcp_servers: Vec::new(),
@@ -797,6 +800,9 @@ impl App {
                         ToolDisplay::Task {
                             subagent, prompt, ..
                         } => format!("delegated to subagent {subagent}: {prompt}"),
+                        ToolDisplay::Builtin { tool, detail, .. } => {
+                            format!("hosted tool {tool}: {detail}")
+                        }
                     };
                     Some(Message::assistant(summary))
                 }
@@ -2540,6 +2546,7 @@ impl App {
     pub fn start_processing(&mut self, msg: &PendingMessage) {
         self.processing = true;
         self.thinking_start = None;
+        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
         self.decode_meter.reset();
 
         // Add user message to chat; the persisted row was appended last,
@@ -2556,9 +2563,23 @@ impl App {
         // Scroll to bottom
         self.scroll = usize::MAX;
         self.input_visible = true;
+    }
 
-        // Show loading indicator (will be replaced when first response arrives)
-        self.chat.start_loading();
+    /// Working directory for the status bar: the absolute path with the
+    /// user home shown as `~` (component-wise, so `~/foo2` is not mistaken
+    /// for home).
+    pub fn cwd_label(&self) -> String {
+        dirs::home_dir()
+            .and_then(|home| {
+                self.cwd.strip_prefix(home).ok().map(|rest| {
+                    if rest.as_os_str().is_empty() {
+                        "~".to_string()
+                    } else {
+                        format!("~/{}", rest.display())
+                    }
+                })
+            })
+            .unwrap_or_else(|| self.cwd.display().to_string())
     }
 
     /// Re-read the session's canonical `tasks.md` and refresh the todo
@@ -2590,8 +2611,8 @@ impl App {
             Ok(event) => {
                 match event {
                     AgentEvent::Text(chunk) => {
-                        // End loading/thinking state and start assistant text
-                        self.chat.end_loading();
+                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
+                        self.chat.collapse_thinking();
                         self.thinking_start = None;
                         self.decode_meter.note_output(chunk.len());
                         self.chat.push_text(&chunk);
@@ -2599,6 +2620,7 @@ impl App {
                         self.input_visible = true;
                     }
                     AgentEvent::Reasoning(chunk) => {
+                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
                         self.decode_meter.note_output(chunk.len());
                         if self.thinking_start.is_none() {
                             self.thinking_start = Some(std::time::Instant::now());
@@ -2613,6 +2635,7 @@ impl App {
                     AgentEvent::ToolCallDelta {
                         arguments_fragment, ..
                     } => {
+                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
                         self.decode_meter.note_output(arguments_fragment.len());
                     }
                     AgentEvent::ToolCallStart {
@@ -2620,7 +2643,8 @@ impl App {
                         name,
                         arguments,
                     } => {
-                        self.chat.end_loading();
+                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
+                        self.chat.collapse_thinking();
                         self.chat.end_text();
                         self.thinking_start = None;
                         self.decode_meter.note_boundary();
@@ -2645,6 +2669,8 @@ impl App {
                         self.chat.push_tool(id, display);
                     }
                     AgentEvent::ToolCallEnd { id, result, .. } => {
+                        // Back to waiting on the model for the next burst.
+                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
                         let feedback = parse_tool_end(&result);
                         match feedback {
                             ToolEndKind::Output(out) => {
@@ -2676,10 +2702,28 @@ impl App {
                         self.request_file_diff(&id);
                         self.refresh_todos().await;
                     }
+                    AgentEvent::BuiltInToolCall { id, tool, detail } => {
+                        // Provider-hosted call (server-side web search etc.):
+                        // visible like a tool call, executed by the provider.
+                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
+                        self.chat.collapse_thinking();
+                        self.chat.end_text();
+                        self.thinking_start = None;
+                        self.decode_meter.note_boundary();
+                        self.chat.push_builtin(id, tool, detail);
+                        self.scroll = usize::MAX;
+                    }
+                    AgentEvent::BuiltInToolResult { id, tool, result } => {
+                        // The provider reports the call done; the model call
+                        // that follows is thinking again.
+                        self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
+                        self.decode_meter.note_boundary();
+                        self.chat.finish_builtin(&id, &tool, result);
+                    }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events
                         // Just finalize the message
-                        self.chat.end_loading();
+                        self.chat.collapse_thinking();
                         self.chat.end_text();
                         self.decode_meter.note_boundary();
                         self.scroll = usize::MAX;
@@ -2705,7 +2749,7 @@ impl App {
                 tracing::error!("Agent error: {}", e);
                 self.decode_meter.note_boundary();
                 // Display error to user
-                self.chat.end_loading();
+                self.chat.collapse_thinking();
                 self.chat.push_error(&format!("{e}"));
                 self.scroll = usize::MAX;
                 self.input_visible = true;

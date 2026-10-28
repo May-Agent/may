@@ -24,7 +24,6 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
             if app.processing {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
-                app.chat.tick_loading();
                 if let Some(start) = app.thinking_start {
                     let secs = start.elapsed().as_secs();
                     app.chat.update_thinking(secs);
