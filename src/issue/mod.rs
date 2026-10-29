@@ -189,6 +189,10 @@ pub enum IssueError {
     /// The operation was rejected (for example a self-relation).
     #[error("{0}")]
     Invalid(String),
+    /// The operation is reserved for the main agent; the text is rendered from
+    /// the refusal template.
+    #[error("{0}")]
+    Reserved(String),
     /// Workspace configuration could not be read.
     #[error(transparent)]
     WorkspaceConfig(#[from] WorkspaceConfigError),

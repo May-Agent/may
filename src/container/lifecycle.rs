@@ -22,6 +22,23 @@ use crate::session::MayHomePaths;
 /// derives from this one definition.
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
 
+/// The workspace mount of a container session.
+///
+/// The session's host directory is mounted at [`CONTAINER_WORKSPACE`]; a
+/// container session declares it so subagent commands can be confined to their
+/// own space inside it.
+///
+/// # Panics
+/// Never in practice: the workspace path is a constant absolute path.
+#[must_use]
+pub fn workspace_mount(host_root: impl Into<std::path::PathBuf>) -> aither_sandbox::MountRoot {
+    aither_sandbox::MountRoot::new(
+        host_root,
+        aither_sandbox::ContainerPath::new(CONTAINER_WORKSPACE)
+            .expect("the container workspace is an absolute path"),
+    )
+}
+
 /// The in-container path of `file_name` in the container's workspace mount.
 #[must_use]
 pub fn container_workspace_path(file_name: &str) -> String {

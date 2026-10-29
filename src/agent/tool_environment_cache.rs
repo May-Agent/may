@@ -134,7 +134,7 @@ impl PreparationLease {
             .send(Request::Complete {
                 session: self.session.clone(),
                 generation: self.generation,
-                registry,
+                registry: Box::new(registry),
             })
             .expect("tool environment cache actor outlives its leases");
     }
@@ -223,7 +223,7 @@ enum Request {
     Complete {
         session: SessionId,
         generation: u64,
-        registry: ShellSessionRegistry,
+        registry: Box<ShellSessionRegistry>,
     },
     Abandon {
         session: SessionId,
@@ -278,7 +278,7 @@ async fn run_cache_actor(
                 session,
                 generation,
                 registry,
-            } => state.complete(session, generation, registry),
+            } => state.complete(session, generation, *registry),
             Request::Abandon {
                 session,
                 generation,

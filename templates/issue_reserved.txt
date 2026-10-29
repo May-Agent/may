@@ -1,0 +1,1 @@
+`issue {{ subcommand }}` is reserved for the main agent. Subagents can read issues with `issue view` and `issue list`; put what should change in your result for your parent.

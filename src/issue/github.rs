@@ -531,7 +531,7 @@ mod tests {
     use super::*;
     use crate::issue::IssueListState;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct StaticToken;
 
     impl GitHubTokenSource for StaticToken {
@@ -622,6 +622,36 @@ mod tests {
 
     fn store(api_base: &str) -> GitHubIssueStore<StaticToken> {
         GitHubIssueStore::with_api_base("o/r".parse().expect("repository"), StaticToken, api_base)
+    }
+
+    #[tokio::test]
+    async fn a_subagent_reads_github_issues_and_sends_no_write_request() {
+        use crate::agent::issue_tool::{SubagentIssueTool, subagent_checks};
+
+        let (api_base, requests) = mock_api(|method, path, _body| match (method, path) {
+            ("GET", "/repos/o/r/issues/1") => (200, gh_issue_json(1, "seed", "open")),
+            ("GET", path) if path.starts_with("/repos/o/r/issues?") => {
+                (200, serde_json::json!([gh_issue_json(1, "seed", "open")]))
+            }
+            (
+                "GET",
+                "/repos/o/r/issues/1/comments"
+                | "/repos/o/r/issues/1/sub_issues"
+                | "/repos/o/r/issues/1/dependencies/blocked_by",
+            ) => (200, serde_json::json!([])),
+            _ => (500, serde_json::json!({"message": "unexpected request"})),
+        })
+        .await;
+        let tool = SubagentIssueTool::new(store(&api_base));
+
+        subagent_checks::assert_reads_work(&tool, 1).await;
+        let reads = requests.lock().expect("requests").len();
+        assert!(reads > 0, "the reads reached the API");
+        subagent_checks::assert_writes_refused(&tool).await;
+
+        let sent = requests.lock().expect("requests").clone();
+        assert_eq!(sent.len(), reads, "refused writes sent no request");
+        assert!(sent.iter().all(|(method, ..)| method == "GET"));
     }
 
     #[tokio::test]
