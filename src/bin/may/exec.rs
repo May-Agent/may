@@ -539,8 +539,7 @@ async fn resolve_targeted_ssh_server(
 fn select_exec_model(config: &MayConfig) -> may_agent::ModelSelector {
     config
         .last_model
-        .as_ref()
-        .cloned()
+        .clone()
         .or_else(|| config.models.advanced.first().cloned())
         .unwrap_or_else(|| panic!("may exec requires at least one configured model"))
 }
