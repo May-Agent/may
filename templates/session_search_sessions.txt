@@ -1,0 +1,8 @@
+{%- import "session_macros.txt" as m -%}
+Search "{{ query }}" ({{ search_mode.as_str() }} mode): showing {{ items.len() }} session(s) from {{ total_matches }} matching message(s).
+{% for item in items %}
+Session {{ item.session_id }} "{{ item.title }}" (model: {{ item.model }}, {{ item.message_count }} messages, updated {{ item.updated_at }}); {{ item.match_count }} matching message(s), top score {{ item.top_score }}.
+{% for highlight in item.highlights %}
+{% call m::match_block(highlight) %}{% endcall %}
+{% endfor %}
+{% endfor %}

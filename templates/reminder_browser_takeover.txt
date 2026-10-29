@@ -1,0 +1,3 @@
+<system-reminder>
+The user manually controlled the browser and just returned control. Re-check the current page state before continuing automation.
+</system-reminder>

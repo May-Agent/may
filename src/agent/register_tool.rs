@@ -5,6 +5,7 @@ use aither_agent::tool_request::{
     channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,13 @@ pub struct RegisterRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterResult {
     pub registered: Vec<String>,
+}
+
+/// What the model reads after a register command was handled.
+#[derive(Debug, Template)]
+#[template(path = "register_done.txt", escape = "none")]
+struct RegisterDoneText<'a> {
+    registered: &'a [String],
 }
 
 /// Unified broker/queue types for register commands.
@@ -123,10 +131,31 @@ impl<K: RegisterKind> Tool for RegisterTool<K> {
         let response = broker.request(request).await?;
         let result = response.map_err(RegisterToolError::Rejected)?;
 
-        ToolResult::json(&serde_json::json!({
-            "ok": true,
-            "registered": result.registered,
-            "approval_required": true
-        }))
+        let text = RegisterDoneText {
+            registered: &result.registered,
+        }
+        .render()
+        .expect("register done template must render");
+        Ok(ToolResult::text(text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use askama::Template;
+
+    use super::RegisterDoneText;
+
+    #[test]
+    fn register_result_lists_what_was_registered() {
+        let registered = vec!["skills/a".to_string(), "skills/b".to_string()];
+        assert_eq!(
+            RegisterDoneText {
+                registered: &registered,
+            }
+            .render()
+            .expect("register done template must render"),
+            "Registered 2 item(s): skills/a, skills/b. The user must approve the registration before it takes effect."
+        );
     }
 }

@@ -4,6 +4,7 @@ use aither_agent::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +35,13 @@ pub struct NotifyArgs {
 pub struct NotifyResult {
     /// Number of push subscriptions the notification was delivered to.
     pub sent: usize,
+}
+
+/// What the model reads after a notification was handled.
+#[derive(Debug, Template)]
+#[template(path = "notify_sent.txt", escape = "none")]
+struct NotifySentText {
+    sent: usize,
 }
 
 /// Broker half of the notify-request channel: submits requests to the
@@ -141,9 +149,26 @@ impl Tool for NotifyTool {
         let response = broker.request(args).await?;
         let result = response.map_err(NotifyToolError::Rejected)?;
 
-        ToolResult::json(&serde_json::json!({
-            "ok": true,
-            "sent": result.sent
-        }))
+        let text = NotifySentText { sent: result.sent }
+            .render()
+            .expect("notify sent template must render");
+        Ok(ToolResult::text(text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use askama::Template;
+
+    use super::NotifySentText;
+
+    #[test]
+    fn notify_result_states_the_delivery_count() {
+        assert_eq!(
+            NotifySentText { sent: 3 }
+                .render()
+                .expect("notify sent template must render"),
+            "Notification delivered to 3 push subscription(s)."
+        );
     }
 }

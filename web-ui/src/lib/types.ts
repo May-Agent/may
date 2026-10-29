@@ -570,11 +570,9 @@ export interface ContextDebugMessage {
 
 export interface SessionContextWindowMetricsResponse {
   usageFraction: number;
-  selectedModelContextWindow: number | null;
-  fastModelContextWindow: number | null;
-  effectiveContextWindow: number;
+  contextWindow: number;
+  estimatedTokens: number;
   systemBlockCount: number;
-  reminderCount: number;
   recentMessageCount: number;
   recentSystemMessageCount: number;
   hasHandoff: boolean;

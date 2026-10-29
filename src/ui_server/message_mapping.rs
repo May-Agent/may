@@ -170,7 +170,7 @@ fn tool_event_to_api_json(record: &ToolEventRecord, seq: usize) -> Value {
             "id": id,
             "name": name,
             "variant": ToolVariant::infer(name),
-            "result": result,
+            "result": crate::session::tool_result_wire::WireToolResult::from(result),
             "seq": seq,
         }),
     }

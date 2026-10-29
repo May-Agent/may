@@ -5,10 +5,10 @@ Browser automation: {% if state.enabled() %}enabled (May manages the runtime lif
 
 Lifecycle:
 1. `browser open` to open the managed browser and light up the live browser sidebar.
-2. `browser read https://example.com --detail full --screenshot full-page --format json` to inspect a page with structured text, accessibility-tree-derived structure, interactive element summaries, and an artifact screenshot.
+2. `browser read https://example.com --detail full --screenshot full-page` to inspect a page with structured text, accessibility-tree-derived structure, interactive element summaries, and an artifact screenshot.
 3. `browser cdp-endpoint` only when you truly need raw CDP access.
 4. `browser close` when browser work is finished so the live sidebar closes and resources are released.
 
-`browser read` returns structured JSON. By default use `--format json`; by default screenshots are viewport captures—use `--screenshot full-page` when you need the whole document or `--screenshot off` when visual context is unnecessary. Prefer answering directly from the structured browser result and referenced artifact path.
+`browser read` returns structured JSON. By default screenshots are viewport captures—use `--screenshot full-page` when you need the whole document or `--screenshot off` when visual context is unnecessary. Prefer answering directly from the structured browser result and referenced artifact path.
 {% else %}Do not install Playwright or launch browser runtimes yourself. If browser automation is needed, ask the user to enable the browser feature in settings.
 {% endif %}

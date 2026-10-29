@@ -1,0 +1,3 @@
+<attachments>
+{% for attachment in attachments %}- {{ attachment.name }} ({{ attachment.kind }}){% if let Some(path) = attachment.path %}, saved at {{ path }}{% endif %}
+{% endfor %}</attachments>

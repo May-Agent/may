@@ -1,0 +1,1 @@
+Registered {{ registered.len() }} item(s): {% for name in registered %}{{ name }}{% if !loop.last %}, {% endif %}{% endfor %}. The user must approve the registration before it takes effect.

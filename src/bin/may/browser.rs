@@ -266,7 +266,6 @@ pub async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
             url,
             detail,
             screenshot,
-            format: _,
         } => {
             let status = ensure_browser_service_started(may_dir.as_path(), &config.browser)
                 .await

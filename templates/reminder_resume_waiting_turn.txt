@@ -1,0 +1,3 @@
+<system-reminder>
+The previous run was interrupted while waiting for {% match request_kind %}{% when ResumeRequestKind::Permission %}a permission decision{% when ResumeRequestKind::AskUser %}an answer to an ask_user question{% when ResumeRequestKind::Workspace %}a workspace access decision{% endmatch %}. {% match resolution %}{% when ResumeResolution::Approved %}The user approved it.{% when ResumeResolution::Denied %}The user denied it.{% when ResumeResolution::Answered %}The user answered it.{% endmatch %} Reassess the latest state, use the recorded response, and continue from the most sensible next action.
+</system-reminder>

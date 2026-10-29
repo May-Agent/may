@@ -2,6 +2,7 @@ use aither_agent::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -96,15 +97,15 @@ pub struct TaskCreateResult {
     pub enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct TaskToolResponse {
-    ok: bool,
+/// What the model reads after `task` created a scheduled task.
+#[derive(Debug, Template)]
+#[template(path = "task_created.txt", escape = "none")]
+struct TaskCreatedText {
     task_id: String,
     profile_id: String,
     trigger: TaskTriggerResponse,
     approved: bool,
     enabled: bool,
-    approval_required: bool,
 }
 
 /// Broker half of the task-request channel: submits create requests to the
@@ -235,14 +236,92 @@ impl Tool for TaskTool {
         let response = broker.request(request).await?;
         let model = response.map_err(TaskToolError::Rejected)?;
 
-        ToolResult::json(&TaskToolResponse {
-            ok: true,
+        let text = TaskCreatedText {
             task_id: model.task_id,
             profile_id: model.profile_id,
             trigger: model.trigger,
             approved: model.approved,
             enabled: model.enabled,
-            approval_required: true,
-        })
+        }
+        .render()
+        .expect("task created template must render");
+        Ok(ToolResult::text(text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use askama::Template;
+
+    use super::TaskCreatedText;
+    use crate::task_trigger::{TaskTriggerResponse, TimeTriggerType};
+
+    fn text(trigger: TaskTriggerResponse, approved: bool, enabled: bool) -> String {
+        TaskCreatedText {
+            task_id: "t1".to_string(),
+            profile_id: "p1".to_string(),
+            trigger,
+            approved,
+            enabled,
+        }
+        .render()
+        .expect("task created template must render")
+    }
+
+    #[test]
+    fn once_trigger_result_names_its_time_and_approval_state() {
+        assert_eq!(
+            text(
+                TaskTriggerResponse::Time {
+                    trigger_type: TimeTriggerType::Once,
+                    run_at_utc: Some("2026-01-01T00:00:00Z".to_string()),
+                    cron_utc: None,
+                },
+                false,
+                false,
+            ),
+            "Scheduled task t1 was created under profile p1. It runs on a time trigger (once) at 2026-01-01T00:00:00Z UTC. The task is not approved and disabled. It does not run until the user approves it."
+        );
+    }
+
+    #[test]
+    fn cron_trigger_result_names_its_expression() {
+        assert_eq!(
+            text(
+                TaskTriggerResponse::Time {
+                    trigger_type: TimeTriggerType::Cron,
+                    run_at_utc: None,
+                    cron_utc: Some("0 9 * * *".to_string()),
+                },
+                true,
+                true,
+            ),
+            "Scheduled task t1 was created under profile p1. It runs on a time trigger (cron) with cron expression 0 9 * * * (UTC). The task is approved and enabled."
+        );
+    }
+
+    #[test]
+    fn event_and_webhook_trigger_results_name_what_fires_them() {
+        assert_eq!(
+            text(
+                TaskTriggerResponse::Event {
+                    event_name: "deploy".to_string(),
+                },
+                true,
+                true,
+            ),
+            "Scheduled task t1 was created under profile p1. It runs when the event deploy is emitted. The task is approved and enabled."
+        );
+        assert_eq!(
+            text(
+                TaskTriggerResponse::Webhook {
+                    token: "secret".to_string(),
+                    webhook_path: "/hooks/secret".to_string(),
+                },
+                true,
+                false,
+            ),
+            "Scheduled task t1 was created under profile p1. It runs when its webhook path /hooks/secret is called. The task is approved and disabled."
+        );
     }
 }

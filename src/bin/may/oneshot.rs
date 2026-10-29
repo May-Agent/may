@@ -360,12 +360,9 @@ fn prompt_oneshot_workspace(
     }
 }
 
-#[derive(serde::Serialize)]
-struct OneShotNonInteractiveAlert<'a> {
-    #[serde(rename = "@type")]
-    alert_type: &'a str,
-    message: &'a str,
-}
+#[derive(askama::Template)]
+#[template(path = "reminder_oneshot_noninteractive.txt", escape = "none")]
+struct OneShotNonInteractiveReminder;
 
 #[derive(Debug, Clone)]
 struct OneShotPromptInput {
@@ -377,13 +374,7 @@ async fn build_oneshot_prompt_with_mentions(
     app: &App,
     prompt: &str,
 ) -> anyhow::Result<OneShotPromptInput> {
-    let mut hidden_context_parts = vec![may_agent::xml::serialize_xml_block(
-        "system-reminder",
-        &OneShotNonInteractiveAlert {
-            alert_type: "oneshot_noninteractive",
-            message: "Non-interactive oneshot run. Do not use ask_user or wait for stdin. Make a reasonable assumption when possible; if interaction is truly required, explain the blocker and stop.",
-        },
-    )?];
+    let mut hidden_context_parts = vec![askama::Template::render(&OneShotNonInteractiveReminder)?];
     let Some(session) = app.session_manager.current() else {
         return Ok(OneShotPromptInput {
             content: prompt.to_string(),
@@ -395,7 +386,7 @@ async fn build_oneshot_prompt_with_mentions(
 
     let db = app.session_manager.db();
     if let Ok(Some(session_mentions_xml)) =
-        may_agent::prompt_mentions::build_session_mentions_xml(db, prompt).await
+        may_agent::prompt_mentions::build_session_mentions(db, prompt).await
     {
         hidden_context_parts.push(session_mentions_xml);
     }
@@ -403,7 +394,7 @@ async fn build_oneshot_prompt_with_mentions(
     let session_paths = may_agent::session::SessionPaths::new(session.sandbox_dir.clone());
     let files_dir = session_paths.files_dir();
     if let Ok(Some(file_mentions_xml)) =
-        may_agent::prompt_mentions::build_file_mentions_xml(&files_dir, prompt, 400).await
+        may_agent::prompt_mentions::build_file_mentions(&files_dir, prompt, 400).await
     {
         hidden_context_parts.push(file_mentions_xml);
     }

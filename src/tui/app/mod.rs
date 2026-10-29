@@ -31,7 +31,7 @@ use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage};
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
-use crate::xml::LARGE_PASTE_THRESHOLD;
+use crate::pasted_text::LARGE_PASTE_THRESHOLD;
 
 /// User-facing message shown when a tool response cannot be sent to the session.
 pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../../texts/tool_response_send_failed.txt");
