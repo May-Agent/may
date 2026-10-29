@@ -148,9 +148,9 @@ impl ChatDb {
         for sql in [
             "DELETE FROM session_pending_permissions WHERE session_id = ?",
             "DELETE FROM session_pending_workspace WHERE session_id = ?",
-            "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
-            "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
-            "DELETE FROM session_pending_ask_user_requests_v2 WHERE session_id = ?",
+            "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1)",
+            "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1)",
+            "DELETE FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1",
         ] {
             query!(tx, sql, session_id).execute().await?;
         }

@@ -1,5 +1,6 @@
 //! May agent implementation.
 
+pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
 #[cfg(test)]
 mod compaction_tests;
@@ -13,6 +14,8 @@ pub(crate) mod issue_tool;
 mod live_settings;
 mod may;
 pub(crate) mod notify_tool;
+#[cfg(test)]
+mod open_questions_tests;
 mod permission;
 mod provider;
 pub(crate) mod register_tool;

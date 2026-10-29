@@ -433,7 +433,8 @@ impl MayAgent {
             .as_ref()
             .and_then(|approver| approver.runtime_service.clone());
         let pending_steer_hook = PendingSteerHook::new(hook_runtime.clone(), &config.session_id);
-        let context_snapshot_hook = ContextSnapshotHook::new(hook_runtime, &config.session_id);
+        let context_snapshot_hook =
+            ContextSnapshotHook::new(hook_runtime.clone(), &config.session_id);
 
         let (skills_dir, subagents_dir) = if let Some(profile_id) = config.profile_id.as_deref() {
             let profile_home =
@@ -456,6 +457,12 @@ impl MayAgent {
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
             .cache_lifetime(config.cache_lifetime.into());
+        if let Some(runtime) = hook_runtime.clone() {
+            builder = builder.context_source(super::ask_user_tool::OpenQuestionsContext::new(
+                runtime,
+                config.session_id.as_str(),
+            ));
+        }
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
         }
@@ -475,7 +482,7 @@ impl MayAgent {
                 may_dir: config.may_dir.clone(),
                 sandbox_dir: config.sandbox_dir.clone(),
                 search_embedder: config.search_embedder.clone(),
-                ask_user_broker: Some(config.ask_user_broker.clone()),
+                ask_user: hook_runtime.clone(),
                 imagine: Some(imagine_config),
                 task_runtime: match &config.environment {
                     AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,

@@ -844,15 +844,15 @@ pub(super) async fn resume_pending_follow_up_runs(
 #[derive(Clone, Copy)]
 pub(super) enum ResumeRequestKind {
     Permission,
-    AskUser,
     Workspace,
+    /// An internal authorization prompt, such as an SSH connection.
+    Authorization,
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum ResumeResolution {
     Approved,
     Denied,
-    Answered,
 }
 
 #[derive(Template)]
@@ -2936,17 +2936,6 @@ mod tests {
         assert_eq!(
             reminder.as_ref(),
             "<system-reminder>\nThe previous run was interrupted while waiting for a permission decision. The user denied it. Reassess the latest state, use the recorded response, and continue from the most sensible next action.\n</system-reminder>"
-        );
-        let reminder = super::resume_waiting_turn_reminder(
-            ResumeRequestKind::AskUser,
-            ResumeResolution::Answered,
-        )
-        .expect("reminder text is not empty");
-        assert!(
-            reminder
-                .as_ref()
-                .contains("waiting for an answer to an ask_user question. The user answered it."),
-            "{reminder}"
         );
     }
 

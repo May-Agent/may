@@ -72,6 +72,9 @@ enum MockChatScenario {
     /// The main agent prints a secret, then forks itself with
     /// `subagent start fork`; the fork answers with [`FORK_ANSWER`].
     ForkProbe,
+    /// The first request asks the user a question through the `ask_user`
+    /// terminal command; every later request gets a plain text reply.
+    AsksUser,
 }
 
 /// A scripted main agent / subagent pair sharing one mock model.
@@ -106,6 +109,38 @@ const SUBAGENT_PROBE_MAX_REQUESTS: usize = 40;
 /// job to finish, and prints what it wrote.
 const SUBAGENT_POLL_SCRIPT: &str = "i=0; while [ $i -lt 8 ]; do if [ -f sub.done ]; then echo POLL_DONE; cat sub.out; exit 0; fi; sleep 1; i=$((i+1)); done; echo POLL_PENDING";
 
+const ASK_USER_SCRIPT: &str =
+    "ask_user --question 'Which database?' --option PostgreSQL --option SQLite";
+
+/// Holds one agent request until the test releases it, so the test can act
+/// while a run is in flight.
+struct RequestGate {
+    /// Zero-based index among agent requests (titles excluded) to hold.
+    held_index: usize,
+    seen: std::sync::atomic::AtomicUsize,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl RequestGate {
+    fn holding(held_index: usize) -> Arc<Self> {
+        Arc::new(Self {
+            held_index,
+            seen: std::sync::atomic::AtomicUsize::new(0),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    async fn hold_if_selected(&self) {
+        let index = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if index == self.held_index {
+            self.arrived.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
 struct MockOpenAiServer {
     addr: SocketAddr,
     requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -114,6 +149,10 @@ struct MockOpenAiServer {
 
 impl MockOpenAiServer {
     async fn spawn(scenario: MockChatScenario) -> Self {
+        Self::spawn_gated(scenario, None).await
+    }
+
+    async fn spawn_gated(scenario: MockChatScenario, gate: Option<Arc<RequestGate>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("mock OpenAI listener should bind");
@@ -142,6 +181,7 @@ impl MockOpenAiServer {
                 let state = state.clone();
                 let requests = requests_for_task.clone();
                 let transcript = transcript.clone();
+                let gate = gate.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |request| {
                         handle_mock_openai_request(
@@ -149,6 +189,7 @@ impl MockOpenAiServer {
                             state.clone(),
                             requests.clone(),
                             transcript.clone(),
+                            gate.clone(),
                         )
                     });
                     let _ = http1::Builder::new().serve_connection(io, service).await;
@@ -342,6 +383,30 @@ impl MockScenarioState {
                         "unexpected request index {other} for terminal round trip"
                     ));
                 }
+            },
+            MockChatScenario::AsksUser => match self.request_index {
+                0 => MockHttpResponse::sse(vec![
+                    delayed_sse_frame(
+                        tool_call_chunk(
+                            "call-ask-user",
+                            "terminal",
+                            &serde_json::json!({
+                                "description": "Ask the user which database to use",
+                                "script": ASK_USER_SCRIPT,
+                                "mode": "sandboxed",
+                                "raw": true,
+                                "timeout": 10,
+                                "max_lines": 50
+                            }),
+                        ),
+                        Duration::from_millis(10),
+                    ),
+                    done_frame(Duration::from_millis(10)),
+                ]),
+                _ => MockHttpResponse::sse(text_stream_frames(
+                    vec!["noted".to_string()],
+                    Duration::from_millis(10),
+                )),
             },
             MockChatScenario::WritesTasksFile => {
                 // The run loop keeps the model going while `tasks.md` has
@@ -678,6 +743,7 @@ async fn handle_mock_openai_request(
     state: Arc<tokio::sync::Mutex<MockScenarioState>>,
     requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
     transcript: Option<PathBuf>,
+    gate: Option<Arc<RequestGate>>,
 ) -> Result<Response<http_body_util::combinators::BoxBody<Bytes, Infallible>>, Infallible> {
     if request.method() == Method::GET && request.uri().path() == "/v1/models" {
         return Ok(json_response(
@@ -722,6 +788,10 @@ async fn handle_mock_openai_request(
             ),
             done_frame(Duration::ZERO),
         ]));
+    }
+
+    if let Some(gate) = &gate {
+        gate.hold_if_selected().await;
     }
 
     let response = {
@@ -3243,4 +3313,198 @@ async fn container_profile_inline_script_task_reads_its_trigger_file() {
 )]
 async fn container_profile_script_file_task_reads_its_trigger_file() {
     container_task_reads_its_trigger_file(TaskScriptSource::File).await;
+}
+
+/// Answers `request_id` through the API with `value` selected.
+async fn answer_open_question(
+    client: &reqwest::Client,
+    server: &RunningUiServer,
+    request_id: &str,
+    value: &str,
+) {
+    let response = client
+        .post(format!("{}/api/ask-user/respond", server.base_url))
+        .json(&serde_json::json!({
+            "id": request_id,
+            "answers": [{
+                "section": "",
+                "answer": { "kind": "selected", "values": [value] }
+            }]
+        }))
+        .send()
+        .await
+        .expect("ask-user respond request should succeed");
+    expect_status(&server.log, response, StatusCode::OK).await;
+}
+
+/// The id of the single open question in the runtime summary.
+fn only_open_question_id(runtime: &Value) -> String {
+    let open = runtime
+        .get("openQuestions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("runtime has no open questions: {runtime}"));
+    assert_eq!(open.len(), 1, "exactly one open question: {runtime}");
+    open[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("open question has an id")
+        .to_string()
+}
+
+/// `ask_user` returns at once and the run ends without an answer; the
+/// question stays open in the runtime summary, and an answer after the run is
+/// committed and then starts a follow-up run that sees its text.
+#[tokio::test]
+#[serial]
+async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::AsksUser).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let response = client
+        .post(format!("{}/api/chat/stream", server.base_url))
+        .json(&serde_json::json!({
+            "sessionId": session_id,
+            "content": "Pick a database."
+        }))
+        .send()
+        .await
+        .expect("chat stream request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let events = collect_turn_events(response, "the asking turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the run must finish without waiting for the answer; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+    let runtime = wait_for_runtime_condition(
+        &client,
+        &server,
+        &session_id,
+        Duration::from_secs(10),
+        "the run to end with the question still open",
+        |runtime| runtime_is_idle(runtime) && runtime.get("openQuestions").is_some(),
+    )
+    .await;
+    let request_id = only_open_question_id(&runtime);
+    let before = mock.agent_requests().await;
+    assert!(
+        !serde_json::to_string(&before)
+            .expect("requests serialize")
+            .contains("Answer: PostgreSQL"),
+        "no answer exists yet"
+    );
+
+    answer_open_question(&client, &server, &request_id, "PostgreSQL").await;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let delivered = loop {
+        let requests = mock.agent_requests().await;
+        if requests.len() > before.len() {
+            break requests[before.len()].to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no follow-up run started within 30s of the answer; server logs:\n{}",
+            server.log.contents().await
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        delivered.contains(&request_id) && delivered.contains("Answer: PostgreSQL"),
+        "the follow-up request must carry the request id and the answer: {delivered}"
+    );
+    wait_for_runtime_condition(
+        &client,
+        &server,
+        &session_id,
+        Duration::from_secs(20),
+        "the follow-up run to end with no question open",
+        |runtime| {
+            runtime_is_idle(runtime)
+                && runtime
+                    .get("openQuestions")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+        },
+    )
+    .await;
+
+    server.stop().await;
+}
+
+/// An answer that arrives while the run is still in flight is committed
+/// first and reaches the model in that run's next request, not the one
+/// already sent.
+#[tokio::test]
+#[serial]
+async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
+    // Agent request 0 asks; request 1 follows the command result and is held.
+    let gate = RequestGate::holding(1);
+    let mock = MockOpenAiServer::spawn_gated(MockChatScenario::AsksUser, Some(gate.clone())).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let response = client
+        .post(format!("{}/api/chat/stream", server.base_url))
+        .json(&serde_json::json!({
+            "sessionId": session_id,
+            "content": "Pick a database."
+        }))
+        .send()
+        .await
+        .expect("chat stream request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+
+    tokio::time::timeout(Duration::from_secs(60), gate.arrived.notified())
+        .await
+        .unwrap_or_else(|_| panic!("the run never sent the request after the ask_user command"));
+    let runtime = get_runtime(&client, &server, &session_id).await;
+    let request_id = only_open_question_id(&runtime);
+    let held = mock.agent_requests().await.len();
+
+    answer_open_question(&client, &server, &request_id, "PostgreSQL").await;
+    gate.release.notify_one();
+
+    let events = collect_turn_events(response, "the interrupted turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let next = loop {
+        let requests = mock.agent_requests().await;
+        if requests.len() > held {
+            break requests[held].to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no request carried the answer within 30s; server logs:\n{}",
+            server.log.contents().await
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
+    let held_request = mock.agent_requests().await[held - 1].to_string();
+    assert!(
+        !held_request.contains("Answer: PostgreSQL"),
+        "the request already in flight predates the answer"
+    );
+    assert!(
+        next.contains(&request_id) && next.contains("Answer: PostgreSQL"),
+        "the next request must carry the request id and the answer: {next}"
+    );
+
+    server.stop().await;
 }

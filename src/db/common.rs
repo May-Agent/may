@@ -299,6 +299,8 @@ pub struct PendingPermissionLookup {
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PendingAskUserLookup {
     pub(crate) session_id: String,
+    /// Whether a run is waiting on the prompt, as opposed to an open question.
+    pub(crate) blocking: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
