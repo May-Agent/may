@@ -303,7 +303,7 @@ async fn build_exec_terminal_tool(
     context: &ExecSessionContext,
     environment: &may_agent::AgentEnvironment,
     may_config: &MayConfig,
-    model: &str,
+    model: &may_agent::ModelSelector,
     ssh_server_id: Option<&str>,
     allow_runtime_install: bool,
     tool_distribution: Arc<aither_sandbox::ToolDistribution>,
@@ -536,12 +536,11 @@ async fn resolve_targeted_ssh_server(
         .ok_or_else(|| ExecError::SshServerNotAttached(server_id.to_string()))
 }
 
-fn select_exec_model(config: &MayConfig) -> String {
+fn select_exec_model(config: &MayConfig) -> may_agent::ModelSelector {
     config
         .last_model
-        .as_ref()
-        .map(ToString::to_string)
-        .or_else(|| config.models.advanced.first().map(ToString::to_string))
+        .clone()
+        .or_else(|| config.models.advanced.first().cloned())
         .unwrap_or_else(|| panic!("may exec requires at least one configured model"))
 }
 

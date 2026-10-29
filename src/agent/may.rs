@@ -693,15 +693,15 @@ impl MayAgent {
             tool_environments,
             provider_attempt,
         } = input;
+        let selector = super::provider::parse_model_selector(model)?;
         let resolved_provider =
-            resolve_provider_runtime(may_config, model, provider_attempt).await?;
+            resolve_provider_runtime(may_config, &selector, provider_attempt).await?;
         let provider_id = resolved_provider.provider_id;
         let llm = resolved_provider.llm;
-        let model_info = aither_models::lookup(model);
-        let request_parameters = super::provider::request_parameters_for(
-            &provider_id,
-            may_config.provider.get(&provider_id),
-            model,
+        let model_info = aither_models::lookup(selector.model_id());
+        let request_parameters = super::provider::session_request_parameters(
+            may_config,
+            &selector,
             reasoning_effort,
             &session_id,
         );
@@ -718,9 +718,13 @@ impl MayAgent {
             ))
         })?;
 
-        let ask_models =
-            super::provider::resolve_ask_tier_models(may_config, &provider_id, model, &session_id)
-                .await?;
+        let ask_models = super::provider::resolve_ask_tier_models(
+            may_config,
+            &provider_id,
+            selector.model_id(),
+            &session_id,
+        )
+        .await?;
         let secrets =
             crate::secrets::Secrets::load(&crate::secrets::SecretStore::new(&may_dir), may_config);
         let config = MayAgentConfig {
@@ -728,7 +732,7 @@ impl MayAgent {
             tool_environments,
             command_priority: may_config.sandbox.command_priority,
             llm,
-            model_id: model.to_string(),
+            model_id: selector.model_id().to_string(),
             provider_id,
             search_embedder: resolved_provider.search_embedder,
             ask_models,
