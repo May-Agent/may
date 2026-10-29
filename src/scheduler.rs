@@ -1910,7 +1910,7 @@ mod tests {
         assert_eq!(script, "/host/scripts/.may-task-script-1.sh");
         assert_eq!(
             task_execution_command(&trigger, &script),
-            "export MAY_TASK_TRIGGER_FILE=/host/scripts/.may-task-trigger-1.json\nexec bash /host/scripts/.may-task-script-1.sh\n"
+            "export MAY_TASK_TRIGGER_FILE=/host/scripts/.may-task-trigger-1.json\nexec bash /host/scripts/.may-task-script-1.sh"
         );
     }
 
@@ -1937,7 +1937,7 @@ mod tests {
         );
         assert_eq!(
             task_file_validation_command(&script),
-            "exec bash -n /workspace/.may-task-script-1.sh\n"
+            "exec bash -n /workspace/.may-task-script-1.sh"
         );
     }
 
