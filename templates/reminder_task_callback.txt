@@ -1,0 +1,5 @@
+<system-reminder>
+Scheduled task "{{ task_name }}" (id {{ task_id }}, profile {{ profile_id }}, {{ trigger_kind }} trigger{% if !trigger_type.is_empty() %} of type {{ trigger_type }}{% endif %}) {{ status }}.
+Summary:
+{{ summary }}
+</system-reminder>

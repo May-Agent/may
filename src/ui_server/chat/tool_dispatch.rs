@@ -113,7 +113,6 @@ pub(super) async fn handle_browser_request(
             url,
             detail,
             screenshot,
-            format: _,
         } => {
             let options = crate::agent::browser_tool::BrowserArgs::read_options(detail, screenshot);
             let browser_manager = ensure_browser_runtime_started(state.as_ref())

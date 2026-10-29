@@ -1,0 +1,4 @@
+<system-reminder>
+Some attachments were offloaded because the current model does not support their modality. Inspect the referenced files with tools before answering.
+{% for attachment in attachments %}- {{ attachment.name }} ({{ attachment.kind }}){% if let Some(path) = attachment.path %}, saved at {{ path }}{% endif %}: needs {{ attachment.modality }} support, which model {{ attachment.model_id }} lacks
+{% endfor %}</system-reminder>

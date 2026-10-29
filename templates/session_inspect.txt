@@ -1,0 +1,14 @@
+{%- import "session_macros.txt" as m -%}
+{% call m::session_line(session) %}{% endcall %}
+{% if let Some(message) = final_assistant_message %}
+Final assistant message:
+{% call m::message_block(message) %}{% endcall %}
+{% endif %}
+{%- if let Some(message) = final_user_message %}
+Final user message:
+{% call m::message_block(message) %}{% endcall %}
+{% endif %}
+{%- if let Some(message) = latest_message %}
+Latest message:
+{% call m::message_block(message) %}{% endcall %}
+{% endif %}

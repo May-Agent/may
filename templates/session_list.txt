@@ -1,0 +1,5 @@
+{%- import "session_macros.txt" as m -%}
+Showing {{ results.len() }} of {{ total_matches }} matching session(s).
+{% for session in results %}
+{% call m::session_line(session) %}{% endcall %}
+{% endfor %}
