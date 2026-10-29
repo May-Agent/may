@@ -42,20 +42,6 @@
       }
     },
     {
-      "tool": "apply_patch",
-      "version": "0.7.0",
-      "target": {
-        "os": "macos",
-        "arch": "aarch64"
-      },
-      "url": "https://github.com/lexoliu/aither/releases/download/v0.7.0/apply_patch-0.7.0-aarch64-apple-darwin.tar.gz",
-      "sha256": "2dbbcddd50f4ab44be9a324f4d16b78722fef7ff5a6839d401e634725362c4c1",
-      "encoding": {
-        "format": "tar_gzip",
-        "executable": "apply_patch"
-      }
-    },
-    {
       "tool": "ripgrep",
       "version": "15.2.0",
       "target": {
@@ -94,20 +80,6 @@
       "sha256": "e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0",
       "encoding": {
         "format": "executable"
-      }
-    },
-    {
-      "tool": "apply_patch",
-      "version": "0.7.0",
-      "target": {
-        "os": "macos",
-        "arch": "x86_64"
-      },
-      "url": "https://github.com/lexoliu/aither/releases/download/v0.7.0/apply_patch-0.7.0-x86_64-apple-darwin.tar.gz",
-      "sha256": "5df125c278d9259d3ec784e35443d2f10821fb274a2b21f7f75bcf4981d13e0e",
-      "encoding": {
-        "format": "tar_gzip",
-        "executable": "apply_patch"
       }
     },
     {
@@ -152,20 +124,6 @@
       }
     },
     {
-      "tool": "apply_patch",
-      "version": "0.7.0",
-      "target": {
-        "os": "linux",
-        "arch": "aarch64"
-      },
-      "url": "https://github.com/lexoliu/aither/releases/download/v0.7.0/apply_patch-0.7.0-aarch64-unknown-linux-musl.tar.gz",
-      "sha256": "3c5c8310ae2a69aa89d528a1159f8b76a7709713c161acbc26e7a76dfb26fa7a",
-      "encoding": {
-        "format": "tar_gzip",
-        "executable": "apply_patch"
-      }
-    },
-    {
       "tool": "ripgrep",
       "version": "15.2.0",
       "target": {
@@ -207,20 +165,6 @@
       }
     },
     {
-      "tool": "apply_patch",
-      "version": "0.7.0",
-      "target": {
-        "os": "linux",
-        "arch": "x86_64"
-      },
-      "url": "https://github.com/lexoliu/aither/releases/download/v0.7.0/apply_patch-0.7.0-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "926c3a26e224e08e2138d87a67d6c6e2fda4b5047a05bca09e919a3466ee90a4",
-      "encoding": {
-        "format": "tar_gzip",
-        "executable": "apply_patch"
-      }
-    },
-    {
       "tool": "ripgrep",
       "version": "15.2.0",
       "target": {
@@ -259,20 +203,6 @@
       "sha256": "083b5377392bc57cf27052b6d20a2d927770683bca844632901ff38b4b7b0ac7",
       "encoding": {
         "format": "executable"
-      }
-    },
-    {
-      "tool": "apply_patch",
-      "version": "0.7.0",
-      "target": {
-        "os": "windows",
-        "arch": "aarch64"
-      },
-      "url": "https://github.com/lexoliu/aither/releases/download/v0.7.0/apply_patch-0.7.0-aarch64-pc-windows-msvc.tar.gz",
-      "sha256": "234146d1e07a5f55b8e1908aa3529daefd19d04303f602f390c73d773a6ba58e",
-      "encoding": {
-        "format": "tar_gzip",
-        "executable": "apply_patch.exe"
       }
     },
     {
@@ -318,16 +248,130 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.7.0",
+      "version": "0.11.0",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/lexoliu/aither/releases/download/patch-v0.11.0/apply_patch-0.11.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "4bd13d2022caa7a12f4b4e3278e7665ca17584221e9d95fb68191f3bda8758fa",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "apply_patch"
+      }
+    },
+    {
+      "tool": "apply_patch",
+      "version": "0.11.0",
+      "target": {
+        "os": "windows",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/lexoliu/aither/releases/download/patch-v0.11.0/apply_patch-0.11.0-aarch64-pc-windows-msvc.tar.gz",
+      "sha256": "0e3f8d61768356890fc0b858d72acf40a96efb026edf40081957cf492950e152",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "apply_patch.exe"
+      }
+    },
+    {
+      "tool": "apply_patch",
+      "version": "0.11.0",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/lexoliu/aither/releases/download/patch-v0.11.0/apply_patch-0.11.0-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "33767f964f0fd713e3d9f6b516f085b6946478f1bfa69ac8ebbdba4eb935d105",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "apply_patch"
+      }
+    },
+    {
+      "tool": "apply_patch",
+      "version": "0.11.0",
+      "target": {
+        "os": "macos",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/lexoliu/aither/releases/download/patch-v0.11.0/apply_patch-0.11.0-x86_64-apple-darwin.tar.gz",
+      "sha256": "1dfc3a73bf3253c381e081022ec17f6906a9df0aeb829cfd4f62b2b047c07144",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "apply_patch"
+      }
+    },
+    {
+      "tool": "apply_patch",
+      "version": "0.11.0",
       "target": {
         "os": "windows",
         "arch": "x86_64"
       },
-      "url": "https://github.com/lexoliu/aither/releases/download/v0.7.0/apply_patch-0.7.0-x86_64-pc-windows-msvc.tar.gz",
-      "sha256": "de21ae96c3cca6093449926458f58c1d5ae1ba5d058d566d773d08b6da4bd6e0",
+      "url": "https://github.com/lexoliu/aither/releases/download/patch-v0.11.0/apply_patch-0.11.0-x86_64-pc-windows-msvc.tar.gz",
+      "sha256": "779120188acf32189842b5a6d5216006d05e15abecc0580859cd40852014abf1",
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch.exe"
+      }
+    },
+    {
+      "tool": "apply_patch",
+      "version": "0.11.0",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/lexoliu/aither/releases/download/patch-v0.11.0/apply_patch-0.11.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "450f514cf57ea8e9c4dbe324870cdede3beb75aae5e74b2873da7b9101da21c5",
+      "encoding": {
+        "format": "tar_gzip",
+        "executable": "apply_patch"
+      }
+    }
+  ],
+  "host_programs": [
+    {
+      "tool": "repo_search",
+      "version": "0.0.3",
+      "target": {
+        "os": "macos",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.3/repo-search-aarch64-apple-darwin.tar.xz",
+      "sha256": "1914358c615573d9636061c0c5ac0e726f3ddd2bcbb2400ec747e9caea3e8de0",
+      "encoding": {
+        "format": "tar_xz",
+        "executable": "repo-search-aarch64-apple-darwin/search"
+      }
+    },
+    {
+      "tool": "repo_search",
+      "version": "0.0.3",
+      "target": {
+        "os": "linux",
+        "arch": "aarch64"
+      },
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.3/repo-search-aarch64-unknown-linux-gnu.tar.xz",
+      "sha256": "3013da4eb463f687951745b28d9a4df541b6f81e8bf7c2f6f26f9de56abceaa2",
+      "encoding": {
+        "format": "tar_xz",
+        "executable": "repo-search-aarch64-unknown-linux-gnu/search"
+      }
+    },
+    {
+      "tool": "repo_search",
+      "version": "0.0.3",
+      "target": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.3/repo-search-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "f1c61cd30ab4dd17b0a36a6e4354acf1493e3024bf92a86890da845362578b8b",
+      "encoding": {
+        "format": "tar_xz",
+        "executable": "repo-search-x86_64-unknown-linux-gnu/search"
       }
     }
   ]
