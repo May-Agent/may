@@ -33,6 +33,12 @@ impl MayHomePaths {
         &self.root
     }
 
+    /// Directory holding one listening socket per live main agent.
+    #[must_use]
+    pub fn agents_dir(&self) -> PathBuf {
+        self.root.join("agents")
+    }
+
     /// Directory holding per-session data.
     #[must_use]
     pub fn sessions_dir(&self) -> PathBuf {
