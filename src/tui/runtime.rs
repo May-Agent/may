@@ -632,6 +632,7 @@ pub struct RuntimeDeps {
 #[derive(Debug)]
 pub struct PendingWorkerBuild {
     model: String,
+    settings: crate::agent::AgentLiveSettings,
     task: std::pin::Pin<Box<executor_core::AnyExecutorTask<Result<AgentWorker, TuiRuntimeError>>>>,
 }
 
@@ -640,6 +641,12 @@ impl PendingWorkerBuild {
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Config values the worker is built from.
+    #[must_use]
+    pub const fn settings(&self) -> &crate::agent::AgentLiveSettings {
+        &self.settings
     }
 
     /// Waits for the worker; cancellation-safe, so it can be raced in a select.
@@ -887,6 +894,23 @@ impl RuntimeDeps {
         )
     }
 
+    /// Starts building a replacement worker for the current session from the
+    /// saved config, on the session's model; the current worker keeps serving
+    /// until the new one is installed.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the worker build cannot start.
+    pub fn begin_reload_worker(&self, app: &App) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        let session = app
+            .session_manager
+            .current()
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
+        let sandbox_dir = session.sandbox_dir.clone();
+        let session_id = session.id.clone();
+        let selected_model = SelectedModel::resolve(&app.config, session.model.as_deref())?;
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+    }
+
     /// Installs a worker finished by `build` as the current session's worker.
     pub fn install_worker(
         app: &mut App,
@@ -895,6 +919,7 @@ impl RuntimeDeps {
         new_worker: AgentWorker,
     ) {
         app.set_current_model(build.model());
+        app.worker_settings = build.settings().clone();
         app.job_registry = Some(new_worker.job_registry().clone());
         app.subagent_runs = Some(new_worker.subagent_runs().clone());
         app.btw_llm = Some(new_worker.btw_llm().clone());
@@ -1098,6 +1123,7 @@ impl RuntimeDeps {
         };
         Ok(PendingWorkerBuild {
             model: model.0,
+            settings: crate::agent::AgentLiveSettings::of(&app.config),
             task: Box::pin(spawn(build_worker_for_session(inputs))),
         })
     }
