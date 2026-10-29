@@ -130,7 +130,7 @@ fn binary_tool_image(result: &ToolResult) -> Option<ToolImage> {
 
 fn extract_tool_output(result: &CommandResult) -> ToolOutput {
     match &result.stdout {
-        CommandStream::Inline(text) => ToolOutput {
+        CommandStream::Inline { text } => ToolOutput {
             text: text.clone(),
             image: None,
         },
@@ -250,7 +250,9 @@ mod tests {
 
     #[test]
     fn parse_tool_end_keeps_text_output() {
-        let result = terminal_result(CommandStream::Inline("hello".to_string()));
+        let result = terminal_result(CommandStream::Inline {
+            text: "hello".to_string(),
+        });
         match parse_tool_end(&result) {
             ToolEndKind::Output(out) => {
                 assert_eq!(out.text, "hello");
