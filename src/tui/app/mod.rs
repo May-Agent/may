@@ -63,6 +63,9 @@ pub struct App {
     pub session_manager: SessionManager,
     /// Configuration
     pub config: MayConfig,
+    /// Config values the current agent worker was built from; a saved change
+    /// to them replaces the worker.
+    pub worker_settings: crate::agent::AgentLiveSettings,
     /// Current input text
     pub input: String,
     /// Input cursor position (character index, not byte index)
@@ -376,6 +379,7 @@ impl App {
 
         Ok(Self {
             session_manager,
+            worker_settings: crate::agent::AgentLiveSettings::of(&config),
             config,
             input: String::new(),
             cursor: 0,

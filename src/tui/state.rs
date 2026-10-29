@@ -562,6 +562,16 @@ pub enum ConfigEditMode {
     },
 }
 
+/// Which setting the config screen's text edit writes to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConfigTextTarget {
+    /// The selected row's primary value: API key, model list, preference.
+    #[default]
+    Primary,
+    /// The selected provider's cache lifetime.
+    CacheLifetime,
+}
+
 /// Unified config state for all sections.
 #[derive(Debug)]
 pub struct ConfigState {
@@ -571,6 +581,8 @@ pub struct ConfigState {
     pub selected: usize,
     /// Edit mode (text input, list selection, or none)
     pub edit_mode: ConfigEditMode,
+    /// Setting the active text edit writes to
+    pub text_target: ConfigTextTarget,
     /// Cached provider list for display
     pub provider_ids: Vec<String>,
     /// Whether we detected API key from env var
@@ -585,6 +597,7 @@ impl Default for ConfigState {
             section: ConfigSection::Providers,
             selected: 0,
             edit_mode: ConfigEditMode::None,
+            text_target: ConfigTextTarget::default(),
             provider_ids: Vec::new(),
             key_from_env: false,
             key_env_var_name: None,
@@ -604,7 +617,7 @@ impl ConfigState {
     pub const fn row_count(&self, _config: &MayConfig) -> usize {
         match self.section {
             ConfigSection::Providers => self.provider_ids.len() + 1,
-            ConfigSection::Models => 4,
+            ConfigSection::Models => 5,
             ConfigSection::Preferences => 3,
         }
     }
@@ -617,6 +630,7 @@ impl ConfigState {
 
     /// Start text editing mode.
     pub fn start_text_edit(&mut self, initial: &str) {
+        self.text_target = ConfigTextTarget::Primary;
         let len = initial.len();
         self.edit_mode = ConfigEditMode::Text {
             input: initial.to_string(),
@@ -626,6 +640,7 @@ impl ConfigState {
 
     /// Cancel editing.
     pub fn cancel_edit(&mut self) {
+        self.text_target = ConfigTextTarget::Primary;
         self.edit_mode = ConfigEditMode::None;
     }
 

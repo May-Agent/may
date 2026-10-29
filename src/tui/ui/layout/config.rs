@@ -70,7 +70,7 @@ pub(super) fn render_config_screen(frame: &mut Frame, area: Rect, app: &App) {
     let help_text = if state.is_editing() {
         "Enter: save | Esc: cancel"
     } else {
-        "Tab: switch section | j/k: navigate | Enter: edit | d: delete | Esc: close"
+        "Tab: switch section | j/k: navigate | Enter: edit | c: cache lifetime | d: delete | Esc: close"
     };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))
@@ -123,7 +123,10 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
                     )
                 },
             );
-            let text = format!("{prefix}{id:<20} {status}");
+            let lifetime = instance.map_or_else(String::new, |inst| {
+                format!("  cache {}", inst.cache_lifetime)
+            });
+            let text = format!("{prefix}{id:<20} {status}{lifetime}");
             let style = if idx == state.selected {
                 Style::default()
                     .fg(Color::Yellow)
@@ -318,7 +321,13 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
     let state = &app.config_state;
     let config = &app.config;
 
-    let tier_names = ["Advanced", "Balanced", "Fast", "Image Generation"];
+    let tier_names = [
+        "Advanced",
+        "Balanced",
+        "Fast",
+        "Image Generation",
+        "Compaction",
+    ];
     let tier_values: Vec<String> = vec![
         config
             .models
@@ -348,6 +357,12 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", "),
+        config
+            .models
+            .compaction_model
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
     ];
 
     let mut items: Vec<ListItem> = tier_names

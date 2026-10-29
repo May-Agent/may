@@ -99,6 +99,7 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             display_name: instance.display_name.clone(),
             enabled: instance.enabled,
             native_tools: UiNativeToolsConfig::from(&instance.native_tools),
+            cache_lifetime: instance.cache_lifetime,
             api: instance.api,
         })
         .collect::<Vec<_>>();
@@ -132,6 +133,11 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
                 .as_ref()
                 .map(ToString::to_string),
             embedding_dimensions: config.models.embedding_dimensions,
+            compaction_model: config
+                .models
+                .compaction_model
+                .as_ref()
+                .map(ToString::to_string),
         },
         preferences: UiPreferencesConfig {
             warn_on_model_change: config.preferences.warn_on_model_change,
@@ -211,6 +217,7 @@ fn provider_map_from_ui(
             instance.display_name = p.display_name.clone().filter(|v| !v.trim().is_empty());
             instance.enabled = p.enabled;
             instance.native_tools = NativeToolsConfig::from(&p.native_tools);
+            instance.cache_lifetime = p.cache_lifetime;
             instance.api = p.api;
             (p.id.clone(), instance)
         })
@@ -280,6 +287,16 @@ async fn run_save_full_config(
                     .expect("ui config save must receive valid model selectors")
             });
         config.models.embedding_dimensions = req.models.embedding_dimensions;
+        config.models.compaction_model = req
+            .models
+            .compaction_model
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .parse::<ModelSelector>()
+                    .expect("ui config save must receive valid model selectors")
+            });
         config.preferences.warn_on_model_change = req.preferences.warn_on_model_change;
         config.preferences.show_token_usage = req.preferences.show_token_usage;
         config.preferences.show_decode_speed = req.preferences.show_decode_speed;
@@ -715,7 +732,68 @@ pub(super) async fn copilot_logout() -> SkyResult<Json<ApiHealth>> {
 #[cfg(test)]
 mod tests {
     use super::{build_ui_full_config, provider_map_from_ui};
+    use crate::cache_lifetime::CacheLifetime;
     use crate::config::{CommandPriority, MayConfig, ProviderInstance, ProviderType};
+    use std::time::Duration;
+
+    #[test]
+    fn full_config_save_roundtrip_preserves_cache_lifetime_and_compaction_model() {
+        let mut config = MayConfig::default();
+        for (id, lifetime) in [
+            ("default", CacheLifetime::default()),
+            ("timed", CacheLifetime::Limited(Duration::from_mins(30))),
+            ("forever", CacheLifetime::Permanent),
+        ] {
+            let mut instance = ProviderInstance::new(ProviderType::Custom)
+                .with_base_url("http://127.0.0.1:8787/v1");
+            instance.cache_lifetime = lifetime;
+            config.upsert_provider(id, instance);
+        }
+        config.models.compaction_model = Some("default::small".parse().expect("selector"));
+
+        // The web UI posts the GET response back as the save body.
+        let ui = serde_json::to_value(build_ui_full_config(&config)).expect("ui config serializes");
+        let providers = ui["providers"].as_array().expect("providers");
+        let wire = |id: &str| {
+            providers
+                .iter()
+                .find(|provider| provider["id"] == id)
+                .map(|provider| provider["cacheLifetime"].clone())
+                .expect("provider on the wire")
+        };
+        assert_eq!(wire("default"), "1h");
+        assert_eq!(wire("timed"), "30m");
+        assert_eq!(wire("forever"), "permanent");
+        assert_eq!(ui["models"]["compactionModel"], "default::small");
+
+        let saved: super::UiFullConfig =
+            serde_json::from_value(ui).expect("ui config deserializes");
+        let providers = provider_map_from_ui(&config.provider, &saved.providers);
+        for (id, instance) in &config.provider {
+            assert_eq!(
+                providers[id].cache_lifetime, instance.cache_lifetime,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_config_without_cache_lifetime_saves_the_default() {
+        let ui = serde_json::to_value(build_ui_full_config(&{
+            let mut config = MayConfig::default();
+            config.upsert_provider("p", ProviderInstance::new(ProviderType::OpenAI));
+            config
+        }))
+        .expect("ui config serializes");
+        let mut ui = ui;
+        ui["providers"][0]
+            .as_object_mut()
+            .expect("provider object")
+            .remove("cacheLifetime");
+        let saved: super::UiFullConfig =
+            serde_json::from_value(ui).expect("an older client's body deserializes");
+        assert!(saved.providers[0].cache_lifetime.is_default());
+    }
 
     #[test]
     fn full_config_save_roundtrip_preserves_native_tools() {

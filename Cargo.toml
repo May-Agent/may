@@ -47,6 +47,7 @@ event-listener = "5"
 executor-core = { version = "0.7", features = ["tokio"] }
 async-fs = "2.1"
 async-io = "2.6"
+humantime = { version = "2.4", default-features = false }
 async-net = "2"
 async-channel = "2"
 blocking = "1"

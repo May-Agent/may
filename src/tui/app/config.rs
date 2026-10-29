@@ -2,7 +2,9 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::super::state::{AppMode, ConfigEditMode, ConfigSection, detect_api_key_from_env};
+use super::super::state::{
+    AppMode, ConfigEditMode, ConfigSection, ConfigTextTarget, detect_api_key_from_env,
+};
 use super::{App, SendAction, char_to_byte_index};
 use crate::config::{ModelTier, ProviderType, get_model_tier};
 use crate::model_selector::ModelSelector;
@@ -45,6 +47,17 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 return self.handle_config_enter();
+            }
+            KeyCode::Char('c') => {
+                // Edit the selected provider's cache lifetime (Providers section only)
+                if state.section == ConfigSection::Providers
+                    && let Some(id) = state.provider_ids.get(state.selected)
+                    && let Some(instance) = self.config.provider.get(id)
+                {
+                    let current = instance.cache_lifetime.to_string();
+                    state.start_text_edit(&current);
+                    state.text_target = ConfigTextTarget::CacheLifetime;
+                }
             }
             KeyCode::Char('d') | KeyCode::Delete => {
                 // Delete provider (only in Providers section)
@@ -136,6 +149,17 @@ impl App {
                 }
                 3 => {
                     self.model_fetch_rx = self.open_tier_model_picker(ModelTier::ImageGeneration);
+                }
+                4 => {
+                    // Edit the compaction model selector
+                    let current = self
+                        .config
+                        .models
+                        .compaction_model
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    state.start_text_edit(&current);
                 }
                 _ => {}
             },
@@ -436,6 +460,10 @@ impl App {
             (value, state.section, state.selected)
         };
 
+        if self.config_state.text_target == ConfigTextTarget::CacheLifetime {
+            return self.save_cache_lifetime_edit(&value, selected);
+        }
+
         match section {
             ConfigSection::Providers => {
                 // Save API key for selected provider
@@ -463,6 +491,7 @@ impl App {
                     1 => self.config.models.balanced = models,
                     2 => self.config.models.fast = models,
                     3 => self.config.models.image_generation = models,
+                    4 => self.config.models.compaction_model = models.into_iter().next(),
                     _ => {}
                 }
             }
@@ -479,6 +508,22 @@ impl App {
         self.config_state.cancel_edit();
         self.persist_config_background();
 
+        None
+    }
+
+    /// Saves the text edit of the selected provider's cache lifetime.
+    ///
+    /// Text that is neither a duration nor `permanent` leaves the edit open
+    /// with the reason in the status line.
+    fn save_cache_lifetime_edit(&mut self, value: &str, selected: usize) -> Option<SendAction> {
+        if let Some(id) = self.config_state.provider_ids.get(selected).cloned()
+            && let Err(error) = self.config.set_provider_cache_lifetime(&id, value)
+        {
+            self.set_status(error.to_string());
+            return None;
+        }
+        self.config_state.cancel_edit();
+        self.persist_config_background();
         None
     }
 

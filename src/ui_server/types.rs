@@ -1284,6 +1284,11 @@ pub struct UiProviderConfig {
     pub(crate) display_name: Option<String>,
     pub(crate) enabled: bool,
     pub(crate) native_tools: UiNativeToolsConfig,
+    /// Default cache lifetime of the main conversation: a duration such as
+    /// `1h`, or `permanent`.
+    #[serde(default)]
+    #[schema(value_type = String)]
+    pub(crate) cache_lifetime: crate::cache_lifetime::CacheLifetime,
     /// Wire API a `custom` provider speaks; must round-trip the config save or
     /// `api = "responses"` is silently dropped on every UI write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1299,6 +1304,9 @@ pub struct UiModelsConfig {
     pub(crate) image_generation: Vec<String>,
     pub(crate) embedding_model: Option<String>,
     pub(crate) embedding_dimensions: Option<usize>,
+    /// Model compaction runs on instead of the session model.
+    #[serde(default)]
+    pub(crate) compaction_model: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
