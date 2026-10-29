@@ -257,7 +257,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         title_generation_queue,
         location_provider: crate::location::LocationProvider::new(),
         runtime_service,
-        agent_listeners: crate::agent_link::AgentListeners::default(),
+        agent_listeners: crate::agent_link::AgentListeners::new(tokio::runtime::Handle::current()),
         task_runtime: task_runtime.clone(),
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),

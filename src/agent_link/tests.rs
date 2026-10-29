@@ -62,7 +62,7 @@ impl Machine {
     async fn listen(&self, session_id: &str, db: ChatDb) -> TestAgent {
         let runtime_service = Arc::new(SessionRuntimeService::new(db, UiEventBus::new()));
         let (wake_tx, wakes) = async_channel::unbounded();
-        let listeners = AgentListeners::default();
+        let listeners = AgentListeners::new(tokio::runtime::Handle::current());
         listeners
             .ensure(
                 &self.agents_dir,
@@ -424,7 +424,7 @@ async fn a_stored_session_that_ran_no_turn_is_listed_and_woken_by_a_message() {
         runtime_service,
     };
     let (wake_tx, wakes) = async_channel::unbounded();
-    let web = AgentListeners::default();
+    let web = AgentListeners::new(tokio::runtime::Handle::current());
     web.open_stored_sessions(&host, |_| {
         let wake_tx = wake_tx.clone();
         move || {
@@ -486,4 +486,40 @@ fn a_container_sessions_prompt_path_goes_through_its_workspace_mount() {
         super::resolve_prompt_path(sandbox, None, "note.txt").expect("local"),
         Path::new("/host/sb/note.txt")
     );
+}
+
+#[tokio::test]
+async fn a_long_session_id_binds_and_a_too_deep_directory_is_refused_with_the_limit() {
+    let mut machine = Machine::new();
+    let long_id = "repulsively-equably-hygienic-dingo-repulsively-equably-hygienic-dingo";
+    let agent = machine.start(long_id, "long").await;
+    let listed = agent.messaging.directory.live().await.expect("list");
+    assert_eq!(names(&listed), ["long"]);
+    assert_eq!(listed[0].session_id, long_id);
+    drop(agent);
+
+    machine.agents_dir = machine.dir.path().join("d".repeat(120)).join("agents");
+    let db = ChatDb::open(&machine.db_path)
+        .await
+        .expect("history.db opens");
+    let runtime_service = Arc::new(SessionRuntimeService::new(db, UiEventBus::new()));
+    let error = AgentListeners::new(tokio::runtime::Handle::current())
+        .ensure(
+            &machine.agents_dir,
+            AgentIdentity {
+                session_id: "deep".to_string(),
+                cwd: PathBuf::from("/work/deep"),
+                sandbox_dir: machine.sandboxes.join("deep"),
+            },
+            runtime_service,
+            || {},
+        )
+        .await
+        .expect_err("a path over the limit cannot be bound");
+    let AgentLinkError::SocketPathTooLong { path, bytes, limit } = &error else {
+        panic!("unexpected error: {error}");
+    };
+    assert_eq!(*bytes, path.as_os_str().len());
+    assert!(bytes > limit);
+    assert!(error.to_string().contains("byte limit"));
 }

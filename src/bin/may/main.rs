@@ -383,7 +383,8 @@ where
     let mut assistant_response = AssistantReply::default();
 
     // Sockets through which other main agents reach this TUI's session
-    let agent_listeners = may_agent::agent_link::AgentListeners::default();
+    let agent_listeners =
+        may_agent::agent_link::AgentListeners::new(tokio::runtime::Handle::current());
 
     loop {
         enum Event {
