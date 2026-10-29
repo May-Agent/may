@@ -8,7 +8,6 @@ const COLORS: Record<SessionRuntimeState, string> = {
   waiting_permission: 'bg-amber-500',
   waiting_workspace: 'bg-amber-500',
   waiting_ask_user: 'bg-sky-500',
-  waiting_terminal_input: 'bg-sky-500',
 };
 
 const LABEL_KEYS: Record<SessionRuntimeState, string> = {
@@ -17,7 +16,6 @@ const LABEL_KEYS: Record<SessionRuntimeState, string> = {
   waiting_permission: 'runtime.waitingPermission',
   waiting_workspace: 'runtime.waitingWorkspace',
   waiting_ask_user: 'runtime.waitingAskUser',
-  waiting_terminal_input: 'runtime.waitingTerminalInput',
 };
 
 export function RuntimePhaseDot({ state }: { state: SessionRuntimeState | undefined }) {
