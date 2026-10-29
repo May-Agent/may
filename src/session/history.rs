@@ -68,6 +68,22 @@ pub enum ToolEventRecord {
         #[serde(with = "super::tool_result_wire")]
         result: aither_core::llm::ToolResult,
     },
+    /// Tool call the user stopped before it produced a result.
+    #[serde(rename = "stopped")]
+    Stopped {
+        /// Tool call id.
+        id: String,
+        /// Tool name.
+        name: String,
+    },
+}
+
+impl ToolEventRecord {
+    /// What the model and the UI see as the result of a stopped call.
+    #[must_use]
+    pub fn stopped_result() -> aither_core::llm::ToolResult {
+        aither_core::llm::ToolResult::text("Stopped by the user before it finished.")
+    }
 }
 
 /// Session metadata stored in the chat history header.
@@ -477,6 +493,18 @@ impl ChatHistory {
                                 }
                                 Some(Ok(Message::tool(id, result.render_for_model())))
                             }
+                            ToolEventRecord::Stopped { id, .. } => {
+                                if id != tool_call_id {
+                                    return Some(Err(HistoryReplayError::ToolEventIdMismatch {
+                                        event_id: id,
+                                        message_id: tool_call_id.to_string(),
+                                    }));
+                                }
+                                Some(Ok(Message::tool(
+                                    id,
+                                    ToolEventRecord::stopped_result().render_for_model(),
+                                )))
+                            }
                         }
                     }
                     // Interaction messages are metadata, not LLM context
@@ -660,8 +688,12 @@ mod tests {
         use aither_core::llm::{CommandOutcome, CommandResult, CommandStream};
 
         let result = ToolResult::Command(Box::new(CommandResult {
-            stdout: CommandStream::Inline("hi\n".to_string()),
-            stderr: Some(CommandStream::Inline("warn\n".to_string())),
+            stdout: CommandStream::Inline {
+                text: "hi\n".to_string(),
+            },
+            stderr: Some(CommandStream::Inline {
+                text: "warn\n".to_string(),
+            }),
             outcome: CommandOutcome::Exited { code: 3 },
         }));
         let stored = serde_json::to_string(&ToolEventRecord::End {
@@ -680,6 +712,53 @@ mod tests {
             loaded.render_for_model(),
             "hi\nstderr:\nwarn\nExit code: 3.\n"
         );
+    }
+
+    #[test]
+    fn stopped_tool_call_replays_with_a_text_result() {
+        let mut history = ChatHistory::new();
+        let start = serde_json::to_string(&ToolEventRecord::Start {
+            id: "call_9".to_string(),
+            name: "terminal".to_string(),
+            arguments: "{}".to_string(),
+        })
+        .expect("serialize tool start");
+        let stopped = serde_json::to_string(&ToolEventRecord::Stopped {
+            id: "call_9".to_string(),
+            name: "terminal".to_string(),
+        })
+        .expect("serialize tool stop");
+        history
+            .messages_mut()
+            .push(ChatMessage::tool("call_9", start, Timestamp::now()));
+        history
+            .messages_mut()
+            .push(ChatMessage::tool("call_9", stopped, Timestamp::now()));
+
+        let messages = history.to_aither_messages().expect("replay stopped call");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tool_calls()[0].id, "call_9");
+        assert_eq!(messages[1].role(), Role::Tool);
+        assert_eq!(messages[1].tool_call_id(), Some("call_9"));
+        assert_eq!(
+            messages[1].content(),
+            ToolEventRecord::stopped_result().render_for_model()
+        );
+    }
+
+    #[test]
+    fn stopped_record_round_trips_through_serde() {
+        let json = serde_json::to_string(&ToolEventRecord::Stopped {
+            id: "c".to_string(),
+            name: "terminal".to_string(),
+        })
+        .expect("serialize");
+        assert!(json.contains("\"stage\":\"stopped\""));
+        let back: ToolEventRecord = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            back,
+            ToolEventRecord::Stopped { ref id, ref name } if id == "c" && name == "terminal"
+        ));
     }
 
     #[test]
