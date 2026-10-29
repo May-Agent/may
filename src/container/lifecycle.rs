@@ -17,6 +17,17 @@ use tokio::time::Instant;
 use super::{ContainerError, ContainerRuntime};
 use crate::session::MayHomePaths;
 
+/// Where a container's host workspace directory is bind-mounted, and the
+/// working directory of its commands. Every host-to-container workspace path
+/// derives from this one definition.
+pub const CONTAINER_WORKSPACE: &str = "/workspace";
+
+/// The in-container path of `file_name` in the container's workspace mount.
+#[must_use]
+pub fn container_workspace_path(file_name: &str) -> String {
+    format!("{CONTAINER_WORKSPACE}/{file_name}")
+}
+
 const LABEL_MANAGED: &str = "may.managed";
 const LABEL_SPEC_FINGERPRINT: &str = "may.spec-fingerprint";
 const SPEC_FINGERPRINT_REVISION: &str = "2026-03-17-v8";
@@ -226,7 +237,7 @@ impl ContainerManager {
         let config = ContainerCreateBody {
             image: Some(spec.image.clone()),
             hostname: Some(spec.name.clone()),
-            working_dir: Some("/workspace".to_string()),
+            working_dir: Some(CONTAINER_WORKSPACE.to_string()),
             env: Some(env),
             host_config: Some(host_config),
             // Keep container alive with a long-running process
@@ -341,9 +352,9 @@ impl ContainerManager {
 
     fn effective_mounts(spec: &ContainerLaunchSpec, shared_paths: &SharedHostPaths) -> Vec<Mount> {
         let mut mounts = vec![
-            // Session sandbox -> /workspace
+            // Session sandbox -> CONTAINER_WORKSPACE
             Mount {
-                target: Some("/workspace".to_string()),
+                target: Some(CONTAINER_WORKSPACE.to_string()),
                 source: Some(spec.workspace.display().to_string()),
                 typ: Some(MountType::BIND),
                 read_only: Some(false),
