@@ -6,8 +6,11 @@ mod compaction_tests;
 mod context_report;
 mod environment;
 mod hooks;
+#[cfg(test)]
+mod idle_compaction_tests;
 pub(crate) mod imagine;
 pub(crate) mod issue_tool;
+mod live_settings;
 mod may;
 pub(crate) mod notify_tool;
 mod permission;
@@ -31,6 +34,7 @@ pub use browser_tool::{
 pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use imagine::ImageGeneratorConfig;
+pub use live_settings::AgentLiveSettings;
 pub use may::{
     AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, MayAgentSessionInput,
     generate_session_title,

@@ -296,6 +296,9 @@ enum WorkerBuildPurpose {
     Session,
     /// A user-requested model switch; failure keeps the current worker.
     SwitchModel,
+    /// A saved config change to what the agent is built from; failure keeps
+    /// the current worker.
+    Reconfigure,
 }
 
 /// A worker build in flight, raced by the event loop against its queues so
@@ -322,6 +325,14 @@ async fn finish_worker_build(
 ) -> anyhow::Result<()> {
     let WorkerBuild { purpose, build } = finished;
     let built = match (purpose, built) {
+        (WorkerBuildPurpose::Reconfigure, Err(error)) => {
+            // Settled either way: the failure is reported once, not retried
+            // on every loop pass.
+            app.worker_settings = build.settings().clone();
+            app.chat
+                .push_error(&format!("Failed to apply the saved settings: {error}"));
+            return Ok(());
+        }
         (_, Ok(built)) => built,
         (WorkerBuildPurpose::Startup, Err(error)) => {
             report_startup_failure(app, &error);
@@ -451,6 +462,28 @@ where
         runtime_deps
             .listen_for_agent_messages(app, &agent_listeners, events.sender())
             .await?;
+
+        // A saved change to the cache lifetime or compaction model replaces
+        // the idle worker with one built from the saved config.
+        if worker.is_some()
+            && worker_build.is_none()
+            && agent_handle.is_none()
+            && app.worker_settings != may_agent::agent::AgentLiveSettings::of(&app.config)
+        {
+            match runtime_deps.begin_reload_worker(app) {
+                Ok(build) => {
+                    worker_build = Some(WorkerBuild {
+                        purpose: WorkerBuildPurpose::Reconfigure,
+                        build,
+                    });
+                }
+                Err(error) => {
+                    app.worker_settings = may_agent::agent::AgentLiveSettings::of(&app.config);
+                    app.chat
+                        .push_error(&format!("Failed to apply the saved settings: {error}"));
+                }
+            }
+        }
 
         // Check for queued messages - start processing if agent is idle
         if agent_handle.is_none()

@@ -273,12 +273,16 @@ export const ja: Messages = {
       apiKey: 'API キー',
       apiKeySaved: 'キー保存済み — 置き換えるには新しいキーを入力',
       baseUrl: 'ベース URL',
+      cacheLifetime: 'キャッシュ保持時間',
+      cacheLifetimeHint: '1h や 5m のような期間、または permanent',
     },
     models: {
       title: 'モデル',
       description: '各プロバイダで利用可能なモデル。',
       defaultModel: 'デフォルトモデル',
       setDefault: 'デフォルトに設定',
+      useForCompaction: '圧縮に使用',
+      compactionModel: '圧縮モデル',
       current: '現在',
     },
     mcp: {
