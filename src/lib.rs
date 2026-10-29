@@ -61,6 +61,8 @@ pub mod secrets;
 pub mod session;
 /// Agent skill discovery and management.
 pub mod skill;
+/// Startup validation of configuration files.
+pub mod startup;
 /// Subagent registration and dispatch.
 pub mod subagent;
 /// Scheduled-task trigger definitions.
