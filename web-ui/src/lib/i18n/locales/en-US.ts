@@ -364,8 +364,8 @@ export const enUS = {
     execution: {
       title: 'Command Priority',
       description: 'Controls CPU and disk scheduling for local and container commands. SSH commands are unaffected.',
-      normal: 'Normal',
-      low: 'Low (default)',
+      normal: 'Normal (default)',
+      low: 'Low',
       lowest: 'Lowest',
       info: 'Lower priority changes scheduling under contention; it does not cap CPU usage.',
     },
