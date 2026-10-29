@@ -257,6 +257,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         title_generation_queue,
         location_provider: crate::location::LocationProvider::new(),
         runtime_service,
+        agent_listeners: crate::agent_link::AgentListeners::new(tokio::runtime::Handle::current()),
         task_runtime: task_runtime.clone(),
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
@@ -267,6 +268,10 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
     chat::resume_pending_follow_up_runs(state.clone())
         .await
         .context("failed to resume persisted pending session runs")?;
+
+    chat::open_all_sessions_for_agents(&state)
+        .await
+        .context("failed to open stored sessions to other agents")?;
 
     // Spawn background tasks
     let _auto_archive = crate::tasks::spawn_auto_archive(db_for_archive.clone());

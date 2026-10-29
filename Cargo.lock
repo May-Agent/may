@@ -7504,6 +7504,7 @@ dependencies = [
  "async-channel 2.5.0",
  "async-fs",
  "async-io 2.6.0",
+ "async-net",
  "async-stream",
  "base64 0.22.1",
  "blocking",
