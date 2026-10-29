@@ -256,6 +256,11 @@ pub struct App {
     pub diff_preview_at: Option<std::time::Instant>,
     /// Loaded secret values for bash-mode masking and env injection.
     pub secrets: crate::secrets::Secrets,
+    /// Questions the agent asked that nobody answered yet, for the status bar.
+    pub open_question_count: usize,
+    /// Which open question `/questions` shows next, so repeated use walks
+    /// through all of them.
+    pub question_cursor: usize,
 }
 
 /// Live-output read state for a running terminal call bound to a
@@ -478,6 +483,8 @@ impl App {
             live_reads: std::collections::HashMap::new(),
             diff_preview_at: None,
             secrets,
+            open_question_count: 0,
+            question_cursor: 0,
         })
     }
 
@@ -2262,6 +2269,7 @@ impl App {
                 self.open_jobs();
                 None
             }
+            "/questions" => Some(SendAction::OpenQuestions),
             "/btw" => {
                 self.open_btw();
                 None
@@ -2837,12 +2845,14 @@ pub enum SendAction {
     Send(PendingMessage),
     /// Persist a pending message for later dispatch.
     EnqueuePending(PendingMessage),
+    /// Show an open question of the session in the answer modal.
+    OpenQuestions,
     /// Submit an ask-user response.
     RespondAskUser {
         /// ID of the pending ask-user request being answered.
         request_id: String,
-        /// The ask-user request that was presented to the user.
-        request: crate::ask_user::AskUserRequest,
+        /// The prompt a run is blocked on, or `None` for an open question.
+        request: Option<crate::ask_user::AskUserRequest>,
         /// The user's answers, one entry per question.
         answers: Vec<crate::ask_user::QuestionAnswer>,
     },

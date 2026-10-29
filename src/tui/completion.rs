@@ -41,6 +41,7 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "Rewind to an earlier prompt (conversation, optionally code too)",
     ),
     ("/jobs", "Background jobs and running subagents"),
+    ("/questions", "Answer the questions the agent left open"),
     (
         "/btw",
         "Ask a side question without touching conversation history",

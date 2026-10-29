@@ -222,7 +222,8 @@ export const zhHant: Messages = {
     askUser: {
       title: 'May 需要您的回覆',
       other: '其他',
-      skip: '略過',
+      failed: '無法送出回答。此問題可能已不再開放。',
+      openTitle: 'May 提出了一個問題',
     },
   },
   settings: {

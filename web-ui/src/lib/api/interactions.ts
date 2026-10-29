@@ -10,8 +10,7 @@ export function respondWorkspace(id: string, approved: boolean): Promise<void> {
 
 export type AskUserAnswer =
   | { kind: 'selected'; values: string[] }
-  | { kind: 'custom'; text: string }
-  | { kind: 'skipped' };
+  | { kind: 'custom'; text: string };
 
 export interface AskUserAnswerEntry {
   section: string;

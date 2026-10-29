@@ -7,6 +7,9 @@ pub(crate) mod history;
 pub mod import;
 pub mod layout;
 mod manager;
+pub mod open_questions;
+#[cfg(test)]
+mod open_questions_tests;
 pub(crate) mod persisted_message;
 mod plan;
 pub(crate) mod run_lease;
@@ -44,5 +47,5 @@ pub use runtime::{
     PersistedWorkspaceRequestPayload, SessionInteractionState, SessionRuntimeState,
     SessionRuntimeSummary, TerminalRuntimeState,
 };
-pub use runtime_service::SessionRuntimeService;
+pub use runtime_service::{AnswerError, AskUserAnswer, ResolvedRequest, SessionRuntimeService};
 pub use store::{SandboxResourceLayout, SessionStore, StoreError};

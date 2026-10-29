@@ -542,7 +542,7 @@ async fn request_registration_approval(
             .iter()
             .any(|value| value.eq_ignore_ascii_case("approve")),
         AnswerValue::Custom(value) => value.eq_ignore_ascii_case("approve"),
-        AnswerValue::Skipped => false,
+        AnswerValue::Skipped => unreachable!("May never produces a skipped answer"),
     });
     if approved {
         Ok(())

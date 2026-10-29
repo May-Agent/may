@@ -944,6 +944,8 @@ pub struct StatusContext<'a> {
     pub usage: Option<(u64, Option<u64>)>,
     /// Queued message count.
     pub queue_count: usize,
+    /// Questions the agent asked that wait for an answer.
+    pub open_questions: usize,
     /// Running background entries (subagents and jobs).
     pub background: &'a [StatusBackgroundItem],
     /// Live decode rate in tokens per second, when measurable.
@@ -2101,6 +2103,10 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
 
     if ctx.queue_count > 0 {
         parts.push(format!("Q:{}", ctx.queue_count));
+    }
+
+    if ctx.open_questions > 0 {
+        parts.push(format!("? {} open · /questions", ctx.open_questions));
     }
 
     for item in ctx.background.iter().take(3) {

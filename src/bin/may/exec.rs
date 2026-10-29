@@ -481,7 +481,7 @@ where
             may_dir: context.may_dir.clone(),
             sandbox_dir: context.sandbox_dir.clone(),
             search_embedder,
-            ask_user_broker: None,
+            ask_user: None,
             imagine: None,
             task_runtime: match environment {
                 may_agent::AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,

@@ -222,7 +222,8 @@ export const ja: Messages = {
     askUser: {
       title: 'May が入力を求めています',
       other: 'その他',
-      skip: 'スキップ',
+      failed: '回答を送信できませんでした。質問はすでに閉じられている可能性があります。',
+      openTitle: 'May からの質問',
     },
   },
   settings: {

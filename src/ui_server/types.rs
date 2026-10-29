@@ -1018,6 +1018,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
                 session_id: request.request.session_id,
             }),
             waiting_ask_user: summary.waiting_ask_user,
+            open_questions: summary.open_questions,
         }
     }
 }
@@ -1086,6 +1087,8 @@ pub struct SessionRuntimeResponse {
     pub(crate) waiting_workspace: Option<WorkspacePollItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) waiting_ask_user: Option<crate::session::PersistedAskUserRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) open_questions: Vec<crate::session::PersistedAskUserRequest>,
 }
 
 impl Default for SessionRuntimeResponse {
@@ -1100,6 +1103,7 @@ impl Default for SessionRuntimeResponse {
             waiting_permission: None,
             waiting_workspace: None,
             waiting_ask_user: None,
+            open_questions: Vec::new(),
         }
     }
 }

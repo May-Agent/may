@@ -464,6 +464,10 @@ where
             );
         }
 
+        // Open questions are listed in the status bar and opened with
+        // `/questions`; they never take over the input on their own.
+        app.open_question_count = runtime_deps.open_questions(app).await?.len();
+
         runtime_deps
             .listen_for_agent_messages(app, &agent_listeners, events.sender())
             .await?;
@@ -871,17 +875,42 @@ where
                         request,
                         answers,
                     }) => {
-                        let session_id = app
-                            .session_manager
-                            .current()
-                            .map(|session| session.id.clone())
-                            .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-                        runtime_deps
-                            .resolve_ask_user_response(app, &session_id, &request_id, &answers)
-                            .await?;
-                        request.respond(answers).unwrap_or_else(|_| {
-                            panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
-                        });
+                        if let Some(request) = request {
+                            let session_id = app
+                                .session_manager
+                                .current()
+                                .map(|session| session.id.clone())
+                                .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+                            runtime_deps
+                                .resolve_ask_user_response(&session_id, &request_id, &answers)
+                                .await?;
+                            request.respond(answers).unwrap_or_else(|_| {
+                                panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
+                            });
+                        } else if !runtime_deps
+                            .answer_open_question(&request_id, &answers)
+                            .await?
+                        {
+                            app.chat.push_notice(
+                                "That question is no longer open; your answer was not sent",
+                            );
+                        }
+                    }
+                    Some(SendAction::OpenQuestions) => {
+                        let open = runtime_deps.open_questions(app).await?;
+                        if open.is_empty() {
+                            app.chat.push_notice("No open questions");
+                        } else {
+                            let index = app.question_cursor % open.len();
+                            app.question_cursor = index + 1;
+                            let request = open
+                                .into_iter()
+                                .nth(index)
+                                .expect("the index is within the open questions");
+                            app.mode = may_agent::tui::AppMode::AskUser(
+                                may_agent::tui::AskUserState::for_open_question(request),
+                            );
+                        }
                     }
                     Some(SendAction::StartCopilotAuth) => {
                         run_copilot_auth(app, events, terminal).await?;
@@ -1044,7 +1073,7 @@ where
                             .map(|session| session.id.clone())
                             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
                         runtime_deps
-                            .resolve_workspace_response(app, &session_id, &request_id, approved)
+                            .resolve_workspace_response(&session_id, &request_id, approved)
                             .await?;
                         request.respond(approved).unwrap_or_else(|_| {
                             panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
