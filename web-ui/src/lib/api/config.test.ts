@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
-import { setFullConfig, type UiFullConfig, type UiProviderConfig } from './config';
+import {
+  DEFAULT_CACHE_LIFETIME,
+  setFullConfig,
+  withCacheLifetime,
+  withCompactionModel,
+  type UiFullConfig,
+  type UiProviderConfig,
+} from './config';
 
 const originalFetch = globalThis.fetch;
 
@@ -16,6 +23,7 @@ function makeProvider(): UiProviderConfig {
     displayName: null,
     enabled: true,
     nativeTools: { webSearch: true, webFetch: false },
+    cacheLifetime: DEFAULT_CACHE_LIFETIME,
   };
 }
 
@@ -84,5 +92,39 @@ describe('setFullConfig', () => {
       webSearch: true,
       webFetch: false,
     });
+  });
+});
+
+describe('cache lifetime and compaction model saves', () => {
+  async function savedBody(full: UiFullConfig) {
+    let captured: unknown;
+    globalThis.fetch = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      captured = JSON.parse(init?.body as string);
+      return new Response('{}', { status: 200 });
+    }) as unknown as typeof fetch;
+    await setFullConfig(full);
+    return captured as {
+      providers: Array<{ cacheLifetime: string }>;
+      models: { compactionModel?: string | null };
+    };
+  }
+
+  test('posts the default, a duration and permanent unchanged', async () => {
+    const base = makeConfig();
+    expect((await savedBody(base)).providers[0].cacheLifetime).toBe('1h');
+    expect(
+      (await savedBody(withCacheLifetime(base, 'chatgpt', '90m'))).providers[0].cacheLifetime,
+    ).toBe('90m');
+    expect(
+      (await savedBody(withCacheLifetime(base, 'chatgpt', 'permanent'))).providers[0].cacheLifetime,
+    ).toBe('permanent');
+  });
+
+  test('posts the compaction model and clears it with null', async () => {
+    const base = makeConfig();
+    const set = await savedBody(withCompactionModel(base, 'chatgpt::gpt-5-mini'));
+    expect(set.models.compactionModel).toBe('chatgpt::gpt-5-mini');
+    const cleared = await savedBody(withCompactionModel(base, null));
+    expect(cleared.models.compactionModel).toBeNull();
   });
 });

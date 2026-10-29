@@ -4,7 +4,7 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { SectionHeader } from './SectionHeader';
 import { useTranslation } from '@/lib/i18n';
-import { getConfig } from '@/lib/api/config';
+import { getConfig, setFullConfig, withCompactionModel } from '@/lib/api/config';
 import { setLastModel } from '@/lib/api/profiles';
 import { useModelsStore } from '@/lib/stores/models';
 import { cn } from '@/lib/utils';
@@ -16,6 +16,7 @@ export function ModelsSection() {
   const modelsLoading = useModelsStore((s) => s.loading);
   const fetchedAt = useModelsStore((s) => s.fetchedAt);
   const [current, setCurrent] = useState<string | null>(null);
+  const [compaction, setCompaction] = useState<string | null>(null);
   const [currentLoaded, setCurrentLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -27,6 +28,7 @@ export function ModelsSection() {
       try {
         const cfg = await getConfig();
         setCurrent(cfg.fullConfig.lastModel ?? null);
+        setCompaction(cfg.fullConfig.models.compactionModel ?? null);
       } finally {
         setCurrentLoaded(true);
       }
@@ -40,6 +42,23 @@ export function ModelsSection() {
     try {
       await setLastModel(model);
       setCurrent(model);
+    } catch (err) {
+      toast.error(t('errors.generic'), {
+        description: err instanceof Error ? err.message : undefined,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Selecting the compaction model again returns compaction to the session model.
+  const toggleCompaction = async (model: string) => {
+    const next = model === compaction ? null : model;
+    setBusy(true);
+    try {
+      const cfg = await getConfig();
+      await setFullConfig(withCompactionModel(cfg.fullConfig, next));
+      setCompaction(next);
     } catch (err) {
       toast.error(t('errors.generic'), {
         description: err instanceof Error ? err.message : undefined,
@@ -67,6 +86,7 @@ export function ModelsSection() {
               <ul className="space-y-1">
                 {g.details.map((d) => {
                   const active = d.id === current;
+                  const forCompaction = d.id === compaction;
                   return (
                     <li
                       key={d.id}
@@ -85,17 +105,27 @@ export function ModelsSection() {
                           {d.contextWindow ? ` · ${d.contextWindow.toLocaleString()} ctx` : ''}
                         </div>
                       </div>
-                      {!active && (
+                      <div className="flex gap-1.5">
                         <Button
                           size="sm"
-                          variant="outline"
+                          variant={forCompaction ? 'default' : 'outline'}
                           disabled={busy}
-                          onClick={() => markDefault(d.id)}
+                          onClick={() => toggleCompaction(d.id)}
                         >
-                          <Star className="size-3.5" />
-                          {t('settings.models.setDefault')}
+                          {t('settings.models.useForCompaction')}
                         </Button>
-                      )}
+                        {!active && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={busy}
+                            onClick={() => markDefault(d.id)}
+                          >
+                            <Star className="size-3.5" />
+                            {t('settings.models.setDefault')}
+                          </Button>
+                        )}
+                      </div>
                     </li>
                   );
                 })}
