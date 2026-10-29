@@ -11,7 +11,7 @@ function makeProvider(): UiProviderConfig {
   return {
     id: 'chatgpt',
     providerType: 'chatgpt',
-    apiKey: null,
+    hasApiKey: false,
     baseUrl: null,
     displayName: null,
     enabled: true,

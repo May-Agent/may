@@ -29,6 +29,9 @@ export type ProviderApi = 'chat-completions' | 'responses';
 export interface UiProviderConfig {
   id: string;
   providerType: ProviderType;
+  /** Whether the server holds a key for this provider. Never carries key material. */
+  hasApiKey: boolean;
+  /** New key material entered by the user; sent only on save, absent on reads. */
   apiKey?: string | null;
   baseUrl?: string | null;
   displayName?: string | null;
