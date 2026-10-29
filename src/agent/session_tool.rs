@@ -16,7 +16,7 @@ use arrow_schema::{DataType, Field, Schema};
 use futures_lite::StreamExt;
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::Index;
-use lancedb::index::scalar::{BTreeIndexBuilder, FtsIndexBuilder};
+use lancedb::index::scalar::{BTreeIndexBuilder, InvertedIndexParams};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::{Table, connect};
 use regex::RegexBuilder;
@@ -1191,7 +1191,7 @@ async fn ensure_index(
 
         for column in ["content", "title", "preview"] {
             table
-                .create_index(&[column], Index::FTS(FtsIndexBuilder::default()))
+                .create_index(&[column], Index::FTS(InvertedIndexParams::default()))
                 .execute()
                 .await?;
         }
