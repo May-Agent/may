@@ -1,0 +1,8 @@
+Scheduled task {{ task_id }} was created under profile {{ profile_id }}. {% match trigger -%}
+{%- when TaskTriggerResponse::Time { trigger_type, run_at_utc, cron_utc } -%}
+It runs on a time trigger ({{ trigger_type.as_str() }}){% if let Some(run_at) = run_at_utc %} at {{ run_at }} UTC{% endif %}{% if let Some(cron) = cron_utc %} with cron expression {{ cron }} (UTC){% endif %}.
+{%- when TaskTriggerResponse::Event { event_name } -%}
+It runs when the event {{ event_name }} is emitted.
+{%- when TaskTriggerResponse::Webhook { token: _, webhook_path } -%}
+It runs when its webhook path {{ webhook_path }} is called.
+{%- endmatch %} The task is {% if approved %}approved{% else %}not approved{% endif %} and {% if enabled %}enabled{% else %}disabled{% endif %}.{% if !approved %} It does not run until the user approves it.{% endif %}

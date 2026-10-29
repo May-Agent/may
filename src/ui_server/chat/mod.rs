@@ -11,20 +11,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use askama::Template;
 use futures_lite::StreamExt;
-use serde::Serialize;
 use skyzen::Result as SkyResult;
 use skyzen::responder::Sse;
 use skyzen::utils::{Json, State};
 
 use aither_core::llm::{
-    Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
+    Attachment as LlmAttachment, CommandOutcome, CommandResult, CommandStream,
+    Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
 };
 use aither_models::lookup as lookup_model_info;
-use aither_sandbox::{
-    AnyContainerExec, BollardContainerExec, ContainerLaunchSpec, Content, OutputEntry,
-    TERMINAL_STDIN_BLOCKED_NOTICE, TerminalResult,
-};
+use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
 use crate::agent::MayAgent;
 use crate::ask_user;
@@ -44,9 +42,7 @@ use super::error_chain::error_chain_text;
 use super::helpers::{RETRY_BACKOFF_MS, elapsed_ms_saturating, send_event, truncate_preview};
 use super::model_resolution::resolve_default_model;
 use super::state::{UiServerState, UiToolQueues};
-use super::terminal_parsing::{
-    TerminalTaskStatus, parse_terminal_result_payload, update_terminal_snapshot_from_tool_event,
-};
+use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::title_generation;
 use super::types::{
     ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
@@ -57,16 +53,15 @@ use super::types::{
 };
 use crate::decode_meter::DecodeMeter;
 
-fn stopped_terminal_tool_result() -> ToolResult {
-    ToolResult::json(&TerminalResult {
-        stdout: OutputEntry::Empty,
+fn stopped_terminal_tool_result(call_id: &str) -> ToolResult {
+    ToolResult::Command(Box::new(CommandResult {
+        stdout: CommandStream::Inline(String::new()),
         stderr: None,
-        exit_code: 130,
-        task_id: None,
-        status: Some("stopped".to_string()),
-        notice: None,
-    })
-    .expect("stopped terminal tool result must serialize")
+        outcome: CommandOutcome::Killed {
+            task_id: call_id.to_string(),
+            notice: "The run was stopped before the command finished.".to_string(),
+        },
+    }))
 }
 
 fn persist_stopped_terminal_calls(
@@ -82,7 +77,7 @@ fn persist_stopped_terminal_calls(
         let record = ToolEventRecord::End {
             id: call_id.clone(),
             name: "terminal".to_string(),
-            result: stopped_terminal_tool_result(),
+            result: stopped_terminal_tool_result(&call_id),
         };
         let serialized = serde_json::to_string(&record)
             .map_err(|error| crate::db::ChatDbError::Storage(error.to_string()))?;
@@ -861,31 +856,6 @@ async fn clear_terminal_runtime_state(
         .map(|_| ())
 }
 
-fn output_contains_terminal_wait_notice(output: &OutputEntry) -> bool {
-    let content = match output {
-        OutputEntry::Inline { content } | OutputEntry::Loaded { content, .. } => Some(content),
-        OutputEntry::Stored { content, .. } => content.as_ref(),
-        OutputEntry::Empty => None,
-    };
-    content
-        .and_then(|content| match content {
-            Content::Text { text, .. } => Some(text.as_str()),
-            Content::Image { .. } => None,
-        })
-        .is_some_and(|text| text.starts_with(TERMINAL_STDIN_BLOCKED_NOTICE))
-}
-
-fn result_waits_for_terminal_input(result: &ToolResult) -> bool {
-    if result.is_error() {
-        return false;
-    }
-    let Some(parsed) = parse_terminal_result_payload(result) else {
-        return false;
-    };
-    parsed.status == Some(TerminalTaskStatus::Running)
-        && output_contains_terminal_wait_notice(&parsed.stdout)
-}
-
 pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
@@ -968,70 +938,48 @@ pub(super) async fn resume_pending_follow_up_runs(
     Ok(())
 }
 
-#[derive(Serialize, skyzen::ToSchema)]
-struct BrowserTakeoverAlertXml {
-    #[serde(rename = "@type")]
-    alert_type: String,
-    event: String,
-    instruction: String,
-}
-
-#[derive(Serialize, skyzen::ToSchema)]
-struct ResumeWaitingTurnXml<'a> {
-    #[serde(rename = "@type")]
-    alert_type: &'a str,
-    request_kind: ResumeRequestKind,
-    resolution: ResumeResolution,
-    instruction: &'a str,
-}
-
-#[derive(Clone, Copy, Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy)]
 pub(super) enum ResumeRequestKind {
     Permission,
     AskUser,
     Workspace,
 }
 
-#[derive(Clone, Copy, Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy)]
 pub(super) enum ResumeResolution {
     Approved,
     Denied,
     Answered,
 }
 
-fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> Result<String, ChatMarkupError> {
-    crate::xml::serialize_xml_block(tag, value).map_err(ChatMarkupError::Serialize)
+#[derive(Template)]
+#[template(path = "reminder_browser_takeover.txt", escape = "none")]
+struct BrowserTakeoverReminder;
+
+#[derive(Template)]
+#[template(path = "reminder_resume_waiting_turn.txt", escape = "none")]
+struct ResumeWaitingTurnReminder {
+    request_kind: ResumeRequestKind,
+    resolution: ResumeResolution,
 }
 
-fn browser_takeover_alert_xml() -> Result<String, ChatMarkupError> {
-    serialize_xml(
-        "system-reminder",
-        &BrowserTakeoverAlertXml {
-            alert_type: "browser_takeover".to_string(),
-            event: "browser_control_returned".to_string(),
-            instruction:
-                "User manually controlled the browser and just returned control. You must re-check current page state before continuing automation."
-                    .to_string(),
-        },
-    )
+fn browser_takeover_alert() -> String {
+    BrowserTakeoverReminder
+        .render()
+        .expect("browser takeover reminder must render")
 }
 
-fn resume_waiting_turn_xml(
+fn resume_waiting_turn_reminder(
     request_kind: ResumeRequestKind,
     resolution: ResumeResolution,
 ) -> Result<crate::XmlBlock, ChatMarkupError> {
-    let xml = serialize_xml(
-        "system-reminder",
-        &ResumeWaitingTurnXml {
-            alert_type: "resume_waiting_turn",
-            request_kind,
-            resolution,
-            instruction: "The previous run was interrupted while waiting for this response. Reassess the latest state, use the recorded response, and continue from the most sensible next action.",
-        },
-    )?;
-    crate::XmlBlock::parse(xml).map_err(ChatMarkupError::Parse)
+    let text = ResumeWaitingTurnReminder {
+        request_kind,
+        resolution,
+    }
+    .render()
+    .expect("resume waiting turn reminder must render");
+    crate::XmlBlock::parse(text).map_err(ChatMarkupError::Parse)
 }
 
 pub(super) async fn schedule_waiting_turn_resume(
@@ -1043,7 +991,7 @@ pub(super) async fn schedule_waiting_turn_resume(
     let pending = PendingUserMessage {
         content: String::new(),
         attachments: Vec::new(),
-        hidden_context_xml: Some(resume_waiting_turn_xml(request_kind, resolution)?),
+        hidden_context_xml: Some(resume_waiting_turn_reminder(request_kind, resolution)?),
         created_at: jiff::Timestamp::now().to_string(),
         delivery_mode: crate::session::PendingUserMessageMode::Steer,
     };
@@ -1645,14 +1593,6 @@ fn run_agent_loop<'a>(
                                 "tool_end",
                             );
                             saw_tool_activity = true;
-                            if name == "terminal" && result_waits_for_terminal_input(&result) {
-                                set_session_runtime_state(
-                                    state,
-                                    session_id.as_str(),
-                                    SessionRuntimeState::WaitingTerminalInput,
-                                )
-                                .await?;
-                            }
                             let record = ToolEventRecord::End {
                                 id: id.clone(),
                                 name: name.clone(),
@@ -2197,8 +2137,6 @@ enum UiChatPreparationError {
     LoadContextSnapshot(#[source] crate::db::ChatDbError),
     #[error("failed to replay session history: {0}")]
     HistoryReplay(#[source] crate::session::HistoryReplayError),
-    #[error("failed to serialize browser takeover alert: {0}")]
-    BuildTakeoverAlert(#[source] ChatMarkupError),
     #[error("failed to build session mentions: {0}")]
     BuildSessionMentions(#[source] crate::prompt_mentions::PromptMentionError),
     #[error("{0}")]
@@ -2262,7 +2200,6 @@ impl UiChatPreparationError {
             | Self::LoadProfileMemories(_)
             | Self::LoadRuntime(_)
             | Self::LoadContextSnapshot(_)
-            | Self::BuildTakeoverAlert(_)
             | Self::BuildSessionMentions(_)
             | Self::BuildFileMentions(_)
             | Self::UpdateSessionTitle(_)
@@ -2281,8 +2218,6 @@ impl UiChatPreparationError {
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ChatMarkupError {
-    #[error("failed to serialize XML fragment: {0}")]
-    Serialize(#[source] quick_xml::SeError),
     #[error("failed to parse XML fragment: {0}")]
     Parse(#[source] crate::XmlBlockError),
 }
@@ -2425,7 +2360,7 @@ async fn resolve_session_context(
             &session_id,
             &history,
             &mut hidden_context_parts,
-            browser_takeover_alert_xml().map_err(UiChatPreparationError::BuildTakeoverAlert)?,
+            browser_takeover_alert(),
             persist_user_message,
         )
         .await
@@ -2450,10 +2385,9 @@ async fn resolve_session_context(
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
 
-    if let Some(session_mentions_xml) =
-        prompt_mentions::build_session_mentions_xml(&db, &req.content)
-            .await
-            .map_err(UiChatPreparationError::BuildSessionMentions)?
+    if let Some(session_mentions_xml) = prompt_mentions::build_session_mentions(&db, &req.content)
+        .await
+        .map_err(UiChatPreparationError::BuildSessionMentions)?
     {
         push_hidden_context_part(
             &db,
@@ -2470,14 +2404,16 @@ async fn resolve_session_context(
     let session_paths =
         session_paths_for_session(state, session.profile_id.as_deref(), &session_id);
     if let Some(file_mentions_xml) =
-        prompt_mentions::build_file_mentions_xml(&session_paths.files_dir(), &req.content, 400)
+        prompt_mentions::build_file_mentions(&session_paths.files_dir(), &req.content, 400)
             .await
             .map_err(|error| match error {
                 prompt_mentions::PromptMentionError::AbsolutePath
                 | prompt_mentions::PromptMentionError::ParentTraversal => {
                     UiChatPreparationError::InvalidFileMentionPath(error)
                 }
-                _ => UiChatPreparationError::BuildFileMentions(error),
+                prompt_mentions::PromptMentionError::SessionLookup(_) => {
+                    UiChatPreparationError::BuildFileMentions(error)
+                }
             })?
     {
         push_hidden_context_part(
@@ -2996,6 +2932,49 @@ mod tests {
     use skyzen::{HttpError, StatusCode};
     use std::collections::HashMap;
 
+    use super::{ResumeRequestKind, ResumeResolution};
+
+    #[test]
+    fn browser_takeover_alert_tells_the_model_to_recheck_the_page() {
+        assert_eq!(
+            super::browser_takeover_alert(),
+            "<system-reminder>\nThe user manually controlled the browser and just returned control. Re-check the current page state before continuing automation.\n</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn resume_reminder_states_what_was_awaited_and_how_it_resolved() {
+        let reminder = super::resume_waiting_turn_reminder(
+            ResumeRequestKind::Permission,
+            ResumeResolution::Denied,
+        )
+        .expect("reminder text is not empty");
+        assert_eq!(
+            reminder.as_ref(),
+            "<system-reminder>\nThe previous run was interrupted while waiting for a permission decision. The user denied it. Reassess the latest state, use the recorded response, and continue from the most sensible next action.\n</system-reminder>"
+        );
+        let reminder = super::resume_waiting_turn_reminder(
+            ResumeRequestKind::AskUser,
+            ResumeResolution::Answered,
+        )
+        .expect("reminder text is not empty");
+        assert!(
+            reminder
+                .as_ref()
+                .contains("waiting for an answer to an ask_user question. The user answered it."),
+            "{reminder}"
+        );
+    }
+
+    #[test]
+    fn stopped_terminal_call_is_a_killed_command_with_a_notice() {
+        let result = super::stopped_terminal_tool_result("call-1");
+        assert_eq!(
+            result.render_for_model(),
+            "(no output)\nThe run was stopped before the command finished.\nTask ID: 'call-1'.\n"
+        );
+    }
+
     #[test]
     fn run_claim_storage_failure_is_an_internal_error_not_a_conflict() {
         let refusal = super::registration_or_refusal::<()>(Err(crate::db::ChatDbError::Storage(
@@ -3061,14 +3040,15 @@ mod tests {
                         phase: aither_agent::ContextWindowPhase::Stable,
                         metrics: aither_agent::ContextWindowMetrics {
                             usage_fraction: 0.0,
-                            selected_model_context_window: None,
-                            fast_model_context_window: None,
-                            effective_context_window: 0,
+                            context_window: 0,
+                            estimated_tokens: 0,
+                            chars_per_token: 4.0,
                             system_block_count: 0,
-                            reminder_count: 0,
                             recent_message_count: 0,
                             recent_system_message_count: 0,
                             has_handoff: false,
+                            has_staged_system_updates: false,
+                            prompt_cache_epoch: 0,
                         },
                         messages: Vec::new(),
                     },

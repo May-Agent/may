@@ -1,30 +1,12 @@
 //! Native terminal-command tool event parsing for streaming UI updates.
 
-use aither_core::llm::ToolResult;
-use aither_sandbox::{OutputEntry, TerminalArgs, TerminalExecutionMode};
-use serde::Deserialize;
+use aither_core::llm::{CommandOutcome, ToolResult};
+use aither_sandbox::{TerminalArgs, TerminalExecutionMode};
 
 use super::types::{
     ApiTerminalExecution, TERMINAL_TOOL_NAME, TerminalCommandMode, TerminalExecutionStatus,
     TerminalStateSnapshot, ToolEventRecord,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum TerminalTaskStatus {
-    Running,
-    Stopped,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub(super) struct ParsedTerminalToolResult {
-    #[schema(value_type = serde_json::Value)]
-    pub(super) stdout: OutputEntry,
-    pub(super) exit_code: i32,
-    #[serde(default)]
-    pub(super) status: Option<TerminalTaskStatus>,
-}
 
 const fn parse_terminal_mode(mode: TerminalExecutionMode) -> TerminalCommandMode {
     match mode {
@@ -55,36 +37,21 @@ pub(super) fn parse_terminal_start(
     }
 }
 
-pub(super) fn parse_terminal_result_payload(
-    result: &ToolResult,
-) -> Option<ParsedTerminalToolResult> {
-    let ToolResult::Json { value } = result else {
-        return None;
-    };
-    // Deserialize from `&Value` directly — `serde_json::from_value` would
-    // deep-clone the whole tree (including full stdout) first.
-    ParsedTerminalToolResult::deserialize(value).ok()
+/// Text recorded as a terminal execution's output.
+fn terminal_end_output(result: &ToolResult) -> String {
+    result.render_for_model()
 }
 
-/// Preserve terminal tool output as structured JSON when possible.
-fn parse_terminal_end_output_from_result(result: &ToolResult) -> Option<String> {
-    if let ToolResult::Json { value } = result {
-        return Some(value.to_string());
-    }
-    result.render_for_model().ok()
-}
-
-fn parse_terminal_status_from_result(result: &ToolResult) -> TerminalExecutionStatus {
+fn terminal_status_from_result(result: &ToolResult) -> TerminalExecutionStatus {
     if result.is_error() {
         return TerminalExecutionStatus::Failed;
     }
-    match parse_terminal_result_payload(result) {
-        Some(parsed) => match parsed.status {
-            Some(TerminalTaskStatus::Stopped) => TerminalExecutionStatus::Stopped,
-            _ if parsed.exit_code != 0 => TerminalExecutionStatus::Failed,
-            _ => TerminalExecutionStatus::Done,
-        },
-        None => TerminalExecutionStatus::Done,
+    match result.command().map(|command| &command.outcome) {
+        Some(CommandOutcome::Killed { .. }) => TerminalExecutionStatus::Stopped,
+        Some(CommandOutcome::Exited { code }) if *code != 0 => TerminalExecutionStatus::Failed,
+        Some(CommandOutcome::Exited { .. } | CommandOutcome::Running { .. }) | None => {
+            TerminalExecutionStatus::Done
+        }
     }
 }
 
@@ -123,11 +90,49 @@ pub(super) fn update_terminal_snapshot_from_tool_event(
                 panic!("terminal tool end received without matching start: call_id={id}")
             });
 
-            let output = parse_terminal_end_output_from_result(result);
-            exec.output = output;
-            exec.status = parse_terminal_status_from_result(result);
+            exec.output = Some(terminal_end_output(result));
+            exec.status = terminal_status_from_result(result);
 
             snapshot.executions.push(exec);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aither_core::llm::{CommandOutcome, CommandResult, CommandStream, ToolResult};
+
+    use super::terminal_status_from_result;
+    use crate::ui_server::types::TerminalExecutionStatus;
+
+    fn command(outcome: CommandOutcome) -> ToolResult {
+        ToolResult::Command(Box::new(CommandResult {
+            stdout: CommandStream::Inline(String::new()),
+            stderr: None,
+            outcome,
+        }))
+    }
+
+    #[test]
+    fn terminal_status_follows_the_command_outcome() {
+        assert_eq!(
+            terminal_status_from_result(&command(CommandOutcome::Exited { code: 0 })),
+            TerminalExecutionStatus::Done
+        );
+        assert_eq!(
+            terminal_status_from_result(&command(CommandOutcome::Exited { code: 2 })),
+            TerminalExecutionStatus::Failed
+        );
+        assert_eq!(
+            terminal_status_from_result(&command(CommandOutcome::Killed {
+                task_id: "t".to_string(),
+                notice: "stopped".to_string(),
+            })),
+            TerminalExecutionStatus::Stopped
+        );
+        assert_eq!(
+            terminal_status_from_result(&ToolResult::error("boom")),
+            TerminalExecutionStatus::Failed
+        );
     }
 }

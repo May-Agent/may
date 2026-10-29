@@ -78,7 +78,7 @@ temporary slide workspace before viewing it:
 
 ```bash
 url=$(cat artifacts/temp/slide_N.url)
-browser read "$url" --detail brief --screenshot viewport --format json > artifacts/temp/slide_N.browser.json
+browser read "$url" --detail brief --screenshot viewport > artifacts/temp/slide_N.browser.json
 image=$(jq -er '.page.screenshot.artifactPath' artifacts/temp/slide_N.browser.json)
 mv "$image" artifacts/temp/slide_N-001.png
 cat artifacts/temp/slide_N-001.png
