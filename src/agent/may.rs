@@ -5,7 +5,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_agent::{
-    Agent, AgentError, AgentKind, CompactResult, HCons, TerminalAgentBuilder, TimedEvent,
+    Agent, AgentError, AgentKind, CompactResult, HCons, Prepared, TerminalAgentBuilder, TimedEvent,
+    Unprepared,
 };
 use aither_cloud::CloudProvider;
 use aither_core::llm::{
@@ -249,6 +250,14 @@ type MayAgentInner = Agent<
     HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>,
 >;
 
+type MayBuilder<S = Unprepared> = TerminalAgentBuilder<
+    RequestParameterizedModel<CloudProvider>,
+    TerminalPermissionHandler,
+    DefaultExecutor,
+    HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>,
+    S,
+>;
+
 /// The May agent.
 pub struct MayAgent {
     inner: MayAgentInner,
@@ -378,7 +387,8 @@ impl MayAgent {
         runtime_system_context =
             runtime_system_context.with_terminal_runtime(terminal_runtime.clone());
 
-        let llm = RequestParameterizedModel::new(config.llm, config.request_parameters.clone());
+        let llm =
+            RequestParameterizedModel::new(config.llm.clone(), config.request_parameters.clone());
 
         // Clone LLM for terminal IPC commands before moving it into the builder.
         let terminal_command_llm = llm.clone();
@@ -398,7 +408,7 @@ impl MayAgent {
         )?;
         let ssh_authorizer_broker = config.ask_user_broker.clone();
         let imagine_config = ImagineCommandConfig {
-            generator: config.image_generator,
+            generator: config.image_generator.clone(),
             artifacts_dir: session_paths.artifacts_dir(),
         };
         let agent_messaging = config
@@ -452,7 +462,7 @@ impl MayAgent {
                 may_dir: config.may_dir.clone(),
                 sandbox_dir: config.sandbox_dir.clone(),
                 search_embedder: config.search_embedder.clone(),
-                ask_user_broker: Some(config.ask_user_broker),
+                ask_user_broker: Some(config.ask_user_broker.clone()),
                 imagine: Some(imagine_config),
                 task_runtime: match &config.environment {
                     AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
@@ -475,12 +485,13 @@ impl MayAgent {
         for (name, description) in &shared_terminal_commands.descriptions {
             builder = builder.tool_description(name.clone(), description.clone());
         }
+        builder = builder.fork_source(shared_terminal_commands.fork_source.clone());
         if is_container {
-            builder = builder.with_skills_readable_only(&skills_dir).await?;
-            builder = builder.with_subagents_readable_only(&subagents_dir).await?;
+            builder = Box::pin(builder.with_skills_readable_only(&skills_dir)).await?;
+            builder = Box::pin(builder.with_subagents_readable_only(&subagents_dir)).await?;
         } else {
-            builder = builder.with_skills(&skills_dir).await?;
-            builder = builder.with_subagents(&subagents_dir).await?;
+            builder = Box::pin(builder.with_skills(&skills_dir)).await?;
+            builder = Box::pin(builder.with_subagents(&subagents_dir)).await?;
         }
         // The builder's descriptions cover every shared command registered
         // above; the native tool surface comes from the same builder.
@@ -510,99 +521,13 @@ impl MayAgent {
             .system_text(tag::TERMINAL_RUNTIME_CONTEXT, terminal_runtime)
             .max_iterations(effective_max_iterations);
 
-        if let Some(voice_hint) = build_native_voice_context(config.native_voice_input) {
-            runtime_system_context =
-                runtime_system_context.with_native_voice_input(voice_hint.clone());
-            builder = builder.system_text(tag::NATIVE_VOICE_INPUT, voice_hint);
-        }
-
-        if let Some(persona_content) = config.profile_persona.clone() {
-            runtime_system_context =
-                runtime_system_context.with_profile_persona(persona_content.clone());
-            builder = builder.system_text(tag::PROFILE_PERSONA, persona_content);
-        }
-
-        if let Some(ref memories) = config.profile_memories
-            && !memories.is_empty()
-        {
-            let profile_memories = memories.to_context_string();
-            runtime_system_context =
-                runtime_system_context.with_profile_memories(profile_memories.clone());
-            builder = builder.system_text(tag::PROFILE_MEMORIES, profile_memories);
-        }
-
-        if let Some(plan_mode) = build_plan_mode_context(config.plan_state) {
-            runtime_system_context = runtime_system_context.with_plan_mode(plan_mode.clone());
-            builder = builder.system_text(tag::PLAN_MODE, plan_mode);
-        }
-
-        if let Some(network_restrictions) =
-            build_network_restrictions_context(config.network_policy.as_ref())
-        {
-            runtime_system_context =
-                runtime_system_context.with_network_restrictions(network_restrictions.clone());
-            builder = builder.system_text(tag::NETWORK_RESTRICTIONS, network_restrictions);
-        }
-
-        if let Some(ref location) = config.location {
-            let location_context = build_location_context(location);
-            runtime_system_context = runtime_system_context.with_location(location_context.clone());
-            builder = builder.system_text(tag::LOCATION_CONTEXT, location_context);
-        }
-
-        let browser_enabled = config.browser_broker.is_some()
-            || matches!(
-                config.environment,
-                AgentEnvironment::Container {
-                    browser_cdp_endpoint: Some(_),
-                    ..
-                }
-            );
-        let mut browser_cdp_endpoint = None;
-
-        // Environment-specific configuration
-        match config.environment {
-            AgentEnvironment::Container {
-                container_id,
-                container_ipc_route,
-                container_exec,
-                browser_cdp_endpoint: cdp_endpoint,
-            } => {
-                let container_context = build_container_environment_context(session_paths.root());
-                runtime_system_context =
-                    runtime_system_context.with_container_environment(container_context.clone());
-                builder =
-                    builder.system_text(tag::CONTAINER_ENVIRONMENT_CONTEXT, container_context);
-                builder = builder.container_runtime(
-                    ContainerShellRuntime::new(container_id, container_ipc_route, container_exec)
-                        .with_workspace_mount(crate::container::lifecycle::workspace_mount(
-                            &config.sandbox_dir,
-                        )),
-                );
-                browser_cdp_endpoint = cdp_endpoint;
-            }
-            AgentEnvironment::Local => {
-                let workspace_context = build_workspace_context(&workspace);
-                runtime_system_context =
-                    runtime_system_context.with_workspace(workspace_context.clone());
-                builder = builder.system_text(tag::WORKSPACE, workspace_context);
-                if let Some(workdirs_context) = build_workspace_workdirs_context(&workspace) {
-                    runtime_system_context =
-                        runtime_system_context.with_workspace_workdirs(workdirs_context.clone());
-                    builder = builder.system_text(tag::WORKSPACE_WORKDIRS, workdirs_context);
-                }
-                if let Some(macos_hint) = build_macos_host_automation_context() {
-                    runtime_system_context =
-                        runtime_system_context.with_platform(macos_hint.clone());
-                    builder = builder.system_text(tag::PLATFORM, macos_hint);
-                }
-            }
-        }
-
-        let browser_context =
-            build_browser_context(browser_enabled, browser_cdp_endpoint.as_deref());
-        runtime_system_context = runtime_system_context.with_browser(browser_context.clone());
-        builder = builder.system_text(tag::BROWSER, browser_context);
+        let (builder, runtime_system_context) = apply_runtime_context(
+            builder,
+            runtime_system_context,
+            &config,
+            &session_paths,
+            &workspace,
+        );
 
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
@@ -610,43 +535,7 @@ impl MayAgent {
             stage = "tool_preparation",
             "preparing session tool environments"
         );
-        let preparation_started = std::time::Instant::now();
-        let (builder, outcome) = match config
-            .tool_environments
-            .acquire(&config.session_id, tool_environment_key)
-            .await?
-        {
-            Acquired::Ready(registry) => (
-                // An equal key describes this registry, so a rejection here
-                // is a key derivation bug and is reported, never re-prepared.
-                builder.prepared_shell_sessions(*registry).await?,
-                "adopted",
-            ),
-            Acquired::Prepare(lease) => {
-                let builder = builder
-                    .initialize_tools(
-                        &config.tool_distribution,
-                        &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
-                    )
-                    .await
-                    .inspect_err(|error| {
-                        tracing::error!(
-                            stage = "tool_preparation",
-                            %error,
-                            "tool environment preparation failed"
-                        );
-                    })?;
-                lease.complete(builder.shell_sessions().clone());
-                (builder, "prepared")
-            }
-        };
-        tracing::debug!(
-            stage = "tool_preparation",
-            session_id = %config.session_id,
-            outcome,
-            elapsed_ms = preparation_started.elapsed().as_millis(),
-            "session tool environments ready"
-        );
+        let builder = Box::pin(prepare_tools(builder, &config, tool_environment_key)).await?;
         let agent = builder.build();
 
         Ok(Self {
@@ -1106,6 +995,160 @@ pub async fn test_agent(
         },
         temp,
     )
+}
+
+/// Applies the runtime context blocks to the builder and mirrors each into
+/// `runtime_system_context`.
+fn apply_runtime_context(
+    mut builder: MayBuilder,
+    mut runtime_system_context: RuntimeSystemContext,
+    config: &MayAgentConfig,
+    session_paths: &SessionPaths,
+    workspace: &MayWorkspace,
+) -> (MayBuilder, RuntimeSystemContext) {
+    if let Some(voice_hint) = build_native_voice_context(config.native_voice_input) {
+        runtime_system_context = runtime_system_context.with_native_voice_input(voice_hint.clone());
+        builder = builder.system_text(tag::NATIVE_VOICE_INPUT, voice_hint);
+    }
+
+    if let Some(persona_content) = config.profile_persona.clone() {
+        runtime_system_context =
+            runtime_system_context.with_profile_persona(persona_content.clone());
+        builder = builder.system_text(tag::PROFILE_PERSONA, persona_content);
+    }
+
+    if let Some(ref memories) = config.profile_memories
+        && !memories.is_empty()
+    {
+        let profile_memories = memories.to_context_string();
+        runtime_system_context =
+            runtime_system_context.with_profile_memories(profile_memories.clone());
+        builder = builder.system_text(tag::PROFILE_MEMORIES, profile_memories);
+    }
+
+    if let Some(plan_mode) = build_plan_mode_context(config.plan_state) {
+        runtime_system_context = runtime_system_context.with_plan_mode(plan_mode.clone());
+        builder = builder.system_text(tag::PLAN_MODE, plan_mode);
+    }
+
+    if let Some(network_restrictions) =
+        build_network_restrictions_context(config.network_policy.as_ref())
+    {
+        runtime_system_context =
+            runtime_system_context.with_network_restrictions(network_restrictions.clone());
+        builder = builder.system_text(tag::NETWORK_RESTRICTIONS, network_restrictions);
+    }
+
+    if let Some(ref location) = config.location {
+        let location_context = build_location_context(location);
+        runtime_system_context = runtime_system_context.with_location(location_context.clone());
+        builder = builder.system_text(tag::LOCATION_CONTEXT, location_context);
+    }
+
+    let browser_enabled = config.browser_broker.is_some()
+        || matches!(
+            config.environment,
+            AgentEnvironment::Container {
+                browser_cdp_endpoint: Some(_),
+                ..
+            }
+        );
+    let mut browser_cdp_endpoint = None;
+
+    // Environment-specific configuration
+    match &config.environment {
+        AgentEnvironment::Container {
+            container_id,
+            container_ipc_route,
+            container_exec,
+            browser_cdp_endpoint: cdp_endpoint,
+        } => {
+            let (container_id, container_ipc_route, container_exec, cdp_endpoint) = (
+                container_id.clone(),
+                container_ipc_route.clone(),
+                container_exec.clone(),
+                cdp_endpoint.clone(),
+            );
+            let container_context = build_container_environment_context(session_paths.root());
+            runtime_system_context =
+                runtime_system_context.with_container_environment(container_context.clone());
+            builder = builder.system_text(tag::CONTAINER_ENVIRONMENT_CONTEXT, container_context);
+            builder = builder.container_runtime(
+                ContainerShellRuntime::new(container_id, container_ipc_route, container_exec)
+                    .with_workspace_mount(crate::container::lifecycle::workspace_mount(
+                        &config.sandbox_dir,
+                    )),
+            );
+            browser_cdp_endpoint = cdp_endpoint;
+        }
+        AgentEnvironment::Local => {
+            let workspace_context = build_workspace_context(workspace);
+            runtime_system_context =
+                runtime_system_context.with_workspace(workspace_context.clone());
+            builder = builder.system_text(tag::WORKSPACE, workspace_context);
+            if let Some(workdirs_context) = build_workspace_workdirs_context(workspace) {
+                runtime_system_context =
+                    runtime_system_context.with_workspace_workdirs(workdirs_context.clone());
+                builder = builder.system_text(tag::WORKSPACE_WORKDIRS, workdirs_context);
+            }
+            if let Some(macos_hint) = build_macos_host_automation_context() {
+                runtime_system_context = runtime_system_context.with_platform(macos_hint.clone());
+                builder = builder.system_text(tag::PLATFORM, macos_hint);
+            }
+        }
+    }
+
+    let browser_context = build_browser_context(browser_enabled, browser_cdp_endpoint.as_deref());
+    runtime_system_context = runtime_system_context.with_browser(browser_context.clone());
+    builder = builder.system_text(tag::BROWSER, browser_context);
+    (builder, runtime_system_context)
+}
+
+/// Prepares the session's tool environments, adopting a cached registry when
+/// one matches `tool_environment_key`.
+async fn prepare_tools(
+    builder: MayBuilder,
+    config: &MayAgentConfig,
+    tool_environment_key: ToolEnvironmentKey,
+) -> Result<MayBuilder<Prepared>, MayAgentError> {
+    let preparation_started = std::time::Instant::now();
+    let (builder, outcome) = match config
+        .tool_environments
+        .acquire(&config.session_id, tool_environment_key)
+        .await?
+    {
+        Acquired::Ready(registry) => (
+            // An equal key describes this registry, so a rejection here
+            // is a key derivation bug and is reported, never re-prepared.
+            builder.prepared_shell_sessions(*registry).await?,
+            "adopted",
+        ),
+        Acquired::Prepare(lease) => {
+            let builder = builder
+                .initialize_tools(
+                    &config.tool_distribution,
+                    &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
+                )
+                .await
+                .inspect_err(|error| {
+                    tracing::error!(
+                        stage = "tool_preparation",
+                        %error,
+                        "tool environment preparation failed"
+                    );
+                })?;
+            lease.complete(builder.shell_sessions().clone());
+            (builder, "prepared")
+        }
+    };
+    tracing::debug!(
+        stage = "tool_preparation",
+        session_id = %config.session_id,
+        outcome,
+        elapsed_ms = preparation_started.elapsed().as_millis(),
+        "session tool environments ready"
+    );
+    Ok(builder)
 }
 
 #[cfg(test)]

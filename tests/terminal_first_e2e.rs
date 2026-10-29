@@ -69,6 +69,9 @@ enum MockChatScenario {
     /// The main agent launches a real subagent from a terminal command and a
     /// scripted child runs one probe; see [`SubagentProbe`].
     SubagentProbe(SubagentProbe),
+    /// The main agent prints a secret, then forks itself with
+    /// `subagent start fork`; the fork answers with [`FORK_ANSWER`].
+    ForkProbe,
 }
 
 /// A scripted main agent / subagent pair sharing one mock model.
@@ -87,6 +90,14 @@ struct SubagentProbe {
 }
 
 const SUBAGENT_PROBE_MARKER: &str = "SUBAGENT-PROBE-TASK";
+/// What only the main agent's context holds in the fork probe: printed by a
+/// command, assembled by the shell so the script itself never spells it.
+const FORK_SECRET: &str = "FORK-CONTEXT-SECRET-7431";
+const FORK_SECRET_SCRIPT: &str = "printf '%s-%s' FORK-CONTEXT-SECRET 7431";
+/// Opens the fork's prompt file; the last message of a fork's first request.
+const FORK_TASK_MARKER: &str = "FORK-PROBE-TASK";
+/// What the fork replies with, and the main agent reads back from `sub.out`.
+const FORK_ANSWER: &str = "FORK-ANSWER-OK";
 /// Requests the probe scenario may serve before the harness fails it, so a
 /// launch that never finishes ends the test with a message instead of hanging.
 const SUBAGENT_PROBE_MAX_REQUESTS: usize = 40;
@@ -197,12 +208,17 @@ impl MockScenarioState {
         if let MockChatScenario::SubagentProbe(probe) = self.scenario.clone() {
             return self.next_probe_response(&probe, request);
         }
+        if matches!(self.scenario, MockChatScenario::ForkProbe) {
+            return self.next_fork_response(request);
+        }
         verify_native_tool_surface(request)?;
         if self.request_index == 0 {
             verify_initial_tool_contract(request)?;
         }
         let response = match &self.scenario {
-            MockChatScenario::SubagentProbe(_) => unreachable!("handled before the match"),
+            MockChatScenario::SubagentProbe(_) | MockChatScenario::ForkProbe => {
+                unreachable!("handled before the match")
+            }
             MockChatScenario::TextEveryTurn(text) => {
                 // Every rebuilt agent must still present the prepared tools,
                 // whether it prepared them or adopted them.
@@ -433,6 +449,62 @@ impl MockScenarioState {
                 Some(output) if output.contains("MAIN_FINAL") => text("probe complete".to_string()),
                 Some(output) if output.contains("POLL_DONE") => {
                     terminal_call("terminal", &id, probe.final_script)
+                }
+                Some(_) => terminal_call("terminal", &id, SUBAGENT_POLL_SCRIPT),
+            }
+        };
+        self.request_index += 1;
+        Ok(response)
+    }
+
+    fn next_fork_response(&mut self, request: &Value) -> Result<MockHttpResponse, String> {
+        if self.request_index >= SUBAGENT_PROBE_MAX_REQUESTS {
+            return Err(format!(
+                "fork probe still running after {} requests: the launch never finished",
+                self.request_index
+            ));
+        }
+        let terminal_call = |name: &str, id: &str, script: &str| {
+            MockHttpResponse::sse(vec![
+                delayed_sse_frame(
+                    tool_call_chunk(
+                        id,
+                        name,
+                        &serde_json::json!({
+                            "description": "Run the fork probe",
+                            "script": script,
+                            "mode": "sandboxed",
+                            "raw": true,
+                            "timeout": 120,
+                            "max_lines": 200
+                        }),
+                    ),
+                    Duration::from_millis(10),
+                ),
+                done_frame(Duration::from_millis(10)),
+            ])
+        };
+        let text = |text: &str| {
+            MockHttpResponse::sse(text_stream_frames(
+                vec![text.to_string()],
+                Duration::from_millis(10),
+            ))
+        };
+        let id = format!("call-fork-{}", self.request_index);
+        let response = if is_fork_request(request) {
+            text(FORK_ANSWER)
+        } else {
+            match latest_tool_output(request) {
+                None => terminal_call("terminal", &id, FORK_SECRET_SCRIPT),
+                Some(output) if output.contains("MAIN_FINAL") => text("fork probe complete"),
+                Some(output) if output.contains("POLL_DONE") => {
+                    terminal_call("terminal", &id, "echo MAIN_FINAL")
+                }
+                Some(output) if output.contains(FORK_SECRET) => {
+                    let launch = format!(
+                        "( printf '{FORK_TASK_MARKER}: report what you know.\\n' > prompt.md\nsubagent start fork prompt.md ) > sub.out 2>&1; touch sub.done"
+                    );
+                    terminal_call("terminal_background", &id, &launch)
                 }
                 Some(_) => terminal_call("terminal", &id, SUBAGENT_POLL_SCRIPT),
             }
@@ -2054,7 +2126,15 @@ impl ProbeFiles {
 /// Runs one chat turn of `probe` on the host path and returns the session
 /// root's files, read before the session is released, with the mock.
 async fn run_subagent_probe(probe: SubagentProbe) -> (ProbeFiles, MockOpenAiServer) {
-    let mock = MockOpenAiServer::spawn(MockChatScenario::SubagentProbe(probe)).await;
+    run_probe_turn(MockChatScenario::SubagentProbe(probe), PROBE_USER_TURN).await
+}
+
+/// Runs one chat turn of `scenario` with `content` as the user message.
+async fn run_probe_turn(
+    scenario: MockChatScenario,
+    content: &str,
+) -> (ProbeFiles, MockOpenAiServer) {
+    let mock = MockOpenAiServer::spawn(scenario).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
@@ -2069,7 +2149,7 @@ async fn run_subagent_probe(probe: SubagentProbe) -> (ProbeFiles, MockOpenAiServ
         .post(format!("{}/api/chat/stream", server.base_url))
         .json(&serde_json::json!({
             "sessionId": session_id,
-            "content": PROBE_USER_TURN
+            "content": content
         }))
         .send()
         .await
@@ -2125,6 +2205,105 @@ fn child_exit_code(outputs: &[String]) -> i32 {
                 .ok()
         })
         .unwrap_or_else(|| panic!("the subagent's command printed no CHILD_RC: {outputs:?}"))
+}
+
+/// Whether a model request is a fork's first: the main agent's context
+/// followed by the fork prompt as the last, user, message.
+fn is_fork_request(request: &Value) -> bool {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.last())
+        .is_some_and(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains(FORK_TASK_MARKER))
+        })
+}
+
+/// A user turn long enough to put the main agent's context between the
+/// refusal point (90% of the 60% compaction point) and the compaction point.
+fn near_compaction_user_turn() -> String {
+    format!(
+        "Run the fork probe. {}",
+        "lorem ipsum ".repeat(FORK_FILLER_REPEATS)
+    )
+}
+
+const FORK_FILLER_REPEATS: usize = 24_000;
+
+#[tokio::test]
+#[serial]
+async fn a_fork_continues_the_main_agents_context() {
+    let (files, mock) = run_probe_turn(MockChatScenario::ForkProbe, "Run the fork probe.").await;
+
+    let requests = mock.agent_requests().await;
+    let forks: Vec<&Value> = requests.iter().filter(|r| is_fork_request(r)).collect();
+    assert_eq!(
+        forks.len(),
+        1,
+        "exactly one fork request expected: {requests:?}"
+    );
+    let fork = forks[0];
+    let messages = fork["messages"].as_array().expect("fork request messages");
+    let saw_secret = messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("tool")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains(FORK_SECRET))
+    });
+    assert!(
+        saw_secret,
+        "the fork's first request must carry the command output only the main agent saw: {messages:?}"
+    );
+    let launch = requests
+        .iter()
+        .rev()
+        .find(|r| {
+            !is_fork_request(r) && latest_tool_output(r).is_some_and(|o| o.contains(FORK_SECRET))
+        })
+        .expect("the main agent's request that launched the fork");
+    let launch_messages = launch["messages"].as_array().expect("launch messages");
+    assert_eq!(
+        &messages[..launch_messages.len()],
+        launch_messages.as_slice(),
+        "the fork must start from the main agent's last request"
+    );
+    assert!(
+        files.get("sub.out").contains(FORK_ANSWER),
+        "the fork's answer must come back as the command's output: {}",
+        files.get("sub.out")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_fork_near_the_compaction_point_returns_the_compact_first_error() {
+    let (files, mock) =
+        run_probe_turn(MockChatScenario::ForkProbe, &near_compaction_user_turn()).await;
+
+    let requests = mock.agent_requests().await;
+    assert!(
+        !requests.iter().any(is_fork_request),
+        "no fork request may be sent when the fork is refused"
+    );
+    let result = files.get("sub.out");
+    assert!(
+        result.contains("Forking is refused") && result.contains("Run `compact` first"),
+        "the compact-first refusal must be the command's error: {result}"
+    );
+    let main_saw_refusal = requests.iter().any(|request| {
+        latest_tool_output(request).is_some_and(|output| {
+            output.contains("POLL_DONE") && output.contains("Run `compact` first")
+        })
+    });
+    assert!(
+        main_saw_refusal,
+        "the main agent's request must carry the refusal as the command's output"
+    );
 }
 
 const WORKTREE_SETUP: &str = "git init -q -b main repo && git -C repo -c user.name=m -c user.email=m@e commit -q --allow-empty -m init && git -C repo worktree add -q -b subagent/s1/work \"$PWD/wt\" && git -C repo rev-parse subagent/s1/work > tip.before";
