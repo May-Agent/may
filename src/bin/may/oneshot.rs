@@ -9,12 +9,12 @@
 
 use std::io::{self, Write};
 
-use aither_agent::AgentEvent;
+use aither_agent::{AgentEvent, TimedEvent};
 use jiff::Timestamp;
 
 use may_agent::agent::{AgentWorker, TuiEvent};
 use may_agent::ask_user;
-use may_agent::tui::runtime::{LocalSessionRuntime, RuntimeDeps, TitleGenContext};
+use may_agent::tui::runtime::{AssistantReply, LocalSessionRuntime, RuntimeDeps, TitleGenContext};
 use may_agent::tui::{App, PendingMessage};
 use may_agent::workspace_request;
 
@@ -122,7 +122,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("oneshot worker was not initialized"))?;
 
     let mut pending_title_gen: Option<TitleGenContext> = None;
-    let mut assistant_response = String::new();
+    let mut assistant_response = AssistantReply::default();
     let mut active_tool_calls = std::collections::HashSet::<String>::new();
     runtime_deps.mark_running(&app).await?;
     let prompt = build_oneshot_prompt_with_mentions(&app, &args.prompt).await?;
@@ -162,7 +162,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 async { handle.recv().await.map(Event::Agent) },
             ),
         );
-        let next = if assistant_response.is_empty() || !active_tool_calls.is_empty() {
+        let next = if assistant_response.text().is_empty() || !active_tool_calls.is_empty() {
             event_future.await
         } else if let Ok(event) =
             tokio::time::timeout(ONESHOT_IDLE_FINISH_TIMEOUT, event_future).await
@@ -180,7 +180,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     &assistant_response,
                 )
                 .await;
-            if !assistant_response.ends_with('\n') {
+            if !assistant_response.text().ends_with('\n') {
                 stdout.write_all(b"\n")?;
                 stdout.flush()?;
             }
@@ -209,14 +209,26 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 request.respond(approved).map_err(anyhow::Error::from)?;
             }
             Event::Agent(TuiEvent::Agent(result)) => {
-                if let Ok(AgentEvent::ToolCallStart { id, .. }) = &result {
+                if let Ok(TimedEvent {
+                    event: AgentEvent::ToolCallStart { id, .. },
+                    ..
+                }) = &result
+                {
                     active_tool_calls.insert(id.clone());
                 }
-                if let Ok(AgentEvent::ToolCallEnd { id, .. }) = &result {
+                if let Ok(TimedEvent {
+                    event: AgentEvent::ToolCallEnd { id, .. },
+                    ..
+                }) = &result
+                {
                     active_tool_calls.remove(id);
                 }
-                if let Ok(AgentEvent::Text(ref text)) = result {
-                    assistant_response.push_str(text);
+                if let Ok(TimedEvent {
+                    at,
+                    event: AgentEvent::Text(ref text),
+                }) = result
+                {
+                    assistant_response.push(text, at);
                     stdout.write_all(text.as_bytes())?;
                     stdout.flush()?;
                 }
@@ -235,7 +247,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     if run_failed {
                         anyhow::bail!("oneshot agent run failed");
                     }
-                    if !assistant_response.ends_with('\n') {
+                    if !assistant_response.text().ends_with('\n') {
                         stdout.write_all(b"\n")?;
                         stdout.flush()?;
                     }
@@ -251,7 +263,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         &assistant_response,
                     )
                     .await;
-                if !assistant_response.ends_with('\n') {
+                if !assistant_response.text().ends_with('\n') {
                     stdout.write_all(b"\n")?;
                     stdout.flush()?;
                 }
@@ -469,15 +481,22 @@ fn parse_oneshot_selection(
 
 fn render_oneshot_event(
     stderr: &mut impl Write,
-    result: &Result<AgentEvent, aither_agent::AgentError>,
+    result: &Result<TimedEvent, aither_agent::AgentError>,
 ) -> anyhow::Result<()> {
+    // Every line opens with the UTC time the agent emitted the event. A run
+    // error is not an event and carries no emission time, so it is stamped on
+    // receipt.
+    let at = result
+        .as_ref()
+        .map_or_else(|_| Timestamp::now(), |timed| timed.at);
+    let result = result.as_ref().map(|timed| &timed.event);
     match result {
         Ok(AgentEvent::RunStart { .. }) => {
-            writeln!(stderr, "Running...")?;
+            writeln!(stderr, "{at} Running...")?;
         }
         Ok(AgentEvent::Reasoning(text)) => {
             if !text.trim().is_empty() {
-                writeln!(stderr, "Thinking: {text}")?;
+                writeln!(stderr, "{at} Thinking: {text}")?;
             }
         }
         // UI progress — oneshot mode ignores deltas.
@@ -490,17 +509,17 @@ fn render_oneshot_event(
             | AgentEvent::Text(_),
         ) => {}
         Ok(AgentEvent::ToolCallStart { name, .. }) => {
-            writeln!(stderr, "Tool: {name}")?;
+            writeln!(stderr, "{at} Tool: {name}")?;
         }
         Ok(AgentEvent::BuiltInToolCall { tool, .. }) => {
-            writeln!(stderr, "Tool: {tool}")?;
+            writeln!(stderr, "{at} Tool: {tool}")?;
         }
         Ok(AgentEvent::ToolCallEnd { name, result, .. }) => {
             if result.is_error() {
                 let error = result.error_message().unwrap_or("tool failed");
-                writeln!(stderr, "Tool failed: {name}: {error}")?;
+                writeln!(stderr, "{at} Tool failed: {name}: {error}")?;
             } else {
-                writeln!(stderr, "Tool finished: {name}")?;
+                writeln!(stderr, "{at} Tool finished: {name}")?;
             }
         }
         Ok(AgentEvent::BackgroundTaskStarted {
@@ -510,30 +529,30 @@ fn render_oneshot_event(
         }) => {
             writeln!(
                 stderr,
-                "Background task started: {task_id} (output: {output_file})"
+                "{at} Background task started: {task_id} (output: {output_file})"
             )?;
         }
         Ok(AgentEvent::BackgroundTaskCompleted { task_id, .. }) => {
-            writeln!(stderr, "Background task completed: {task_id}")?;
+            writeln!(stderr, "{at} Background task completed: {task_id}")?;
         }
         Ok(AgentEvent::RunPaused { reason, .. }) => {
-            writeln!(stderr, "Paused: {reason:?}")?;
+            writeln!(stderr, "{at} Paused: {reason:?}")?;
         }
         Ok(AgentEvent::RunResumed { reason, .. }) => {
-            writeln!(stderr, "Resumed: {reason:?}")?;
+            writeln!(stderr, "{at} Resumed: {reason:?}")?;
         }
         Ok(AgentEvent::SkillActivated { name, .. }) => {
-            writeln!(stderr, "Skill activated: {name}")?;
+            writeln!(stderr, "{at} Skill activated: {name}")?;
         }
         Ok(AgentEvent::Usage(usage)) => {
             writeln!(
                 stderr,
-                "Usage: prompt={:?} completion={:?} total={:?}",
+                "{at} Usage: prompt={:?} completion={:?} total={:?}",
                 usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
             )?;
         }
         Ok(AgentEvent::Error(error)) | Err(error) => {
-            writeln!(stderr, "Error: {error}")?;
+            writeln!(stderr, "{at} Error: {error}")?;
         }
     }
     stderr.flush()?;
@@ -542,7 +561,42 @@ fn render_oneshot_event(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_oneshot_selection;
+    use aither_agent::{AgentEvent, TimedEvent};
+    use jiff::Timestamp;
+
+    use super::{parse_oneshot_selection, render_oneshot_event};
+
+    fn render(event: &Result<TimedEvent, aither_agent::AgentError>) -> String {
+        let mut out = Vec::new();
+        render_oneshot_event(&mut out, event).expect("render must succeed");
+        String::from_utf8(out).expect("event lines are utf-8")
+    }
+
+    #[test]
+    fn event_lines_carry_the_emission_time_as_rfc3339_utc() {
+        let at: Timestamp = "2024-03-01T10:00:01.250Z".parse().expect("valid time");
+        let line = render(&Ok(TimedEvent {
+            at,
+            event: AgentEvent::run_start("run", 1),
+        }));
+        let (stamp, rest) = line.split_once(' ').expect("line has a timestamp prefix");
+        assert_eq!(stamp, "2024-03-01T10:00:01.25Z");
+        assert!(stamp.ends_with('Z'));
+        assert_eq!(stamp.parse::<Timestamp>().expect("valid RFC 3339"), at);
+        assert_eq!(rest, "Running...\n");
+    }
+
+    #[test]
+    fn a_run_error_is_stamped_between_markers_taken_around_its_receipt() {
+        let before = Timestamp::now();
+        let line = render(&Err(aither_agent::AgentError::Llm("boom".to_string())));
+        let after = Timestamp::now();
+        let (stamp, rest) = line.split_once(' ').expect("line has a timestamp prefix");
+        let at = stamp.parse::<Timestamp>().expect("valid RFC 3339");
+        assert!(stamp.ends_with('Z'));
+        assert!(before <= at && at <= after);
+        assert!(rest.starts_with("Error:"));
+    }
 
     #[test]
     fn parse_oneshot_selection_accepts_single_choice() {
