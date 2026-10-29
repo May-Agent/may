@@ -25,6 +25,8 @@ pub struct Model {
     pub script_inline: Option<String>,
     /// Whether this task requires network access (heel-only flag).
     pub needs_network: bool,
+    /// Maximum runtime of one run in seconds; the run is killed when it passes.
+    pub timeout_secs: i64,
     /// Whether the task has been approved for execution.
     pub approved: bool,
     /// Whether the task is enabled.

@@ -34,6 +34,7 @@ pub(super) struct ScheduledTaskResponse {
     pub script_path: Option<String>,
     pub script_inline: Option<String>,
     pub needs_network: bool,
+    pub timeout_secs: i64,
     pub approved: bool,
     pub enabled: bool,
     pub last_run_at: Option<String>,
@@ -58,6 +59,7 @@ impl ScheduledTaskResponse {
             script_path: m.script_path,
             script_inline: m.script_inline,
             needs_network: m.needs_network,
+            timeout_secs: m.timeout_secs,
             approved: m.approved,
             enabled: m.enabled,
             last_run_at: m.last_run_at,
@@ -90,6 +92,8 @@ pub(super) struct CreateTaskRequest {
     pub script_inline: Option<String>,
     #[serde(default)]
     pub needs_network: bool,
+    /// Maximum runtime of one run in seconds.
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -107,6 +111,8 @@ pub(super) struct UpdateTaskRequest {
     pub script_path: Option<String>,
     #[serde(default)]
     pub script_inline: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +300,7 @@ async fn run_create_task(
             &req.profile_id,
             normalized_script_path,
             normalized_script_inline,
+            req.timeout_secs,
         )
         .await
         .map_err(bad_request_error)?;
@@ -312,6 +319,7 @@ async fn run_create_task(
             script_path: normalized_script_path,
             script_inline: normalized_script_inline,
             needs_network: req.needs_network,
+            timeout_secs: req.timeout_secs,
         })
         .await
         .map_err(internal_error)?;
@@ -403,6 +411,10 @@ async fn run_update_task(
             &current.profile_id,
             next_script_path.as_deref(),
             next_script_inline.as_deref(),
+            req.timeout_secs.unwrap_or_else(|| {
+                u64::try_from(current.timeout_secs)
+                    .expect("stored task timeout is a validated positive number")
+            }),
         )
         .await
         .map_err(bad_request_error)?;
@@ -441,6 +453,7 @@ async fn run_update_task(
             run_at: normalized_run_at_update,
             script_path: normalized_script_path_update.map(Some),
             script_inline: normalized_script_inline_update.map(Some),
+            timeout_secs: req.timeout_secs,
         },
     )
     .await

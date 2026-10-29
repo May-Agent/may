@@ -19,9 +19,11 @@ impl ChatDb {
         let trigger_kind = params.trigger.kind().as_str();
         let trigger_type = params.trigger.storage_trigger_type();
         let now = jiff::Timestamp::now().to_string();
+        let timeout_secs = i64::try_from(params.timeout_secs)
+            .expect("task timeout is validated against the background cap before it is stored");
         query!(
             self.db,
-            "INSERT INTO scheduled_tasks (id, profile_id, session_id, name, trigger_kind, trigger_type, cron_expression, run_at, script_path, script_inline, needs_network, approved, enabled, last_run_at, last_run_status, last_run_output, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO scheduled_tasks (id, profile_id, session_id, name, trigger_kind, trigger_type, cron_expression, run_at, script_path, script_inline, needs_network, timeout_secs, approved, enabled, last_run_at, last_run_status, last_run_output, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params.id,
             params.profile_id,
             params.session_id,
@@ -33,6 +35,7 @@ impl ChatDb {
             params.script_path,
             params.script_inline,
             params.needs_network,
+            timeout_secs,
             false,
             true,
             Option::<String>::None,
@@ -55,6 +58,7 @@ impl ChatDb {
             script_path: params.script_path.map(ToOwned::to_owned),
             script_inline: params.script_inline.map(ToOwned::to_owned),
             needs_network: params.needs_network,
+            timeout_secs,
             approved: false,
             enabled: true,
             last_run_at: None,
@@ -125,9 +129,14 @@ impl ChatDb {
         let run_at_enabled = params.run_at.is_some();
         let script_path_enabled = params.script_path.is_some();
         let script_inline_enabled = params.script_inline.is_some();
+        let timeout_enabled = params.timeout_secs.is_some();
+        let timeout_secs = params.timeout_secs.map(|secs| {
+            i64::try_from(secs)
+                .expect("task timeout is validated against the background cap before it is stored")
+        });
         query!(
             self.db,
-            "UPDATE scheduled_tasks SET updated_at = ?, name = CASE WHEN ? THEN ? ELSE name END, enabled = CASE WHEN ? THEN ? ELSE enabled END, approved = CASE WHEN ? THEN ? ELSE approved END, cron_expression = CASE WHEN ? THEN ? ELSE cron_expression END, run_at = CASE WHEN ? THEN ? ELSE run_at END, script_path = CASE WHEN ? THEN ? ELSE script_path END, script_inline = CASE WHEN ? THEN ? ELSE script_inline END WHERE id = ?",
+            "UPDATE scheduled_tasks SET updated_at = ?, name = CASE WHEN ? THEN ? ELSE name END, enabled = CASE WHEN ? THEN ? ELSE enabled END, approved = CASE WHEN ? THEN ? ELSE approved END, cron_expression = CASE WHEN ? THEN ? ELSE cron_expression END, run_at = CASE WHEN ? THEN ? ELSE run_at END, script_path = CASE WHEN ? THEN ? ELSE script_path END, script_inline = CASE WHEN ? THEN ? ELSE script_inline END, timeout_secs = CASE WHEN ? THEN ? ELSE timeout_secs END WHERE id = ?",
             now,
             name_enabled,
             params.name,
@@ -143,6 +152,8 @@ impl ChatDb {
             params.script_path.flatten(),
             script_inline_enabled,
             params.script_inline.flatten(),
+            timeout_enabled,
+            timeout_secs.unwrap_or(0),
             id
         )
         .execute()
