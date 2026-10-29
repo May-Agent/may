@@ -12,9 +12,9 @@ use std::sync::Arc;
 use aither_core::llm::Tool;
 use aither_sandbox::{
     AnyContainerExec, BollardContainerExec, Configured, ContainerLaunchSpec, ContainerShellRuntime,
-    OutputFormat, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, TerminalArgs,
-    TerminalExecutionMode, TerminalMode, TerminalResult, TerminalTool, ToolRegistryBuilder,
-    permission::PermissionError,
+    JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry,
+    TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode, TerminalMode, TerminalResult,
+    TerminalTool, ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -474,6 +474,7 @@ impl TaskRuntime {
         profile_id: &str,
         script_path: Option<&str>,
         script_inline: Option<&str>,
+        timeout_secs: u32,
     ) -> Result<(), String> {
         let profile = self
             .db
@@ -481,8 +482,13 @@ impl TaskRuntime {
             .await
             .map_err(|error| profile_load_error(profile_id, &error))?
             .ok_or_else(|| profile_not_found_error(profile_id))?;
-        Box::pin(self.validate_task_script_for_profile_model(&profile, script_path, script_inline))
-            .await
+        Box::pin(self.validate_task_script_for_profile_model(
+            &profile,
+            script_path,
+            script_inline,
+            timeout_secs,
+        ))
+        .await
     }
 
     /// Create a scheduled task requested by the in-chat `task` tool.
@@ -536,6 +542,7 @@ impl TaskRuntime {
             &profile,
             normalized.script.script_path.as_deref(),
             normalized.script.script_inline.as_deref(),
+            normalized.timeout_secs,
         ))
         .await?;
 
@@ -554,6 +561,7 @@ impl TaskRuntime {
                 script_path: normalized.script.script_path.as_deref(),
                 script_inline: normalized.script.script_inline.as_deref(),
                 needs_network: normalized.needs_network,
+                timeout_secs: normalized.timeout_secs,
             })
             .await
             .map_err(|error| prefixed_error("failed to create scheduled task: ", &error))?;
@@ -799,7 +807,9 @@ impl TaskRuntime {
         profile: &profiles::Model,
         script_path: Option<&str>,
         script_inline: Option<&str>,
+        timeout_secs: u32,
     ) -> Result<(), String> {
+        let timeout = TaskTimeout::new(timeout_secs)?;
         let profile_info = self
             .db
             .profile_info_from_model(profile.clone())
@@ -810,9 +820,9 @@ impl TaskRuntime {
             .await?;
 
         match profile_info.environment.kind() {
-            ProfileEnvironment::Local => self.validate_local(&profile.id, &script).await,
+            ProfileEnvironment::Local => self.validate_local(&profile.id, &script, timeout).await,
             ProfileEnvironment::Container { .. } => {
-                Box::pin(self.validate_container(profile, &script)).await
+                Box::pin(self.validate_container(profile, &script, timeout)).await
             }
         }
     }
@@ -1087,6 +1097,7 @@ impl TaskRuntime {
         script: &TaskScript,
         command: String,
     ) -> Result<String, String> {
+        let timeout = TaskTimeout::from_stored(task.timeout_secs)?;
         let terminal_tool = self
             .local_terminal_tool(
                 &task.profile_id,
@@ -1100,11 +1111,17 @@ impl TaskRuntime {
             local_task_execution_mode(task.needs_network),
             None,
             command,
+            timeout,
         )
         .await
     }
 
-    async fn validate_local(&self, profile_id: &str, script: &TaskScript) -> Result<(), String> {
+    async fn validate_local(
+        &self,
+        profile_id: &str,
+        script: &TaskScript,
+        timeout: TaskTimeout,
+    ) -> Result<(), String> {
         let terminal_tool = self
             .local_terminal_tool(
                 profile_id,
@@ -1119,6 +1136,7 @@ impl TaskRuntime {
             local_task_execution_mode(false),
             None,
             build_validation_command(script),
+            timeout,
         )
         .await
         .map(|_| ())
@@ -1319,10 +1337,11 @@ impl TaskRuntime {
 
     async fn execute_container(
         &self,
-        _task: &scheduled_tasks::Model,
+        task: &scheduled_tasks::Model,
         profile: &profiles::Model,
         command: String,
     ) -> Result<String, String> {
+        let timeout = TaskTimeout::from_stored(task.timeout_secs)?;
         let (terminal_tool, container_manager, container_id) =
             Box::pin(self.container_terminal_tool(profile, NetworkAccessSource::TaskContainer))
                 .await?;
@@ -1331,6 +1350,7 @@ impl TaskRuntime {
             TerminalExecutionMode::Default,
             None,
             command,
+            timeout,
         )
         .await;
         container_manager.touch_activity(&container_id);
@@ -1351,6 +1371,7 @@ impl TaskRuntime {
         &self,
         profile: &profiles::Model,
         script: &TaskScript,
+        timeout: TaskTimeout,
     ) -> Result<(), String> {
         let (terminal_tool, container_manager, container_id) = Box::pin(
             self.container_terminal_tool(profile, NetworkAccessSource::TaskValidationContainer),
@@ -1361,6 +1382,7 @@ impl TaskRuntime {
             TerminalExecutionMode::Default,
             None,
             build_validation_command(script),
+            timeout,
         )
         .await
         .map(|_| ());
@@ -1399,46 +1421,108 @@ impl TaskScheduler {
     }
 }
 
+/// Maximum runtime of one scheduled run, validated against the largest
+/// timeout a background terminal job accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskTimeout(std::time::Duration);
+
+impl TaskTimeout {
+    fn new(secs: u32) -> Result<Self, String> {
+        let cap = aither_sandbox::DEFAULT_BACKGROUND_TIMEOUT_CAP;
+        let timeout = std::time::Duration::from_secs(u64::from(secs));
+        if secs == 0 || timeout > cap {
+            return Err(format!(
+                "task timeout_secs must be between 1 and {} seconds, got {secs}",
+                cap.as_secs()
+            ));
+        }
+        Ok(Self(timeout))
+    }
+
+    fn from_stored(secs: i64) -> Result<Self, String> {
+        let secs = u32::try_from(secs)
+            .map_err(|_| format!("stored task timeout_secs is out of range: {secs}"))?;
+        Self::new(secs)
+    }
+
+    const fn as_secs(self) -> u64 {
+        self.0.as_secs()
+    }
+}
+
+/// Runs `script` as a background terminal job bounded by `timeout` and waits
+/// for its final result; the foreground limit does not apply to it.
 async fn run_terminal_command(
     terminal_tool: &TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
     mode: TerminalExecutionMode,
     ssh_server_id: Option<String>,
     script: String,
+    timeout: TaskTimeout,
 ) -> Result<String, String> {
-    let output = terminal_tool
+    let started = terminal_tool
+        .background_tool()
         .call(
-            TerminalArgs {
-                description: "run the scheduled task script".to_string(),
-                script,
-                mode,
-                ssh_server_id,
-                expect: OutputFormat::Text,
-                resolution: aither_sandbox::MediaResolution::Auto,
-                max_lines: 800,
-                raw: false,
+            TerminalBackgroundArgs {
+                terminal: TerminalArgs {
+                    description: "run the scheduled task script".to_string(),
+                    script,
+                    mode,
+                    ssh_server_id,
+                    expect: OutputFormat::Text,
+                    resolution: aither_sandbox::MediaResolution::Auto,
+                    max_lines: 800,
+                    raw: false,
+                },
+                timeout: timeout.as_secs(),
             },
             aither_core::llm::ToolContext::new(),
         )
         .await
         .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
-
-    if output.is_error() {
-        return Err(output
+    if started.is_error() {
+        return Err(started
             .error_message()
             .unwrap_or("task terminal execution failed")
             .to_string());
     }
-    let payload = output
+    let payload = started
         .render_for_model()
         .map_err(|error| prefixed_error("failed to render terminal tool result: ", &error))?;
+    let started: TerminalResult = serde_json::from_str(&payload)
+        .map_err(|error| prefixed_error("failed to parse terminal result: ", &error))?;
+    let task_id = started
+        .task_id
+        .ok_or_else(|| "background terminal job started without a task id".to_string())?;
 
-    parse_terminal_result(&payload)
+    let receiver = terminal_tool.background_receiver();
+    let completed = loop {
+        let Some(completed) = receiver.recv().await else {
+            return Err("background terminal channel closed before the task finished".to_string());
+        };
+        if completed.task_id == task_id {
+            break completed;
+        }
+    };
+
+    let killed = terminal_tool
+        .job_registry()
+        .get_by_task_id(&task_id)
+        .await
+        .is_some_and(|job| job.status == JobStatus::Killed);
+    if killed {
+        return Err(format!(
+            "task timed out after {} seconds and was killed",
+            timeout.as_secs()
+        ));
+    }
+    let result = completed
+        .result
+        .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
+
+    parse_terminal_result(&result)
 }
 
-fn parse_terminal_result(payload: &str) -> Result<String, String> {
-    let result: TerminalResult = serde_json::from_str(payload)
-        .map_err(|error| prefixed_error("failed to parse terminal result: ", &error))?;
-
+fn parse_terminal_result(result: &TerminalResult) -> Result<String, String> {
     if result.exit_code != 0 {
         return Err(task_script_failure(
             result.exit_code,
@@ -1497,8 +1581,12 @@ fn timestamp_to_chrono(ts: jiff::Timestamp) -> chrono::DateTime<chrono::Utc> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{TaskRuntime, TaskScript, local_task_execution_mode};
-    use aither_sandbox::TerminalExecutionMode;
+    use super::{
+        SchedulerPermissionHandler, TaskRuntime, TaskScript, TaskTimeout,
+        local_task_execution_mode, run_terminal_command,
+    };
+    use aither_sandbox::{Configured, TerminalExecutionMode, TerminalTool};
+    use executor_core::DefaultExecutor;
     use tempfile::tempdir;
 
     use crate::db::{ChatDb, CreateScheduledTaskParams, NetworkAccessSource};
@@ -1552,6 +1640,7 @@ mod tests {
                 script_path: None,
                 script_inline: Some("echo hi"),
                 needs_network: false,
+                timeout_secs: 60,
             })
             .await
             .expect("task should persist");
@@ -1616,5 +1705,89 @@ mod tests {
             error.starts_with("failed to prepare baseline tools: "),
             "unexpected error: {error}"
         );
+    }
+
+    /// Builds a real local terminal over a temp workspace, prepared the same
+    /// way scheduled runs prepare theirs.
+    async fn scheduler_test_terminal(
+        dir: &std::path::Path,
+    ) -> TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured> {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let may_dir = dir.join(".may");
+        std::fs::create_dir_all(&may_dir).expect("may dir should be created");
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        let db = ChatDb::open(&dir.join("history.db"))
+            .await
+            .expect("db should initialize");
+        let runtime = TaskRuntime::load(
+            db,
+            may_dir,
+            Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+        )
+        .await
+        .expect("task runtime should load");
+        runtime
+            .local_terminal_tool(
+                "profile",
+                NetworkAccessSource::TaskLocal,
+                &TaskScript {
+                    content: String::new(),
+                    host_working_dir: workspace,
+                },
+                false,
+            )
+            .await
+            .expect("terminal should initialize")
+    }
+
+    #[tokio::test]
+    async fn task_runs_past_the_foreground_limit() {
+        let dir = tempdir().expect("temp dir should be created");
+        let terminal = scheduler_test_terminal(dir.path()).await;
+        let runtime_secs = u32::try_from(aither_sandbox::DEFAULT_FOREGROUND_LIMIT.as_secs())
+            .expect("the foreground limit fits in u32 seconds")
+            + 2;
+
+        let output = run_terminal_command(
+            &terminal,
+            TerminalExecutionMode::Sandboxed,
+            None,
+            format!("sleep {runtime_secs}; echo finished"),
+            TaskTimeout::new(runtime_secs + 60).expect("timeout is within the cap"),
+        )
+        .await
+        .expect("a task longer than the foreground limit should complete");
+
+        assert!(output.contains("finished"), "unexpected output: {output}");
+    }
+
+    #[tokio::test]
+    async fn task_past_its_own_timeout_fails_with_timeout_error() {
+        let dir = tempdir().expect("temp dir should be created");
+        let terminal = scheduler_test_terminal(dir.path()).await;
+
+        let error = run_terminal_command(
+            &terminal,
+            TerminalExecutionMode::Sandboxed,
+            None,
+            "sleep 60; echo finished".to_string(),
+            TaskTimeout::new(2).expect("timeout is within the cap"),
+        )
+        .await
+        .expect_err("a task past its timeout must fail");
+
+        assert_eq!(error, "task timed out after 2 seconds and was killed");
+    }
+
+    #[test]
+    fn task_timeout_is_bounded_by_the_background_cap() {
+        assert!(TaskTimeout::new(0).is_err());
+        assert!(TaskTimeout::new(1).is_ok());
+        let cap = u32::try_from(aither_sandbox::DEFAULT_BACKGROUND_TIMEOUT_CAP.as_secs())
+            .expect("the background cap fits in u32 seconds");
+        assert!(TaskTimeout::new(cap).is_ok());
+        assert!(TaskTimeout::new(cap + 1).is_err());
+        assert!(TaskTimeout::from_stored(-1).is_err());
     }
 }
