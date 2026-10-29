@@ -297,13 +297,21 @@ impl MockScenarioState {
                 }
             },
             MockChatScenario::WritesTasksFile => {
-                // The run loop keeps the model going while the injected
-                // `<tasks_document>` block has unchecked items, so the mock
-                // finishes the checklist whenever it sees one and replies
-                // with plain text once everything is checked.
+                // The run loop keeps the model going while `tasks.md` has
+                // unchecked items, and the model side sees the file once per
+                // change (whole at session start, a diff afterwards), so the
+                // mock finishes the checklist whenever the newest injection
+                // adds an unchecked item and replies with plain text once
+                // everything is checked.
+                if self.request_index >= TASKS_SCENARIO_MAX_REQUESTS {
+                    return Err(format!(
+                        "tasks scenario still looping after {} requests: the run loop keeps objecting to tasks.md",
+                        self.request_index
+                    ));
+                }
                 let script = match tasks_injection(request) {
                     None if self.request_index == 0 => Some(TASKS_PARTIAL_SCRIPT),
-                    Some(tasks) if tasks.contains("- [ ]") => Some(TASKS_DONE_SCRIPT),
+                    Some(tasks) if injection_adds_unchecked_item(tasks) => Some(TASKS_DONE_SCRIPT),
                     _ => None,
                 };
                 match script {
@@ -339,6 +347,42 @@ impl MockScenarioState {
 
 const TASKS_PARTIAL_SCRIPT: &str = "printf -- '- [x] write report\\n- [ ] ship it\\n' > tasks.md";
 const TASKS_DONE_SCRIPT: &str = "printf -- '- [x] write report\\n- [x] ship it\\n' > tasks.md";
+
+/// Requests the tasks scenario may serve before the harness fails it, so a
+/// run loop that never settles ends the test with a message instead of hanging.
+const TASKS_SCENARIO_MAX_REQUESTS: usize = 8;
+
+/// Whether a `<tasks_document>` injection leaves an unchecked item open: the
+/// whole document at session start, or a diff whose added (`+ `) lines carry
+/// one. Removed lines of a diff say nothing about the current file.
+fn injection_adds_unchecked_item(injection: &str) -> bool {
+    injection.lines().any(|line| {
+        line.starts_with("- [ ]")
+            || line
+                .strip_prefix("+ ")
+                .is_some_and(|added| added.starts_with("- [ ]"))
+    })
+}
+
+/// How long a chat turn in the tasks test may take before the test fails.
+const TASKS_TURN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Collects a turn's events, failing with the turn and the server log when it
+/// does not finish within [`TASKS_TURN_TIMEOUT`].
+async fn collect_turn_events(
+    response: reqwest::Response,
+    turn: &str,
+    log: &ServerLog,
+) -> Vec<(String, Value)> {
+    let collected = tokio::time::timeout(TASKS_TURN_TIMEOUT, collect_sse_events(response)).await;
+    let Ok(events) = collected else {
+        panic!(
+            "{turn} produced no done event within {TASKS_TURN_TIMEOUT:?}; server logs:\n{}",
+            log.contents().await
+        );
+    };
+    events
+}
 
 /// The `<tasks_document>` system message the run loop injects from `tasks.md`.
 fn tasks_injection(request: &Value) -> Option<&str> {
@@ -1783,7 +1827,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         .await
         .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    let events = collect_sse_events(response).await;
+    let events = collect_turn_events(response, "the first tasks turn", &server.log).await;
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
         "chat stream should complete; events: {events:?}; server logs:\n{}",
@@ -1859,7 +1903,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         .await
         .expect("second chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    let events = collect_sse_events(response).await;
+    let events = collect_turn_events(response, "the follow-up tasks turn", &server.log).await;
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
         "second chat stream should complete; events: {events:?}; server logs:\n{}",
