@@ -474,7 +474,7 @@ impl TaskRuntime {
         profile_id: &str,
         script_path: Option<&str>,
         script_inline: Option<&str>,
-        timeout_secs: u64,
+        timeout_secs: u32,
     ) -> Result<(), String> {
         let profile = self
             .db
@@ -807,7 +807,7 @@ impl TaskRuntime {
         profile: &profiles::Model,
         script_path: Option<&str>,
         script_inline: Option<&str>,
-        timeout_secs: u64,
+        timeout_secs: u32,
     ) -> Result<(), String> {
         let timeout = TaskTimeout::new(timeout_secs)?;
         let profile_info = self
@@ -1427,9 +1427,9 @@ impl TaskScheduler {
 struct TaskTimeout(std::time::Duration);
 
 impl TaskTimeout {
-    fn new(secs: u64) -> Result<Self, String> {
+    fn new(secs: u32) -> Result<Self, String> {
         let cap = aither_sandbox::DEFAULT_BACKGROUND_TIMEOUT_CAP;
-        let timeout = std::time::Duration::from_secs(secs);
+        let timeout = std::time::Duration::from_secs(u64::from(secs));
         if secs == 0 || timeout > cap {
             return Err(format!(
                 "task timeout_secs must be between 1 and {} seconds, got {secs}",
@@ -1440,8 +1440,8 @@ impl TaskTimeout {
     }
 
     fn from_stored(secs: i64) -> Result<Self, String> {
-        let secs = u64::try_from(secs)
-            .map_err(|_| format!("stored task timeout_secs is negative: {secs}"))?;
+        let secs = u32::try_from(secs)
+            .map_err(|_| format!("stored task timeout_secs is out of range: {secs}"))?;
         Self::new(secs)
     }
 
@@ -1519,10 +1519,10 @@ async fn run_terminal_command(
         .result
         .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
 
-    parse_terminal_result(result)
+    parse_terminal_result(&result)
 }
 
-fn parse_terminal_result(result: TerminalResult) -> Result<String, String> {
+fn parse_terminal_result(result: &TerminalResult) -> Result<String, String> {
     if result.exit_code != 0 {
         return Err(task_script_failure(
             result.exit_code,
@@ -1782,10 +1782,10 @@ mod tests {
     fn task_timeout_is_bounded_by_the_background_cap() {
         assert!(TaskTimeout::new(0).is_err());
         assert!(TaskTimeout::new(1).is_ok());
-        assert!(TaskTimeout::new(aither_sandbox::DEFAULT_BACKGROUND_TIMEOUT_CAP.as_secs()).is_ok());
-        assert!(
-            TaskTimeout::new(aither_sandbox::DEFAULT_BACKGROUND_TIMEOUT_CAP.as_secs() + 1).is_err()
-        );
+        let cap = u32::try_from(aither_sandbox::DEFAULT_BACKGROUND_TIMEOUT_CAP.as_secs())
+            .expect("the background cap fits in u32 seconds");
+        assert!(TaskTimeout::new(cap).is_ok());
+        assert!(TaskTimeout::new(cap + 1).is_err());
         assert!(TaskTimeout::from_stored(-1).is_err());
     }
 }
