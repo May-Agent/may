@@ -133,6 +133,19 @@ export function ProvidersSection() {
                     </div>
                   </div>
                   <div>
+                    <label className="text-xs text-muted-foreground">
+                      {t('settings.providers.cacheLifetime')}
+                    </label>
+                    <input
+                      value={p.cacheLifetime}
+                      onChange={(e) => updateProvider(p.id, { cacheLifetime: e.target.value })}
+                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm font-mono outline-none focus:ring-2 focus:ring-ring"
+                    />
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t('settings.providers.cacheLifetimeHint')}
+                    </p>
+                  </div>
+                  <div>
                     <label className="text-xs text-muted-foreground">{t('settings.providers.baseUrl')}</label>
                     <input
                       value={p.baseUrl ?? ''}

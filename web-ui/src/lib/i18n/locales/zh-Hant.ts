@@ -273,12 +273,16 @@ export const zhHant: Messages = {
       apiKey: 'API 金鑰',
       apiKeySaved: '已儲存金鑰 — 輸入新金鑰以替換',
       baseUrl: '基礎網址',
+      cacheLifetime: '快取保留時間',
+      cacheLifetimeHint: '如 1h、5m 的時長，或 permanent',
     },
     models: {
       title: '模型',
       description: '各供應商可用的模型。',
       defaultModel: '預設模型',
       setDefault: '設為預設',
+      useForCompaction: '用於壓縮',
+      compactionModel: '壓縮模型',
       current: '目前',
     },
     mcp: {
