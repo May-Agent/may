@@ -21,7 +21,7 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # Aither framework
 aither-core = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-agent = { git = "https://github.com/lexoliu/aither", branch = "dev", features = ["mcp", "websearch", "webfetch", "skills"] }
-aither-sandbox = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-sandbox = { git = "https://github.com/lexoliu/aither", branch = "dev", features = ["code-folding"] }
 aither-cloud = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-rag = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-copilot = { git = "https://github.com/lexoliu/aither", branch = "dev" }
