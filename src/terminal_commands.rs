@@ -681,7 +681,8 @@ mod tests {
 
         // The peer is a second main agent listening on the same machine.
         let (woken_tx, woken) = async_channel::unbounded();
-        let peer_listeners = crate::agent_link::AgentListeners::default();
+        let peer_listeners =
+            crate::agent_link::AgentListeners::new(tokio::runtime::Handle::current());
         for (id, wake_tx) in [("main", None), ("peer", Some(woken_tx))] {
             peer_listeners
                 .ensure(
