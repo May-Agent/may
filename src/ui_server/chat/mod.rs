@@ -18,8 +18,7 @@ use skyzen::responder::Sse;
 use skyzen::utils::{Json, State};
 
 use aither_core::llm::{
-    Attachment as LlmAttachment, CommandOutcome, CommandResult, CommandStream,
-    Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
+    Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
 };
 use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
@@ -53,17 +52,6 @@ use super::types::{
 };
 use crate::decode_meter::DecodeMeter;
 
-fn stopped_terminal_tool_result(call_id: &str) -> ToolResult {
-    ToolResult::Command(Box::new(CommandResult {
-        stdout: CommandStream::Inline(String::new()),
-        stderr: None,
-        outcome: CommandOutcome::Killed {
-            task_id: call_id.to_string(),
-            notice: "The run was stopped before the command finished.".to_string(),
-        },
-    }))
-}
-
 const fn segment_emitted_at(segment_at: Option<jiff::Timestamp>) -> jiff::Timestamp {
     segment_at.expect("a non-empty text segment has a text event time")
 }
@@ -78,10 +66,9 @@ fn persist_stopped_terminal_calls(
         .cloned()
         .collect::<Vec<_>>();
     for call_id in running_terminal_ids {
-        let record = ToolEventRecord::End {
+        let record = ToolEventRecord::Stopped {
             id: call_id.clone(),
             name: "terminal".to_string(),
-            result: stopped_terminal_tool_result(&call_id),
         };
         let serialized = serde_json::to_string(&record)
             .map_err(|error| crate::db::ChatDbError::Storage(error.to_string()))?;
@@ -2998,15 +2985,6 @@ mod tests {
                 .as_ref()
                 .contains("waiting for an answer to an ask_user question. The user answered it."),
             "{reminder}"
-        );
-    }
-
-    #[test]
-    fn stopped_terminal_call_is_a_killed_command_with_a_notice() {
-        let result = super::stopped_terminal_tool_result("call-1");
-        assert_eq!(
-            result.render_for_model(),
-            "(no output)\nThe run was stopped before the command finished.\nTask ID: 'call-1'.\n"
         );
     }
 
