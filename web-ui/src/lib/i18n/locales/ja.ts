@@ -366,8 +366,8 @@ export const ja: Messages = {
     execution: {
       title: 'コマンド優先度',
       description: 'ローカルおよびコンテナーのコマンドに対する CPU とディスクのスケジューリングを制御します。SSH コマンドには影響しません。',
-      normal: '標準',
-      low: '低（既定）',
+      normal: '標準（既定）',
+      low: '低',
       lowest: '最低',
       info: '優先度を下げると競合時のスケジューリングが変わりますが、CPU 使用率を制限するものではありません。',
     },
