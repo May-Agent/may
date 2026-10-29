@@ -104,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if !matches!(cli_mode, CliMode::Help(_)) {
+        may_agent::startup::validate_configuration().await?;
         may_agent::configure_heel_binary().await;
     }
 
