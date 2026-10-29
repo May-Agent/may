@@ -431,6 +431,9 @@ pub struct UiServerState {
     pub(crate) title_generation_queue: TitleGenerationQueue,
     pub(crate) location_provider: crate::location::LocationProvider,
     pub(crate) runtime_service: Arc<crate::session::SessionRuntimeService>,
+    /// Sockets through which other main agents on this machine reach this
+    /// server's sessions.
+    pub(crate) agent_listeners: crate::agent_link::AgentListeners,
     pub(crate) task_runtime: Arc<crate::scheduler::TaskRuntime>,
     /// Embedded baseline tool distribution shared by agents, tasks and containers.
     pub(crate) tool_distribution: Arc<aither_sandbox::ToolDistribution>,

@@ -38,8 +38,6 @@ pub enum SessionRuntimeState {
     WaitingWorkspace,
     /// Blocked on an ask-user question.
     WaitingAskUser,
-    /// Blocked on terminal input from the user.
-    WaitingTerminalInput,
 }
 
 impl SessionRuntimeState {
@@ -52,7 +50,6 @@ impl SessionRuntimeState {
             Self::WaitingPermission => "waiting_permission",
             Self::WaitingWorkspace => "waiting_workspace",
             Self::WaitingAskUser => "waiting_ask_user",
-            Self::WaitingTerminalInput => "waiting_terminal_input",
         }
     }
 
@@ -86,7 +83,6 @@ impl core::str::FromStr for SessionRuntimeState {
             "waiting_permission" => Ok(Self::WaitingPermission),
             "waiting_workspace" => Ok(Self::WaitingWorkspace),
             "waiting_ask_user" => Ok(Self::WaitingAskUser),
-            "waiting_terminal_input" => Ok(Self::WaitingTerminalInput),
             other => Err(SessionRuntimeStateParseError {
                 value: other.to_string(),
             }),
@@ -391,8 +387,6 @@ impl SessionRuntimeSummary {
                 | SessionRuntimeState::WaitingAskUser
         ) {
             SessionRuntimeState::Idle
-        } else if self.state == SessionRuntimeState::WaitingTerminalInput {
-            SessionRuntimeState::WaitingTerminalInput
         } else if self.state == SessionRuntimeState::Running {
             SessionRuntimeState::Running
         } else {

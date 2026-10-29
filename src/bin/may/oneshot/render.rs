@@ -97,6 +97,14 @@ enum LineKind<'a> {
     SkillActivated {
         name: &'a str,
     },
+    /// Token counts; a count the provider did not report is omitted.
+    Usage {
+        prompt: Option<u32>,
+        cache_read: Option<u32>,
+        cache_write: Option<u32>,
+        completion: Option<u32>,
+        total: Option<u32>,
+    },
     Error {
         error: &'a AgentError,
     },
@@ -317,17 +325,16 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
             AgentEvent::SkillActivated { name, .. } => {
                 self.write_line(at, LineKind::SkillActivated { name })
             }
-            // The usage line is not templated.
-            AgentEvent::Usage(usage) => {
-                let stderr = self.stderr()?;
-                writeln!(
-                    stderr,
-                    "{at} Usage: prompt={:?} completion={:?} total={:?}",
-                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-                )?;
-                stderr.flush()?;
-                Ok(())
-            }
+            AgentEvent::Usage(usage) => self.write_line(
+                at,
+                LineKind::Usage {
+                    prompt: usage.prompt_tokens,
+                    cache_read: usage.cache_read_tokens,
+                    cache_write: usage.cache_write_tokens,
+                    completion: usage.completion_tokens,
+                    total: usage.total_tokens,
+                },
+            ),
             AgentEvent::Error(error) => self.write_line(at, LineKind::Error { error }),
         }
     }

@@ -66,7 +66,34 @@ enum MockChatScenario {
     /// request gets a plain text reply, so follow-up turns can probe what
     /// the model side injects from the file.
     WritesTasksFile,
+    /// The main agent launches a real subagent from a terminal command and a
+    /// scripted child runs one probe; see [`SubagentProbe`].
+    SubagentProbe(SubagentProbe),
 }
+
+/// A scripted main agent / subagent pair sharing one mock model.
+///
+/// The main agent runs `setup`, launches `subagent start` with `grant_flags`
+/// in a background job, polls until the launch command finished, then runs
+/// `final_script`. The child runs `child_script` once and ends. A request is
+/// the child's when a user or system message carries [`SUBAGENT_PROBE_MARKER`],
+/// which only the subagent's prompt file does.
+#[derive(Clone)]
+struct SubagentProbe {
+    setup: &'static str,
+    grant_flags: &'static str,
+    child_script: &'static str,
+    final_script: &'static str,
+}
+
+const SUBAGENT_PROBE_MARKER: &str = "SUBAGENT-PROBE-TASK";
+/// Requests the probe scenario may serve before the harness fails it, so a
+/// launch that never finishes ends the test with a message instead of hanging.
+const SUBAGENT_PROBE_MAX_REQUESTS: usize = 40;
+
+/// Waits at most eight seconds (the foreground limit is ten) for the launch
+/// job to finish, and prints what it wrote.
+const SUBAGENT_POLL_SCRIPT: &str = "i=0; while [ $i -lt 8 ]; do if [ -f sub.done ]; then echo POLL_DONE; cat sub.out; exit 0; fi; sleep 1; i=$((i+1)); done; echo POLL_PENDING";
 
 struct MockOpenAiServer {
     addr: SocketAddr,
@@ -167,11 +194,15 @@ impl MockScenarioState {
     }
 
     fn next_response(&mut self, request: &Value) -> Result<MockHttpResponse, String> {
+        if let MockChatScenario::SubagentProbe(probe) = self.scenario.clone() {
+            return self.next_probe_response(&probe, request);
+        }
         verify_native_tool_surface(request)?;
         if self.request_index == 0 {
             verify_initial_tool_contract(request)?;
         }
         let response = match &self.scenario {
+            MockChatScenario::SubagentProbe(_) => unreachable!("handled before the match"),
             MockChatScenario::TextEveryTurn(text) => {
                 // Every rebuilt agent must still present the prepared tools,
                 // whether it prepared them or adopted them.
@@ -297,13 +328,21 @@ impl MockScenarioState {
                 }
             },
             MockChatScenario::WritesTasksFile => {
-                // The run loop keeps the model going while the injected
-                // `<tasks_document>` block has unchecked items, so the mock
-                // finishes the checklist whenever it sees one and replies
-                // with plain text once everything is checked.
+                // The run loop keeps the model going while `tasks.md` has
+                // unchecked items, and the model side sees the file once per
+                // change (whole at session start, a diff afterwards), so the
+                // mock finishes the checklist whenever the newest injection
+                // adds an unchecked item and replies with plain text once
+                // everything is checked.
+                if self.request_index >= TASKS_SCENARIO_MAX_REQUESTS {
+                    return Err(format!(
+                        "tasks scenario still looping after {} requests: the run loop keeps objecting to tasks.md",
+                        self.request_index
+                    ));
+                }
                 let script = match tasks_injection(request) {
                     None if self.request_index == 0 => Some(TASKS_PARTIAL_SCRIPT),
-                    Some(tasks) if tasks.contains("- [ ]") => Some(TASKS_DONE_SCRIPT),
+                    Some(tasks) if injection_adds_unchecked_item(tasks) => Some(TASKS_DONE_SCRIPT),
                     _ => None,
                 };
                 match script {
@@ -335,10 +374,112 @@ impl MockScenarioState {
         self.request_index += 1;
         Ok(response)
     }
+
+    fn next_probe_response(
+        &mut self,
+        probe: &SubagentProbe,
+        request: &Value,
+    ) -> Result<MockHttpResponse, String> {
+        if self.request_index >= SUBAGENT_PROBE_MAX_REQUESTS {
+            return Err(format!(
+                "subagent probe still running after {} requests: the launch never finished",
+                self.request_index
+            ));
+        }
+        let is_child = is_subagent_request(request);
+        if !is_child {
+            verify_native_tool_surface(request)?;
+        }
+        let latest = latest_tool_output(request);
+        let terminal_call = |name: &str, id: &str, script: &str| {
+            MockHttpResponse::sse(vec![
+                delayed_sse_frame(
+                    tool_call_chunk(
+                        id,
+                        name,
+                        &serde_json::json!({
+                            "description": "Run the subagent authority probe",
+                            "script": script,
+                            "mode": "sandboxed",
+                            "raw": true,
+                            "timeout": 120,
+                            "max_lines": 200
+                        }),
+                    ),
+                    Duration::from_millis(10),
+                ),
+                done_frame(Duration::from_millis(10)),
+            ])
+        };
+        let text = |text: String| {
+            MockHttpResponse::sse(text_stream_frames(vec![text], Duration::from_millis(10)))
+        };
+        let id = format!("call-probe-{}", self.request_index);
+        let response = if is_child {
+            latest.map_or_else(
+                || terminal_call("terminal", &id, probe.child_script),
+                |output| text(format!("child probe output: {output}")),
+            )
+        } else {
+            match latest {
+                None => {
+                    let launch = format!(
+                        "( {setup}\nprintf '{SUBAGENT_PROBE_MARKER}: run the probe.\\n' > prompt.md\nsubagent start explore prompt.md --model fast {flags} ) > sub.out 2>&1; touch sub.done",
+                        setup = probe.setup,
+                        flags = probe.grant_flags,
+                    );
+                    terminal_call("terminal_background", &id, &launch)
+                }
+                Some(output) if output.contains("MAIN_FINAL") => text("probe complete".to_string()),
+                Some(output) if output.contains("POLL_DONE") => {
+                    terminal_call("terminal", &id, probe.final_script)
+                }
+                Some(_) => terminal_call("terminal", &id, SUBAGENT_POLL_SCRIPT),
+            }
+        };
+        self.request_index += 1;
+        Ok(response)
+    }
 }
 
 const TASKS_PARTIAL_SCRIPT: &str = "printf -- '- [x] write report\\n- [ ] ship it\\n' > tasks.md";
 const TASKS_DONE_SCRIPT: &str = "printf -- '- [x] write report\\n- [x] ship it\\n' > tasks.md";
+
+/// Requests the tasks scenario may serve before the harness fails it, so a
+/// run loop that never settles ends the test with a message instead of hanging.
+const TASKS_SCENARIO_MAX_REQUESTS: usize = 8;
+
+/// Whether a `<tasks_document>` injection leaves an unchecked item open: the
+/// whole document at session start, or a diff whose added (`+ `) lines carry
+/// one. Removed lines of a diff say nothing about the current file.
+fn injection_adds_unchecked_item(injection: &str) -> bool {
+    injection.lines().any(|line| {
+        line.starts_with("- [ ]")
+            || line
+                .strip_prefix("+ ")
+                .is_some_and(|added| added.starts_with("- [ ]"))
+    })
+}
+
+/// How long a chat turn in the tasks test may take before the test fails.
+const TASKS_TURN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Collects a turn's events, failing with the turn and the server log when it
+/// does not finish within [`TASKS_TURN_TIMEOUT`].
+async fn collect_turn_events(
+    response: reqwest::Response,
+    turn: &str,
+    log: &ServerLog,
+) -> Vec<(String, Value)> {
+    let collected = tokio::time::timeout(TASKS_TURN_TIMEOUT, collect_sse_events(response)).await;
+    let Ok(events) = collected else {
+        panic!(
+            "{turn} produced no done event within {TASKS_TURN_TIMEOUT:?}; server logs:\n{}",
+            log.contents().await
+        );
+    };
+    events
+}
 
 /// The `<tasks_document>` system message the run loop injects from `tasks.md`.
 fn tasks_injection(request: &Value) -> Option<&str> {
@@ -1783,7 +1924,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         .await
         .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    let events = collect_sse_events(response).await;
+    let events = collect_turn_events(response, "the first tasks turn", &server.log).await;
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
         "chat stream should complete; events: {events:?}; server logs:\n{}",
@@ -1859,7 +2000,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
         .await
         .expect("second chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
-    let events = collect_sse_events(response).await;
+    let events = collect_turn_events(response, "the follow-up tasks turn", &server.log).await;
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
         "second chat stream should complete; events: {events:?}; server logs:\n{}",
@@ -1877,6 +2018,220 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
 
     server.stop().await;
     environment.release(&harness, &session_id).await;
+}
+
+const PROBE_USER_TURN: &str = "Run the subagent authority probe.";
+
+/// The session root's regular files, read before the session is released.
+struct ProbeFiles(std::collections::BTreeMap<String, String>);
+
+impl ProbeFiles {
+    fn read(sandbox_dir: &Path) -> Self {
+        let entries = std::fs::read_dir(sandbox_dir)
+            .unwrap_or_else(|error| panic!("the session root should be readable: {error}"));
+        Self(
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let name = entry.file_name().into_string().ok()?;
+                    let text = std::fs::read_to_string(entry.path()).ok()?;
+                    Some((name, text))
+                })
+                .collect(),
+        )
+    }
+
+    fn get(&self, name: &str) -> &str {
+        self.0.get(name).unwrap_or_else(|| {
+            panic!(
+                "the probe should have written {name}; session root files: {:?}",
+                self.0.keys().collect::<Vec<_>>()
+            )
+        })
+    }
+}
+
+/// Runs one chat turn of `probe` on the host path and returns the session
+/// root's files, read before the session is released, with the mock.
+async fn run_subagent_probe(probe: SubagentProbe) -> (ProbeFiles, MockOpenAiServer) {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SubagentProbe(probe)).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
+        .sandbox_dir(&session_id, Some(environment.profile_id()));
+
+    let response = client
+        .post(format!("{}/api/chat/stream", server.base_url))
+        .json(&serde_json::json!({
+            "sessionId": session_id,
+            "content": PROBE_USER_TURN
+        }))
+        .send()
+        .await
+        .expect("chat stream request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let events = collect_turn_events(response, "the subagent probe turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the probe turn should complete; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+    let files = ProbeFiles::read(&sandbox_dir);
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+    (files, mock)
+}
+
+/// Whether a model request is the subagent's: its first user message is the
+/// prompt file, which carries [`SUBAGENT_PROBE_MARKER`]. Notices the main agent
+/// receives later may quote the marker, so only the first user message counts.
+fn is_subagent_request(request: &Value) -> bool {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        })
+        .and_then(|message| message.get("content").and_then(Value::as_str))
+        .is_some_and(|content| content.contains(SUBAGENT_PROBE_MARKER))
+}
+
+/// The latest tool output of every subagent request: what its command printed.
+async fn child_probe_outputs(mock: &MockOpenAiServer) -> Vec<String> {
+    mock.agent_requests()
+        .await
+        .iter()
+        .filter(|request| is_subagent_request(request))
+        .filter_map(latest_tool_output)
+        .collect()
+}
+
+fn child_exit_code(outputs: &[String]) -> i32 {
+    outputs
+        .iter()
+        .find_map(|output| {
+            let start = output.find("CHILD_RC=")? + "CHILD_RC=".len();
+            output[start..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("the subagent's command printed no CHILD_RC: {outputs:?}"))
+}
+
+const WORKTREE_SETUP: &str = "git init -q -b main repo && git -C repo -c user.name=m -c user.email=m@e commit -q --allow-empty -m init && git -C repo worktree add -q -b subagent/s1/work \"$PWD/wt\" && git -C repo rev-parse subagent/s1/work > tip.before";
+const WORKTREE_FINAL: &str = "git -C repo rev-parse subagent/s1/work > tip.after; echo MAIN_FINAL";
+const CHILD_COMMIT: &str = "cd ../../wt && echo x > f.txt && echo WROTE_FILE && git add f.txt && git -c user.name=c -c user.email=c@e commit -q -m 'child commit'; echo CHILD_RC=$?";
+
+#[tokio::test]
+#[serial]
+async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
+    let (files, mock) = run_subagent_probe(SubagentProbe {
+        setup: "printf -- '- [x] original\\n' > tasks.md",
+        grant_flags: "",
+        child_script: "printf -- '- [x] hacked\\n' >> ../../tasks.md; echo CHILD_RC=$?",
+        final_script: "cp tasks.md tasks.before; printf -- '- [x] original\\n- [x] main wrote\\n' > tasks.md; echo MAIN_FINAL",
+    })
+    .await;
+
+    let outputs = child_probe_outputs(&mock).await;
+    assert_ne!(
+        child_exit_code(&outputs),
+        0,
+        "the subagent's write to tasks.md must fail: {outputs:?}"
+    );
+    assert_eq!(
+        files.get("tasks.before"),
+        "- [x] original\n",
+        "tasks.md changed while only the subagent had run"
+    );
+    assert_eq!(
+        files.get("tasks.md"),
+        "- [x] original\n- [x] main wrote\n",
+        "the main agent's write in the same session must succeed"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn subagent_without_a_commit_grant_cannot_commit_in_a_worktree() {
+    let (files, mock) = run_subagent_probe(SubagentProbe {
+        setup: WORKTREE_SETUP,
+        grant_flags: "--worktrees \"$PWD/wt\"",
+        child_script: CHILD_COMMIT,
+        final_script: WORKTREE_FINAL,
+    })
+    .await;
+
+    let outputs = child_probe_outputs(&mock).await;
+    assert_ne!(
+        child_exit_code(&outputs),
+        0,
+        "an unauthorized git commit must fail: {outputs:?}"
+    );
+    assert!(
+        outputs.iter().any(|output| output.contains("WROTE_FILE")),
+        "the worktree is writable, so the failure is the commit's: {outputs:?}"
+    );
+    assert_eq!(
+        files.get("tip.before"),
+        files.get("tip.after"),
+        "the branch moved although the subagent had no commit grant"
+    );
+    let result = files.get("sub.out");
+    assert!(
+        !result.contains("Commits made in the granted worktrees"),
+        "a subagent without a commit grant reports no commits: {result}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn subagent_with_a_commit_grant_commits_and_the_main_agent_gets_the_listing() {
+    let (files, mock) = run_subagent_probe(SubagentProbe {
+        setup: WORKTREE_SETUP,
+        grant_flags: "--commit-worktrees \"$PWD/wt\"",
+        child_script: CHILD_COMMIT,
+        final_script: WORKTREE_FINAL,
+    })
+    .await;
+
+    let outputs = child_probe_outputs(&mock).await;
+    assert_eq!(
+        child_exit_code(&outputs),
+        0,
+        "the authorized git commit must succeed: {outputs:?}"
+    );
+    let before = files.get("tip.before");
+    let after = files.get("tip.after");
+    assert_ne!(before, after, "the branch should have moved");
+
+    let result = files.get("sub.out");
+    assert!(
+        result.contains("Commits made in the granted worktrees:")
+            && result.contains("child commit")
+            && result.contains(&after.trim()[..7]),
+        "the subagent result lists the commit: {result}"
+    );
+    // The main agent saw that listing in the tool output it was given.
+    let main_saw_listing = mock.agent_requests().await.iter().any(|request| {
+        latest_tool_output(request).is_some_and(|output| {
+            output.contains("POLL_DONE")
+                && output.contains("Commits made in the granted worktrees:")
+        })
+    });
+    assert!(
+        main_saw_listing,
+        "no main-agent request carried the commit listing"
+    );
 }
 
 /// A 500's response body is redacted, so the server log is the only place its

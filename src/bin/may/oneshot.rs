@@ -502,7 +502,9 @@ mod tests {
 
     fn command(outcome: CommandOutcome) -> ToolResult {
         ToolResult::Command(Box::new(CommandResult {
-            stdout: CommandStream::Inline(String::new()),
+            stdout: CommandStream::Inline {
+                text: String::new(),
+            },
             stderr: None,
             outcome,
         }))
@@ -559,6 +561,51 @@ mod tests {
         assert!(stamp.ends_with('Z'));
         assert!(before <= at && at <= after);
         assert!(rest.starts_with("Error:"));
+    }
+
+    fn usage_line(usage: aither_core::llm::Usage) -> String {
+        let mut output = output();
+        output
+            .event(&Ok(TimedEvent {
+                at: Timestamp::UNIX_EPOCH,
+                event: AgentEvent::Usage(usage),
+            }))
+            .expect("usage renders");
+        stderr(&output)
+            .split_once(' ')
+            .expect("line has a timestamp prefix")
+            .1
+            .to_string()
+    }
+
+    #[test]
+    fn the_usage_line_names_cache_reads_and_writes() {
+        let usage = aither_core::llm::Usage {
+            prompt_tokens: Some(1200),
+            completion_tokens: Some(80),
+            total_tokens: Some(1280),
+            cache_read_tokens: Some(1000),
+            cache_write_tokens: Some(150),
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(usage),
+            "Usage: prompt=1200 cache_read=1000 cache_write=150 completion=80 total=1280\n"
+        );
+    }
+
+    #[test]
+    fn the_usage_line_omits_fields_the_provider_did_not_report() {
+        let usage = aither_core::llm::Usage {
+            prompt_tokens: Some(1200),
+            completion_tokens: Some(80),
+            total_tokens: Some(1280),
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(usage),
+            "Usage: prompt=1200 completion=80 total=1280\n"
+        );
     }
 
     #[test]
