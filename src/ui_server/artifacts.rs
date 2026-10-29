@@ -237,7 +237,7 @@ fn not_modified_response(etag: &str, cache_control: &str) -> skyzen::Response {
 const ARTIFACT_SANDBOX_CSP: &str = "sandbox allow-scripts";
 
 fn is_active_artifact_content_type(content_type: &str) -> bool {
-    let essence = content_type.split(';').next().map(str::trim).unwrap_or("");
+    let essence = content_type.split(';').next().map_or("", str::trim);
     essence == "text/html"
         || essence == "text/xml"
         || essence == "application/xml"

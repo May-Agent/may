@@ -838,7 +838,7 @@ mod tests {
             "hasApiKey: false clears the stored key"
         );
 
-        let mut replaced = saved.providers.clone();
+        let mut replaced = saved.providers;
         replaced[0].api_key = Some("sk-new".to_string());
         let providers = provider_map_from_ui(&config.provider, &replaced);
         assert_eq!(
