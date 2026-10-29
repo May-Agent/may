@@ -1001,9 +1001,9 @@ impl Default for RemoteAccessConfig {
 #[serde(rename_all = "snake_case")]
 pub enum CommandPriority {
     /// Run at the host's own CPU and I/O priority.
+    #[default]
     Normal,
     /// Yield under contention: `nice 10`, utility I/O.
-    #[default]
     Low,
     /// Yield most strongly under contention: `nice 19`, background I/O.
     Lowest,
@@ -1367,13 +1367,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_priority_defaults_to_low() {
+    fn command_priority_defaults_to_normal() {
         assert_eq!(
             MayConfig::default().sandbox.command_priority,
-            CommandPriority::Low
+            CommandPriority::Normal
         );
         let config: MayConfig = toml::from_str("").expect("a config without sandbox parses");
-        assert_eq!(config.sandbox.command_priority, CommandPriority::Low);
+        assert_eq!(config.sandbox.command_priority, CommandPriority::Normal);
     }
 
     #[test]

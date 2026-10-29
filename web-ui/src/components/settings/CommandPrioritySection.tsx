@@ -29,7 +29,7 @@ export function CommandPrioritySection() {
   }, []);
 
   const priority: CommandPriority =
-    config?.fullConfig.sandbox.commandPriority ?? 'low';
+    config?.fullConfig.sandbox.commandPriority ?? 'normal';
 
   const change = async (next: CommandPriority) => {
     if (next === priority || busy) return;
