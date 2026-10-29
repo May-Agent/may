@@ -1404,13 +1404,6 @@ impl ChatDb {
             let mut summary = self.load_session_runtime_summary(&session_id).await?;
             let original_state = summary.state;
             let original_browser_takeover = summary.interactions.browser.takeover_active;
-            let expired_terminal_wait =
-                matches!(original_state, SessionRuntimeState::WaitingTerminalInput);
-
-            if expired_terminal_wait {
-                summary.state = SessionRuntimeState::Idle;
-                summary.interactions.terminal = TerminalRuntimeState::default();
-            }
             if original_browser_takeover {
                 summary.interactions.browser.takeover_active = false;
                 summary.interactions.browser.takeover_alert_pending = true;
@@ -1423,8 +1416,7 @@ impl ChatDb {
                 summary.interactions.terminal = TerminalRuntimeState::default();
             }
 
-            if summary.state != original_state || expired_terminal_wait || original_browser_takeover
-            {
+            if summary.state != original_state || original_browser_takeover {
                 self.write_session_runtime(&session_id, &summary).await?;
             }
         }

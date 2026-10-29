@@ -170,7 +170,6 @@ export const ja: Messages = {
     waitingPermission: '権限の承認待ち',
     waitingWorkspace: 'ワークスペース権限待ち',
     waitingAskUser: '入力待ち',
-    waitingTerminalInput: 'タスクが入力待ち',
     queued: '{count} 件キュー',
   },
   browserLive: {
