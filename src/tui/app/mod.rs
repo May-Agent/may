@@ -247,6 +247,9 @@ pub struct App {
     /// Live tracker of `subagent` runs, shared with the session worker's
     /// `subagent` IPC command (set when the agent worker installs)
     pub subagent_tracker: crate::agent::SubagentTracker,
+    /// The lease of the run in flight, held from its start until the TUI has
+    /// persisted its last message.
+    pub run_guard: Option<crate::session::SessionRunGuard>,
     /// Running terminal calls bound to registry jobs for live output.
     pub live_reads: std::collections::HashMap<String, LiveRead>,
     /// Last time file-diff previews were requested for running calls.
@@ -471,6 +474,7 @@ impl App {
             jobs_selected: 0,
             jobs_refreshed: None,
             subagent_tracker: crate::agent::SubagentTracker::default(),
+            run_guard: None,
             live_reads: std::collections::HashMap::new(),
             diff_preview_at: None,
             secrets,

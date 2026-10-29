@@ -41,10 +41,7 @@ use crate::models::fetch_all_models;
 use aither_models::lookup as lookup_model_info;
 
 use error::internal_error;
-use state::{
-    AskUserApprover, SessionRunCancellationRegistry, UiServerState, WorkspaceApprover,
-    tool_dispatch_channels,
-};
+use state::{AskUserApprover, UiServerState, WorkspaceApprover, tool_dispatch_channels};
 use types::{
     ApiHealth, ModelInfoItem, ModelsResponse, ProviderModelsItem, ProviderModelsResponse,
     RequestLogCacheSummary, RequestLogEntry, RequestLogsResponse,
@@ -161,21 +158,23 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
 
     let (_session_store, db_for_archive, default_profile_id) =
         crate::session::initialize_session_persistence(&may_dir).await?;
-    db_for_archive
-        .recover_session_runtimes_after_restart()
-        .await
-        .context("failed to reconcile persisted session runtime state after restart")?;
-    db_for_archive
-        .recover_session_run_leases_after_restart()
-        .await
-        .context("failed to reconcile persisted session run leases after restart")?;
     let (title_generation_queue, title_generation_rx) =
         crate::ui_server::state::TitleGenerationQueue::new();
     let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
-    let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
-        db_for_archive.clone(),
-        ui_event_bus.clone(),
-    ));
+    // Request handlers acquire runs from outside the tokio runtime, so the
+    // lease tasks are spawned on its handle.
+    let lease_handle = tokio::runtime::Handle::current();
+    let runtime_service = Arc::new(
+        crate::session::SessionRuntimeService::new(db_for_archive.clone(), ui_event_bus.clone())
+            .with_spawner(Arc::new(move |task| {
+                lease_handle.spawn(task);
+            })),
+    );
+    runtime_service
+        .runs()
+        .recover_after_restart()
+        .await
+        .context("failed to reconcile persisted session runtime state after restart")?;
     let remote_access_manager = Arc::new(remote_access::RemoteAccessManager::new(
         ui_event_bus.clone(),
     ));
@@ -241,7 +240,6 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         workspace_approver,
         ask_user_approver,
         tool_dispatchers,
-        run_cancellation_registry: SessionRunCancellationRegistry::new(),
         fetched_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
         config: arc_swap::ArcSwap::from_pointee(config),
         ui_event_bus,

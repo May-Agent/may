@@ -5,6 +5,10 @@ pub const SESSION_CONTEXT_SNAPSHOT_DROP: &str = include_str!("session_context_sn
 pub const SESSION_CONTEXT_SNAPSHOT_SCHEMA: &str =
     include_str!("session_context_snapshot_schema.sql");
 
+pub const SESSION_RUN_LEASES_COLUMNS: &str = include_str!("session_run_leases_columns.sql");
+pub const SESSION_RUN_LEASES_DROP: &str = include_str!("session_run_leases_drop.sql");
+pub const SESSION_RUN_LEASES_SCHEMA: &str = include_str!("session_run_leases_schema.sql");
+
 pub fn statements(contents: &str) -> impl Iterator<Item = &str> {
     contents
         .split(';')

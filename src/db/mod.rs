@@ -11,6 +11,7 @@ mod memory;
 mod message;
 mod notification;
 mod profile;
+mod run_lease;
 mod session;
 mod sql;
 mod task;
@@ -31,6 +32,7 @@ pub use common::{
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use message::MessageMeta;
+pub use run_lease::RunFence;
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
@@ -70,6 +72,7 @@ impl ChatDb {
         Self::ensure_message_columns(&db).await?;
         Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
+        Self::ensure_session_run_lease_table(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Ok(Self { db })
@@ -221,6 +224,41 @@ impl ChatDb {
             )
             .execute()
             .await?;
+        }
+        Ok(())
+    }
+
+    /// Replace the boolean `active` lease table with the fenced layout.
+    ///
+    /// A lease is transient, so the legacy table is dropped rather than
+    /// converted: a run holding a legacy lease loses it, which only matters
+    /// to a process still running the previous build against this file.
+    async fn ensure_session_run_lease_table(db: &SkyDb) -> Result<(), ChatDbError> {
+        const EXPECTED_COLUMNS: [&str; 5] = [
+            "session_id",
+            "owner",
+            "generation",
+            "heartbeat_at",
+            "cancellation_requested",
+        ];
+        let columns = query!(db, db_sql::SESSION_RUN_LEASES_COLUMNS)
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        let actual_columns = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        if !actual_columns.is_empty() && actual_columns != EXPECTED_COLUMNS {
+            tracing::info!(
+                columns = ?actual_columns,
+                "session_run_leases has the legacy layout; recreating it with fenced leases"
+            );
+            query!(db, db_sql::SESSION_RUN_LEASES_DROP)
+                .execute()
+                .await?;
+        }
+        for statement in db_sql::statements(db_sql::SESSION_RUN_LEASES_SCHEMA) {
+            query!(db, statement).execute().await?;
         }
         Ok(())
     }
@@ -480,7 +518,7 @@ mod tests {
 
     use crate::PermissionRequestMode;
     use crate::db::ProfileEnvironmentKind;
-    use crate::db::entity::{scheduled_task_runs, session_run_leases};
+    use crate::db::entity::scheduled_task_runs;
     use crate::profile::ProfileEnvironment;
     use crate::session::{
         PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
@@ -913,7 +951,7 @@ mod tests {
                 .expect("previous takeover owner should be cleared")
         );
 
-        db.recover_session_runtimes_after_restart()
+        db.recover_session_runtimes_after_restart(i64::MAX)
             .await
             .expect("runtime recovery should clear stale takeover ownership");
         assert_eq!(
@@ -940,9 +978,11 @@ mod tests {
         db.create_session(session_id, Some("Takeover race"), Some("test-model"))
             .await
             .expect("session should be created");
-        db.set_session_runtime_state(session_id, SessionRuntimeState::Running)
+        let fence = db
+            .acquire_session_run_lease(session_id, "owner", 0, i64::MIN)
             .await
-            .expect("run should be marked active");
+            .expect("lease acquisition should succeed")
+            .expect("the lease is free");
         db.set_browser_takeover_owner(session_id)
             .await
             .expect("takeover should be active");
@@ -963,7 +1003,7 @@ mod tests {
         );
 
         assert!(
-            db.clear_running_if_idle(session_id)
+            db.finish_session_run(&fence)
                 .await
                 .expect("cancelled run should settle")
         );
@@ -1276,7 +1316,7 @@ mod tests {
         .await
         .expect("waiting workspace should persist");
 
-        db.recover_session_runtimes_after_restart()
+        db.recover_session_runtimes_after_restart(i64::MAX)
             .await
             .expect("runtime recovery should succeed");
 
@@ -1489,96 +1529,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn session_run_lease_rejects_second_claim_until_released() {
-        let dir = tempdir().expect("temp dir should be created");
-        let db_path = dir.path().join("history.db");
-        let db = ChatDb::open(&db_path)
-            .await
-            .expect("db should initialize successfully");
-
-        db.create_session("session-1", Some("Session"), Some("test-model"))
-            .await
-            .expect("session should persist");
-
-        assert!(
-            db.claim_session_run_lease("session-1")
-                .await
-                .expect("first lease claim should succeed")
-        );
-        assert!(
-            !db.claim_session_run_lease("session-1")
-                .await
-                .expect("second lease claim should be rejected")
-        );
-        assert!(
-            db.request_session_run_cancel("session-1")
-                .await
-                .expect("cancellation request should persist against active lease")
-        );
-
-        db.release_session_run_lease("session-1")
-            .await
-            .expect("lease release should persist");
-
-        assert!(
-            db.claim_session_run_lease("session-1")
-                .await
-                .expect("released lease should become claimable again")
-        );
-    }
-
-    /// Concurrent claims of distinct sessions on one database file must all
-    /// succeed: a claim never fails with a lock error because another
-    /// connection committed a write while it ran.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn concurrent_session_run_lease_claims_never_hit_lock_errors() {
-        const SESSIONS: usize = 16;
-        const ROUNDS: usize = 25;
-
-        let dir = tempdir().expect("temp dir should be created");
-        let db = ChatDb::open(&dir.path().join("history.db"))
-            .await
-            .expect("db should initialize successfully");
-        let session_ids = (0..SESSIONS)
-            .map(|index| format!("session-{index}"))
-            .collect::<Vec<_>>();
-        for session_id in &session_ids {
-            db.create_session(session_id, Some("Session"), Some("test-model"))
-                .await
-                .expect("session should persist");
-        }
-
-        let tasks = session_ids
-            .into_iter()
-            .map(|session_id| {
-                let db = db.clone();
-                tokio::spawn(async move {
-                    for round in 0..ROUNDS {
-                        let claimed = db
-                            .claim_session_run_lease(&session_id)
-                            .await
-                            .unwrap_or_else(|error| {
-                                panic!("claim {round} of {session_id} failed: {error}")
-                            });
-                        assert!(
-                            claimed,
-                            "claim {round} of {session_id} found the lease active"
-                        );
-                        db.release_session_run_lease(&session_id)
-                            .await
-                            .unwrap_or_else(|error| {
-                                panic!("release {round} of {session_id} failed: {error}")
-                            });
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        for task in tasks {
-            task.await.expect("claim task should not panic");
-        }
-    }
-
     /// Concurrent dequeues of distinct sessions' pending messages on one
     /// database file must all succeed and hand back every queued message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1640,49 +1590,5 @@ mod tests {
         for task in tasks {
             task.await.expect("take task should not panic");
         }
-    }
-
-    #[tokio::test]
-    async fn session_run_lease_recovery_clears_stale_active_run() {
-        let dir = tempdir().expect("temp dir should be created");
-        let db_path = dir.path().join("history.db");
-        let db = ChatDb::open(&db_path)
-            .await
-            .expect("db should initialize successfully");
-
-        db.create_session("session-1", Some("Session"), Some("test-model"))
-            .await
-            .expect("session should persist");
-        assert!(
-            db.claim_session_run_lease("session-1")
-                .await
-                .expect("lease claim should succeed")
-        );
-        assert!(
-            db.request_session_run_cancel("session-1")
-                .await
-                .expect("cancellation request should persist")
-        );
-
-        db.recover_session_run_leases_after_restart()
-            .await
-            .expect("lease recovery should clear stale active state");
-
-        let recovered = query!(
-            db.db,
-            "SELECT * FROM session_run_leases WHERE session_id = ?",
-            "session-1"
-        )
-        .fetch_optional::<session_run_leases::Model>()
-        .await
-        .expect("lease lookup should succeed")
-        .expect("lease row should exist");
-        assert!(!recovered.active);
-        assert!(!recovered.cancellation_requested);
-        assert!(
-            db.claim_session_run_lease("session-1")
-                .await
-                .expect("recovered lease should become claimable")
-        );
     }
 }

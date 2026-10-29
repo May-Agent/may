@@ -6,7 +6,7 @@
 
 use jiff::Timestamp;
 
-use crate::db::ChatDb;
+use crate::db::{ChatDb, RunFence};
 use crate::session::history::{ChatMessage, MessageRole};
 
 /// A buffered message to be persisted at the end of the turn.
@@ -20,14 +20,14 @@ struct PendingMessage {
 
 /// Buffers chat messages for a turn and writes them atomically.
 pub(super) struct TurnPersister {
-    session_id: String,
+    fence: RunFence,
     pending: Vec<PendingMessage>,
 }
 
 impl TurnPersister {
-    pub fn new(session_id: &str) -> Self {
+    pub const fn new(fence: RunFence) -> Self {
         Self {
-            session_id: session_id.to_string(),
+            fence,
             pending: Vec::new(),
         }
     }
@@ -74,7 +74,9 @@ impl TurnPersister {
                 reasoning: Vec::new(),
                 tool_calls: Vec::new(),
             };
-            let row = db.append_chat_message(&self.session_id, &chat_msg).await?;
+            let row = db
+                .append_chat_message_as_run(&self.fence, &chat_msg)
+                .await?;
             last_id = Some(i64::from(row.id));
         }
 
@@ -119,7 +121,12 @@ mod tests {
         let tool_start_at: Timestamp = "2024-03-01T10:00:01.250Z".parse().expect("valid time");
         let tool_end_at: Timestamp = "2024-03-01T10:00:04.750Z".parse().expect("valid time");
         let answer_at: Timestamp = "2024-03-01T10:00:06.500Z".parse().expect("valid time");
-        let mut persister = TurnPersister::new(session_id);
+        let fence = db
+            .acquire_session_run_lease(session_id, "owner", 0, i64::MIN)
+            .await
+            .expect("lease acquisition should succeed")
+            .expect("the lease is free");
+        let mut persister = TurnPersister::new(fence);
         persister.push_tool_event("call_1".to_string(), "start".to_string(), tool_start_at);
         persister.push_tool_event("call_1".to_string(), "end".to_string(), tool_end_at);
         persister.push_assistant("done".to_string(), answer_at);
