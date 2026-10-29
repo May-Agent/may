@@ -22,7 +22,7 @@ use std::io;
 use std::mem;
 use std::panic;
 
-use aither_agent::AgentEvent;
+use aither_agent::{AgentEvent, TimedEvent};
 use anyhow::Context;
 
 use crate::browser::run_browser;
@@ -49,7 +49,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
-use may_agent::tui::runtime::{LocalSessionRuntime, RuntimeDeps, TitleGenContext};
+use may_agent::tui::runtime::{AssistantReply, LocalSessionRuntime, RuntimeDeps, TitleGenContext};
 use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
 use may_agent::workspace_request::{self, WorkspaceRequestQueue};
 use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
@@ -380,7 +380,7 @@ where
 
     // For title generation
     let mut pending_title_gen: Option<TitleGenContext> = None;
-    let mut assistant_response = String::new();
+    let mut assistant_response = AssistantReply::default();
 
     loop {
         enum Event {
@@ -596,8 +596,12 @@ where
                 match tui_event {
                     TuiEvent::Agent(result) => {
                         // Capture text for title generation
-                        if let Ok(AgentEvent::Text(ref text)) = result {
-                            assistant_response.push_str(text);
+                        if let Ok(TimedEvent {
+                            at,
+                            event: AgentEvent::Text(ref text),
+                        }) = result
+                        {
+                            assistant_response.push(text, at);
                         }
                         let ended = app.handle_agent_event(result).await;
                         if ended {

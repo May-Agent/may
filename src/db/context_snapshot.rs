@@ -19,8 +19,9 @@ use super::{ChatDb, ChatDbError, query};
 ///
 /// 1 = every blob written before versioning existed (the pre-0.7 and 0.7
 /// shapes alike, which are indistinguishable without a recorded version).
-/// 2 = the current `AgentCheckpoint` shape.
-pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 2;
+/// 2 = every `AgentCheckpoint` before context items carried their commit time.
+/// 3 = the current `AgentCheckpoint` shape, whose items persist `committed_at`.
+pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 3;
 
 /// Inputs for [`ChatDb::upsert_context_debug_snapshot`].
 #[derive(Debug)]
@@ -419,6 +420,54 @@ mod tests {
         assert_eq!(stored.checkpoint.tool_surface_hash, "tool-surface-hash");
         assert_eq!(stored.checkpoint.context_window.messages.len(), 1);
         assert!(!stored.checkpoint.has_background_tasks);
+    }
+
+    #[tokio::test]
+    async fn restored_context_items_keep_their_commit_times() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+
+        let mut context = aither_agent::Context::new();
+        let before = jiff::Timestamp::now();
+        context.push(aither_core::llm::Message::user("one"));
+        context.push(aither_core::llm::Message::assistant("two"));
+        let after = jiff::Timestamp::now();
+        let checkpoint = context.checkpoint();
+        let committed = checkpoint
+            .items()
+            .iter()
+            .map(aither_agent::ContextItem::committed_at)
+            .collect::<Vec<_>>();
+        assert_eq!(committed.len(), 2);
+        assert!(committed.iter().all(|at| before <= *at && *at <= after));
+
+        let mut snapshot = representative_checkpoint();
+        snapshot.context = checkpoint;
+        db.upsert_session_context_snapshot(
+            "session-times",
+            SessionContextSnapshotUpsert {
+                checkpoint: snapshot,
+                last_message_db_id: None,
+            },
+        )
+        .await
+        .expect("upsert should succeed");
+
+        let restored = db
+            .get_session_context_snapshot("session-times")
+            .await
+            .expect("get should succeed")
+            .expect("snapshot should exist");
+        let restored = restored
+            .checkpoint
+            .context
+            .items()
+            .iter()
+            .map(aither_agent::ContextItem::committed_at)
+            .collect::<Vec<_>>();
+        assert_eq!(restored, committed);
     }
 
     #[tokio::test]

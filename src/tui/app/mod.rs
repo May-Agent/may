@@ -49,7 +49,7 @@ pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
 }
 
 /// Agent event from aither-agent.
-pub use aither_agent::{AgentError, AgentEvent};
+pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
 
 use super::state::{
     ActiveTextInput, AppMode, ChatgptAuthStatus, ConfigEditMode, ConfigState, CopilotAuthStatus,
@@ -2606,9 +2606,9 @@ impl App {
     }
 
     /// Handle an agent event. Returns true if stream ended.
-    pub async fn handle_agent_event(&mut self, result: Result<AgentEvent, AgentError>) -> bool {
+    pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
-            Ok(event) => {
+            Ok(TimedEvent { event, .. }) => {
                 match event {
                     AgentEvent::Text(chunk) => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
