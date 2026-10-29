@@ -156,10 +156,13 @@ walkdir = "2"
 sha2 = "0.10"
 
 # Session retrieval index
-lancedb = { version = "0.23.1", default-features = false }
-lance-index = "1.0.1"
-arrow-array = "56.2"
-arrow-schema = "56.2"
+# `remote` is required even for local-only use: lancedb 0.40's `job.rs`
+# references `Error::Http` unconditionally, so the crate does not compile
+# without it.
+lancedb = { version = "0.40", default-features = false, features = ["remote"] }
+lance-index = "13.0"
+arrow-array = "58.4"
+arrow-schema = "58.4"
 similar = "3.1.1"
 dunce = "1.0.5"
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
