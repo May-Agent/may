@@ -376,6 +376,29 @@ fn prompt_oneshot_workspace(
 #[template(path = "reminder_oneshot_noninteractive.txt", escape = "none")]
 struct OneShotNonInteractiveReminder;
 
+/// The usage line, naming only the token counts the provider reported.
+#[derive(askama::Template)]
+#[template(path = "oneshot_usage.txt", escape = "none")]
+struct OneShotUsageLine {
+    prompt: Option<u32>,
+    cache_read: Option<u32>,
+    cache_write: Option<u32>,
+    completion: Option<u32>,
+    total: Option<u32>,
+}
+
+impl From<&aither_core::llm::Usage> for OneShotUsageLine {
+    fn from(usage: &aither_core::llm::Usage) -> Self {
+        Self {
+            prompt: usage.prompt_tokens,
+            cache_read: usage.cache_read_tokens,
+            cache_write: usage.cache_write_tokens,
+            completion: usage.completion_tokens,
+            total: usage.total_tokens,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct OneShotPromptInput {
     content: String,
@@ -545,11 +568,8 @@ fn render_oneshot_event(
             writeln!(stderr, "{at} Skill activated: {name}")?;
         }
         Ok(AgentEvent::Usage(usage)) => {
-            writeln!(
-                stderr,
-                "{at} Usage: prompt={:?} completion={:?} total={:?}",
-                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-            )?;
+            let line = askama::Template::render(&OneShotUsageLine::from(usage))?;
+            writeln!(stderr, "{at} {line}")?;
         }
         Ok(AgentEvent::Error(error)) | Err(error) => {
             writeln!(stderr, "{at} Error: {error}")?;
@@ -596,6 +616,47 @@ mod tests {
         assert!(stamp.ends_with('Z'));
         assert!(before <= at && at <= after);
         assert!(rest.starts_with("Error:"));
+    }
+
+    fn usage_line(usage: aither_core::llm::Usage) -> String {
+        let line = render(&Ok(TimedEvent {
+            at: Timestamp::UNIX_EPOCH,
+            event: AgentEvent::Usage(usage),
+        }));
+        line.split_once(' ')
+            .expect("line has a timestamp prefix")
+            .1
+            .to_string()
+    }
+
+    #[test]
+    fn the_usage_line_names_cache_reads_and_writes() {
+        let usage = aither_core::llm::Usage {
+            prompt_tokens: Some(1200),
+            completion_tokens: Some(80),
+            total_tokens: Some(1280),
+            cache_read_tokens: Some(1000),
+            cache_write_tokens: Some(150),
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(usage),
+            "Usage: prompt=1200 cache_read=1000 cache_write=150 completion=80 total=1280\n"
+        );
+    }
+
+    #[test]
+    fn the_usage_line_omits_fields_the_provider_did_not_report() {
+        let usage = aither_core::llm::Usage {
+            prompt_tokens: Some(1200),
+            completion_tokens: Some(80),
+            total_tokens: Some(1280),
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(usage),
+            "Usage: prompt=1200 completion=80 total=1280\n"
+        );
     }
 
     #[test]
