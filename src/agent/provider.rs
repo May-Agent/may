@@ -40,14 +40,17 @@ pub(super) fn err_api_key_required(provider: &str) -> String {
     format!("API key required for provider '{provider}'")
 }
 
+/// Parses a session `provider::model` selector string.
+pub(super) fn parse_model_selector(selector: &str) -> Result<ModelSelector, MayAgentError> {
+    selector.parse::<ModelSelector>().map_err(|error| {
+        MayAgentError::MissingApiKey(format!("Invalid model selector '{selector}': {error}"))
+    })
+}
+
 fn resolve_model_selector(
     may_config: &MayConfig,
-    selector: &str,
-) -> Result<(ModelSelector, ProviderInstance), MayAgentError> {
-    let selector = selector.parse::<ModelSelector>().map_err(|error| {
-        MayAgentError::MissingApiKey(format!("Invalid model selector '{selector}': {error}"))
-    })?;
-
+    selector: &ModelSelector,
+) -> Result<ProviderInstance, MayAgentError> {
     let provider_id = selector.provider_id();
     let Some(provider_instance) = may_config.provider.get(provider_id).cloned() else {
         return Err(MayAgentError::MissingApiKey(err_no_provider(
@@ -66,7 +69,7 @@ fn resolve_model_selector(
         )));
     }
 
-    Ok((selector, provider_instance))
+    Ok(provider_instance)
 }
 
 /// Wraps a base [`LanguageModel`] so every request carries a pinned
@@ -88,6 +91,24 @@ impl<M> RequestParameterizedModel<M> {
     const fn parameters(&self) -> &Parameters {
         &self.parameters
     }
+}
+
+/// [`request_parameters_for`] for a session's `selector`, looking the provider
+/// instance up in `config`.
+pub(super) fn session_request_parameters(
+    config: &MayConfig,
+    selector: &ModelSelector,
+    reasoning_effort: Option<ReasoningEffort>,
+    session_id: &SessionId,
+) -> Parameters {
+    let provider_id = selector.provider_id();
+    request_parameters_for(
+        provider_id,
+        config.provider.get(provider_id),
+        selector.model_id(),
+        reasoning_effort,
+        session_id,
+    )
 }
 
 /// Computes the [`Parameters`] a model should run with: `reasoning_effort`
@@ -185,7 +206,11 @@ where
 /// Number of runnable provider candidates for `selector`.
 #[must_use]
 pub fn provider_candidate_count(config: &MayConfig, selector: &str) -> usize {
-    usize::from(resolve_model_selector(config, selector).is_ok())
+    usize::from(
+        parse_model_selector(selector)
+            .and_then(|selector| resolve_model_selector(config, &selector))
+            .is_ok(),
+    )
 }
 
 /// The concrete runtime produced by [`resolve_provider_runtime`].
@@ -208,10 +233,10 @@ pub struct ResolvedProviderRuntime {
 /// selector or all candidates fail.
 pub async fn resolve_provider_runtime(
     may_config: &MayConfig,
-    selector: &str,
+    selector: &ModelSelector,
     _provider_attempt: usize,
 ) -> Result<ResolvedProviderRuntime, MayAgentError> {
-    let (selector, provider_instance) = resolve_model_selector(may_config, selector)?;
+    let provider_instance = resolve_model_selector(may_config, selector)?;
     let provider_id = selector.provider_id().to_string();
     let llm =
         build_cloud_provider_from_instance(&provider_id, &provider_instance, selector.model_id())
@@ -692,6 +717,19 @@ mod tests {
         );
         assert!(!parameters.native_tools.claude.web_search);
         assert!(parameters.native_tools.claude.web_fetch);
+    }
+
+    #[test]
+    fn session_selector_enables_native_web_search() {
+        let mut config = MayConfig::default();
+        let mut instance = ProviderInstance::new(ProviderType::Google).with_api_key("key");
+        instance.native_tools.web_search = true;
+        config.provider.insert("google".to_string(), instance);
+
+        let selector = parse_model_selector("google::gemini-3-flash-preview").unwrap();
+        let parameters = session_request_parameters(&config, &selector, None, &SessionId::new());
+        assert!(parameters.websearch);
+        assert!(aither_models::lookup(selector.model_id()).is_some());
     }
 
     #[tokio::test]
