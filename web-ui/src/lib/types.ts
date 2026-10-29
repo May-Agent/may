@@ -96,8 +96,7 @@ export type SessionRuntimeState =
   | 'running'
   | 'waiting_permission'
   | 'waiting_workspace'
-  | 'waiting_ask_user'
-  | 'waiting_terminal_input';
+  | 'waiting_ask_user';
 
 export type SessionPlanState = 'disabled' | 'draft' | 'approved';
 
