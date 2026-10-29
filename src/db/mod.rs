@@ -71,6 +71,7 @@ impl ChatDb {
         Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
+        Self::migrate_removed_waiting_terminal_input(&db).await?;
         Ok(Self { db })
     }
 
@@ -172,6 +173,20 @@ impl ChatDb {
             count,
             "migrated legacy remote profiles to local home + attached SSH servers",
         );
+        Ok(())
+    }
+
+    /// Idempotent data migration: `waiting_terminal_input` was removed as a
+    /// session runtime state. A session stored in it has no running turn, so
+    /// it loads as idle with its terminal metadata cleared, as restart
+    /// recovery treats any session whose turn is not running.
+    async fn migrate_removed_waiting_terminal_input(db: &SkyDb) -> Result<(), ChatDbError> {
+        query!(
+            db,
+            "UPDATE session_runtimes SET state = 'idle', terminal_task_id = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL WHERE state = 'waiting_terminal_input'"
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -1285,46 +1300,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_recovery_expires_terminal_wait_state() {
+    async fn removed_waiting_terminal_input_state_migrates_to_idle() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
+        let session_id = "session-test";
+
+        {
+            let db = ChatDb::open(&db_path)
+                .await
+                .expect("db should initialize successfully");
+            db.create_session(session_id, Some("Test session"), Some("test-model"))
+                .await
+                .expect("session should be created");
+            db.set_session_runtime_state(session_id, SessionRuntimeState::Running)
+                .await
+                .expect("runtime row should persist");
+            // Manufacture the row an older build wrote.
+            super::query!(
+                db.db,
+                "UPDATE session_runtimes SET state = 'waiting_terminal_input', terminal_task_id = 'amber-forest-thunder-pearl', terminal_output_file = 'outputs/amber-forest-thunder-pearl.txt', terminal_output_preview = 'preview', terminal_input_notice = 'input needed' WHERE session_id = ?",
+                session_id
+            )
+            .execute()
+            .await
+            .expect("legacy row should be written");
+        }
+
         let db = ChatDb::open(&db_path)
             .await
-            .expect("db should initialize successfully");
-
-        let session_id = "session-test";
-        db.create_session(session_id, Some("Test session"), Some("test-model"))
-            .await
-            .expect("session should be created");
-        db.set_session_runtime_state(session_id, SessionRuntimeState::WaitingTerminalInput)
-            .await
-            .expect("waiting terminal input should persist");
-        let mut runtime = db
-            .get_session_runtime(session_id)
-            .await
-            .expect("runtime should load")
-            .expect("runtime should exist");
-        runtime.interactions.terminal = TerminalRuntimeState {
-            task_id: Some("amber-forest-thunder-pearl".to_string()),
-            output_file: Some("outputs/amber-forest-thunder-pearl.txt".to_string()),
-            output_preview: Some("preview".to_string()),
-            input_notice: Some("input needed".to_string()),
-        };
-        db.write_session_runtime(session_id, &runtime)
-            .await
-            .expect("terminal runtime metadata should persist");
-
-        db.recover_session_runtimes_after_restart()
-            .await
-            .expect("runtime recovery should succeed");
-
+            .expect("reopen should migrate the removed state");
         let runtime = db
             .get_session_runtime(session_id)
             .await
             .expect("runtime should load")
             .expect("runtime should exist");
         assert_eq!(runtime.state, SessionRuntimeState::Idle);
-        assert!(!runtime.has_pending_messages());
         assert_eq!(
             runtime.interactions.terminal,
             TerminalRuntimeState::default()
