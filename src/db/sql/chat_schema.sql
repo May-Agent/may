@@ -33,7 +33,6 @@ CREATE TABLE IF NOT EXISTS request_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, s
 CREATE TABLE IF NOT EXISTS network_access_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, profile_id TEXT, source TEXT NOT NULL, mode TEXT NOT NULL, domain TEXT NOT NULL, port INTEGER NOT NULL, allowed BOOLEAN NOT NULL, reason TEXT, timestamp TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_runtimes (session_id TEXT PRIMARY KEY, state TEXT NOT NULL, browser_takeover_active BOOLEAN NOT NULL, browser_takeover_alert_pending BOOLEAN NOT NULL, terminal_task_id TEXT, terminal_output_file TEXT, terminal_output_preview TEXT, terminal_input_notice TEXT, terminal_background_reason TEXT, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_plans (session_id TEXT PRIMARY KEY, plan_state TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS session_run_leases (session_id TEXT PRIMARY KEY, active BOOLEAN NOT NULL, cancellation_requested BOOLEAN NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_pending_permissions (request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, mode TEXT NOT NULL, script TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_pending_workspace (request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);

@@ -49,7 +49,10 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
-use may_agent::tui::runtime::{AssistantReply, LocalSessionRuntime, RuntimeDeps, TitleGenContext};
+use may_agent::session::RunOutcome;
+use may_agent::tui::runtime::{
+    AssistantReply, LocalSessionRuntime, QueuedRunStart, RuntimeDeps, TitleGenContext,
+};
 use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
 use may_agent::workspace_request::{self, WorkspaceRequestQueue};
 use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
@@ -392,6 +395,8 @@ where
 
     // For title generation
     let mut pending_title_gen: Option<TitleGenContext> = None;
+    // The busy status shows once per episode of another run holding the session.
+    let mut busy_elsewhere_notified = false;
     let mut assistant_response = AssistantReply::default();
 
     // Sockets through which other main agents reach this TUI's session
@@ -485,19 +490,32 @@ where
             }
         }
 
-        // Check for queued messages - start processing if agent is idle
+        // Check for queued messages - start processing if agent is idle. The
+        // run lease is taken before any message leaves the queue.
         if agent_handle.is_none()
             && let Some(w) = worker.as_ref()
-            && let Some(msg) = runtime_deps.take_next_dispatchable(app).await?
         {
-            runtime_deps.mark_running(app).await?;
-            agent_handle = Some(
-                runtime_deps
-                    .start_agent_task(app, w, msg, &mut pending_title_gen)
-                    .await?,
-            );
-            assistant_response.clear();
-            continue;
+            match runtime_deps.begin_queued_run(app).await? {
+                QueuedRunStart::Started(msg) => {
+                    busy_elsewhere_notified = false;
+                    agent_handle = Some(
+                        runtime_deps
+                            .start_agent_task(app, w, msg, &mut pending_title_gen)
+                            .await?,
+                    );
+                    assistant_response.clear();
+                    continue;
+                }
+                QueuedRunStart::Busy => {
+                    if !busy_elsewhere_notified {
+                        busy_elsewhere_notified = true;
+                        app.set_status(
+                            "This session is running elsewhere; the message stays queued",
+                        );
+                    }
+                }
+                QueuedRunStart::Nothing => busy_elsewhere_notified = false,
+            }
         }
 
         // DIAGNOSTIC: Check channel states before entering select
@@ -653,6 +671,7 @@ where
                                     &mut agent_handle,
                                     &mut pending_title_gen,
                                     &assistant_response,
+                                    RunOutcome::Completed,
                                 )
                                 .await;
                         }
@@ -682,6 +701,7 @@ where
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
+                                RunOutcome::Completed,
                             )
                             .await;
                     }
@@ -693,6 +713,7 @@ where
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
+                                RunOutcome::Failed,
                             )
                             .await;
                     }
@@ -756,6 +777,7 @@ where
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
+                                RunOutcome::Cancelled,
                             )
                             .await;
                         continue;
@@ -822,13 +844,19 @@ where
                         if agent_handle.is_none()
                             && let Some(w) = worker.as_ref()
                         {
-                            runtime_deps.mark_running(app).await?;
-                            agent_handle = Some(
-                                runtime_deps
-                                    .start_agent_task(app, w, msg, &mut pending_title_gen)
-                                    .await?,
-                            );
-                            assistant_response.clear();
+                            if runtime_deps.begin_run(app).await? {
+                                agent_handle = Some(
+                                    runtime_deps
+                                        .start_agent_task(app, w, msg, &mut pending_title_gen)
+                                        .await?,
+                                );
+                                assistant_response.clear();
+                            } else {
+                                app.chat.push_notice(
+                                    "This session is running elsewhere; the message stays queued",
+                                );
+                                runtime_deps.enqueue_pending_message(app, msg).await?;
+                            }
                         } else if worker.is_none() && worker_build.is_some() {
                             // The session's worker is still being prepared;
                             // it picks the message up from the queue.
