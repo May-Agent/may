@@ -1,0 +1,1 @@
+Usage:{% if let Some(tokens) = prompt %} prompt={{ tokens }}{% endif %}{% if let Some(tokens) = cache_read %} cache_read={{ tokens }}{% endif %}{% if let Some(tokens) = cache_write %} cache_write={{ tokens }}{% endif %}{% if let Some(tokens) = completion %} completion={{ tokens }}{% endif %}{% if let Some(tokens) = total %} total={{ tokens }}{% endif %}
