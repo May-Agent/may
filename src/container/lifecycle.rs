@@ -28,6 +28,9 @@ pub fn container_workspace_path(file_name: &str) -> String {
     format!("{CONTAINER_WORKSPACE}/{file_name}")
 }
 
+/// Workspace subdirectories bind-mounted into the container's `~/.may`.
+const WORKSPACE_MOUNT_DIRS: [&str; 2] = ["skills", "subagents"];
+
 const LABEL_MANAGED: &str = "may.managed";
 const LABEL_SPEC_FINGERPRINT: &str = "may.spec-fingerprint";
 const SPEC_FINGERPRINT_REVISION: &str = "2026-03-17-v8";
@@ -214,6 +217,11 @@ impl ContainerManager {
         shared_paths: &SharedHostPaths,
         spec_fingerprint: &str,
     ) -> Result<String, ContainerError> {
+        // A bind mount whose source is missing fails the create, so the
+        // workspace subdirectories the container mounts exist first.
+        for dir in WORKSPACE_MOUNT_DIRS {
+            async_fs::create_dir_all(spec.workspace.join(dir)).await?;
+        }
         let env = Self::effective_env(spec, host_gateway);
         let mounts = Self::effective_mounts(spec, shared_paths);
 
@@ -368,22 +376,15 @@ impl ContainerManager {
                 read_only: Some(false),
                 ..Default::default()
             },
-            // Session-scoped skill/subagent roots mapped into container ~/.may.
-            Mount {
-                target: Some("/root/.may/skills".to_string()),
-                source: Some(spec.workspace.join("skills").display().to_string()),
-                typ: Some(MountType::BIND),
-                read_only: Some(false),
-                ..Default::default()
-            },
-            Mount {
-                target: Some("/root/.may/subagents".to_string()),
-                source: Some(spec.workspace.join("subagents").display().to_string()),
-                typ: Some(MountType::BIND),
-                read_only: Some(false),
-                ..Default::default()
-            },
         ];
+        // Workspace-scoped skill/subagent roots mapped into container ~/.may.
+        mounts.extend(WORKSPACE_MOUNT_DIRS.iter().map(|dir| Mount {
+            target: Some(format!("/root/.may/{dir}")),
+            source: Some(spec.workspace.join(dir).display().to_string()),
+            typ: Some(MountType::BIND),
+            read_only: Some(false),
+            ..Default::default()
+        }));
 
         for mount in &spec.mounts {
             mounts.push(Mount {
