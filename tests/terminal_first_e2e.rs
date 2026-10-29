@@ -2562,3 +2562,156 @@ async fn ui_chat_reports_unreachable_provider_error() {
 
     server.stop().await;
 }
+
+/// Upper bound on one container-profile task run, including its container
+/// start.
+const CONTAINER_TASK_RUN_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Which script source a task under test uses.
+#[derive(Debug, Clone, Copy)]
+enum TaskScriptSource {
+    Inline,
+    File,
+}
+
+/// A container-profile task runs its script and reads its trigger file, so
+/// the script and trigger paths in the command resolve inside the container.
+async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("unused".to_string())).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Container
+        .prepare(&harness, &client, &server)
+        .await;
+
+    let script = r#"cat "$MAY_TASK_TRIGGER_FILE""#;
+    let script_dir = tempfile::tempdir().expect("script dir should be created");
+    let script_fields = match source {
+        TaskScriptSource::Inline => serde_json::json!({ "scriptInline": script }),
+        TaskScriptSource::File => {
+            let path = script_dir.path().join("trigger-reader.sh");
+            tokio::fs::write(&path, script)
+                .await
+                .expect("script file should be written");
+            serde_json::json!({ "scriptPath": path.display().to_string() })
+        }
+    };
+    let mut body = serde_json::json!({
+        "profileId": environment.profile_id(),
+        "name": "container trigger reader",
+        "trigger": { "kind": "event", "eventName": "e2e.container.trigger" },
+        "timeoutSecs": 120,
+    });
+    body.as_object_mut()
+        .expect("task body is an object")
+        .extend(
+            script_fields
+                .as_object()
+                .expect("script fields are an object")
+                .clone(),
+        );
+
+    let response = client
+        .post(format!("{}/api/tasks", server.base_url))
+        .json(&body)
+        .send()
+        .await
+        .expect("create task request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let created: Value = response.json().await.expect("task response should be JSON");
+    let task_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("task response should include id")
+        .to_string();
+
+    let response = client
+        .post(format!("{}/api/tasks/{task_id}/run", server.base_url))
+        .send()
+        .await
+        .expect("run task request should succeed");
+    expect_status(&server.log, response, StatusCode::OK).await;
+
+    let deadline = Instant::now() + CONTAINER_TASK_RUN_TIMEOUT;
+    let task = loop {
+        let response = client
+            .get(format!("{}/api/tasks/{task_id}", server.base_url))
+            .send()
+            .await
+            .expect("get task request should succeed");
+        let response = expect_status(&server.log, response, StatusCode::OK).await;
+        let task: Value = response.json().await.expect("task response should be JSON");
+        let status = task.get("lastRunStatus").and_then(Value::as_str);
+        if matches!(status, Some("success" | "failed")) {
+            break task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task did not finish within {CONTAINER_TASK_RUN_TIMEOUT:?}; task: {task}; server logs:\n{}",
+            server.log.contents().await
+        );
+        sleep(Duration::from_millis(500)).await;
+    };
+
+    assert_eq!(
+        task.get("lastRunStatus").and_then(Value::as_str),
+        Some("success"),
+        "the task should succeed; task: {task}; server logs:\n{}",
+        server.log.contents().await
+    );
+    let output = task
+        .get("lastRunOutput")
+        .and_then(Value::as_str)
+        .expect("a finished task should record its output");
+    assert!(
+        output.contains(&task_id),
+        "the script should print the trigger file, which names the task; output: {output}"
+    );
+
+    server.stop().await;
+    if let PreparedEnvironment::Container {
+        profile_id,
+        manager,
+    } = environment
+    {
+        let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
+            .await
+            .expect("session persistence should initialize");
+        let profile = db
+            .get_profile(&profile_id)
+            .await
+            .expect("profile lookup should succeed")
+            .expect("container profile should exist");
+        let name = format!("may-{}", profile.slug.as_deref().unwrap_or(&profile.id));
+        let container_id = manager
+            .resolve_container_id_by_name(&name)
+            .await
+            .expect("task container lookup should succeed")
+            .unwrap_or_else(|| panic!("task container {name} should exist"));
+        manager
+            .remove(&container_id)
+            .await
+            .expect("task container should be removed");
+    }
+}
+
+#[tokio::test]
+#[serial]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "container runtimes are expected only on Linux"
+)]
+async fn container_profile_inline_script_task_reads_its_trigger_file() {
+    container_task_reads_its_trigger_file(TaskScriptSource::Inline).await;
+}
+
+#[tokio::test]
+#[serial]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "container runtimes are expected only on Linux"
+)]
+async fn container_profile_script_file_task_reads_its_trigger_file() {
+    container_task_reads_its_trigger_file(TaskScriptSource::File).await;
+}
