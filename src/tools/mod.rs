@@ -2,12 +2,13 @@
 
 use aither_sandbox::{ToolDistribution, ToolRuntimeError};
 
-/// Release asset `tool-distribution-0.7.0.json` of aither v0.7.0, byte for byte.
-const EMBEDDED_DISTRIBUTION: &[u8] = include_bytes!("tool-distribution-0.7.0.json");
-/// SHA-256 of the aither v0.7.0 `tool-distribution-0.7.0.json` release asset.
+/// Release asset `tool-distribution-0.11.0.json` of aither's `patch-v0.11.0`
+/// release, byte for byte.
+const EMBEDDED_DISTRIBUTION: &[u8] = include_bytes!("tool-distribution-0.11.0.json");
+/// SHA-256 of the `patch-v0.11.0` `tool-distribution-0.11.0.json` release asset.
 #[cfg(test)]
 const EMBEDDED_DISTRIBUTION_SHA256: &str =
-    "fc8670fa02e7619b6b099a46e8889a5533b3ea23c0fb5e281b25da1f07c28ac8";
+    "c0108572ea69c8ab7efb4dc9aba07c355f82c9efe1d04e4c7219b8ffd236fc7d";
 
 /// Loads the embedded, hash-pinned baseline distribution.
 ///
