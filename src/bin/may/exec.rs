@@ -46,6 +46,10 @@ pub enum ExecError {
     ResolveEnvironment(may_agent::ResolveAgentEnvironmentError),
     #[error("failed to load MCP terminal commands: {0}")]
     LoadMcpConnections(may_agent::mcp::McpConnectionLoadError),
+    #[error("failed to read the current working directory: {0}")]
+    CurrentDir(std::io::Error),
+    #[error("failed to resolve the session issue backend: {0}")]
+    ResolveIssueBackend(may_agent::issue::IssueError),
     #[error("failed to resolve provider runtime: {0}")]
     ResolveProviderRuntime(may_agent::agent::MayAgentError),
     #[error("failed to load May config: {0}")]
@@ -455,6 +459,16 @@ where
     LLM: aither_core::LanguageModel + Clone + 'static,
 {
     let mut builder = aither_sandbox::ToolRegistryBuilder::new();
+    let session_paths = SessionPaths::new(context.sandbox_dir.clone());
+    // Issues belong to the project `may exec` runs in, as for the TUI and
+    // UI server, never to the session sandbox.
+    let cwd = std::env::current_dir().map_err(ExecError::CurrentDir)?;
+    let issue_store = may_agent::issue::resolve_issue_store(
+        &cwd,
+        &session_paths.workspace_config(),
+        context.db.clone(),
+    )
+    .map_err(ExecError::ResolveIssueBackend)?;
     register_shared_terminal_commands(
         &mut builder,
         SharedTerminalCommandConfig {
@@ -485,6 +499,7 @@ where
             request_parameters: aither_core::llm::model::Parameters::default(),
             // exec has no UI reader; the tracker still records harmlessly.
             subagent_tracker: may_agent::agent::SubagentTracker::default(),
+            issue_store,
         },
     )
     .await

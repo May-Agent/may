@@ -5,6 +5,7 @@
 mod common;
 mod context_snapshot;
 pub mod entity;
+mod issue;
 mod logs;
 mod memory;
 mod message;
