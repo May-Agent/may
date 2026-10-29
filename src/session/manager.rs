@@ -661,6 +661,26 @@ impl SessionManager {
         Ok(i64::from(row.id))
     }
 
+    /// Append a message to the current session as part of a run: persisted
+    /// only while the run's lease `fence` still holds, and recorded in the
+    /// in-memory history only once it is.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::NoActiveSession`] when no session is active, or [`SessionError`] on persistence failure, a lost lease included.
+    pub async fn append_message_as_run(
+        &mut self,
+        fence: &crate::db::RunFence,
+        message: ChatMessage,
+    ) -> Result<i64, SessionError> {
+        self.ensure_persisted().await?;
+
+        let session = self.current.as_mut().ok_or(SessionError::NoActiveSession)?;
+        let row = self.db.append_chat_message_as_run(fence, &message).await?;
+        session.history.push(message);
+
+        Ok(i64::from(row.id))
+    }
+
     /// Rewind the current session's conversation to just before the user
     /// message at `prompt_index` (a position in
     /// [`ChatHistory::messages`]). The user message, its attached hidden

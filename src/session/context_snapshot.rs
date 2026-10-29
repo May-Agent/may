@@ -1,7 +1,10 @@
 use aither_agent::{AgentCheckpoint, CheckpointContext};
 use aither_core::llm::Message as LlmMessage;
 
-use crate::{MayAgent, db::ChatDb};
+use crate::{
+    MayAgent,
+    db::{ChatDb, RunFence},
+};
 
 /// A context snapshot persisted for a session, used to resume without a full
 /// history replay.
@@ -117,12 +120,12 @@ pub async fn load_persisted_context_snapshot(
 
 async fn persist_checkpoint(
     db: &ChatDb,
-    session_id: &str,
+    fence: &RunFence,
     checkpoint: AgentCheckpoint,
 ) -> Result<(), crate::db::ChatDbError> {
-    let last_message_db_id = db.max_message_id(session_id).await?;
-    db.upsert_session_context_snapshot(
-        session_id,
+    let last_message_db_id = db.max_message_id(&fence.session_id).await?;
+    db.upsert_session_context_snapshot_as_run(
+        fence,
         crate::db::SessionContextSnapshotUpsert {
             checkpoint,
             last_message_db_id,
@@ -133,7 +136,7 @@ async fn persist_checkpoint(
 }
 
 /// Persist a checkpoint produced by a checkpoint hook as the session's
-/// context snapshot.
+/// context snapshot, as the run holding `fence`.
 ///
 /// # Errors
 ///
@@ -141,14 +144,14 @@ async fn persist_checkpoint(
 /// message ID or upserting the snapshot fails.
 pub async fn persist_checkpoint_from_hook(
     db: &ChatDb,
-    session_id: &str,
+    fence: &RunFence,
     ctx: &CheckpointContext<'_>,
 ) -> Result<(), crate::db::ChatDbError> {
-    persist_checkpoint(db, session_id, checkpoint_from_hook(ctx)).await
+    persist_checkpoint(db, fence, checkpoint_from_hook(ctx)).await
 }
 
 /// Export the agent's checkpoint and persist it as the session's context
-/// snapshot.
+/// snapshot, as the run holding `fence`.
 ///
 /// # Errors
 ///
@@ -157,10 +160,10 @@ pub async fn persist_checkpoint_from_hook(
 /// when storing the snapshot fails.
 pub async fn persist_agent_context_snapshot(
     db: &ChatDb,
-    session_id: &str,
+    fence: &RunFence,
     agent: &mut MayAgent,
 ) -> Result<(), PersistContextSnapshotError> {
     let checkpoint = agent.export_checkpoint().await?;
-    persist_checkpoint(db, session_id, checkpoint).await?;
+    persist_checkpoint(db, fence, checkpoint).await?;
     Ok(())
 }

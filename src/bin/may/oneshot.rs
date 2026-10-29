@@ -14,6 +14,7 @@ use jiff::Timestamp;
 
 use may_agent::agent::{AgentWorker, TuiEvent};
 use may_agent::ask_user;
+use may_agent::session::RunOutcome;
 use may_agent::tui::runtime::{AssistantReply, LocalSessionRuntime, RuntimeDeps, TitleGenContext};
 use may_agent::tui::{App, PendingMessage};
 use may_agent::workspace_request;
@@ -127,7 +128,9 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = AssistantReply::default();
     let mut active_tool_calls = std::collections::HashSet::<String>::new();
-    runtime_deps.mark_running(&app).await?;
+    if !runtime_deps.begin_run(&mut app).await? {
+        anyhow::bail!("the session is already running in another May process");
+    }
     let prompt = build_oneshot_prompt_with_mentions(&app, &args.prompt).await?;
     let handle = runtime_deps
         .start_agent_task(
@@ -181,6 +184,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     &mut agent_handle,
                     &mut pending_title_gen,
                     &assistant_response,
+                    RunOutcome::Completed,
                 )
                 .await;
             output.end_text_line()?;
@@ -241,6 +245,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                             &mut agent_handle,
                             &mut pending_title_gen,
                             &assistant_response,
+                            if run_failed {
+                                RunOutcome::Failed
+                            } else {
+                                RunOutcome::Completed
+                            },
                         )
                         .await;
                     if run_failed {
@@ -257,6 +266,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         &mut None,
                         &mut pending_title_gen,
                         &assistant_response,
+                        RunOutcome::Completed,
                     )
                     .await;
                 output.end_text_line()?;
@@ -271,6 +281,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         &mut None,
                         &mut pending_title_gen,
                         &assistant_response,
+                        RunOutcome::Failed,
                     )
                     .await;
                 anyhow::bail!(error);

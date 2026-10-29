@@ -25,11 +25,12 @@ use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec
 
 use crate::agent::MayAgent;
 use crate::ask_user;
+use crate::db::RunFence;
 use crate::prompt_mentions;
 use crate::session::{
-    ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths, MessageRole, PendingUserMessage,
-    PersistedAttachment, SessionId, SessionPaths, SessionRuntimeState, SessionStore,
-    TerminalRuntimeState,
+    AcquireError, ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths, MessageRole,
+    PendingUserMessage, PersistedAttachment, RunOutcome, SessionId, SessionPaths, SessionRunGuard,
+    SessionRuntimeState, SessionStore, TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 use crate::ui_event_bus::UiEventTopics;
@@ -656,101 +657,18 @@ fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
     }
 }
 
-struct SessionRunRegistration {
-    state: Arc<UiServerState>,
-    session_id: String,
-    receiver: async_channel::Receiver<()>,
-}
-
-impl SessionRunRegistration {
-    /// Claim the session's run, or `Ok(None)` when another run holds it.
-    ///
-    /// A storage failure is an error, never a refusal: reporting it as "the
-    /// session is already active" would hide the failure behind a conflict.
-    async fn try_new(
-        state: Arc<UiServerState>,
-        session_id: impl Into<String>,
-    ) -> Result<Option<Self>, crate::db::ChatDbError> {
-        let session_id = session_id.into();
-        if !state
-            .db()
-            .claim_session_run_lease(session_id.as_str())
-            .await?
-        {
-            return Ok(None);
-        }
-        let Some(receiver) = state.run_cancellation_registry.try_open(&session_id) else {
-            state
-                .db()
-                .release_session_run_lease(session_id.as_str())
-                .await?;
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            state,
-            session_id,
-            receiver,
-        }))
-    }
-
-    const fn receiver(&self) -> &async_channel::Receiver<()> {
-        &self.receiver
-    }
-
-    async fn close(&self) -> Result<(), crate::db::ChatDbError> {
-        let released = self
-            .state
-            .db()
-            .release_session_run_lease(self.session_id.as_str())
-            .await;
-        self.state.run_cancellation_registry.close(&self.session_id);
-        released
-    }
-}
-
-/// The run registration a client turn proceeds with, or the response that
-/// refuses it: a conflict when another run holds the session, an internal
-/// error when claiming the run failed.
-fn registration_or_refusal<T>(claim: Result<Option<T>, crate::db::ChatDbError>) -> SkyResult<T> {
-    claim
-        .map_err(internal_error)?
-        .ok_or_else(active_session_conflict_error)
-}
-
-impl Drop for SessionRunRegistration {
-    fn drop(&mut self) {
-        self.state.run_cancellation_registry.close(&self.session_id);
+/// The response that refuses a client turn: a conflict when another run holds
+/// the session, an internal error when acquiring the run failed.
+fn acquire_refusal(error: AcquireError) -> skyzen::Error {
+    match error {
+        AcquireError::Busy(_) => active_session_conflict_error(),
+        AcquireError::Storage(error) => internal_error(error),
     }
 }
 
 fn active_session_conflict_error() -> skyzen::Error {
     skyzen::Error::msg("session is already active; send this message via steer or queue instead")
         .set_status(skyzen::StatusCode::CONFLICT)
-}
-
-const STOP_WAIT_POLL_INTERVAL_MS: u64 = 120;
-
-async fn wait_for_session_stop_settlement(
-    state: &UiServerState,
-    session_id: &str,
-) -> Result<crate::session::SessionRuntimeSummary, crate::db::ChatDbError> {
-    loop {
-        let runtime = state.runtime_service.get(session_id).await?;
-        let lease_active = state.db().session_run_lease_active(session_id).await?;
-
-        if !lease_active && !runtime.interactions.is_active() {
-            if runtime.state.is_active() {
-                state
-                    .runtime_service
-                    .clear_running_if_needed(session_id)
-                    .await?;
-                return state.runtime_service.get(session_id).await;
-            }
-            return Ok(runtime);
-        }
-
-        async_io::Timer::after(Duration::from_millis(STOP_WAIT_POLL_INTERVAL_MS)).await;
-    }
 }
 
 fn persisted_attachments(
@@ -799,31 +717,15 @@ pub fn api_attachments_from_persisted(
         .collect()
 }
 
-async fn set_session_runtime_state(
+/// Record that the run is executing again after a wait, as the lease holder.
+async fn mark_run_running(
     state: &Arc<UiServerState>,
-    session_id: &str,
-    runtime_state: SessionRuntimeState,
+    fence: &RunFence,
 ) -> Result<(), crate::db::ChatDbError> {
     state
         .runtime_service
-        .set_state(session_id, runtime_state)
+        .set_state_as_run(fence, SessionRuntimeState::Running)
         .await
-}
-
-async fn clear_running_state_if_needed(
-    state: &Arc<UiServerState>,
-    session_id: &str,
-) -> Result<(), crate::db::ChatDbError> {
-    state
-        .runtime_service
-        .clear_running_if_needed(session_id)
-        .await?;
-    // A chat turn persists its buffered messages before reaching this boundary.
-    // Refresh the profile snapshot only after the turn has settled so every UI
-    // client can invalidate its active-session history without racing the
-    // per-turn chat stream.
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(())
 }
 
 async fn set_terminal_runtime_state(
@@ -852,73 +754,81 @@ async fn clear_terminal_runtime_state(
 pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
-        let run_registration =
-            match SessionRunRegistration::try_new(state.clone(), session_id.clone()).await {
-                Ok(Some(run_registration)) => run_registration,
-                // The run holding the session dispatches pending work when it ends.
-                Ok(None) => return,
-                Err(error) => {
-                    tracing::error!(session_id = %session_id, error = %error, "failed to claim session run for follow-up dispatch");
-                    return;
-                }
-            };
-
-        loop {
-            let next = match state
-                .runtime_service
-                .take_next_dispatchable(&session_id)
-                .await
-            {
-                Ok(next) => next,
-                Err(error) => {
-                    tracing::warn!(session_id = %session_id, error = %error, "failed to load next pending message");
-                    break;
-                }
-            };
-            let Some(next) = next else {
-                break;
-            };
-
-            let request = ChatRequest {
-                session_id: session_id.clone(),
-                content: next.content,
-                attachments: api_attachments_from_persisted(next.attachments),
-                hidden_context_xml: next.hidden_context_xml,
-                delivery_mode: next.delivery_mode,
-            };
-            if let Err(error) =
-                Box::pin(run_chat_collect_with_receiver(
-                    state.clone(),
-                    request,
-                    true,
-                    true,
-                    run_registration.receiver(),
-                ))
-                .await
-            {
-                tracing::warn!(session_id = %session_id, error = %error, "follow-up run failed");
-                break;
+        let guard = match state.runtime_service.runs().acquire(&session_id).await {
+            Ok(guard) => guard,
+            // The run holding the session looks for pending work again when
+            // it ends, after releasing, so it sees what was enqueued here.
+            Err(AcquireError::Busy(_)) => return,
+            Err(AcquireError::Storage(error)) => {
+                tracing::error!(session_id = %session_id, error = %error, "failed to acquire session run for follow-up dispatch");
+                return;
             }
-        }
-
-        if let Err(error) = run_registration.close().await {
-            tracing::error!(session_id = %session_id, error = %error, "failed to release session run after follow-up dispatch");
-        }
-        if let Err(error) = clear_running_state_if_needed(&state, &session_id).await {
-            tracing::error!(session_id = %session_id, error = %error, "failed to clear running state after follow-up dispatch");
-        }
+        };
+        dispatch_follow_ups(state, guard).await;
     });
 }
 
-async fn spawn_follow_up_runs_if_dispatchable(
-    state: &Arc<UiServerState>,
-    session_id: &str,
-) -> Result<(), crate::db::ChatDbError> {
-    let runtime = state.runtime_service.get(session_id).await?;
-    if runtime.can_dispatch_follow_up() {
-        spawn_follow_up_runs(state.clone(), session_id.to_string());
+/// Continue a run that [`SessionRunGuard::finish`] re-acquired for pending work.
+fn spawn_continued_run(state: Arc<UiServerState>, guard: SessionRunGuard) {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(dispatch_follow_ups(state, guard));
+}
+
+/// Run the session's pending messages one after another under `guard`,
+/// until the queue is empty and finishing the guard finds no new work.
+async fn dispatch_follow_ups(state: Arc<UiServerState>, mut guard: SessionRunGuard) {
+    let session_id = guard.session_id().to_string();
+    loop {
+        let next = match state.runtime_service.take_next_for_run(&session_id).await {
+            Ok(next) => next,
+            Err(error) => {
+                tracing::warn!(session_id = %session_id, error = %error, "failed to load next pending message");
+                finish_failed_run(guard).await;
+                return;
+            }
+        };
+        let Some(next) = next else {
+            match guard.finish(RunOutcome::Completed).await {
+                Ok(Some(continued)) => {
+                    guard = continued;
+                    continue;
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::error!(session_id = %session_id, error = %error, "failed to release session run after follow-up dispatch");
+                    return;
+                }
+            }
+        };
+
+        let request = ChatRequest {
+            session_id: session_id.clone(),
+            content: next.content,
+            attachments: api_attachments_from_persisted(next.attachments),
+            hidden_context_xml: next.hidden_context_xml,
+            delivery_mode: next.delivery_mode,
+        };
+        if let Err(error) = Box::pin(run_chat_collect_with_receiver(
+            state.clone(),
+            request,
+            true,
+            true,
+            &guard,
+        ))
+        .await
+        {
+            tracing::warn!(session_id = %session_id, error = %error, "follow-up run failed");
+            finish_failed_run(guard).await;
+            return;
+        }
     }
-    Ok(())
+}
+
+async fn finish_failed_run(guard: SessionRunGuard) {
+    let session_id = guard.session_id().to_string();
+    if let Err(error) = guard.finish_idle(RunOutcome::Failed).await {
+        tracing::error!(session_id = %session_id, error = %error, "failed to release failed session run");
+    }
 }
 
 pub(super) async fn resume_pending_follow_up_runs(
@@ -1118,15 +1028,17 @@ pub(super) async fn stop_session_run(
         );
     }
 
-    let persisted_cancel = state
-        .db()
-        .request_session_run_cancel(&session_id)
+    let cancelled = state
+        .runtime_service
+        .runs()
+        .cancel(&session_id)
         .await
         .map_err(internal_error)?;
-    let cancelled = state.run_cancellation_registry.cancel(&session_id) || persisted_cancel;
     tracing::info!(session_id = %session_id, cancelled, "received session stop request");
 
-    let runtime = wait_for_session_stop_settlement(&state, &session_id)
+    let runtime = state
+        .runtime_service
+        .settle_stopped(&session_id)
         .await
         .map_err(internal_error)?;
     Ok(Json(runtime.into()))
@@ -1145,9 +1057,12 @@ pub(super) async fn chat_stream(
         return Err(active_session_conflict_error());
     }
 
-    let run_registration = registration_or_refusal(
-        SessionRunRegistration::try_new(state.clone(), req.session_id.clone()).await,
-    )?;
+    let run_guard = state
+        .runtime_service
+        .runs()
+        .acquire(&req.session_id)
+        .await
+        .map_err(acquire_refusal)?;
     let (sender, sse) = Sse::channel();
 
     let tokio_handle = state.tokio_handle.clone();
@@ -1156,7 +1071,7 @@ pub(super) async fn chat_stream(
             state.clone(),
             req,
             sender.clone(),
-            run_registration,
+            run_guard,
         ))
         .await
         {
@@ -1250,7 +1165,7 @@ fn run_agent_loop<'a>(
     state: &'a Arc<UiServerState>,
     req: &'a ChatRequest,
     sink: &'a mut impl ChatSink,
-    cancel_rx: &'a async_channel::Receiver<()>,
+    guard: &'a SessionRunGuard,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
 ) -> Pin<Box<impl Future<Output = Result<AgentRunResult, AgentLoopError>> + 'a>> {
@@ -1288,6 +1203,7 @@ fn run_agent_loop<'a>(
             } = match prepare_agent_for_request(
                 state,
                 req,
+                guard.fence(),
                 persist_user_message && attempt == 0,
                 use_persisted_context_snapshot,
                 attempt,
@@ -1341,7 +1257,7 @@ fn run_agent_loop<'a>(
             let mut last_todo_hash: Option<u64> = None;
             let session_paths =
                 session_paths_for_session(state, profile_id.as_deref(), &session_id);
-            let mut turn_persister = turn_persister::TurnPersister::new(session_id.as_str());
+            let mut turn_persister = turn_persister::TurnPersister::new(guard.fence().clone());
 
             let mut terminal_error: Option<aither_agent::AgentError> = None;
             let mut cancellation_reason: Option<&'static str> = None;
@@ -1359,8 +1275,10 @@ fn run_agent_loop<'a>(
                 loop {
                     let next_event = tokio::select! {
                         biased;
-                        cancel = cancel_rx.recv() => {
-                            if cancel == Ok(()) {
+                        cancel = guard.cancellation().recv() => {
+                            if cancel == Ok(()) && guard.is_lost() {
+                                cancellation_reason = Some("session run lease lost");
+                            } else if cancel == Ok(()) {
                                 cancellation_reason = Some("run cancelled by user");
                             } else {
                                 cancellation_reason = Some("run cancellation channel closed unexpectedly");
@@ -1529,12 +1447,7 @@ fn run_agent_loop<'a>(
                                 name.as_str(),
                                 "terminal" | "terminal_input" | "terminal_kill" | "terminal_read"
                             ) {
-                                set_session_runtime_state(
-                                    state,
-                                    session_id.as_str(),
-                                    SessionRuntimeState::Running,
-                                )
-                                .await?;
+                                mark_run_running(state, guard.fence()).await?;
                             }
                             // Buffer accumulated text segment before the tool call.
                             if !segment_text.trim().is_empty() {
@@ -1667,12 +1580,7 @@ fn run_agent_loop<'a>(
                         Ok(aither_agent::AgentEvent::BackgroundTaskCompleted { .. }) => {
                             saw_tool_activity = true;
                             clear_terminal_runtime_state(state, session_id.as_str()).await?;
-                            set_session_runtime_state(
-                                state,
-                                session_id.as_str(),
-                                SessionRuntimeState::Running,
-                            )
-                            .await?;
+                            mark_run_running(state, guard.fence()).await?;
                         }
                         Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
                             terminal_error = Some(err);
@@ -1869,19 +1777,10 @@ async fn stream_chat_events(
     state: Arc<UiServerState>,
     req: ChatRequest,
     sender: skyzen::responder::sse::Sender,
-    run_registration: SessionRunRegistration,
+    guard: SessionRunGuard,
 ) -> Result<(), crate::db::ChatDbError> {
-    set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running).await?;
     let mut sink = SseSink::new(sender.clone());
-    let result = run_agent_loop(
-        &state,
-        &req,
-        &mut sink,
-        run_registration.receiver(),
-        true,
-        true,
-    )
-    .await;
+    let result = run_agent_loop(&state, &req, &mut sink, &guard, true, true).await;
     let response_session_id = req.session_id.clone();
     match result {
         Ok(result) => {
@@ -1893,14 +1792,13 @@ async fn stream_chat_events(
             };
             // Release the session before announcing the end of the turn, so
             // a client that sends its next message on `done` is never refused
-            // as a concurrent run. For the same reason the follow-up
-            // dispatcher starts only when there is pending work: it claims
-            // the session's run, and claiming it with nothing to dispatch
-            // would refuse that next message.
-            run_registration.close().await?;
-            clear_running_state_if_needed(&state, &response_session_id).await?;
+            // as a concurrent run. Finishing continues the session under a
+            // new guard only when there is pending work to dispatch.
+            let continued = guard.finish(RunOutcome::Completed).await?;
             send_event(&sender, "done", &done_event).await;
-            spawn_follow_up_runs_if_dispatchable(&state, &response_session_id).await?;
+            if let Some(continued) = continued {
+                spawn_continued_run(state.clone(), continued);
+            }
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
             let done_event = SseDoneEvent {
@@ -1909,15 +1807,18 @@ async fn stream_chat_events(
                 session_id: response_session_id.clone(),
                 assistant: api_message_from_run_result(*result),
             };
-            run_registration.close().await?;
-            clear_running_state_if_needed(&state, &response_session_id).await?;
+            let continued = guard.finish(RunOutcome::Completed).await?;
             send_event(&sender, "paused", &done_event).await;
-            spawn_follow_up_runs_if_dispatchable(&state, &response_session_id).await?;
+            if let Some(continued) = continued {
+                spawn_continued_run(state.clone(), continued);
+            }
         }
         // Errors are already sent to the sink via on_error in run_agent_loop.
+        Err(AgentLoopError::Cancelled(_)) => {
+            guard.finish_idle(RunOutcome::Cancelled).await?;
+        }
         Err(_) => {
-            run_registration.close().await?;
-            clear_running_state_if_needed(&state, &response_session_id).await?;
+            guard.finish_idle(RunOutcome::Failed).await?;
         }
     }
     Ok(())
@@ -1926,39 +1827,25 @@ async fn stream_chat_events(
 /// Drive a chat turn without an attached SSE client — used by the follow-up
 /// queue to dispatch server-side enqueued messages. All assistant text and
 /// tool events are still persisted by the main loop; the sink only
-/// suppresses network emission.
+/// suppresses network emission. The caller keeps the run's guard and settles
+/// it once the queue is drained.
 async fn run_chat_collect_with_receiver(
     state: Arc<UiServerState>,
     req: ChatRequest,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
-    cancel_rx: &async_channel::Receiver<()>,
+    guard: &SessionRunGuard,
 ) -> Result<(), ChatCollectError> {
-    set_session_runtime_state(&state, &req.session_id, SessionRuntimeState::Running)
-        .await
-        .map_err(internal_error)
-        .map_err(ChatCollectError::from)?;
     let mut sink = CollectSink;
     let result = run_agent_loop(
         &state,
         &req,
         &mut sink,
-        cancel_rx,
+        guard,
         persist_user_message,
         use_persisted_context_snapshot,
     )
     .await;
-    let takeover_paused = matches!(&result, Err(AgentLoopError::BrowserTakeoverPaused(_)));
-    clear_running_state_if_needed(&state, &req.session_id)
-        .await
-        .map_err(internal_error)
-        .map_err(ChatCollectError::from)?;
-    if takeover_paused {
-        spawn_follow_up_runs_if_dispatchable(&state, &req.session_id)
-            .await
-            .map_err(internal_error)
-            .map_err(ChatCollectError::from)?;
-    }
     match result {
         Ok(_) | Err(AgentLoopError::BrowserTakeoverPaused(_)) => Ok(()),
         Err(AgentLoopError::Preparation(error)) => Err(ChatCollectError::Preparation(error)),
@@ -2298,6 +2185,7 @@ impl From<skyzen::Error> for ChatCollectError {
 async fn resolve_session_context(
     state: &Arc<UiServerState>,
     req: &ChatRequest,
+    fence: &RunFence,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
 ) -> Result<SessionContext, UiChatPreparationError> {
@@ -2382,7 +2270,7 @@ async fn resolve_session_context(
     if persist_user_message && take_over_alert_pending(state, &session_id).await {
         push_hidden_context_part(
             &db,
-            &session_id,
+            fence,
             &history,
             &mut hidden_context_parts,
             browser_takeover_alert(),
@@ -2400,7 +2288,7 @@ async fn resolve_session_context(
     {
         push_hidden_context_part(
             &db,
-            &session_id,
+            fence,
             &history,
             &mut hidden_context_parts,
             hidden_context_xml.to_string(),
@@ -2416,7 +2304,7 @@ async fn resolve_session_context(
     {
         push_hidden_context_part(
             &db,
-            &session_id,
+            fence,
             &history,
             &mut hidden_context_parts,
             session_mentions_xml,
@@ -2443,7 +2331,7 @@ async fn resolve_session_context(
     {
         push_hidden_context_part(
             &db,
-            &session_id,
+            fence,
             &history,
             &mut hidden_context_parts,
             file_mentions_xml,
@@ -2462,8 +2350,8 @@ async fn resolve_session_context(
                 .map_err(UiChatPreparationError::UpdateSessionTitle)?;
             state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
         }
-        db.append_chat_message(
-            session_id.as_str(),
+        db.append_chat_message_as_run(
+            fence,
             &ChatMessage::user_with_attachments(
                 req.content.clone(),
                 persisted_attachments(req.attachments.clone()),
@@ -2528,7 +2416,7 @@ fn session_paths_for_session(
 
 async fn push_hidden_context_part(
     db: &crate::db::ChatDb,
-    session_id: &SessionId,
+    fence: &RunFence,
     history: &ChatHistory,
     hidden_context_parts: &mut Vec<String>,
     content: String,
@@ -2546,11 +2434,8 @@ async fn push_hidden_context_part(
             matches!(message.role, MessageRole::HiddenContext) && message.content == trimmed
         })
     {
-        db.append_chat_message(
-            session_id.as_str(),
-            &ChatMessage::hidden_context(trimmed.to_string()),
-        )
-        .await?;
+        db.append_chat_message_as_run(fence, &ChatMessage::hidden_context(trimmed.to_string()))
+            .await?;
     }
 
     if !already_queued {
@@ -2828,6 +2713,7 @@ async fn listen_for_agent_messages(
 fn prepare_agent_for_request<'a>(
     state: &'a Arc<UiServerState>,
     req: &'a ChatRequest,
+    fence: &'a RunFence,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
     provider_attempt: usize,
@@ -2836,6 +2722,7 @@ fn prepare_agent_for_request<'a>(
         let ctx = Box::pin(resolve_session_context(
             state,
             req,
+            fence,
             persist_user_message,
             use_persisted_context_snapshot,
         ))
@@ -3065,11 +2952,10 @@ mod tests {
 
     #[test]
     fn run_claim_storage_failure_is_an_internal_error_not_a_conflict() {
-        let refusal = super::registration_or_refusal::<()>(Err(crate::db::ChatDbError::Storage(
-            "database is locked".to_string(),
-        )))
-        .expect_err("a failed claim must refuse the turn");
-        let refusal = refusal.into_boxed_http_error();
+        let refusal = super::acquire_refusal(crate::session::AcquireError::Storage(
+            crate::db::ChatDbError::Storage("database is locked".to_string()),
+        ))
+        .into_boxed_http_error();
         assert_eq!(refusal.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(
             refusal.to_string().contains("database is locked"),
@@ -3079,9 +2965,12 @@ mod tests {
 
     #[test]
     fn run_claim_held_by_another_run_is_a_conflict() {
-        let refusal = super::registration_or_refusal::<()>(Ok(None))
-            .expect_err("a held run must refuse the turn")
-            .into_boxed_http_error();
+        let refusal = super::acquire_refusal(crate::session::AcquireError::Busy(
+            crate::session::SessionBusy {
+                session_id: "session".to_string(),
+            },
+        ))
+        .into_boxed_http_error();
         assert_eq!(refusal.status(), StatusCode::CONFLICT);
     }
 

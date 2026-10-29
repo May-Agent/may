@@ -6,6 +6,7 @@ use super::common::{
     ContextDebugSnapshotMessage, SessionContextSnapshotUpsert, StoredSessionContextSnapshot,
     StoredSessionContextSnapshotRow, overflow_error, storage_error,
 };
+use super::run_lease::RunFence;
 use super::{ChatDb, ChatDbError, query};
 
 /// Format version of the serialized [`aither_agent::AgentCheckpoint`] stored in
@@ -258,11 +259,40 @@ impl ChatDb {
         session_id: &str,
         snapshot: SessionContextSnapshotUpsert,
     ) -> Result<(), ChatDbError> {
+        self.upsert_session_context_snapshot_fenced(None, session_id, snapshot)
+            .await
+    }
+
+    /// Upsert the session's context snapshot as part of a run: committed only
+    /// while the run's lease `fence` still holds.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RunLeaseLost`] when the lease was taken over or
+    /// released, or [`ChatDbError`] on storage failure.
+    pub async fn upsert_session_context_snapshot_as_run(
+        &self,
+        fence: &RunFence,
+        snapshot: SessionContextSnapshotUpsert,
+    ) -> Result<(), ChatDbError> {
+        self.upsert_session_context_snapshot_fenced(Some(fence), &fence.session_id, snapshot)
+            .await
+    }
+
+    async fn upsert_session_context_snapshot_fenced(
+        &self,
+        fence: Option<&RunFence>,
+        session_id: &str,
+        snapshot: SessionContextSnapshotUpsert,
+    ) -> Result<(), ChatDbError> {
         let updated_at = jiff::Timestamp::now().to_string();
         let checkpoint_blob = rmp_serde::to_vec_named(&snapshot.checkpoint)
             .map_err(|error| storage_error(format!("failed to encode checkpoint blob: {error}")))?;
+        let mut tx = match fence {
+            Some(fence) => self.begin_fenced(fence).await?,
+            None => self.db.begin().await?,
+        };
         query!(
-            self.db,
+            tx,
             "INSERT INTO session_context_snapshots (session_id, checkpoint_blob, last_message_db_id, updated_at, format_version) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET checkpoint_blob = excluded.checkpoint_blob, last_message_db_id = excluded.last_message_db_id, updated_at = excluded.updated_at, format_version = excluded.format_version",
             session_id,
             checkpoint_blob,
@@ -272,6 +302,7 @@ impl ChatDb {
         )
         .execute()
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 

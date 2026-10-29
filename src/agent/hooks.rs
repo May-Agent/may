@@ -8,25 +8,29 @@
 //! [`ContextSnapshotHook`] runs on every aither checkpoint event and
 //! writes the checkpoint payload to SQLite so the session can be
 //! resumed after a restart. Both hooks are no-ops when the agent was
-//! created without a live [`crate::db::ChatDb`] (for example in
-//! one-shot or exec mode).
+//! created without a live [`SessionRuntimeService`] (for example in
+//! exec mode). The snapshot is a run-scoped commit, fenced by the lease of
+//! the run in this process; the steer hook also ends the turn of a run that
+//! lost its lease.
 
 use aither_agent::{CheckpointContext, Hook, TurnBoundaryAction, TurnBoundaryContext};
 
-use crate::session::SessionId;
+use std::sync::Arc;
+
+use crate::session::{SessionId, SessionRuntimeService};
 
 /// Ends the current agent turn when the host-side session runtime
 /// reports a pending user message waiting to steer the conversation.
 #[derive(Debug, Clone)]
 pub(super) struct PendingSteerHook {
-    db: Option<crate::db::ChatDb>,
+    runtime: Option<Arc<SessionRuntimeService>>,
     session_id: String,
 }
 
 impl PendingSteerHook {
-    pub(super) fn new(db: Option<crate::db::ChatDb>, session_id: &SessionId) -> Self {
+    pub(super) fn new(runtime: Option<Arc<SessionRuntimeService>>, session_id: &SessionId) -> Self {
         Self {
-            db,
+            runtime,
             session_id: session_id.as_str().to_string(),
         }
     }
@@ -34,10 +38,13 @@ impl PendingSteerHook {
 
 impl Hook for PendingSteerHook {
     async fn on_turn_boundary(&self, _ctx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
-        let Some(db) = &self.db else {
+        let Some(service) = &self.runtime else {
             return TurnBoundaryAction::Continue;
         };
-        let Ok(runtime) = db.get_session_runtime(&self.session_id).await else {
+        if service.runs().is_lost(&self.session_id) {
+            return TurnBoundaryAction::EndTurn;
+        }
+        let Ok(runtime) = service.db().get_session_runtime(&self.session_id).await else {
             tracing::warn!(
                 session_id = %self.session_id,
                 "failed to inspect runtime for steer boundary"
@@ -56,14 +63,14 @@ impl Hook for PendingSteerHook {
 /// session can be resumed after a restart.
 #[derive(Debug, Clone)]
 pub(super) struct ContextSnapshotHook {
-    db: Option<crate::db::ChatDb>,
+    runtime: Option<Arc<SessionRuntimeService>>,
     session_id: String,
 }
 
 impl ContextSnapshotHook {
-    pub(super) fn new(db: Option<crate::db::ChatDb>, session_id: &SessionId) -> Self {
+    pub(super) fn new(runtime: Option<Arc<SessionRuntimeService>>, session_id: &SessionId) -> Self {
         Self {
-            db,
+            runtime,
             session_id: session_id.as_str().to_string(),
         }
     }
@@ -71,10 +78,14 @@ impl ContextSnapshotHook {
 
 impl Hook for ContextSnapshotHook {
     async fn on_checkpoint(&self, ctx: &CheckpointContext<'_>) -> Option<String> {
-        let Some(db) = &self.db else {
-            return None;
+        let service = self.runtime.as_ref()?;
+        let Some(fence) = service.runs().live_fence(&self.session_id) else {
+            return Some(format!(
+                "session {} checkpointed outside a run lease",
+                self.session_id
+            ));
         };
-        match crate::session::persist_checkpoint_from_hook(db, &self.session_id, ctx).await {
+        match crate::session::persist_checkpoint_from_hook(&service.db(), &fence, ctx).await {
             Ok(()) => None,
             Err(error) => Some(error.to_string()),
         }
