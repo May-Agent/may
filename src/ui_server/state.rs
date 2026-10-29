@@ -413,7 +413,6 @@ pub struct UiServerState {
     pub(crate) workspace_approver: WorkspaceApprover,
     pub(crate) ask_user_approver: AskUserApprover,
     pub(crate) tool_dispatchers: UiToolDispatchers,
-    pub(crate) run_cancellation_registry: SessionRunCancellationRegistry,
     pub(crate) fetched_models_cache: RefreshableCache<Vec<crate::models::FetchedModel>>,
     pub(crate) config: ArcSwap<MayConfig>,
     pub(crate) ui_event_bus: UiEventBus,
@@ -568,35 +567,6 @@ pub enum WorkspaceApprovalError {
     PersistHistory(#[source] crate::db::ChatDbError),
     #[error("workspace request interrupted")]
     Interrupted,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SessionRunCancellationRegistry {
-    live_responses: Arc<LiveResponseRegistry<()>>,
-}
-
-impl SessionRunCancellationRegistry {
-    #[must_use]
-    pub(crate) fn new() -> Self {
-        Self {
-            live_responses: Arc::new(LiveResponseRegistry::new()),
-        }
-    }
-
-    pub(crate) fn try_open(
-        &self,
-        session_id: impl Into<String>,
-    ) -> Option<async_channel::Receiver<()>> {
-        self.live_responses.try_open(&session_id.into())
-    }
-
-    pub(crate) fn cancel(&self, session_id: &str) -> bool {
-        self.live_responses.resolve(session_id, ())
-    }
-
-    pub(crate) fn close(&self, session_id: &str) -> bool {
-        self.live_responses.discard(session_id)
-    }
 }
 
 /// Generate skipped answers for all questions in the request.

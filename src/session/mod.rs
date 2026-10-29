@@ -9,6 +9,9 @@ pub mod layout;
 mod manager;
 pub(crate) mod persisted_message;
 mod plan;
+pub(crate) mod run_lease;
+#[cfg(test)]
+mod run_lease_tests;
 pub mod runtime;
 mod runtime_service;
 mod store;
@@ -31,6 +34,9 @@ pub use manager::{
 };
 pub(crate) use persisted_message::{PersistedMessage, PersistedMessageError};
 pub use plan::SessionPlanState;
+pub use run_lease::{
+    AcquireError, DEFAULT_RUN_LEASE_TTL, RunOutcome, SessionBusy, SessionRunGuard, SessionRuns,
+};
 pub use runtime::{
     AttachmentKind, BrowserInteractionState, PendingUserMessage, PendingUserMessageMode,
     PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment,
