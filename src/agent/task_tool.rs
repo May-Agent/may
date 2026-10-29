@@ -50,6 +50,8 @@ pub struct TaskArgs {
     /// Required for local(heel) tasks. Ignored for container tasks.
     #[serde(default)]
     pub needs_network: Option<bool>,
+    /// Maximum runtime of one run in seconds; the run is killed when it passes.
+    pub timeout_secs: u64,
 }
 
 /// Request to create a scheduled task, delivered over the task broker.
@@ -76,6 +78,7 @@ pub struct NormalizedTaskCreateRequest {
     pub trigger: NormalizedTaskTrigger,
     pub script: TaskScriptSpec,
     pub needs_network: bool,
+    pub timeout_secs: u64,
 }
 
 /// Outcome of a handled task-create request.
@@ -157,6 +160,7 @@ impl TaskCreateRequest {
             trigger,
             script,
             needs_network,
+            timeout_secs: self.args.timeout_secs,
         })
     }
 }
