@@ -1,6 +1,8 @@
 //! May agent implementation.
 
 pub(crate) mod browser_tool;
+#[cfg(test)]
+mod compaction_tests;
 mod context_report;
 mod environment;
 mod hooks;

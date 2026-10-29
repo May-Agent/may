@@ -19,8 +19,10 @@ use super::{ChatDb, ChatDbError, query};
 ///
 /// 1 = every blob written before versioning existed (the pre-0.7 and 0.7
 /// shapes alike, which are indistinguishable without a recorded version).
-/// 2 = the current `AgentCheckpoint` shape.
-pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 2;
+/// 2 = the `AgentCheckpoint` shape of the pre-context-policy aither.
+/// 3 = the current `AgentCheckpoint` shape (sequenced context items, typed
+/// handoff, budget-based window metrics).
+pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 3;
 
 /// Inputs for [`ChatDb::upsert_context_debug_snapshot`].
 #[derive(Debug)]
@@ -349,14 +351,15 @@ mod tests {
                 phase: aither_agent::ContextWindowPhase::Stable,
                 metrics: aither_agent::ContextWindowMetrics {
                     usage_fraction: 0.5,
-                    selected_model_context_window: Some(200_000),
-                    fast_model_context_window: None,
-                    effective_context_window: 200_000,
+                    context_window: 200_000,
+                    estimated_tokens: 100_000,
+                    chars_per_token: 4.0,
                     system_block_count: 1,
-                    reminder_count: 0,
                     recent_message_count: 1,
                     recent_system_message_count: 1,
                     has_handoff: false,
+                    has_staged_system_updates: false,
+                    prompt_cache_epoch: 0,
                 },
                 messages: vec![aither_core::llm::Message::user("hello")],
             },

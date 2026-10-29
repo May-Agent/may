@@ -1,0 +1,3 @@
+Task {{ task_id }} was created in profile {{ profile_id }}.
+Trigger: {% match trigger %}{% when TaskTriggerResponse::Time { trigger_type, run_at_utc, cron_utc } %}{{ trigger_type.as_str() }} schedule{% if let Some(at) = run_at_utc %} at {{ at }} UTC{% endif %}{% if let Some(cron) = cron_utc %} on cron "{{ cron }}" (UTC){% endif %}{% when TaskTriggerResponse::Event { event_name } %}event "{{ event_name }}"{% when TaskTriggerResponse::Webhook { webhook_path, .. } %}webhook at {{ webhook_path }}{% endmatch %}.
+{% if approved %}The user approved it.{% else %}The user has not approved it.{% endif %} It is {% if enabled %}enabled{% else %}disabled{% endif %} and needs the user's approval before it can run.

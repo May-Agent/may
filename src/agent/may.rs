@@ -14,7 +14,7 @@ use aither_core::llm::{
 };
 use aither_sandbox::{AnyContainerExec, ContainerShellRuntime, SshServer, TerminalTool};
 use executor_core::DefaultExecutor;
-use futures_lite::Stream;
+use futures_lite::{Stream, StreamExt as _};
 
 use super::hooks::{ContextSnapshotHook, PendingSteerHook};
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
@@ -775,6 +775,9 @@ impl MayAgent {
 
     /// Run a query and stream events.
     ///
+    /// aither stamps every event with its emission time; May's consumers
+    /// read the events only, so the stamp is dropped here.
+    ///
     /// The run's state machine spans every agent turn and is tens of
     /// kilobytes, so it is built on the heap here, in a frame that has
     /// returned before the stream is first polled. A caller that pinned it in
@@ -785,7 +788,11 @@ impl MayAgent {
         prompt: &str,
         attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> Pin<Box<impl Stream<Item = Result<AgentEvent, AgentError>> + '_>> {
-        Box::pin(self.inner.run(prompt, attachments))
+        Box::pin(
+            self.inner
+                .run(prompt, attachments)
+                .map(|result| result.map(|timed| timed.event)),
+        )
     }
 
     /// Run a query and persist per-turn hidden context as a regular system

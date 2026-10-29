@@ -1,0 +1,47 @@
+{%- macro session_line(s) -%}
+Session {{ s.session_id }}: "{{ s.title }}" ({{ s.model }}{% if let Some(profile_id) = s.profile_id %}, profile {{ profile_id }}{% endif %}{% if s.archived %}, archived{% endif %}), {{ s.message_count }} messages, created {{ s.created_at }}, updated {{ s.updated_at }}.{% if !s.preview.is_empty() %} Preview: {{ s.preview }}{% endif %}
+{%- endmacro -%}
+{%- macro message_block(m) -%}
+[{{ m.message_id }}] {{ m.role }}{% if let Some(at) = m.timestamp %} at {{ at }}{% endif %}:
+{{ m.content }}
+{%- endmacro -%}
+{%- macro hit_block(h) -%}
+- {{ h.role }} message {{ h.message_id }} in session {{ h.session_id }} ("{{ h.title }}", {{ h.model }}) at {{ h.timestamp }}, score {{ h.score }}, matched by {% for mode in h.matched_by %}{{ mode.label() }}{% if !loop.last %}, {% endif %}{% endfor %}:
+{% if let Some(content) = h.content %}{{ content }}{% else %}{{ h.snippet }}{% endif %}
+{%- endmacro -%}
+{%- match output -%}
+{%- when SessionOutput::Inspect with (view) -%}
+{% call session_line(view.session) %}{% endcall %}
+{% if let Some(m) = view.final_assistant_message %}
+Final assistant message:
+{% call message_block(m) %}{% endcall %}
+{% endif %}{% if let Some(m) = view.final_user_message %}
+Final user message:
+{% call message_block(m) %}{% endcall %}
+{% endif %}{% if let Some(m) = view.latest_message %}
+Latest message:
+{% call message_block(m) %}{% endcall %}
+{% endif %}
+{%- when SessionOutput::Messages with (view) -%}
+{% call session_line(view.session) %}{% endcall %}
+{{ view.messages.len() }} messages:
+{% for m in view.messages %}
+{% call message_block(m) %}{% endcall %}
+{% endfor %}
+{%- when SessionOutput::List with (view) -%}
+{{ view.sessions.len() }} of {{ view.total_matches }} matching sessions:
+{% for s in view.sessions %}
+{% call session_line(s) %}{% endcall %}
+{% endfor %}
+{%- when SessionOutput::SearchSessions with (view) -%}
+Search "{{ view.query }}" ({{ view.search_mode.label() }}): {{ view.sessions.len() }} sessions shown of {{ view.total_matches }} matching messages.
+{% for s in view.sessions %}
+Session {{ s.session_id }}: "{{ s.title }}" ({{ s.model }}), {{ s.message_count }} messages, updated {{ s.updated_at }}, {{ s.match_count }} matches, top score {{ s.top_score }}
+{% for h in s.highlights %}{% call hit_block(h) %}{% endcall %}
+{% endfor %}{% endfor %}
+{%- when SessionOutput::SearchMessages with (view) -%}
+Search "{{ view.query }}" ({{ view.search_mode.label() }}): {{ view.hits.len() }} messages shown of {{ view.total_matches }} matching.
+{% for h in view.hits %}
+{% call hit_block(h) %}{% endcall %}
+{% endfor %}
+{%- endmatch -%}

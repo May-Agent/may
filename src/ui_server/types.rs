@@ -885,28 +885,30 @@ pub struct SessionContextWindowSnapshotResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionContextWindowMetricsResponse {
     pub(crate) usage_fraction: f32,
-    pub(crate) selected_model_context_window: Option<u32>,
-    pub(crate) fast_model_context_window: Option<u32>,
-    pub(crate) effective_context_window: usize,
+    pub(crate) context_window: u32,
+    pub(crate) estimated_tokens: usize,
+    pub(crate) chars_per_token: f64,
     pub(crate) system_block_count: usize,
-    pub(crate) reminder_count: usize,
     pub(crate) recent_message_count: usize,
     pub(crate) recent_system_message_count: usize,
     pub(crate) has_handoff: bool,
+    pub(crate) has_staged_system_updates: bool,
+    pub(crate) prompt_cache_epoch: u32,
 }
 
 impl From<aither_agent::ContextWindowMetrics> for SessionContextWindowMetricsResponse {
     fn from(value: aither_agent::ContextWindowMetrics) -> Self {
         Self {
             usage_fraction: value.usage_fraction,
-            selected_model_context_window: value.selected_model_context_window,
-            fast_model_context_window: value.fast_model_context_window,
-            effective_context_window: value.effective_context_window,
+            context_window: value.context_window,
+            estimated_tokens: value.estimated_tokens,
+            chars_per_token: value.chars_per_token,
             system_block_count: value.system_block_count,
-            reminder_count: value.reminder_count,
             recent_message_count: value.recent_message_count,
             recent_system_message_count: value.recent_system_message_count,
             has_handoff: value.has_handoff,
+            has_staged_system_updates: value.has_staged_system_updates,
+            prompt_cache_epoch: value.prompt_cache_epoch,
         }
     }
 }

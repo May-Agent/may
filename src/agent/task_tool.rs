@@ -2,6 +2,7 @@ use aither_agent::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -96,15 +97,14 @@ pub struct TaskCreateResult {
     pub enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct TaskToolResponse {
-    ok: bool,
+#[derive(Template)]
+#[template(path = "task_created.txt", escape = "none")]
+struct TaskCreatedTemplate {
     task_id: String,
     profile_id: String,
     trigger: TaskTriggerResponse,
     approved: bool,
     enabled: bool,
-    approval_required: bool,
 }
 
 /// Broker half of the task-request channel: submits create requests to the
@@ -235,14 +235,16 @@ impl Tool for TaskTool {
         let response = broker.request(request).await?;
         let model = response.map_err(TaskToolError::Rejected)?;
 
-        ToolResult::json(&TaskToolResponse {
-            ok: true,
-            task_id: model.task_id,
-            profile_id: model.profile_id,
-            trigger: model.trigger,
-            approved: model.approved,
-            enabled: model.enabled,
-            approval_required: true,
-        })
+        Ok(ToolResult::text(
+            TaskCreatedTemplate {
+                task_id: model.task_id,
+                profile_id: model.profile_id,
+                trigger: model.trigger,
+                approved: model.approved,
+                enabled: model.enabled,
+            }
+            .render()
+            .expect("task created template must render"),
+        ))
     }
 }
