@@ -560,6 +560,8 @@ pub struct CreateScheduledTaskParams<'a> {
     pub script_inline: Option<&'a str>,
     /// Whether the task requires outbound network access.
     pub needs_network: bool,
+    /// Maximum runtime of one run in seconds.
+    pub timeout_secs: u32,
 }
 
 /// Parameters for updating a scheduled task.
@@ -579,6 +581,8 @@ pub struct UpdateScheduledTaskParams<'a> {
     pub script_path: Option<Option<&'a str>>,
     /// Inline script update; `Some(None)` clears it.
     pub script_inline: Option<Option<&'a str>>,
+    /// Run timeout update in seconds.
+    pub timeout_secs: Option<u32>,
 }
 
 /// Where a profile's agent workload runs, persisted as lowercase.

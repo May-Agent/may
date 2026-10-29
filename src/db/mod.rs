@@ -68,6 +68,7 @@ impl ChatDb {
         Self::ensure_profile_preference_columns(&db).await?;
         Self::ensure_session_columns(&db).await?;
         Self::ensure_message_columns(&db).await?;
+        Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Ok(Self { db })
@@ -86,6 +87,24 @@ impl ChatDb {
             query!(db, "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT")
                 .execute()
                 .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_scheduled_task_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "PRAGMA table_info(scheduled_tasks)")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        if !columns.iter().any(|column| column.name == "timeout_secs") {
+            // SQLite needs a default to add a NOT NULL column; it only fills
+            // rows created before the column existed, and operators change it
+            // per task. New tasks always state their own timeout.
+            query!(
+                db,
+                "ALTER TABLE scheduled_tasks ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 600"
+            )
+            .execute()
+            .await?;
         }
         Ok(())
     }
@@ -1426,6 +1445,7 @@ mod tests {
             script_path: None,
             script_inline: Some("echo hi"),
             needs_network: false,
+            timeout_secs: 60,
         })
         .await
         .expect("task should persist");
