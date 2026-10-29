@@ -10,11 +10,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aither_core::llm::Tool;
+use aither_core::llm::tool::{CommandOutcome, CommandStream};
 use aither_sandbox::{
-    AnyContainerExec, BollardContainerExec, Configured, ContainerLaunchSpec, ContainerShellRuntime,
-    JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry,
-    TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode, TerminalMode, TerminalResult,
-    TerminalTool, ToolRegistryBuilder, permission::PermissionError,
+    AnyContainerExec, BollardContainerExec, CompletedCommand, Configured, ContainerLaunchSpec,
+    ContainerShellRuntime, JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
+    ShellSessionRegistry, TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode,
+    TerminalMode, TerminalTool, ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -1606,14 +1607,12 @@ async fn run_terminal_command(
             .unwrap_or("task terminal execution failed")
             .to_string());
     }
-    let payload = started
-        .render_for_model()
-        .map_err(|error| prefixed_error("failed to render terminal tool result: ", &error))?;
-    let started: TerminalResult = serde_json::from_str(&payload)
-        .map_err(|error| prefixed_error("failed to parse terminal result: ", &error))?;
-    let task_id = started
-        .task_id
-        .ok_or_else(|| "background terminal job started without a task id".to_string())?;
+    let Some(CommandOutcome::Running { task_id, .. }) =
+        started.command().map(|command| &command.outcome)
+    else {
+        return Err("background terminal job started without a task id".to_string());
+    };
+    let task_id = task_id.clone();
 
     let receiver = terminal_tool.background_receiver();
     let completed = loop {
@@ -1643,22 +1642,15 @@ async fn run_terminal_command(
     parse_terminal_result(&result)
 }
 
-fn parse_terminal_result(result: &TerminalResult) -> Result<String, String> {
+fn parse_terminal_result(result: &CompletedCommand) -> Result<String, String> {
+    let output = combine_output(
+        &result.stdout.render_for_model(),
+        result.stderr.as_ref().map(CommandStream::render_for_model),
+    );
     if result.exit_code != 0 {
-        return Err(task_script_failure(
-            result.exit_code,
-            combine_output(
-                &result.stdout.to_string(),
-                result.stderr.as_ref().map(ToString::to_string),
-            )
-            .as_str(),
-        ));
+        return Err(task_script_failure(result.exit_code, output.as_str()));
     }
-
-    Ok(combine_output(
-        &result.stdout.to_string(),
-        result.stderr.as_ref().map(ToString::to_string),
-    ))
+    Ok(output)
 }
 
 fn combine_output(stdout: &str, stderr: Option<String>) -> String {

@@ -13,6 +13,7 @@ use arrow_array::{
     RecordBatchReader, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
+use askama::Template;
 use futures_lite::StreamExt;
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::Index;
@@ -55,6 +56,20 @@ pub enum SessionSearchMode {
     Fuzzy,
     /// Embedding-similarity search.
     Semantic,
+}
+
+impl SessionSearchMode {
+    /// Name of the mode as the model passes it in `search_mode`.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Text => "text",
+            Self::Regex => "regex",
+            Self::Fulltext => "fulltext",
+            Self::Fuzzy => "fuzzy",
+            Self::Semantic => "semantic",
+        }
+    }
 }
 
 /// Output shape for the `session list` tool command.
@@ -209,8 +224,6 @@ enum SessionToolError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("tool result serialization error: {0}")]
-    ToolResult(#[from] aither_core::Error),
     #[error("RAG error: {0}")]
     Rag(#[from] aither_rag::RagError),
     #[error("Arrow error: {0}")]
@@ -607,7 +620,7 @@ async fn execute_search(
     if total_matches > 0 && rows.is_empty() {
         return Err(SessionToolError::AllResultsAlreadyInContext);
     }
-    finalize_rows_with_total(&rows, total_matches, &args)
+    Ok(finalize_rows_with_total(&rows, total_matches, &args))
 }
 
 /// Removes current-session hits whose content already appears in the exact
@@ -649,7 +662,7 @@ fn filter_rows_against_messages(
         .collect()
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct SessionSummaryView {
     session_id: String,
     title: String,
@@ -678,7 +691,7 @@ impl From<crate::db::entity::sessions::Model> for SessionSummaryView {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct SessionMessageView {
     message_id: i32,
     role: String,
@@ -697,12 +710,61 @@ impl From<crate::db::entity::messages::Model> for SessionMessageView {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct SessionInspectView {
     session: SessionSummaryView,
     final_assistant_message: Option<SessionMessageView>,
     final_user_message: Option<SessionMessageView>,
     latest_message: Option<SessionMessageView>,
+}
+
+/// Everything the `session` command can answer with.
+enum SessionOutput {
+    Inspect(Box<SessionInspectView>),
+    Messages(SessionMessagesView),
+    List(SessionListView),
+    SearchSessions(SessionSearchSessionsView),
+    SearchMessages(SessionSearchMessagesView),
+}
+
+#[derive(Template)]
+#[template(path = "session_result.txt", escape = "none")]
+struct SessionResultTemplate {
+    output: SessionOutput,
+}
+
+impl SessionOutput {
+    fn into_tool_result(self) -> ToolResult {
+        ToolResult::text(
+            SessionResultTemplate { output: self }
+                .render()
+                .expect("session result template must render"),
+        )
+    }
+}
+
+struct SessionMessagesView {
+    session: SessionSummaryView,
+    messages: Vec<SessionMessageView>,
+}
+
+struct SessionListView {
+    total_matches: usize,
+    sessions: Vec<SessionSummaryView>,
+}
+
+struct SessionSearchSessionsView {
+    query: String,
+    search_mode: SessionSearchMode,
+    total_matches: usize,
+    sessions: Vec<SessionResult>,
+}
+
+struct SessionSearchMessagesView {
+    query: String,
+    search_mode: SessionSearchMode,
+    total_matches: usize,
+    hits: Vec<MessageResult>,
 }
 
 async fn execute_inspect(
@@ -730,16 +792,13 @@ async fn execute_inspect(
         .cloned()
         .map(SessionMessageView::from);
 
-    ToolResult::json(&serde_json::json!({
-        "action": "inspect",
-        "result": SessionInspectView {
-            session: SessionSummaryView::from(session),
-            final_assistant_message,
-            final_user_message,
-            latest_message,
-        }
+    Ok(SessionOutput::Inspect(Box::new(SessionInspectView {
+        session: SessionSummaryView::from(session),
+        final_assistant_message,
+        final_user_message,
+        latest_message,
     }))
-    .map_err(SessionToolError::ToolResult)
+    .into_tool_result())
 }
 
 async fn execute_messages(
@@ -759,13 +818,11 @@ async fn execute_messages(
         .map(SessionMessageView::from)
         .collect::<Vec<_>>();
 
-    ToolResult::json(&serde_json::json!({
-        "action": "messages",
-        "session": SessionSummaryView::from(session),
-        "returned": messages.len(),
-        "messages": messages,
-    }))
-    .map_err(SessionToolError::ToolResult)
+    Ok(SessionOutput::Messages(SessionMessagesView {
+        session: SessionSummaryView::from(session),
+        messages,
+    })
+    .into_tool_result())
 }
 
 async fn execute_list(
@@ -823,13 +880,11 @@ async fn execute_list(
         .map(SessionSummaryView::from)
         .collect::<Vec<_>>();
 
-    ToolResult::json(&serde_json::json!({
-        "action": "list",
-        "returned": results.len(),
-        "total_matches": total_matches,
-        "results": results,
-    }))
-    .map_err(SessionToolError::ToolResult)
+    Ok(SessionOutput::List(SessionListView {
+        total_matches,
+        sessions: results,
+    })
+    .into_tool_result())
 }
 
 fn split_command_form_tokens(
@@ -1075,7 +1130,7 @@ struct SessionMatchRow {
     matched_by: Vec<SessionSearchMode>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct MessageResult {
     session_id: String,
     title: String,
@@ -1086,7 +1141,6 @@ struct MessageResult {
     score: f64,
     matched_by: Vec<SessionSearchMode>,
     snippet: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
 }
 
@@ -1113,7 +1167,7 @@ impl MessageResult {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct SessionResult {
     session_id: String,
     title: String,
@@ -1740,7 +1794,7 @@ async fn run_semantic_query(
     if total_matches > 0 && rows.is_empty() {
         return Err(SessionToolError::AllResultsAlreadyInContext);
     }
-    finalize_rows_with_total(&rows, total_matches, &args)
+    Ok(finalize_rows_with_total(&rows, total_matches, &args))
 }
 
 async fn read_rows_from_stream(
@@ -1870,23 +1924,20 @@ fn finalize_rows_with_total(
     rows: &[SessionMatchRow],
     total_matches: usize,
     args: &SessionArgs,
-) -> Result<ToolResult, SessionToolError> {
+) -> ToolResult {
     let start = args.offset.min(rows.len());
     let end = (start + args.limit).min(rows.len());
     let rows = rows[start..end].to_vec();
 
-    let value = if args.output_mode == SessionOutputMode::Messages {
-        let items: Vec<MessageResult> = rows
-            .into_iter()
-            .map(|row| MessageResult::from_row(row, args.include_content))
-            .collect();
-        serde_json::json!({
-            "query": args.query,
-            "search_mode": args.search_mode,
-            "output_mode": args.output_mode,
-            "total_matches": total_matches,
-            "returned": items.len(),
-            "results": items,
+    let output = if args.output_mode == SessionOutputMode::Messages {
+        SessionOutput::SearchMessages(SessionSearchMessagesView {
+            query: args.query.clone(),
+            search_mode: args.search_mode,
+            total_matches,
+            hits: rows
+                .into_iter()
+                .map(|row| MessageResult::from_row(row, args.include_content))
+                .collect(),
         })
     } else {
         let mut grouped: HashMap<String, SessionResult> = HashMap::new();
@@ -1922,17 +1973,15 @@ fn finalize_rows_with_total(
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
         });
 
-        serde_json::json!({
-            "query": args.query,
-            "search_mode": args.search_mode,
-            "output_mode": args.output_mode,
-            "total_matches": total_matches,
-            "returned": items.len(),
-            "results": items,
+        SessionOutput::SearchSessions(SessionSearchSessionsView {
+            query: args.query.clone(),
+            search_mode: args.search_mode,
+            total_matches,
+            sessions: items,
         })
     };
 
-    ToolResult::json(&value).map_err(SessionToolError::ToolResult)
+    output.into_tool_result()
 }
 
 #[cfg(test)]

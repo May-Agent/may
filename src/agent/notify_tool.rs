@@ -4,6 +4,7 @@ use aither_agent::tool_request::{
     ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,12 @@ pub struct NotifyArgs {
     /// the new callback conversation.
     #[serde(default)]
     pub callback_message: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "notify_result.txt", escape = "none")]
+struct NotifyResultTemplate {
+    sent: usize,
 }
 
 /// Outcome of a handled notify request.
@@ -141,9 +148,10 @@ impl Tool for NotifyTool {
         let response = broker.request(args).await?;
         let result = response.map_err(NotifyToolError::Rejected)?;
 
-        ToolResult::json(&serde_json::json!({
-            "ok": true,
-            "sent": result.sent
-        }))
+        Ok(ToolResult::text(
+            NotifyResultTemplate { sent: result.sent }
+                .render()
+                .expect("notify result template must render"),
+        ))
     }
 }

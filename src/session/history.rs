@@ -33,15 +33,6 @@ pub enum HistoryReplayError {
         #[source]
         source: serde_json::Error,
     },
-    /// Tool result could not be rendered for the model.
-    #[error("tool result '{tool_call_id}' could not be rendered for the model")]
-    RenderToolResult {
-        /// Id of the tool call whose result failed to render.
-        tool_call_id: String,
-        /// Underlying render error.
-        #[source]
-        source: aither_core::Error,
-    },
     /// A persisted attachment could not be replayed into model form.
     #[error("attachment '{name}' could not be replayed: {reason}")]
     InvalidAttachment {
@@ -76,6 +67,22 @@ pub enum ToolEventRecord {
         /// Rendered tool result.
         result: aither_core::llm::ToolResult,
     },
+    /// Tool call the user stopped before it produced a result.
+    #[serde(rename = "stopped")]
+    Stopped {
+        /// Tool call id.
+        id: String,
+        /// Tool name.
+        name: String,
+    },
+}
+
+impl ToolEventRecord {
+    /// What the model and the UI see as the result of a stopped call.
+    #[must_use]
+    pub fn stopped_result() -> aither_core::llm::ToolResult {
+        aither_core::llm::ToolResult::text("Stopped by the user before it finished.")
+    }
 }
 
 /// Session metadata stored in the chat history header.
@@ -475,15 +482,19 @@ impl ChatHistory {
                                         message_id: tool_call_id.to_string(),
                                     }));
                                 }
-                                match result.render_for_model() {
-                                    Ok(content) => Some(Ok(Message::tool(id, content))),
-                                    Err(source) => {
-                                        Some(Err(HistoryReplayError::RenderToolResult {
-                                            tool_call_id: id,
-                                            source,
-                                        }))
-                                    }
+                                Some(Ok(Message::tool(id, result.render_for_model())))
+                            }
+                            ToolEventRecord::Stopped { id, .. } => {
+                                if id != tool_call_id {
+                                    return Some(Err(HistoryReplayError::ToolEventIdMismatch {
+                                        event_id: id,
+                                        message_id: tool_call_id.to_string(),
+                                    }));
                                 }
+                                Some(Ok(Message::tool(
+                                    id,
+                                    ToolEventRecord::stopped_result().render_for_model(),
+                                )))
                             }
                         }
                     }
@@ -660,6 +671,53 @@ mod tests {
         assert_eq!(messages[1].role(), Role::Tool);
         assert_eq!(messages[1].tool_call_id(), Some("call_123"));
         assert_eq!(messages[1].content(), "done");
+    }
+
+    #[test]
+    fn stopped_tool_call_replays_with_a_text_result() {
+        let mut history = ChatHistory::new();
+        let start = serde_json::to_string(&ToolEventRecord::Start {
+            id: "call_9".to_string(),
+            name: "terminal".to_string(),
+            arguments: "{}".to_string(),
+        })
+        .expect("serialize tool start");
+        let stopped = serde_json::to_string(&ToolEventRecord::Stopped {
+            id: "call_9".to_string(),
+            name: "terminal".to_string(),
+        })
+        .expect("serialize tool stop");
+        history
+            .messages_mut()
+            .push(ChatMessage::tool("call_9", start));
+        history
+            .messages_mut()
+            .push(ChatMessage::tool("call_9", stopped));
+
+        let messages = history.to_aither_messages().expect("replay stopped call");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tool_calls()[0].id, "call_9");
+        assert_eq!(messages[1].role(), Role::Tool);
+        assert_eq!(messages[1].tool_call_id(), Some("call_9"));
+        assert_eq!(
+            messages[1].content(),
+            ToolEventRecord::stopped_result().render_for_model()
+        );
+    }
+
+    #[test]
+    fn stopped_record_round_trips_through_serde() {
+        let json = serde_json::to_string(&ToolEventRecord::Stopped {
+            id: "c".to_string(),
+            name: "terminal".to_string(),
+        })
+        .expect("serialize");
+        assert!(json.contains("\"stage\":\"stopped\""));
+        let back: ToolEventRecord = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            back,
+            ToolEventRecord::Stopped { ref id, ref name } if id == "c" && name == "terminal"
+        ));
     }
 
     #[test]

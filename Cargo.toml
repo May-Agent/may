@@ -137,7 +137,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
 # Templating
-askama = "0.15"
+askama = "0.16"
 
 # Embedded resources
 include_dir = "0.7"

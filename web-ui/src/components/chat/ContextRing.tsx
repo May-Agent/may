@@ -50,7 +50,7 @@ export function ContextRing({ sessionId }: { sessionId: string }) {
   const metrics = data?.windowSnapshot?.metrics;
   const fraction = metrics?.usageFraction ?? 0;
   const pct = Math.min(100, Math.max(0, Math.round(fraction * 100)));
-  const totalWindow = metrics?.effectiveContextWindow ?? null;
+  const totalWindow = metrics?.contextWindow ?? null;
   const { stroke, text } = tone(fraction);
 
   const radius = 7;
@@ -105,14 +105,11 @@ export function ContextRing({ sessionId }: { sessionId: string }) {
               })}
             </div>
             <div className="grid grid-cols-2 gap-2">
-              <Stat label="Effective" value={formatTokens(metrics.effectiveContextWindow)} />
-              <Stat
-                label="Selected model"
-                value={formatTokens(metrics.selectedModelContextWindow)}
-              />
+              <Stat label="Window" value={formatTokens(metrics.contextWindow)} />
+              <Stat label="Estimated" value={formatTokens(metrics.estimatedTokens)} />
               <Stat label="Recent messages" value={metrics.recentMessageCount.toString()} />
               <Stat label="System blocks" value={metrics.systemBlockCount.toString()} />
-              <Stat label="Reminders" value={metrics.reminderCount.toString()} />
+              <Stat label="Cache rewrites" value={metrics.promptCacheEpoch.toString()} />
               <Stat
                 label="Handoff"
                 value={metrics.hasHandoff ? 'active' : '—'}

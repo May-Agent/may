@@ -73,13 +73,14 @@ and do not replace a missing URL with an empty string or a guessed port.
 ### Step 3: View and Verify
 
 Use the shared May-managed browser to capture the slide. The browser command
-persists its screenshot and returns the path as JSON; move that image into the
+persists its screenshot and reports the path on a `Screenshot saved to <path> (WxH).` line; move that image into the
 temporary slide workspace before viewing it:
 
 ```bash
 url=$(cat artifacts/temp/slide_N.url)
-browser read "$url" --detail brief --screenshot viewport --format json > artifacts/temp/slide_N.browser.json
-image=$(jq -er '.page.screenshot.artifactPath' artifacts/temp/slide_N.browser.json)
+browser read "$url" --detail brief --screenshot viewport > artifacts/temp/slide_N.browser.txt
+image=$(sed -n 's/^Screenshot saved to \(.*\) ([0-9]*x[0-9]*)\.$/\1/p' artifacts/temp/slide_N.browser.txt)
+test -n "$image"
 mv "$image" artifacts/temp/slide_N-001.png
 cat artifacts/temp/slide_N-001.png
 ```

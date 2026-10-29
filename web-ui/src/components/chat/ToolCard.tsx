@@ -124,27 +124,34 @@ interface TerminalResult {
   stderr: OutputStream | null;
 }
 
-function extractOutputStream(entry: unknown): OutputStream | null {
-  if (!entry || typeof entry !== 'object') return null;
-  const e = entry as Record<string, unknown>;
-  const content = e.content;
-  if (!content || typeof content !== 'object') return null;
-  const c = content as Record<string, unknown>;
-  if (c.type !== 'text' || typeof c.text !== 'string') return null;
-  if (c.text.length === 0) return null;
-  const url = typeof e.url === 'string' && e.url.length > 0 ? e.url : null;
-  return { text: c.text, truncated: c.truncated === true, url };
+function extractOutputStream(stream: unknown): OutputStream | null {
+  if (!stream || typeof stream !== 'object') return null;
+  const e = stream as Record<string, unknown>;
+  const file =
+    e.file && typeof e.file === 'object' ? (e.file as Record<string, unknown>) : null;
+  const url = file && typeof file.url === 'string' && file.url.length > 0 ? file.url : null;
+  if (e.kind === 'inline') {
+    return typeof e.text === 'string' && e.text.length > 0
+      ? { text: e.text, truncated: false, url: null }
+      : null;
+  }
+  if (e.kind === 'stored') {
+    if (typeof e.preview !== 'string' || e.preview.length === 0) return null;
+    return { text: e.preview, truncated: e.truncated === true, url };
+  }
+  return null;
 }
 
 function extractTerminalResult(result: unknown): TerminalResult | null {
   if (!result || typeof result !== 'object') return null;
   const r = result as Record<string, unknown>;
-  if (r.kind !== 'json' || !r.value || typeof r.value !== 'object') return null;
-  const v = r.value as Record<string, unknown>;
+  if (r.kind !== 'command') return null;
+  const outcome =
+    r.outcome && typeof r.outcome === 'object' ? (r.outcome as Record<string, unknown>) : {};
   return {
-    exitCode: typeof v.exit_code === 'number' ? v.exit_code : null,
-    stdout: extractOutputStream(v.stdout),
-    stderr: extractOutputStream(v.stderr),
+    exitCode: outcome.status === 'exited' && typeof outcome.code === 'number' ? outcome.code : null,
+    stdout: extractOutputStream(r.stdout),
+    stderr: extractOutputStream(r.stderr),
   };
 }
 
@@ -157,10 +164,6 @@ function extractGenericResultText(result: unknown): string | null {
   }
   if (kind === 'error') {
     return typeof r.message === 'string' ? r.message : null;
-  }
-  if (kind === 'json') {
-    if (r.value === undefined || r.value === null) return null;
-    return JSON.stringify(r.value, null, 2);
   }
   if (kind === 'done') return null;
   return typeof result === 'string' ? result : JSON.stringify(result, null, 2);

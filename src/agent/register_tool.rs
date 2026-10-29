@@ -5,6 +5,7 @@ use aither_agent::tool_request::{
     channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,12 @@ pub struct RegisterRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterResult {
     pub registered: Vec<String>,
+}
+
+#[derive(Template)]
+#[template(path = "register_result.txt", escape = "none")]
+struct RegisterResultTemplate<'a> {
+    registered: &'a [String],
 }
 
 /// Unified broker/queue types for register commands.
@@ -123,10 +130,12 @@ impl<K: RegisterKind> Tool for RegisterTool<K> {
         let response = broker.request(request).await?;
         let result = response.map_err(RegisterToolError::Rejected)?;
 
-        ToolResult::json(&serde_json::json!({
-            "ok": true,
-            "registered": result.registered,
-            "approval_required": true
-        }))
+        Ok(ToolResult::text(
+            RegisterResultTemplate {
+                registered: &result.registered,
+            }
+            .render()
+            .expect("register result template must render"),
+        ))
     }
 }

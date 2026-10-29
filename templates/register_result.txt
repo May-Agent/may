@@ -1,0 +1,2 @@
+Registered {{ registered.len() }} item(s); they take effect once the user approves them.{% for name in registered %}
+- {{ name }}{% endfor %}

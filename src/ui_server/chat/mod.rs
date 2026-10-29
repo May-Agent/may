@@ -21,10 +21,7 @@ use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
 };
 use aither_models::lookup as lookup_model_info;
-use aither_sandbox::{
-    AnyContainerExec, BollardContainerExec, ContainerLaunchSpec, Content, OutputEntry,
-    TERMINAL_STDIN_BLOCKED_NOTICE, TerminalResult,
-};
+use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
 use crate::agent::MayAgent;
 use crate::ask_user;
@@ -44,9 +41,7 @@ use super::error_chain::error_chain_text;
 use super::helpers::{RETRY_BACKOFF_MS, elapsed_ms_saturating, send_event, truncate_preview};
 use super::model_resolution::resolve_default_model;
 use super::state::{UiServerState, UiToolQueues};
-use super::terminal_parsing::{
-    TerminalTaskStatus, parse_terminal_result_payload, update_terminal_snapshot_from_tool_event,
-};
+use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::title_generation;
 use super::types::{
     ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
@@ -56,18 +51,6 @@ use super::types::{
     ToolVariant,
 };
 use crate::decode_meter::DecodeMeter;
-
-fn stopped_terminal_tool_result() -> ToolResult {
-    ToolResult::json(&TerminalResult {
-        stdout: OutputEntry::Empty,
-        stderr: None,
-        exit_code: 130,
-        task_id: None,
-        status: Some("stopped".to_string()),
-        notice: None,
-    })
-    .expect("stopped terminal tool result must serialize")
-}
 
 fn persist_stopped_terminal_calls(
     terminal_snapshot: &mut TerminalStateSnapshot,
@@ -79,10 +62,9 @@ fn persist_stopped_terminal_calls(
         .cloned()
         .collect::<Vec<_>>();
     for call_id in running_terminal_ids {
-        let record = ToolEventRecord::End {
+        let record = ToolEventRecord::Stopped {
             id: call_id.clone(),
             name: "terminal".to_string(),
-            result: stopped_terminal_tool_result(),
         };
         let serialized = serde_json::to_string(&record)
             .map_err(|error| crate::db::ChatDbError::Storage(error.to_string()))?;
@@ -861,31 +843,6 @@ async fn clear_terminal_runtime_state(
         .map(|_| ())
 }
 
-fn output_contains_terminal_wait_notice(output: &OutputEntry) -> bool {
-    let content = match output {
-        OutputEntry::Inline { content } | OutputEntry::Loaded { content, .. } => Some(content),
-        OutputEntry::Stored { content, .. } => content.as_ref(),
-        OutputEntry::Empty => None,
-    };
-    content
-        .and_then(|content| match content {
-            Content::Text { text, .. } => Some(text.as_str()),
-            Content::Image { .. } => None,
-        })
-        .is_some_and(|text| text.starts_with(TERMINAL_STDIN_BLOCKED_NOTICE))
-}
-
-fn result_waits_for_terminal_input(result: &ToolResult) -> bool {
-    if result.is_error() {
-        return false;
-    }
-    let Some(parsed) = parse_terminal_result_payload(result) else {
-        return false;
-    };
-    parsed.status == Some(TerminalTaskStatus::Running)
-        && output_contains_terminal_wait_notice(&parsed.stdout)
-}
-
 pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
@@ -1645,14 +1602,6 @@ fn run_agent_loop<'a>(
                                 "tool_end",
                             );
                             saw_tool_activity = true;
-                            if name == "terminal" && result_waits_for_terminal_input(&result) {
-                                set_session_runtime_state(
-                                    state,
-                                    session_id.as_str(),
-                                    SessionRuntimeState::WaitingTerminalInput,
-                                )
-                                .await?;
-                            }
                             let record = ToolEventRecord::End {
                                 id: id.clone(),
                                 name: name.clone(),
@@ -3061,14 +3010,15 @@ mod tests {
                         phase: aither_agent::ContextWindowPhase::Stable,
                         metrics: aither_agent::ContextWindowMetrics {
                             usage_fraction: 0.0,
-                            selected_model_context_window: None,
-                            fast_model_context_window: None,
-                            effective_context_window: 0,
+                            context_window: 0,
+                            estimated_tokens: 0,
+                            chars_per_token: 4.0,
                             system_block_count: 0,
-                            reminder_count: 0,
                             recent_message_count: 0,
                             recent_system_message_count: 0,
                             has_handoff: false,
+                            has_staged_system_updates: false,
+                            prompt_cache_epoch: 0,
                         },
                         messages: Vec::new(),
                     },
