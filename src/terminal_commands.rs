@@ -12,6 +12,7 @@ use aither_search::{SearchEmbeddingResolution, SearchTool};
 use crate::agent::ImageGeneratorConfig;
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
+use crate::agent::issue_tool::IssueTool;
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
 use crate::agent::session_tool::SessionTool;
@@ -81,6 +82,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Tracker the `subagent` command reports each invocation to — the host
     /// UI reads live per-run stats off it.
     pub subagent_tracker: SubagentTracker,
+    /// Issue store for the `issue` command, resolved from the session
+    /// workspace and its per-project configuration.
+    pub issue_store: crate::issue::ResolvedIssueStore,
 }
 
 /// What [`register_shared_terminal_commands`] installed.
@@ -132,6 +136,11 @@ where
             config.sandbox_dir.clone(),
             to_search_embedding_resolution(config.search_embedder.clone()),
         ),
+    );
+    register_tool_with_description(
+        builder,
+        &mut descriptions,
+        IssueTool::new(config.issue_store),
     );
 
     if let Some(ask_user_broker) = config.ask_user_broker {
@@ -333,6 +342,16 @@ mod tests {
         }
     }
 
+    async fn test_issue_store(dir: &std::path::Path) -> crate::issue::ResolvedIssueStore {
+        let db = crate::db::ChatDb::open(&dir.join("history.db"))
+            .await
+            .expect("chat db should open");
+        crate::issue::ResolvedIssueStore::May(crate::issue::MayIssueStore::new(
+            db,
+            "test".to_string(),
+        ))
+    }
+
     #[tokio::test]
     async fn chat_specific_tools_are_terminal_commands_when_brokers_are_present() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -368,6 +387,7 @@ mod tests {
                 terminal_tool_factory: None,
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
+                issue_store: test_issue_store(temp.path()).await,
             },
         )
         .await
@@ -419,6 +439,7 @@ mod tests {
                 terminal_tool_factory: None,
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
+                issue_store: test_issue_store(temp.path()).await,
             },
         )
         .await
@@ -474,6 +495,7 @@ mod tests {
                 terminal_tool_factory: None,
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
+                issue_store: test_issue_store(temp.path()).await,
             },
         )
         .await
@@ -517,6 +539,7 @@ mod tests {
                 terminal_tool_factory: None,
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
+                issue_store: test_issue_store(temp.path()).await,
             },
         )
         .await

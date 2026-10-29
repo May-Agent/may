@@ -64,6 +64,18 @@ CREATE INDEX IF NOT EXISTS idx_session_pending_permissions_session ON session_pe
 CREATE INDEX IF NOT EXISTS idx_session_pending_workspace_session ON session_pending_workspace(session_id);
 DROP TABLE IF EXISTS session_tasks;
 CREATE TABLE IF NOT EXISTS global_memory (id INTEGER PRIMARY KEY CHECK (id = 1), content TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS issue_projects (id INTEGER PRIMARY KEY, repo_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS issues (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, number INTEGER NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (project_id, number));
+CREATE TABLE IF NOT EXISTS issue_labels (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, UNIQUE (project_id, name));
+CREATE TABLE IF NOT EXISTS issue_label_assignments (issue_id INTEGER NOT NULL, label_id INTEGER NOT NULL, PRIMARY KEY (issue_id, label_id));
+CREATE TABLE IF NOT EXISTS issue_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, issue_id INTEGER NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS issue_relations (issue_id INTEGER NOT NULL, related_issue_id INTEGER NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (issue_id, related_issue_id, kind));
+CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id, state, number);
+CREATE INDEX IF NOT EXISTS idx_issue_labels_project ON issue_labels(project_id);
+CREATE INDEX IF NOT EXISTS idx_issue_label_assignments_label ON issue_label_assignments(label_id);
+CREATE INDEX IF NOT EXISTS idx_issue_comments_issue ON issue_comments(issue_id);
+CREATE INDEX IF NOT EXISTS idx_issue_relations_issue ON issue_relations(issue_id, kind);
+CREATE INDEX IF NOT EXISTS idx_issue_relations_related ON issue_relations(related_issue_id, kind);
 CREATE TABLE IF NOT EXISTS profile_remote_servers (profile_id TEXT NOT NULL, ssh_server_name TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, PRIMARY KEY (profile_id, ssh_server_name));
 CREATE INDEX IF NOT EXISTS idx_profile_remote_servers_profile ON profile_remote_servers(profile_id, sort_order);
 PRAGMA journal_mode=WAL;

@@ -42,3 +42,5 @@ Invoke with `subagent --subagent "<type-or-path>" --prompt "<prompt>"`.
 {% endfor %}
 </subagents>
 {% endif %}
+
+Persist work state as issues through the `issue` command ({{ issue_backend_name }} backend{% if let Some(repository) = issue_repository %}: {{ repository }}{% endif %}). Track tasks as issues with labels and blocked-by relations.
