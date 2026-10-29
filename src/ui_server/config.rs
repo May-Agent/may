@@ -785,7 +785,7 @@ mod tests {
     fn full_config_serializes_sandbox_command_priority() {
         let ui = serde_json::to_value(build_ui_full_config(&MayConfig::default()))
             .expect("ui config serializes");
-        assert_eq!(ui["sandbox"]["commandPriority"], "low");
+        assert_eq!(ui["sandbox"]["commandPriority"], "normal");
 
         let mut config = MayConfig::default();
         config.sandbox.command_priority = CommandPriority::Lowest;

@@ -366,8 +366,8 @@ export const zhHant: Messages = {
     execution: {
       title: '命令優先權',
       description: '控制本機與容器命令的 CPU 與磁碟排程。SSH 命令不受影響。',
-      normal: '一般',
-      low: '低（預設）',
+      normal: '一般（預設）',
+      low: '低',
       lowest: '最低',
       info: '降低優先權會改變資源競爭時的排程，但不會限制 CPU 用量。',
     },
