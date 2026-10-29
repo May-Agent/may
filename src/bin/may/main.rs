@@ -382,6 +382,9 @@ where
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = AssistantReply::default();
 
+    // Sockets through which other main agents reach this TUI's session
+    let agent_listeners = may_agent::agent_link::AgentListeners::default();
+
     loop {
         enum Event {
             AskUser(may_agent::ask_user::AskUserRequest),
@@ -442,6 +445,10 @@ where
                 },
             );
         }
+
+        runtime_deps
+            .listen_for_agent_messages(app, &agent_listeners, events.sender())
+            .await?;
 
         // Check for queued messages - start processing if agent is idle
         if agent_handle.is_none()
