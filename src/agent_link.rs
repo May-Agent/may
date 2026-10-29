@@ -21,6 +21,7 @@ use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use futures_util::StreamExt as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::db::ChatDbError;
 use crate::session::{
@@ -95,6 +96,18 @@ pub enum AgentLinkError {
         #[source]
         source: std::io::Error,
     },
+    /// The socket path does not fit the OS limit on Unix socket paths.
+    #[error(
+        "agent socket path {path} is {bytes} bytes, over the {limit}-byte limit of Unix socket paths; use a shorter home directory"
+    )]
+    SocketPathTooLong {
+        /// The path that cannot be bound.
+        path: PathBuf,
+        /// Its length in bytes.
+        bytes: usize,
+        /// Longest path the OS accepts.
+        limit: usize,
+    },
     /// A live agent already listens for the session.
     #[error("session {0} already has a live listener")]
     AlreadyListening(String),
@@ -162,8 +175,38 @@ pub enum AgentLinkError {
     },
 }
 
-fn socket_path(dir: &Path, session_id: &str) -> PathBuf {
-    dir.join(format!("{session_id}.{SOCKET_EXTENSION}"))
+/// Bytes of `sockaddr_un.sun_path`, including the terminating NUL, fixed by the OS ABI.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const SUN_PATH_BYTES: usize = 104;
+/// Bytes of `sockaddr_un.sun_path`, including the terminating NUL, fixed by the OS ABI.
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+const SUN_PATH_BYTES: usize = 108;
+
+/// Hex digits of the session-id digest naming a socket file.
+const SOCKET_NAME_DIGITS: usize = 16;
+
+/// Socket path of a session: a fixed-length digest of its id, so long session
+/// ids never overflow `sun_path`. The agent's identity comes from its Status reply.
+fn socket_path(dir: &Path, session_id: &str) -> Result<PathBuf, AgentLinkError> {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(session_id.as_bytes());
+    let mut name = String::with_capacity(SOCKET_NAME_DIGITS + 1 + SOCKET_EXTENSION.len());
+    for byte in &digest[..SOCKET_NAME_DIGITS / 2] {
+        write!(name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    name.push('.');
+    name.push_str(SOCKET_EXTENSION);
+    let path = dir.join(name);
+    let bytes = path.as_os_str().len();
+    if bytes >= SUN_PATH_BYTES {
+        return Err(AgentLinkError::SocketPathTooLong {
+            path,
+            bytes,
+            limit: SUN_PATH_BYTES - 1,
+        });
+    }
+    Ok(path)
 }
 
 /// Bound the wait for `future` to [`EXCHANGE_TIMEOUT`].
@@ -281,7 +324,7 @@ impl<W: WakeAgent> AgentListener<W> {
                 path: dir.to_path_buf(),
                 source,
             })?;
-        let path = socket_path(dir, &identity.session_id);
+        let path = socket_path(dir, &identity.session_id)?;
         match exchange(&path, &Request::Status).await {
             Ok(_) => return Err(AgentLinkError::AlreadyListening(identity.session_id)),
             Err(AgentLinkError::Unreachable(_)) => remove_socket(&path).await?,
@@ -479,7 +522,7 @@ impl AgentDirectory {
     /// # Errors
     /// [`AgentLinkError::Unreachable`] when nothing listens, or the exchange error.
     pub async fn wake(&self, session_id: &str) -> Result<(), AgentLinkError> {
-        let path = socket_path(&self.dir, session_id);
+        let path = socket_path(&self.dir, session_id)?;
         match exchange(&path, &Request::Wake).await? {
             Response::Woken => Ok(()),
             Response::Status(_) => Err(AgentLinkError::UnexpectedResponse(path)),
@@ -511,8 +554,11 @@ async fn probe(path: PathBuf) -> Option<AgentStatus> {
 
 /// Listener tasks of one process, keyed by session. Dropping a task drops its
 /// listener, which removes the socket.
-#[derive(Default)]
 pub struct AgentListeners {
+    /// Runtime the listener tasks run on. Hosts such as the web server call
+    /// from threads outside any Tokio context, where the global executor
+    /// cannot spawn.
+    runtime: tokio::runtime::Handle,
     tasks: Mutex<HashMap<String, AnyExecutorTask<()>>>,
 }
 
@@ -523,6 +569,15 @@ impl std::fmt::Debug for AgentListeners {
 }
 
 impl AgentListeners {
+    /// Listeners whose tasks run on `runtime`.
+    #[must_use]
+    pub fn new(runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            runtime,
+            tasks: Mutex::default(),
+        }
+    }
+
     fn tasks(&self) -> std::sync::MutexGuard<'_, HashMap<String, AnyExecutorTask<()>>> {
         self.tasks
             .lock()
@@ -546,7 +601,10 @@ impl AgentListeners {
         }
         let session_id = identity.session_id.clone();
         let listener = AgentListener::bind(dir, identity, runtime_service, wake).await?;
-        let task = executor_core::spawn(listener.serve());
+        let task = {
+            let _context = self.runtime.enter();
+            executor_core::spawn(listener.serve())
+        };
         self.tasks().insert(session_id, task);
         Ok(())
     }
