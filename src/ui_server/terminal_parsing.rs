@@ -47,7 +47,8 @@ fn terminal_status_from_result(result: &ToolResult) -> TerminalExecutionStatus {
         return TerminalExecutionStatus::Failed;
     }
     match result.command().map(|command| &command.outcome) {
-        Some(CommandOutcome::Killed { .. }) => TerminalExecutionStatus::Stopped,
+        // A foreground run killed at its time bound failed; a user stop is `ToolEventRecord::Stopped`.
+        Some(CommandOutcome::Killed { .. }) => TerminalExecutionStatus::Failed,
         Some(CommandOutcome::Exited { code }) if *code != 0 => TerminalExecutionStatus::Failed,
         Some(CommandOutcome::Exited { .. } | CommandOutcome::Running { .. }) | None => {
             TerminalExecutionStatus::Done
@@ -95,6 +96,17 @@ pub(super) fn update_terminal_snapshot_from_tool_event(
 
             snapshot.executions.push(exec);
         }
+        ToolEventRecord::Stopped { id, name } => {
+            if !name.eq_ignore_ascii_case(TERMINAL_TOOL_NAME) {
+                return;
+            }
+            let mut exec = snapshot.running_by_call_id.remove(id).unwrap_or_else(|| {
+                panic!("terminal tool stop received without matching start: call_id={id}")
+            });
+            exec.output = Some(terminal_end_output(&ToolEventRecord::stopped_result()));
+            exec.status = TerminalExecutionStatus::Stopped;
+            snapshot.executions.push(exec);
+        }
     }
 }
 
@@ -102,12 +114,16 @@ pub(super) fn update_terminal_snapshot_from_tool_event(
 mod tests {
     use aither_core::llm::{CommandOutcome, CommandResult, CommandStream, ToolResult};
 
-    use super::terminal_status_from_result;
-    use crate::ui_server::types::TerminalExecutionStatus;
+    use super::{terminal_status_from_result, update_terminal_snapshot_from_tool_event};
+    use crate::ui_server::types::{
+        TerminalExecutionStatus, TerminalStateSnapshot, ToolEventRecord,
+    };
 
     fn command(outcome: CommandOutcome) -> ToolResult {
         ToolResult::Command(Box::new(CommandResult {
-            stdout: CommandStream::Inline(String::new()),
+            stdout: CommandStream::Inline {
+                text: String::new(),
+            },
             stderr: None,
             outcome,
         }))
@@ -126,13 +142,36 @@ mod tests {
         assert_eq!(
             terminal_status_from_result(&command(CommandOutcome::Killed {
                 task_id: "t".to_string(),
-                notice: "stopped".to_string(),
+                notice: "killed at the foreground limit".to_string(),
             })),
-            TerminalExecutionStatus::Stopped
+            TerminalExecutionStatus::Failed
         );
         assert_eq!(
             terminal_status_from_result(&ToolResult::error("boom")),
             TerminalExecutionStatus::Failed
         );
+    }
+
+    #[test]
+    fn stopped_call_is_stopped_in_the_snapshot() {
+        let mut snapshot = TerminalStateSnapshot::default();
+        update_terminal_snapshot_from_tool_event(
+            &mut snapshot,
+            &ToolEventRecord::Start {
+                id: "call".to_string(),
+                name: "terminal".to_string(),
+                arguments: "{\"description\":\"d\",\"script\":\"make\"}".to_string(),
+            },
+        );
+        update_terminal_snapshot_from_tool_event(
+            &mut snapshot,
+            &ToolEventRecord::Stopped {
+                id: "call".to_string(),
+                name: "terminal".to_string(),
+            },
+        );
+        assert!(snapshot.running_by_call_id.is_empty());
+        let exec = snapshot.executions.pop().expect("one execution");
+        assert_eq!(exec.status, TerminalExecutionStatus::Stopped);
     }
 }
