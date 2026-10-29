@@ -16,6 +16,7 @@ use super::common::{
     to_i64_from_u64, to_u64, to_usize,
 };
 use super::entity::messages;
+use super::run_lease::RunFence;
 use super::{ChatDb, ChatDbError, query, truncate_preview};
 
 /// Optional columns carried by an appended message row.
@@ -40,6 +41,21 @@ impl ChatDb {
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn append_message(
         &self,
+        session_id: &str,
+        role: MessageRole,
+        content: &str,
+        timestamp: Option<&str>,
+        meta: MessageMeta<'_>,
+    ) -> Result<messages::Model, ChatDbError> {
+        self.append_message_fenced(None, session_id, role, content, timestamp, meta)
+            .await
+    }
+
+    /// Append a message as part of a run: with a `fence`, the append commits
+    /// only while that lease is still held.
+    pub(super) async fn append_message_fenced(
+        &self,
+        fence: Option<&RunFence>,
         session_id: &str,
         role: MessageRole,
         content: &str,
@@ -85,8 +101,12 @@ impl ChatDb {
         let provider_id = stats.and_then(|s| s.provider_id.clone());
         let session_update = role.session_summary_update();
         let role_str = role.as_str();
+        let mut tx = match fence {
+            Some(fence) => self.begin_fenced(fence).await?,
+            None => self.db.begin().await?,
+        };
         let model = query!(
-            self.db,
+            tx,
             "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
             session_id,
             role_str,
@@ -112,7 +132,8 @@ impl ChatDb {
             let preview = session_update
                 .update_preview
                 .then(|| truncate_preview(content));
-            self.update_session_stats(
+            Self::update_session_stats_in(
+                &mut tx,
                 session_id,
                 &now,
                 preview.as_deref(),
@@ -120,6 +141,7 @@ impl ChatDb {
             )
             .await?;
         }
+        tx.commit().await?;
 
         Ok(model)
     }
@@ -437,6 +459,31 @@ impl ChatDb {
         session_id: &str,
         message: &ChatMessage,
     ) -> Result<messages::Model, ChatDbError> {
+        self.append_chat_message_fenced(None, session_id, message)
+            .await
+    }
+
+    /// Append a chat history message as part of a run: committed only while
+    /// the run's lease `fence` still holds.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RunLeaseLost`] when the lease was taken over or
+    /// released, or [`ChatDbError`] on storage failure.
+    pub async fn append_chat_message_as_run(
+        &self,
+        fence: &RunFence,
+        message: &ChatMessage,
+    ) -> Result<messages::Model, ChatDbError> {
+        self.append_chat_message_fenced(Some(fence), &fence.session_id, message)
+            .await
+    }
+
+    async fn append_chat_message_fenced(
+        &self,
+        fence: Option<&RunFence>,
+        session_id: &str,
+        message: &ChatMessage,
+    ) -> Result<messages::Model, ChatDbError> {
         let timestamp = message.timestamp.map(|value| value.to_string());
         let stats = message
             .stats
@@ -465,7 +512,8 @@ impl ChatDb {
                 storage_error(format!("failed to serialize message tool calls: {error}"))
             })?)
         };
-        self.append_message(
+        self.append_message_fenced(
+            fence,
             session_id,
             message.role.clone(),
             &message.content,

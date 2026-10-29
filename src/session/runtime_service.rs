@@ -2,16 +2,20 @@ use crate::db::ChatDb;
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 
 use super::{
-    PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
-    PersistedPermissionRequest, PersistedWorkspaceRequest, SessionPlanState, SessionRuntimeState,
-    SessionRuntimeSummary, TerminalRuntimeState,
+    AcquireError, PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
+    PersistedPermissionRequest, PersistedWorkspaceRequest, RunOutcome, SessionPlanState,
+    SessionRuns, SessionRuntimeState, SessionRuntimeSummary, TerminalRuntimeState,
 };
+
+/// How often a stop re-checks whether the stopped run has ended.
+const STOP_SETTLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// Persists session runtime state and publishes UI events for changes.
 #[derive(Clone)]
 pub struct SessionRuntimeService {
     db: ChatDb,
     ui_event_bus: UiEventBus,
+    runs: SessionRuns,
 }
 
 impl std::fmt::Debug for SessionRuntimeService {
@@ -24,8 +28,34 @@ impl std::fmt::Debug for SessionRuntimeService {
 impl SessionRuntimeService {
     /// Create the service over `db`, publishing change events on `ui_event_bus`.
     #[must_use]
-    pub const fn new(db: ChatDb, ui_event_bus: UiEventBus) -> Self {
-        Self { db, ui_event_bus }
+    pub fn new(db: ChatDb, ui_event_bus: UiEventBus) -> Self {
+        Self::with_run_ttl(db, ui_event_bus, super::DEFAULT_RUN_LEASE_TTL)
+    }
+
+    /// Create the service with run leases that expire after `ttl` without a
+    /// heartbeat.
+    #[must_use]
+    pub fn with_run_ttl(db: ChatDb, ui_event_bus: UiEventBus, ttl: std::time::Duration) -> Self {
+        let runs = SessionRuns::new(db.clone(), ui_event_bus.clone()).with_ttl(ttl);
+        Self {
+            db,
+            ui_event_bus,
+            runs,
+        }
+    }
+
+    /// Spawn the background tasks of run leases with `spawner`; see
+    /// [`super::run_lease::Spawner`].
+    #[must_use]
+    pub fn with_spawner(mut self, spawner: super::run_lease::Spawner) -> Self {
+        self.runs = self.runs.with_spawner(spawner);
+        self
+    }
+
+    /// Single-owner run leases of this database.
+    #[must_use]
+    pub const fn runs(&self) -> &SessionRuns {
+        &self.runs
     }
 
     /// Clone of the underlying database handle.
@@ -68,6 +98,23 @@ impl SessionRuntimeService {
         state: SessionRuntimeState,
     ) -> Result<(), crate::db::ChatDbError> {
         self.db.set_session_runtime_state(session_id, state).await?;
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
+        Ok(())
+    }
+
+    /// Persist a session's runtime state as the run holding `fence`.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError::RunLeaseLost`] when the run no longer
+    /// holds the lease, or [`crate::db::ChatDbError`] on storage failure.
+    pub async fn set_state_as_run(
+        &self,
+        fence: &crate::db::RunFence,
+        state: SessionRuntimeState,
+    ) -> Result<(), crate::db::ChatDbError> {
+        self.db
+            .set_session_runtime_state_as_run(fence, state)
+            .await?;
         self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(())
     }
@@ -146,6 +193,52 @@ impl SessionRuntimeService {
         let next = self
             .db
             .take_next_dispatchable_pending_message(session_id)
+            .await?;
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
+        Ok(next)
+    }
+
+    /// Hold until the stopped session has no live run, then settle whatever
+    /// state it was left in. A session still waiting on a request after its
+    /// run ended (a restart dropped the run that was waiting) has no run to
+    /// settle it, so this takes the session's run itself and finishes it.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn settle_stopped(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        loop {
+            let runtime = self.get(session_id).await?;
+            if !self.runs.is_held(session_id).await? {
+                if !runtime.state.is_active() || runtime.interactions.is_active() {
+                    return Ok(runtime);
+                }
+                match self.runs.acquire(session_id).await {
+                    Ok(guard) => {
+                        guard.finish_idle(RunOutcome::Cancelled).await?;
+                        return self.get(session_id).await;
+                    }
+                    Err(AcquireError::Busy(_)) => {}
+                    Err(AcquireError::Storage(error)) => return Err(error),
+                }
+            }
+            async_io::Timer::after(STOP_SETTLE_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Pop the next pending message for the run holding the session's lease.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn take_next_for_run(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<PendingUserMessage>, crate::db::ChatDbError> {
+        let next = self
+            .db
+            .take_next_pending_message_for_run(session_id)
             .await?;
         self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(next)
@@ -248,21 +341,6 @@ impl SessionRuntimeService {
         let summary = self.db.set_waiting_ask_user(session_id, request).await?;
         self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(summary)
-    }
-
-    /// Atomically transition Running → Idle only if currently Running.
-    ///
-    /// # Errors
-    /// Returns [`crate::db::ChatDbError`] on storage failure.
-    pub async fn clear_running_if_needed(
-        &self,
-        session_id: &str,
-    ) -> Result<(), crate::db::ChatDbError> {
-        let transitioned = self.db.clear_running_if_idle(session_id).await?;
-        if transitioned {
-            self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
-        }
-        Ok(())
     }
 
     /// Mark a peer as owning browser input for the session.

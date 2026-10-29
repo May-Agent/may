@@ -29,6 +29,13 @@ pub enum ChatDbError {
     /// A profile row carries an environment value that is not recognized or no longer allowed.
     #[error("Invalid profile environment: {0}")]
     InvalidProfileEnvironment(String),
+    /// A run-scoped write was refused because the run's lease was taken over
+    /// or released.
+    #[error("The run lease of session {session_id} is no longer held by this run")]
+    RunLeaseLost {
+        /// Session whose lease the run no longer holds.
+        session_id: String,
+    },
     /// A pin operation would exceed the per-profile pinned-item limit.
     #[error(
         "Pinned limit exceeded for profile {profile_id}: current pinned items {current}, limit {limit}"
