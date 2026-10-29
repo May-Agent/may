@@ -1,0 +1,22 @@
+{{ at }} {% match kind -%}
+{%- when LineKind::RunStart -%}Running...
+{%- when LineKind::Thinking { text } -%}Thinking: {{ text }}
+{%- when LineKind::ToolStart { name, label } -%}Tool: {{ name }}{% if !label.is_empty() %}: {{ label }}{% endif %}
+{%- when LineKind::BuiltInTool { tool, detail } -%}Tool: {{ tool }}{% if !detail.is_empty() %}: {{ detail }}{% endif %}
+{%- when LineKind::ToolFinished { name, label, elapsed, outcome } -%}
+Tool finished: {{ name }}{% if !label.is_empty() %}: {{ label }}{% endif %}{% if let Some(elapsed) = elapsed %} in {{ elapsed }}{% endif %}
+{%- match outcome -%}
+{%- when ToolOutcome::Done -%}
+{%- when ToolOutcome::Exited { code } -%}, exit code {{ code }}
+{%- when ToolOutcome::Background { task_id } -%}, running in background as task {{ task_id }}
+{%- when ToolOutcome::Killed { task_id } -%}, killed (task {{ task_id }})
+{%- endmatch -%}
+{%- when LineKind::ToolFailed { name, label, elapsed, message } -%}
+Tool failed: {{ name }}{% if !label.is_empty() %}: {{ label }}{% endif %}{% if let Some(elapsed) = elapsed %} in {{ elapsed }}{% endif %}: {{ message }}
+{%- when LineKind::BackgroundStarted { task_id, output_file } -%}Background task started: {{ task_id }} (output: {{ output_file }})
+{%- when LineKind::BackgroundCompleted { task_id } -%}Background task completed: {{ task_id }}
+{%- when LineKind::Paused { reason } -%}Paused: {{ reason }}
+{%- when LineKind::Resumed { reason } -%}Resumed: {{ reason }}
+{%- when LineKind::SkillActivated { name } -%}Skill activated: {{ name }}
+{%- when LineKind::Error { error } -%}Error: {{ error }}
+{%- endmatch %}
