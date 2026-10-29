@@ -405,16 +405,22 @@ async fn run_update_task(
         .map(ToString::to_string)
         .or_else(|| current.script_inline.clone());
     validate_script_fields(next_script_path.as_deref(), next_script_inline.as_deref())?;
+    let next_timeout_secs = match req.timeout_secs {
+        Some(secs) => secs,
+        None => u32::try_from(current.timeout_secs).map_err(|_| {
+            bad_request_error(format!(
+                "stored task timeout_secs is out of range: {}",
+                current.timeout_secs
+            ))
+        })?,
+    };
     state
         .task_runtime
         .validate_task_script_for_profile(
             &current.profile_id,
             next_script_path.as_deref(),
             next_script_inline.as_deref(),
-            req.timeout_secs.unwrap_or_else(|| {
-                u64::try_from(current.timeout_secs)
-                    .expect("stored task timeout is a validated positive number")
-            }),
+            next_timeout_secs,
         )
         .await
         .map_err(bad_request_error)?;
