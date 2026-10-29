@@ -35,7 +35,7 @@ use crate::session::{SessionId, SessionPlanState};
 
 const SESSION_PROVIDER: &str = "session";
 const COMPACTION_PROVIDER: &str = "compaction";
-const SESSION_MODEL: &str = "session-model";
+pub(super) const SESSION_MODEL: &str = "session-model";
 const COMPACTION_MODEL: &str = "compaction-model";
 /// Opening words of aither's compaction instruction.
 const COMPACTION_MARKER: &str = "Your context window is being compacted";
@@ -48,13 +48,13 @@ struct Traffic {
 }
 
 /// Stub `OpenAI` server: plain text for a turn, a handoff for a compaction.
-struct StubModel {
-    base_url: String,
-    requests: Arc<tokio::sync::Mutex<Vec<String>>>,
+pub(super) struct StubModel {
+    pub(super) base_url: String,
+    pub(super) requests: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 impl StubModel {
-    async fn spawn(model: &'static str) -> Self {
+    pub(super) async fn spawn(model: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub model server");
@@ -158,9 +158,12 @@ fn reply(status: StatusCode, content_type: &'static str, body: String) -> Respon
 }
 
 /// What building a session agent needs besides the config.
-struct SessionParts {
+pub(super) struct SessionParts {
     dir: std::path::PathBuf,
-    db: crate::db::ChatDb,
+    pub(super) db: crate::db::ChatDb,
+    session_id: SessionId,
+    /// The runtime the session persists its interactions through, when it has one.
+    pub(super) runtime: Option<Arc<crate::session::SessionRuntimeService>>,
     workspace_broker: crate::workspace_request::WorkspaceRequestBroker,
     ask_user_broker: crate::ask_user::AskUserBroker,
     tool_environments: ToolEnvironmentCache,
@@ -172,7 +175,7 @@ struct SessionParts {
 }
 
 impl SessionParts {
-    async fn new(dir: std::path::PathBuf) -> Self {
+    pub(super) async fn new(dir: std::path::PathBuf) -> Self {
         // The baseline tools are downloaded once into the build directory's
         // `tmp/may-tools`, which the terminal E2E suite shares.
         let shared_tools = std::env::current_exe()
@@ -196,6 +199,8 @@ impl SessionParts {
         Self {
             dir,
             db,
+            session_id: SessionId::new(),
+            runtime: None,
             workspace_broker,
             ask_user_broker,
             tool_environments: ToolEnvironmentCache::spawn(),
@@ -210,14 +215,18 @@ impl SessionParts {
             sandbox_dir: self.dir.join("sandbox"),
             may_dir: self.dir.join(".may"),
             cwd,
-            session_id: SessionId::new(),
+            session_id: self.session_id.clone(),
             workspace_request_broker: self.workspace_broker.clone(),
             ask_user_broker: self.ask_user_broker.clone(),
             db: self.db.clone(),
             model: "session::session-model",
             reasoning_effort: None,
             profile_id: None,
-            permission_approver: None,
+            permission_approver: self.runtime.as_ref().map(|runtime| {
+                crate::agent::PermissionApprover::new()
+                    .with_runtime_service(runtime.clone())
+                    .for_session(self.session_id.as_str())
+            }),
             profile_persona: None,
             profile_memories: None,
             plan_state: SessionPlanState::default(),
@@ -238,10 +247,10 @@ impl SessionParts {
 }
 
 /// A session agent built from a saved config that points at stub servers.
-struct Session {
-    agent: MayAgent,
+pub(super) struct Session {
+    pub(super) agent: MayAgent,
     clock: ManualClock,
-    parts: SessionParts,
+    pub(super) parts: SessionParts,
     _temp: tempfile::TempDir,
 }
 
@@ -253,7 +262,7 @@ fn stub_provider(server: &StubModel) -> ProviderInstance {
 
 /// A saved config whose session provider is `session` and, when given, whose
 /// compaction model lives on `compaction`.
-fn saved_config(session: &StubModel, compaction: Option<&StubModel>) -> MayConfig {
+pub(super) fn saved_config(session: &StubModel, compaction: Option<&StubModel>) -> MayConfig {
     let mut config = MayConfig::default();
     config
         .provider
@@ -271,10 +280,35 @@ fn saved_config(session: &StubModel, compaction: Option<&StubModel>) -> MayConfi
 }
 
 impl Session {
-    async fn start(config: &MayConfig) -> Self {
+    pub(super) async fn start(config: &MayConfig) -> Self {
+        Self::start_with(config, false).await
+    }
+
+    /// Starts a session that persists its interactions through a runtime
+    /// service over its database, as the web server's sessions do.
+    pub(super) async fn start_with_runtime(config: &MayConfig) -> Self {
+        Self::start_with(config, true).await
+    }
+
+    async fn start_with(config: &MayConfig, with_runtime: bool) -> Self {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let temp = tempfile::tempdir().expect("tempdir");
-        let parts = SessionParts::new(temp.path().to_path_buf()).await;
+        let mut parts = SessionParts::new(temp.path().to_path_buf()).await;
+        if with_runtime {
+            parts
+                .db
+                .create_session(
+                    parts.session_id.as_str(),
+                    Some("Session"),
+                    Some("test-model"),
+                )
+                .await
+                .expect("create the session row");
+            parts.runtime = Some(Arc::new(crate::session::SessionRuntimeService::new(
+                parts.db.clone(),
+                crate::ui_event_bus::UiEventBus::new(),
+            )));
+        }
         let clock = ManualClock::new();
         let agent = Box::pin(Self::build(config, &parts, &clock)).await;
         Self {
@@ -307,7 +341,7 @@ impl Session {
     /// Sleeps out the idle timer the way the worker does, then compacts if
     /// the agent says it is due. `None` when no idle compaction is pending
     /// or nothing was compacted.
-    async fn compact_when_due(&mut self) -> Option<()> {
+    pub(super) async fn compact_when_due(&mut self) -> Option<()> {
         let due_in = self.agent.idle_compaction_due_in()?;
         self.clock.advance(due_in);
         self.agent
@@ -319,7 +353,7 @@ impl Session {
 }
 
 /// Runs one user turn to completion.
-async fn run_turn(agent: &mut MayAgent) {
+pub(super) async fn run_turn(agent: &mut MayAgent) {
     let mut stream = agent.run("Say hello.", []);
     while let Some(event) = stream.next().await {
         event.expect("the turn runs");

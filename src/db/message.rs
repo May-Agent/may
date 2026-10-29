@@ -180,7 +180,8 @@ impl ChatDb {
         .await?;
         let session_update = role.session_summary_update();
         if session_update.touch_updated_at {
-            self.update_session_stats(
+            Self::update_session_stats_in(
+                tx,
                 session_id,
                 &now,
                 None,
@@ -239,8 +240,26 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
+            .append_permission_response_message_in_tx(
+                &mut tx, session_id, request_id, approved, timestamp,
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(message)
+    }
+
+    /// Transactional body of [`Self::append_permission_response_message`].
+    pub(super) async fn append_permission_response_message_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
+        session_id: &str,
+        request_id: &str,
+        approved: bool,
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
             .append_structured_message_in_tx(
-                &mut tx,
+                tx,
                 session_id,
                 MessageRole::PermissionResponse,
                 timestamp,
@@ -255,7 +274,6 @@ impl ChatDb {
         )
         .execute()
         .await?;
-        tx.commit().await?;
         Ok(message)
     }
 
@@ -307,8 +325,26 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
+            .append_workspace_response_message_in_tx(
+                &mut tx, session_id, request_id, approved, timestamp,
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(message)
+    }
+
+    /// Transactional body of [`Self::append_workspace_response_message`].
+    pub(super) async fn append_workspace_response_message_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
+        session_id: &str,
+        request_id: &str,
+        approved: bool,
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
             .append_structured_message_in_tx(
-                &mut tx,
+                tx,
                 session_id,
                 MessageRole::WorkspaceResponse,
                 timestamp,
@@ -323,7 +359,6 @@ impl ChatDb {
         )
         .execute()
         .await?;
-        tx.commit().await?;
         Ok(message)
     }
 
@@ -340,12 +375,25 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
-            .append_structured_message_in_tx(
-                &mut tx,
-                session_id,
-                MessageRole::AskUserRequest,
-                timestamp,
+            .append_ask_user_request_message_in_tx(
+                &mut tx, session_id, request_id, questions, timestamp,
             )
+            .await?;
+        tx.commit().await?;
+        Ok(message)
+    }
+
+    /// Transactional body of [`Self::append_ask_user_request_message`].
+    pub(super) async fn append_ask_user_request_message_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
+        session_id: &str,
+        request_id: &str,
+        questions: &[crate::ask_user::Question],
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
+            .append_structured_message_in_tx(tx, session_id, MessageRole::AskUserRequest, timestamp)
             .await?;
         query!(
             tx,
@@ -382,7 +430,6 @@ impl ChatDb {
                 .await?;
             }
         }
-        tx.commit().await?;
         Ok(message)
     }
 
@@ -399,8 +446,26 @@ impl ChatDb {
     ) -> Result<messages::Model, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let message = self
+            .append_ask_user_response_message_in_tx(
+                &mut tx, session_id, request_id, answers, timestamp,
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(message)
+    }
+
+    /// Transactional body of [`Self::append_ask_user_response_message`].
+    pub(super) async fn append_ask_user_response_message_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
+        session_id: &str,
+        request_id: &str,
+        answers: &[crate::ask_user::QuestionAnswer],
+        timestamp: Option<&str>,
+    ) -> Result<messages::Model, ChatDbError> {
+        let message = self
             .append_structured_message_in_tx(
-                &mut tx,
+                tx,
                 session_id,
                 MessageRole::AskUserResponse,
                 timestamp,
@@ -420,7 +485,9 @@ impl ChatDb {
             let (answer_kind, custom_text, selected_values) = match &answer.answer {
                 AnswerValue::Selected(values) => ("selected", None, values.as_slice()),
                 AnswerValue::Custom(value) => ("custom", Some(value.as_str()), &[][..]),
-                AnswerValue::Skipped => ("skipped", None, &[][..]),
+                AnswerValue::Skipped => {
+                    unreachable!("May never commits a skipped answer: check_answers refuses it")
+                }
             };
             query!(
                 tx,
@@ -446,7 +513,6 @@ impl ChatDb {
                 .await?;
             }
         }
-        tx.commit().await?;
         Ok(message)
     }
 

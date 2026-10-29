@@ -305,6 +305,10 @@ pub struct SessionRuntimeSummary {
     /// Ask-user request blocking the session, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_ask_user: Option<PersistedAskUserRequest>,
+    /// Questions the agent asked that are neither answered nor withdrawn,
+    /// oldest first. No run waits on them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_questions: Vec<PersistedAskUserRequest>,
     /// Last update timestamp as an ISO string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -322,6 +326,7 @@ impl Default for SessionRuntimeSummary {
             waiting_permission: None,
             waiting_workspace: None,
             waiting_ask_user: None,
+            open_questions: Vec::new(),
             updated_at: None,
         }
     }
@@ -363,6 +368,7 @@ impl SessionRuntimeSummary {
             && self.waiting_permission.is_none()
             && self.waiting_workspace.is_none()
             && self.waiting_ask_user.is_none()
+            && self.open_questions.is_empty()
     }
 
     /// Keep overflow steer messages ahead of regular queued work.

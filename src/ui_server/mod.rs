@@ -705,6 +705,9 @@ fn build_provider_models_response(
 }
 
 #[cfg(test)]
+mod response_tests;
+
+#[cfg(test)]
 mod tests {
     #[cfg(not(feature = "ui"))]
     use super::UiServerMode;

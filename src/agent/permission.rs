@@ -302,6 +302,36 @@ impl PermissionApprover {
         rx.recv().await.map_err(|_| PermissionError::Interrupted)
     }
 
+    /// Resolve the pending request `request_id`: the decision is committed
+    /// first (the request cleared by its id, the decision in the history),
+    /// and only then is the waiting run woken. Returns `None` when the
+    /// request is not pending.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] when the commit fails; nothing is
+    /// woken then.
+    ///
+    /// # Panics
+    /// Panics if the approver has no runtime service.
+    pub async fn resolve(
+        &self,
+        request_id: &str,
+        approved: bool,
+    ) -> Result<Option<crate::session::ResolvedRequest>, crate::db::ChatDbError> {
+        let runtime = self
+            .runtime_service
+            .as_ref()
+            .expect("resolving a permission request needs the runtime service");
+        let Some(session_id) = runtime
+            .commit_permission_response(request_id, approved)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let woke = self.respond(request_id, approved);
+        Ok(Some(crate::session::ResolvedRequest { session_id, woke }))
+    }
+
     /// Deliver a decision for `request_id`; returns false if no matching pending request exists.
     #[must_use]
     pub fn respond(&self, request_id: &str, approved: bool) -> bool {
