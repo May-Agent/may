@@ -20,7 +20,7 @@
 
 use std::future::Future;
 
-use aither_agent::{AgentEvent, CompactResult};
+use aither_agent::{CompactResult, TimedEvent};
 use aither_core::llm::Attachment;
 use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
@@ -34,7 +34,7 @@ use crate::db::ChatDb;
 #[derive(Debug)]
 pub enum TuiEvent {
     /// Agent produced a streaming event.
-    Agent(Result<AgentEvent, aither_agent::AgentError>),
+    Agent(Result<TimedEvent, aither_agent::AgentError>),
     /// Compaction request finished.
     Compacted(Result<Option<CompactResult>, aither_agent::AgentError>),
     /// Context-window measurement for `/context` is ready.

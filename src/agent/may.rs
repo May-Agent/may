@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_agent::{
-    Agent, AgentError, AgentEvent, AgentKind, CompactResult, HCons, TerminalAgentBuilder,
+    Agent, AgentError, AgentKind, CompactResult, HCons, TerminalAgentBuilder, TimedEvent,
 };
 use aither_cloud::CloudProvider;
 use aither_core::llm::{
@@ -784,7 +784,7 @@ impl MayAgent {
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> Pin<Box<impl Stream<Item = Result<AgentEvent, AgentError>> + '_>> {
+    ) -> Pin<Box<impl Stream<Item = Result<TimedEvent, AgentError>> + '_>> {
         Box::pin(self.inner.run(prompt, attachments))
     }
 
@@ -795,7 +795,7 @@ impl MayAgent {
         prompt: &str,
         hidden_context: Option<&str>,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> Pin<Box<impl Stream<Item = Result<AgentEvent, AgentError>> + '_>> {
+    ) -> Pin<Box<impl Stream<Item = Result<TimedEvent, AgentError>> + '_>> {
         if let Some(hidden_context) = hidden_context
             .map(str::trim)
             .filter(|text| !text.is_empty())

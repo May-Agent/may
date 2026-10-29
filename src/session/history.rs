@@ -270,13 +270,13 @@ impl ChatMessage {
         }
     }
 
-    /// Create a new assistant message.
-    pub fn assistant(content: impl Into<String>) -> Self {
+    /// Create a new assistant message the agent emitted at `at`.
+    pub fn assistant(content: impl Into<String>, at: Timestamp) -> Self {
         Self {
             role: MessageRole::Assistant,
             content: content.into(),
             attachments: Vec::new(),
-            timestamp: Some(Timestamp::now()),
+            timestamp: Some(at),
             tool_call_id: None,
             stats: None,
             reasoning: Vec::new(),
@@ -284,13 +284,17 @@ impl ChatMessage {
         }
     }
 
-    /// Create a new assistant message with usage stats.
-    pub fn assistant_with_stats(content: impl Into<String>, stats: ChatMessageStats) -> Self {
+    /// Create a new assistant message, emitted at `at`, with usage stats.
+    pub fn assistant_with_stats(
+        content: impl Into<String>,
+        stats: ChatMessageStats,
+        at: Timestamp,
+    ) -> Self {
         Self {
             role: MessageRole::Assistant,
             content: content.into(),
             attachments: Vec::new(),
-            timestamp: Some(Timestamp::now()),
+            timestamp: Some(at),
             tool_call_id: None,
             stats: Some(stats),
             reasoning: Vec::new(),
@@ -312,13 +316,17 @@ impl ChatMessage {
         }
     }
 
-    /// Create a new tool message.
-    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    /// Create a new tool message recorded at `at`.
+    pub fn tool(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        at: Timestamp,
+    ) -> Self {
         Self {
             role: MessageRole::Tool,
             content: content.into(),
             attachments: Vec::new(),
-            timestamp: Some(Timestamp::now()),
+            timestamp: Some(at),
             tool_call_id: Some(tool_call_id.into()),
             stats: None,
             reasoning: Vec::new(),
@@ -600,7 +608,9 @@ mod tests {
             "<system-reminder>notice</system-reminder>",
         ));
         history.messages_mut().push(ChatMessage::user("hello"));
-        history.messages_mut().push(ChatMessage::assistant("world"));
+        history
+            .messages_mut()
+            .push(ChatMessage::assistant("world", Timestamp::now()));
 
         let messages = history.to_aither_messages().unwrap();
         assert_eq!(messages.len(), 3);
@@ -630,10 +640,10 @@ mod tests {
         .expect("serialize tool end");
         history
             .messages_mut()
-            .push(ChatMessage::tool("call_123", start));
+            .push(ChatMessage::tool("call_123", start, Timestamp::now()));
         history
             .messages_mut()
-            .push(ChatMessage::tool("call_123", end));
+            .push(ChatMessage::tool("call_123", end, Timestamp::now()));
 
         let messages = history.to_aither_messages().expect("replay tool lifecycle");
         assert_eq!(messages.len(), 2);
@@ -675,9 +685,11 @@ mod tests {
     #[test]
     fn unstructured_legacy_tool_history_fails_fast() {
         let mut history = ChatHistory::new();
-        history
-            .messages_mut()
-            .push(ChatMessage::tool("call_123", "plain legacy output"));
+        history.messages_mut().push(ChatMessage::tool(
+            "call_123",
+            "plain legacy output",
+            Timestamp::now(),
+        ));
         assert!(matches!(
             history.to_aither_messages(),
             Err(HistoryReplayError::InvalidToolEvent(_))
