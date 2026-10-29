@@ -31,7 +31,7 @@ pub enum WireStream {
 impl From<&CommandStream> for WireStream {
     fn from(stream: &CommandStream) -> Self {
         match stream {
-            CommandStream::Inline(text) => Self::Inline { text: text.clone() },
+            CommandStream::Inline { text } => Self::Inline { text: text.clone() },
             CommandStream::Stored {
                 file,
                 preview,
@@ -52,7 +52,7 @@ impl From<&CommandStream> for WireStream {
 impl From<WireStream> for CommandStream {
     fn from(stream: WireStream) -> Self {
         match stream {
-            WireStream::Inline { text } => Self::Inline(text),
+            WireStream::Inline { text } => Self::Inline { text },
             WireStream::Stored {
                 file,
                 preview,
@@ -164,7 +164,9 @@ mod tests {
     #[test]
     fn command_wire_shape_is_typed_fields() {
         let result = command(
-            CommandStream::Inline("out".to_string()),
+            CommandStream::Inline {
+                text: "out".to_string(),
+            },
             Some(CommandStream::Stored {
                 file: StoredFile {
                     url: "outputs/e.txt".to_string(),
@@ -199,7 +201,12 @@ mod tests {
             ToolResult::tsv("a\tb\n"),
             ToolResult::image(vec![1, 2, 3], "image/png"),
             ToolResult::error("boom"),
-            command(CommandStream::Inline("out".to_string()), None),
+            command(
+                CommandStream::Inline {
+                    text: "out".to_string(),
+                },
+                None,
+            ),
             command(
                 CommandStream::Image {
                     media_type: "image/png".to_string(),
