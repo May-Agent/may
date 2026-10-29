@@ -14,21 +14,23 @@ import { BrowserTakeoverBanner } from './BrowserTakeoverBanner';
 import { PlanBanner } from './PlanBanner';
 import { Button } from '@/components/ui/button';
 import { useTranslation } from '@/lib/i18n';
-import type { ApiAttachment } from '@/lib/types';
+import type { ApiAttachment, ApiMessage } from '@/lib/types';
 import { enqueueMessage } from '@/lib/api/chat';
 import { isConfigUsable } from '@/lib/api/config';
 import { cn } from '@/lib/utils';
 
 const STICKY_BOTTOM_THRESHOLD_PX = 48;
+const NO_MESSAGES: ApiMessage[] = [];
 
 export function ChatView({ sessionId }: { sessionId: string }) {
   const open = useSessionsStore((s) => s.open);
-  const messages = useSessionsStore((s) => s.activeMessages);
+  const messages = useSessionsStore((s) => s.messages[sessionId] ?? NO_MESSAGES);
   const active = useSessionsStore((s) => s.active);
   const appendMessage = useSessionsStore((s) => s.appendMessage);
-  const activeTurn = useTurnStore((s) => s.active);
-  const stopping = useTurnStore((s) => s.stopping);
-  const lastTurn = useTurnStore((s) => s.last);
+  const sessionTurn = useTurnStore((s) => s.turns[sessionId]);
+  const activeTurn = sessionTurn?.active ?? null;
+  const stopping = sessionTurn?.stopping ?? false;
+  const lastTurn = sessionTurn?.last ?? null;
   const send = useTurnStore((s) => s.send);
   const cancel = useTurnStore((s) => s.cancel);
   const retry = useTurnStore((s) => s.retry);
@@ -92,7 +94,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     active.reasoningEffort.length > 0 &&
     active.reasoningEffort.toLowerCase() !== 'off';
   const lastTurnForActive =
-    lastTurn && lastTurn.sessionId === active.id && !lastTurn.error ? lastTurn : null;
+    lastTurn && !lastTurn.error ? lastTurn : null;
 
   const handleSend = async (
     content: string,
@@ -106,7 +108,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       timestamp: new Date().toISOString(),
       attachments,
     };
-    appendMessage(userMessage);
+    appendMessage(sessionId, userMessage);
     // Sending a new message is an explicit user intent to follow the tail.
     stickyBottomRef.current = true;
 
@@ -167,8 +169,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               code={lastTurn.error.code}
               message={lastTurn.error.message}
               retryable={lastTurn.error.retryable}
-              onRetry={() => void retry()}
-              onDismiss={dismissError}
+              onRetry={() => void retry(sessionId)}
+              onDismiss={() => dismissError(sessionId)}
             />
           )}
         </div>
@@ -203,7 +205,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             disabled={!configUsable}
             streaming={streaming}
             onSend={handleSend}
-            onCancel={() => void cancel()}
+            onCancel={() => void cancel(sessionId)}
             sessionId={active.id}
             currentModel={active.model}
             currentReasoningEffort={active.reasoningEffort}
