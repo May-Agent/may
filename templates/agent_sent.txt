@@ -1,0 +1,1 @@
+Message stored for "{{ recipient }}" and the agent was woken. Its reply, if any, arrives as a message to you.

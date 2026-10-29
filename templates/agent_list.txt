@@ -1,0 +1,7 @@
+{%- if agents.is_empty() -%}
+No agent is running on this machine.
+{%- else -%}
+{%- for agent in agents -%}
+- {{ agent.status.name }}{% if agent.is_self %} (you){% endif %} [id {{ agent.status.session_id }}]: {{ agent.status.activity }}, in {{ agent.status.cwd.display() }}{% if agent.status.roots.is_empty() %}, no roots in tasks.md{% else %}, roots: {{ agent.status.roots.join(", ") }}{% endif %}
+{% endfor -%}
+{%- endif -%}

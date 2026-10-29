@@ -5,6 +5,8 @@
 
 /// Agent construction, tools, and runtime glue.
 pub mod agent;
+/// Main agents on one machine discover each other and exchange messages.
+pub mod agent_link;
 /// Persistent storage for OAuth credentials.
 pub mod auth_store;
 /// Managed browser sessions backing the browser tool.
