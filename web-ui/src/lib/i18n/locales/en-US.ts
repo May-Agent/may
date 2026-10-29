@@ -168,7 +168,6 @@ export const enUS = {
     waitingPermission: 'Permission required',
     waitingWorkspace: 'Workspace access required',
     waitingAskUser: 'Waiting for input',
-    waitingTerminalInput: 'Task awaiting input',
     queued: '{count} queued',
   },
   browserTakeover: {

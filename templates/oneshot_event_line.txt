@@ -18,5 +18,7 @@ Tool failed: {{ name }}{% if !label.is_empty() %}: {{ label }}{% endif %}{% if l
 {%- when LineKind::Paused { reason } -%}Paused: {{ reason }}
 {%- when LineKind::Resumed { reason } -%}Resumed: {{ reason }}
 {%- when LineKind::SkillActivated { name } -%}Skill activated: {{ name }}
+{%- when LineKind::Usage { prompt, cache_read, cache_write, completion, total } -%}
+Usage:{% if let Some(tokens) = prompt %} prompt={{ tokens }}{% endif %}{% if let Some(tokens) = cache_read %} cache_read={{ tokens }}{% endif %}{% if let Some(tokens) = cache_write %} cache_write={{ tokens }}{% endif %}{% if let Some(tokens) = completion %} completion={{ tokens }}{% endif %}{% if let Some(tokens) = total %} total={{ tokens }}{% endif %}
 {%- when LineKind::Error { error } -%}Error: {{ error }}
 {%- endmatch %}

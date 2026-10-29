@@ -5,6 +5,8 @@
 
 /// Agent construction, tools, and runtime glue.
 pub mod agent;
+/// Main agents on one machine discover each other and exchange messages.
+pub mod agent_link;
 /// Persistent storage for OAuth credentials.
 pub mod auth_store;
 /// Managed browser sessions backing the browser tool.
@@ -59,6 +61,8 @@ pub mod secrets;
 pub mod session;
 /// Agent skill discovery and management.
 pub mod skill;
+/// Startup validation of configuration files.
+pub mod startup;
 /// Subagent registration and dispatch.
 pub mod subagent;
 /// Scheduled-task trigger definitions.

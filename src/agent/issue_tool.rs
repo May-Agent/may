@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use aither_core::llm::{Tool, ToolResult};
+use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -129,10 +130,78 @@ pub enum IssueArgs {
     },
 }
 
+impl IssueArgs {
+    /// The subcommand name as typed on the command line.
+    const fn subcommand(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::View { .. } => "view",
+            Self::List { .. } => "list",
+            Self::Edit { .. } => "edit",
+            Self::Comment { .. } => "comment",
+            Self::Close { .. } => "close",
+            Self::Label { .. } => "label",
+            Self::BlockedBy { .. } => "blocked-by",
+            Self::SubIssue { .. } => "sub-issue",
+        }
+    }
+
+    /// Whether the subcommand changes the issue backend.
+    const fn writes(&self) -> bool {
+        !matches!(self, Self::View { .. } | Self::List { .. })
+    }
+}
+
+/// Refusal of a write subcommand to a subagent.
+#[derive(Template)]
+#[template(path = "issue_reserved.txt")]
+struct IssueReserved {
+    subcommand: &'static str,
+}
+
 /// `issue` tool: unified issue tracker over the resolved backend.
 #[derive(Debug, Clone)]
 pub struct IssueTool<S> {
     store: S,
+}
+
+/// The `issue` tool as a subagent sees it: the read subcommands work and every
+/// write subcommand is refused before it reaches the backend.
+#[derive(Debug, Clone)]
+pub struct SubagentIssueTool<S> {
+    store: S,
+}
+
+impl<S: IssueStore> SubagentIssueTool<S> {
+    /// Bind the read-only tool to the session's issue store.
+    #[must_use]
+    pub const fn new(store: S) -> Self {
+        Self { store }
+    }
+}
+
+impl<S: IssueStore + Clone + 'static> Tool for SubagentIssueTool<S> {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("issue")
+    }
+
+    type Arguments = IssueArgs;
+    type Res = ToolResult;
+
+    async fn call(
+        &self,
+        arguments: Self::Arguments,
+        _cx: aither_core::llm::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
+        if arguments.writes() {
+            let refusal = IssueReserved {
+                subcommand: arguments.subcommand(),
+            }
+            .render()?;
+            return Err(IssueError::Reserved(refusal).into());
+        }
+        execute(&self.store, arguments).await.map_err(Into::into)
+    }
 }
 
 impl<S: IssueStore> IssueTool<S> {
@@ -346,9 +415,123 @@ fn render_detail(detail: &IssueDetail) -> String {
     out
 }
 
+/// Shared checks of the subagent's `issue` tool, run against each backend.
+#[cfg(test)]
+pub mod subagent_checks {
+    use aither_core::llm::ToolContext;
+
+    use super::*;
+
+    /// One of every subcommand that changes the backend.
+    pub fn write_args() -> Vec<IssueArgs> {
+        vec![
+            IssueArgs::Create {
+                title: "t".to_string(),
+                body: None,
+                labels: Vec::new(),
+            },
+            IssueArgs::Edit {
+                number: 1,
+                title: Some("t".to_string()),
+                body: None,
+                state: None,
+            },
+            IssueArgs::Comment {
+                number: 1,
+                body: "b".to_string(),
+            },
+            IssueArgs::Close { number: 1 },
+            IssueArgs::Label {
+                number: 1,
+                add: vec!["bug".to_string()],
+                remove: Vec::new(),
+            },
+            IssueArgs::BlockedBy {
+                number: 1,
+                add: vec![2],
+                remove: Vec::new(),
+            },
+            IssueArgs::SubIssue {
+                number: 1,
+                add: vec![2],
+                remove: Vec::new(),
+            },
+        ]
+    }
+
+    /// Every write subcommand is refused with the reserved-for-main-agent text.
+    pub async fn assert_writes_refused<S: IssueStore + Clone + 'static>(
+        tool: &SubagentIssueTool<S>,
+    ) {
+        for args in write_args() {
+            let subcommand = args.subcommand();
+            let error = tool
+                .call(args, ToolContext::new())
+                .await
+                .expect_err("a subagent's write must be refused");
+            let text = error.to_string();
+            assert!(
+                text.contains(&format!(
+                    "`issue {subcommand}` is reserved for the main agent"
+                )),
+                "{subcommand}: {text}"
+            );
+        }
+    }
+
+    /// Both read subcommands run against the backend.
+    pub async fn assert_reads_work<S: IssueStore + Clone + 'static>(
+        tool: &SubagentIssueTool<S>,
+        number: i64,
+    ) {
+        let viewed = tool
+            .call(IssueArgs::View { number }, ToolContext::new())
+            .await
+            .expect("a subagent may view an issue");
+        assert!(format!("{viewed:?}").contains(&format!("#{number}")));
+        tool.call(
+            IssueArgs::List {
+                state: IssueListState::All,
+                labels: Vec::new(),
+                limit: 10,
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("a subagent may list issues");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_subagent_reads_issues_and_its_writes_never_reach_the_may_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let store = crate::issue::MayIssueStore::new(db, "test".to_string());
+        let created = store.create("seed", "body", &[]).await.expect("seed issue");
+        let before = store
+            .list(IssueListState::All, &[], 50)
+            .await
+            .expect("list");
+
+        let tool = SubagentIssueTool::new(store.clone());
+        subagent_checks::assert_reads_work(&tool, created.number).await;
+        subagent_checks::assert_writes_refused(&tool).await;
+
+        let after = store
+            .list(IssueListState::All, &[], 50)
+            .await
+            .expect("list");
+        assert_eq!(before.len(), after.len());
+        let detail = store.get(created.number).await.expect("view");
+        assert_eq!(detail.title, "seed");
+        assert!(detail.comments.is_empty() && detail.labels.is_empty());
+    }
 
     #[test]
     fn args_schema_uses_subcommand_tag_shape() {

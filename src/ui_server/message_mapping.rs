@@ -173,6 +173,16 @@ fn tool_event_to_api_json(record: &ToolEventRecord, seq: usize) -> Value {
             "result": crate::session::tool_result_wire::WireToolResult::from(result),
             "seq": seq,
         }),
+        ToolEventRecord::Stopped { id, name } => json!({
+            "stage": "end",
+            "id": id,
+            "name": name,
+            "variant": ToolVariant::infer(name),
+            "result": crate::session::tool_result_wire::WireToolResult::from(
+                &ToolEventRecord::stopped_result()
+            ),
+            "seq": seq,
+        }),
     }
 }
 

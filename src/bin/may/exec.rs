@@ -12,7 +12,7 @@ use std::sync::Arc;
 use aither_core::llm::{CommandOutcome, CommandResult, Tool, ToolResult};
 use aither_sandbox::{
     ContainerShellRuntime, OutputFormat, ShellRuntimeAvailability, SshServer, TerminalArgs,
-    TerminalExecutionMode, TerminalTool, terminal_tool_factory_channel,
+    TerminalExecutionMode, TerminalTool,
 };
 use may_agent::session::{SessionPaths, initialize_session_persistence};
 use may_agent::{
@@ -389,11 +389,16 @@ async fn build_exec_terminal_tool(
             ..
         } => terminal_tool
             .with_shell_sessions(shell_sessions)
-            .with_container_runtime(ContainerShellRuntime::new(
-                container_id.clone(),
-                container_ipc_route.clone(),
-                container_exec.clone(),
-            )),
+            .with_container_runtime(
+                ContainerShellRuntime::new(
+                    container_id.clone(),
+                    container_ipc_route.clone(),
+                    container_exec.clone(),
+                )
+                .with_workspace_mount(
+                    may_agent::container::lifecycle::workspace_mount(&context.sandbox_dir),
+                ),
+            ),
         may_agent::AgentEnvironment::Local => terminal_tool.with_shell_sessions(shell_sessions),
     };
 
@@ -430,19 +435,16 @@ async fn build_exec_terminal_tool(
         ),
     )
     .await?;
-    let (terminal_tool_factory, terminal_tool_factory_receiver) = terminal_tool_factory_channel();
     let registry = build_exec_registry(
         context,
         may_config,
         resolved_provider.llm,
         resolved_provider.search_embedder,
         &tool_dispatchers,
-        terminal_tool_factory,
         environment,
     )
     .await?;
     let terminal_tool = terminal_tool.with_registry(registry);
-    terminal_tool.start_factory_service(terminal_tool_factory_receiver);
     Ok(terminal_tool)
 }
 
@@ -452,7 +454,6 @@ async fn build_exec_registry<LLM>(
     llm: LLM,
     search_embedder: may_agent::embedding_provider::EmbeddingModelResolution,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
-    terminal_tool_factory: aither_sandbox::TerminalToolFactory,
     environment: &may_agent::AgentEnvironment,
 ) -> Result<Arc<aither_sandbox::ToolRegistry>, ExecError>
 where
@@ -493,13 +494,14 @@ where
             register_subagents_broker: None,
             workspace_request_broker: None,
             subagent_runs: aither_agent::specialized::SubagentRuns::default(),
-            terminal_tool_factory: Some(terminal_tool_factory),
             // exec runs scripts without a model turn, so no provider-hosted
             // web tools exist here and the commands must stay registered.
             request_parameters: aither_core::llm::model::Parameters::default(),
             // exec has no UI reader; the tracker still records harmlessly.
             subagent_tracker: may_agent::agent::SubagentTracker::default(),
             issue_store,
+            // exec is no main agent: it has no turn boundary to deliver at.
+            agent_messaging: None,
         },
     )
     .await

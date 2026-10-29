@@ -170,7 +170,6 @@ export const zhHant: Messages = {
     waitingPermission: '等待授權',
     waitingWorkspace: '等待工作區授權',
     waitingAskUser: '等待您的回覆',
-    waitingTerminalInput: '任務等待輸入',
     queued: '佇列中 {count} 則',
   },
   browserLive: {
