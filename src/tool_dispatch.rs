@@ -306,7 +306,6 @@ async fn handle_browser_request(
             url,
             detail,
             screenshot,
-            format: _,
         } => {
             let options = crate::agent::BrowserArgs::read_options(detail, screenshot);
             let request = BrowserServiceRequest::Read { url, options };

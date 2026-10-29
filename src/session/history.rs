@@ -33,15 +33,6 @@ pub enum HistoryReplayError {
         #[source]
         source: serde_json::Error,
     },
-    /// Tool result could not be rendered for the model.
-    #[error("tool result '{tool_call_id}' could not be rendered for the model")]
-    RenderToolResult {
-        /// Id of the tool call whose result failed to render.
-        tool_call_id: String,
-        /// Underlying render error.
-        #[source]
-        source: aither_core::Error,
-    },
     /// A persisted attachment could not be replayed into model form.
     #[error("attachment '{name}' could not be replayed: {reason}")]
     InvalidAttachment {
@@ -73,7 +64,8 @@ pub enum ToolEventRecord {
         id: String,
         /// Tool name.
         name: String,
-        /// Rendered tool result.
+        /// Tool result, stored in its wire form.
+        #[serde(with = "super::tool_result_wire")]
         result: aither_core::llm::ToolResult,
     },
 }
@@ -475,15 +467,7 @@ impl ChatHistory {
                                         message_id: tool_call_id.to_string(),
                                     }));
                                 }
-                                match result.render_for_model() {
-                                    Ok(content) => Some(Ok(Message::tool(id, content))),
-                                    Err(source) => {
-                                        Some(Err(HistoryReplayError::RenderToolResult {
-                                            tool_call_id: id,
-                                            source,
-                                        }))
-                                    }
-                                }
+                                Some(Ok(Message::tool(id, result.render_for_model())))
                             }
                         }
                     }
@@ -544,9 +528,8 @@ fn replay_user_message(
                     )?,
                 };
                 let saved_path = attachment_local_path(attachment).ok();
-                let xml = crate::xml::pasted_text_xml(&text, saved_path.as_deref())
-                    .map_err(|error| invalid_attachment(attachment, error))?;
-                let _ = write!(content, "\n{xml}");
+                let block = crate::pasted_text::pasted_text_block(&text, saved_path.as_deref());
+                let _ = write!(content, "\n{block}");
             }
             AttachmentKind::File => {
                 let label = attachment_local_path(attachment).map_or_else(
@@ -660,6 +643,33 @@ mod tests {
         assert_eq!(messages[1].role(), Role::Tool);
         assert_eq!(messages[1].tool_call_id(), Some("call_123"));
         assert_eq!(messages[1].content(), "done");
+    }
+
+    #[test]
+    fn command_result_survives_storage_and_replays_as_prose() {
+        use aither_core::llm::{CommandOutcome, CommandResult, CommandStream};
+
+        let result = ToolResult::Command(Box::new(CommandResult {
+            stdout: CommandStream::Inline("hi\n".to_string()),
+            stderr: Some(CommandStream::Inline("warn\n".to_string())),
+            outcome: CommandOutcome::Exited { code: 3 },
+        }));
+        let stored = serde_json::to_string(&ToolEventRecord::End {
+            id: "call_1".to_string(),
+            name: "terminal".to_string(),
+            result: result.clone(),
+        })
+        .expect("serialize command tool end");
+        let ToolEventRecord::End { result: loaded, .. } =
+            serde_json::from_str::<ToolEventRecord>(&stored).expect("deserialize command tool end")
+        else {
+            panic!("expected an end record");
+        };
+        assert_eq!(loaded, result);
+        assert_eq!(
+            loaded.render_for_model(),
+            "hi\nstderr:\nwarn\nExit code: 3.\n"
+        );
     }
 
     #[test]

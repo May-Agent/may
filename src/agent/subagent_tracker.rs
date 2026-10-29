@@ -288,10 +288,20 @@ where
     async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
         // `prompt_file` carries the task text now; read it for the run's
         // display label, falling back to the path itself if it is gone.
-        let prompt = async_fs::read_to_string(&args.prompt_file)
+        let (subagent, prompt_file) = match &args {
+            SubagentArgs::Start {
+                subagent,
+                prompt_file,
+                ..
+            } => (subagent.clone(), prompt_file.clone()),
+            SubagentArgs::Resume { id, prompt_file } => {
+                (format!("resume #{id}"), prompt_file.clone())
+            }
+        };
+        let prompt = async_fs::read_to_string(&prompt_file)
             .await
-            .unwrap_or_else(|_| args.prompt_file.clone());
-        let (run, _guard) = self.tracker.begin(&args.subagent, &prompt);
+            .unwrap_or(prompt_file);
+        let (run, _guard) = self.tracker.begin(&subagent, &prompt);
         ACTIVE_RUN.scope(run, self.inner.call(args, cx)).await
     }
 }

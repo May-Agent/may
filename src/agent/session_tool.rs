@@ -13,6 +13,7 @@ use arrow_array::{
     RecordBatchReader, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
+use askama::Template;
 use futures_lite::StreamExt;
 use lance_index::scalar::FullTextSearchQuery;
 use lancedb::index::Index;
@@ -55,6 +56,21 @@ pub enum SessionSearchMode {
     Fuzzy,
     /// Embedding-similarity search.
     Semantic,
+}
+
+impl SessionSearchMode {
+    /// Name of the mode as the model passes it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Text => "text",
+            Self::Regex => "regex",
+            Self::Fulltext => "fulltext",
+            Self::Fuzzy => "fuzzy",
+            Self::Semantic => "semantic",
+        }
+    }
 }
 
 /// Output shape for the `session list` tool command.
@@ -209,8 +225,6 @@ enum SessionToolError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("tool result serialization error: {0}")]
-    ToolResult(#[from] aither_core::Error),
     #[error("RAG error: {0}")]
     Rag(#[from] aither_rag::RagError),
     #[error("Arrow error: {0}")]
@@ -607,7 +621,7 @@ async fn execute_search(
     if total_matches > 0 && rows.is_empty() {
         return Err(SessionToolError::AllResultsAlreadyInContext);
     }
-    finalize_rows_with_total(&rows, total_matches, &args)
+    Ok(finalize_rows_with_total(&rows, total_matches, &args))
 }
 
 /// Removes current-session hits whose content already appears in the exact
@@ -649,7 +663,7 @@ fn filter_rows_against_messages(
         .collect()
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct SessionSummaryView {
     session_id: String,
     title: String,
@@ -678,7 +692,7 @@ impl From<crate::db::entity::sessions::Model> for SessionSummaryView {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct SessionMessageView {
     message_id: i32,
     role: String,
@@ -697,12 +711,50 @@ impl From<crate::db::entity::messages::Model> for SessionMessageView {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct SessionInspectView {
+/// What the model reads for `session inspect`.
+#[derive(Debug, Template)]
+#[template(path = "session_inspect.txt", escape = "none")]
+struct SessionInspectText {
     session: SessionSummaryView,
     final_assistant_message: Option<SessionMessageView>,
     final_user_message: Option<SessionMessageView>,
     latest_message: Option<SessionMessageView>,
+}
+
+/// What the model reads for `session messages`.
+#[derive(Debug, Template)]
+#[template(path = "session_messages.txt", escape = "none")]
+struct SessionMessagesText {
+    session: SessionSummaryView,
+    messages: Vec<SessionMessageView>,
+}
+
+/// What the model reads for `session list`.
+#[derive(Debug, Template)]
+#[template(path = "session_list.txt", escape = "none")]
+struct SessionListText {
+    total_matches: usize,
+    results: Vec<SessionSummaryView>,
+}
+
+/// What the model reads for a message-mode `session search`.
+#[derive(Debug, Template)]
+#[template(path = "session_search_messages.txt", escape = "none")]
+struct SessionSearchMessagesText {
+    query: String,
+    search_mode: SessionSearchMode,
+    total_matches: usize,
+    items: Vec<MessageResult>,
+}
+
+/// What the model reads for a session-mode `session search`.
+#[derive(Debug, Template)]
+#[template(path = "session_search_sessions.txt", escape = "none")]
+struct SessionSearchSessionsText {
+    query: String,
+    search_mode: SessionSearchMode,
+    total_matches: usize,
+    items: Vec<SessionResult>,
 }
 
 async fn execute_inspect(
@@ -730,16 +782,15 @@ async fn execute_inspect(
         .cloned()
         .map(SessionMessageView::from);
 
-    ToolResult::json(&serde_json::json!({
-        "action": "inspect",
-        "result": SessionInspectView {
-            session: SessionSummaryView::from(session),
-            final_assistant_message,
-            final_user_message,
-            latest_message,
-        }
-    }))
-    .map_err(SessionToolError::ToolResult)
+    let text = SessionInspectText {
+        session: SessionSummaryView::from(session),
+        final_assistant_message,
+        final_user_message,
+        latest_message,
+    }
+    .render()
+    .expect("session inspect template must render");
+    Ok(ToolResult::text(text))
 }
 
 async fn execute_messages(
@@ -759,13 +810,13 @@ async fn execute_messages(
         .map(SessionMessageView::from)
         .collect::<Vec<_>>();
 
-    ToolResult::json(&serde_json::json!({
-        "action": "messages",
-        "session": SessionSummaryView::from(session),
-        "returned": messages.len(),
-        "messages": messages,
-    }))
-    .map_err(SessionToolError::ToolResult)
+    let text = SessionMessagesText {
+        session: SessionSummaryView::from(session),
+        messages,
+    }
+    .render()
+    .expect("session messages template must render");
+    Ok(ToolResult::text(text))
 }
 
 async fn execute_list(
@@ -823,13 +874,13 @@ async fn execute_list(
         .map(SessionSummaryView::from)
         .collect::<Vec<_>>();
 
-    ToolResult::json(&serde_json::json!({
-        "action": "list",
-        "returned": results.len(),
-        "total_matches": total_matches,
-        "results": results,
-    }))
-    .map_err(SessionToolError::ToolResult)
+    let text = SessionListText {
+        total_matches,
+        results,
+    }
+    .render()
+    .expect("session list template must render");
+    Ok(ToolResult::text(text))
 }
 
 fn split_command_form_tokens(
@@ -1075,7 +1126,7 @@ struct SessionMatchRow {
     matched_by: Vec<SessionSearchMode>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct MessageResult {
     session_id: String,
     title: String,
@@ -1086,7 +1137,6 @@ struct MessageResult {
     score: f64,
     matched_by: Vec<SessionSearchMode>,
     snippet: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
 }
 
@@ -1113,7 +1163,7 @@ impl MessageResult {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct SessionResult {
     session_id: String,
     title: String,
@@ -1740,7 +1790,7 @@ async fn run_semantic_query(
     if total_matches > 0 && rows.is_empty() {
         return Err(SessionToolError::AllResultsAlreadyInContext);
     }
-    finalize_rows_with_total(&rows, total_matches, &args)
+    Ok(finalize_rows_with_total(&rows, total_matches, &args))
 }
 
 async fn read_rows_from_stream(
@@ -1870,24 +1920,24 @@ fn finalize_rows_with_total(
     rows: &[SessionMatchRow],
     total_matches: usize,
     args: &SessionArgs,
-) -> Result<ToolResult, SessionToolError> {
+) -> ToolResult {
     let start = args.offset.min(rows.len());
     let end = (start + args.limit).min(rows.len());
     let rows = rows[start..end].to_vec();
 
-    let value = if args.output_mode == SessionOutputMode::Messages {
+    let text = if args.output_mode == SessionOutputMode::Messages {
         let items: Vec<MessageResult> = rows
             .into_iter()
             .map(|row| MessageResult::from_row(row, args.include_content))
             .collect();
-        serde_json::json!({
-            "query": args.query,
-            "search_mode": args.search_mode,
-            "output_mode": args.output_mode,
-            "total_matches": total_matches,
-            "returned": items.len(),
-            "results": items,
-        })
+        SessionSearchMessagesText {
+            query: args.query.clone(),
+            search_mode: args.search_mode,
+            total_matches,
+            items,
+        }
+        .render()
+        .expect("session search template must render")
     } else {
         let mut grouped: HashMap<String, SessionResult> = HashMap::new();
         for row in rows {
@@ -1922,17 +1972,17 @@ fn finalize_rows_with_total(
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
         });
 
-        serde_json::json!({
-            "query": args.query,
-            "search_mode": args.search_mode,
-            "output_mode": args.output_mode,
-            "total_matches": total_matches,
-            "returned": items.len(),
-            "results": items,
-        })
+        SessionSearchSessionsText {
+            query: args.query.clone(),
+            search_mode: args.search_mode,
+            total_matches,
+            items,
+        }
+        .render()
+        .expect("session search template must render")
     };
 
-    ToolResult::json(&value).map_err(SessionToolError::ToolResult)
+    ToolResult::text(text)
 }
 
 #[cfg(test)]
@@ -2220,5 +2270,94 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].message_id, 2);
         assert_eq!(filtered[1].session_id, "other");
+    }
+
+    fn summary(session_id: &str, archived: bool) -> SessionSummaryView {
+        SessionSummaryView {
+            session_id: session_id.to_string(),
+            title: "Plan".to_string(),
+            model: "m1".to_string(),
+            profile_id: Some("p1".to_string()),
+            archived,
+            created_at: "2026-01-01".to_string(),
+            updated_at: "2026-01-02".to_string(),
+            message_count: 4,
+            preview: "first words".to_string(),
+        }
+    }
+
+    fn message(message_id: i32, role: &str, content: &str) -> SessionMessageView {
+        SessionMessageView {
+            message_id,
+            role: role.to_string(),
+            timestamp: Some("2026-01-02T10:00:00Z".to_string()),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn list_result_reads_as_sentences_and_session_lines() {
+        let text = SessionListText {
+            total_matches: 5,
+            results: vec![summary("s1", false), summary("s2", true)],
+        }
+        .render()
+        .expect("session list template must render");
+        assert_eq!(
+            text,
+            "Showing 2 of 5 matching session(s).\n\nSession s1 \"Plan\" (model: m1, 4 messages, updated 2026-01-02, profile p1, created 2026-01-01)\nPreview: first words\n\nSession s2 \"Plan\" (model: m1, 4 messages, updated 2026-01-02, archived, profile p1, created 2026-01-01)\nPreview: first words\n"
+        );
+    }
+
+    #[test]
+    fn messages_result_lists_each_message_with_role_and_time() {
+        let text = SessionMessagesText {
+            session: summary("s1", false),
+            messages: vec![message(1, "user", "hi"), message(2, "assistant", "hello")],
+        }
+        .render()
+        .expect("session messages template must render");
+        assert_eq!(
+            text,
+            "Session s1 \"Plan\" (model: m1, 4 messages, updated 2026-01-02, profile p1, created 2026-01-01)\nPreview: first words\n2 message(s):\n\nMessage 1 (user, 2026-01-02T10:00:00Z):\nhi\n\nMessage 2 (assistant, 2026-01-02T10:00:00Z):\nhello\n"
+        );
+    }
+
+    #[test]
+    fn inspect_result_names_the_final_messages() {
+        let text = SessionInspectText {
+            session: summary("s1", false),
+            final_assistant_message: Some(message(2, "assistant", "done")),
+            final_user_message: Some(message(1, "user", "go")),
+            latest_message: None,
+        }
+        .render()
+        .expect("session inspect template must render");
+        assert_eq!(
+            text,
+            "Session s1 \"Plan\" (model: m1, 4 messages, updated 2026-01-02, profile p1, created 2026-01-01)\nPreview: first words\n\nFinal assistant message:\nMessage 2 (assistant, 2026-01-02T10:00:00Z):\ndone\n\nFinal user message:\nMessage 1 (user, 2026-01-02T10:00:00Z):\ngo\n"
+        );
+    }
+
+    #[test]
+    fn search_results_state_query_mode_and_matches() {
+        let item = MessageResult::from_row(match_row("s1", 7, "needle in a haystack"), true);
+        let text = SessionSearchMessagesText {
+            query: "needle".to_string(),
+            search_mode: SessionSearchMode::Text,
+            total_matches: 1,
+            items: vec![item],
+        }
+        .render()
+        .expect("session search template must render");
+        assert!(
+            text.starts_with(
+                "Search \"needle\" (text mode): showing 1 of 1 matching message(s).\n\nMessage 7 ("
+            ),
+            "unexpected search text: {text}"
+        );
+        assert!(text.contains("matched by text."), "{text}");
+        assert!(text.contains("Snippet: needle in a haystack"), "{text}");
+        assert!(text.contains("Content:\nneedle in a haystack"), "{text}");
     }
 }

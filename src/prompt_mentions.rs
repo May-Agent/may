@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use askama::Template;
 use async_fs;
-use serde::Serialize;
 
 use crate::db::{ChatDb, ChatDbError};
 
-/// Error type for building prompt mention XML.
+/// Error type for building prompt mention blocks.
 #[derive(Debug, thiserror::Error)]
 pub enum PromptMentionError {
     /// Failed to load session metadata.
@@ -17,51 +17,32 @@ pub enum PromptMentionError {
     /// File mention path traversal is not allowed.
     #[error("file mention path traversal is not allowed")]
     ParentTraversal,
-    /// Failed to serialize mention XML.
-    #[error("failed to serialize mention XML: {0}")]
-    Serialize(#[from] quick_xml::SeError),
 }
 
-#[derive(Serialize)]
-struct SessionMentionXml {
-    #[serde(rename = "@id")]
+struct SessionMention {
     id: String,
-    #[serde(rename = "@title")]
     title: String,
-    #[serde(rename = "@model")]
     model: String,
-    #[serde(rename = "recent_user_message", default)]
-    recent_user_messages: Vec<TextXmlBlockOwned>,
+    recent_user_messages: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct SessionMentionsXml {
-    #[serde(rename = "session")]
-    sessions: Vec<SessionMentionXml>,
+#[derive(Template)]
+#[template(path = "session_mentions.txt", escape = "none")]
+struct SessionMentions {
+    sessions: Vec<SessionMention>,
 }
 
-#[derive(Serialize)]
-struct TextXmlBlockOwned {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-#[derive(Serialize)]
-struct FileMentionXml {
-    #[serde(rename = "@path")]
+struct FileMention {
     path: String,
-    #[serde(rename = "@name")]
     name: String,
-    #[serde(rename = "@content_type", skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
-    #[serde(rename = "preview", skip_serializing_if = "Option::is_none")]
-    preview: Option<TextXmlBlockOwned>,
+    preview: Option<String>,
 }
 
-#[derive(Serialize)]
-struct FileMentionsXml {
-    #[serde(rename = "file")]
-    files: Vec<FileMentionXml>,
+#[derive(Template)]
+#[template(path = "file_mentions.txt", escape = "none")]
+struct FileMentions {
+    files: Vec<FileMention>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -77,16 +58,18 @@ struct MentionCandidate {
     value: String,
 }
 
-/// Build the `session_mentions` XML block for `@`-mentions found in `content`,
+/// Build the `session_mentions` block for `@`-mentions found in `content`,
 /// looking each up in the database. Returns `None` when no valid session
 /// mentions are present.
 ///
 /// # Errors
 ///
-/// Returns [`PromptMentionError::SessionLookup`] when a session lookup fails,
-/// or [`PromptMentionError::Serialize`] when the XML block cannot be
-/// serialized.
-pub async fn build_session_mentions_xml(
+/// Returns [`PromptMentionError::SessionLookup`] when a session lookup fails.
+///
+/// # Panics
+///
+/// Panics if the compiled template fails to render.
+pub async fn build_session_mentions(
     db: &ChatDb,
     content: &str,
 ) -> Result<Option<String>, PromptMentionError> {
@@ -107,11 +90,9 @@ pub async fn build_session_mentions_xml(
                 .rev()
                 .filter(|message| message.role == "user")
                 .take(4)
-                .map(|message| TextXmlBlockOwned {
-                    content: truncate_preview_with_limit(&message.content, 160),
-                })
+                .map(|message| truncate_preview_with_limit(&message.content, 160))
                 .collect::<Vec<_>>();
-            entries.push(SessionMentionXml {
+            entries.push(SessionMention {
                 id: session.id,
                 title,
                 model,
@@ -124,13 +105,14 @@ pub async fn build_session_mentions_xml(
         return Ok(None);
     }
 
-    Ok(Some(crate::xml::serialize_xml_block(
-        "session_mentions",
-        &SessionMentionsXml { sessions: entries },
-    )?))
+    Ok(Some(
+        SessionMentions { sessions: entries }
+            .render()
+            .expect("session mentions template must render"),
+    ))
 }
 
-/// Build the `file_mentions` XML block for file `@`-mentions found in
+/// Build the `file_mentions` block for file `@`-mentions found in
 /// `content`, resolving each against `files_dir`. Returns `None` when no valid
 /// file mentions are present.
 ///
@@ -138,9 +120,12 @@ pub async fn build_session_mentions_xml(
 ///
 /// Returns [`PromptMentionError::AbsolutePath`] or
 /// [`PromptMentionError::ParentTraversal`] when a mention path is not a safe
-/// relative path, and [`PromptMentionError::Serialize`] when the XML block
-/// cannot be serialized.
-pub async fn build_file_mentions_xml(
+/// relative path.
+///
+/// # Panics
+///
+/// Panics if the compiled template fails to render.
+pub async fn build_file_mentions(
     files_dir: &Path,
     content: &str,
     preview_limit: usize,
@@ -167,15 +152,13 @@ pub async fn build_file_mentions_xml(
         let preview = async_fs::read_to_string(&full_path)
             .await
             .ok()
-            .map(|content| TextXmlBlockOwned {
-                content: truncate_preview_with_limit(content.as_str(), preview_limit),
-            });
+            .map(|content| truncate_preview_with_limit(content.as_str(), preview_limit));
         let name = validated
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or_else(|| validated.as_os_str().to_str().unwrap_or("file"))
             .to_string();
-        files.push(FileMentionXml {
+        files.push(FileMention {
             path: validated.to_string_lossy().replace('\\', "/"),
             name,
             content_type,
@@ -187,10 +170,11 @@ pub async fn build_file_mentions_xml(
         return Ok(None);
     }
 
-    Ok(Some(crate::xml::serialize_xml_block(
-        "file_mentions",
-        &FileMentionsXml { files },
-    )?))
+    Ok(Some(
+        FileMentions { files }
+            .render()
+            .expect("file mentions template must render"),
+    ))
 }
 
 /// Extract session `@`-mention IDs from `content`, skipping mentions inside
@@ -377,6 +361,48 @@ mod tests {
         MentionCandidate, MentionKind, extract_file_mention_paths, extract_session_mention_ids,
         parse_relative_file_mention,
     };
+
+    #[test]
+    fn session_mentions_read_as_sentences() {
+        let text = askama::Template::render(&super::SessionMentions {
+            sessions: vec![super::SessionMention {
+                id: "s1".to_string(),
+                title: "Plan".to_string(),
+                model: "m1".to_string(),
+                recent_user_messages: vec!["first".to_string(), "second".to_string()],
+            }],
+        })
+        .expect("render");
+        assert_eq!(
+            text,
+            "<session_mentions>\nSession s1 titled \"Plan\" (model: m1).\n  Recent user message: first\n  Recent user message: second\n</session_mentions>"
+        );
+    }
+
+    #[test]
+    fn file_mentions_name_the_file_and_show_its_preview() {
+        let text = askama::Template::render(&super::FileMentions {
+            files: vec![
+                super::FileMention {
+                    path: "notes/a.md".to_string(),
+                    name: "a.md".to_string(),
+                    content_type: Some("text/markdown".to_string()),
+                    preview: Some("# A".to_string()),
+                },
+                super::FileMention {
+                    path: "b.bin".to_string(),
+                    name: "b.bin".to_string(),
+                    content_type: None,
+                    preview: None,
+                },
+            ],
+        })
+        .expect("render");
+        assert_eq!(
+            text,
+            "<file_mentions>\nFile notes/a.md (name: a.md, type: text/markdown).\nPreview:\n# A\nFile b.bin (name: b.bin).\n</file_mentions>"
+        );
+    }
 
     #[test]
     fn extracts_generic_session_mentions() {

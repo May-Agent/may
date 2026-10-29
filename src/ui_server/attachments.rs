@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use aither_core::llm::Attachment as LlmAttachment;
 use aither_models::{Ability, lookup as lookup_model_info};
+use askama::Template;
 use base64::Engine;
-use serde::Serialize;
 use skyzen::Result as SkyResult;
 
 use crate::agent::generate_session_title;
@@ -18,79 +18,70 @@ use super::types::{ApiAttachment, ChatRequest};
 
 pub(super) const INLINE_PASTED_TEXT_THRESHOLD: usize = 1200;
 
-#[derive(Serialize, skyzen::ToSchema)]
-struct TextXmlBlock<'a> {
-    #[serde(rename = "$text")]
+#[derive(Template)]
+#[template(path = "prompt_text_block.txt", escape = "none")]
+struct PromptTextBlock<'a> {
+    tag: &'static str,
     content: &'a str,
 }
 
-#[derive(Clone, Serialize, skyzen::ToSchema)]
-struct AttachmentXml {
-    #[serde(rename = "@name")]
+/// An attachment the prompt names for the model.
+#[derive(Clone)]
+struct PromptAttachment {
     name: String,
-    #[serde(rename = "@type")]
-    attachment_type: AttachmentKind,
-    #[serde(rename = "@path", skip_serializing_if = "Option::is_none")]
+    kind: AttachmentKind,
     path: Option<String>,
-    #[serde(rename = "@offloaded", skip_serializing_if = "Option::is_none")]
-    offloaded: Option<bool>,
-    #[serde(rename = "@required_modality", skip_serializing_if = "Option::is_none")]
-    required_modality: Option<String>,
-    #[serde(rename = "@reason", skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
 }
 
-#[derive(Clone, Serialize, skyzen::ToSchema)]
-struct AttachmentsXml {
-    #[serde(rename = "attachment")]
-    attachments: Vec<AttachmentXml>,
+#[derive(Template)]
+#[template(path = "prompt_attachments.txt", escape = "none")]
+struct PromptAttachments<'a> {
+    attachments: &'a [PromptAttachment],
 }
 
-#[derive(Clone, Serialize, skyzen::ToSchema)]
-struct UnsupportedModalityAlertXml {
-    #[serde(rename = "@type")]
-    alert_type: String,
-    message: String,
-    offloaded_attachments: AttachmentsXml,
+/// An attachment offloaded because the model lacks its modality.
+#[derive(Clone)]
+struct OffloadedAttachment {
+    name: String,
+    kind: AttachmentKind,
+    path: Option<String>,
+    modality: &'static str,
+    model_id: String,
+}
+
+#[derive(Template)]
+#[template(path = "reminder_unsupported_modality.txt", escape = "none")]
+struct UnsupportedModalityReminder<'a> {
+    attachments: &'a [OffloadedAttachment],
 }
 
 enum PromptSection {
     PastedText(String),
     OffloadedText(String),
-    Attachments(Vec<AttachmentXml>),
-    UnsupportedModalityAlert(Vec<AttachmentXml>),
+    Attachments(Vec<PromptAttachment>),
+    UnsupportedModalityAlert(Vec<OffloadedAttachment>),
 }
 
 impl PromptSection {
     fn render(&self) -> SkyResult<String> {
         match self {
-            Self::PastedText(content) => serialize_xml("pasted_text", &TextXmlBlock { content }),
-            Self::OffloadedText(content) => {
-                serialize_xml("offloaded_text", &TextXmlBlock { content })
+            Self::PastedText(content) => PromptTextBlock {
+                tag: "pasted_text",
+                content,
             }
-            Self::Attachments(attachments) => serialize_xml(
-                "attachments",
-                &AttachmentsXml {
-                    attachments: attachments.clone(),
-                },
-            ),
-            Self::UnsupportedModalityAlert(offloaded_attachments) => serialize_xml(
-                "system-reminder",
-                &UnsupportedModalityAlertXml {
-                    alert_type: "unsupported_modality_offload".to_string(),
-                    message:
-                        "Some attachments were offloaded because the current model does not support their modality. Inspect the referenced files with tools before answering.".to_string(),
-                    offloaded_attachments: AttachmentsXml {
-                        attachments: offloaded_attachments.clone(),
-                    },
-                },
-            ),
+            .render(),
+            Self::OffloadedText(content) => PromptTextBlock {
+                tag: "offloaded_text",
+                content,
+            }
+            .render(),
+            Self::Attachments(attachments) => PromptAttachments { attachments }.render(),
+            Self::UnsupportedModalityAlert(attachments) => {
+                UnsupportedModalityReminder { attachments }.render()
+            }
         }
+        .map_err(internal_error)
     }
-}
-
-fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> SkyResult<String> {
-    crate::xml::serialize_xml_block(tag, value).map_err(internal_error)
 }
 
 pub(super) async fn build_prompt_and_attachments(
@@ -143,7 +134,7 @@ pub(super) async fn build_prompt_and_attachments(
                 }
                 None => None,
             };
-            offloaded_xml_items.push(build_offloaded_attachment_xml(
+            offloaded_xml_items.push(build_offloaded_attachment(
                 attachment,
                 required_modality
                     .as_ref()
@@ -158,13 +149,10 @@ pub(super) async fn build_prompt_and_attachments(
         }
 
         if let Some((saved_path, relative_path)) = uploaded {
-            xml_items.push(AttachmentXml {
+            xml_items.push(PromptAttachment {
                 name: attachment.name.clone(),
-                attachment_type: attachment.attachment_type,
+                kind: attachment.attachment_type,
                 path: Some(relative_path),
-                offloaded: None,
-                required_modality: None,
-                reason: None,
             });
 
             if let Some(modality) = required_modality.as_ref() {
@@ -187,13 +175,10 @@ pub(super) async fn build_prompt_and_attachments(
             } else {
                 let (_, relative_path) =
                     Box::pin(save_large_pasted_text(state, &req.session_id, text)).await?;
-                xml_items.push(AttachmentXml {
+                xml_items.push(PromptAttachment {
                     name: attachment.name.clone(),
-                    attachment_type: AttachmentKind::Document,
+                    kind: AttachmentKind::Document,
                     path: Some(relative_path),
-                    offloaded: None,
-                    required_modality: None,
-                    reason: None,
                 });
             }
             continue;
@@ -214,25 +199,19 @@ pub(super) async fn build_prompt_and_attachments(
                 source.local_path.as_deref(),
                 Some(&source.url),
             )?;
-            xml_items.push(AttachmentXml {
+            xml_items.push(PromptAttachment {
                 name: attachment.name.clone(),
-                attachment_type: attachment.attachment_type,
+                kind: attachment.attachment_type,
                 path: source.relative_path,
-                offloaded: None,
-                required_modality: None,
-                reason: None,
             });
             attachments.push(LlmAttachment::new(source.url, media_type));
             continue;
         }
 
-        xml_items.push(AttachmentXml {
+        xml_items.push(PromptAttachment {
             name: attachment.name.clone(),
-            attachment_type: attachment.attachment_type,
+            kind: attachment.attachment_type,
             path: None,
-            offloaded: None,
-            required_modality: None,
-            reason: None,
         });
     }
 
@@ -493,21 +472,20 @@ impl ModelModalitySupport {
     }
 }
 
-// ── XML rendering ────────────────────────────────────────────
+// ── Prompt text rendering ────────────────────────────────────
 
-fn build_offloaded_attachment_xml(
+fn build_offloaded_attachment(
     attachment: &ApiAttachment,
     modality: &AttachmentModality,
     relative_path: Option<&str>,
     model_id: &str,
-) -> AttachmentXml {
-    AttachmentXml {
+) -> OffloadedAttachment {
+    OffloadedAttachment {
         name: attachment.name.clone(),
-        attachment_type: attachment.attachment_type,
+        kind: attachment.attachment_type,
         path: relative_path.map(ToOwned::to_owned),
-        offloaded: Some(true),
-        required_modality: Some(modality.label().to_string()),
-        reason: Some(["model:", model_id, " lacks ", modality.label()].concat()),
+        modality: modality.label(),
+        model_id: model_id.to_string(),
     }
 }
 
@@ -679,6 +657,45 @@ mod tests {
             upload_data_url: None,
             text_content: None,
         }
+    }
+
+    #[test]
+    fn prompt_sections_render_as_tagged_text_and_lists() {
+        assert_eq!(
+            PromptSection::PastedText("some text".to_string())
+                .render()
+                .expect("render"),
+            "<pasted_text>\nsome text\n</pasted_text>"
+        );
+        assert_eq!(
+            PromptSection::Attachments(vec![
+                PromptAttachment {
+                    name: "a.png".to_string(),
+                    kind: AttachmentKind::Image,
+                    path: Some("files/a.png".to_string()),
+                },
+                PromptAttachment {
+                    name: "b.txt".to_string(),
+                    kind: AttachmentKind::File,
+                    path: None,
+                },
+            ])
+            .render()
+            .expect("render"),
+            "<attachments>\n- a.png (image), saved at files/a.png\n- b.txt (file)\n</attachments>"
+        );
+        assert_eq!(
+            PromptSection::UnsupportedModalityAlert(vec![OffloadedAttachment {
+                name: "clip.wav".to_string(),
+                kind: AttachmentKind::Audio,
+                path: Some("files/clip.wav".to_string()),
+                modality: "audio",
+                model_id: "m1".to_string(),
+            }])
+            .render()
+            .expect("render"),
+            "<system-reminder>\nSome attachments were offloaded because the current model does not support their modality. Inspect the referenced files with tools before answering.\n- clip.wav (audio), saved at files/clip.wav: needs audio support, which model m1 lacks\n</system-reminder>"
+        );
     }
 
     #[test]

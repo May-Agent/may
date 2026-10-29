@@ -25,6 +25,7 @@ import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { useBrowserViewStore } from '@/lib/stores/browserView';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
+import { extractTerminalResult, type OutputStream } from '@/lib/terminalResult';
 
 SyntaxHighlighter.registerLanguage('bash', bash);
 
@@ -106,48 +107,6 @@ function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
   }
 }
 
-interface OutputStream {
-  text: string;
-  truncated: boolean;
-  /**
-   * Relative outputs/* path when the full payload is persisted to disk.
-   * Truncation in itself is an internal context-management concern and is
-   * never surfaced to the user as a warning; we only expose it indirectly
-   * by offering a link to the full file when one exists.
-   */
-  url: string | null;
-}
-
-interface TerminalResult {
-  exitCode: number | null;
-  stdout: OutputStream | null;
-  stderr: OutputStream | null;
-}
-
-function extractOutputStream(entry: unknown): OutputStream | null {
-  if (!entry || typeof entry !== 'object') return null;
-  const e = entry as Record<string, unknown>;
-  const content = e.content;
-  if (!content || typeof content !== 'object') return null;
-  const c = content as Record<string, unknown>;
-  if (c.type !== 'text' || typeof c.text !== 'string') return null;
-  if (c.text.length === 0) return null;
-  const url = typeof e.url === 'string' && e.url.length > 0 ? e.url : null;
-  return { text: c.text, truncated: c.truncated === true, url };
-}
-
-function extractTerminalResult(result: unknown): TerminalResult | null {
-  if (!result || typeof result !== 'object') return null;
-  const r = result as Record<string, unknown>;
-  if (r.kind !== 'json' || !r.value || typeof r.value !== 'object') return null;
-  const v = r.value as Record<string, unknown>;
-  return {
-    exitCode: typeof v.exit_code === 'number' ? v.exit_code : null,
-    stdout: extractOutputStream(v.stdout),
-    stderr: extractOutputStream(v.stderr),
-  };
-}
-
 function extractGenericResultText(result: unknown): string | null {
   if (!result || typeof result !== 'object') return null;
   const r = result as Record<string, unknown>;
@@ -157,10 +116,6 @@ function extractGenericResultText(result: unknown): string | null {
   }
   if (kind === 'error') {
     return typeof r.message === 'string' ? r.message : null;
-  }
-  if (kind === 'json') {
-    if (r.value === undefined || r.value === null) return null;
-    return JSON.stringify(r.value, null, 2);
   }
   if (kind === 'done') return null;
   return typeof result === 'string' ? result : JSON.stringify(result, null, 2);

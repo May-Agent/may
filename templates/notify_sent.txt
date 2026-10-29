@@ -1,0 +1,1 @@
+Notification delivered to {{ sent }} push subscription(s).
