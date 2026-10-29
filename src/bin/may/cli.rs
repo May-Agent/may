@@ -6,7 +6,7 @@
 
 use aither_core::llm::model::ReasoningEffort;
 use aither_sandbox::TerminalExecutionMode;
-use may_agent::browser_service::{BrowserReadDetail, BrowserReadFormat, BrowserScreenshotMode};
+use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
 
 /// Top-level CLI mode the binary resolves from argv.
 #[derive(Debug, PartialEq, Eq)]
@@ -59,7 +59,6 @@ pub enum BrowserCliCommand {
         url: String,
         detail: BrowserReadDetail,
         screenshot: BrowserScreenshotMode,
-        format: BrowserReadFormat,
     },
     Provision,
     Kill,
@@ -98,7 +97,7 @@ impl ExecArgs {
 
 impl BrowserCliArgs {
     pub const fn help_text() -> &'static str {
-        "Usage: may browser <status|open|close|targets|contexts|cdp-endpoint|read <url> [--detail <brief|standard|full>] [--screenshot <off|viewport|full-page>] [--format json]|provision|kill>\n\nInspect or maintain the May-managed browser runtime used for browser automation."
+        "Usage: may browser <status|open|close|targets|contexts|cdp-endpoint|read <url> [--detail <brief|standard|full>] [--screenshot <off|viewport|full-page>]|provision|kill>\n\nInspect or maintain the May-managed browser runtime used for browser automation."
     }
 }
 
@@ -144,7 +143,6 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
             });
             let mut detail = BrowserReadDetail::default();
             let mut screenshot = BrowserScreenshotMode::default();
-            let mut format = BrowserReadFormat::Json;
             let mut index = 2;
             while index < args.len() {
                 match args[index].as_str() {
@@ -178,18 +176,6 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
                         };
                         index += 2;
                     }
-                    "--format" => {
-                        let value = args
-                            .get(index + 1)
-                            .unwrap_or_else(|| panic!("may browser read requires --format json"));
-                        format = match value.as_str() {
-                            "json" => BrowserReadFormat::Json,
-                            other => {
-                                panic!("invalid may browser read format '{other}'; expected json")
-                            }
-                        };
-                        index += 2;
-                    }
                     other => panic!("unexpected may browser read argument '{other}'"),
                 }
             }
@@ -197,7 +183,6 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
                 url,
                 detail,
                 screenshot,
-                format,
             }
         }
         "service" => {
@@ -401,7 +386,7 @@ mod tests {
         parse_cli_mode, parse_reasoning_effort,
     };
     use aither_core::llm::model::ReasoningEffort;
-    use may_agent::browser_service::{BrowserReadDetail, BrowserReadFormat, BrowserScreenshotMode};
+    use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
@@ -460,15 +445,12 @@ mod tests {
                 "full",
                 "--screenshot",
                 "full-page",
-                "--format",
-                "json",
             ])),
             CliMode::Browser(BrowserCliArgs {
                 command: BrowserCliCommand::Read {
                     url: "https://example.com".to_string(),
                     detail: BrowserReadDetail::Full,
                     screenshot: BrowserScreenshotMode::FullPage,
-                    format: BrowserReadFormat::Json,
                 },
             })
         );

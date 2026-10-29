@@ -9,7 +9,7 @@
 //! alongside the messages. Numbers are estimates at ~4 bytes per token,
 //! the same heuristic the agent uses for its own context budgeting.
 
-use aither_agent::{ContextWindowMetrics, ContextWindowPhase, SmartCompressionConfig};
+use aither_agent::{ContextPolicy, ContextWindowMetrics, ContextWindowPhase, Handoff};
 use aither_sandbox::TerminalArgs;
 
 use super::runtime_context::tag;
@@ -76,13 +76,8 @@ pub struct ContextReport {
     pub model_id: String,
     /// Provider identifier shown in the header.
     pub provider_id: String,
-    /// Effective window the agent budgets against (the smaller of the
-    /// selected and fast-compaction model contexts).
+    /// Usable window the agent budgets against.
     pub window_tokens: usize,
-    /// Selected model's own context window.
-    pub selected_window_tokens: Option<u32>,
-    /// Fast compaction model's context window.
-    pub fast_window_tokens: Option<u32>,
     /// Estimated tokens the next request would send, messages plus the
     /// `terminal` tool definition.
     pub used_tokens: usize,
@@ -170,24 +165,15 @@ impl ContextReport {
             }
         }
 
-        // Activated skills arrive as `skill_instruction` reminders; every
-        // other reminder counts toward the message stream.
-        let mut reminder_chars = 0usize;
-        for reminder in context.reminders() {
-            if reminder.contains("<skill_instruction") {
-                skill_chars += reminder.len();
-            } else {
-                reminder_chars += reminder.len();
-            }
-        }
-
         let messages = context.recent();
         let message_chars = messages
             .iter()
             .map(|message| message.content().len())
             .sum::<usize>()
-            + reminder_chars
-            + context.handoff().map_or(0, str::len);
+            + context.handoff().map_or(0, |handoff| match handoff {
+                Handoff::Text(text) => text.len(),
+                Handoff::Document(document) => document.render_markdown().len(),
+            });
 
         let categories = [
             (ContextCategory::SystemPrompt, system_prompt_chars, None),
@@ -232,12 +218,12 @@ impl ContextReport {
         .collect::<Vec<_>>();
 
         let used_tokens = categories.iter().map(|row| row.tokens).sum();
-        let window = metrics.effective_context_window;
-        // May keeps aither's default smart-compression strategy: compaction
-        // starts at `effective_trigger`, so everything above it is the
-        // autocompact buffer from the user's perspective. `trigger` is a
-        // fraction in [0, 1]; flooring the product is the intended bucket.
-        let trigger = SmartCompressionConfig::default().effective_trigger();
+        let window = usize::try_from(metrics.context_window).expect("a u32 window fits usize");
+        // May keeps aither's default context policy: a compaction is forked at
+        // `compact_at`, so everything above it is the autocompact buffer from
+        // the user's perspective. `trigger` is a fraction in [0, 1]; flooring
+        // the product is the intended bucket.
+        let trigger = ContextPolicy::default().compact_at;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let autocompact_buffer =
             window.saturating_sub((f64::from(trigger) * window as f64) as usize);
@@ -246,8 +232,6 @@ impl ContextReport {
             model_id: model_id.to_string(),
             provider_id: provider_id.to_string(),
             window_tokens: window,
-            selected_window_tokens: metrics.selected_model_context_window,
-            fast_window_tokens: metrics.fast_model_context_window,
             used_tokens,
             phase,
             categories,
@@ -358,24 +342,8 @@ fn terminal_tool_definition_chars() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use aither_core::llm::Message;
-    use serde::Serialize;
-
     use super::*;
-
-    /// Renders like `insert_reminder(&SystemReminder { content: skill_xml })`
-    /// — its tag derives from the type name.
-    #[derive(Serialize)]
-    struct SkillInstruction {
-        #[serde(rename = "$text")]
-        content: String,
-    }
-
-    #[derive(Serialize)]
-    struct Tasks {
-        #[serde(rename = "$text")]
-        content: String,
-    }
+    use aither_core::llm::Message;
 
     fn base_system_block() -> &'static str {
         "<tool_architecture>\n<native_tools>\n- terminal: Execute terminal commands.\n- terminal_kill: Terminate a background task.\n</native_tools>\n</tool_architecture>\n\n\
@@ -389,12 +357,6 @@ mod tests {
         context.insert_system_text(BASE_SYSTEM_TAG, base_system_block());
         context.insert_system_text(tag::MEMORY, "remember this");
         context.insert_system_text(tag::WORKSPACE, "sandbox=/tmp cwd=/tmp");
-        context.insert_reminder(&SkillInstruction {
-            content: "use the pdf skill".to_string(),
-        });
-        context.insert_reminder(&Tasks {
-            content: "- [ ] task".to_string(),
-        });
         context.push(Message::user("hello"));
         context.push(Message::assistant("hi there"));
         context
@@ -403,14 +365,15 @@ mod tests {
     fn test_metrics() -> ContextWindowMetrics {
         ContextWindowMetrics {
             usage_fraction: 0.0,
-            selected_model_context_window: Some(400_000),
-            fast_model_context_window: Some(200_000),
-            effective_context_window: 200_000,
+            context_window: 200_000,
+            estimated_tokens: 0,
+            chars_per_token: 4.0,
             system_block_count: 0,
-            reminder_count: 0,
             recent_message_count: 0,
             recent_system_message_count: 0,
             has_handoff: false,
+            has_staged_system_updates: false,
+            prompt_cache_epoch: 0,
         }
     }
 
@@ -477,17 +440,15 @@ mod tests {
             (terminal_tool_definition_chars() + native_span.len()) / 4
         );
 
-        // Skill reminders land on Skills, other reminders on Messages.
         let skills_span = &base_system_block()[base_system_block().find("<skills>").unwrap()
             ..base_system_block().find("</skills>").unwrap() + "</skills>".len()];
         assert_eq!(
             category_tokens(&report, ContextCategory::Skills),
-            (skills_span.len() + "<skill_instruction>use the pdf skill</skill_instruction>".len())
-                / 4
+            skills_span.len() / 4
         );
         assert_eq!(
             category_tokens(&report, ContextCategory::Messages),
-            ("hello".len() + "hi there".len() + "<tasks>- [ ] task</tasks>".len()) / 4
+            ("hello".len() + "hi there".len()) / 4
         );
         assert_eq!(
             category_tokens(&report, ContextCategory::Memory),
@@ -511,7 +472,10 @@ mod tests {
             report.used_tokens + report.free_tokens + report.autocompact_buffer_tokens,
             report.window_tokens
         );
-        // Default smart-compression config: trigger 0.7 minus 0.2 reserve.
-        assert_eq!(report.autocompact_buffer_tokens, report.window_tokens / 2);
+        // Default context policy: compaction forks at 0.6 of the window.
+        assert_eq!(
+            report.autocompact_buffer_tokens,
+            report.window_tokens * 2 / 5
+        );
     }
 }

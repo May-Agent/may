@@ -1,0 +1,18 @@
+{%- macro session_line(session) -%}
+Session {{ session.session_id }} "{{ session.title }}" (model: {{ session.model }}, {{ session.message_count }} messages, updated {{ session.updated_at }}{% if session.archived %}, archived{% endif %}{% if let Some(profile_id) = session.profile_id %}, profile {{ profile_id }}{% endif %}, created {{ session.created_at }})
+Preview: {{ session.preview }}
+{%- endmacro -%}
+
+{%- macro message_block(message) -%}
+Message {{ message.message_id }} ({{ message.role }}{% if let Some(timestamp) = message.timestamp %}, {{ timestamp }}{% endif %}):
+{{ message.content }}
+{%- endmacro -%}
+
+{%- macro match_block(item) -%}
+Message {{ item.message_id }} ({{ item.role }}, {{ item.timestamp }}) in session {{ item.session_id }} "{{ item.title }}" (model: {{ item.model }}); score {{ item.score }}, matched by {% for mode in item.matched_by %}{{ mode.as_str() }}{% if !loop.last %}, {% endif %}{% endfor %}.
+Snippet: {{ item.snippet }}
+{%- if let Some(content) = item.content %}
+Content:
+{{ content }}
+{%- endif -%}
+{%- endmacro -%}

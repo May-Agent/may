@@ -240,7 +240,7 @@ impl MockScenarioState {
                 2 => {
                     let input_result = latest_tool_output(request)
                         .ok_or_else(|| "terminal input command result missing".to_string())?;
-                    if input_result.get("exit_code").and_then(Value::as_i64) != Some(0) {
+                    if tool_output_reports_failure(&input_result) {
                         return Err(format!("terminal input IPC command failed: {input_result}"));
                     }
                     let task_id = self
@@ -272,15 +272,10 @@ impl MockScenarioState {
                 3 => {
                     let tool_output = latest_tool_output(request)
                         .ok_or_else(|| "terminal read command result missing".to_string())?;
-                    if tool_output.get("exit_code").and_then(Value::as_i64) != Some(0) {
+                    if tool_output_reports_failure(&tool_output) {
                         return Err(format!("terminal read IPC command failed: {tool_output}"));
                     }
-                    let text = tool_output
-                        .pointer("/stdout/content/text")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            "terminal read command result missing stdout text".to_string()
-                        })?;
+                    let text = tool_output.as_str();
                     if !text.contains("hello lexo") {
                         return Err(format!(
                             "terminal_read output did not contain terminal echo: {text}"
@@ -303,7 +298,7 @@ impl MockScenarioState {
             },
             MockChatScenario::WritesTasksFile => {
                 // The run loop keeps the model going while the injected
-                // `<tasks>` document has unchecked items, so the mock
+                // `<tasks_document>` block has unchecked items, so the mock
                 // finishes the checklist whenever it sees one and replies
                 // with plain text once everything is checked.
                 let script = match tasks_injection(request) {
@@ -345,14 +340,14 @@ impl MockScenarioState {
 const TASKS_PARTIAL_SCRIPT: &str = "printf -- '- [x] write report\\n- [ ] ship it\\n' > tasks.md";
 const TASKS_DONE_SCRIPT: &str = "printf -- '- [x] write report\\n- [x] ship it\\n' > tasks.md";
 
-/// The `<tasks>` system message the run loop injects from `tasks.md`.
+/// The `<tasks_document>` system message the run loop injects from `tasks.md`.
 fn tasks_injection(request: &Value) -> Option<&str> {
     request
         .get("messages")?
         .as_array()?
         .iter()
         .filter_map(|message| message.get("content").and_then(Value::as_str))
-        .rfind(|content| content.starts_with("<tasks>"))
+        .rfind(|content| content.starts_with("<tasks_document>"))
 }
 
 fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
@@ -1191,23 +1186,29 @@ where
     }
 }
 
-fn latest_tool_output(request: &Value) -> Option<Value> {
+/// The text of the latest tool message the model was shown.
+fn latest_tool_output(request: &Value) -> Option<String> {
     let messages = request.get("messages")?.as_array()?;
-    let content = messages.iter().rev().find_map(|message| {
+    messages.iter().rev().find_map(|message| {
         let role = message.get("role")?.as_str()?;
         if role != "tool" {
             return None;
         }
         message.get("content")?.as_str().map(ToOwned::to_owned)
-    })?;
-    serde_json::from_str(&content).ok()
+    })
+}
+
+/// Whether a command result shown to the model reports a non-zero exit code.
+fn tool_output_reports_failure(output: &str) -> bool {
+    output.contains("Exit code: ")
 }
 
 fn terminal_task_id_from_latest_tool_output(request: &Value) -> Option<String> {
-    latest_tool_output(request)?
-        .get("task_id")?
-        .as_str()
-        .map(ToOwned::to_owned)
+    let output = latest_tool_output(request)?;
+    let marker = "Started in background as task '";
+    let start = output.find(marker)? + marker.len();
+    let end = output[start..].find('\'')?;
+    Some(output[start..start + end].to_string())
 }
 /// Return `response` when it carries `expected`, otherwise fail with its body
 /// and the server's logs, which carry the cause of a redacted 5xx body.
@@ -1517,7 +1518,7 @@ fn extract_stored_output_path(text: &str) -> Option<PathBuf> {
     let marker = "absolute path: ";
     let start = text.find(marker)?;
     let remainder = &text[start + marker.len()..];
-    let end = remainder.find("; output was truncated in-chat]")?;
+    let end = remainder.find(").")?;
     Some(PathBuf::from(&remainder[..end]))
 }
 
@@ -1621,7 +1622,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[full content at outputs/"),
+        stdout.contains("the full output is saved to outputs/"),
         "expected preview output with stored file reference, got: {stdout}"
     );
     let stored_path = extract_stored_output_path(&stdout)
@@ -2202,12 +2203,6 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
     let terminal_output = agent_requests
         .last()
         .and_then(latest_tool_output)
-        .and_then(|output| {
-            output
-                .pointer("/stdout/content/text")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
         .expect("the final model request should carry the terminal read output");
     let expected_workdir = environment.expected_workdir(&harness, &session_id).await;
     let expected_line = format!("cwd={expected_workdir}");
