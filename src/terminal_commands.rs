@@ -83,6 +83,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Issue store for the `issue` command, resolved from the session
     /// workspace and its per-project configuration.
     pub issue_store: crate::issue::ResolvedIssueStore,
+    /// Discovery and messaging between main agents, when the session has a
+    /// persistent queue to deliver through.
+    pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
 }
 
 /// What [`register_shared_terminal_commands`] installed.
@@ -148,6 +151,18 @@ where
         let ask_user = AskUserTool::new(config.session_id.clone(), ask_user_broker);
         describe_tool(&mut descriptions, &ask_user);
         builder.main_only(|reserved| reserved.configure_tool(ask_user));
+    }
+
+    if let Some(messaging) = config.agent_messaging {
+        let agent = crate::agent_link::AgentTool::new(
+            messaging,
+            config.session_id.clone(),
+            config.sandbox_dir.clone(),
+            matches!(config.task_runtime, TaskRuntimeKind::Container)
+                .then(|| crate::container::lifecycle::workspace_mount(config.sandbox_dir.clone())),
+        );
+        describe_tool(&mut descriptions, &agent);
+        builder.main_only(|reserved| reserved.configure_tool(agent));
     }
 
     if let Some(imagine) = config.imagine {
@@ -395,6 +410,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                agent_messaging: None,
             },
         )
         .await
@@ -446,6 +462,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                agent_messaging: None,
             },
         )
         .await
@@ -501,6 +518,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
                 issue_store: test_issue_store(temp.path()).await,
+                agent_messaging: None,
             },
         )
         .await
@@ -544,6 +562,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                agent_messaging: None,
             },
         )
         .await
@@ -620,6 +639,136 @@ mod tests {
         );
     }
 
+    async fn agent_list(
+        registry: &aither_sandbox::ToolRegistry,
+    ) -> aither_sandbox::CommandEnvelope {
+        registry
+            .query_tool_handler("agent", &["list".to_string()])
+            .await
+    }
+
+    async fn agent_send(
+        registry: &aither_sandbox::ToolRegistry,
+    ) -> aither_sandbox::CommandEnvelope {
+        let args = ["send", "peer-agent", "note.txt"].map(str::to_string);
+        registry.query_tool_handler("agent", &args).await
+    }
+
+    #[tokio::test]
+    async fn agent_list_and_send_are_refused_to_a_subagent_and_work_for_the_main_agent() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("sb");
+        std::fs::create_dir_all(&session_dir).expect("sandbox dir");
+        std::fs::write(session_dir.join("note.txt"), "are you free?").expect("prompt file");
+        let issue_store = test_issue_store(temp.path()).await;
+        let db = crate::db::ChatDb::open(&temp.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        for (id, title) in [("main", "main-agent"), ("peer", "peer-agent")] {
+            db.create_session(id, Some(title), None)
+                .await
+                .expect("session is created");
+        }
+        let runtime_service = std::sync::Arc::new(crate::session::SessionRuntimeService::new(
+            db,
+            crate::ui_event_bus::UiEventBus::new(),
+        ));
+        let messaging = crate::agent_link::AgentMessaging {
+            directory: crate::agent_link::AgentDirectory::new(temp.path().join("agents")),
+            runtime_service: runtime_service.clone(),
+        };
+
+        // The peer is a second main agent listening on the same machine.
+        let (woken_tx, woken) = async_channel::unbounded();
+        let peer_listeners =
+            crate::agent_link::AgentListeners::new(tokio::runtime::Handle::current());
+        for (id, wake_tx) in [("main", None), ("peer", Some(woken_tx))] {
+            peer_listeners
+                .ensure(
+                    &temp.path().join("agents"),
+                    crate::agent_link::AgentIdentity {
+                        session_id: id.to_string(),
+                        cwd: temp.path().to_path_buf(),
+                        sandbox_dir: temp.path().join(id),
+                    },
+                    runtime_service.clone(),
+                    move || {
+                        if let Some(wake_tx) = &wake_tx {
+                            wake_tx.try_send(()).expect("test keeps the receiver");
+                        }
+                    },
+                )
+                .await
+                .expect("agent listens");
+        }
+
+        let mut builder = ToolRegistryBuilder::new();
+        register_shared_terminal_commands(
+            &mut builder,
+            SharedTerminalCommandConfig {
+                llm: MockLlm,
+                ask_flagship: None,
+                ask_balanced: None,
+                ask_fast: None,
+                session_id: "main".to_string(),
+                may_dir: temp.path().to_path_buf(),
+                sandbox_dir: session_dir.clone(),
+                search_embedder: EmbeddingModelResolution::Disabled,
+                ask_user_broker: None,
+                imagine: None,
+                task_runtime: TaskRuntimeKind::Local,
+                task_broker: None,
+                notify_broker: None,
+                browser_broker: None,
+                register_skills_broker: None,
+                register_subagents_broker: None,
+                workspace_request_broker: None,
+                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagent_tracker: SubagentTracker::default(),
+                request_parameters: Parameters::default(),
+                issue_store,
+                agent_messaging: Some(messaging),
+            },
+        )
+        .await
+        .expect("commands should register");
+        let main = builder.build(session_dir.join("outputs"));
+        let subagent = main.for_subagent();
+
+        assert!(!main.is_reserved("agent"));
+        assert!(subagent.is_reserved("agent"));
+        for refused in [agent_list(&subagent).await, agent_send(&subagent).await] {
+            assert!(!refused.ok, "{refused:?}");
+            assert!(
+                refused
+                    .error
+                    .as_deref()
+                    .is_some_and(|text| text.contains("reserved for the main agent")),
+                "{refused:?}"
+            );
+        }
+        assert!(
+            woken.is_empty(),
+            "a refused send must not reach the recipient"
+        );
+
+        let listed = agent_list(&main).await;
+        assert!(listed.ok, "{listed:?}");
+        let Some(aither_sandbox::CommandPayload::Text { content: text }) = listed.payload else {
+            panic!("agent list returns text: {listed:?}");
+        };
+        assert!(text.contains("main-agent (you)"), "{text}");
+        assert!(text.contains("peer-agent"), "{text}");
+
+        let sent = agent_send(&main).await;
+        assert!(sent.ok, "{sent:?}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv())
+            .await
+            .expect("waited 5s for the peer to be woken by the main agent's send")
+            .expect("wake channel stays open");
+    }
+
     #[tokio::test]
     async fn web_commands_are_registered_without_hosted_tools() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -650,6 +799,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                agent_messaging: None,
             },
         )
         .await
