@@ -234,6 +234,27 @@ fn not_modified_response(etag: &str, cache_control: &str) -> skyzen::Response {
     response
 }
 
+const ARTIFACT_SANDBOX_CSP: &str = "sandbox allow-scripts";
+
+fn is_active_artifact_content_type(content_type: &str) -> bool {
+    let essence = content_type.split(';').next().map_or("", str::trim);
+    essence == "text/html"
+        || essence == "text/xml"
+        || essence == "application/xml"
+        || essence.ends_with("+xml")
+}
+
+fn insert_artifact_security_headers(response: &mut skyzen::Response, content_type: &str) {
+    insert_header(response, skyzen::header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    if is_active_artifact_content_type(content_type) {
+        insert_header(
+            response,
+            skyzen::header::CONTENT_SECURITY_POLICY,
+            ARTIFACT_SANDBOX_CSP,
+        );
+    }
+}
+
 fn file_response(
     bytes: Vec<u8>,
     content_type: &str,
@@ -244,6 +265,7 @@ fn file_response(
     insert_header(&mut response, skyzen::header::CONTENT_TYPE, content_type);
     insert_header(&mut response, skyzen::header::ETAG, etag);
     insert_header(&mut response, skyzen::header::CACHE_CONTROL, cache_control);
+    insert_artifact_security_headers(&mut response, content_type);
     response
 }
 
@@ -1647,8 +1669,15 @@ pub(super) async fn get_artifact_preview(
         "artifact path traversal is not allowed",
     )
     .await?;
+    artifact_file_response(resolved, &if_none_match).await
+}
+
+async fn artifact_file_response(
+    resolved: ResolvedSessionFile,
+    if_none_match: &IfNoneMatchHeader,
+) -> SkyResult<skyzen::Response> {
     let etag = etag_value(&resolved.metadata);
-    if etag_matches(&if_none_match, &etag) {
+    if etag_matches(if_none_match, &etag) {
         return Ok(not_modified_response(&etag, PREVIEW_CACHE_CONTROL));
     }
 
@@ -1827,10 +1856,12 @@ mod tests {
     use super::{
         ARTIFACT_DIAGNOSTIC_TRUNCATION_SUFFIX, GENERIC_VALIDATION_PROFILE,
         MAX_ARTIFACT_DIAGNOSTIC_CHARS, MAX_ARTIFACT_DIAGNOSTICS, acquire_slidev_build_lock,
-        instrument_artifact_html, normalized_artifact_diagnostics, read_slidev_build_diagnostics,
-        slidev_source_diagnostics, write_slidev_build_diagnostics,
+        artifact_file_response, instrument_artifact_html, normalized_artifact_diagnostics,
+        read_slidev_build_diagnostics, resolve_scoped_file, slidev_source_diagnostics,
+        write_slidev_build_diagnostics,
     };
-    use crate::ui_server::types::ArtifactDiagnosticsRequest;
+    use crate::ui_server::types::{ArtifactDiagnosticsRequest, IfNoneMatchHeader};
+    use std::path::PathBuf;
 
     const VALID_SLIDEV: &str = include_str!("../../tests/fixtures/slidev/valid.md");
     const INVALID_SLIDEV: &str =
@@ -1897,6 +1928,68 @@ mod tests {
             normalized[MAX_ARTIFACT_DIAGNOSTICS - 1],
             "2 additional artifact diagnostics were omitted."
         );
+    }
+
+    async fn preview_response_header(dir: &std::path::Path, name: &str) -> String {
+        let resolved = resolve_scoped_file(dir, PathBuf::from(name), "not found", "no traversal")
+            .await
+            .expect("artifact resolves inside the scope");
+        let response = artifact_file_response(resolved, &IfNoneMatchHeader(None))
+            .await
+            .expect("preview serves the artifact");
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get(skyzen::header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff"),
+            "{name} preview must carry nosniff"
+        );
+        headers
+            .get(skyzen::header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn preview_response_sandboxes_executable_artifact_content() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        async_fs::write(
+            dir.path().join("index.html"),
+            "<!doctype html><html></html>",
+        )
+        .await
+        .expect("html artifact should be written");
+        async_fs::write(
+            dir.path().join("icon.svg"),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+        )
+        .await
+        .expect("svg artifact should be written");
+
+        for name in ["index.html", "icon.svg"] {
+            let csp = preview_response_header(dir.path(), name).await;
+            assert!(
+                csp.starts_with("sandbox") && csp.contains("allow-scripts"),
+                "{name} preview must carry a CSP sandbox, got: {csp}"
+            );
+            assert!(
+                !csp.contains("allow-same-origin"),
+                "{name} preview must not share the UI origin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_response_leaves_inert_content_unsandboxed() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        async_fs::write(dir.path().join("notes.txt"), "hello")
+            .await
+            .expect("text artifact should be written");
+
+        let csp = preview_response_header(dir.path(), "notes.txt").await;
+        assert!(csp.is_empty(), "inert artifact content needs no sandbox");
     }
 
     #[tokio::test]

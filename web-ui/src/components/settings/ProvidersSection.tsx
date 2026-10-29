@@ -55,7 +55,13 @@ export function ProvidersSection() {
     if (!cfg) return;
     setBusy(true);
     try {
-      await setFullConfig(cfg.fullConfig);
+      await setFullConfig({
+        ...cfg.fullConfig,
+        providers: cfg.fullConfig.providers.map((p) => ({
+          ...p,
+          apiKey: p.apiKey?.trim() ? p.apiKey : undefined,
+        })),
+      });
       toast.success(t('common.save'));
     } catch (err) {
       toast.error(t('errors.generic'), {
@@ -112,6 +118,7 @@ export function ProvidersSection() {
                       <input
                         type={shown ? 'text' : 'password'}
                         value={p.apiKey ?? ''}
+                        placeholder={p.hasApiKey ? t('settings.providers.apiKeySaved') : undefined}
                         onChange={(e) => updateProvider(p.id, { apiKey: e.target.value })}
                         className="w-full rounded-md border border-border bg-background px-3 py-1.5 pr-9 text-sm font-mono outline-none focus:ring-2 focus:ring-ring"
                       />

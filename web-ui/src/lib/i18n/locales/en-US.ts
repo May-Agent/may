@@ -270,6 +270,7 @@ export const enUS = {
       title: 'Providers',
       description: 'API keys and base URLs for LLM providers.',
       apiKey: 'API key',
+      apiKeySaved: 'Key saved — enter a new key to replace',
       baseUrl: 'Base URL',
     },
     models: {
