@@ -24,7 +24,8 @@ interface SessionsState {
   index: Record<string, SessionSummary>;
   order: string[];
   active: ApiSession | null;
-  activeMessages: ApiMessage[];
+  /** Loaded messages keyed by the session that owns them. */
+  messages: Record<string, ApiMessage[]>;
   loading: boolean;
   error: string | null;
 
@@ -38,8 +39,8 @@ interface SessionsState {
   remove: (id: string) => Promise<void>;
   archive: (id: string, archived: boolean) => Promise<void>;
 
-  appendMessage: (msg: ApiMessage) => void;
-  replaceMessage: (msg: ApiMessage) => void;
+  appendMessage: (sessionId: string, msg: ApiMessage) => void;
+  replaceMessage: (sessionId: string, msg: ApiMessage) => void;
   updateRuntime: (id: string, runtime: Partial<SessionRuntimeSummary>) => void;
 }
 
@@ -49,7 +50,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   index: {},
   order: [],
   active: null,
-  activeMessages: [],
+  messages: {},
   loading: false,
   error: null,
 
@@ -77,7 +78,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       if (generation !== activeRequestGeneration) return;
       set({
         active: session,
-        activeMessages: session.messages ?? [],
+        messages: { ...get().messages, [id]: session.messages ?? [] },
         loading: false,
       });
     } catch (err) {
@@ -95,7 +96,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
         if (prev.active?.id !== id) return prev;
         return {
           active: session,
-          activeMessages: session.messages ?? [],
+          messages: { ...prev.messages, [id]: session.messages ?? [] },
         };
       });
     } catch (err) {
@@ -121,7 +122,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       },
       order: [created.id, ...prev.order.filter((x) => x !== created.id)],
       active: created,
-      activeMessages: created.messages ?? [],
+      messages: { ...prev.messages, [created.id]: created.messages ?? [] },
     }));
     return created;
   },
@@ -160,11 +161,12 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     activeRequestGeneration += 1;
     set((prev) => {
       const { [id]: _, ...rest } = prev.index;
+      const { [id]: _messages, ...messages } = prev.messages;
       return {
         index: rest,
+        messages,
         order: prev.order.filter((x) => x !== id),
         active: prev.active?.id === id ? null : prev.active,
-        activeMessages: prev.active?.id === id ? [] : prev.activeMessages,
       };
     });
   },
@@ -175,15 +177,21 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     await get().load();
   },
 
-  appendMessage(msg) {
+  appendMessage(sessionId, msg) {
     set((prev) => ({
-      activeMessages: [...prev.activeMessages, msg],
+      messages: {
+        ...prev.messages,
+        [sessionId]: [...(prev.messages[sessionId] ?? []), msg],
+      },
     }));
   },
 
-  replaceMessage(msg) {
+  replaceMessage(sessionId, msg) {
     set((prev) => ({
-      activeMessages: prev.activeMessages.map((m) => (m.id === msg.id ? msg : m)),
+      messages: {
+        ...prev.messages,
+        [sessionId]: (prev.messages[sessionId] ?? []).map((m) => (m.id === msg.id ? msg : m)),
+      },
     }));
   },
 
