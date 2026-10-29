@@ -133,6 +133,13 @@ pub struct MayAgentConfig {
     pub search_embedder: EmbeddingModelResolution,
     /// Tier-resolved models for the `ask` terminal command.
     pub ask_models: super::provider::AskTierModels,
+    /// Model compaction runs on; `None` compacts on the session model.
+    pub compaction_llm: Option<RequestParameterizedModel<CloudProvider>>,
+    /// How long the session provider keeps the conversation cached; idle
+    /// compaction and reassembly follow it.
+    pub cache_lifetime: crate::cache_lifetime::CacheLifetime,
+    /// Time source for idle timing; `None` reads the system clock. Tests set it.
+    pub clock: Option<aither_agent::ManualClock>,
     /// Session sandbox directory (`TerminalTool` creates working dir inside).
     pub sandbox_dir: PathBuf,
     /// May directory (~/.may/).
@@ -448,7 +455,14 @@ impl MayAgent {
         };
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .hook(context_snapshot_hook)
-            .hook(pending_steer_hook);
+            .hook(pending_steer_hook)
+            .cache_lifetime(config.cache_lifetime.into());
+        if let Some(clock) = config.clock.clone() {
+            builder = builder.clock(clock);
+        }
+        if let Some(compaction_llm) = config.compaction_llm.clone() {
+            builder = builder.compaction_model(compaction_llm);
+        }
         let subagent_tracker = crate::agent::subagent_tracker::SubagentTracker::default();
         let shared_terminal_commands = register_shared_terminal_commands(
             builder.tool_registry_mut(),
@@ -566,6 +580,20 @@ impl MayAgent {
         may_config: &MayConfig,
         input: MayAgentSessionInput<'_>,
     ) -> Result<Self, MayAgentError> {
+        let config = Box::pin(Self::session_config(may_config, input)).await?;
+        Box::pin(Self::new(config)).await
+    }
+
+    /// Resolves the [`MayAgentConfig`] of a session from the May config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MayAgentError`] when resolving the provider runtime fails
+    /// or the SSH attachments for the profile cannot be loaded.
+    pub(crate) async fn session_config(
+        may_config: &MayConfig,
+        input: MayAgentSessionInput<'_>,
+    ) -> Result<MayAgentConfig, MayAgentError> {
         let MayAgentSessionInput {
             sandbox_dir,
             may_dir,
@@ -624,9 +652,22 @@ impl MayAgent {
             &session_id,
         )
         .await?;
+        let compaction_llm = super::provider::resolve_compaction_model(
+            may_config,
+            &provider_id,
+            selector.model_id(),
+            &session_id,
+        )
+        .await?;
+        let cache_lifetime = may_config
+            .get_provider(&provider_id)
+            .map(|instance| instance.cache_lifetime)
+            .ok_or_else(|| {
+                MayAgentError::Llm(format!("provider '{provider_id}' is not configured"))
+            })?;
         let secrets =
             crate::secrets::Secrets::load(&crate::secrets::SecretStore::new(&may_dir), may_config);
-        let config = MayAgentConfig {
+        Ok(MayAgentConfig {
             tool_distribution,
             tool_environments,
             command_priority: may_config.sandbox.command_priority,
@@ -635,6 +676,9 @@ impl MayAgent {
             provider_id,
             search_embedder: resolved_provider.search_embedder,
             ask_models,
+            compaction_llm,
+            cache_lifetime,
+            clock: None,
             sandbox_dir,
             may_dir,
             cwd,
@@ -667,9 +711,7 @@ impl MayAgent {
             model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),
             request_parameters,
             db,
-        };
-
-        Box::pin(Self::new(config)).await
+        })
     }
 
     /// Run a query and stream events.
@@ -865,6 +907,18 @@ impl MayAgent {
 
     pub(crate) fn push_message(&mut self, message: aither_core::llm::Message) {
         self.inner.push_message(message);
+    }
+
+    /// How long from now the idle compaction is due; see
+    /// [`Agent::idle_compaction_due_in`].
+    pub(crate) fn idle_compaction_due_in(&self) -> Option<std::time::Duration> {
+        self.inner.idle_compaction_due_in()
+    }
+
+    /// Compacts the idle session once it is due; see
+    /// [`Agent::compact_when_idle`].
+    pub(crate) async fn compact_when_idle(&mut self) -> Result<Option<CompactResult>, AgentError> {
+        Box::pin(self.inner.compact_when_idle()).await
     }
 
     pub(crate) async fn compact(

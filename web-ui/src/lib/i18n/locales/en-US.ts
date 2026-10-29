@@ -271,12 +271,16 @@ export const enUS = {
       apiKey: 'API key',
       apiKeySaved: 'Key saved — enter a new key to replace',
       baseUrl: 'Base URL',
+      cacheLifetime: 'Cache lifetime',
+      cacheLifetimeHint: 'A duration such as 1h or 5m, or permanent',
     },
     models: {
       title: 'Models',
       description: 'Available models per provider.',
       defaultModel: 'Default model',
       setDefault: 'Set as default',
+      useForCompaction: 'Use for compaction',
+      compactionModel: 'Compaction model',
       current: 'Current',
     },
     mcp: {

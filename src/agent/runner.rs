@@ -267,8 +267,8 @@ async fn run_worker(
     snapshot_db: ChatDb,
 ) {
     loop {
-        // Wait for a command
-        let Ok(command) = command_rx.recv().await else {
+        // Wait for a command; an idle session is compacted on the way.
+        let Some(command) = next_command(&mut agent, &command_rx, &snapshot_db).await else {
             // Channel closed, shutdown
             break;
         };
@@ -346,6 +346,55 @@ async fn run_worker(
             }
             WorkerCommand::Shutdown => {
                 break;
+            }
+        }
+    }
+}
+
+/// Waits for the next worker command, compacting the idle session when the
+/// agent says its cache is about to expire.
+///
+/// aither reports no pending idle compaction while a compaction model is set,
+/// so this never competes with the idle reassembly that mode runs. A command
+/// arriving during the compaction drops it where it stands, which leaves the
+/// conversation untouched, and is returned at once. `None` means the command
+/// channel closed.
+async fn next_command(
+    agent: &mut MayAgent,
+    command_rx: &Receiver<WorkerCommand>,
+    snapshot_db: &ChatDb,
+) -> Option<WorkerCommand> {
+    loop {
+        let Some(due_in) = agent.idle_compaction_due_in() else {
+            return command_rx.recv().await.ok();
+        };
+        // `Some` is a command (or the closed channel), `None` the elapsed timer.
+        let command =
+            futures_lite::future::or(async { Some(command_rx.recv().await.ok()) }, async {
+                async_io::Timer::after(due_in).await;
+                None
+            })
+            .await;
+        if let Some(command) = command {
+            return command;
+        }
+        let compaction =
+            futures_lite::future::or(async { Ok(agent.compact_when_idle().await) }, async {
+                Err(command_rx.recv().await.ok())
+            })
+            .await;
+        match compaction {
+            Err(command) => return command,
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(_))) => {
+                let session_id = agent.session_id().as_str().to_string();
+                let _ =
+                    crate::session::persist_agent_context_snapshot(snapshot_db, &session_id, agent)
+                        .await;
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "idle compaction failed");
+                return command_rx.recv().await.ok();
             }
         }
     }

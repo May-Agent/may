@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::cache_lifetime::CacheLifetime;
 use crate::model_selector::ModelSelector;
 use crate::network_policy::NetworkPolicyConfig;
 
@@ -460,6 +461,9 @@ pub struct ProviderInstance {
     /// Whether this provider is enabled
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Default cache lifetime of the main conversation on this provider.
+    #[serde(default, skip_serializing_if = "CacheLifetime::is_default")]
+    pub cache_lifetime: CacheLifetime,
 }
 
 const fn default_true() -> bool {
@@ -476,6 +480,7 @@ impl Default for ProviderInstance {
             base_url: None,
             display_name: None,
             enabled: true,
+            cache_lifetime: CacheLifetime::default(),
         }
     }
 }
@@ -652,6 +657,10 @@ pub struct ModelsConfig {
     /// Optional explicit embedding dimensions for providers that require it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_dimensions: Option<usize>,
+    /// Model compaction runs on instead of the session model. Idle
+    /// compaction is off while one is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<ModelSelector>,
 }
 
 impl ModelsConfig {
@@ -1207,6 +1216,24 @@ impl MayConfig {
         self.provider.insert(id.into(), provider);
     }
 
+    /// Sets the cache lifetime of provider `id` from the text a settings
+    /// editor submitted: a duration such as `1h`, or `permanent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error when `text` is neither; the config is unchanged.
+    pub fn set_provider_cache_lifetime(
+        &mut self,
+        id: &str,
+        text: &str,
+    ) -> Result<(), crate::cache_lifetime::CacheLifetimeParseError> {
+        let lifetime = text.parse()?;
+        if let Some(instance) = self.provider.get_mut(id) {
+            instance.cache_lifetime = lifetime;
+        }
+        Ok(())
+    }
+
     /// Register a provider after a completed OAuth flow.
     ///
     /// Re-authentication keeps an existing instance in place — only its type
@@ -1365,6 +1392,76 @@ pub struct AvailableModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cache_lifetime_and_compaction_model_survive_a_saved_config() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("config.toml");
+        let mut config = MayConfig::default();
+        config.upsert_provider(
+            "anthropic",
+            ProviderInstance::new(ProviderType::Anthropic).with_api_key("k"),
+        );
+        config.upsert_provider(
+            "openai",
+            ProviderInstance::new(ProviderType::OpenAI).with_api_key("k"),
+        );
+        config.upsert_provider("ollama", ProviderInstance::new(ProviderType::Ollama));
+        // The TUI cache-lifetime edit applies its text through this setter.
+        config
+            .set_provider_cache_lifetime("anthropic", "90m")
+            .expect("duration parses");
+        config
+            .set_provider_cache_lifetime("openai", "permanent")
+            .expect("permanent parses");
+        config.models.compaction_model = Some(ModelSelector::new("openai", "gpt-5-mini"));
+        config.save_to(&path).await.expect("config saves");
+
+        let written = std::fs::read_to_string(&path).expect("config file");
+        assert!(written.contains("cache_lifetime = \"1h 30m\""), "{written}");
+        assert!(
+            written.contains("cache_lifetime = \"permanent\""),
+            "{written}"
+        );
+        assert_eq!(
+            written.matches("cache_lifetime").count(),
+            2,
+            "the one-hour default is omitted: {written}"
+        );
+
+        let loaded = MayConfig::load_from(&path).await.expect("config loads");
+        assert_eq!(
+            loaded.provider["anthropic"].cache_lifetime,
+            CacheLifetime::Limited(Duration::from_mins(90))
+        );
+        assert_eq!(
+            loaded.provider["openai"].cache_lifetime,
+            CacheLifetime::Permanent
+        );
+        assert_eq!(
+            loaded.provider["ollama"].cache_lifetime,
+            CacheLifetime::default()
+        );
+        assert_eq!(
+            loaded.provider["ollama"].cache_lifetime,
+            CacheLifetime::Limited(Duration::from_hours(1))
+        );
+        assert_eq!(
+            loaded.models.compaction_model,
+            config.models.compaction_model
+        );
+    }
+
+    #[test]
+    fn invalid_cache_lifetime_edit_leaves_the_config_unchanged() {
+        let mut config = MayConfig::default();
+        config.upsert_provider("openai", ProviderInstance::new(ProviderType::OpenAI));
+        config
+            .set_provider_cache_lifetime("openai", "soon")
+            .expect_err("not a duration");
+        assert!(config.provider["openai"].cache_lifetime.is_default());
+    }
 
     #[test]
     fn command_priority_defaults_to_normal() {

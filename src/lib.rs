@@ -13,6 +13,8 @@ pub mod auth_store;
 pub mod browser_service;
 /// Bundled resources shipped with the binary.
 pub mod bundle;
+/// Provider prompt-cache lifetime.
+pub mod cache_lifetime;
 /// `ChatGPT` subscription OAuth flow.
 pub mod chatgpt;
 /// Configuration loading and types.

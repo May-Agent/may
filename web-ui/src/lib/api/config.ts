@@ -26,6 +26,15 @@ export interface UiNativeToolsConfig {
 
 export type ProviderApi = 'chat-completions' | 'responses';
 
+/**
+ * A provider's default cache lifetime: a duration such as `1h` or `5m`, or
+ * `permanent`. The server parses it; an unparsable value fails the save.
+ */
+export type CacheLifetime = string;
+
+/** The lifetime a provider has when its config declares none. */
+export const DEFAULT_CACHE_LIFETIME: CacheLifetime = '1h';
+
 export interface UiProviderConfig {
   id: string;
   providerType: ProviderType;
@@ -37,6 +46,7 @@ export interface UiProviderConfig {
   displayName?: string | null;
   enabled: boolean;
   nativeTools: UiNativeToolsConfig;
+  cacheLifetime: CacheLifetime;
   api?: ProviderApi | null;
 }
 
@@ -47,6 +57,8 @@ export interface UiModelsConfig {
   imageGeneration: string[];
   embeddingModel?: string | null;
   embeddingDimensions?: number | null;
+  /** Model compaction runs on instead of the session model, as `provider::model`. */
+  compactionModel?: string | null;
 }
 
 export interface UiPreferencesConfig {
@@ -122,6 +134,23 @@ export interface UiConfigResponse {
 
 export function getConfig(): Promise<UiConfigResponse> {
   return apiGet<UiConfigResponse>('/config');
+}
+
+/** `full` with one provider's cache lifetime replaced. */
+export function withCacheLifetime(
+  full: UiFullConfig,
+  providerId: string,
+  cacheLifetime: CacheLifetime,
+): UiFullConfig {
+  return {
+    ...full,
+    providers: full.providers.map((p) => (p.id === providerId ? { ...p, cacheLifetime } : p)),
+  };
+}
+
+/** `full` with the compaction model replaced; `null` compacts on the session model. */
+export function withCompactionModel(full: UiFullConfig, selector: string | null): UiFullConfig {
+  return { ...full, models: { ...full.models, compactionModel: selector } };
 }
 
 export function setFullConfig(full: UiFullConfig): Promise<void> {

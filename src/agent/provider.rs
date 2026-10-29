@@ -371,6 +371,52 @@ async fn resolve_ask_tier_model(
     )))
 }
 
+/// Builds the configured compaction model wrapped in the [`Parameters`] of its
+/// own provider instance. `None` means compaction runs on the session model:
+/// no compaction model is configured, or it is the session's own model.
+///
+/// # Errors
+///
+/// Returns [`MayAgentError`] when the selector references a provider missing
+/// from `config` or its model fails to build.
+pub async fn resolve_compaction_model(
+    config: &MayConfig,
+    session_provider_id: &str,
+    session_model_id: &str,
+    session_id: &SessionId,
+) -> Result<Option<RequestParameterizedModel<CloudProvider>>, MayAgentError> {
+    let Some(selector) = config.models.compaction_model.as_ref() else {
+        return Ok(None);
+    };
+    let provider_id = selector.provider_id();
+    if provider_id == session_provider_id && selector.model_id() == session_model_id {
+        return Ok(None);
+    }
+    let Some(instance) = config.get_provider(provider_id) else {
+        return Err(MayAgentError::MissingApiKey(format!(
+            "compaction model '{selector}' references provider '{provider_id}', \
+             which is not configured"
+        )));
+    };
+    let llm = build_cloud_provider_from_instance(provider_id, instance, selector.model_id())
+        .await
+        .map_err(|error| {
+            MayAgentError::Llm(format!(
+                "failed to build compaction model '{selector}': {error}"
+            ))
+        })?;
+    Ok(Some(RequestParameterizedModel::new(
+        llm,
+        request_parameters_for(
+            provider_id,
+            Some(instance),
+            selector.model_id(),
+            None,
+            session_id,
+        ),
+    )))
+}
+
 /// Builds a fast+balanced provider chain for background memory extraction.
 ///
 /// # Errors
