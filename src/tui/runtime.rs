@@ -30,6 +30,9 @@ pub enum TuiRuntimeError {
     /// No active session.
     #[error("No active session")]
     NoActiveSession,
+    /// A turn was started without holding the session's run lease.
+    #[error("no session run lease is held for this turn")]
+    NoRunLease,
     /// History replay failed.
     #[error("history replay failed: {0}")]
     HistoryReplay(#[from] crate::session::HistoryReplayError),
@@ -239,32 +242,55 @@ impl LocalSessionRuntime {
         Ok(next)
     }
 
-    /// Mark a session as running.
+    /// Start the next queued turn for a session: take its run lease first,
+    /// and only then the message, so a session held elsewhere never has its
+    /// queue touched.
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] on storage failure.
-    pub async fn set_running(&self, session_id: &SessionId) -> Result<(), TuiRuntimeError> {
-        self.runtime_service
-            .set_state(
-                session_id.as_str(),
-                crate::session::SessionRuntimeState::Running,
-            )
+    pub async fn begin_queued(&self, session_id: &SessionId) -> Result<QueuedRun, TuiRuntimeError> {
+        let runtime = self.runtime_service.get(session_id.as_str()).await?;
+        if !runtime.has_pending_messages() || runtime.interactions.is_active() {
+            return Ok(QueuedRun::Nothing);
+        }
+        let Some(guard) = self.acquire_run(session_id).await? else {
+            return Ok(QueuedRun::Busy);
+        };
+        // An error drops the guard, which settles the session.
+        let next = self
+            .runtime_service
+            .take_next_for_run(session_id.as_str())
             .await?;
-        Ok(())
+        let Some(message) = next else {
+            guard
+                .finish_idle(crate::session::RunOutcome::Completed)
+                .await?;
+            return Ok(QueuedRun::Nothing);
+        };
+        Ok(QueuedRun::Started(
+            pending_message_from_runtime(message).await?,
+            Box::new(guard),
+        ))
     }
 
-    /// Clear the running flag when `expected` still holds it.
+    /// Take the session's run lease, or `None` while another run holds it.
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] on storage failure.
-    pub async fn clear_running_if_needed(
+    pub async fn acquire_run(
         &self,
         session_id: &SessionId,
-    ) -> Result<(), TuiRuntimeError> {
-        self.runtime_service
-            .clear_running_if_needed(session_id.as_str())
-            .await?;
-        Ok(())
+    ) -> Result<Option<crate::session::SessionRunGuard>, TuiRuntimeError> {
+        match self
+            .runtime_service
+            .runs()
+            .acquire(session_id.as_str())
+            .await
+        {
+            Ok(guard) => Ok(Some(guard)),
+            Err(crate::session::AcquireError::Busy(_)) => Ok(None),
+            Err(crate::session::AcquireError::Storage(error)) => Err(error.into()),
+        }
     }
 
     /// Persist an ask-user request and surface it in the app.
@@ -610,6 +636,28 @@ fn decode_data_url(data_url: &str) -> Result<Vec<u8>, TuiRuntimeError> {
         .map_err(TuiRuntimeError::DecodeDataUrl)
 }
 
+/// Result of starting the next queued turn.
+#[derive(Debug)]
+pub enum QueuedRun {
+    /// No message is dispatchable; the session was left untouched.
+    Nothing,
+    /// Another run holds the session; the queue was left untouched.
+    Busy,
+    /// The lease is held and the message was taken for the turn.
+    Started(PendingMessage, Box<crate::session::SessionRunGuard>),
+}
+
+/// Outcome of [`RuntimeDeps::begin_queued_run`].
+#[derive(Debug)]
+pub enum QueuedRunStart {
+    /// No message is dispatchable.
+    Nothing,
+    /// Another run holds the session; the queue was left untouched.
+    Busy,
+    /// The app holds the lease and the message is to run.
+    Started(PendingMessage),
+}
+
 /// Runtime dependencies shared by session and agent operations.
 #[derive(Debug, Clone)]
 pub struct RuntimeDeps {
@@ -949,9 +997,16 @@ impl RuntimeDeps {
             });
         }
 
+        let guard = app.run_guard.as_ref().ok_or(TuiRuntimeError::NoRunLease)?;
+        let fence = guard.fence().clone();
+        let lease = crate::agent::RunLease::of(guard);
+
         if let Some(hidden_context_xml) = msg.hidden_context_xml.as_ref() {
             app.session_manager
-                .append_message(ChatMessage::hidden_context(hidden_context_xml.to_string()))
+                .append_message_as_run(
+                    &fence,
+                    ChatMessage::hidden_context(hidden_context_xml.to_string()),
+                )
                 .await?;
         }
 
@@ -962,10 +1017,10 @@ impl RuntimeDeps {
             .collect::<Result<Vec<_>, _>>()?;
         let user_message_id = app
             .session_manager
-            .append_message(ChatMessage::user_with_attachments(
-                msg.content.clone(),
-                persisted_attachments,
-            ))
+            .append_message_as_run(
+                &fence,
+                ChatMessage::user_with_attachments(msg.content.clone(), persisted_attachments),
+            )
             .await?;
         // Checkpoint the code at this prompt boundary so a later
         // conversation-and-code rewind can restore it.
@@ -977,17 +1032,20 @@ impl RuntimeDeps {
             prompt,
             msg.hidden_context_xml.as_ref().map(ToString::to_string),
             image_urls,
+            lease,
         ))
     }
 
     /// Settle the app after a run finishes: persist the assistant message, save
-    /// the session, clear runtime state, and kick off title generation.
+    /// the session, finish the run (which settles the session's runtime state
+    /// and releases its lease), and kick off title generation.
     pub async fn finish_agent_task(
         &self,
         app: &mut App,
         agent_handle: &mut Option<AgentHandle>,
         title_gen: &mut Option<TitleGenContext>,
         assistant_response: &AssistantReply,
+        outcome: crate::session::RunOutcome,
     ) {
         let session_id = app
             .session_manager
@@ -996,25 +1054,35 @@ impl RuntimeDeps {
         *agent_handle = None;
         app.finish_processing();
 
-        if let Some(at) = assistant_response.at()
-            && let Err(error) = app
-                .session_manager
-                .append_message(ChatMessage::assistant(assistant_response.text(), at))
-                .await
-        {
-            tracing::warn!(error = %error, "failed to persist assistant message");
+        if let Some(at) = assistant_response.at() {
+            if let Some(fence) = app.run_guard.as_ref().map(|guard| guard.fence().clone()) {
+                if let Err(error) = app
+                    .session_manager
+                    .append_message_as_run(
+                        &fence,
+                        ChatMessage::assistant(assistant_response.text(), at),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %error, "failed to persist assistant message");
+                }
+            } else {
+                tracing::warn!("an assistant reply ended without a held session run");
+            }
         }
 
         if let Err(e) = app.session_manager.save_current().await {
             tracing::warn!("Failed to save session history: {}", e);
         }
-        if let Some(session_id) = session_id.as_ref() {
-            if let Err(error) = self.local_runtime.clear_running_if_needed(session_id).await {
-                tracing::warn!(session_id = %session_id, error = %error, "failed to clear local runtime state");
-            }
-            if let Err(error) = self.local_runtime.sync_app_queue(app, session_id).await {
-                tracing::warn!(session_id = %session_id, error = %error, "failed to refresh local pending queue");
-            }
+        if let Some(guard) = app.run_guard.take()
+            && let Err(error) = guard.finish_idle(outcome).await
+        {
+            tracing::warn!(error = %error, "failed to release the session run");
+        }
+        if let Some(session_id) = session_id.as_ref()
+            && let Err(error) = self.local_runtime.sync_app_queue(app, session_id).await
+        {
+            tracing::warn!(session_id = %session_id, error = %error, "failed to refresh local pending queue");
         }
 
         if let Some(ctx) = title_gen.take()
@@ -1184,37 +1252,49 @@ impl RuntimeDeps {
         Ok(())
     }
 
-    /// Take the next pending message eligible for dispatch.
+    /// Start the next queued turn; the app holds the lease until
+    /// [`Self::finish_agent_task`]. Returns the message to run, or why none
+    /// started.
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] on storage failure.
-    pub async fn take_next_dispatchable(
-        &self,
-        app: &mut App,
-    ) -> Result<Option<PendingMessage>, TuiRuntimeError> {
+    pub async fn begin_queued_run(&self, app: &mut App) -> Result<QueuedRunStart, TuiRuntimeError> {
         let Some(session_id) = app
             .session_manager
             .current()
             .map(|session| session.id.clone())
         else {
-            return Ok(None);
+            return Ok(QueuedRunStart::Nothing);
         };
-        self.local_runtime
-            .take_next_dispatchable(app, &session_id)
-            .await
+        match self.local_runtime.begin_queued(&session_id).await? {
+            QueuedRun::Nothing => Ok(QueuedRunStart::Nothing),
+            QueuedRun::Busy => Ok(QueuedRunStart::Busy),
+            QueuedRun::Started(message, guard) => {
+                app.run_guard = Some(*guard);
+                self.local_runtime.sync_app_queue(app, &session_id).await?;
+                Ok(QueuedRunStart::Started(message))
+            }
+        }
     }
 
-    /// Mark the app's current session as running.
+    /// Take the run lease of the app's current session for the turn about to
+    /// start; the app holds it until [`Self::finish_agent_task`]. Returns
+    /// `false`, holding nothing, while another run (a web server or a second
+    /// TUI process on the same database) holds the session.
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError::NoActiveSession`] when no session is active, or [`TuiRuntimeError`] on storage failure.
-    pub async fn mark_running(&self, app: &App) -> Result<(), TuiRuntimeError> {
+    pub async fn begin_run(&self, app: &mut App) -> Result<bool, TuiRuntimeError> {
         let session_id = app
             .session_manager
             .current()
             .map(|session| session.id.clone())
             .ok_or(TuiRuntimeError::NoActiveSession)?;
-        self.local_runtime.set_running(&session_id).await
+        let Some(guard) = self.local_runtime.acquire_run(&session_id).await? else {
+            return Ok(false);
+        };
+        app.run_guard = Some(guard);
+        Ok(true)
     }
 
     /// Persist an ask-user request and surface it in the app.
@@ -1593,5 +1673,161 @@ async fn build_worker_for_session(
         }
     }
 
-    Ok(spawn_worker(DefaultExecutor, agent, db))
+    Ok(spawn_worker(
+        DefaultExecutor,
+        agent,
+        db,
+        deps.local_runtime.runtime_service.runs().clone(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LocalSessionRuntime, QueuedRun};
+    use crate::SessionId;
+    use crate::db::ChatDb;
+    use crate::session::{
+        PendingUserMessage, PendingUserMessageMode, RunOutcome, SessionRuntimeService,
+    };
+
+    fn queued(content: &str) -> PendingUserMessage {
+        PendingUserMessage {
+            content: content.to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            created_at: jiff::Timestamp::now().to_string(),
+            delivery_mode: PendingUserMessageMode::Queue,
+        }
+    }
+
+    async fn contents(service: &SessionRuntimeService, session_id: &str) -> Vec<String> {
+        service
+            .get(session_id)
+            .await
+            .expect("runtime")
+            .queued_messages
+            .into_iter()
+            .map(|message| message.content)
+            .collect()
+    }
+
+    /// While another holder runs the session, starting the next queued turn
+    /// leaves the queue exactly as it was; once the holder finishes, the
+    /// messages dispatch in their original order.
+    #[tokio::test]
+    async fn busy_session_keeps_queue_order_and_untouched_until_the_holder_finishes() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("history.db");
+        let db = ChatDb::open(&path).await.expect("open");
+        db.create_session("session", Some("Session"), Some("test-model"))
+            .await
+            .expect("create session");
+        let local = LocalSessionRuntime::new(db);
+        let other = SessionRuntimeService::new(
+            ChatDb::open(&path).await.expect("open other handle"),
+            crate::ui_event_bus::UiEventBus::new(),
+        );
+        let session_id = SessionId::from_string("session");
+
+        for content in ["first", "second"] {
+            local
+                .runtime_service
+                .enqueue("session", queued(content), PendingUserMessageMode::Queue)
+                .await
+                .expect("enqueue");
+        }
+        let before = local.runtime_service.get("session").await.expect("runtime");
+
+        let holder = other.runs().acquire("session").await.expect("holder");
+        for _ in 0..3 {
+            let outcome = local.begin_queued(&session_id).await.expect("begin");
+            assert!(matches!(outcome, QueuedRun::Busy), "got {outcome:?}");
+        }
+        let during = local.runtime_service.get("session").await.expect("runtime");
+        assert_eq!(
+            during.queued_messages, before.queued_messages,
+            "the queue must not be rewritten while another run holds the session"
+        );
+        assert_eq!(
+            contents(&local.runtime_service, "session").await,
+            ["first", "second"]
+        );
+
+        holder
+            .finish_idle(RunOutcome::Completed)
+            .await
+            .expect("holder ends");
+
+        for expected in ["first", "second"] {
+            let QueuedRun::Started(message, guard) =
+                local.begin_queued(&session_id).await.expect("begin")
+            else {
+                panic!("expected {expected:?} to start");
+            };
+            assert_eq!(message.content, expected);
+            (*guard)
+                .finish_idle(RunOutcome::Completed)
+                .await
+                .expect("turn ends");
+        }
+        let QueuedRun::Nothing = local.begin_queued(&session_id).await.expect("begin") else {
+            panic!("an empty queue must start nothing");
+        };
+        assert!(
+            !local
+                .runtime_service
+                .runs()
+                .is_held("session")
+                .await
+                .expect("lease"),
+            "an empty queue must leave the lease released"
+        );
+    }
+
+    /// A message the user types while another run holds the session joins
+    /// the queue behind the earlier ones.
+    #[tokio::test]
+    async fn message_typed_while_busy_is_queued_in_order() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("history.db");
+        let db = ChatDb::open(&path).await.expect("open");
+        db.create_session("session", Some("Session"), Some("test-model"))
+            .await
+            .expect("create session");
+        let local = LocalSessionRuntime::new(db);
+        let other = SessionRuntimeService::new(
+            ChatDb::open(&path).await.expect("open other handle"),
+            crate::ui_event_bus::UiEventBus::new(),
+        );
+        let session_id = SessionId::from_string("session");
+
+        local
+            .runtime_service
+            .enqueue("session", queued("earlier"), PendingUserMessageMode::Queue)
+            .await
+            .expect("enqueue");
+        let holder = other.runs().acquire("session").await.expect("holder");
+        assert!(
+            local
+                .acquire_run(&session_id)
+                .await
+                .expect("acquire")
+                .is_none()
+        );
+        local
+            .runtime_service
+            .enqueue("session", queued("typed"), PendingUserMessageMode::Queue)
+            .await
+            .expect("enqueue");
+        assert_eq!(
+            contents(&local.runtime_service, "session").await,
+            ["earlier", "typed"]
+        );
+        holder
+            .finish_idle(RunOutcome::Completed)
+            .await
+            .expect("holder ends");
+    }
 }

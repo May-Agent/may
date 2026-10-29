@@ -26,8 +26,8 @@ use super::common::{
     parse_session_runtime_state, row_not_found, session_not_found_db_error, storage_error,
 };
 use super::entity::{
-    session_pending_permissions, session_pending_workspace, session_plans, session_run_leases,
-    session_runtimes, sessions,
+    session_pending_permissions, session_pending_workspace, session_plans, session_runtimes,
+    sessions,
 };
 use super::{ChatDb, ChatDbError, query};
 
@@ -409,233 +409,6 @@ impl ChatDb {
         Ok(summaries)
     }
 
-    /// Write session runtime.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `BackgroundReason` fails to serialize — the type is
-    /// serde-derived, so this cannot happen.
-    pub async fn write_session_runtime(
-        &self,
-        session_id: &str,
-        summary: &SessionRuntimeSummary,
-    ) -> Result<(), ChatDbError> {
-        let now = jiff::Timestamp::now().to_string();
-        let mut tx = self.db.begin().await?;
-        query!(
-            tx,
-            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, terminal_task_id, terminal_output_file, terminal_output_preview, terminal_input_notice, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, browser_takeover_active = excluded.browser_takeover_active, browser_takeover_alert_pending = excluded.browser_takeover_alert_pending, terminal_task_id = excluded.terminal_task_id, terminal_output_file = excluded.terminal_output_file, terminal_output_preview = excluded.terminal_output_preview, terminal_input_notice = excluded.terminal_input_notice, updated_at = excluded.updated_at",
-            session_id,
-            summary.state.as_str(),
-            summary.interactions.browser.takeover_active,
-            summary.interactions.browser.takeover_alert_pending,
-            summary.interactions.terminal.task_id.as_deref(),
-            summary.interactions.terminal.output_file.as_deref(),
-            summary.interactions.terminal.output_preview.as_deref(),
-            summary.interactions.terminal.input_notice.as_deref(),
-            now.as_str()
-        )
-        .execute()
-        .await?;
-        query!(
-            tx,
-            "INSERT INTO session_plans (session_id, plan_state, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET plan_state = excluded.plan_state, updated_at = excluded.updated_at",
-            session_id,
-            summary.plan_state.as_str(),
-            now.as_str()
-        )
-        .execute()
-        .await?;
-
-        query!(
-            tx,
-            "DELETE FROM session_pending_message_attachments WHERE message_id IN (SELECT id FROM session_pending_message_entries WHERE session_id = ?)",
-            session_id
-        )
-        .execute()
-        .await?;
-        query!(
-            tx,
-            "DELETE FROM session_pending_message_entries WHERE session_id = ?",
-            session_id
-        )
-        .execute()
-        .await?;
-        for message in &summary.queued_messages {
-            query!(
-                tx,
-                "INSERT INTO session_pending_message_entries (session_id, delivery_mode, content, hidden_context_xml, created_at) VALUES (?, ?, ?, ?, ?)",
-                session_id,
-                message.delivery_mode.as_str(),
-                message.content.as_str(),
-                message.hidden_context_xml.clone().map(XmlBlock::into_inner),
-                message.created_at.as_str()
-            )
-            .execute()
-            .await?;
-            let message_id = query!(tx, "SELECT last_insert_rowid() AS value")
-                .fetch_one::<I64ValueRow>()
-                .await?
-                .value;
-            for (ordinal, attachment) in message.attachments.iter().enumerate() {
-                query!(
-                    tx,
-                    "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    message_id,
-                    i64::try_from(ordinal).map_err(|error| overflow_error("pending attachment ordinal", &error))?,
-                    attachment.id.as_str(),
-                    attachment.name.as_str(),
-                    attachment.attachment_type.as_str(),
-                    attachment.url.as_str(),
-                    attachment.upload_data_url.as_deref(),
-                    attachment.text_content.as_deref()
-                )
-                .execute()
-                .await?;
-            }
-        }
-        if let Some(message) = &summary.pending_immediate {
-            query!(
-                tx,
-                "INSERT INTO session_pending_message_entries (session_id, delivery_mode, content, hidden_context_xml, created_at) VALUES (?, ?, ?, ?, ?)",
-                session_id,
-                message.delivery_mode.as_str(),
-                message.content.as_str(),
-                message.hidden_context_xml.clone().map(XmlBlock::into_inner),
-                message.created_at.as_str()
-            )
-            .execute()
-            .await?;
-            let message_id = query!(tx, "SELECT last_insert_rowid() AS value")
-                .fetch_one::<I64ValueRow>()
-                .await?
-                .value;
-            for (ordinal, attachment) in message.attachments.iter().enumerate() {
-                query!(
-                    tx,
-                    "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    message_id,
-                    i64::try_from(ordinal).map_err(|error| overflow_error("pending attachment ordinal", &error))?,
-                    attachment.id.as_str(),
-                    attachment.name.as_str(),
-                    attachment.attachment_type.as_str(),
-                    attachment.url.as_str(),
-                    attachment.upload_data_url.as_deref(),
-                    attachment.text_content.as_deref()
-                )
-                .execute()
-                .await?;
-            }
-        }
-
-        query!(
-            tx,
-            "DELETE FROM session_pending_permissions WHERE session_id = ?",
-            session_id
-        )
-        .execute()
-        .await?;
-        if let Some(request) = &summary.waiting_permission {
-            query!(
-                tx,
-                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at) VALUES (?, ?, ?, ?, ?)",
-                request.id.as_str(),
-                session_id,
-                request.request.mode.as_str(),
-                request.request.script.as_str(),
-                summary.updated_at.as_deref().unwrap_or(now.as_str())
-            )
-            .execute()
-            .await?;
-        }
-
-        query!(
-            tx,
-            "DELETE FROM session_pending_workspace WHERE session_id = ?",
-            session_id
-        )
-        .execute()
-        .await?;
-        if let Some(request) = &summary.waiting_workspace {
-            query!(
-                tx,
-                "INSERT INTO session_pending_workspace (request_id, session_id, path, reason, created_at) VALUES (?, ?, ?, ?, ?)",
-                request.id.as_str(),
-                session_id,
-                request.request.path.as_str(),
-                request.request.reason.as_str(),
-                summary.updated_at.as_deref().unwrap_or(now.as_str())
-            )
-            .execute()
-            .await?;
-        }
-
-        query!(
-            tx,
-            "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
-            session_id
-        )
-        .execute()
-        .await?;
-        query!(
-            tx,
-            "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
-            session_id
-        )
-        .execute()
-        .await?;
-        query!(
-            tx,
-            "DELETE FROM session_pending_ask_user_requests_v2 WHERE session_id = ?",
-            session_id
-        )
-        .execute()
-        .await?;
-        if let Some(request) = &summary.waiting_ask_user {
-            query!(
-                tx,
-                "INSERT INTO session_pending_ask_user_requests_v2 (request_id, session_id, created_at) VALUES (?, ?, ?)",
-                request.id.as_str(),
-                session_id,
-                summary.updated_at.as_deref().unwrap_or(now.as_str())
-            )
-            .execute()
-            .await?;
-            for (question_ordinal, question) in request.questions.iter().enumerate() {
-                let question_ordinal = i64::try_from(question_ordinal)
-                    .map_err(|error| overflow_error("ask-user question ordinal", &error))?;
-                query!(
-                    tx,
-                    "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select) VALUES (?, ?, ?, ?, ?)",
-                    request.id.as_str(),
-                    question_ordinal,
-                    question.section.as_str(),
-                    question.question.as_str(),
-                    question.multi_select
-                )
-                .execute()
-                .await?;
-                for (option_ordinal, option) in question.option.iter().enumerate() {
-                    query!(
-                        tx,
-                        "INSERT INTO session_pending_ask_user_question_options_v2 (request_id, question_ordinal, option_ordinal, value) VALUES (?, ?, ?, ?)",
-                        request.id.as_str(),
-                        question_ordinal,
-                        i64::try_from(option_ordinal).map_err(|error| overflow_error("ask-user option ordinal", &error))?,
-                        option.as_str()
-                    )
-                    .execute()
-                    .await?;
-                }
-            }
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Set the base runtime state for a session with a direct SQL update.
     ///
     /// # Errors
@@ -656,22 +429,6 @@ impl ChatDb {
         .execute()
         .await?;
         Ok(())
-    }
-
-    /// Atomically transition Running → Idle only if currently Running.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    pub async fn clear_running_if_idle(&self, session_id: &str) -> Result<bool, ChatDbError> {
-        let result = query!(
-            self.db,
-            "UPDATE session_runtimes SET state = 'idle', updated_at = ? WHERE session_id = ? AND state = 'running'",
-            jiff::Timestamp::now().to_string(),
-            session_id
-        )
-        .execute()
-        .await?;
-        Ok(result.rows_written > 0)
     }
 
     /// Set only the terminal interaction fields via direct SQL update.
@@ -1390,36 +1147,47 @@ impl ChatDb {
         )
     }
 
-    /// Normalize persisted runtime state after a server restart.
+    /// Repair persisted runtime state after a server restart.
     ///
-    /// This only repairs durable state. Live resources such as streams,
-    /// process handles, and SSH connections must be rebuilt lazily.
+    /// Only durable state is repaired; live resources such as streams,
+    /// process handles, and SSH connections are rebuilt lazily. Leases whose
+    /// holder stopped renewing before `expired_before_ms` are freed, and
+    /// sessions no live lease covers get field-level fixes: a `running`
+    /// state becomes `idle` (waiting states are derived from the pending
+    /// request rows) with its terminal interaction cleared, and an active
+    /// browser takeover ends with its alert pending. A session whose lease a
+    /// live run still holds, a TUI process sharing this database for
+    /// instance, is left to that run.
     ///
     /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    pub async fn recover_session_runtimes_after_restart(&self) -> Result<(), ChatDbError> {
-        let sessions = self.list_sessions().await?;
-        for session in sessions {
-            let session_id = session.id.clone();
-            let mut summary = self.load_session_runtime_summary(&session_id).await?;
-            let original_state = summary.state;
-            let original_browser_takeover = summary.interactions.browser.takeover_active;
-            if original_browser_takeover {
-                summary.interactions.browser.takeover_active = false;
-                summary.interactions.browser.takeover_alert_pending = true;
-            }
-            summary.normalize_state();
-            if matches!(original_state, SessionRuntimeState::Running)
-                && summary.state == SessionRuntimeState::Running
-            {
-                summary.state = SessionRuntimeState::Idle;
-                summary.interactions.terminal = TerminalRuntimeState::default();
-            }
-
-            if summary.state != original_state || original_browser_takeover {
-                self.write_session_runtime(&session_id, &summary).await?;
-            }
-        }
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn recover_session_runtimes_after_restart(
+        &self,
+        expired_before_ms: i64,
+    ) -> Result<(), ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "UPDATE session_run_leases SET owner = NULL, cancellation_requested = 0 WHERE owner IS NOT NULL AND heartbeat_at < ?",
+            expired_before_ms
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "UPDATE session_runtimes SET browser_takeover_active = 0, browser_takeover_alert_pending = 1, updated_at = ? WHERE browser_takeover_active = 1 AND NOT EXISTS (SELECT 1 FROM session_run_leases AS lease WHERE lease.session_id = session_runtimes.session_id AND lease.owner IS NOT NULL)",
+            jiff::Timestamp::now().to_string()
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "UPDATE session_runtimes SET state = 'idle', terminal_task_id = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL, updated_at = ? WHERE state = 'running' AND NOT EXISTS (SELECT 1 FROM session_run_leases AS lease WHERE lease.session_id = session_runtimes.session_id AND lease.owner IS NOT NULL)",
+            jiff::Timestamp::now().to_string()
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1446,111 +1214,6 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Recover session run leases after restart.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    pub async fn recover_session_run_leases_after_restart(&self) -> Result<(), ChatDbError> {
-        query!(
-            self.db,
-            "UPDATE session_run_leases SET active = ?, cancellation_requested = ?, updated_at = ? WHERE active = ?",
-            false,
-            false,
-            jiff::Timestamp::now().to_string(),
-            true
-        )
-        .execute()
-        .await?;
-        Ok(())
-    }
-
-    /// Claim the session's run lease, returning whether this call took it.
-    ///
-    /// The claim is one conditional upsert, so it takes SQLite's write lock
-    /// directly (waiting out the busy timeout) instead of upgrading a read
-    /// transaction, which SQLite refuses outright with `SQLITE_BUSY` once
-    /// another connection has written in the meantime.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
-    pub async fn claim_session_run_lease(&self, session_id: &str) -> Result<bool, ChatDbError> {
-        let result = query!(
-            self.db,
-            "INSERT INTO session_run_leases (session_id, active, cancellation_requested, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET active = excluded.active, cancellation_requested = excluded.cancellation_requested, updated_at = excluded.updated_at WHERE session_run_leases.active = ?",
-            session_id,
-            true,
-            false,
-            jiff::Timestamp::now().to_string(),
-            false
-        )
-        .execute()
-        .await?;
-        Ok(result.rows_written > 0)
-    }
-
-    /// Release session run lease.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    pub async fn release_session_run_lease(&self, session_id: &str) -> Result<(), ChatDbError> {
-        query!(
-            self.db,
-            "UPDATE session_run_leases SET active = ?, cancellation_requested = ?, updated_at = ? WHERE session_id = ?",
-            false,
-            false,
-            jiff::Timestamp::now().to_string(),
-            session_id
-        )
-        .execute()
-        .await?;
-        Ok(())
-    }
-
-    /// Session run lease active.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    pub async fn session_run_lease_active(&self, session_id: &str) -> Result<bool, ChatDbError> {
-        let lease = query!(
-            self.db,
-            "SELECT * FROM session_run_leases WHERE session_id = ?",
-            session_id
-        )
-        .fetch_optional::<session_run_leases::Model>()
-        .await?;
-        Ok(lease.is_some_and(|lease| lease.active))
-    }
-
-    /// Request session run cancel.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    pub async fn request_session_run_cancel(&self, session_id: &str) -> Result<bool, ChatDbError> {
-        let result = query!(
-            self.db,
-            "UPDATE session_run_leases SET cancellation_requested = ?, updated_at = ? WHERE session_id = ? AND active = ?",
-            true,
-            jiff::Timestamp::now().to_string(),
-            session_id,
-            true
-        )
-        .execute()
-        .await?;
-        Ok(result.rows_written > 0)
-    }
-
     /// Return session ids that have persisted follow-up work ready to resume.
     ///
     /// # Errors
@@ -1567,9 +1230,9 @@ impl ChatDb {
         Ok(session_ids)
     }
 
-    /// Update session stats after inserting a message row.
-    pub(super) async fn update_session_stats(
-        &self,
+    /// Update session stats after inserting a message row, inside `tx`.
+    pub(super) async fn update_session_stats_in(
+        tx: &mut skyzen_services::DbTransaction,
         session_id: &str,
         updated_at: &str,
         preview: Option<&str>,
@@ -1587,16 +1250,29 @@ impl ChatDb {
         };
         match preview {
             Some(preview) => {
-                query!(self.db, sql, updated_at, preview, session_id)
+                query!(tx, sql, updated_at, preview, session_id)
                     .execute()
                     .await?;
             }
             None => {
-                query!(self.db, sql, updated_at, session_id)
-                    .execute()
-                    .await?;
+                query!(tx, sql, updated_at, session_id).execute().await?;
             }
         }
+        Ok(())
+    }
+
+    /// Update session stats after inserting a message row.
+    pub(super) async fn update_session_stats(
+        &self,
+        session_id: &str,
+        updated_at: &str,
+        preview: Option<&str>,
+        increment_count: bool,
+    ) -> Result<(), ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        Self::update_session_stats_in(&mut tx, session_id, updated_at, preview, increment_count)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 }

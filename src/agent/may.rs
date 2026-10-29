@@ -428,13 +428,12 @@ impl MayAgent {
                 ),
                 runtime_service,
             });
-        let runtime_db = config
+        let hook_runtime = config
             .permission_approver
             .as_ref()
-            .and_then(|approver| approver.runtime_service.as_ref())
-            .map(|runtime_service| runtime_service.db());
-        let pending_steer_hook = PendingSteerHook::new(runtime_db.clone(), &config.session_id);
-        let context_snapshot_hook = ContextSnapshotHook::new(runtime_db, &config.session_id);
+            .and_then(|approver| approver.runtime_service.clone());
+        let pending_steer_hook = PendingSteerHook::new(hook_runtime.clone(), &config.session_id);
+        let context_snapshot_hook = ContextSnapshotHook::new(hook_runtime, &config.session_id);
 
         let (skills_dir, subagents_dir) = if let Some(profile_id) = config.profile_id.as_deref() {
             let profile_home =
