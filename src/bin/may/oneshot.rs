@@ -20,12 +20,16 @@ use may_agent::workspace_request;
 
 use super::cli::OneShotArgs;
 
+mod render;
+
+use render::OneShotOutput;
+
 /// Records a question for the current session, prompts on stderr and answers it.
 async fn answer_oneshot_question(
     runtime_deps: &RuntimeDeps,
     app: &mut App,
     request: may_agent::ask_user::AskUserRequest,
-    stderr: &mut io::Stderr,
+    output: &mut OneShotOutput<io::Stdout, io::Stderr>,
 ) -> anyhow::Result<()> {
     let session_id = app
         .session_manager
@@ -36,7 +40,7 @@ async fn answer_oneshot_question(
     let request_id = runtime_deps
         .register_ask_user_request(app, &session_id, &questions)
         .await?;
-    let answers = prompt_oneshot_questions(&questions, stderr)?;
+    let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
     runtime_deps
         .resolve_ask_user_response(app, &session_id, &request_id, &answers)
         .await?;
@@ -95,8 +99,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     )
     .with_oneshot_overrides(args.model.clone(), args.reasoning_effort);
 
-    let mut stdout = io::stdout();
-    let mut stderr = io::stderr();
+    let mut output = OneShotOutput::new(io::stdout(), io::stderr());
     let mut worker: Option<AgentWorker> = None;
     let mut build = runtime_deps
         .begin_new_session(&mut app, &mut worker)
@@ -111,7 +114,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         match next {
             Ok(completed) => break completed?,
             Err(Some(request)) => {
-                answer_oneshot_question(&runtime_deps, &mut app, request, &mut stderr).await?;
+                answer_oneshot_question(&runtime_deps, &mut app, request, &mut output).await?;
             }
             Err(None) => anyhow::bail!("ask-user channel closed while preparing the session"),
         }
@@ -145,7 +148,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
 
     loop {
         if let Some(request) = runtime_deps.pending_permission(&app).await? {
-            let approved = prompt_oneshot_permission(&request.request, &mut stderr)?;
+            let approved = prompt_oneshot_permission(&request.request, output.stderr()?)?;
             runtime_deps
                 .resolve_permission_response(&mut app, &request.id, approved)
                 .await?;
@@ -180,10 +183,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     &assistant_response,
                 )
                 .await;
-            if !assistant_response.text().ends_with('\n') {
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
-            }
+            output.end_text_line()?;
             return Ok(());
         };
         let Some(event) = next else {
@@ -191,7 +191,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         };
         match event {
             Event::AskUser(request) => {
-                answer_oneshot_question(&runtime_deps, &mut app, request, &mut stderr).await?;
+                answer_oneshot_question(&runtime_deps, &mut app, request, &mut output).await?;
             }
             Event::Workspace(request) => {
                 let session_id = app
@@ -202,7 +202,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 let request_id = runtime_deps
                     .register_workspace_request(&mut app, &session_id, &request.args.request)
                     .await?;
-                let approved = prompt_oneshot_workspace(&request.args.request, &mut stderr)?;
+                let approved = prompt_oneshot_workspace(&request.args.request, output.stderr()?)?;
                 runtime_deps
                     .resolve_workspace_response(&mut app, &session_id, &request_id, approved)
                     .await?;
@@ -229,10 +229,9 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 }) = result
                 {
                     assistant_response.push(text, at);
-                    stdout.write_all(text.as_bytes())?;
-                    stdout.flush()?;
+                    output.text(text)?;
                 }
-                render_oneshot_event(&mut stderr, &result)?;
+                output.event(&result)?;
                 let run_failed = result.is_err();
                 let ended = app.handle_agent_event(result).await;
                 if ended {
@@ -247,10 +246,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     if run_failed {
                         anyhow::bail!("oneshot agent run failed");
                     }
-                    if !assistant_response.text().ends_with('\n') {
-                        stdout.write_all(b"\n")?;
-                        stdout.flush()?;
-                    }
+                    output.end_text_line()?;
                     return Ok(());
                 }
             }
@@ -263,15 +259,12 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         &assistant_response,
                     )
                     .await;
-                if !assistant_response.text().ends_with('\n') {
-                    stdout.write_all(b"\n")?;
-                    stdout.flush()?;
-                }
+                output.end_text_line()?;
                 return Ok(());
             }
             Event::Agent(TuiEvent::Compacted(_) | TuiEvent::ContextReport(_)) => {}
             Event::Agent(TuiEvent::Error(error)) => {
-                let _ = writeln!(stderr, "[error] {error}");
+                writeln!(output.stderr()?, "[error] {error}")?;
                 runtime_deps
                     .finish_agent_task(
                         &mut app,
@@ -376,29 +369,6 @@ fn prompt_oneshot_workspace(
 #[template(path = "reminder_oneshot_noninteractive.txt", escape = "none")]
 struct OneShotNonInteractiveReminder;
 
-/// The usage line, naming only the token counts the provider reported.
-#[derive(askama::Template)]
-#[template(path = "oneshot_usage.txt", escape = "none")]
-struct OneShotUsageLine {
-    prompt: Option<u32>,
-    cache_read: Option<u32>,
-    cache_write: Option<u32>,
-    completion: Option<u32>,
-    total: Option<u32>,
-}
-
-impl From<&aither_core::llm::Usage> for OneShotUsageLine {
-    fn from(usage: &aither_core::llm::Usage) -> Self {
-        Self {
-            prompt: usage.prompt_tokens,
-            cache_read: usage.cache_read_tokens,
-            cache_write: usage.cache_write_tokens,
-            completion: usage.completion_tokens,
-            total: usage.total_tokens,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct OneShotPromptInput {
     content: String,
@@ -502,103 +472,74 @@ fn parse_oneshot_selection(
     Some(selected)
 }
 
-fn render_oneshot_event(
-    stderr: &mut impl Write,
-    result: &Result<TimedEvent, aither_agent::AgentError>,
-) -> anyhow::Result<()> {
-    // Every line opens with the UTC time the agent emitted the event. A run
-    // error is not an event and carries no emission time, so it is stamped on
-    // receipt.
-    let at = result
-        .as_ref()
-        .map_or_else(|_| Timestamp::now(), |timed| timed.at);
-    let result = result.as_ref().map(|timed| &timed.event);
-    match result {
-        Ok(AgentEvent::RunStart { .. }) => {
-            writeln!(stderr, "{at} Running...")?;
-        }
-        Ok(AgentEvent::Reasoning(text)) => {
-            if !text.trim().is_empty() {
-                writeln!(stderr, "{at} Thinking: {text}")?;
-            }
-        }
-        // UI progress — oneshot mode ignores deltas.
-        Ok(
-            AgentEvent::ToolCallDelta { .. }
-            | AgentEvent::TurnComplete { .. }
-            | AgentEvent::Checkpoint { .. }
-            | AgentEvent::Complete { .. }
-            | AgentEvent::BuiltInToolResult { .. }
-            | AgentEvent::Text(_),
-        ) => {}
-        Ok(AgentEvent::ToolCallStart { name, .. }) => {
-            writeln!(stderr, "{at} Tool: {name}")?;
-        }
-        Ok(AgentEvent::BuiltInToolCall { tool, .. }) => {
-            writeln!(stderr, "{at} Tool: {tool}")?;
-        }
-        Ok(AgentEvent::ToolCallEnd { name, result, .. }) => {
-            if result.is_error() {
-                let error = result.error_message().unwrap_or("tool failed");
-                writeln!(stderr, "{at} Tool failed: {name}: {error}")?;
-            } else {
-                writeln!(stderr, "{at} Tool finished: {name}")?;
-            }
-        }
-        Ok(AgentEvent::BackgroundTaskStarted {
-            task_id,
-            output_file,
-            ..
-        }) => {
-            writeln!(
-                stderr,
-                "{at} Background task started: {task_id} (output: {output_file})"
-            )?;
-        }
-        Ok(AgentEvent::BackgroundTaskCompleted { task_id, .. }) => {
-            writeln!(stderr, "{at} Background task completed: {task_id}")?;
-        }
-        Ok(AgentEvent::RunPaused { reason, .. }) => {
-            writeln!(stderr, "{at} Paused: {reason:?}")?;
-        }
-        Ok(AgentEvent::RunResumed { reason, .. }) => {
-            writeln!(stderr, "{at} Resumed: {reason:?}")?;
-        }
-        Ok(AgentEvent::SkillActivated { name, .. }) => {
-            writeln!(stderr, "{at} Skill activated: {name}")?;
-        }
-        Ok(AgentEvent::Usage(usage)) => {
-            let line = askama::Template::render(&OneShotUsageLine::from(usage))?;
-            writeln!(stderr, "{at} {line}")?;
-        }
-        Ok(AgentEvent::Error(error)) | Err(error) => {
-            writeln!(stderr, "{at} Error: {error}")?;
-        }
-    }
-    stderr.flush()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use aither_agent::{AgentEvent, TimedEvent};
+    use aither_core::llm::tool::{
+        CommandOutcome, CommandResult, CommandStream, StoredFile, ToolResult,
+    };
     use jiff::Timestamp;
 
-    use super::{parse_oneshot_selection, render_oneshot_event};
+    use super::parse_oneshot_selection;
+    use super::render::OneShotOutput;
 
-    fn render(event: &Result<TimedEvent, aither_agent::AgentError>) -> String {
-        let mut out = Vec::new();
-        render_oneshot_event(&mut out, event).expect("render must succeed");
-        String::from_utf8(out).expect("event lines are utf-8")
+    type Output = OneShotOutput<Vec<u8>, Vec<u8>>;
+
+    fn output() -> Output {
+        OneShotOutput::new(Vec::new(), Vec::new())
+    }
+
+    fn timed(at: &str, event: AgentEvent) -> TimedEvent {
+        TimedEvent {
+            at: at.parse().expect("valid time"),
+            event,
+        }
+    }
+
+    fn stderr(output: &Output) -> String {
+        String::from_utf8(output.stderr_bytes().to_vec()).expect("event lines are utf-8")
+    }
+
+    fn command(outcome: CommandOutcome) -> ToolResult {
+        ToolResult::Command(Box::new(CommandResult {
+            stdout: CommandStream::Inline {
+                text: String::new(),
+            },
+            stderr: None,
+            outcome,
+        }))
+    }
+
+    fn terminal_call(output: &mut Output, arguments: &str, result: ToolResult) {
+        output
+            .event(&Ok(timed(
+                "2024-03-01T10:00:01Z",
+                AgentEvent::tool_start("c1", "terminal", arguments),
+            )))
+            .expect("start renders");
+        output
+            .event(&Ok(timed(
+                "2024-03-01T10:00:02.250Z",
+                AgentEvent::ToolCallEnd {
+                    id: "c1".to_string(),
+                    name: "terminal".to_string(),
+                    result,
+                },
+            )))
+            .expect("end renders");
     }
 
     #[test]
     fn event_lines_carry_the_emission_time_as_rfc3339_utc() {
+        let mut output = output();
         let at: Timestamp = "2024-03-01T10:00:01.250Z".parse().expect("valid time");
-        let line = render(&Ok(TimedEvent {
-            at,
-            event: AgentEvent::run_start("run", 1),
-        }));
+        output
+            .event(&Ok(TimedEvent {
+                at,
+                event: AgentEvent::run_start("run", 1),
+            }))
+            .expect("render must succeed");
+        let line = stderr(&output);
         let (stamp, rest) = line.split_once(' ').expect("line has a timestamp prefix");
         assert_eq!(stamp, "2024-03-01T10:00:01.25Z");
         assert!(stamp.ends_with('Z'));
@@ -608,9 +549,13 @@ mod tests {
 
     #[test]
     fn a_run_error_is_stamped_between_markers_taken_around_its_receipt() {
+        let mut output = output();
         let before = Timestamp::now();
-        let line = render(&Err(aither_agent::AgentError::Llm("boom".to_string())));
+        output
+            .event(&Err(aither_agent::AgentError::Llm("boom".to_string())))
+            .expect("render must succeed");
         let after = Timestamp::now();
+        let line = stderr(&output);
         let (stamp, rest) = line.split_once(' ').expect("line has a timestamp prefix");
         let at = stamp.parse::<Timestamp>().expect("valid RFC 3339");
         assert!(stamp.ends_with('Z'));
@@ -619,11 +564,15 @@ mod tests {
     }
 
     fn usage_line(usage: aither_core::llm::Usage) -> String {
-        let line = render(&Ok(TimedEvent {
-            at: Timestamp::UNIX_EPOCH,
-            event: AgentEvent::Usage(usage),
-        }));
-        line.split_once(' ')
+        let mut output = output();
+        output
+            .event(&Ok(TimedEvent {
+                at: Timestamp::UNIX_EPOCH,
+                event: AgentEvent::Usage(usage),
+            }))
+            .expect("usage renders");
+        stderr(&output)
+            .split_once(' ')
             .expect("line has a timestamp prefix")
             .1
             .to_string()
@@ -656,6 +605,118 @@ mod tests {
         assert_eq!(
             usage_line(usage),
             "Usage: prompt=1200 completion=80 total=1280\n"
+        );
+    }
+
+    #[test]
+    fn a_terminal_call_that_exits_zero_shows_its_description_duration_and_exit_code() {
+        let mut output = output();
+        terminal_call(
+            &mut output,
+            r#"{"description":"list sources","script":"ls src"}"#,
+            command(CommandOutcome::Exited { code: 0 }),
+        );
+        assert_eq!(
+            stderr(&output),
+            "2024-03-01T10:00:01Z Tool: terminal: list sources\n\
+             2024-03-01T10:00:02.25Z Tool finished: terminal: list sources in 1.2s, exit code 0\n"
+        );
+    }
+
+    #[test]
+    fn a_terminal_call_without_a_description_shows_a_short_form_of_its_script() {
+        let mut output = output();
+        terminal_call(
+            &mut output,
+            r#"{"script":"cargo test\n  --all"}"#,
+            command(CommandOutcome::Exited { code: 101 }),
+        );
+        assert_eq!(
+            stderr(&output),
+            "2024-03-01T10:00:01Z Tool: terminal: cargo test …\n\
+             2024-03-01T10:00:02.25Z Tool finished: terminal: cargo test … in 1.2s, exit code 101\n"
+        );
+    }
+
+    #[test]
+    fn a_background_terminal_call_names_its_task() {
+        let mut output = output();
+        terminal_call(
+            &mut output,
+            r#"{"description":"serve","script":"serve"}"#,
+            command(CommandOutcome::Running {
+                task_id: "t7".to_string(),
+                output: StoredFile {
+                    url: "outputs/t7.txt".to_string(),
+                    path: "/sandbox/outputs/t7.txt".to_string(),
+                },
+            }),
+        );
+        assert!(stderr(&output).ends_with(
+            "Tool finished: terminal: serve in 1.2s, running in background as task t7\n"
+        ));
+    }
+
+    #[test]
+    fn a_killed_terminal_call_and_a_failed_tool_state_their_outcome() {
+        let mut killed = output();
+        terminal_call(
+            &mut killed,
+            r#"{"description":"wait","script":"sleep 99"}"#,
+            command(CommandOutcome::Killed {
+                task_id: "t9".to_string(),
+                notice: "Killed at the time bound.".to_string(),
+            }),
+        );
+        assert!(stderr(&killed).ends_with("in 1.2s, killed (task t9)\n"));
+
+        let mut failed = output();
+        terminal_call(
+            &mut failed,
+            r#"{"description":"wait","script":"sleep 99"}"#,
+            ToolResult::error("permission denied"),
+        );
+        assert!(
+            stderr(&failed).ends_with("Tool failed: terminal: wait in 1.2s: permission denied\n")
+        );
+    }
+
+    #[test]
+    fn another_tool_start_line_names_the_tool_and_summarises_its_arguments() {
+        let mut output = output();
+        output
+            .event(&Ok(timed(
+                "2024-03-01T10:00:01Z",
+                AgentEvent::tool_start("c2", "read_page", r#"{"url":"https://example.com"}"#),
+            )))
+            .expect("start renders");
+        assert_eq!(
+            stderr(&output),
+            "2024-03-01T10:00:01Z Tool: read_page: {\"url\":\"https://example.com\"}\n"
+        );
+    }
+
+    #[test]
+    fn assistant_text_ends_its_line_before_the_next_event_line() {
+        let mut output = output();
+        output.text("for arrays and strings:").expect("text writes");
+        output
+            .event(&Ok(timed(
+                "2024-03-01T10:00:01Z",
+                AgentEvent::run_start("run", 1),
+            )))
+            .expect("event renders");
+        output.text("done.\n").expect("text writes");
+        output
+            .event(&Ok(timed(
+                "2024-03-01T10:00:02Z",
+                AgentEvent::run_start("run", 2),
+            )))
+            .expect("event renders");
+        output.end_text_line().expect("nothing is open");
+        assert_eq!(
+            String::from_utf8(output.stdout_bytes().to_vec()).expect("utf-8"),
+            "for arrays and strings:\ndone.\n"
         );
     }
 
