@@ -96,6 +96,9 @@ pub struct SharedTerminalCommands {
     pub descriptions: Vec<(String, String)>,
     /// Names of commands backed by MCP connections.
     pub mcp_command_names: Vec<String>,
+    /// Where the main agent publishes its requests for the `subagent` command's
+    /// `fork` kind; the main agent's builder must be given it.
+    pub fork_source: aither_agent::ForkSource,
 }
 
 /// Register every shared IPC command on the terminal tool's command registry.
@@ -244,6 +247,7 @@ where
             SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
         ]);
     let subagent_tracker = config.subagent_tracker;
+    let fork_source = subagent_tool.fork_source();
     describe_tool(&mut descriptions, &subagent_tool);
     // Built for each terminal that serves the registry, so a subagent launches
     // its own subagents with its own authority, never the main agent's.
@@ -269,6 +273,7 @@ where
     Ok(SharedTerminalCommands {
         descriptions,
         mcp_command_names,
+        fork_source,
     })
 }
 
