@@ -93,7 +93,7 @@ pub(super) struct CreateTaskRequest {
     #[serde(default)]
     pub needs_network: bool,
     /// Maximum runtime of one run in seconds.
-    pub timeout_secs: u64,
+    pub timeout_secs: u32,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -112,7 +112,7 @@ pub(super) struct UpdateTaskRequest {
     #[serde(default)]
     pub script_inline: Option<String>,
     #[serde(default)]
-    pub timeout_secs: Option<u64>,
+    pub timeout_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

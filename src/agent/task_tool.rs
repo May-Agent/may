@@ -51,7 +51,7 @@ pub struct TaskArgs {
     #[serde(default)]
     pub needs_network: Option<bool>,
     /// Maximum runtime of one run in seconds; the run is killed when it passes.
-    pub timeout_secs: u64,
+    pub timeout_secs: u32,
 }
 
 /// Request to create a scheduled task, delivered over the task broker.
@@ -78,7 +78,7 @@ pub struct NormalizedTaskCreateRequest {
     pub trigger: NormalizedTaskTrigger,
     pub script: TaskScriptSpec,
     pub needs_network: bool,
-    pub timeout_secs: u64,
+    pub timeout_secs: u32,
 }
 
 /// Outcome of a handled task-create request.
