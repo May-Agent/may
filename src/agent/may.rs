@@ -429,7 +429,6 @@ impl MayAgent {
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook);
-        let terminal_command_factory = builder.terminal_tool_factory();
         let subagent_tracker = crate::agent::subagent_tracker::SubagentTracker::default();
         let shared_terminal_commands = register_shared_terminal_commands(
             builder.tool_registry_mut(),
@@ -457,7 +456,6 @@ impl MayAgent {
                 request_parameters: config.request_parameters.clone(),
                 workspace_request_broker: (!is_container)
                     .then_some(config.workspace_request_broker.clone()),
-                terminal_tool_factory: Some(terminal_command_factory),
                 subagent_runs: subagent_runs.clone(),
                 issue_store: issue_store.clone(),
             },
@@ -564,11 +562,12 @@ impl MayAgent {
                     runtime_system_context.with_container_environment(container_context.clone());
                 builder =
                     builder.system_text(tag::CONTAINER_ENVIRONMENT_CONTEXT, container_context);
-                builder = builder.container_runtime(ContainerShellRuntime::new(
-                    container_id,
-                    container_ipc_route,
-                    container_exec,
-                ));
+                builder = builder.container_runtime(
+                    ContainerShellRuntime::new(container_id, container_ipc_route, container_exec)
+                        .with_workspace_mount(crate::container::lifecycle::workspace_mount(
+                            &config.sandbox_dir,
+                        )),
+                );
                 browser_cdp_endpoint = cdp_endpoint;
             }
             AgentEnvironment::Local => {
