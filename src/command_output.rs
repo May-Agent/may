@@ -7,7 +7,7 @@ use aither_core::llm::CommandStream;
 #[must_use]
 pub fn stream_text(stream: &CommandStream) -> String {
     match stream {
-        CommandStream::Inline(text) => text.clone(),
+        CommandStream::Inline { text } => text.clone(),
         CommandStream::Stored { .. } | CommandStream::Image { .. } => stream.render_for_model(),
     }
 }
