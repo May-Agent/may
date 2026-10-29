@@ -959,7 +959,7 @@ impl RuntimeDeps {
         app: &mut App,
         agent_handle: &mut Option<AgentHandle>,
         title_gen: &mut Option<TitleGenContext>,
-        assistant_response: &str,
+        assistant_response: &AssistantReply,
     ) {
         let session_id = app
             .session_manager
@@ -968,10 +968,10 @@ impl RuntimeDeps {
         *agent_handle = None;
         app.finish_processing();
 
-        if !assistant_response.is_empty()
+        if let Some(at) = assistant_response.at()
             && let Err(error) = app
                 .session_manager
-                .append_message(ChatMessage::assistant(assistant_response))
+                .append_message(ChatMessage::assistant(assistant_response.text(), at))
                 .await
         {
             tracing::warn!(error = %error, "failed to persist assistant message");
@@ -990,14 +990,14 @@ impl RuntimeDeps {
         }
 
         if let Some(ctx) = title_gen.take()
-            && !assistant_response.is_empty()
+            && !assistant_response.text().is_empty()
         {
             Self::spawn_title_generation(
                 app.config.clone(),
                 app.session_manager.db().clone(),
                 app.session_manager.current().map(|s| s.id.clone()),
                 ctx.user_message,
-                assistant_response.to_string(),
+                assistant_response.text().to_string(),
             );
         }
     }
@@ -1278,6 +1278,42 @@ impl RuntimeDeps {
             }
         })
         .detach();
+    }
+}
+
+/// The assistant text a run streamed, with the emission time of its newest chunk.
+#[derive(Debug, Default)]
+pub struct AssistantReply {
+    text: String,
+    at: Option<jiff::Timestamp>,
+}
+
+impl AssistantReply {
+    /// Append a text chunk the agent emitted at `at`.
+    pub fn push(&mut self, chunk: &str, at: jiff::Timestamp) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.text.push_str(chunk);
+        self.at = Some(at);
+    }
+
+    /// Forget the accumulated reply.
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.at = None;
+    }
+
+    /// The accumulated text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Emission time of the newest chunk; `None` while the reply is empty.
+    #[must_use]
+    pub const fn at(&self) -> Option<jiff::Timestamp> {
+        self.at
     }
 }
 

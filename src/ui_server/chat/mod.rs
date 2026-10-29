@@ -64,6 +64,10 @@ fn stopped_terminal_tool_result(call_id: &str) -> ToolResult {
     }))
 }
 
+const fn segment_emitted_at(segment_at: Option<jiff::Timestamp>) -> jiff::Timestamp {
+    segment_at.expect("a non-empty text segment has a text event time")
+}
+
 fn persist_stopped_terminal_calls(
     terminal_snapshot: &mut TerminalStateSnapshot,
     turn_persister: &mut turn_persister::TurnPersister,
@@ -81,7 +85,9 @@ fn persist_stopped_terminal_calls(
         };
         let serialized = serde_json::to_string(&record)
             .map_err(|error| crate::db::ChatDbError::Storage(error.to_string()))?;
-        turn_persister.push_tool_event(call_id, serialized);
+        // The stop is decided here, not by the agent: there is no emission
+        // time to carry, so the stop is stamped when it happens.
+        turn_persister.push_tool_event(call_id, serialized, jiff::Timestamp::now());
         update_terminal_snapshot_from_tool_event(terminal_snapshot, &record);
     }
     Ok(())
@@ -1333,6 +1339,10 @@ fn run_agent_loop<'a>(
             let mut decode_meter = DecodeMeter::default();
             let mut last_speed_emit: Option<Instant> = None;
             let mut segment_text = String::new(); // current text segment, flushed on tool calls
+            // Emission time of the newest text chunk in `segment_text`.
+            let mut segment_at: Option<jiff::Timestamp> = None;
+            // Emission time of the newest agent event.
+            let mut last_event_at: Option<jiff::Timestamp> = None;
             let mut full_text = String::new(); // accumulated full assistant text
             let mut reasoning_text = String::new();
             let mut terminal_snapshot = TerminalStateSnapshot::default();
@@ -1375,7 +1385,12 @@ fn run_agent_loop<'a>(
                     let Some(event) = next_event else {
                         break;
                     };
-                    match event {
+                    let event = event.map(|timed| {
+                        last_event_at = Some(timed.at);
+                        (timed.at, timed.event)
+                    });
+                    let event_at = event.as_ref().ok().map(|(at, _)| *at);
+                    match event.map(|(_, event)| event) {
                         Ok(aither_agent::AgentEvent::Reasoning(text)) => {
                             log_first_agent_event(
                                 &mut first_agent_event_seen,
@@ -1412,6 +1427,7 @@ fn run_agent_loop<'a>(
                                 assistant_id.as_str(),
                             );
                             segment_text.push_str(&text);
+                            segment_at = event_at;
                             full_text.push_str(&text);
                             if !sink.on_text(&text).await {
                                 cancellation_reason =
@@ -1535,7 +1551,10 @@ fn run_agent_loop<'a>(
                             }
                             // Buffer accumulated text segment before the tool call.
                             if !segment_text.trim().is_empty() {
-                                turn_persister.push_assistant(segment_text.clone());
+                                turn_persister.push_assistant(
+                                    segment_text.clone(),
+                                    segment_emitted_at(segment_at),
+                                );
                                 segment_text.clear();
                             }
 
@@ -1546,7 +1565,11 @@ fn run_agent_loop<'a>(
                             };
                             let serialized = serde_json::to_string(&record)
                                 .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
-                            turn_persister.push_tool_event(id.clone(), serialized);
+                            turn_persister.push_tool_event(
+                                id.clone(),
+                                serialized,
+                                event_at.expect("tool events come from the agent stream"),
+                            );
                             update_terminal_snapshot_from_tool_event(
                                 &mut terminal_snapshot,
                                 &record,
@@ -1600,7 +1623,11 @@ fn run_agent_loop<'a>(
                             };
                             let serialized = serde_json::to_string(&record)
                                 .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
-                            turn_persister.push_tool_event(id.clone(), serialized);
+                            turn_persister.push_tool_event(
+                                id.clone(),
+                                serialized,
+                                event_at.expect("tool events come from the agent stream"),
+                            );
                             update_terminal_snapshot_from_tool_event(
                                 &mut terminal_snapshot,
                                 &record,
@@ -1700,14 +1727,18 @@ fn run_agent_loop<'a>(
 
                 persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
                 if !segment_text.trim().is_empty() {
-                    turn_persister.push_assistant(segment_text.clone());
+                    turn_persister
+                        .push_assistant(segment_text.clone(), segment_emitted_at(segment_at));
                 }
 
                 let has_assistant_text = !full_text.trim().is_empty();
                 let has_tool_activity =
                     !terminal_snapshot.executions.is_empty() || saw_tool_activity;
                 if !has_assistant_text && has_tool_activity {
-                    turn_persister.push_assistant(String::new());
+                    turn_persister.push_assistant(
+                        String::new(),
+                        last_event_at.expect("tool activity implies an agent event"),
+                    );
                 }
 
                 // Flush the entire turn atomically
@@ -1769,7 +1800,8 @@ fn run_agent_loop<'a>(
                     persist_stopped_terminal_calls(&mut terminal_snapshot, &mut turn_persister)?;
                 }
                 if !segment_text.trim().is_empty() {
-                    turn_persister.push_assistant(segment_text.clone());
+                    turn_persister
+                        .push_assistant(segment_text.clone(), segment_emitted_at(segment_at));
                 }
                 // Flush the entire turn atomically before returning
                 turn_persister.flush(&state.db()).await?;
@@ -1783,7 +1815,7 @@ fn run_agent_loop<'a>(
 
             // Buffer remaining text segment.
             if !segment_text.trim().is_empty() {
-                turn_persister.push_assistant(segment_text.clone());
+                turn_persister.push_assistant(segment_text.clone(), segment_emitted_at(segment_at));
             }
 
             let has_assistant_text = !full_text.trim().is_empty();
@@ -1800,7 +1832,10 @@ fn run_agent_loop<'a>(
                 return Err(AgentLoopError::EmptyAssistantResponse);
             }
             if !has_assistant_text && has_tool_activity {
-                turn_persister.push_assistant(String::new());
+                turn_persister.push_assistant(
+                    String::new(),
+                    last_event_at.expect("tool activity implies an agent event"),
+                );
             }
 
             // Flush the entire turn atomically
