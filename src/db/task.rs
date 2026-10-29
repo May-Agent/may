@@ -19,8 +19,7 @@ impl ChatDb {
         let trigger_kind = params.trigger.kind().as_str();
         let trigger_type = params.trigger.storage_trigger_type();
         let now = jiff::Timestamp::now().to_string();
-        let timeout_secs = i64::try_from(params.timeout_secs)
-            .expect("task timeout is validated against the background cap before it is stored");
+        let timeout_secs = i64::from(params.timeout_secs);
         query!(
             self.db,
             "INSERT INTO scheduled_tasks (id, profile_id, session_id, name, trigger_kind, trigger_type, cron_expression, run_at, script_path, script_inline, needs_network, timeout_secs, approved, enabled, last_run_at, last_run_status, last_run_output, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -130,10 +129,7 @@ impl ChatDb {
         let script_path_enabled = params.script_path.is_some();
         let script_inline_enabled = params.script_inline.is_some();
         let timeout_enabled = params.timeout_secs.is_some();
-        let timeout_secs = params.timeout_secs.map(|secs| {
-            i64::try_from(secs)
-                .expect("task timeout is validated against the background cap before it is stored")
-        });
+        let timeout_secs = params.timeout_secs.map(i64::from);
         query!(
             self.db,
             "UPDATE scheduled_tasks SET updated_at = ?, name = CASE WHEN ? THEN ? ELSE name END, enabled = CASE WHEN ? THEN ? ELSE enabled END, approved = CASE WHEN ? THEN ? ELSE approved END, cron_expression = CASE WHEN ? THEN ? ELSE cron_expression END, run_at = CASE WHEN ? THEN ? ELSE run_at END, script_path = CASE WHEN ? THEN ? ELSE script_path END, script_inline = CASE WHEN ? THEN ? ELSE script_inline END, timeout_secs = CASE WHEN ? THEN ? ELSE timeout_secs END WHERE id = ?",
