@@ -5,6 +5,7 @@ mod context_report;
 mod environment;
 mod hooks;
 pub(crate) mod imagine;
+pub(crate) mod issue_tool;
 mod may;
 pub(crate) mod notify_tool;
 mod permission;

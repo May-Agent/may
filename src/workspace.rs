@@ -37,6 +37,101 @@ pub struct WorkspaceConfig {
     /// Working directories with read/write access (user-approved).
     #[serde(default)]
     pub workdirs: Vec<WorkspaceDir>,
+    /// Per-project settings keyed by directory.
+    ///
+    /// `path` is any directory inside the project; it is canonicalized and
+    /// resolved to a repository identity the same way session workspaces
+    /// are, so every worktree of one repository matches the same entry.
+    #[serde(default)]
+    pub projects: Vec<ProjectConfig>,
+}
+
+/// Per-project configuration entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    /// A directory inside the project (typically the main checkout root).
+    pub path: PathBuf,
+    /// Issue backend for this project; absent means local may issues.
+    #[serde(default)]
+    pub issues: ProjectIssues,
+}
+
+/// Issue backend selected for a project.
+///
+/// Serialized as an internally tagged table, e.g.:
+/// `issues = { backend = "github", repository = "owner/repo" }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case")]
+pub enum ProjectIssues {
+    /// Local may issue store (default).
+    #[default]
+    May,
+    /// GitHub issues on the named repository.
+    Github {
+        /// `owner/repo` of the GitHub repository.
+        repository: GitHubRepository,
+    },
+}
+
+/// A GitHub repository in `owner/repo` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubRepository {
+    owner: String,
+    repo: String,
+}
+
+impl GitHubRepository {
+    /// Repository owner.
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Repository name.
+    #[must_use]
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+}
+
+impl std::fmt::Display for GitHubRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.owner, self.repo)
+    }
+}
+
+/// Error type for a malformed `owner/repo` string.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid GitHub repository '{0}': expected owner/repo")]
+pub struct GitHubRepositoryError(String);
+
+impl std::str::FromStr for GitHubRepository {
+    type Err = GitHubRepositoryError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || GitHubRepositoryError(value.to_string());
+        let (owner, repo) = value.split_once('/').ok_or_else(invalid)?;
+        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+            return Err(invalid());
+        }
+        Ok(Self {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        })
+    }
+}
+
+impl Serialize for GitHubRepository {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for GitHubRepository {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// Error type for workspace configuration operations.

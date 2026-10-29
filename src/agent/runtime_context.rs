@@ -378,6 +378,8 @@ struct BaseSystemTemplate {
     skills: Vec<BaseSystemSkill>,
     has_subagents: bool,
     subagents: Vec<BaseSystemSubagent>,
+    issue_backend_name: &'static str,
+    issue_repository: Option<String>,
 }
 
 pub fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> String {
@@ -539,6 +541,7 @@ pub async fn build_base_system_prompt(
     request_parameters: &Parameters,
     skills_dir: &std::path::Path,
     subagents_dir: &std::path::Path,
+    issue_backend: &crate::issue::IssueBackendInfo,
 ) -> Result<String, MayAgentError> {
     let mut commands = shared_terminal_commands
         .iter()
@@ -600,6 +603,8 @@ pub async fn build_base_system_prompt(
         skills,
         has_subagents: !subagents.is_empty(),
         subagents,
+        issue_backend_name: issue_backend.name,
+        issue_repository: issue_backend.repository.clone(),
     };
     template.render().map_err(|error| {
         MayAgentError::Sandbox(format!("failed to render base system prompt: {error}"))
@@ -946,6 +951,21 @@ mod tests {
         commands: &[(String, String)],
         request_parameters: &Parameters,
     ) -> String {
+        render_base_system_prompt_with_backend(
+            commands,
+            request_parameters,
+            &crate::issue::IssueBackendInfo {
+                name: "may",
+                repository: None,
+            },
+        )
+    }
+
+    fn render_base_system_prompt_with_backend(
+        commands: &[(String, String)],
+        request_parameters: &Parameters,
+        issue_backend: &crate::issue::IssueBackendInfo,
+    ) -> String {
         let dir = tempdir().expect("temp dir should be created");
         tokio_test::block_on(build_base_system_prompt(
             commands,
@@ -953,8 +973,28 @@ mod tests {
             request_parameters,
             dir.path(),
             dir.path(),
+            issue_backend,
         ))
         .expect("base system prompt should render")
+    }
+
+    #[test]
+    fn base_system_prompt_names_the_issue_backend() {
+        let prompt = render_base_system_prompt(&[], &Parameters::default());
+        assert!(prompt.contains("`issue` command (may backend)"), "{prompt}");
+
+        let prompt = render_base_system_prompt_with_backend(
+            &[],
+            &Parameters::default(),
+            &crate::issue::IssueBackendInfo {
+                name: "github",
+                repository: Some("May-Agent/may".to_string()),
+            },
+        );
+        assert!(
+            prompt.contains("`issue` command (github backend: May-Agent/may)"),
+            "{prompt}"
+        );
     }
 
     #[test]
