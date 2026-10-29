@@ -81,6 +81,9 @@ pub enum MayAgentError {
     /// Workspace config error.
     #[error("Workspace config error: {0}")]
     Workspace(#[from] crate::workspace::WorkspaceConfigError),
+    /// Issue backend resolution error.
+    #[error("Issue backend error: {0}")]
+    Issue(#[from] crate::issue::IssueError),
     /// MCP error.
     #[error("MCP error: {0}")]
     Mcp(#[from] crate::mcp::McpConnectionLoadError),
@@ -388,6 +391,11 @@ impl MayAgent {
         let ask_balanced = config.ask_models.balanced.clone();
         let ask_fast = config.ask_models.fast.clone();
 
+        let issue_store = crate::issue::resolve_issue_store(
+            &config.cwd,
+            &session_paths.workspace_config(),
+            config.db.clone(),
+        )?;
         let ssh_authorizer_broker = config.ask_user_broker.clone();
         let imagine_config = ImagineCommandConfig {
             generator: config.image_generator,
@@ -451,6 +459,7 @@ impl MayAgent {
                     .then_some(config.workspace_request_broker.clone()),
                 terminal_tool_factory: Some(terminal_command_factory),
                 subagent_runs: subagent_runs.clone(),
+                issue_store: issue_store.clone(),
             },
         )
         .await?;
@@ -473,6 +482,7 @@ impl MayAgent {
             &config.request_parameters,
             &skills_dir,
             &subagents_dir,
+            &crate::issue::IssueStore::info(&issue_store),
         )
         .await?;
         builder = builder

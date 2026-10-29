@@ -1,6 +1,7 @@
 //! Database entity definitions.
 
 pub mod folders;
+pub mod issues;
 pub mod messages;
 pub mod network_access_logs;
 pub mod notification_mailbox;

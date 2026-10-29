@@ -28,6 +28,8 @@ pub mod embedding_provider;
 mod file_tracker;
 mod fs_utils;
 mod heel;
+/// Issue tracking: may issues by default, GitHub when configured.
+pub mod issue;
 mod live_response;
 /// Location lookup for location-aware profiles.
 pub mod location;
