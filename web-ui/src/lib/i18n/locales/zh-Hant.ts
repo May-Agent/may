@@ -272,6 +272,7 @@ export const zhHant: Messages = {
       title: '服務供應商',
       description: 'LLM 服務供應商的 API 金鑰與基礎網址。',
       apiKey: 'API 金鑰',
+      apiKeySaved: '已儲存金鑰 — 輸入新金鑰以替換',
       baseUrl: '基礎網址',
     },
     models: {

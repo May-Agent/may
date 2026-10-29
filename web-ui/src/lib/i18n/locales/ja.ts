@@ -272,6 +272,7 @@ export const ja: Messages = {
       title: 'プロバイダ',
       description: 'LLM プロバイダの API キーとベース URL。',
       apiKey: 'API キー',
+      apiKeySaved: 'キー保存済み — 置き換えるには新しいキーを入力',
       baseUrl: 'ベース URL',
     },
     models: {
