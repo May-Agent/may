@@ -93,7 +93,8 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
         .map(|(id, instance)| UiProviderConfig {
             id: id.clone(),
             provider_type: instance.resolve_type(id),
-            api_key: instance.api_key.clone(),
+            has_api_key: instance.api_key.is_some(),
+            api_key: None,
             base_url: instance.base_url.clone(),
             display_name: instance.display_name.clone(),
             enabled: instance.enabled,
@@ -192,13 +193,20 @@ pub(super) async fn save_full_config(
 /// Shared by the REST handler and tests so a save applies exactly what the
 /// web UI submits, including provider-native tool toggles.
 fn provider_map_from_ui(
+    stored: &std::collections::HashMap<String, ProviderInstance>,
     providers: &[UiProviderConfig],
 ) -> std::collections::HashMap<String, ProviderInstance> {
     providers
         .iter()
         .map(|p| {
             let mut instance = ProviderInstance::new(p.provider_type);
-            instance.api_key = p.api_key.clone().filter(|v| !v.trim().is_empty());
+            instance.api_key = match p.api_key.clone().filter(|v| !v.trim().is_empty()) {
+                Some(new_key) => Some(new_key),
+                None if p.has_api_key => stored
+                    .get(&p.id)
+                    .and_then(|instance| instance.api_key.clone()),
+                None => None,
+            };
             instance.base_url = p.base_url.clone().filter(|v| !v.trim().is_empty());
             instance.display_name = p.display_name.clone().filter(|v| !v.trim().is_empty());
             instance.enabled = p.enabled;
@@ -256,7 +264,7 @@ async fn run_save_full_config(
     };
 
     let updated = state.update_config(|config| {
-        config.provider = provider_map_from_ui(&req.providers);
+        config.provider = provider_map_from_ui(&config.provider, &req.providers);
         config.models.advanced = parse_selector_list(&req.models.advanced);
         config.models.balanced = parse_selector_list(&req.models.balanced);
         config.models.fast = parse_selector_list(&req.models.fast);
@@ -723,7 +731,7 @@ mod tests {
         let saved: super::UiFullConfig =
             serde_json::from_value(ui).expect("ui config deserializes");
 
-        let providers = provider_map_from_ui(&saved.providers);
+        let providers = provider_map_from_ui(&config.provider, &saved.providers);
         let openai = providers.get("openai").expect("provider survives a save");
         assert!(openai.native_tools.web_search);
         assert!(openai.native_tools.web_fetch);
@@ -744,7 +752,7 @@ mod tests {
 
         let saved: super::UiFullConfig =
             serde_json::from_value(ui).expect("ui config deserializes");
-        let providers = provider_map_from_ui(&saved.providers);
+        let providers = provider_map_from_ui(&config.provider, &saved.providers);
         let swe2 = providers.get("swe2").expect("provider survives a save");
         assert_eq!(swe2.api, Some(crate::config::ProviderApi::Responses));
         assert!(swe2.native_tools.web_search);
@@ -766,7 +774,7 @@ mod tests {
 
         let saved: super::UiFullConfig =
             serde_json::from_value(ui).expect("ui config deserializes");
-        let providers = provider_map_from_ui(&saved.providers);
+        let providers = provider_map_from_ui(&config.provider, &saved.providers);
         let chatgpt = providers.get("chatgpt").expect("provider survives a save");
         assert_eq!(chatgpt.resolve_type("chatgpt"), ProviderType::Chatgpt);
         assert!(chatgpt.native_tools.web_search);
@@ -783,6 +791,61 @@ mod tests {
         config.sandbox.command_priority = CommandPriority::Lowest;
         let ui = serde_json::to_value(build_ui_full_config(&config)).expect("ui config serializes");
         assert_eq!(ui["sandbox"]["commandPriority"], "lowest");
+    }
+
+    #[test]
+    fn config_response_reports_key_presence_without_key_material() {
+        let mut config = MayConfig::default();
+        config.upsert_provider(
+            "openai",
+            ProviderInstance::new(ProviderType::OpenAI).with_api_key("sk-test"),
+        );
+
+        let ui = serde_json::to_value(build_ui_full_config(&config)).expect("ui config serializes");
+        let provider = &ui["providers"][0];
+        assert_eq!(provider["hasApiKey"], true);
+        assert!(
+            provider.get("apiKey").is_none(),
+            "the config response must not carry key material"
+        );
+        assert!(!ui.to_string().contains("sk-test"));
+    }
+
+    #[test]
+    fn config_save_without_a_new_key_keeps_the_stored_key() {
+        let mut config = MayConfig::default();
+        config.upsert_provider(
+            "openai",
+            ProviderInstance::new(ProviderType::OpenAI).with_api_key("sk-test"),
+        );
+
+        let ui = serde_json::to_value(build_ui_full_config(&config)).expect("ui config serializes");
+        let saved: super::UiFullConfig =
+            serde_json::from_value(ui).expect("ui config deserializes");
+
+        let providers = provider_map_from_ui(&config.provider, &saved.providers);
+        assert_eq!(
+            providers["openai"].api_key.as_deref(),
+            Some("sk-test"),
+            "a save without key material keeps the stored key"
+        );
+
+        let mut cleared = saved.providers.clone();
+        cleared[0].has_api_key = false;
+        let providers = provider_map_from_ui(&config.provider, &cleared);
+        assert!(
+            providers["openai"].api_key.is_none(),
+            "hasApiKey: false clears the stored key"
+        );
+
+        let mut replaced = saved.providers.clone();
+        replaced[0].api_key = Some("sk-new".to_string());
+        let providers = provider_map_from_ui(&config.provider, &replaced);
+        assert_eq!(
+            providers["openai"].api_key.as_deref(),
+            Some("sk-new"),
+            "newly entered key material replaces the stored key"
+        );
     }
 
     #[test]

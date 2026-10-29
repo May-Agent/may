@@ -1276,6 +1276,12 @@ impl From<&UiNativeToolsConfig> for NativeToolsConfig {
 pub struct UiProviderConfig {
     pub(crate) id: String,
     pub(crate) provider_type: ProviderType,
+    /// Whether an API key is stored for this provider. On save, `false`
+    /// clears the stored key unless `api_key` carries new material.
+    pub(crate) has_api_key: bool,
+    /// New key material entered by the user. Never serialized back out: the
+    /// config response only reports `has_api_key`.
+    #[serde(default, skip_serializing)]
     pub(crate) api_key: Option<String>,
     pub(crate) base_url: Option<String>,
     pub(crate) display_name: Option<String>,
