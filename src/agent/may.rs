@@ -401,6 +401,16 @@ impl MayAgent {
             generator: config.image_generator,
             artifacts_dir: session_paths.artifacts_dir(),
         };
+        let agent_messaging = config
+            .permission_approver
+            .as_ref()
+            .and_then(|approver| approver.runtime_service.clone())
+            .map(|runtime_service| crate::agent_link::AgentMessaging {
+                directory: crate::agent_link::AgentDirectory::new(
+                    crate::session::MayHomePaths::new(config.may_dir.clone()).agents_dir(),
+                ),
+                runtime_service,
+            });
         let runtime_db = config
             .permission_approver
             .as_ref()
@@ -458,6 +468,7 @@ impl MayAgent {
                     .then_some(config.workspace_request_broker.clone()),
                 subagent_runs: subagent_runs.clone(),
                 issue_store: issue_store.clone(),
+                agent_messaging,
             },
         )
         .await?;

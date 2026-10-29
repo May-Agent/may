@@ -66,6 +66,9 @@ pub enum TuiRuntimeError {
         /// URL that is not a local `file://` URL.
         url: String,
     },
+    /// Listening for messages from other agents failed.
+    #[error("failed to listen for messages from other agents: {0}")]
+    AgentLink(#[from] crate::agent_link::AgentLinkError),
     /// Selected model is empty.
     #[error("Selected model is empty")]
     EmptySelectedModel,
@@ -1116,6 +1119,43 @@ impl RuntimeDeps {
         self.local_runtime
             .enqueue_pending_message(app, &session_id, message)
             .await
+    }
+
+    /// Keep the app's current session discoverable by other main agents on
+    /// this machine, and drop the listeners of sessions the app left. A message
+    /// stored for the session wakes the event loop, which then dispatches it.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError::AgentLink`] when the socket cannot be bound.
+    pub async fn listen_for_agent_messages(
+        &self,
+        app: &App,
+        listeners: &crate::agent_link::AgentListeners,
+        wake: crate::tui::event::EventSender,
+    ) -> Result<(), TuiRuntimeError> {
+        let Some(session) = app.session_manager.current() else {
+            return Ok(());
+        };
+        listeners.retain_only(session.id.as_str());
+        listeners
+            .ensure(
+                &crate::session::MayHomePaths::new(app.session_manager.may_dir().to_path_buf())
+                    .agents_dir(),
+                crate::agent_link::AgentIdentity {
+                    session_id: session.id.as_str().to_string(),
+                    cwd: app.cwd.clone(),
+                    sandbox_dir: session.sandbox_dir.clone(),
+                },
+                self.local_runtime.runtime_service.clone(),
+                move || {
+                    // The loop is parked on its next event; any event ends the park.
+                    if let Err(error) = wake.try_send(crate::tui::event::AppEvent::Tick) {
+                        tracing::warn!(%error, "failed to wake the event loop for an agent message");
+                    }
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     /// Take the next pending message eligible for dispatch.
