@@ -6,13 +6,13 @@ use aither_agent::webfetch::WebFetchTool;
 use aither_agent::websearch::WebSearchTool;
 use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
-use aither_sandbox::{TerminalToolFactory, ToolRegistryBuilder};
+use aither_sandbox::ToolRegistryBuilder;
 use aither_search::{SearchEmbeddingResolution, SearchTool};
 
 use crate::agent::ImageGeneratorConfig;
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
-use crate::agent::issue_tool::IssueTool;
+use crate::agent::issue_tool::{IssueTool, SubagentIssueTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
 use crate::agent::session_tool::SessionTool;
@@ -69,8 +69,6 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub register_subagents_broker: Option<RegisterBroker>,
     /// Broker for workspace-access requests.
     pub workspace_request_broker: Option<WorkspaceRequestBroker>,
-    /// Factory producing per-call terminal tools.
-    pub terminal_tool_factory: Option<TerminalToolFactory>,
     /// Registry the `subagent` command reports in-flight runs to;
     /// cloneable handle the host uses to list or cancel them.
     pub subagent_runs: aither_agent::specialized::SubagentRuns,
@@ -137,18 +135,19 @@ where
             to_search_embedding_resolution(config.search_embedder.clone()),
         ),
     );
-    register_tool_with_description(
-        builder,
+    describe_tool(
         &mut descriptions,
-        IssueTool::new(config.issue_store),
+        &IssueTool::new(config.issue_store.clone()),
+    );
+    builder.configure_role_tools(
+        IssueTool::new(config.issue_store.clone()),
+        SubagentIssueTool::new(config.issue_store),
     );
 
     if let Some(ask_user_broker) = config.ask_user_broker {
-        register_tool_with_description(
-            builder,
-            &mut descriptions,
-            AskUserTool::new(config.session_id.clone(), ask_user_broker),
-        );
+        let ask_user = AskUserTool::new(config.session_id.clone(), ask_user_broker);
+        describe_tool(&mut descriptions, &ask_user);
+        builder.main_only(|reserved| reserved.configure_tool(ask_user));
     }
 
     if let Some(imagine) = config.imagine {
@@ -217,12 +216,11 @@ where
         );
     }
 
-    let subagent_tool = {
-        let tool = SubagentTool::new(UsageObservedModel::new(config.llm))
-            .with_runs(config.subagent_runs)
-            .with_builtins()
-            .with_base_dir(&config.sandbox_dir);
-        let tool = tool.with_file_mounts([
+    let subagent_tool = SubagentTool::new(UsageObservedModel::new(config.llm))
+        .with_runs(config.subagent_runs)
+        .with_builtins()
+        .with_base_dir(&config.sandbox_dir)
+        .with_file_mounts([
             SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
             SubagentFileMount::new(
                 PathBuf::from("subagents"),
@@ -230,14 +228,16 @@ where
             ),
             SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
         ]);
-        let tool = if let Some(factory) = config.terminal_tool_factory {
-            tool.with_terminal_tool_factory(factory)
-        } else {
-            tool
-        };
-        TrackedSubagentTool::new(tool, config.subagent_tracker)
-    };
-    register_tool_with_description(builder, &mut descriptions, subagent_tool);
+    let subagent_tracker = config.subagent_tracker;
+    describe_tool(&mut descriptions, &subagent_tool);
+    // Built for each terminal that serves the registry, so a subagent launches
+    // its own subagents with its own authority, never the main agent's.
+    builder.configure_terminal_bound_tool("subagent", move |binding| {
+        TrackedSubagentTool::new(
+            subagent_tool.for_terminal(binding),
+            subagent_tracker.clone(),
+        )
+    });
 
     let mut mcp_command_names = Vec::new();
     for connection in load_active_mcp_connections(&config.may_dir).await? {
@@ -277,12 +277,20 @@ fn register_tool_with_description<T>(
     T: Tool + Send + Sync + 'static,
     T::Arguments: schemars::JsonSchema + serde::de::DeserializeOwned + Send + 'static,
 {
-    let definition = ToolDefinition::new(&tool);
+    describe_tool(descriptions, &tool);
+    builder.configure_tool(tool);
+}
+
+fn describe_tool<T>(descriptions: &mut Vec<(String, String)>, tool: &T)
+where
+    T: Tool,
+    T::Arguments: schemars::JsonSchema + serde::de::DeserializeOwned,
+{
+    let definition = ToolDefinition::new(tool);
     descriptions.push((
         definition.name().to_string(),
         short_description(definition.description()),
     ));
-    builder.configure_tool(tool);
 }
 
 pub(crate) fn short_description(description: &str) -> String {
@@ -384,7 +392,6 @@ mod tests {
                 register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
-                terminal_tool_factory: None,
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
@@ -436,7 +443,6 @@ mod tests {
                 register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
-                terminal_tool_factory: None,
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
@@ -492,7 +498,6 @@ mod tests {
                 register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
-                terminal_tool_factory: None,
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
                 issue_store: test_issue_store(temp.path()).await,
@@ -507,6 +512,112 @@ mod tests {
         assert!(!registry.is_tool_configured("webfetch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "webfetch"));
+    }
+
+    #[tokio::test]
+    async fn a_subagent_registry_reads_issues_and_refuses_ask_user_and_issue_writes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("sessions/session-1");
+        let (ask_user_broker, ask_user_queue) = ask_user::channel();
+        let mut builder = ToolRegistryBuilder::new();
+        register_shared_terminal_commands(
+            &mut builder,
+            SharedTerminalCommandConfig {
+                llm: MockLlm,
+                ask_flagship: None,
+                ask_balanced: None,
+                ask_fast: None,
+                session_id: "session-1".to_string(),
+                may_dir: temp.path().to_path_buf(),
+                sandbox_dir: session_dir.clone(),
+                search_embedder: EmbeddingModelResolution::Disabled,
+                ask_user_broker: Some(ask_user_broker),
+                imagine: None,
+                task_runtime: TaskRuntimeKind::Local,
+                task_broker: None,
+                notify_broker: None,
+                browser_broker: None,
+                register_skills_broker: None,
+                register_subagents_broker: None,
+                workspace_request_broker: None,
+                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagent_tracker: SubagentTracker::default(),
+                request_parameters: Parameters::default(),
+                issue_store: test_issue_store(temp.path()).await,
+            },
+        )
+        .await
+        .expect("commands should register");
+        let main = builder.build(session_dir.join("outputs"));
+        let subagent = main.for_subagent();
+
+        // `subagent` is built per terminal, so a subagent launches with its own
+        // authority; it is not reserved for the main agent.
+        assert!(!main.is_reserved("subagent"));
+        assert!(!subagent.is_reserved("subagent"));
+        assert!(subagent.is_tool_configured("subagent"));
+
+        // The main agent creates an issue; the subagent can read it.
+        let created = main
+            .query_tool_handler("issue", &["create".to_string(), "seed".to_string()])
+            .await;
+        assert!(created.ok, "{created:?}");
+        let viewed = subagent
+            .query_tool_handler("issue", &["view".to_string(), "1".to_string()])
+            .await;
+        assert!(viewed.ok, "{viewed:?}");
+        let listed = subagent
+            .query_tool_handler("issue", &["list".to_string()])
+            .await;
+        assert!(listed.ok, "{listed:?}");
+
+        // Every write subcommand is refused from the subagent registry.
+        for args in [
+            vec!["create", "x"],
+            vec!["edit", "1", "--title", "x"],
+            vec!["comment", "1", "x"],
+            vec!["close", "1"],
+            vec!["label", "1", "--add", "bug"],
+            vec!["blocked-by", "1", "--add", "2"],
+            vec!["sub-issue", "1", "--add", "2"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            let refused = subagent.query_tool_handler("issue", &args).await;
+            assert!(!refused.ok, "{args:?}: {refused:?}");
+            assert!(
+                refused
+                    .error
+                    .as_deref()
+                    .is_some_and(|text| text.contains("reserved for the main agent")),
+                "{args:?}: {refused:?}"
+            );
+        }
+        let issues = main
+            .query_tool_handler(
+                "issue",
+                &["list".to_string(), "--state".to_string(), "all".to_string()],
+            )
+            .await;
+        assert!(issues.ok, "{issues:?}");
+
+        // `ask_user` is refused to the subagent and stays available to the main agent.
+        assert!(!main.is_reserved("ask_user"));
+        assert!(subagent.is_reserved("ask_user"));
+        let refused = subagent
+            .query_tool_handler("ask_user", &["--question".to_string(), "q".to_string()])
+            .await;
+        assert!(!refused.ok, "{refused:?}");
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .is_some_and(|text| text.contains("reserved for the main agent")),
+            "{refused:?}"
+        );
+        assert!(
+            ask_user_queue.is_empty(),
+            "the refused call must not reach the user"
+        );
     }
 
     #[tokio::test]
@@ -536,7 +647,6 @@ mod tests {
                 register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
-                terminal_tool_factory: None,
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,

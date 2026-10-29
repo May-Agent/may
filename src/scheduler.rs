@@ -1399,7 +1399,8 @@ impl TaskRuntime {
             AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
                 container_manager.runtime().client.clone(),
             )))),
-        );
+        )
+        .with_workspace_mount(crate::container::lifecycle::workspace_mount(&workspace_dir));
         let terminal_tool = self
             .initialized_terminal_tool(
                 SchedulerPermissionHandler {
