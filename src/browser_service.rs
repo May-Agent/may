@@ -4,8 +4,8 @@ pub use aither_browser::{
     BrowserAccessibilityNode, BrowserAccessibilityProperty, BrowserAccessibilitySnapshot,
     BrowserArtifactScreenshot, BrowserCapturedScreenshot, BrowserInteractiveElement,
     BrowserPageCapture, BrowserPageSnapshot, BrowserPageSummary, BrowserReadDetail,
-    BrowserReadFormat, BrowserReadOptions, BrowserScreenshotMode, BrowserServiceRequest,
-    BrowserServiceResponse, BrowserServiceStatus,
+    BrowserReadOptions, BrowserScreenshotMode, BrowserServiceRequest, BrowserServiceResponse,
+    BrowserServiceStatus,
 };
 
 use crate::session::SessionPaths;

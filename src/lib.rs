@@ -14,6 +14,7 @@ pub mod bundle;
 /// `ChatGPT` subscription OAuth flow.
 pub mod chatgpt;
 /// Configuration loading and types.
+pub mod command_output;
 pub mod config;
 /// Container runtime detection, images, and lifecycle.
 pub mod container;
@@ -44,9 +45,11 @@ pub mod models;
 pub use aither_sandbox::network_policy;
 /// Web-push notification delivery and mailbox.
 pub mod notification;
+/// Large pasted text rendered for the model.
+pub mod pasted_text;
 /// Profile model and environment resolution.
 pub mod profile;
-/// `@`-mention extraction and prompt XML building.
+/// `@`-mention extraction and prompt text building.
 pub mod prompt_mentions;
 /// Scheduled task execution.
 pub mod scheduler;

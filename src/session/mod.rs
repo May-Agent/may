@@ -12,6 +12,7 @@ mod plan;
 pub mod runtime;
 mod runtime_service;
 mod store;
+pub(crate) mod tool_result_wire;
 
 pub use context_snapshot::{
     PersistContextSnapshotError, PersistedContextSnapshot, checkpoint_from_hook,

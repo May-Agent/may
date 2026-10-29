@@ -145,6 +145,7 @@ pub struct SseToolEndEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) arguments: Option<&'a str>,
     #[schema(value_type = serde_json::Value)]
+    #[serde(serialize_with = "crate::session::tool_result_wire::serialize")]
     pub(crate) result: &'a ToolResult,
     #[serde(skip_serializing_if = "crate::ui_server::tool_summary::ToolSummary::is_empty")]
     pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
@@ -885,11 +886,9 @@ pub struct SessionContextWindowSnapshotResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionContextWindowMetricsResponse {
     pub(crate) usage_fraction: f32,
-    pub(crate) selected_model_context_window: Option<u32>,
-    pub(crate) fast_model_context_window: Option<u32>,
-    pub(crate) effective_context_window: usize,
+    pub(crate) context_window: u32,
+    pub(crate) estimated_tokens: usize,
     pub(crate) system_block_count: usize,
-    pub(crate) reminder_count: usize,
     pub(crate) recent_message_count: usize,
     pub(crate) recent_system_message_count: usize,
     pub(crate) has_handoff: bool,
@@ -899,11 +898,9 @@ impl From<aither_agent::ContextWindowMetrics> for SessionContextWindowMetricsRes
     fn from(value: aither_agent::ContextWindowMetrics) -> Self {
         Self {
             usage_fraction: value.usage_fraction,
-            selected_model_context_window: value.selected_model_context_window,
-            fast_model_context_window: value.fast_model_context_window,
-            effective_context_window: value.effective_context_window,
+            context_window: value.context_window,
+            estimated_tokens: value.estimated_tokens,
             system_block_count: value.system_block_count,
-            reminder_count: value.reminder_count,
             recent_message_count: value.recent_message_count,
             recent_system_message_count: value.recent_system_message_count,
             has_handoff: value.has_handoff,

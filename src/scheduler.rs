@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aither_core::llm::Tool;
+use aither_core::llm::{CommandOutcome, Tool};
 use aither_sandbox::{
-    AnyContainerExec, BollardContainerExec, Configured, ContainerLaunchSpec, ContainerShellRuntime,
-    JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry,
-    TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode, TerminalMode, TerminalResult,
-    TerminalTool, ToolRegistryBuilder, permission::PermissionError,
+    AnyContainerExec, BollardContainerExec, CompletedCommand, Configured, ContainerLaunchSpec,
+    ContainerShellRuntime, JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
+    ShellSessionRegistry, TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode,
+    TerminalMode, TerminalTool, ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -210,21 +210,18 @@ fn task_notification_callback_context(
     summary: &str,
 ) -> Option<crate::XmlBlock> {
     task.session_id.as_ref()?;
-    let xml = crate::xml::serialize_xml_block(
-        "system-reminder",
-        &TaskNotificationCallbackXml {
-            alert_type: "task_callback",
-            task_id: task.id.as_str(),
-            task_name: task.name.as_str(),
-            profile_id: task.profile_id.as_str(),
-            trigger_kind: task.trigger_kind.as_str(),
-            trigger_type: task.trigger_type.as_str(),
-            status: status.as_str(),
-            summary,
-        },
-    )
-    .ok()?;
-    crate::XmlBlock::parse(xml).ok()
+    let text = TaskCallbackReminder {
+        task_id: task.id.as_str(),
+        task_name: task.name.as_str(),
+        profile_id: task.profile_id.as_str(),
+        trigger_kind: task.trigger_kind.as_str(),
+        trigger_type: task.trigger_type.as_str(),
+        status: status.as_str(),
+        summary,
+    }
+    .render()
+    .expect("task callback reminder must render");
+    crate::XmlBlock::parse(text).ok()
 }
 
 fn task_notification_callback_payload(
@@ -384,10 +381,9 @@ struct TaskExecutionTask {
     trigger: TaskTriggerResponse,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct TaskNotificationCallbackXml<'a> {
-    #[serde(rename = "@type")]
-    alert_type: &'static str,
+#[derive(Template)]
+#[template(path = "reminder_task_callback.txt", escape = "none")]
+struct TaskCallbackReminder<'a> {
     task_id: &'a str,
     task_name: &'a str,
     profile_id: &'a str,
@@ -1606,14 +1602,14 @@ async fn run_terminal_command(
             .unwrap_or("task terminal execution failed")
             .to_string());
     }
-    let payload = started
-        .render_for_model()
-        .map_err(|error| prefixed_error("failed to render terminal tool result: ", &error))?;
-    let started: TerminalResult = serde_json::from_str(&payload)
-        .map_err(|error| prefixed_error("failed to parse terminal result: ", &error))?;
-    let task_id = started
-        .task_id
-        .ok_or_else(|| "background terminal job started without a task id".to_string())?;
+    let CommandOutcome::Running { task_id, .. } = started
+        .command()
+        .ok_or_else(|| "background terminal tool did not return a command result".to_string())?
+        .outcome
+        .clone()
+    else {
+        return Err("background terminal job started without a task id".to_string());
+    };
 
     let receiver = terminal_tool.background_receiver();
     let completed = loop {
@@ -1643,22 +1639,19 @@ async fn run_terminal_command(
     parse_terminal_result(&result)
 }
 
-fn parse_terminal_result(result: &TerminalResult) -> Result<String, String> {
+fn parse_terminal_result(result: &CompletedCommand) -> Result<String, String> {
+    let output = combine_output(
+        &crate::command_output::stream_text(&result.stdout),
+        result
+            .stderr
+            .as_ref()
+            .map(crate::command_output::stream_text),
+    );
     if result.exit_code != 0 {
-        return Err(task_script_failure(
-            result.exit_code,
-            combine_output(
-                &result.stdout.to_string(),
-                result.stderr.as_ref().map(ToString::to_string),
-            )
-            .as_str(),
-        ));
+        return Err(task_script_failure(result.exit_code, output.as_str()));
     }
 
-    Ok(combine_output(
-        &result.stdout.to_string(),
-        result.stderr.as_ref().map(ToString::to_string),
-    ))
+    Ok(output)
 }
 
 fn combine_output(stdout: &str, stderr: Option<String>) -> String {
@@ -1708,8 +1701,28 @@ mod tests {
         task_file_validation_command,
     };
     use aither_sandbox::{Configured, TerminalExecutionMode, TerminalTool};
+    use askama::Template;
     use executor_core::DefaultExecutor;
     use tempfile::tempdir;
+
+    #[test]
+    fn task_callback_reminder_states_the_outcome_and_summary() {
+        let text = super::TaskCallbackReminder {
+            task_id: "t1",
+            task_name: "Backup",
+            profile_id: "p1",
+            trigger_kind: "time",
+            trigger_type: "cron",
+            status: "failed",
+            summary: "disk full",
+        }
+        .render()
+        .expect("reminder must render");
+        assert_eq!(
+            text,
+            "<system-reminder>\nScheduled task \"Backup\" (id t1, profile p1, time trigger of type cron) failed.\nSummary:\ndisk full\n</system-reminder>"
+        );
+    }
 
     use crate::db::{ChatDb, CreateScheduledTaskParams, NetworkAccessSource};
     use crate::task_trigger::PersistedTaskTrigger;

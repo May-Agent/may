@@ -1,0 +1,3 @@
+<system-reminder>
+Non-interactive oneshot run. Do not use ask_user or wait for stdin. Make a reasonable assumption when possible; if interaction is truly required, explain the blocker and stop.
+</system-reminder>

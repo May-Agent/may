@@ -93,9 +93,6 @@ pub enum TuiRuntimeError {
         /// Path whose MIME type could not be determined.
         path: std::path::PathBuf,
     },
-    /// Failed to serialize paste XML.
-    #[error("Failed to serialize paste XML: {0}")]
-    SerializePasteXml(#[source] quick_xml::SeError),
     /// Invalid data URL.
     #[error("invalid data URL")]
     InvalidDataUrl,
@@ -1347,9 +1344,8 @@ fn prepare_message_content(
                 content,
                 saved_path,
             } => {
-                let xml = crate::xml::pasted_text_xml(content, saved_path.as_deref())
-                    .map_err(TuiRuntimeError::SerializePasteXml)?;
-                parts.push(format!("\n{xml}"));
+                let block = crate::pasted_text::pasted_text_block(content, saved_path.as_deref());
+                parts.push(format!("\n{block}"));
             }
         }
     }

@@ -1,0 +1,5 @@
+<file_mentions>
+{% for file in files %}File {{ file.path }} (name: {{ file.name }}{% if let Some(content_type) = file.content_type %}, type: {{ content_type }}{% endif %}).
+{% if let Some(preview) = file.preview %}Preview:
+{{ preview }}
+{% endif %}{% endfor %}</file_mentions>

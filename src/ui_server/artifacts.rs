@@ -1193,15 +1193,13 @@ pub(super) async fn prepare_slidev_preview(
     }))
 }
 
-#[derive(serde::Serialize, skyzen::ToSchema)]
+#[derive(askama::Template)]
+#[template(path = "reminder_artifact_validation.txt", escape = "none")]
 struct ArtifactValidationReminder<'a> {
-    #[serde(rename = "@type")]
-    reminder_type: &'static str,
     validation_id: &'a str,
     artifact_type: &'a str,
     path: &'a str,
     diagnostics: &'a [String],
-    instruction: &'static str,
 }
 
 fn normalized_artifact_diagnostics(diagnostics: Vec<String>) -> Result<Vec<String>, skyzen::Error> {
@@ -1301,17 +1299,14 @@ pub(super) async fn report_artifact_diagnostics(
         }));
     }
 
-    let reminder = ArtifactValidationReminder {
-        reminder_type: "artifact_validation_failed",
+    let reminder_text = askama::Template::render(&ArtifactValidationReminder {
         validation_id: validation_id.as_str(),
         artifact_type,
         path: request.path.as_str(),
         diagnostics: diagnostics.as_slice(),
-        instruction: "The declared artifact failed validation. Inspect and repair the source, validate it again, and do not claim completion until it renders without diagnostics. Return the artifact control tag again after the repair.",
-    };
-    let reminder_xml =
-        crate::xml::serialize_xml_block("system-reminder", &reminder).map_err(internal_error)?;
-    let hidden_context_xml = crate::XmlBlock::parse(reminder_xml).map_err(internal_error)?;
+    })
+    .map_err(internal_error)?;
+    let hidden_context_xml = crate::XmlBlock::parse(reminder_text).map_err(internal_error)?;
     let pending = crate::session::PendingUserMessage {
         content: String::new(),
         attachments: Vec::new(),
@@ -1862,6 +1857,22 @@ mod tests {
     };
     use crate::ui_server::types::{ArtifactDiagnosticsRequest, IfNoneMatchHeader};
     use std::path::PathBuf;
+
+    #[test]
+    fn validation_reminder_lists_diagnostics_and_the_repair_instruction() {
+        let diagnostics = vec!["bad import".to_string(), "missing slide".to_string()];
+        let text = askama::Template::render(&super::ArtifactValidationReminder {
+            validation_id: "v1",
+            artifact_type: "slides",
+            path: "artifacts/deck.md",
+            diagnostics: &diagnostics,
+        })
+        .expect("reminder must render");
+        assert_eq!(
+            text,
+            "<system-reminder>\nThe declared slides artifact at artifacts/deck.md failed validation (validation id v1). Diagnostics:\n- bad import\n- missing slide\nInspect and repair the source, validate it again, and do not claim completion until it renders without diagnostics. Return the artifact control tag again after the repair.\n</system-reminder>"
+        );
+    }
 
     const VALID_SLIDEV: &str = include_str!("../../tests/fixtures/slidev/valid.md");
     const INVALID_SLIDEV: &str =

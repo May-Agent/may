@@ -1,18 +1,10 @@
-//! XML helpers for structured context payloads.
+//! Hidden-context block type.
 //!
-//! The two items in this module are:
-//!
-//! - [`XmlBlock`] — a non-empty, trimmed string that wraps an XML
-//!   fragment (typically emitted by [`serialize_xml_block`]) and is
-//!   safe to inject into an LLM prompt as hidden context or a tagged
-//!   context payload. The newtype enforces the non-empty invariant at
-//!   the type level so downstream code never has to defend against it.
-//! - [`serialize_xml_block`] — a thin, shared wrapper around
-//!   [`quick_xml::se::Serializer::with_root`] for emitting a single
-//!   `<tag>...</tag>` block from a serde-serialisable value. Callers
-//!   that need to build a structured system-reminder, attachment
-//!   preamble, or `@mention` payload share this helper so the wire
-//!   format stays consistent.
+//! [`XmlBlock`] is a non-empty, trimmed string holding text rendered from a
+//! typed template (a `<system-reminder>` or other tagged context payload)
+//! that is safe to inject into an LLM prompt as hidden context. The newtype
+//! enforces the non-empty invariant at the type level so downstream code
+//! never has to defend against it.
 
 use std::ops::Deref;
 
@@ -39,75 +31,6 @@ pub enum XmlBlockError {
     /// The provided content was empty after trimming whitespace.
     #[error("xml context block must not be empty")]
     Empty,
-}
-
-/// Serializes `value` as a single `<tag>...</tag>` XML block.
-///
-/// This is a thin wrapper around [`quick_xml::se::Serializer::with_root`]
-/// used to build context-payload XML for runtime injection. It returns
-/// a raw `String` so callers can post-process before wrapping the result
-/// in an [`XmlBlock`].
-///
-/// # Errors
-///
-/// Returns [`quick_xml::SeError`] when the root tag cannot be written or
-/// `value` fails to serialize.
-pub fn serialize_xml_block<T: Serialize>(
-    tag: &str,
-    value: &T,
-) -> Result<String, quick_xml::SeError> {
-    let mut output = String::new();
-    let serializer = quick_xml::se::Serializer::with_root(&mut output, Some(tag))?;
-    value.serialize(serializer)?;
-    Ok(output)
-}
-
-/// Threshold (chars) above which a pasted-text attachment is truncated for
-/// the model and expected to live in a saved file.
-pub const LARGE_PASTE_THRESHOLD: usize = 4000;
-
-/// Maximum chars shown in LLM context for large pastes.
-pub const PASTE_TRUNCATE_LIMIT: usize = 2000;
-
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-struct PastedText {
-    #[serde(rename = "@chars")]
-    chars: usize,
-    #[serde(rename = "@truncated", skip_serializing_if = "Option::is_none")]
-    truncated: Option<bool>,
-    #[serde(rename = "@full_path", skip_serializing_if = "Option::is_none")]
-    full_path: Option<String>,
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-/// Build the pasted-text XML block a user message contributes to the prompt.
-///
-/// Content longer than [`LARGE_PASTE_THRESHOLD`] chars is truncated to
-/// [`PASTE_TRUNCATE_LIMIT`] and `saved_path` is referenced via `full_path`.
-///
-/// # Errors
-///
-/// Returns [`quick_xml::SeError`] when the block fails to serialize.
-pub fn pasted_text_xml(
-    content: &str,
-    saved_path: Option<&std::path::Path>,
-) -> Result<String, quick_xml::SeError> {
-    let char_count = content.chars().count();
-    let (text_content, is_truncated) = if char_count > LARGE_PASTE_THRESHOLD {
-        let truncated: String = content.chars().take(PASTE_TRUNCATE_LIMIT).collect();
-        (truncated, true)
-    } else {
-        (content.to_string(), false)
-    };
-
-    quick_xml::se::to_string(&PastedText {
-        chars: char_count,
-        truncated: is_truncated.then_some(true),
-        full_path: saved_path.map(|p| p.display().to_string()),
-        content: text_content,
-    })
 }
 
 impl XmlBlock {
@@ -190,7 +113,7 @@ impl TryFrom<&str> for XmlBlock {
 
 #[cfg(test)]
 mod tests {
-    use super::{XmlBlock, serialize_xml_block};
+    use super::XmlBlock;
 
     #[test]
     fn parse_accepts_plain_text_context() {
@@ -213,19 +136,5 @@ mod tests {
     fn parse_rejects_empty_content() {
         let error = XmlBlock::parse("   ").expect_err("empty content must still fail");
         assert_eq!(error.to_string(), "xml context block must not be empty");
-    }
-
-    #[test]
-    fn serialize_xml_block_emits_single_tagged_root() {
-        #[derive(serde::Serialize)]
-        struct Payload {
-            status: &'static str,
-        }
-
-        let xml = serialize_xml_block("system-reminder", &Payload { status: "ok" })
-            .expect("serialize should succeed");
-        assert!(xml.contains("<system-reminder>"));
-        assert!(xml.contains("<status>ok</status>"));
-        assert!(xml.contains("</system-reminder>"));
     }
 }

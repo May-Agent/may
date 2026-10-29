@@ -1,0 +1,6 @@
+{%- import "session_macros.txt" as m -%}
+{% call m::session_line(session) %}{% endcall %}
+{{ messages.len() }} message(s):
+{% for message in messages %}
+{% call m::message_block(message) %}{% endcall %}
+{% endfor %}

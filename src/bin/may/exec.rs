@@ -9,10 +9,10 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use aither_core::llm::Tool;
+use aither_core::llm::{CommandOutcome, CommandResult, Tool, ToolResult};
 use aither_sandbox::{
     ContainerShellRuntime, OutputFormat, ShellRuntimeAvailability, SshServer, TerminalArgs,
-    TerminalExecutionMode, TerminalResult, TerminalTool, terminal_tool_factory_channel,
+    TerminalExecutionMode, TerminalTool, terminal_tool_factory_channel,
 };
 use may_agent::session::{SessionPaths, initialize_session_persistence};
 use may_agent::{
@@ -68,8 +68,8 @@ pub enum ExecError {
     SshServerNotAttached(String),
     #[error("terminal execution failed: {0}")]
     TerminalCall(aither_core::Error),
-    #[error("failed to parse terminal result: {0}")]
-    ParseTerminalResult(serde_json::Error),
+    #[error("terminal tool did not return a command result")]
+    NotACommandResult,
     #[error("failed to write stdout: {0}")]
     WriteStdout(std::io::Error),
     #[error("failed to write stderr: {0}")]
@@ -170,11 +170,11 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
                 .to_string()
         )));
     }
-    let payload = output.render_for_model().map_err(ExecError::TerminalCall)?;
-    let result: TerminalResult =
-        serde_json::from_str(&payload).map_err(ExecError::ParseTerminalResult)?;
+    let ToolResult::Command(result) = output else {
+        return Err(ExecError::NotACommandResult);
+    };
     render_exec_result(&result)?;
-    Ok(result.exit_code)
+    Ok(exit_code(&result.outcome))
 }
 
 async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContext, ExecError> {
@@ -557,11 +557,22 @@ const fn select_exec_mode(
     TerminalExecutionMode::Default
 }
 
-fn render_exec_result(result: &TerminalResult) -> Result<(), ExecError> {
+/// Process exit code reported for a command outcome. A background task has
+/// not finished, so it reports success; a run killed at its time bound reports
+/// `-1`.
+const fn exit_code(outcome: &CommandOutcome) -> i32 {
+    match outcome {
+        CommandOutcome::Exited { code } => *code,
+        CommandOutcome::Running { .. } => 0,
+        CommandOutcome::Killed { .. } => -1,
+    }
+}
+
+fn render_exec_result(result: &CommandResult) -> Result<(), ExecError> {
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
 
-    let stdout_text = result.stdout.to_string();
+    let stdout_text = may_agent::command_output::stream_text(&result.stdout);
     if !stdout_text.is_empty() {
         stdout
             .write_all(stdout_text.as_bytes())
@@ -572,8 +583,8 @@ fn render_exec_result(result: &TerminalResult) -> Result<(), ExecError> {
         stdout.flush().map_err(ExecError::WriteStdout)?;
     }
 
-    if let Some(stderr_entry) = &result.stderr {
-        let stderr_text = stderr_entry.to_string();
+    if let Some(stderr_stream) = &result.stderr {
+        let stderr_text = may_agent::command_output::stream_text(stderr_stream);
         if !stderr_text.is_empty() {
             stderr
                 .write_all(stderr_text.as_bytes())
@@ -584,11 +595,14 @@ fn render_exec_result(result: &TerminalResult) -> Result<(), ExecError> {
         }
     }
 
-    if let Some(task_id) = &result.task_id {
-        let status = result.status.as_deref().unwrap_or("running");
-        stderr
-            .write_all(format!("background task: {task_id} ({status})\n").as_bytes())
-            .map_err(ExecError::WriteStderr)?;
+    match &result.outcome {
+        CommandOutcome::Exited { .. } => {}
+        CommandOutcome::Running { task_id, .. } => stderr
+            .write_all(format!("background task: {task_id} (running)\n").as_bytes())
+            .map_err(ExecError::WriteStderr)?,
+        CommandOutcome::Killed { task_id, .. } => stderr
+            .write_all(format!("background task: {task_id} (killed)\n").as_bytes())
+            .map_err(ExecError::WriteStderr)?,
     }
     stderr.flush().map_err(ExecError::WriteStderr)?;
 
