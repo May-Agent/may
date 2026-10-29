@@ -1745,7 +1745,9 @@ mod tests {
     async fn task_runs_past_the_foreground_limit() {
         let dir = tempdir().expect("temp dir should be created");
         let terminal = scheduler_test_terminal(dir.path()).await;
-        let runtime_secs = aither_sandbox::DEFAULT_FOREGROUND_LIMIT.as_secs() + 2;
+        let runtime_secs = u32::try_from(aither_sandbox::DEFAULT_FOREGROUND_LIMIT.as_secs())
+            .expect("the foreground limit fits in u32 seconds")
+            + 2;
 
         let output = run_terminal_command(
             &terminal,
