@@ -24,7 +24,7 @@ use serde::Serialize;
 use shell_escape::escape as shell_escape;
 
 use crate::agent::task_tool::{TaskCreateRequest, TaskCreateResult, TaskRuntimeKind};
-use crate::container::lifecycle::ContainerManager;
+use crate::container::lifecycle::{ContainerManager, container_workspace_path};
 use crate::db::entity::{profiles, scheduled_tasks};
 use crate::db::{ChatDb, NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError};
@@ -67,6 +67,12 @@ struct TaskValidationScriptTemplate<'a> {
 #[template(path = "task_execute_script.sh", escape = "none")]
 struct TaskExecutionScriptTemplate<'a> {
     trigger_file: &'a str,
+    script_file: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "task_validate_script_file.sh", escape = "none")]
+struct TaskFileValidationTemplate<'a> {
     script_file: &'a str,
 }
 
@@ -279,10 +285,85 @@ struct TaskScript {
     host_working_dir: PathBuf,
 }
 
+/// Where a task's script and trigger files are written on the host, and how
+/// the command that reads them refers to them. A container sees the host
+/// directory only through its workspace mount, so the two differ there.
+#[derive(Debug, Clone)]
+struct TaskFilePlacement {
+    host_dir: PathBuf,
+    in_container: bool,
+}
+
+impl TaskFilePlacement {
+    const fn local(host_dir: PathBuf) -> Self {
+        Self {
+            host_dir,
+            in_container: false,
+        }
+    }
+
+    /// Files go into the container's host-side `workspace_dir`, which the
+    /// container mounts at [`CONTAINER_WORKSPACE`](crate::container::lifecycle::CONTAINER_WORKSPACE).
+    const fn container(workspace_dir: PathBuf) -> Self {
+        Self {
+            host_dir: workspace_dir,
+            in_container: true,
+        }
+    }
+
+    /// The path of `file_name` as the command's shell sees it.
+    fn command_path(&self, file_name: &str) -> String {
+        if self.in_container {
+            container_workspace_path(file_name)
+        } else {
+            self.host_dir.join(file_name).display().to_string()
+        }
+    }
+
+    async fn write(&self, file_name: String, contents: &[u8]) -> Result<PlacedTaskFile, String> {
+        let host_path = self.host_dir.join(&file_name);
+        tokio::fs::write(&host_path, contents)
+            .await
+            .map_err(|error| {
+                format!("failed to write task file {}: {error}", host_path.display())
+            })?;
+        Ok(PlacedTaskFile {
+            command_path: self.command_path(&file_name),
+            host_path,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlacedTaskFile {
+    host_path: PathBuf,
+    command_path: String,
+}
+
 #[derive(Debug, Clone)]
 struct MaterializedTaskExecution {
     command: String,
     cleanup_paths: Vec<PathBuf>,
+}
+
+fn task_execution_command(trigger_file: &str, script_file: &str) -> String {
+    let trigger_file = shell_escape(Cow::Borrowed(trigger_file));
+    let script_file = shell_escape(Cow::Borrowed(script_file));
+    TaskExecutionScriptTemplate {
+        trigger_file: &trigger_file,
+        script_file: &script_file,
+    }
+    .render()
+    .expect("task execution template must render")
+}
+
+fn task_file_validation_command(script_file: &str) -> String {
+    let script_file = shell_escape(Cow::Borrowed(script_file));
+    TaskFileValidationTemplate {
+        script_file: &script_file,
+    }
+    .render()
+    .expect("task file validation template must render")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -948,8 +1029,11 @@ impl TaskRuntime {
             .map_err(|error| invalid_profile_error(task.profile_id.as_str(), &error))?;
 
         let script = self.resolve_script(task).await?;
+        let placement = self
+            .task_file_placement(&profile, profile_info.environment.kind(), &script)
+            .await?;
         let materialized = self
-            .materialize_task_execution(task, &script, invocation)
+            .materialize_task_execution(task, &script, invocation, &placement)
             .await?;
 
         let result = match profile_info.environment.kind() {
@@ -967,23 +1051,46 @@ impl TaskRuntime {
         result
     }
 
+    /// The host directory a task's files are written to and the paths its
+    /// command uses for them, which depend on where the profile runs it.
+    async fn task_file_placement(
+        &self,
+        profile: &profiles::Model,
+        environment: &ProfileEnvironment,
+        script: &TaskScript,
+    ) -> Result<TaskFilePlacement, String> {
+        match environment {
+            ProfileEnvironment::Local => {
+                Ok(TaskFilePlacement::local(script.host_working_dir.clone()))
+            }
+            ProfileEnvironment::Container { .. } => self
+                .container_task_workspace(profile)
+                .await
+                .map(TaskFilePlacement::container),
+        }
+    }
+
+    /// The profile's host-side task workspace, created on demand; its
+    /// container mounts it at [`CONTAINER_WORKSPACE`](crate::container::lifecycle::CONTAINER_WORKSPACE).
+    async fn container_task_workspace(&self, profile: &profiles::Model) -> Result<PathBuf, String> {
+        let workspace_dir = self
+            .may_dir
+            .join("task-workspaces")
+            .join(profile_workspace_key(profile));
+        tokio::fs::create_dir_all(&workspace_dir)
+            .await
+            .map_err(|error| workspace_prepare_error(&workspace_dir, &error))?;
+        Ok(workspace_dir)
+    }
+
     async fn materialize_task_execution(
         &self,
         task: &scheduled_tasks::Model,
         script: &TaskScript,
         invocation: TaskInvocation,
+        placement: &TaskFilePlacement,
     ) -> Result<MaterializedTaskExecution, String> {
         let execution_id = uuid::Uuid::new_v4().to_string();
-        let script_path = script.host_working_dir.join(temp_task_file_name(
-            ".may-task-script-",
-            execution_id.as_str(),
-            ".sh",
-        ));
-        let trigger_path = script.host_working_dir.join(temp_task_file_name(
-            ".may-task-trigger-",
-            execution_id.as_str(),
-            ".json",
-        ));
         let trigger_payload = serde_json::to_vec(
             &TaskExecutionEnvelope::new(task, invocation).map_err(|error| {
                 prefixed_error("failed to build task trigger payload: ", &error)
@@ -991,40 +1098,30 @@ impl TaskRuntime {
         )
         .map_err(|error| prefixed_error("failed to encode task trigger payload: ", &error))?;
 
-        tokio::fs::write(&script_path, script.content.as_bytes())
+        let script_file = placement
+            .write(
+                temp_task_file_name(".may-task-script-", execution_id.as_str(), ".sh"),
+                script.content.as_bytes(),
+            )
+            .await?;
+        let trigger_file = match placement
+            .write(
+                temp_task_file_name(".may-task-trigger-", execution_id.as_str(), ".json"),
+                &trigger_payload,
+            )
             .await
-            .map_err(|error| {
-                format!(
-                    "failed to write task script {}: {error}",
-                    script_path.display()
-                )
-            })?;
-        tokio::fs::write(&trigger_path, trigger_payload)
-            .await
-            .map_err(|error| {
-                let script_path = script_path.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::fs::remove_file(script_path).await;
-                });
-                format!(
-                    "failed to write task trigger payload {}: {error}",
-                    trigger_path.display()
-                )
-            })?;
-
-        let trigger_file =
-            shell_escape(Cow::Owned(trigger_path.display().to_string())).into_owned();
-        let script_file = shell_escape(Cow::Owned(script_path.display().to_string())).into_owned();
-        let command = TaskExecutionScriptTemplate {
-            trigger_file: &trigger_file,
-            script_file: &script_file,
-        }
-        .render()
-        .expect("task execution template must render");
+        {
+            Ok(trigger_file) => trigger_file,
+            Err(error) => {
+                self.cleanup_materialized_execution(vec![script_file.host_path])
+                    .await;
+                return Err(error);
+            }
+        };
 
         Ok(MaterializedTaskExecution {
-            command,
-            cleanup_paths: vec![script_path, trigger_path],
+            command: task_execution_command(&trigger_file.command_path, &script_file.command_path),
+            cleanup_paths: vec![script_file.host_path, trigger_file.host_path],
         })
     }
 
@@ -1228,7 +1325,7 @@ impl TaskRuntime {
 
     /// Starts the profile's container and builds a terminal that executes in
     /// it, storing outputs in the host-side task workspace mounted at
-    /// `/workspace`. Returns the container manager and container ID so callers
+    /// [`CONTAINER_WORKSPACE`](crate::container::lifecycle::CONTAINER_WORKSPACE). Returns the container manager and container ID so callers
     /// can record activity.
     async fn container_terminal_tool(
         &self,
@@ -1275,13 +1372,7 @@ impl TaskRuntime {
             .map_err(|error| prefixed_error("container image check/build failed: ", &error))?;
 
         let container_name = container_profile_name(profile);
-        let workspace_dir = self
-            .may_dir
-            .join("task-workspaces")
-            .join(profile_workspace_key(profile));
-        tokio::fs::create_dir_all(&workspace_dir)
-            .await
-            .map_err(|error| workspace_prepare_error(&workspace_dir, &error))?;
+        let workspace_dir = self.container_task_workspace(profile).await?;
 
         let mut launch_spec = ContainerLaunchSpec::new(
             container_name,
@@ -1363,10 +1454,40 @@ impl TaskRuntime {
         }
     }
 
+    /// Writes the script into the task workspace and syntax-checks it at its
+    /// in-container path, so validation fails exactly where a run would.
     async fn validate_container(
         &self,
         profile: &profiles::Model,
         script: &TaskScript,
+        timeout: TaskTimeout,
+    ) -> Result<(), String> {
+        let placement = TaskFilePlacement::container(self.container_task_workspace(profile).await?);
+        let script_file = placement
+            .write(
+                temp_task_file_name(
+                    ".may-task-validate-",
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                    ".sh",
+                ),
+                script.content.as_bytes(),
+            )
+            .await?;
+        let result = Box::pin(self.run_container_validation(
+            profile,
+            task_file_validation_command(&script_file.command_path),
+            timeout,
+        ))
+        .await;
+        self.cleanup_materialized_execution(vec![script_file.host_path])
+            .await;
+        result
+    }
+
+    async fn run_container_validation(
+        &self,
+        profile: &profiles::Model,
+        command: String,
         timeout: TaskTimeout,
     ) -> Result<(), String> {
         let (terminal_tool, container_manager, container_id) = Box::pin(
@@ -1377,7 +1498,7 @@ impl TaskRuntime {
             &terminal_tool,
             TerminalExecutionMode::Default,
             None,
-            build_validation_command(script),
+            command,
             timeout,
         )
         .await
@@ -1575,8 +1696,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        SchedulerPermissionHandler, TaskRuntime, TaskScript, TaskTimeout,
-        local_task_execution_mode, run_terminal_command,
+        SchedulerPermissionHandler, TaskFilePlacement, TaskRuntime, TaskScript, TaskTimeout,
+        local_task_execution_mode, run_terminal_command, task_execution_command,
+        task_file_validation_command,
     };
     use aither_sandbox::{Configured, TerminalExecutionMode, TerminalTool};
     use askama::Template;
@@ -1791,6 +1913,63 @@ mod tests {
         .expect_err("a task past its timeout must fail");
 
         assert_eq!(error, "task timed out after 2 seconds and was killed");
+    }
+
+    #[test]
+    fn host_placement_commands_use_host_paths() {
+        let placement = TaskFilePlacement::local(std::path::PathBuf::from("/host/scripts"));
+        let script = placement.command_path(".may-task-script-1.sh");
+        let trigger = placement.command_path(".may-task-trigger-1.json");
+        assert_eq!(script, "/host/scripts/.may-task-script-1.sh");
+        assert_eq!(
+            task_execution_command(&trigger, &script),
+            "export MAY_TASK_TRIGGER_FILE=/host/scripts/.may-task-trigger-1.json\nexec bash /host/scripts/.may-task-script-1.sh"
+        );
+    }
+
+    #[test]
+    fn container_placement_commands_use_the_workspace_mount() {
+        let placement = TaskFilePlacement::container(std::path::PathBuf::from(
+            "/host/may/task-workspaces/work",
+        ));
+        let script = placement.command_path(".may-task-script-1.sh");
+        let trigger = placement.command_path(".may-task-trigger-1.json");
+        assert_eq!(
+            script,
+            crate::container::lifecycle::container_workspace_path(".may-task-script-1.sh")
+        );
+        let command = task_execution_command(&trigger, &script);
+        assert!(
+            command.contains("MAY_TASK_TRIGGER_FILE=/workspace/.may-task-trigger-1.json")
+                && command.contains("exec bash /workspace/.may-task-script-1.sh"),
+            "unexpected command: {command}"
+        );
+        assert!(
+            !command.contains("/host/may"),
+            "a container command must not mention host paths: {command}"
+        );
+        assert_eq!(
+            task_file_validation_command(&script),
+            "exec bash -n /workspace/.may-task-script-1.sh"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_writes_to_the_host_dir_and_reports_the_command_path() {
+        let dir = tempdir().expect("temp dir should be created");
+        let placement = TaskFilePlacement::container(dir.path().to_path_buf());
+
+        let file = placement
+            .write("task.sh".to_string(), b"echo ok")
+            .await
+            .expect("file should be written");
+
+        assert_eq!(file.host_path, dir.path().join("task.sh"));
+        assert_eq!(file.command_path, "/workspace/task.sh");
+        assert_eq!(
+            std::fs::read(&file.host_path).expect("host file should exist"),
+            b"echo ok"
+        );
     }
 
     #[test]

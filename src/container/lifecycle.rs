@@ -17,6 +17,20 @@ use tokio::time::Instant;
 use super::{ContainerError, ContainerRuntime};
 use crate::session::MayHomePaths;
 
+/// Where a container's host workspace directory is bind-mounted, and the
+/// working directory of its commands. Every host-to-container workspace path
+/// derives from this one definition.
+pub const CONTAINER_WORKSPACE: &str = "/workspace";
+
+/// The in-container path of `file_name` in the container's workspace mount.
+#[must_use]
+pub fn container_workspace_path(file_name: &str) -> String {
+    format!("{CONTAINER_WORKSPACE}/{file_name}")
+}
+
+/// Workspace subdirectories bind-mounted into the container's `~/.may`.
+const WORKSPACE_MOUNT_DIRS: [&str; 2] = ["skills", "subagents"];
+
 const LABEL_MANAGED: &str = "may.managed";
 const LABEL_SPEC_FINGERPRINT: &str = "may.spec-fingerprint";
 const SPEC_FINGERPRINT_REVISION: &str = "2026-03-17-v8";
@@ -203,6 +217,11 @@ impl ContainerManager {
         shared_paths: &SharedHostPaths,
         spec_fingerprint: &str,
     ) -> Result<String, ContainerError> {
+        // A bind mount whose source is missing fails the create, so the
+        // workspace subdirectories the container mounts exist first.
+        for dir in WORKSPACE_MOUNT_DIRS {
+            async_fs::create_dir_all(spec.workspace.join(dir)).await?;
+        }
         let env = Self::effective_env(spec, host_gateway);
         let mounts = Self::effective_mounts(spec, shared_paths);
 
@@ -226,7 +245,7 @@ impl ContainerManager {
         let config = ContainerCreateBody {
             image: Some(spec.image.clone()),
             hostname: Some(spec.name.clone()),
-            working_dir: Some("/workspace".to_string()),
+            working_dir: Some(CONTAINER_WORKSPACE.to_string()),
             env: Some(env),
             host_config: Some(host_config),
             // Keep container alive with a long-running process
@@ -341,9 +360,9 @@ impl ContainerManager {
 
     fn effective_mounts(spec: &ContainerLaunchSpec, shared_paths: &SharedHostPaths) -> Vec<Mount> {
         let mut mounts = vec![
-            // Session sandbox -> /workspace
+            // Session sandbox -> CONTAINER_WORKSPACE
             Mount {
-                target: Some("/workspace".to_string()),
+                target: Some(CONTAINER_WORKSPACE.to_string()),
                 source: Some(spec.workspace.display().to_string()),
                 typ: Some(MountType::BIND),
                 read_only: Some(false),
@@ -357,22 +376,15 @@ impl ContainerManager {
                 read_only: Some(false),
                 ..Default::default()
             },
-            // Session-scoped skill/subagent roots mapped into container ~/.may.
-            Mount {
-                target: Some("/root/.may/skills".to_string()),
-                source: Some(spec.workspace.join("skills").display().to_string()),
-                typ: Some(MountType::BIND),
-                read_only: Some(false),
-                ..Default::default()
-            },
-            Mount {
-                target: Some("/root/.may/subagents".to_string()),
-                source: Some(spec.workspace.join("subagents").display().to_string()),
-                typ: Some(MountType::BIND),
-                read_only: Some(false),
-                ..Default::default()
-            },
         ];
+        // Workspace-scoped skill/subagent roots mapped into container ~/.may.
+        mounts.extend(WORKSPACE_MOUNT_DIRS.iter().map(|dir| Mount {
+            target: Some(format!("/root/.may/{dir}")),
+            source: Some(spec.workspace.join(dir).display().to_string()),
+            typ: Some(MountType::BIND),
+            read_only: Some(false),
+            ..Default::default()
+        }));
 
         for mount in &spec.mounts {
             mounts.push(Mount {
