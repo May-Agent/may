@@ -503,6 +503,16 @@ pub fn handle_btw_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     None
 }
 
+/// Zoomed image overlay: Esc closes it; a click outside the image is handled
+/// by the mouse handler.
+pub fn handle_image_view_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    if code == KeyCode::Esc {
+        app.mode = AppMode::Chat;
+        app.image_view_area = None;
+    }
+    None
+}
+
 /// Job detail view: scroll output, stop a running job, refresh, back to Jobs.
 pub fn handle_job_detail_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let AppMode::JobDetail(state) = &mut app.mode else {

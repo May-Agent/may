@@ -38,8 +38,23 @@ pub enum ToolStatus {
 pub struct ToolCallImage {
     /// Key the image state is cached under.
     pub key: String,
-    /// Label shown on the image placeholder header line.
+    /// Label used when no source path is known.
     pub label: String,
+    /// Source path or URL the image came from, when known.
+    pub path: String,
+}
+
+impl ToolCallImage {
+    /// Caption shown under the zoomed image: the source path, falling back
+    /// to the label.
+    #[must_use]
+    pub fn caption(&self) -> &str {
+        if self.path.is_empty() {
+            &self.label
+        } else {
+            &self.path
+        }
+    }
 }
 
 /// Information about a terminal command execution.
@@ -990,8 +1005,8 @@ pub struct UnifiedRenderContext<'a> {
     pub status_ctx: Option<StatusContext<'a>>,
     /// Whether terminal supports image rendering
     pub images_supported: bool,
-    /// Output: accumulated image positions (url, `line_index`) for overlay rendering
-    pub image_positions_out: Option<&'a mut Vec<(String, usize)>>,
+    /// Output: accumulated image positions (url, `line_index`, caption) for overlay rendering
+    pub image_positions_out: Option<&'a mut Vec<(String, usize, String)>>,
 }
 
 impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
@@ -1093,21 +1108,11 @@ fn plain_text(line: &Line<'_>) -> String {
         .collect::<String>()
 }
 
-/// Push a `🖼` image placeholder block: a header line followed by
-/// `IMAGE_HEIGHT - 1` blank rows reserved for the graphics overlay.
-/// Returns the header row index, which the overlay uses as its anchor.
-fn push_image_rows(lines: &mut Vec<Line<'_>>, label: &str) -> usize {
+/// Push `IMAGE_HEIGHT` blank rows reserved for the graphics overlay.
+/// Returns the first reserved row index, which the overlay uses as its anchor.
+fn push_image_rows(lines: &mut Vec<Line<'_>>) -> usize {
     let index = lines.len();
-    lines.push(Line::from(vec![
-        Span::styled("🖼 ", Style::default()),
-        Span::styled(
-            label.to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    for _ in 1..IMAGE_HEIGHT {
+    for _ in 0..IMAGE_HEIGHT {
         lines.push(Line::from(""));
     }
     index
@@ -1138,18 +1143,14 @@ fn push_attachment_line(
     lines: &mut Vec<Line<'_>>,
     attachment: &Attachment,
     images_supported: bool,
-    positions: Option<&mut Vec<(String, usize)>>,
+    positions: Option<&mut Vec<(String, usize, String)>>,
 ) {
     if images_supported && let Attachment::Image { path, .. } = attachment {
-        let label = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("image");
-        let index = push_image_rows(lines, label);
+        let index = push_image_rows(lines);
         if let Some(key) = attachment.image_cache_key()
             && let Some(positions) = positions
         {
-            positions.push((key, index));
+            positions.push((key, index, path.display().to_string()));
         }
         return;
     }
@@ -1166,14 +1167,14 @@ fn push_tool_call_image(
     lines: &mut Vec<Line<'_>>,
     info: Option<&TerminalCallInfo>,
     images_supported: bool,
-    positions: &mut Vec<(String, usize)>,
+    positions: &mut Vec<(String, usize, String)>,
 ) {
     if !images_supported {
         return;
     }
     if let Some(image) = info.and_then(|info| info.image.as_ref()) {
-        let index = push_image_rows(lines, &image.label);
-        positions.push((image.key.clone(), index));
+        let index = push_image_rows(lines);
+        positions.push((image.key.clone(), index, image.caption().to_string()));
     }
 }
 
@@ -1384,9 +1385,9 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, image
                 }
             }
             if images_supported
-                && let Some(image) = terminal_info.as_ref().and_then(|info| info.image.as_ref())
+                && let Some(_) = terminal_info.as_ref().and_then(|info| info.image.as_ref())
             {
-                push_image_rows(lines, &image.label);
+                push_image_rows(lines);
             }
         }
         ToolDisplay::Fetch {
@@ -1413,9 +1414,9 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, image
                 }
             }
             if images_supported
-                && let Some(image) = terminal_info.as_ref().and_then(|info| info.image.as_ref())
+                && let Some(_) = terminal_info.as_ref().and_then(|info| info.image.as_ref())
             {
-                push_image_rows(lines, &image.label);
+                push_image_rows(lines);
             }
         }
         ToolDisplay::Task {
@@ -1448,8 +1449,8 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, image
                         lines.push(Line::from(format!("      {line}")));
                     }
                 }
-                if images_supported && let Some(image) = latest.image.as_ref() {
-                    push_image_rows(lines, &image.label);
+                if images_supported && latest.image.is_some() {
+                    push_image_rows(lines);
                 }
             }
         }
@@ -1495,9 +1496,9 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, image
                 }
             }
             if images_supported
-                && let Some(image) = output.as_ref().and_then(|info| info.image.as_ref())
+                && let Some(_) = output.as_ref().and_then(|info| info.image.as_ref())
             {
-                push_image_rows(lines, &image.label);
+                push_image_rows(lines);
             }
             plain_diff_lines(diffs, *expanded, lines);
         }
@@ -1649,7 +1650,7 @@ struct RenderContext<'a> {
     queue_ctx: Option<QueueContext<'a>>,
     status_ctx: Option<StatusContext<'a>>,
     images_supported: bool,
-    image_positions_out: Option<&'a mut Vec<(String, usize)>>,
+    image_positions_out: Option<&'a mut Vec<(String, usize, String)>>,
 }
 
 /// Internal implementation for rendering chat stream.
@@ -1678,7 +1679,7 @@ fn render_impl(
     } = ctx;
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut collected_image_positions: Vec<(String, usize)> = Vec::new();
+    let mut collected_image_positions: Vec<(String, usize, String)> = Vec::new();
 
     let build_start = std::time::Instant::now();
     for elem in chat.active_elements() {
@@ -1734,8 +1735,8 @@ fn render_impl(
                 }
 
                 // Collect image positions with offset adjustment
-                for (url, pos) in md_result.image_positions {
-                    collected_image_positions.push((url, line_offset + pos));
+                for (url, pos, caption) in md_result.image_positions {
+                    collected_image_positions.push((url, line_offset + pos, caption));
                 }
 
                 if *streaming {
@@ -1872,12 +1873,6 @@ fn render_impl(
         render_status_line(&mut lines, ctx, area.width as usize);
     }
 
-    // Export collected image positions for overlay rendering
-    if let Some(out) = image_positions_out {
-        out.clear();
-        out.extend(collected_image_positions);
-    }
-
     stats.lines_build = build_start.elapsed();
 
     // Calculate dimensions using VISUAL line count (accounting for wrap)
@@ -1887,6 +1882,24 @@ fn render_impl(
     let visual_content_height = total_wrapped_lines(&lines, render_width);
     stats.wrap_count = wrap_start.elapsed();
     stats.content_height = visual_content_height;
+
+    // Export collected image positions for overlay rendering, converting each
+    // logical line index to the visual row the paragraph actually draws it
+    // on: a wrapped line above pushes the image's reserved rows further down.
+    if let Some(out) = image_positions_out {
+        out.clear();
+        out.extend(
+            collected_image_positions
+                .into_iter()
+                .map(|(key, index, caption)| {
+                    let row = lines[..index.min(lines.len())]
+                        .iter()
+                        .map(|line| wrapped_line_rows(line, render_width))
+                        .sum();
+                    (key, row, caption)
+                }),
+        );
+    }
 
     // Export dimensions for scroll normalization
     // Use visual height so scrolling works correctly with wrapped lines
@@ -1932,6 +1945,19 @@ fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
 }
 
+/// Wrapped row count of a single rendered line, matching the main
+/// paragraph's word wrap exactly — `Paragraph::line_count` is the only
+/// way to get an exact match for the wrap behavior.
+fn wrapped_line_rows(line: &Line<'_>, width: usize) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    let w = u16::try_from(width).unwrap_or(u16::MAX);
+    Paragraph::new(vec![line.clone()])
+        .wrap(Wrap { trim: false })
+        .line_count(w)
+}
+
 /// Render the input line into the lines vector. Attached images get a
 /// placeholder block above the input row — the overlay paints the preview
 /// into it — when the terminal supports graphics.
@@ -1939,20 +1965,16 @@ fn render_input_line(
     lines: &mut Vec<Line<'_>>,
     ctx: &InputContext<'_>,
     images_supported: bool,
-    mut image_positions: Option<&mut Vec<(String, usize)>>,
+    mut image_positions: Option<&mut Vec<(String, usize, String)>>,
 ) {
     if images_supported {
         for att in ctx.attachments {
             if let Attachment::Image { path, .. } = att {
-                let label = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("image");
-                let index = push_image_rows(lines, label);
+                let index = push_image_rows(lines);
                 if let Some(key) = att.image_cache_key()
                     && let Some(positions) = image_positions.as_mut()
                 {
-                    positions.push((key, index));
+                    positions.push((key, index, path.display().to_string()));
                 }
             }
         }
@@ -2205,7 +2227,7 @@ fn render_tool_inline<'a>(
     display: &'a ToolDisplay,
     is_selected: bool,
     images_supported: bool,
-    image_positions: &mut Vec<(String, usize)>,
+    image_positions: &mut Vec<(String, usize, String)>,
 ) {
     let selection_marker = if is_selected { "▶ " } else { "  " };
     let selection_style = if is_selected {
@@ -2975,7 +2997,11 @@ mod tests {
         render_input_line(&mut lines, &ctx, true, Some(&mut positions));
 
         assert_eq!(lines.len(), IMAGE_HEIGHT + 1);
-        assert!(lines[0].spans[0].content.contains("🖼"));
+        assert!(
+            lines[..IMAGE_HEIGHT]
+                .iter()
+                .all(|line| line.spans.iter().all(|span| span.content.is_empty()))
+        );
         assert_eq!(positions.len(), 1);
         let prompt = lines.last().expect("input line");
         assert_eq!(prompt.spans[0].content, "> ");
@@ -3011,6 +3037,7 @@ mod tests {
             super::TerminalCallInfo::new("screenshot".to_string()).with_image(ToolCallImage {
                 key: "tool-image:t1".to_string(),
                 label: "shot.png".to_string(),
+                path: "outputs/shot.png".to_string(),
             }),
         );
 
@@ -3019,7 +3046,14 @@ mod tests {
         render_tool_inline(&mut lines, &display, false, true, &mut positions);
 
         assert_eq!(lines.len(), 1 + IMAGE_HEIGHT); // "$ screenshot" + image block
-        assert_eq!(positions, vec![("tool-image:t1".to_string(), 1)]);
+        assert_eq!(
+            positions,
+            vec![(
+                "tool-image:t1".to_string(),
+                1,
+                "outputs/shot.png".to_string()
+            )]
+        );
 
         // Without graphics support the block collapses to nothing — the text
         // output already carries the [image] marker.
@@ -3027,7 +3061,7 @@ mod tests {
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, false, &mut positions);
         assert_eq!(lines.len(), 1);
-        assert_eq!(positions, Vec::<(String, usize)>::new());
+        assert_eq!(positions, Vec::<(String, usize, String)>::new());
     }
 
     #[test]
