@@ -38,6 +38,7 @@ pub mod issue;
 mod live_response;
 /// Location lookup for location-aware profiles.
 pub mod location;
+pub mod log_ring;
 /// MCP server configuration, connections, and management.
 pub mod mcp;
 /// Profile memory extraction and injection.

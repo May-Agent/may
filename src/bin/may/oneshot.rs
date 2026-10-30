@@ -30,7 +30,7 @@ use render::OneShotOutput;
 /// Records a question for the current session, prompts on stderr and answers it.
 async fn answer_oneshot_question(
     runtime_deps: &RuntimeDeps,
-    app: &mut App,
+    app: &App,
     request: may_agent::ask_user::AskUserRequest,
     output: &mut OneShotOutput<io::Stdout, io::Stderr>,
 ) -> anyhow::Result<()> {
@@ -40,9 +40,22 @@ async fn answer_oneshot_question(
         .map(|session| session.id.clone())
         .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
     let questions = request.args.request.clone().into_questions();
-    let request_id = runtime_deps
-        .register_ask_user_request(app, &session_id, &questions)
-        .await?;
+    let request_id = match runtime_deps
+        .register_ask_user_request(&session_id, &questions)
+        .await
+    {
+        Ok(request_id) => request_id,
+        // A dropped request fails the tool call instead of the run.
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to register ask-user request");
+            writeln!(
+                output.stderr()?,
+                "[error] failed to register the question: {error}"
+            )?;
+            drop(request);
+            return Ok(());
+        }
+    };
     let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
     match runtime_deps
         .resolve_ask_user_response(&session_id, &request_id, &answers)
@@ -128,7 +141,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         match next {
             Ok(completed) => break completed?,
             Err(Some(request)) => {
-                answer_oneshot_question(&runtime_deps, &mut app, request, &mut output).await?;
+                answer_oneshot_question(&runtime_deps, &app, request, &mut output).await?;
             }
             Err(None) => anyhow::bail!("ask-user channel closed while preparing the session"),
         }
@@ -208,7 +221,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         };
         match event {
             Event::AskUser(request) => {
-                answer_oneshot_question(&runtime_deps, &mut app, request, &mut output).await?;
+                answer_oneshot_question(&runtime_deps, &app, request, &mut output).await?;
             }
             Event::Workspace(request) => {
                 let session_id = app
@@ -216,9 +229,21 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     .current()
                     .map(|session| session.id.clone())
                     .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
-                let request_id = runtime_deps
+                let request_id = match runtime_deps
                     .register_workspace_request(&mut app, &session_id, &request.args.request)
-                    .await?;
+                    .await
+                {
+                    Ok(request_id) => request_id,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to register workspace request");
+                        writeln!(
+                            output.stderr()?,
+                            "[error] failed to register the workspace request: {error}"
+                        )?;
+                        drop(request);
+                        continue;
+                    }
+                };
                 let approved = prompt_oneshot_workspace(&request.args.request, output.stderr()?)?;
                 match runtime_deps
                     .resolve_workspace_response(&session_id, &request_id, approved)

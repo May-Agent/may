@@ -7,6 +7,7 @@ pub(crate) mod history;
 pub mod import;
 pub mod layout;
 mod manager;
+mod open_lock;
 pub mod open_questions;
 #[cfg(test)]
 mod open_questions_tests;
@@ -35,6 +36,7 @@ pub use manager::{
     initialize_session_persistence, list_summaries_from_db, load_history_from_db,
     reconcile_container_profile_sessions, summarize_db_sessions,
 };
+pub use open_lock::{SESSION_LOCK_FILE, SessionOpenLock, SessionOpenLockError};
 pub(crate) use persisted_message::{PersistedMessage, PersistedMessageError};
 pub use plan::SessionPlanState;
 pub use run_lease::{
