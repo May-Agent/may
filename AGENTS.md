@@ -135,7 +135,7 @@ During streaming:
 ```
 
 # Terminal-first tool calling
-The native tools are `terminal`, `terminal_background`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact`. This describes command execution capability and does not imply a specific shell implementation.
+The native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact`. This describes command execution capability and does not imply a specific shell implementation.
 
 Everything else is exposed as CLI commands through the terminal tool's IPC bridge rather than as additional native tools.
 For instance, web search is done by executing `websearch "query"` through the terminal tool, not by calling a separate native `websearch` tool. A tool the model provider executes server-side is the exception: it is passed to the provider natively and, while enabled, replaces the corresponding terminal command. High-frequency browser work should use the May-managed `browser` command rather than ad-hoc shell recipes or direct browser installers.
@@ -167,7 +167,7 @@ Do not leave high-frequency capabilities as ad-hoc shell snippets the agent has 
 - Runtime prompt/context rendering must use static typed template inputs. Do not branch on enabled/disabled states to hand-build prompt strings in Rust and then pass those strings into templates.
 - Text the model reads — tool results, notices, alerts and reminders — is natural language rendered from a typed template; no serializer output (JSON, XML) reaches the model, except data a command or an external tool itself produced and the schema of output the model must emit.
 - Prefer runtime-agnostic async primitives. Do not introduce new `tokio::*` filesystem, timer, task, process, or networking usage when an existing runtime-neutral abstraction already fits this codebase (for example `async_fs`, `futures-lite`, `blocking`, `zenwave`, or existing executor abstractions). If a path must work outside a Tokio reactor, keep it Tokio-free.
-- **Native tools.** The agent's native tools are `terminal`, `terminal_background`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact`. Every other capability is an IPC CLI command registered through `register_shared_terminal_commands` and invoked from `terminal`, never passed to `TerminalAgentBuilder::tool(...)`. The one exception is a tool the model provider executes server-side, which is passed to the provider natively and, while enabled, replaces the corresponding terminal command.
+- **Native tools.** The agent's native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact`. Every other capability is an IPC CLI command registered through `register_shared_terminal_commands` and invoked from `terminal`, never passed to `TerminalAgentBuilder::tool(...)`. The one exception is a tool the model provider executes server-side, which is passed to the provider natively and, while enabled, replaces the corresponding terminal command.
 - May has no setting that needs a restart to apply; configuration updates live.
 - System alerts are event-driven and one-shot: an alert is injected when its event happens and never again. Nothing replays, restates or regenerates alerts, after compaction or otherwise.
 - Never rewrite the cached prompt prefix while the provider's cache is still warm; work that rewrites it (reassembly) runs only after the cache lifetime has passed.

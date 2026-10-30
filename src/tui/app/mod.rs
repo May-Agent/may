@@ -1239,8 +1239,8 @@ impl App {
 
     /// Resolve a background task id into a user-facing label: the job's
     /// script when the registry knows it, else the description (or command)
-    /// of the call whose output introduced the id — the `terminal_background`
-    /// result that named it. The id itself is never surfaced.
+    /// of the call whose output introduced the id — the `terminal` result
+    /// that named it. The id itself is never surfaced.
     fn resolve_task_label(&self, task_id: &str) -> Option<String> {
         use super::ui::chat::ChatElement;
         if let Some(job) = self.jobs.iter().find(|job| job.task_id == task_id) {
