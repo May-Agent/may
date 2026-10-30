@@ -844,9 +844,17 @@ impl App {
                 ChatElement::ToolCall { display, .. } => {
                     let summary = match display {
                         ToolDisplay::Terminal {
-                            command, output, ..
+                            description,
+                            command,
+                            output,
+                            ..
                         } => {
-                            let mut text = format!("ran terminal command:\n{command}");
+                            let lead = if description.is_empty() {
+                                "ran terminal command".to_string()
+                            } else {
+                                format!("ran terminal command ({description})")
+                            };
+                            let mut text = format!("{lead}:\n{command}");
                             if let Some(info) = output
                                 && !info.output.is_empty()
                             {
@@ -856,11 +864,22 @@ impl App {
                             }
                             text
                         }
-                        ToolDisplay::Search { query, .. } => format!("web search: {query}"),
-                        ToolDisplay::Fetch { url, .. } => format!("fetched {url}"),
-                        ToolDisplay::Task {
-                            subagent, prompt, ..
-                        } => format!("delegated to subagent {subagent}: {prompt}"),
+                        ToolDisplay::Action {
+                            chip,
+                            summary,
+                            output,
+                            ..
+                        } => {
+                            let mut text = format!("called {chip}: {summary}");
+                            if let Some(info) = output
+                                && !info.output.is_empty()
+                            {
+                                let tail: String = info.output.chars().take(600).collect();
+                                text.push_str("\noutput:\n");
+                                text.push_str(&tail);
+                            }
+                            text
+                        }
                         ToolDisplay::Builtin { tool, detail, .. } => {
                             format!("hosted tool {tool}: {detail}")
                         }
@@ -1216,6 +1235,40 @@ impl App {
                 })
             }
         }
+    }
+
+    /// Resolve a background task id into a user-facing label: the job's
+    /// script when the registry knows it, else the description (or command)
+    /// of the call whose output introduced the id — the `terminal_background`
+    /// result that named it. The id itself is never surfaced.
+    fn resolve_task_label(&self, task_id: &str) -> Option<String> {
+        use super::ui::chat::ChatElement;
+        if let Some(job) = self.jobs.iter().find(|job| job.task_id == task_id) {
+            return job.script.lines().next().map(str::to_string);
+        }
+        self.chat.elements().iter().find_map(|element| {
+            let ChatElement::ToolCall {
+                display:
+                    ToolDisplay::Terminal {
+                        description,
+                        command,
+                        output,
+                        ..
+                    },
+                ..
+            } = element
+            else {
+                return None;
+            };
+            let info = output.as_ref()?;
+            info.output.contains(task_id).then(|| {
+                if description.is_empty() {
+                    command.lines().next().unwrap_or_default().to_string()
+                } else {
+                    description.clone()
+                }
+            })
+        })
     }
 
     /// Recover an image produced by the `imagine` command: it writes into
@@ -2653,12 +2706,14 @@ impl App {
         self.chat.push_tool(
             id.clone(),
             ToolDisplay::Terminal {
+                description: String::new(),
                 command: format!("! {masked}"),
                 mode: aither_sandbox::TerminalExecutionMode::Default,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
-                expanded: false,
+                pinned: None,
+                finished_at: None,
             },
         );
         self.scroll = usize::MAX;
@@ -2864,21 +2919,64 @@ impl App {
                         self.thinking_start = None;
                         self.decode_meter.note_boundary();
                         let display = match parse_tool_start(&name, &arguments) {
-                            ToolStartKind::Terminal { command, mode } => ToolDisplay::Terminal {
-                                command,
+                            ToolStartKind::Terminal {
+                                description,
+                                script,
+                                mode,
+                            } => ToolDisplay::Terminal {
+                                description,
+                                command: script,
                                 mode,
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
                                 diffs: Vec::new(),
-                                expanded: false,
+                                pinned: None,
+                                finished_at: None,
                             },
-                            ToolStartKind::Generic { name, arguments } => ToolDisplay::Terminal {
-                                command: format!("{name} {arguments}"),
-                                mode: aither_sandbox::TerminalExecutionMode::Default,
+                            ToolStartKind::Stdin { task_id, input } => {
+                                let mut detail: Vec<String> = Vec::new();
+                                if let Some(target) = self.resolve_task_label(&task_id) {
+                                    detail.push(format!("→ {target}"));
+                                }
+                                if input.lines().count() > 1 {
+                                    detail.extend(input.lines().map(str::to_string));
+                                }
+                                ToolDisplay::Action {
+                                    chip: "stdin".to_string(),
+                                    task_id: Some(task_id),
+                                    summary: input.lines().next().unwrap_or_default().to_string(),
+                                    detail,
+                                    status: super::ui::chat::ToolStatus::Running,
+                                    output: None,
+                                    pinned: None,
+                                    finished_at: None,
+                                }
+                            }
+                            ToolStartKind::JobControl { action, task_id } => ToolDisplay::Action {
+                                chip: action.chip().to_string(),
+                                task_id: Some(task_id.clone()),
+                                summary: self
+                                    .resolve_task_label(&task_id)
+                                    .unwrap_or_else(|| "background task".to_string()),
+                                detail: Vec::new(),
                                 status: super::ui::chat::ToolStatus::Running,
                                 output: None,
-                                diffs: Vec::new(),
-                                expanded: false,
+                                pinned: None,
+                                finished_at: None,
+                            },
+                            ToolStartKind::Generic {
+                                name,
+                                summary,
+                                arguments,
+                            } => ToolDisplay::Action {
+                                chip: name,
+                                task_id: None,
+                                summary,
+                                detail: pretty_arguments(&arguments),
+                                status: super::ui::chat::ToolStatus::Running,
+                                output: None,
+                                pinned: None,
+                                finished_at: None,
                             },
                         };
                         self.chat.push_tool(id, display);
@@ -2895,7 +2993,6 @@ impl App {
                                 self.chat.update_tool_with_output(
                                     &id,
                                     super::ui::chat::ToolStatus::Done,
-                                    None,
                                     Some(out.text.as_str()),
                                 );
                                 if let Some(image) = image
@@ -2908,7 +3005,6 @@ impl App {
                                 self.chat.update_tool_with_output(
                                     &id,
                                     super::ui::chat::ToolStatus::Failed(err),
-                                    None,
                                     None,
                                 );
                             }
@@ -3029,6 +3125,23 @@ impl App {
         let context_window = self.context_window?;
         Some((prompt_tokens, context_window))
     }
+}
+
+/// An unknown tool's argument payload as expanded-body lines: the raw text
+/// when it fits on one line, pretty-printed JSON otherwise.
+fn pretty_arguments(arguments: &str) -> Vec<String> {
+    if arguments.lines().count() <= 1 {
+        return arguments.lines().map(str::to_string).collect();
+    }
+    serde_json::from_str::<serde_json::Value>(arguments).map_or_else(
+        |_| arguments.lines().map(str::to_string).collect(),
+        |value| {
+            serde_json::to_string_pretty(&value).map_or_else(
+                |_| arguments.lines().map(str::to_string).collect(),
+                |pretty| pretty.lines().map(str::to_string).collect(),
+            )
+        },
+    )
 }
 
 /// Actions returned by event handling.
