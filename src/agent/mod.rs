@@ -52,7 +52,9 @@ pub use provider::{
     RequestParameterizedModel, ResolvedProviderRuntime, build_fast_provider_chain,
     provider_candidate_count, resolve_provider_runtime,
 };
-pub use runner::{AgentHandle, AgentWorker, RunLease, TuiEvent, spawn_worker};
+pub use runner::{
+    AgentHandle, AgentWorker, ForeignTurn, RemoteTurn, RunLease, TuiEvent, spawn_worker,
+};
 pub use subagent_tracker::{
     SubagentRunSnapshot, SubagentTracker, TrackedSubagentTool, UsageObservedModel,
 };

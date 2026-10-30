@@ -114,6 +114,14 @@ impl ChatDb {
                 .execute()
                 .await?;
         }
+        if !existing.contains("non_interactive") {
+            query!(
+                db,
+                "ALTER TABLE sessions ADD COLUMN non_interactive BOOLEAN NOT NULL DEFAULT 0"
+            )
+            .execute()
+            .await?;
+        }
         Ok(())
     }
 
