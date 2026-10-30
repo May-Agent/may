@@ -10,7 +10,7 @@ use ratatui::{
 
 use super::super::super::app::App;
 use super::super::super::state::{ConfigEditMode, ConfigSection};
-use super::{centered_rect, char_to_byte_idx};
+use super::{centered_rect, char_to_byte_idx, display_width_prefix};
 
 pub(super) fn render_config_screen(frame: &mut Frame, area: Rect, app: &App) {
     // Guard: need minimum size to render safely
@@ -282,6 +282,24 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
             true,
         );
 
+        // IME anchor on the `|` marker of the focused field (masked fields
+        // show one `*` per char, so width equals the char cursor).
+        let (value, field_area, masked) = match *focused_field {
+            0 => (name, chunks[0], false),
+            1 => (base_url, chunks[1], false),
+            _ => (api_key, chunks[2], true),
+        };
+        let text_w = if masked {
+            *cursor
+        } else {
+            display_width_prefix(value, *cursor)
+        };
+        let caret_x = field_area.x + 1 + u16::try_from(text_w).unwrap_or(u16::MAX);
+        frame.set_cursor_position((
+            caret_x.min(field_area.right().saturating_sub(2)),
+            field_area.y + 1,
+        ));
+
         let instructions =
             Paragraph::new("Tab/↓↑ to switch fields · Enter to save · Esc to cancel")
                 .style(Style::default().fg(Color::DarkGray))
@@ -305,6 +323,13 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
         let display = format!("{}|{}", &masked[..cursor_pos], &masked[cursor_pos..]);
         items[state.selected] = ListItem::new(format!("  API Key: {display}"))
             .style(Style::default().fg(Color::Yellow));
+
+        // IME anchor on the `|` marker inside the selected row.
+        let row = area.y + 1 + u16::try_from(state.selected).unwrap_or(u16::MAX);
+        if row < area.bottom().saturating_sub(1) {
+            let caret_x = area.x + 12 + u16::try_from(cursor).unwrap_or(u16::MAX);
+            frame.set_cursor_position((caret_x.min(area.right().saturating_sub(2)), row));
+        }
     }
 
     let list = List::new(items).block(
@@ -391,6 +416,15 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
         items[state.selected] =
             ListItem::new(format!("  {}: {}", tier_names[state.selected], display))
                 .style(Style::default().fg(Color::Yellow));
+
+        // IME anchor on the `|` marker inside the selected row.
+        let row = area.y + 1 + u16::try_from(state.selected).unwrap_or(u16::MAX);
+        if row < area.bottom().saturating_sub(1) {
+            let prefix = 5 + tier_names[state.selected].len();
+            let caret_x = area.x
+                + u16::try_from(prefix + display_width_prefix(input, cursor)).unwrap_or(u16::MAX);
+            frame.set_cursor_position((caret_x.min(area.right().saturating_sub(2)), row));
+        }
     }
 
     let list = List::new(items).block(
@@ -448,6 +482,11 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
         let display = format!("{}|{}", &input[..cursor_pos], &input[cursor_pos..]);
         items[0] = ListItem::new(format!("  Max iterations:        {display}"))
             .style(Style::default().fg(Color::Yellow));
+
+        // IME anchor on the `|` marker inside the edited row.
+        let caret_x =
+            area.x + 26 + u16::try_from(display_width_prefix(input, cursor)).unwrap_or(u16::MAX);
+        frame.set_cursor_position((caret_x.min(area.right().saturating_sub(2)), area.y + 1));
     }
 
     let list = List::new(items).block(

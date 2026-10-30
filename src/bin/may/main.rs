@@ -104,12 +104,32 @@ fn write_bug_snapshot(
     Ok(path)
 }
 
+/// Stack every tokio worker gets. Spawned threads default to the pthread
+/// stack — 512 KiB on macOS (Linux gives ~8 MiB) — and a terminal-bound
+/// command polls its whole chain on one stack: `subagent` reaches
+/// `route_model` → `generate` → `respond` → hyper nested inside the IPC
+/// call inside the parent run, which aborts debug builds with a stack
+/// overflow. Workers get the main thread's own budget.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 fn ensure_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn tokio_runtime() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .build()
+}
+
+fn main() -> anyhow::Result<()> {
+    tokio_runtime()
+        .context("failed to build the tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
     ensure_rustls_provider();
 
@@ -1851,4 +1871,52 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Terminal-bound tool chains poll deep enough that the pthread default
+    /// (512 KiB on macOS) aborts them; workers must carry the configured stack.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn tokio_workers_carry_the_configured_stack() {
+        let measured = tokio_runtime().expect("runtime builds").block_on(async {
+            tokio::spawn(async { worker_stack_bytes() })
+                .await
+                .expect("worker task joins")
+        });
+        assert!(
+            measured >= WORKER_STACK_BYTES,
+            "tokio worker stack {measured} below configured {WORKER_STACK_BYTES}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn worker_stack_bytes() -> usize {
+        // SAFETY: reads this thread's own stack size; always safe to call.
+        unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn worker_stack_bytes() -> usize {
+        // SAFETY: attr is written by pthread_getattr_np, read, then destroyed.
+        unsafe {
+            let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+            assert_eq!(
+                libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()),
+                0
+            );
+            let attr = attr.assume_init();
+            let mut size = 0usize;
+            assert_eq!(
+                libc::pthread_attr_getstacksize(&raw const attr, &raw mut size),
+                0
+            );
+            let mut attr = attr;
+            libc::pthread_attr_destroy(&raw mut attr);
+            size
+        }
+    }
 }
