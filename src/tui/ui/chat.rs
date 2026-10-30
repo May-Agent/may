@@ -984,6 +984,9 @@ pub struct UnifiedRenderContext<'a> {
     pub view_height_out: Option<&'a AtomicUsize>,
     /// Input line rendered below chat content, when present.
     pub input_ctx: Option<InputContext<'a>>,
+    /// Whether the input caret owns the terminal cursor (IME anchor).
+    /// Only set when the composer actually receives keystrokes.
+    pub input_caret_active: bool,
     /// Queue indicator context, when messages are queued.
     pub queue_ctx: Option<QueueContext<'a>>,
     /// Status bar context, when the bar is shown.
@@ -1001,6 +1004,7 @@ impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
             content_height_out: ctx.content_height_out,
             view_height_out: ctx.view_height_out,
             input_ctx: ctx.input_ctx,
+            input_caret_active: ctx.input_caret_active,
             queue_ctx: ctx.queue_ctx,
             status_ctx: ctx.status_ctx,
             images_supported: ctx.images_supported,
@@ -1646,6 +1650,7 @@ struct RenderContext<'a> {
     content_height_out: Option<&'a AtomicUsize>,
     view_height_out: Option<&'a AtomicUsize>,
     input_ctx: Option<InputContext<'a>>,
+    input_caret_active: bool,
     queue_ctx: Option<QueueContext<'a>>,
     status_ctx: Option<StatusContext<'a>>,
     images_supported: bool,
@@ -1671,6 +1676,7 @@ fn render_impl(
         content_height_out,
         view_height_out,
         input_ctx,
+        input_caret_active,
         queue_ctx,
         status_ctx,
         images_supported,
@@ -1858,13 +1864,18 @@ fn render_impl(
     }
 
     // Render input line if provided (for full-screen scroll mode)
+    let mut input_line_idx = None;
+    let mut caret_line = None;
     if let Some(ctx) = input_ctx {
-        render_input_line(
+        if input_caret_active {
+            caret_line = Some(input_caret_line(&ctx));
+        }
+        input_line_idx = Some(render_input_line(
             &mut lines,
             &ctx,
             images_supported,
             Some(&mut collected_image_positions),
-        );
+        ));
     }
 
     // Render status bar if provided
@@ -1899,10 +1910,14 @@ fn render_impl(
 
     // Keep input/composer anchored to the bottom when content underflows.
     // Use explicit top padding lines to keep wrap + scroll behavior consistent.
+    let top_padding = view_height.saturating_sub(visual_content_height);
+    // Visual row where the input line starts (before padding is applied).
+    let input_top = input_line_idx.map(|idx| {
+        visual_content_height.saturating_sub(total_wrapped_lines(&lines[idx..], render_width))
+    });
     let (scroll_y, final_lines) = if visual_content_height < view_height {
-        let padding = view_height - visual_content_height;
-        let mut padded = Vec::with_capacity(padding + lines.len());
-        for _ in 0..padding {
+        let mut padded = Vec::with_capacity(top_padding + lines.len());
+        for _ in 0..top_padding {
             padded.push(Line::from(""));
         }
         padded.extend(lines);
@@ -1923,6 +1938,22 @@ fn render_impl(
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     frame.render_widget(paragraph, area);
+
+    // Anchor the terminal cursor on the caret cell so IME composition and
+    // its candidate window track the real insertion point.
+    if let (Some(caret_line), Some(input_top)) = (caret_line, input_top)
+        && let Some((cx, cy)) = wrapped_tail_cell(caret_line, area.width)
+    {
+        let caret_row = top_padding + input_top + usize::from(cy);
+        if caret_row >= usize::from(scroll_y)
+            && caret_row - usize::from(scroll_y) < usize::from(area.height)
+        {
+            frame.set_cursor_position((
+                area.x + cx,
+                area.y + u16::try_from(caret_row - usize::from(scroll_y)).unwrap_or(u16::MAX),
+            ));
+        }
+    }
     stats.widget = widget_start.elapsed();
     stats
 }
@@ -1932,31 +1963,11 @@ fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
 }
 
-/// Render the input line into the lines vector. Attached images get a
-/// placeholder block above the input row — the overlay paints the preview
-/// into it — when the terminal supports graphics.
-fn render_input_line(
-    lines: &mut Vec<Line<'_>>,
-    ctx: &InputContext<'_>,
-    images_supported: bool,
-    mut image_positions: Option<&mut Vec<(String, usize)>>,
-) {
-    if images_supported {
-        for att in ctx.attachments {
-            if let Attachment::Image { path, .. } = att {
-                let label = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("image");
-                let index = push_image_rows(lines, label);
-                if let Some(key) = att.image_cache_key()
-                    && let Some(positions) = image_positions.as_mut()
-                {
-                    positions.push((key, index));
-                }
-            }
-        }
-    }
+/// The input `Line` up to and including the caret marker: prompt,
+/// attachment chips and the text before the caret. The caret marker's
+/// cell is where the terminal cursor — and therefore IME composition —
+/// anchors.
+fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
     let mut spans = Vec::new();
 
     // Prompt
@@ -1994,14 +2005,79 @@ fn render_input_line(
         }
     }
 
-    // Input text with cursor (convert char index to byte index)
     let byte_idx = char_to_byte_index(ctx.input, ctx.cursor);
-    let (before, after) = ctx.input.split_at(byte_idx);
-    spans.push(Span::raw(before.to_string()));
+    spans.push(Span::raw(ctx.input[..byte_idx].to_string()));
     spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
-    spans.push(Span::raw(after.to_string()));
+    Line::from(spans)
+}
 
-    lines.push(Line::from(spans));
+/// Cell of `line`'s last grapheme once wrapped to `width`: the caret cell
+/// of the input caret line. Rendering into a scratch buffer keeps this
+/// exactly in step with `Paragraph` wrapping (wide graphemes included).
+fn wrapped_tail_cell(line: Line<'static>, width: u16) -> Option<(u16, u16)> {
+    if width == 0 {
+        return None;
+    }
+    let rows = Paragraph::new(vec![line.clone()])
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    let rows = u16::try_from(rows).unwrap_or(u16::MAX);
+    if rows == 0 {
+        return None;
+    }
+    let buf_area = Rect::new(0, 0, width, rows);
+    let mut buf = Buffer::empty(buf_area);
+    Paragraph::new(vec![line])
+        .wrap(Wrap { trim: false })
+        .render(buf_area, &mut buf);
+    // Trailing cells of wide graphemes are reset to blank, so the last
+    // non-blank cell is the caret marker itself.
+    for y in (buf_area.top()..buf_area.bottom()).rev() {
+        for x in (buf_area.left()..buf_area.right()).rev() {
+            if buf[(x, y)].symbol() != " " {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+/// Render the input line into the lines vector and return its index.
+/// Attached images get a placeholder block above the input row — the
+/// overlay paints the preview into it — when the terminal supports
+/// graphics.
+fn render_input_line(
+    lines: &mut Vec<Line<'_>>,
+    ctx: &InputContext<'_>,
+    images_supported: bool,
+    mut image_positions: Option<&mut Vec<(String, usize)>>,
+) -> usize {
+    if images_supported {
+        for att in ctx.attachments {
+            if let Attachment::Image { path, .. } = att {
+                let label = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image");
+                let index = push_image_rows(lines, label);
+                if let Some(key) = att.image_cache_key()
+                    && let Some(positions) = image_positions.as_mut()
+                {
+                    positions.push((key, index));
+                }
+            }
+        }
+    }
+
+    // Input text with caret (convert char index to byte index)
+    let mut line = input_caret_line(ctx);
+    let byte_idx = char_to_byte_index(ctx.input, ctx.cursor);
+    line.spans
+        .push(Span::raw(ctx.input[byte_idx..].to_string()));
+
+    let index = lines.len();
+    lines.push(line);
+    index
 }
 
 /// Render queued messages into the lines vector.

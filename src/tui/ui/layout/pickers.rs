@@ -7,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::super::super::app::App;
 use super::{centered_rect, centered_rect_exact};
@@ -101,6 +102,13 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
         ])
     };
     frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[1]);
+    let caret_x = chunks[1].x
+        + 8
+        + u16::try_from(UnicodeWidthStr::width(app.session_search.as_str())).unwrap_or(u16::MAX);
+    frame.set_cursor_position((
+        caret_x.min(chunks[1].right().saturating_sub(1)),
+        chunks[1].y,
+    ));
 
     // Build display lines with section headers
     let list_height = chunks[2].height as usize;
@@ -532,6 +540,12 @@ pub(super) fn render_file_picker_popup(frame: &mut Frame, area: Rect, app: &App)
     );
 
     frame.render_widget(search_input, chunks[0]);
+    let caret_x =
+        chunks[0].x + 1 + u16::try_from(UnicodeWidthStr::width(query)).unwrap_or(u16::MAX);
+    frame.set_cursor_position((
+        caret_x.min(chunks[0].right().saturating_sub(2)),
+        chunks[0].y + 1,
+    ));
 
     // Results list
     let max_visible = (chunks[1].height as usize).saturating_sub(2);
