@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use aither_agent::ContextWindowPhase;
 use aither_sandbox::TerminalExecutionMode;
@@ -26,8 +27,6 @@ pub enum ToolStatus {
     Running,
     /// Tool call completed.
     Done,
-    /// Search completed with N results.
-    SearchDone(usize),
     /// Tool call failed with an error message.
     Failed(String),
 }
@@ -134,39 +133,11 @@ impl TerminalCallInfo {
 /// Display representation of a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolDisplay {
-    /// Web search query executed through the terminal command tool.
-    Search {
-        /// Search query text.
-        query: String,
-        /// Call status.
-        status: ToolStatus,
-        /// Result count once completed.
-        results: Option<usize>,
-        /// The underlying terminal call info.
-        terminal_info: Option<TerminalCallInfo>,
-    },
-    /// URL fetch executed through the terminal command tool.
-    Fetch {
-        /// Fetched URL.
-        url: String,
-        /// Call status.
-        status: ToolStatus,
-        /// The underlying terminal call info.
-        terminal_info: Option<TerminalCallInfo>,
-    },
-    /// Subagent task.
-    Task {
-        /// Subagent name.
-        subagent: String,
-        /// Prompt given to the subagent.
-        prompt: String,
-        /// Call status.
-        status: ToolStatus,
-        /// Terminal calls made by this subagent (most recent at end).
-        terminal_calls: Vec<TerminalCallInfo>,
-    },
-    /// Direct terminal command.
+    /// A `terminal` or `terminal_background` script execution.
     Terminal {
+        /// Model-provided summary shown as the headline; empty for `!`
+        /// bash calls, which headline their command instead.
+        description: String,
         /// Command text.
         command: String,
         /// Requested execution backend.
@@ -177,8 +148,32 @@ pub enum ToolDisplay {
         output: Option<TerminalCallInfo>,
         /// File changes attributed to this call (one per tracked root).
         diffs: Vec<crate::file_tracker::RootDiff>,
-        /// Long commands/diffs start collapsed; a click toggles this.
-        expanded: bool,
+        /// Expansion pinned by a click; `None` follows the automatic rule.
+        pinned: Option<bool>,
+        /// When the call finished; drives automatic collapse.
+        finished_at: Option<Instant>,
+    },
+    /// A labelled action: a terminal control call (`terminal_input`,
+    /// `terminal_read`, `terminal_kill`) or any other tool invocation.
+    Action {
+        /// Chip label shown in brackets — `stdin`, `read`, `kill`, or the
+        /// tool name.
+        chip: String,
+        /// Background task id the call acts on, kept only to scrub it from
+        /// the result text — the id itself is never rendered.
+        task_id: Option<String>,
+        /// One-line user-facing summary.
+        summary: String,
+        /// Extra body lines rendered in the expanded body, above the output.
+        detail: Vec<String>,
+        /// Call status.
+        status: ToolStatus,
+        /// The output from this call.
+        output: Option<TerminalCallInfo>,
+        /// Expansion pinned by a click; `None` follows the automatic rule.
+        pinned: Option<bool>,
+        /// When the call finished; drives automatic collapse.
+        finished_at: Option<Instant>,
     },
     /// Provider-hosted (server-side) tool call — the provider executes it,
     /// the harness only observes start and result events.
@@ -191,13 +186,20 @@ pub enum ToolDisplay {
         status: ToolStatus,
         /// Result summary once the provider reports it.
         output: Option<String>,
+        /// Expansion pinned by a click; `None` follows the automatic rule.
+        pinned: Option<bool>,
+        /// When the call finished; drives automatic collapse.
+        finished_at: Option<Instant>,
     },
 }
 
-/// Multi-line commands longer than this collapse to their first line.
-const COLLAPSE_COMMAND_LINES: usize = 3;
-/// Diffs with more lines than this collapse to their `±` summary.
-const COLLAPSE_DIFF_LINES: usize = 8;
+/// A finished call keeps its body open this long before it auto-collapses
+/// to its headline.
+const RECENT_EXPAND: std::time::Duration = std::time::Duration::from_secs(15);
+/// Output lines previewed inside an expanded body.
+const OUTPUT_PREVIEW_LINES: usize = 3;
+/// Diff lines previewed per root inside an expanded body.
+const DIFF_PREVIEW_LINES: usize = 8;
 
 /// A screen-row span (in `rendered_plain_lines` space) owned by one
 /// collapsible element — a click inside toggles its expansion.
@@ -212,43 +214,58 @@ pub struct ClickRegion {
 }
 
 impl ToolDisplay {
-    /// Whether this call's body is long enough to be collapsible.
+    /// Whether the call has a body worth expanding — something beyond the
+    /// headline. A call without one renders its headline bare, with no
+    /// expand marker and no click region.
     #[must_use]
-    pub fn is_collapsible(&self) -> bool {
+    pub fn expandable(&self) -> bool {
         match self {
-            Self::Terminal { command, diffs, .. } => {
-                command.lines().count() > COLLAPSE_COMMAND_LINES
-                    || diffs.iter().map(|d| d.text.lines().count()).sum::<usize>()
-                        > COLLAPSE_DIFF_LINES
+            Self::Terminal { .. } => true,
+            Self::Action { detail, output, .. } => {
+                !detail.is_empty() || output.as_ref().is_some_and(|info| !info.output.is_empty())
             }
-            Self::Search { .. } | Self::Fetch { .. } | Self::Task { .. } | Self::Builtin { .. } => {
-                false
-            }
+            Self::Builtin { output, .. } => output.as_ref().is_some_and(|text| !text.is_empty()),
         }
     }
 
-    /// Get the most recent terminal call for this tool.
+    /// The user-set expansion pin shared by every variant.
     #[must_use]
-    pub fn latest_terminal(&self) -> Option<&TerminalCallInfo> {
+    const fn pinned(&self) -> Option<bool> {
         match self {
-            Self::Search { terminal_info, .. } | Self::Fetch { terminal_info, .. } => {
-                terminal_info.as_ref()
-            }
-            Self::Task { terminal_calls, .. } => terminal_calls.last(),
-            Self::Terminal { output, .. } => output.as_ref(),
-            Self::Builtin { .. } => None,
+            Self::Terminal { pinned, .. }
+            | Self::Action { pinned, .. }
+            | Self::Builtin { pinned, .. } => *pinned,
         }
+    }
+
+    /// When the call finished, shared by every variant.
+    #[must_use]
+    const fn finished_at(&self) -> Option<Instant> {
+        match self {
+            Self::Terminal { finished_at, .. }
+            | Self::Action { finished_at, .. }
+            | Self::Builtin { finished_at, .. } => *finished_at,
+        }
+    }
+
+    /// Whether the body renders open at `now`: a click pin wins; otherwise
+    /// the body is open while the call runs and for [`RECENT_EXPAND`]
+    /// after it finishes.
+    #[must_use]
+    pub fn body_open(&self, now: Instant) -> bool {
+        self.pinned().unwrap_or_else(|| {
+            matches!(self.status(), ToolStatus::Running)
+                || self
+                    .finished_at()
+                    .is_some_and(|at| now.duration_since(at) < RECENT_EXPAND)
+        })
     }
 
     /// Get all terminal calls for this tool.
     #[must_use]
     pub fn all_terminal_calls(&self) -> Vec<&TerminalCallInfo> {
         match self {
-            Self::Search { terminal_info, .. } | Self::Fetch { terminal_info, .. } => {
-                terminal_info.iter().collect()
-            }
-            Self::Task { terminal_calls, .. } => terminal_calls.iter().collect(),
-            Self::Terminal { output, .. } => output.iter().collect(),
+            Self::Terminal { output, .. } | Self::Action { output, .. } => output.iter().collect(),
             Self::Builtin { .. } => Vec::new(),
         }
     }
@@ -257,29 +274,9 @@ impl ToolDisplay {
     #[must_use]
     pub const fn status(&self) -> &ToolStatus {
         match self {
-            Self::Search { status, .. }
-            | Self::Fetch { status, .. }
-            | Self::Task { status, .. }
-            | Self::Terminal { status, .. }
+            Self::Terminal { status, .. }
+            | Self::Action { status, .. }
             | Self::Builtin { status, .. } => status,
-        }
-    }
-
-    /// Check if this is a subagent task.
-    #[must_use]
-    pub const fn is_subagent(&self) -> bool {
-        matches!(self, Self::Task { .. })
-    }
-
-    /// Get a short type name for display.
-    #[must_use]
-    pub fn type_name(&self) -> &str {
-        match self {
-            Self::Search { .. } => "search",
-            Self::Fetch { .. } => "fetch",
-            Self::Task { subagent, .. } => subagent,
-            Self::Terminal { .. } => "terminal",
-            Self::Builtin { tool, .. } => tool,
         }
     }
 
@@ -567,6 +564,8 @@ impl ChatStream {
                 detail,
                 status: ToolStatus::Running,
                 output: None,
+                pinned: None,
+                finished_at: None,
             },
         });
     }
@@ -577,12 +576,19 @@ impl ChatStream {
         for elem in &mut self.elements {
             if let ChatElement::ToolCall {
                 id: tool_id,
-                display: ToolDisplay::Builtin { status, output, .. },
+                display:
+                    ToolDisplay::Builtin {
+                        status,
+                        output,
+                        finished_at,
+                        ..
+                    },
             } = elem
                 && tool_id == id
             {
                 *status = ToolStatus::Done;
                 *output = Some(result);
+                *finished_at = Some(Instant::now());
                 return;
             }
         }
@@ -594,18 +600,15 @@ impl ChatStream {
                 detail: String::new(),
                 status: ToolStatus::Done,
                 output: Some(result),
+                pinned: None,
+                finished_at: Some(Instant::now()),
             },
         });
     }
 
-    /// Update a tool's status and output by ID.
-    pub fn update_tool_with_output(
-        &mut self,
-        id: &str,
-        status: ToolStatus,
-        results: Option<usize>,
-        output: Option<&str>,
-    ) {
+    /// Update a tool's status and output by ID. A non-`Running` status stamps
+    /// the call's finish time, which the automatic collapse counts from.
+    pub fn update_tool_with_output(&mut self, id: &str, status: ToolStatus, output: Option<&str>) {
         for elem in &mut self.elements {
             if let ChatElement::ToolCall {
                 id: tool_id,
@@ -613,47 +616,19 @@ impl ChatStream {
             } = elem
                 && tool_id == id
             {
+                let finished = !matches!(status, ToolStatus::Running);
                 match display {
-                    ToolDisplay::Search {
-                        status: s,
-                        results: r,
-                        terminal_info,
-                        ..
-                    } => {
-                        *s = status;
-                        *r = results;
-                        if let Some(out) = output
-                            && let Some(info) = terminal_info
-                        {
-                            info.output.clear();
-                            info.output.push_str(out);
-                        }
-                    }
-                    ToolDisplay::Fetch {
-                        status: s,
-                        terminal_info,
-                        ..
-                    } => {
-                        *s = status;
-                        if let Some(out) = output
-                            && let Some(info) = terminal_info
-                        {
-                            info.output.clear();
-                            info.output.push_str(out);
-                        }
-                    }
-                    ToolDisplay::Task { status: s, .. } => {
-                        *s = status;
-                        // For tasks, output is parsed to extract terminal calls
-                        // This is handled separately via update_subagent_terminal
-                    }
                     ToolDisplay::Terminal {
                         status: s,
                         command,
                         output: out,
+                        finished_at,
                         ..
                     } => {
                         *s = status;
+                        if finished {
+                            *finished_at = Some(Instant::now());
+                        }
                         if let Some(output_text) = output {
                             *out = Some(TerminalCallInfo {
                                 command: command.clone(),
@@ -663,12 +638,40 @@ impl ChatStream {
                             });
                         }
                     }
-                    ToolDisplay::Builtin {
+                    ToolDisplay::Action {
                         status: s,
+                        chip,
+                        task_id,
                         output: out,
+                        finished_at,
                         ..
                     } => {
                         *s = status;
+                        if finished {
+                            *finished_at = Some(Instant::now());
+                        }
+                        if let Some(output_text) = output {
+                            *out = Some(TerminalCallInfo {
+                                command: chip.clone(),
+                                output: task_id.as_ref().map_or_else(
+                                    || output_text.to_string(),
+                                    |id| scrub_task_id(output_text, id),
+                                ),
+                                output_file: None,
+                                image: None,
+                            });
+                        }
+                    }
+                    ToolDisplay::Builtin {
+                        status: s,
+                        output: out,
+                        finished_at,
+                        ..
+                    } => {
+                        *s = status;
+                        if finished {
+                            *finished_at = Some(Instant::now());
+                        }
                         if let Some(output_text) = output {
                             *out = Some(output_text.to_string());
                         }
@@ -679,17 +682,21 @@ impl ChatStream {
         }
     }
 
-    /// Flip the expanded state of a collapsible element (tool call or
-    /// thinking block).
+    /// Flip the expansion of a collapsible element (tool call or thinking
+    /// block). For tool calls this sets the click pin: `Some(true)` pins the
+    /// body open, `Some(false)` pins it shut, overriding the automatic rule.
     pub fn toggle_expanded(&mut self, id: &str) {
         for elem in &mut self.elements {
             match elem {
                 ChatElement::ToolCall {
                     id: tool_id,
                     display,
-                } if tool_id == id && display.is_collapsible() => {
-                    if let ToolDisplay::Terminal { expanded, .. } = display {
-                        *expanded = !*expanded;
+                } if tool_id == id && display.expandable() => {
+                    let open = display.body_open(Instant::now());
+                    match display {
+                        ToolDisplay::Terminal { pinned, .. }
+                        | ToolDisplay::Action { pinned, .. }
+                        | ToolDisplay::Builtin { pinned, .. } => *pinned = Some(!open),
                     }
                     break;
                 }
@@ -765,18 +772,7 @@ impl ChatStream {
                 && tool_id == id
             {
                 match display {
-                    ToolDisplay::Search { terminal_info, .. }
-                    | ToolDisplay::Fetch { terminal_info, .. } => {
-                        if let Some(info) = terminal_info {
-                            info.image = Some(image);
-                        }
-                    }
-                    ToolDisplay::Task { terminal_calls, .. } => {
-                        if let Some(latest) = terminal_calls.last_mut() {
-                            latest.image = Some(image);
-                        }
-                    }
-                    ToolDisplay::Terminal { output, .. } => {
+                    ToolDisplay::Terminal { output, .. } | ToolDisplay::Action { output, .. } => {
                         if let Some(info) = output {
                             info.image = Some(image);
                         }
@@ -811,21 +807,6 @@ impl ChatStream {
                         );
                     }
                 }
-                break;
-            }
-        }
-    }
-
-    /// Add a terminal call to a subagent task.
-    pub fn update_subagent_terminal(&mut self, id: &str, terminal_info: TerminalCallInfo) {
-        for elem in &mut self.elements {
-            if let ChatElement::ToolCall {
-                id: tool_id,
-                display: ToolDisplay::Task { terminal_calls, .. },
-            } = elem
-                && tool_id == id
-            {
-                terminal_calls.push(terminal_info);
                 break;
             }
         }
@@ -999,6 +980,9 @@ pub struct UnifiedRenderContext<'a> {
     pub view_height_out: Option<&'a AtomicUsize>,
     /// Input line rendered below chat content, when present.
     pub input_ctx: Option<InputContext<'a>>,
+    /// Whether the input caret owns the terminal cursor (IME anchor).
+    /// Only set when the composer actually receives keystrokes.
+    pub input_caret_active: bool,
     /// Queue indicator context, when messages are queued.
     pub queue_ctx: Option<QueueContext<'a>>,
     /// Status bar context, when the bar is shown.
@@ -1016,6 +1000,7 @@ impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
             content_height_out: ctx.content_height_out,
             view_height_out: ctx.view_height_out,
             input_ctx: ctx.input_ctx,
+            input_caret_active: ctx.input_caret_active,
             queue_ctx: ctx.queue_ctx,
             status_ctx: ctx.status_ctx,
             images_supported: ctx.images_supported,
@@ -1061,7 +1046,7 @@ pub fn build_plain_wrapped_lines_unified(
             out.append(&mut wrap_plain_line(&plain_text(&line), max_width));
         }
         let collapsible_id = match elem {
-            ChatElement::ToolCall { id, display } if display.is_collapsible() => Some(id.clone()),
+            ChatElement::ToolCall { id, display } if display.expandable() => Some(id.clone()),
             ChatElement::Thinking {
                 id,
                 expanded: false,
@@ -1356,143 +1341,114 @@ fn plain_lines_for_element(elem: &ChatElement, images_supported: bool) -> Vec<Li
     lines
 }
 
+/// The one-line headline a call renders: `▸`/`▾`-suffixed description,
+/// chip + summary, or the command itself when no description exists.
+fn tool_headline(display: &ToolDisplay) -> String {
+    match display {
+        ToolDisplay::Terminal {
+            description,
+            command,
+            mode,
+            ..
+        } => {
+            if description.is_empty() {
+                format!(
+                    "{}$ {}",
+                    terminal_mode_marker(*mode),
+                    command.lines().next().unwrap_or_default()
+                )
+            } else {
+                description.clone()
+            }
+        }
+        ToolDisplay::Action { chip, summary, .. } => {
+            let (label, rest) = action_headline(chip, summary);
+            format!("{label} {rest}").trim_end().to_string()
+        }
+        ToolDisplay::Builtin { tool, detail, .. } => {
+            format!("[{tool}] {detail}").trim_end().to_string()
+        }
+    }
+}
+
+/// Remove a background task id from a tool's result text, replacing its
+/// quoted and bare occurrences with a readable referent.
+fn scrub_task_id(text: &str, task_id: &str) -> String {
+    text.replace(&format!("task '{task_id}'"), "task")
+        .replace(&format!("Task '{task_id}'"), "Task")
+        .replace(&format!("task_id={task_id}"), "task")
+        .replace(task_id, "the task")
+}
+
+/// Status shown inside an expanded body (`↳ running`), or `None` when the
+/// call finished cleanly.
+fn body_status_text(status: &ToolStatus) -> Option<String> {
+    match status {
+        ToolStatus::Running => Some("running".to_string()),
+        ToolStatus::Done => None,
+        ToolStatus::Failed(e) => Some(format!("failed: {e}")),
+    }
+}
+
+/// Status suffix appended to a collapsed headline — only when the state is
+/// worth surfacing while folded.
+fn collapsed_status_suffix(display: &ToolDisplay, open: bool) -> String {
+    if open {
+        return String::new();
+    }
+    match display.status() {
+        ToolStatus::Running => " — running".to_string(),
+        ToolStatus::Done => String::new(),
+        ToolStatus::Failed(e) => format!(" — failed: {e}"),
+    }
+}
+
 /// Plain-text mirror of `render_tool_inline` for one tool call.
 fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, images_supported: bool) {
+    let expandable = display.expandable();
+    let open = expandable && display.body_open(Instant::now());
+    let marker = if !expandable {
+        "  "
+    } else if open {
+        "▾ "
+    } else {
+        "▸ "
+    };
+    lines.push(Line::from(format!(
+        "{marker}{}{}",
+        tool_headline(display),
+        collapsed_status_suffix(display, open)
+    )));
+    if !open {
+        return;
+    }
     match display {
-        ToolDisplay::Search {
-            query,
-            status,
-            results,
-            terminal_info,
-        } => {
-            let status_text = match status {
-                ToolStatus::Running => "...".to_string(),
-                ToolStatus::Done => results.map_or(String::new(), |n| format!("{n} results")),
-                ToolStatus::SearchDone(n) => format!("{n} results"),
-                ToolStatus::Failed(e) => format!("failed: {e}"),
-            };
-            let query_display = if status_text.is_empty() {
-                format!("\"{query}\"")
-            } else {
-                format!("\"{query}\" {status_text}")
-            };
-            lines.push(Line::from(format!("  [search] {query_display}")));
-            if let Some(info) = terminal_info
-                && !info.output.is_empty()
-            {
-                for line in info.output_preview(2).lines() {
-                    lines.push(Line::from(format!("    {line}")));
-                }
-            }
-            if images_supported
-                && let Some(_) = terminal_info.as_ref().and_then(|info| info.image.as_ref())
-            {
-                push_image_rows(lines);
-            }
-        }
-        ToolDisplay::Fetch {
-            url,
-            status,
-            terminal_info,
-        } => {
-            let status_text = match status {
-                ToolStatus::Running => "...",
-                ToolStatus::Done | ToolStatus::SearchDone(_) => "",
-                ToolStatus::Failed(_) => "failed",
-            };
-            let url_display = if status_text.is_empty() {
-                url.clone()
-            } else {
-                format!("{url} {status_text}")
-            };
-            lines.push(Line::from(format!("  [fetch] {url_display}")));
-            if let Some(info) = terminal_info
-                && !info.output.is_empty()
-            {
-                for line in info.output_preview(2).lines() {
-                    lines.push(Line::from(format!("    {line}")));
-                }
-            }
-            if images_supported
-                && let Some(_) = terminal_info.as_ref().and_then(|info| info.image.as_ref())
-            {
-                push_image_rows(lines);
-            }
-        }
-        ToolDisplay::Task {
-            subagent,
-            prompt,
-            status,
-            terminal_calls,
-        } => {
-            let status_text = match status {
-                ToolStatus::Running => "...",
-                ToolStatus::Done | ToolStatus::SearchDone(_) => "",
-                ToolStatus::Failed(_) => "failed",
-            };
-            let prompt_preview = match prompt.char_indices().nth(50) {
-                Some((pos, _)) => format!("{}...", &prompt[..pos]),
-                None => prompt.clone(),
-            };
-            let prompt_display = if status_text.is_empty() {
-                prompt_preview
-            } else {
-                format!("{prompt_preview} {status_text}")
-            };
-            lines.push(Line::from(format!(
-                "  [subagent:{subagent}] {prompt_display}"
-            )));
-            if let Some(latest) = terminal_calls.last() {
-                lines.push(Line::from(format!("    $ {}", latest.command_preview(60))));
-                if !latest.output.is_empty() {
-                    for line in latest.output_preview(2).lines() {
-                        lines.push(Line::from(format!("      {line}")));
-                    }
-                }
-                if images_supported && latest.image.is_some() {
-                    push_image_rows(lines);
-                }
-            }
-        }
         ToolDisplay::Terminal {
             command,
             mode,
             status,
             output,
             diffs,
-            expanded,
+            ..
         } => {
-            let status_text = match status {
-                ToolStatus::Running => Some("running".to_string()),
-                ToolStatus::Done => None,
-                ToolStatus::SearchDone(n) => Some(format!("{n} results")),
-                ToolStatus::Failed(e) => Some(format!("failed: {e}")),
-            };
             let mode_prefix = terminal_mode_marker(*mode);
             let mut command_lines = command.lines();
             if let Some(first) = command_lines.next() {
-                lines.push(Line::from(format!("  {mode_prefix}$ {first}")));
-                let hidden = command.lines().count() - 1;
-                if !*expanded && command.lines().count() > COLLAPSE_COMMAND_LINES {
-                    lines.push(Line::from(format!(
-                        "  ▸ … {hidden} more lines — click to expand"
-                    )));
-                } else {
-                    for line in command_lines {
-                        lines.push(Line::from(format!("  │ {line}")));
-                    }
+                lines.push(Line::from(format!("{mode_prefix}$ {first}")));
+                for line in command_lines {
+                    lines.push(Line::from(format!("│ {line}")));
                 }
             } else {
-                lines.push(Line::from(format!("  {mode_prefix}$")));
+                lines.push(Line::from(format!("{mode_prefix}$")));
             }
-            if let Some(status) = status_text {
-                lines.push(Line::from(format!("  ↳ {status}")));
+            if let Some(status_text) = body_status_text(status) {
+                lines.push(Line::from(format!("↳ {status_text}")));
             }
             if let Some(info) = output
                 && !info.output.is_empty()
             {
-                for line in info.output_preview(3).lines() {
-                    lines.push(Line::from(format!("  │ {line}")));
+                for line in info.output_preview(OUTPUT_PREVIEW_LINES).lines() {
+                    lines.push(Line::from(format!("│ {line}")));
                 }
             }
             if images_supported
@@ -1500,29 +1456,49 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, image
             {
                 push_image_rows(lines);
             }
-            plain_diff_lines(diffs, *expanded, lines);
+            plain_diff_lines(diffs, lines);
         }
-        ToolDisplay::Builtin {
-            tool,
+        ToolDisplay::Action {
             detail,
             status,
             output,
+            ..
         } => {
-            let status_text = match status {
-                ToolStatus::Running => "running...".to_string(),
-                ToolStatus::Done => String::new(),
-                ToolStatus::SearchDone(n) => format!("{n} results"),
-                ToolStatus::Failed(e) => format!("failed: {e}"),
-            };
-            let header = if status_text.is_empty() {
-                format!("  [{tool}] {detail}")
-            } else {
-                format!("  [{tool}] {detail} {status_text}")
-            };
-            lines.push(Line::from(header.trim_end().to_string()));
-            if let Some(out) = output {
-                for line in out.lines().take(3) {
-                    lines.push(Line::from(format!("    {line}")));
+            for line in detail.iter().take(DIFF_PREVIEW_LINES) {
+                lines.push(Line::from(format!("│ {line}")));
+            }
+            if detail.len() > DIFF_PREVIEW_LINES {
+                lines.push(Line::from(format!(
+                    "│ … {} more lines",
+                    detail.len() - DIFF_PREVIEW_LINES
+                )));
+            }
+            if let Some(status_text) = body_status_text(status) {
+                lines.push(Line::from(format!("↳ {status_text}")));
+            }
+            if let Some(info) = output
+                && !info.output.is_empty()
+            {
+                for line in info.output_preview(OUTPUT_PREVIEW_LINES).lines() {
+                    lines.push(Line::from(format!("│ {line}")));
+                }
+            }
+            if images_supported
+                && output
+                    .as_ref()
+                    .and_then(|info| info.image.as_ref())
+                    .is_some()
+            {
+                push_image_rows(lines);
+            }
+        }
+        ToolDisplay::Builtin { status, output, .. } => {
+            if let Some(status_text) = body_status_text(status) {
+                lines.push(Line::from(format!("↳ {status_text}")));
+            }
+            if let Some(text) = output {
+                for line in text.lines().take(OUTPUT_PREVIEW_LINES) {
+                    lines.push(Line::from(format!("│ {line}")));
                 }
             }
         }
@@ -1530,43 +1506,28 @@ fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, image
 }
 
 /// Plain-text mirror of `render_diff_preview`.
-fn plain_diff_lines(
-    diffs: &[crate::file_tracker::RootDiff],
-    expanded: bool,
-    lines: &mut Vec<Line<'static>>,
-) {
-    const PREVIEW_LINES: usize = 8;
-    let total: usize = diffs.iter().map(|d| d.text.lines().count()).sum();
-    let collapsed = !expanded && total > COLLAPSE_DIFF_LINES;
-
+fn plain_diff_lines(diffs: &[crate::file_tracker::RootDiff], lines: &mut Vec<Line<'static>>) {
     for (index, diff) in diffs.iter().enumerate() {
         let summary = format!(
-            "± {} file{} (+{} −{}){}",
+            "± {} file{} (+{} −{})",
             diff.files,
             if diff.files == 1 { "" } else { "s" },
             diff.additions,
             diff.deletions,
-            if collapsed { " ▸" } else { "" },
         );
         if diffs.len() > 1 {
-            lines.push(Line::from(format!(
-                "  {summary} in {}",
-                diff.root.display()
-            )));
+            lines.push(Line::from(format!("{summary} in {}", diff.root.display())));
         } else {
-            lines.push(Line::from(format!("  {summary}")));
-        }
-        if collapsed {
-            continue;
+            lines.push(Line::from(summary));
         }
         let count = diff.text.lines().count();
-        for line in diff.text.lines().take(PREVIEW_LINES) {
-            lines.push(Line::from(format!("  │ {line}")));
+        for line in diff.text.lines().take(DIFF_PREVIEW_LINES) {
+            lines.push(Line::from(format!("│ {line}")));
         }
-        if count > PREVIEW_LINES {
+        if count > DIFF_PREVIEW_LINES {
             lines.push(Line::from(format!(
-                "  │ … {} more diff lines",
-                count - PREVIEW_LINES
+                "│ … {} more diff lines",
+                count - DIFF_PREVIEW_LINES
             )));
         }
         if index + 1 < diffs.len() {
@@ -1647,6 +1608,7 @@ struct RenderContext<'a> {
     content_height_out: Option<&'a AtomicUsize>,
     view_height_out: Option<&'a AtomicUsize>,
     input_ctx: Option<InputContext<'a>>,
+    input_caret_active: bool,
     queue_ctx: Option<QueueContext<'a>>,
     status_ctx: Option<StatusContext<'a>>,
     images_supported: bool,
@@ -1672,6 +1634,7 @@ fn render_impl(
         content_height_out,
         view_height_out,
         input_ctx,
+        input_caret_active,
         queue_ctx,
         status_ctx,
         images_supported,
@@ -1859,13 +1822,18 @@ fn render_impl(
     }
 
     // Render input line if provided (for full-screen scroll mode)
+    let mut input_line_idx = None;
+    let mut caret_line = None;
     if let Some(ctx) = input_ctx {
-        render_input_line(
+        if input_caret_active {
+            caret_line = Some(input_caret_line(&ctx));
+        }
+        input_line_idx = Some(render_input_line(
             &mut lines,
             &ctx,
             images_supported,
             Some(&mut collected_image_positions),
-        );
+        ));
     }
 
     // Render status bar if provided
@@ -1912,10 +1880,14 @@ fn render_impl(
 
     // Keep input/composer anchored to the bottom when content underflows.
     // Use explicit top padding lines to keep wrap + scroll behavior consistent.
+    let top_padding = view_height.saturating_sub(visual_content_height);
+    // Visual row where the input line starts (before padding is applied).
+    let input_top = input_line_idx.map(|idx| {
+        visual_content_height.saturating_sub(total_wrapped_lines(&lines[idx..], render_width))
+    });
     let (scroll_y, final_lines) = if visual_content_height < view_height {
-        let padding = view_height - visual_content_height;
-        let mut padded = Vec::with_capacity(padding + lines.len());
-        for _ in 0..padding {
+        let mut padded = Vec::with_capacity(top_padding + lines.len());
+        for _ in 0..top_padding {
             padded.push(Line::from(""));
         }
         padded.extend(lines);
@@ -1936,6 +1908,22 @@ fn render_impl(
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     frame.render_widget(paragraph, area);
+
+    // Anchor the terminal cursor on the caret cell so IME composition and
+    // its candidate window track the real insertion point.
+    if let (Some(caret_line), Some(input_top)) = (caret_line, input_top)
+        && let Some((cx, cy)) = wrapped_tail_cell(caret_line, area.width)
+    {
+        let caret_row = top_padding + input_top + usize::from(cy);
+        if caret_row >= usize::from(scroll_y)
+            && caret_row - usize::from(scroll_y) < usize::from(area.height)
+        {
+            frame.set_cursor_position((
+                area.x + cx,
+                area.y + u16::try_from(caret_row - usize::from(scroll_y)).unwrap_or(u16::MAX),
+            ));
+        }
+    }
     stats.widget = widget_start.elapsed();
     stats
 }
@@ -1958,27 +1946,11 @@ fn wrapped_line_rows(line: &Line<'_>, width: usize) -> usize {
         .line_count(w)
 }
 
-/// Render the input line into the lines vector. Attached images get a
-/// placeholder block above the input row — the overlay paints the preview
-/// into it — when the terminal supports graphics.
-fn render_input_line(
-    lines: &mut Vec<Line<'_>>,
-    ctx: &InputContext<'_>,
-    images_supported: bool,
-    mut image_positions: Option<&mut Vec<(String, usize, String)>>,
-) {
-    if images_supported {
-        for att in ctx.attachments {
-            if let Attachment::Image { path, .. } = att {
-                let index = push_image_rows(lines);
-                if let Some(key) = att.image_cache_key()
-                    && let Some(positions) = image_positions.as_mut()
-                {
-                    positions.push((key, index, path.display().to_string()));
-                }
-            }
-        }
-    }
+/// The input `Line` up to and including the caret marker: prompt,
+/// attachment chips and the text before the caret. The caret marker's
+/// cell is where the terminal cursor — and therefore IME composition —
+/// anchors.
+fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
     let mut spans = Vec::new();
 
     // Prompt
@@ -2016,14 +1988,72 @@ fn render_input_line(
         }
     }
 
-    // Input text with cursor (convert char index to byte index)
     let byte_idx = char_to_byte_index(ctx.input, ctx.cursor);
-    let (before, after) = ctx.input.split_at(byte_idx);
-    spans.push(Span::raw(before.to_string()));
+    spans.push(Span::raw(ctx.input[..byte_idx].to_string()));
     spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
-    spans.push(Span::raw(after.to_string()));
+    Line::from(spans)
+}
 
-    lines.push(Line::from(spans));
+/// Cell of `line`'s last grapheme once wrapped to `width`: the caret cell
+/// of the input caret line. Rendering into a scratch buffer keeps this
+/// exactly in step with `Paragraph` wrapping (wide graphemes included).
+fn wrapped_tail_cell(line: Line<'static>, width: u16) -> Option<(u16, u16)> {
+    if width == 0 {
+        return None;
+    }
+    let rows = u16::try_from(wrapped_line_rows(&line, width as usize)).unwrap_or(u16::MAX);
+    if rows == 0 {
+        return None;
+    }
+    let buf_area = Rect::new(0, 0, width, rows);
+    let mut buf = Buffer::empty(buf_area);
+    Paragraph::new(vec![line])
+        .wrap(Wrap { trim: false })
+        .render(buf_area, &mut buf);
+    // Trailing cells of wide graphemes are reset to blank, so the last
+    // non-blank cell is the caret marker itself.
+    for y in (buf_area.top()..buf_area.bottom()).rev() {
+        for x in (buf_area.left()..buf_area.right()).rev() {
+            if buf[(x, y)].symbol() != " " {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+/// Render the input line into the lines vector and return its index.
+/// Attached images get a placeholder block above the input row — the
+/// overlay paints the preview into it — when the terminal supports
+/// graphics.
+fn render_input_line(
+    lines: &mut Vec<Line<'_>>,
+    ctx: &InputContext<'_>,
+    images_supported: bool,
+    mut image_positions: Option<&mut Vec<(String, usize, String)>>,
+) -> usize {
+    if images_supported {
+        for att in ctx.attachments {
+            if let Attachment::Image { path, .. } = att {
+                let index = push_image_rows(lines);
+                if let Some(key) = att.image_cache_key()
+                    && let Some(positions) = image_positions.as_mut()
+                {
+                    positions.push((key, index, path.display().to_string()));
+                }
+            }
+        }
+    }
+
+    // Input text with caret (convert char index to byte index)
+    let mut line = input_caret_line(ctx);
+    let byte_idx = char_to_byte_index(ctx.input, ctx.cursor);
+    line.spans
+        .push(Span::raw(ctx.input[byte_idx..].to_string()));
+
+    let index = lines.len();
+    lines.push(line);
+    index
 }
 
 /// Render queued messages into the lines vector.
@@ -2222,6 +2252,72 @@ const fn terminal_mode_marker(mode: TerminalExecutionMode) -> &'static str {
     }
 }
 
+/// A tool call's styled headline: expand marker + chip/description +
+/// collapsed status suffix. Mirrors `plain_tool_lines`'s first line.
+fn tool_header_line(display: &ToolDisplay, selection_style: Style, open: bool) -> Line<'_> {
+    let marker = if !display.expandable() {
+        "  "
+    } else if open {
+        "▾ "
+    } else {
+        "▸ "
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![Span::styled(marker, dim)];
+    match display {
+        ToolDisplay::Terminal { .. } => {
+            spans.push(Span::styled(tool_headline(display), selection_style));
+        }
+        ToolDisplay::Action { chip, summary, .. } => {
+            let (label, rest) = action_headline(chip, summary);
+            spans.push(Span::styled(label, chip_style(chip)));
+            if !rest.is_empty() {
+                spans.push(Span::styled(format!(" {rest}"), selection_style));
+            }
+        }
+        ToolDisplay::Builtin { tool, detail, .. } => {
+            spans.push(Span::styled(
+                format!("[{tool}]"),
+                Style::default().fg(Color::Magenta),
+            ));
+            if !detail.is_empty() {
+                spans.push(Span::styled(format!(" {detail}"), selection_style));
+            }
+        }
+    }
+    let suffix = collapsed_status_suffix(display, open);
+    if !suffix.is_empty() {
+        let style = if matches!(display.status(), ToolStatus::Failed(_)) {
+            Style::default().fg(Color::Red)
+        } else {
+            dim
+        };
+        spans.push(Span::styled(suffix, style));
+    }
+    Line::from(spans)
+}
+
+/// An `Action` headline as `(label, rest)`: known IPC command names get a
+/// semantic verb (`websearch` → `Searched "query"`), everything else keeps
+/// its `[chip]` label. `tool_headline` renders the same text plainly.
+fn action_headline(chip: &str, summary: &str) -> (String, String) {
+    match chip {
+        "websearch" => ("Searched".to_string(), format!("\"{summary}\"")),
+        "webfetch" => ("Fetched".to_string(), summary.to_string()),
+        _ => (format!("[{chip}]"), summary.to_string()),
+    }
+}
+
+/// Color for an `Action` chip label.
+fn chip_style(chip: &str) -> Style {
+    match chip {
+        "kill" => Style::default().fg(Color::Red),
+        "stdin" => Style::default().fg(Color::Yellow),
+        "websearch" | "webfetch" => Style::default().fg(Color::Blue),
+        _ => Style::default().fg(Color::Cyan),
+    }
+}
+
 fn render_tool_inline<'a>(
     lines: &mut Vec<Line<'a>>,
     display: &'a ToolDisplay,
@@ -2229,255 +2325,104 @@ fn render_tool_inline<'a>(
     images_supported: bool,
     image_positions: &mut Vec<(String, usize, String)>,
 ) {
-    let selection_marker = if is_selected { "▶ " } else { "  " };
+    let open = display.expandable() && display.body_open(Instant::now());
     let selection_style = if is_selected {
         Style::default().bg(Color::DarkGray)
     } else {
         Style::default()
     };
+    let dim = Style::default().fg(Color::DarkGray);
+
+    lines.push(tool_header_line(display, selection_style, open));
+    if !open {
+        return;
+    }
 
     match display {
-        ToolDisplay::Search {
-            query,
-            status,
-            results,
-            terminal_info,
-        } => {
-            let status_text = match status {
-                ToolStatus::Running => "...".to_string(),
-                ToolStatus::Done => results.map_or(String::new(), |n| format!("{n} results")),
-                ToolStatus::SearchDone(n) => format!("{n} results"),
-                ToolStatus::Failed(e) => format!("failed: {e}"),
-            };
-            let query_display = if status_text.is_empty() {
-                format!("\"{query}\"")
-            } else {
-                format!("\"{query}\" {status_text}")
-            };
-            lines.push(Line::from(vec![
-                Span::raw(selection_marker),
-                Span::styled("[search] ", Style::default().fg(Color::Blue)),
-                Span::styled(query_display, selection_style),
-            ]));
-
-            // Show terminal output preview if available
-            if let Some(info) = terminal_info
-                && !info.output.is_empty()
-            {
-                let preview = info.output_preview(2);
-                for line in preview.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {line}"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-            push_tool_call_image(
-                lines,
-                terminal_info.as_ref(),
-                images_supported,
-                image_positions,
-            );
-        }
-        ToolDisplay::Fetch {
-            url,
-            status,
-            terminal_info,
-        } => {
-            let status_text = match status {
-                ToolStatus::Running => "...",
-                ToolStatus::Done | ToolStatus::SearchDone(_) => "",
-                ToolStatus::Failed(_) => "failed",
-            };
-            let url_display = if status_text.is_empty() {
-                url.clone()
-            } else {
-                format!("{url} {status_text}")
-            };
-            lines.push(Line::from(vec![
-                Span::raw(selection_marker),
-                Span::styled("[fetch] ", Style::default().fg(Color::Cyan)),
-                Span::styled(url_display, selection_style),
-            ]));
-
-            // Show terminal output preview if available
-            if let Some(info) = terminal_info
-                && !info.output.is_empty()
-            {
-                let preview = info.output_preview(2);
-                for line in preview.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {line}"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-            push_tool_call_image(
-                lines,
-                terminal_info.as_ref(),
-                images_supported,
-                image_positions,
-            );
-        }
-        ToolDisplay::Task {
-            subagent,
-            prompt,
-            status,
-            terminal_calls,
-        } => {
-            let status_text = match status {
-                ToolStatus::Running => "...",
-                ToolStatus::Done | ToolStatus::SearchDone(_) => "",
-                ToolStatus::Failed(_) => "failed",
-            };
-
-            // Truncate prompt for display (unicode-safe)
-            let prompt_preview = match prompt.char_indices().nth(50) {
-                Some((pos, _)) => format!("{}...", &prompt[..pos]),
-                None => prompt.clone(),
-            };
-
-            let prompt_display = if status_text.is_empty() {
-                prompt_preview
-            } else {
-                format!("{prompt_preview} {status_text}")
-            };
-
-            lines.push(Line::from(vec![
-                Span::raw(selection_marker),
-                Span::styled(
-                    format!("[subagent:{subagent}] "),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(prompt_display, selection_style),
-            ]));
-
-            // Show most recent terminal call for subagent
-            if let Some(latest) = terminal_calls.last() {
-                let cmd_preview = latest.command_preview(60);
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("$ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(cmd_preview, Style::default().fg(Color::DarkGray)),
-                ]));
-
-                // Show output preview
-                if !latest.output.is_empty() {
-                    let preview = latest.output_preview(2);
-                    for line in preview.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("      {line}"),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                }
-                push_tool_call_image(lines, Some(latest), images_supported, image_positions);
-            }
-        }
         ToolDisplay::Terminal {
             command,
             mode,
             status,
             output,
             diffs,
-            expanded,
+            ..
         } => {
-            let status_text = match status {
-                ToolStatus::Running => Some("running".to_string()),
-                ToolStatus::Done => None,
-                ToolStatus::SearchDone(n) => Some(format!("{n} results")),
-                ToolStatus::Failed(e) => Some(format!("failed: {e}")),
-            };
-
             let mode_prefix = terminal_mode_marker(*mode);
-
             let mut command_lines = command.lines();
             if let Some(first) = command_lines.next() {
                 lines.push(Line::from(vec![
-                    Span::raw(selection_marker),
                     Span::styled(mode_prefix, Style::default().fg(Color::Red).bold()),
-                    Span::styled("$ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("$ ", dim),
                     Span::styled(first.to_string(), selection_style),
                 ]));
-
-                let hidden = command.lines().count() - 1;
-                if !*expanded && command.lines().count() > COLLAPSE_COMMAND_LINES {
+                for line in command_lines {
                     lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(
-                            format!("▸ … {hidden} more lines — click to expand"),
-                            Style::default().fg(Color::DarkGray).italic(),
-                        ),
+                        Span::styled("│ ", dim),
+                        Span::styled(line.to_string(), selection_style),
                     ]));
-                } else {
-                    for line in command_lines {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(line.to_string(), selection_style),
-                        ]));
-                    }
                 }
             } else {
                 lines.push(Line::from(vec![
-                    Span::raw(selection_marker),
                     Span::styled(mode_prefix, Style::default().fg(Color::Red).bold()),
-                    Span::styled("$", Style::default().fg(Color::DarkGray)),
+                    Span::styled("$", dim),
                 ]));
             }
-
-            if let Some(status) = status_text {
+            if let Some(status_text) = body_status_text(status) {
                 lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("↳ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(status, Style::default().fg(Color::DarkGray)),
+                    Span::styled("↳ ", dim),
+                    Span::styled(status_text, dim),
                 ]));
             }
-
             if let Some(info) = output
                 && !info.output.is_empty()
             {
-                let preview = info.output_preview(3);
-                for line in preview.lines() {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
-                    ]));
+                for line in info.output_preview(OUTPUT_PREVIEW_LINES).lines() {
+                    lines.push(Line::from(Span::styled(format!("│ {line}"), dim)));
                 }
             }
             push_tool_call_image(lines, output.as_ref(), images_supported, image_positions);
-
-            render_diff_preview(lines, diffs, *expanded);
+            render_diff_preview(lines, diffs);
         }
-        ToolDisplay::Builtin {
-            tool,
+        ToolDisplay::Action {
             detail,
             status,
             output,
+            ..
         } => {
-            let status_text = match status {
-                ToolStatus::Running => "running...".to_string(),
-                ToolStatus::Done => String::new(),
-                ToolStatus::SearchDone(n) => format!("{n} results"),
-                ToolStatus::Failed(e) => format!("failed: {e}"),
-            };
-            let detail_display = if status_text.is_empty() {
-                detail.clone()
-            } else {
-                format!("{detail} {status_text}")
-            };
-            lines.push(Line::from(vec![
-                Span::raw(selection_marker),
-                Span::styled(format!("[{tool}] "), Style::default().fg(Color::Magenta)),
-                Span::styled(detail_display, selection_style),
-            ]));
-            if let Some(out) = output {
-                for line in out.lines().take(3) {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {line}"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
+            for line in detail.iter().take(DIFF_PREVIEW_LINES) {
+                lines.push(Line::from(Span::styled(format!("│ {line}"), dim)));
+            }
+            if detail.len() > DIFF_PREVIEW_LINES {
+                lines.push(Line::from(Span::styled(
+                    format!("│ … {} more lines", detail.len() - DIFF_PREVIEW_LINES),
+                    dim.italic(),
+                )));
+            }
+            if let Some(status_text) = body_status_text(status) {
+                lines.push(Line::from(vec![
+                    Span::styled("↳ ", dim),
+                    Span::styled(status_text, dim),
+                ]));
+            }
+            if let Some(info) = output
+                && !info.output.is_empty()
+            {
+                for line in info.output_preview(OUTPUT_PREVIEW_LINES).lines() {
+                    lines.push(Line::from(Span::styled(format!("│ {line}"), dim)));
+                }
+            }
+            push_tool_call_image(lines, output.as_ref(), images_supported, image_positions);
+        }
+        ToolDisplay::Builtin { status, output, .. } => {
+            if let Some(status_text) = body_status_text(status) {
+                lines.push(Line::from(vec![
+                    Span::styled("↳ ", dim),
+                    Span::styled(status_text, dim),
+                ]));
+            }
+            if let Some(text) = output {
+                for line in text.lines().take(OUTPUT_PREVIEW_LINES) {
+                    lines.push(Line::from(Span::styled(format!("│ {line}"), dim)));
                 }
             }
         }
@@ -2500,56 +2445,37 @@ fn diff_line_style(line: &str) -> Style {
 }
 
 /// Render a compact per-root diff summary plus a capped tinted preview
-/// under an inline terminal tool call. Long diffs collapse to their
-/// summary until `expanded`.
-fn render_diff_preview<'a>(
-    lines: &mut Vec<Line<'a>>,
-    diffs: &'a [crate::file_tracker::RootDiff],
-    expanded: bool,
-) {
-    const PREVIEW_LINES: usize = 8;
-
-    let total: usize = diffs.iter().map(|d| d.text.lines().count()).sum();
-    let collapsed = !expanded && total > COLLAPSE_DIFF_LINES;
-
+/// inside an expanded terminal tool body.
+fn render_diff_preview<'a>(lines: &mut Vec<Line<'a>>, diffs: &'a [crate::file_tracker::RootDiff]) {
     for (index, diff) in diffs.iter().enumerate() {
         let summary = format!(
-            "± {} file{} (+{} −{}){}",
+            "± {} file{} (+{} −{})",
             diff.files,
             if diff.files == 1 { "" } else { "s" },
             diff.additions,
             diff.deletions,
-            if collapsed { " ▸" } else { "" },
         );
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                if diffs.len() > 1 {
-                    format!("{summary} in {}", diff.root.display())
-                } else {
-                    summary
-                },
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-        if collapsed {
-            continue;
-        }
+        lines.push(Line::from(Span::styled(
+            if diffs.len() > 1 {
+                format!("{summary} in {}", diff.root.display())
+            } else {
+                summary
+            },
+            Style::default().fg(Color::Yellow),
+        )));
 
         let total = diff.text.lines().count();
-        for line in diff.text.lines().take(PREVIEW_LINES) {
+        for line in diff.text.lines().take(DIFF_PREVIEW_LINES) {
             lines.push(Line::from(vec![
-                Span::raw("  "),
                 Span::styled("│ ", Style::default().fg(Color::DarkGray)),
                 Span::styled(line.to_string(), diff_line_style(line)),
             ]));
         }
-        if total > PREVIEW_LINES {
+        if total > DIFF_PREVIEW_LINES {
             lines.push(Line::from(vec![
-                Span::raw("  "),
                 Span::styled("│ ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("… {} more diff lines", total - PREVIEW_LINES),
+                    format!("… {} more diff lines", total - DIFF_PREVIEW_LINES),
                     Style::default().fg(Color::DarkGray).italic(),
                 ),
             ]));
@@ -2571,13 +2497,21 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 
     // Header
     let title = match display {
-        ToolDisplay::Search { query, .. } => format!("Search: \"{query}\""),
-        ToolDisplay::Fetch { url, .. } => format!("Fetch: {url}"),
-        ToolDisplay::Task {
-            subagent, prompt, ..
-        } => format!("Subagent:{subagent} - {prompt}"),
-        ToolDisplay::Terminal { command, mode, .. } => {
-            format!("{}$ {command}", terminal_mode_marker(*mode))
+        ToolDisplay::Terminal {
+            description,
+            command,
+            mode,
+            ..
+        } => {
+            if description.is_empty() {
+                format!("{}$ {command}", terminal_mode_marker(*mode))
+            } else {
+                format!("{description} — {}$ {command}", terminal_mode_marker(*mode))
+            }
+        }
+        ToolDisplay::Action { chip, summary, .. } => {
+            let (label, rest) = action_headline(chip, summary);
+            format!("{label} {rest}").trim_end().to_string()
         }
         ToolDisplay::Builtin { tool, detail, .. } => {
             format!("{tool}: {detail}")
@@ -2596,10 +2530,6 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
             Span::styled("Status: Running...", Style::default().fg(Color::Yellow))
         }
         ToolStatus::Done => Span::styled("Status: Done", Style::default().fg(Color::Green)),
-        ToolStatus::SearchDone(n) => Span::styled(
-            format!("Status: {n} results"),
-            Style::default().fg(Color::Green),
-        ),
         ToolStatus::Failed(e) => Span::styled(
             format!("Status: Failed - {e}"),
             Style::default().fg(Color::Red),
@@ -2607,6 +2537,31 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
     };
     lines.push(Line::from(status_line));
     lines.push(Line::from(""));
+
+    // Invocation detail for Action calls (the raw arguments payload).
+    if let ToolDisplay::Action { detail, .. } = display
+        && !detail.is_empty()
+    {
+        lines.push(Line::from(Span::styled(
+            "─── Detail ───",
+            Style::default().fg(Color::Blue),
+        )));
+        for line in detail {
+            lines.push(Line::from(line.clone()));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Provider-hosted result text.
+    if let ToolDisplay::Builtin {
+        output: Some(text), ..
+    } = display
+    {
+        for line in text.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+        lines.push(Line::from(""));
+    }
 
     // Terminal calls
     let terminal_calls = display.all_terminal_calls();
@@ -2714,8 +2669,8 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
-        build_plain_wrapped_lines_unified, render_input_line, render_tool_inline,
+        ChatElement, ChatStream, InputContext, RECENT_EXPAND, ToolCallImage, ToolDisplay,
+        ToolStatus, build_plain_wrapped_lines_unified, render_input_line, render_tool_inline,
         terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
@@ -2723,6 +2678,7 @@ mod tests {
     use aither_sandbox::TerminalExecutionMode;
     use ratatui::text::Line;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     #[test]
     fn live_output_appends_to_running_terminal_call() {
@@ -2730,12 +2686,14 @@ mod tests {
         stream.push_tool(
             "call-1".to_string(),
             ToolDisplay::Terminal {
+                description: String::new(),
                 command: "echo hi".to_string(),
                 mode: TerminalExecutionMode::Default,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
-                expanded: false,
+                pinned: None,
+                finished_at: None,
             },
         );
 
@@ -2763,7 +2721,7 @@ mod tests {
 
         // A finished call leaves the running list and stops accepting
         // late deltas via the running-only path.
-        stream.update_tool_with_output("call-1", ToolStatus::Done, None, Some("hello\nworld\n"));
+        stream.update_tool_with_output("call-1", ToolStatus::Done, Some("hello\nworld\n"));
         assert_eq!(stream.running_terminal_calls(), Vec::new());
         assert!(!stream.is_tool_running("call-1"));
     }
@@ -2791,12 +2749,14 @@ mod tests {
             (TerminalExecutionMode::Ssh, "[ssh] "),
         ] {
             let display = ToolDisplay::Terminal {
+                description: String::new(),
                 command: "echo hi".to_string(),
                 mode,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
-                expanded: false,
+                pinned: None,
+                finished_at: None,
             };
             let mut lines: Vec<Line> = Vec::new();
             let mut positions = Vec::new();
@@ -2806,18 +2766,26 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect();
-            assert_eq!(rendered, format!("  {marker}$ echo hi"));
+            assert_eq!(rendered, format!("▸ {marker}$ echo hi"));
         }
     }
 
+    /// A call that finished long ago — outside [`RECENT_EXPAND`], so the
+    /// automatic rule renders it collapsed.
     fn terminal_display(command: &str) -> ToolDisplay {
         ToolDisplay::Terminal {
+            description: String::new(),
             command: command.to_string(),
             mode: TerminalExecutionMode::Default,
             status: ToolStatus::Done,
             output: None,
             diffs: Vec::new(),
-            expanded: false,
+            pinned: None,
+            finished_at: Some(
+                Instant::now()
+                    .checked_sub(RECENT_EXPAND * 2)
+                    .expect("test clock precedes twice the expand window"),
+            ),
         }
     }
 
@@ -2836,6 +2804,7 @@ mod tests {
         chat.push_tool(
             "call-1".to_string(),
             ToolDisplay::Terminal {
+                description: String::new(),
                 command: "terminal_background {…}".to_string(),
                 mode: TerminalExecutionMode::Default,
                 status: ToolStatus::Done,
@@ -2845,7 +2814,8 @@ mod tests {
                     ),
                 ),
                 diffs: Vec::new(),
-                expanded: false,
+                pinned: None,
+                finished_at: None,
             },
         );
         chat.push_text("后台任务运行正常，已输出到第 7 行（约每秒一行）。再等它跑完：\n");
@@ -2883,14 +2853,37 @@ mod tests {
     }
 
     #[test]
-    fn collapsible_only_when_long() {
-        assert!(!terminal_display("echo hi").is_collapsible());
-        assert!(!terminal_display("a\nb\nc").is_collapsible());
-        assert!(terminal_display("a\nb\nc\nd").is_collapsible());
+    fn expandable_rules() {
+        // Terminal calls always have a command body to expand into.
+        assert!(terminal_display("echo hi").expandable());
+        assert!(terminal_display("a\nb\nc").expandable());
+
+        // Action/Builtin calls expand only when they carry detail or output.
+        let bare = ToolDisplay::Action {
+            chip: "kill".to_string(),
+            task_id: None,
+            summary: "task".to_string(),
+            detail: Vec::new(),
+            status: ToolStatus::Done,
+            output: None,
+            pinned: None,
+            finished_at: None,
+        };
+        assert!(!bare.expandable());
+        let builtin = ToolDisplay::Builtin {
+            tool: "web_search".to_string(),
+            detail: "q".to_string(),
+            status: ToolStatus::Done,
+            output: None,
+            pinned: None,
+            finished_at: None,
+        };
+        assert!(!builtin.expandable());
     }
 
     #[test]
-    fn collapsed_command_shows_hint_then_expands() {
+    fn expansion_states() {
+        // Finished long ago: collapsed to the headline only.
         let mut display = terminal_display("one\ntwo\nthree\nfour\nfive");
         let text = {
             let mut lines: Vec<Line> = Vec::new();
@@ -2898,49 +2891,78 @@ mod tests {
             render_tool_inline(&mut lines, &display, false, true, &mut positions);
             rendered_text(&lines)
         };
-        assert_eq!(text[0], "  $ one");
-        assert!(text[1].contains("4 more lines"));
-        assert_eq!(text.len(), 2);
+        assert_eq!(text, vec!["▸ $ one".to_string()]);
 
-        let ToolDisplay::Terminal { expanded, .. } = &mut display else {
+        // Just finished: still open, showing the whole command.
+        let ToolDisplay::Terminal { finished_at, .. } = &mut display else {
             unreachable!()
         };
-        *expanded = true;
+        *finished_at = Some(Instant::now());
         let text = {
             let mut lines: Vec<Line> = Vec::new();
             let mut positions = Vec::new();
             render_tool_inline(&mut lines, &display, false, true, &mut positions);
             rendered_text(&lines)
         };
-        assert_eq!(text.len(), 5);
-        assert_eq!(text[4], "  │ five");
+        assert_eq!(text.len(), 6); // headline + 5 command lines
+        assert_eq!(text[5], "│ five");
+
+        // A click pins it shut regardless of the recent-expansion window.
+        let ToolDisplay::Terminal { pinned, .. } = &mut display else {
+            unreachable!()
+        };
+        *pinned = Some(false);
+        let text = {
+            let mut lines: Vec<Line> = Vec::new();
+            let mut positions = Vec::new();
+            render_tool_inline(&mut lines, &display, false, true, &mut positions);
+            rendered_text(&lines)
+        };
+        assert_eq!(text, vec!["▸ $ one".to_string()]);
     }
 
     #[test]
-    fn collapsed_diff_shows_summary_only() {
+    fn expanded_shows_diff_body() {
         let body = "+line\n".repeat(12);
-        let display = ToolDisplay::Terminal {
-            command: "echo hi".to_string(),
-            mode: TerminalExecutionMode::Default,
-            status: ToolStatus::Done,
-            output: None,
-            diffs: vec![crate::file_tracker::RootDiff {
+        let mut display = terminal_display("echo hi");
+        {
+            let ToolDisplay::Terminal { diffs, .. } = &mut display else {
+                unreachable!()
+            };
+            *diffs = vec![crate::file_tracker::RootDiff {
                 root: std::path::PathBuf::from("/tmp/root"),
                 text: body,
                 files: 1,
                 additions: 12,
                 deletions: 0,
-            }],
-            expanded: false,
-        };
-        assert!(display.is_collapsible());
+            }];
+        }
+
+        // Collapsed: only the headline, no diff information.
         let mut lines: Vec<Line> = Vec::new();
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, true, &mut positions);
         let text = rendered_text(&lines);
-        // command line + summary with ▸ marker, no diff body
-        assert_eq!(text.len(), 2);
-        assert!(text[1].contains("± 1 file (+12 −0) ▸"));
+        assert_eq!(text, vec!["▸ $ echo hi".to_string()]);
+
+        // Expanded: command, diff summary and the capped diff body.
+        let ToolDisplay::Terminal {
+            pinned,
+            finished_at,
+            ..
+        } = &mut display
+        else {
+            unreachable!()
+        };
+        *pinned = Some(true);
+        *finished_at = Some(Instant::now());
+        let mut lines: Vec<Line> = Vec::new();
+        let mut positions = Vec::new();
+        render_tool_inline(&mut lines, &display, false, true, &mut positions);
+        let text = rendered_text(&lines);
+        assert_eq!(text[0], "▾ $ echo hi");
+        assert!(text[2].contains("± 1 file (+12 −0)"));
+        assert!(text[11].contains("4 more diff lines"));
     }
 
     #[test]
@@ -2949,17 +2971,17 @@ mod tests {
         chat.push_tool("t1".to_string(), terminal_display("a\nb\nc\nd"));
         assert_eq!(
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false).len(),
-            2 // "$ a" + collapse hint
+            1 // headline only
         );
         chat.toggle_expanded("t1");
         assert_eq!(
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false).len(),
-            4
+            5 // headline + 4 command lines
         );
         chat.toggle_expanded("t1");
         assert_eq!(
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false).len(),
-            2
+            1
         );
     }
 
@@ -3030,9 +3052,10 @@ mod tests {
     #[test]
     fn tool_image_reserves_rows_and_registers_position() {
         let mut display = terminal_display("screenshot");
-        let ToolDisplay::Terminal { output, .. } = &mut display else {
+        let ToolDisplay::Terminal { output, pinned, .. } = &mut display else {
             unreachable!()
         };
+        *pinned = Some(true);
         *output = Some(
             super::TerminalCallInfo::new("screenshot".to_string()).with_image(ToolCallImage {
                 key: "tool-image:t1".to_string(),
@@ -3045,12 +3068,13 @@ mod tests {
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, true, &mut positions);
 
-        assert_eq!(lines.len(), 1 + IMAGE_HEIGHT); // "$ screenshot" + image block
+        // headline + "$ screenshot" + image block
+        assert_eq!(lines.len(), 2 + IMAGE_HEIGHT);
         assert_eq!(
             positions,
             vec![(
                 "tool-image:t1".to_string(),
-                1,
+                2,
                 "outputs/shot.png".to_string()
             )]
         );
@@ -3060,7 +3084,7 @@ mod tests {
         let mut lines: Vec<Line> = Vec::new();
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, false, &mut positions);
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         assert_eq!(positions, Vec::<(String, usize, String)>::new());
     }
 
@@ -3079,11 +3103,15 @@ mod tests {
             Some(&mut regions),
             false,
         );
-        assert_eq!(regions.len(), 1);
+        // Both calls collapsed to their headline; each is a one-row region.
+        assert_eq!(lines.len(), 2);
+        assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].element_id, "t1");
         assert_eq!(regions[0].start, 0);
-        assert_eq!(regions[0].end, 2);
-        assert!(lines.len() >= 3);
+        assert_eq!(regions[0].end, 1);
+        assert_eq!(regions[1].element_id, "t2");
+        assert_eq!(regions[1].start, 1);
+        assert_eq!(regions[1].end, 2);
     }
 
     #[test]

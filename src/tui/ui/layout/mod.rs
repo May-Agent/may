@@ -14,7 +14,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use ratatui::Frame;
 
@@ -160,6 +160,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 cursor: app.cursor,
                 attachments: &app.attachments,
             }),
+            input_caret_active: matches!(app.mode, AppMode::Chat),
             queue_ctx: if queue_messages.is_empty() {
                 None
             } else {
@@ -526,6 +527,13 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::White)
         });
     frame.render_widget(search, chunks[0]);
+    let caret_x = chunks[0].x
+        + 1
+        + u16::try_from(UnicodeWidthStr::width(app.tier_picker_query.as_str())).unwrap_or(u16::MAX);
+    frame.set_cursor_position((
+        caret_x.min(chunks[0].right().saturating_sub(2)),
+        chunks[0].y + 1,
+    ));
 
     // Model list or loading indicator
     if app.tier_picker_loading {
@@ -1043,6 +1051,17 @@ fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState) {
             format!("> {}▌", state.input),
             Style::default().fg(Color::White),
         )));
+        // IME anchor at the `▌` cell; approximate the wrap for long input.
+        let offset = 2 + UnicodeWidthStr::width(state.input.as_str());
+        let row_w = usize::from(inner.width).max(1);
+        let caret_row = usize::from(inner.y)
+            .saturating_add(offset / row_w)
+            .min(usize::from(inner.bottom()).saturating_sub(1));
+        let caret_col = usize::from(inner.x) + offset % row_w;
+        frame.set_cursor_position((
+            u16::try_from(caret_col).unwrap_or(u16::MAX),
+            u16::try_from(caret_row).unwrap_or(u16::MAX),
+        ));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Ask a quick question about this session — Enter ask · Esc close",
@@ -1720,6 +1739,13 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
             Span::styled("_", Style::default().fg(Color::DarkGray)),
         ]));
         frame.render_widget(input_line, chunks[2]);
+        let caret_x = chunks[2].x
+            + 4
+            + u16::try_from(UnicodeWidthStr::width(qs.custom_text.as_str())).unwrap_or(u16::MAX);
+        frame.set_cursor_position((
+            caret_x.min(chunks[2].right().saturating_sub(1)),
+            chunks[2].y,
+        ));
         3
     } else {
         2
