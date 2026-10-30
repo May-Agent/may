@@ -49,6 +49,16 @@ use types::{
 pub use chat::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
 pub use types::DaemonHealth;
 
+/// Applies the configured remote access, once the daemon listens on TCP.
+///
+/// # Errors
+/// Fails when the profiles cannot be read.
+pub(crate) async fn sync_remote_access(state: &UiServerState) -> anyhow::Result<()> {
+    remote_access::sync_remote_access_from_state(state)
+        .await
+        .context("failed to sync remote access state")
+}
+
 #[cfg(feature = "ui")]
 static WEB_UI_DIST: include_dir::Dir<'static> =
     skyzen::embed_dir!("$CARGO_MANIFEST_DIR/web-ui/dist");
@@ -309,10 +319,6 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
     title_generation::spawn_worker(state.clone(), title_generation_rx);
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
-    remote_access::sync_remote_access_from_state(&state)
-        .await
-        .context("failed to sync remote access state")?;
-
     let router = build_router(state.clone(), mode);
     Ok(StartedServer { state, router })
 }

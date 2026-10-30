@@ -953,37 +953,41 @@ impl BrowserConfig {
     }
 }
 
-/// Cloudflare-based remote access configuration for the May UI server.
+/// `tailscale` command run when no other binary is configured.
+pub const DEFAULT_TAILSCALE_BINARY: &str = "tailscale";
+
+/// Remote access to the May daemon over Tailscale: `tailscale serve` exposes
+/// the daemon's loopback listener on the tailnet over HTTPS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteAccessConfig {
-    /// Whether the server should keep remote access enabled.
+    /// Whether the daemon keeps remote access enabled.
     #[serde(default)]
     pub enabled: bool,
-    /// Cloudflared executable path or command name.
-    #[serde(default = "default_cloudflared_binary")]
-    pub cloudflared_binary: String,
-    /// Remotely managed Cloudflare tunnel token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tunnel_token: Option<String>,
-    /// Public HTTPS URL routed to this server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_url: Option<String>,
+    /// Tailscale CLI path or command name.
+    #[serde(default = "default_tailscale_binary")]
+    pub tailscale_binary: String,
+    /// Tailnet HTTPS port the daemon is served on.
+    #[serde(default = "default_tailscale_https_port")]
+    pub https_port: u16,
     /// Whether local-environment profiles may be exposed remotely.
     #[serde(default)]
     pub allow_local_environment: bool,
 }
 
-fn default_cloudflared_binary() -> String {
-    "cloudflared".to_string()
+fn default_tailscale_binary() -> String {
+    DEFAULT_TAILSCALE_BINARY.to_string()
+}
+
+const fn default_tailscale_https_port() -> u16 {
+    443
 }
 
 impl Default for RemoteAccessConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            cloudflared_binary: default_cloudflared_binary(),
-            tunnel_token: None,
-            public_url: None,
+            tailscale_binary: default_tailscale_binary(),
+            https_port: default_tailscale_https_port(),
             allow_local_environment: false,
         }
     }
