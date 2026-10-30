@@ -218,7 +218,7 @@ pub(crate) async fn context_dump(
 }
 
 /// One message of a `/btw` request.
-#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BtwMessage {
     /// `system`, `user` or `assistant`.
@@ -265,7 +265,10 @@ pub(crate) async fn btw(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let llm = worker.btw_llm().clone();
+    let llm = worker
+        .btw_llm()
+        .cloned()
+        .ok_or_else(|| internal_error_message("the idle agent has no model"))?;
     let mut answer = String::new();
     let mut stream = std::pin::pin!(llm.respond(aither_core::llm::LLMRequest::new(messages)));
     while let Some(event) = stream.next().await {

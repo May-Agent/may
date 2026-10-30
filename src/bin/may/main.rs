@@ -333,6 +333,22 @@ where
         may_agent::agent::ToolEnvironmentCache::spawn(),
     );
 
+    // Agents run in the May daemon; the TUI is its client. Starting or
+    // replacing the daemon shows on the status line meanwhile.
+    app.set_status("Connecting to the May daemon…");
+    terminal.draw(|frame| ui::render(frame, &mut app))?;
+    let paths = may_agent::daemon::DaemonPaths::user()?;
+    let runtime_deps = match may_agent::daemon::lifecycle::ensure_running(&paths, |_| {}).await {
+        Ok(client) => {
+            app.status = None;
+            app.btw_daemon = Some(client.clone());
+            runtime_deps.with_daemon(client)
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!("the May daemon is unavailable: {error}"));
+        }
+    };
+
     // Only start a session if configuration is complete
     let mut worker_build = None;
     if app.is_configured() {
@@ -473,6 +489,9 @@ where
     // The busy status shows once per episode of another run holding the session.
     let mut busy_elsewhere_notified = false;
     let mut assistant_response = AssistantReply::default();
+    // Daemon-held prompts already shown, so a prompt answered moments ago is
+    // not reopened before the daemon clears it.
+    let mut shown_prompts = std::collections::HashSet::<String>::new();
 
     // Sockets through which other main agents reach this TUI's session
     let agent_listeners =
@@ -484,6 +503,7 @@ where
             Workspace(may_agent::workspace_request::WorkspaceRequest),
             WorkerBuilt(Box<Result<AgentWorker, may_agent::tui::runtime::TuiRuntimeError>>),
             Agent(TuiEvent),
+            ForeignTurn(may_agent::agent::ForeignTurn),
             Context(Option<TuiEvent>),
             Terminal(Box<AppEvent>),
         }
@@ -543,6 +563,28 @@ where
                     request: request.request,
                 },
             );
+        }
+        // A daemon run waits on its prompts in the daemon; they show here
+        // from the session's runtime state and are answered over REST.
+        if runtime_deps.daemon().is_some() && matches!(app.mode, may_agent::tui::AppMode::Chat) {
+            if let Some(request) = runtime_deps.pending_ask_user(app).await?
+                && shown_prompts.insert(request.id.clone())
+            {
+                app.show_blocking_prompt(may_agent::tui::AppMode::AskUser(
+                    may_agent::tui::AskUserState::for_open_question(request),
+                ));
+            } else if let Some(request) = runtime_deps.pending_workspace(app).await?
+                && shown_prompts.insert(request.id.clone())
+            {
+                app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
+                    may_agent::tui::state::WorkspaceConfirmState {
+                        request_id: request.id,
+                        path: request.request.path,
+                        reason: request.request.reason,
+                        request: None,
+                    },
+                ));
+            }
         }
         phases.step("pending_permission", step_start.elapsed());
 
@@ -681,6 +723,10 @@ where
                                 let result = handle.recv().await;
                                 tracing::info!("agent handle.recv() RETURNED");
                                 result.map(Event::Agent)
+                            } else if let Some(worker) = worker.as_ref() {
+                                // A turn another client started, rendered
+                                // while this TUI has none of its own.
+                                worker.next_foreign_turn().await.map(Event::ForeignTurn)
                             } else {
                                 futures_lite::future::pending().await
                             }
@@ -721,6 +767,7 @@ where
                 Some(Event::Workspace(_)) => "Workspace",
                 Some(Event::WorkerBuilt(_)) => "WorkerBuilt",
                 Some(Event::Agent(_)) => "Agent",
+                Some(Event::ForeignTurn(_)) => "ForeignTurn",
                 Some(Event::Context(_)) => "Context",
                 Some(Event::Terminal(_)) => "Terminal",
                 None => "None",
@@ -737,6 +784,7 @@ where
             Event::Workspace(_) => "workspace",
             Event::WorkerBuilt(_) => "worker_built",
             Event::Agent(_) => "agent",
+            Event::ForeignTurn(_) => "foreign_turn",
             Event::Context(_) => "context",
         };
 
@@ -795,7 +843,9 @@ where
                         app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
                             may_agent::tui::state::WorkspaceConfirmState {
                                 request_id,
-                                request,
+                                path: request.args.request.path.clone(),
+                                reason: request.args.request.reason.clone(),
+                                request: Some(request),
                             },
                         ));
                     }
@@ -806,6 +856,24 @@ where
                         drop(request);
                     }
                 }
+            }
+
+            Event::ForeignTurn(turn) => {
+                let message = may_agent::tui::queue::PendingMessage {
+                    content: turn.content.clone().unwrap_or_default(),
+                    hidden_context_xml: None,
+                    attachments: Vec::new(),
+                    queued_at: jiff::Timestamp::now(),
+                    delivery_mode: may_agent::session::PendingUserMessageMode::Queue,
+                    display: turn.content.is_none().then(String::new),
+                };
+                if let Some(content) = turn.content {
+                    app.session_manager
+                        .record_unpersisted(may_agent::session::ChatMessage::user(content));
+                }
+                app.start_processing(&message);
+                assistant_response.clear();
+                agent_handle = Some(turn.handle);
             }
 
             Event::Agent(tui_event) => {
@@ -832,7 +900,9 @@ where
                                 .await;
                         }
                     }
-                    TuiEvent::ContextReport(_) | TuiEvent::ContextDump(_) => {
+                    TuiEvent::ContextReport(_)
+                    | TuiEvent::ContextDump(_)
+                    | TuiEvent::ContextDumpSaved { .. } => {
                         // Reports arrive on the context channel; the agent
                         // channel only carries them if the channels raced.
                     }
@@ -920,6 +990,15 @@ where
                     }
                     Some(TuiEvent::ContextDump(Err(err))) => {
                         app.chat.push_error(&format!("Context dump failed: {err}"));
+                    }
+                    Some(TuiEvent::ContextDumpSaved {
+                        path,
+                        message_count,
+                    }) => {
+                        app.chat.push_notice(&format!(
+                            "Context dump written to {path} — {message_count} messages"
+                        ));
+                        app.scroll = usize::MAX;
                     }
                     Some(TuiEvent::Error(err)) => app.chat.push_error(&err),
                     _ => {}
@@ -1303,14 +1382,24 @@ where
                             .await?
                         {
                             ResponseCommit::Committed => {
-                                request.respond(approved).unwrap_or_else(|_| {
-                                    panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
-                                });
+                                if let Some(request) = request {
+                                    request.respond(approved).unwrap_or_else(|_| {
+                                        panic!(
+                                            "{}",
+                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                        )
+                                    });
+                                }
                             }
                             ResponseCommit::Lost(committed) => {
-                                request.respond(committed).unwrap_or_else(|_| {
-                                    panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
-                                });
+                                if let Some(request) = request {
+                                    request.respond(committed).unwrap_or_else(|_| {
+                                        panic!(
+                                            "{}",
+                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                        )
+                                    });
+                                }
                                 app.chat.push_notice(
                                     "That request was already answered elsewhere; the run continues with that decision, not yours",
                                 );

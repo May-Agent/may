@@ -34,4 +34,8 @@ pub struct Model {
     /// TUI's launch directory); `None` uses the daemon's.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Whether nobody answers prompts for this session (a `may <prompt>`
+    /// one-shot run): permission requests are refused instead of asked.
+    #[serde(default)]
+    pub non_interactive: bool,
 }

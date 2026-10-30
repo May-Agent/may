@@ -43,9 +43,6 @@ pub enum SessionError {
     /// A persisted message failed to decode.
     #[error("Persisted message error: {0}")]
     PersistedMessage(#[from] PersistedMessageError),
-    /// The session is open in another may process.
-    #[error("{0}")]
-    OpenLock(#[from] super::open_lock::SessionOpenLockError),
 }
 
 /// Unique session identifier (four random words joined by `-`).
@@ -410,9 +407,6 @@ pub struct SessionManager {
     current: Option<Session>,
     /// The currently active profile ID (sessions are created within this profile).
     current_profile_id: Option<String>,
-    /// Open lock of the current session; held while it is bound to this
-    /// process, dropped on session switch or when the manager drops.
-    open_lock: Option<super::open_lock::SessionOpenLock>,
 }
 
 impl SessionManager {
@@ -430,7 +424,6 @@ impl SessionManager {
             db,
             current: None,
             current_profile_id: Some(default_profile_id),
-            open_lock: None,
         };
         Ok(manager)
     }
@@ -496,9 +489,6 @@ impl SessionManager {
         };
 
         self.current = Some(session);
-        // The previous session's open lock goes with it; the new session is
-        // unpersisted and locks when `ensure_persisted` first writes it.
-        self.open_lock = None;
         // SAFETY: We just set `self.current` to `Some` above.
         Ok(self.current.as_ref().expect("just assigned"))
     }
@@ -546,18 +536,31 @@ impl SessionManager {
                 session.persisted = true;
             }
         }
-        if self
-            .open_lock
-            .as_ref()
-            .is_none_or(|lock| lock.session_id() != session_id)
+        Ok(())
+    }
+
+    /// Records `message` in the current session's in-memory history only,
+    /// for a turn whose rows the daemon writes.
+    pub fn record_unpersisted(&mut self, message: ChatMessage) {
+        if let Some(session) = self.current.as_mut() {
+            session.history.messages_mut().push(message);
+        }
+    }
+
+    /// Re-reads the current session's history from the database, after the
+    /// daemon wrote a turn.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] when the history cannot be read.
+    pub async fn refresh_history(&mut self) -> Result<(), SessionError> {
+        let Some(session_id) = self.current.as_ref().map(|session| session.id.clone()) else {
+            return Ok(());
+        };
+        let history = load_history_from_db(&self.db, session_id.as_str()).await?;
+        if let Some(session) = self.current.as_mut()
+            && session.id == session_id
         {
-            let paths = self
-                .store
-                .session_paths(session_id.as_str(), profile_id.as_deref());
-            self.open_lock = Some(super::open_lock::SessionOpenLock::acquire(
-                session_id.as_str(),
-                paths.root(),
-            )?);
+            session.history = history;
         }
         Ok(())
     }
@@ -597,20 +600,6 @@ impl SessionManager {
             .unwrap_or_else(|_| Timestamp::now());
 
         let history = load_history_from_db(&self.db, id.as_str()).await?;
-
-        // Activating the session takes its open lock; the kernel releases
-        // it if this process dies.
-        if self
-            .open_lock
-            .as_ref()
-            .is_none_or(|lock| lock.session_id() != id.as_str())
-        {
-            let paths = self.store.session_paths(id.as_str(), profile_id.as_deref());
-            self.open_lock = Some(super::open_lock::SessionOpenLock::acquire(
-                id.as_str(),
-                paths.root(),
-            )?);
-        }
 
         let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
         let session = Session {
@@ -895,13 +884,6 @@ impl SessionManager {
     /// # Errors
     /// Returns [`SessionError::NotFound`] when the session does not exist, or [`SessionError`] on storage failure.
     pub async fn delete_session(&mut self, id: &str) -> Result<(), SessionError> {
-        if self
-            .open_lock
-            .as_ref()
-            .is_some_and(|lock| lock.session_id() == id)
-        {
-            self.open_lock = None;
-        }
         let profile_id = self
             .db
             .get_session(id)
