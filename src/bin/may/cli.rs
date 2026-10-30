@@ -136,12 +136,12 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
             _ => CliMode::Rest(args[2..].to_vec()),
         },
         Some("daemon") => match args.get(2).map(String::as_str) {
-            Some("--help" | "-h") => CliMode::Help(DaemonCommand::help_text()),
             None => CliMode::Daemon(DaemonCommand::Run),
             Some("install") => CliMode::Daemon(DaemonCommand::Install),
             Some("uninstall") => CliMode::Daemon(DaemonCommand::Uninstall),
             Some("status") => CliMode::Daemon(DaemonCommand::Status),
             Some("stop") => CliMode::Daemon(DaemonCommand::Stop),
+            // `--help`, `-h` and anything unknown.
             Some(_) => CliMode::Help(DaemonCommand::help_text()),
         },
         Some("browser") => match args.get(2).map(String::as_str) {

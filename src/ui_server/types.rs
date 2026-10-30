@@ -175,9 +175,6 @@ pub struct SseHeartbeat {
     pub(crate) ok: bool,
 }
 
-/// Chat-stream ping emitted every 10 s so proxies and the browser's
-/// own idle detection don't close the connection during long tool phases.
-
 /// Live decode-speed sample emitted while model output streams.
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]

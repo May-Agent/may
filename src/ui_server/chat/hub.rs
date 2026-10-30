@@ -17,7 +17,7 @@ const CHANNEL_CAPACITY: usize = 1024;
 
 /// One frame for `/api/events`.
 #[derive(Debug, Clone)]
-pub(crate) struct TurnFrame {
+pub struct TurnFrame {
     /// SSE event kind: `session_turn` or `session_agent`.
     pub(crate) kind: &'static str,
     /// JSON payload.
@@ -41,13 +41,13 @@ impl SessionChannel {
 
 /// Live turn frames of every session.
 #[derive(Debug, Default)]
-pub(crate) struct TurnHub {
+pub struct TurnHub {
     sessions: Mutex<HashMap<String, SessionChannel>>,
 }
 
 /// A subscription to one session's turns.
 #[derive(Debug)]
-pub(crate) struct TurnSubscription {
+pub struct TurnSubscription {
     /// Frames of the turn in progress, oldest first.
     pub(crate) replay: Vec<Arc<TurnFrame>>,
     /// Frames from now on.
@@ -60,10 +60,11 @@ impl TurnHub {
             .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let channel = sessions
+        let result = f(sessions
             .entry(session_id.to_string())
-            .or_insert_with(SessionChannel::new);
-        f(channel)
+            .or_insert_with(SessionChannel::new));
+        drop(sessions);
+        result
     }
 
     /// Starts a new turn of `session_id`: the replay buffer restarts.

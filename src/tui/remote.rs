@@ -331,9 +331,9 @@ async fn send_turn(
     let sent: Result<serde_json::Value, _> = client
         .post(&session_path(session_id, "/messages"), &body)
         .await;
-    if let Err(error) = sent {
-        if shared.take_pending().is_some() {
-            fail(&event_tx, error.to_string()).await;
-        }
+    if let Err(error) = sent
+        && shared.take_pending().is_some()
+    {
+        fail(&event_tx, error.to_string()).await;
     }
 }

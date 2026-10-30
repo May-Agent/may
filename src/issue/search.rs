@@ -32,7 +32,7 @@ struct IssueDocumentText<'a> {
 }
 
 /// One issue a search returned, best first.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueHit {
     /// Issue number.
     pub number: i64,

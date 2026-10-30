@@ -1957,54 +1957,6 @@ where
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Terminal-bound tool chains poll deep enough that the pthread default
-    /// (512 KiB on macOS) aborts them; workers must carry the configured stack.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn tokio_workers_carry_the_configured_stack() {
-        let measured = tokio_runtime().expect("runtime builds").block_on(async {
-            tokio::spawn(async { worker_stack_bytes() })
-                .await
-                .expect("worker task joins")
-        });
-        assert!(
-            measured >= WORKER_STACK_BYTES,
-            "tokio worker stack {measured} below configured {WORKER_STACK_BYTES}"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    fn worker_stack_bytes() -> usize {
-        // SAFETY: reads this thread's own stack size; always safe to call.
-        unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn worker_stack_bytes() -> usize {
-        // SAFETY: attr is written by pthread_getattr_np, read, then destroyed.
-        unsafe {
-            let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
-            assert_eq!(
-                libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()),
-                0
-            );
-            let attr = attr.assume_init();
-            let mut size = 0usize;
-            assert_eq!(
-                libc::pthread_attr_getstacksize(&raw const attr, &raw mut size),
-                0
-            );
-            let mut attr = attr;
-            libc::pthread_attr_destroy(&raw mut attr);
-            size
-        }
-    }
-}
-
 /// `may ui`: make sure the daemon runs, then open its web UI.
 async fn open_web_ui() -> anyhow::Result<()> {
     if !cfg!(feature = "ui") {
@@ -2083,6 +2035,54 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
                 Err(_) => println!("May daemon not running."),
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Terminal-bound tool chains poll deep enough that the pthread default
+    /// (512 KiB on macOS) aborts them; workers must carry the configured stack.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn tokio_workers_carry_the_configured_stack() {
+        let measured = tokio_runtime().expect("runtime builds").block_on(async {
+            tokio::spawn(async { worker_stack_bytes() })
+                .await
+                .expect("worker task joins")
+        });
+        assert!(
+            measured >= WORKER_STACK_BYTES,
+            "tokio worker stack {measured} below configured {WORKER_STACK_BYTES}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn worker_stack_bytes() -> usize {
+        // SAFETY: reads this thread's own stack size; always safe to call.
+        unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn worker_stack_bytes() -> usize {
+        // SAFETY: attr is written by pthread_getattr_np, read, then destroyed.
+        unsafe {
+            let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+            assert_eq!(
+                libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()),
+                0
+            );
+            let attr = attr.assume_init();
+            let mut size = 0usize;
+            assert_eq!(
+                libc::pthread_attr_getstacksize(&raw const attr, &raw mut size),
+                0
+            );
+            let mut attr = attr;
+            libc::pthread_attr_destroy(&raw mut attr);
+            size
         }
     }
 }

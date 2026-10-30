@@ -1109,7 +1109,7 @@ impl RuntimeDeps {
         }
 
         if self.daemon.is_some() {
-            return self.send_remote_turn(app, worker, msg);
+            return Self::send_remote_turn(app, worker, msg);
         }
 
         let guard = app.run_guard.as_ref().ok_or(TuiRuntimeError::NoRunLease)?;
@@ -1155,7 +1155,6 @@ impl RuntimeDeps {
     /// in-memory history records the message now so the chat's history
     /// positions stay aligned until the turn's end reloads them.
     fn send_remote_turn(
-        &self,
         app: &mut App,
         worker: &AgentWorker,
         msg: PendingMessage,
@@ -1326,7 +1325,6 @@ impl RuntimeDeps {
     /// reasoning effort and working directory the daemon runs the session
     /// with are recorded on the session first.
     fn begin_remote_worker(
-        &self,
         app: &App,
         client: crate::client::DaemonClient,
         session_id: SessionId,
@@ -1374,7 +1372,13 @@ impl RuntimeDeps {
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
         if let Some(client) = self.daemon.clone() {
-            return Ok(self.begin_remote_worker(app, client, session_id, model, reasoning_effort));
+            return Ok(Self::begin_remote_worker(
+                app,
+                client,
+                session_id,
+                model,
+                reasoning_effort,
+            ));
         }
         let current = app.session_manager.current();
         let history_messages = current
