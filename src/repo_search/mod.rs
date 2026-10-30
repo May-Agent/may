@@ -23,7 +23,9 @@ use repo_search_client::launcher::{self, ConnectError, Launcher as _};
 use repo_search_client::protocol::{BuildId, Hello};
 
 #[cfg(target_os = "macos")]
-type PlatformLauncher = repo_search_client::launcher::LaunchdAgents;
+type PlatformLauncher = repo_search_client::launcher::LaunchdAgents<
+    repo_search_client::launcher::install::SystemLaunchctl,
+>;
 #[cfg(not(target_os = "macos"))]
 type PlatformLauncher = repo_search_client::launcher::spawn::OnDemand;
 
