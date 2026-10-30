@@ -17,6 +17,7 @@ use aither_sandbox::{AnyContainerExec, ContainerShellRuntime, SshServer, Termina
 use executor_core::DefaultExecutor;
 use futures_lite::Stream;
 
+use super::context_dump::ContextDump;
 use super::hooks::{ContextSnapshotHook, PendingSteerHook};
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::permission::PermissionApprover;
@@ -845,6 +846,28 @@ impl MayAgent {
             self.inner.context(),
             &snapshot.metrics,
             snapshot.phase,
+        ))
+    }
+
+    /// Verbatim context composition for `/context dump`.
+    ///
+    /// Same measurement discipline as [`Self::context_report`]: runtime
+    /// blocks are reconciled first, so the dump describes the state the
+    /// next request would be assembled from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the model profiles cannot be fetched
+    /// during initialization.
+    pub async fn context_dump(&mut self) -> Result<ContextDump, AgentError> {
+        self.sync_runtime_context().await;
+        let snapshot = self.inner.snapshot_context_window().await?;
+        Ok(ContextDump::assemble(
+            &self.model_id,
+            &self.provider_id,
+            self.session_id.as_str(),
+            self.inner.context(),
+            &snapshot,
         ))
     }
 
