@@ -1,0 +1,1 @@
+Code search is unavailable: {{ reason }}

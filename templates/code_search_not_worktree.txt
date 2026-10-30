@@ -1,0 +1,1 @@
+{{ dir }} is not inside a git worktree. Pass `--repo <dir>` with a directory inside the repository to search.

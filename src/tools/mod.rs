@@ -21,11 +21,31 @@ pub fn embedded_distribution() -> Result<ToolDistribution, ToolRuntimeError> {
     ToolDistribution::from_json(EMBEDDED_DISTRIBUTION)
 }
 
+/// May's own host-program pins: the repo-search daemon release whose
+/// version matches the `repo-search-client` crate May links, since the
+/// daemon refuses a handshake from any other client version.
+const HOST_PROGRAMS: &[u8] = include_bytes!("host-programs.json");
+/// SHA-256 of `host-programs.json`, so an accidental edit fails a test.
+#[cfg(test)]
+const HOST_PROGRAMS_SHA256: &str =
+    "5b207d66f6380dd36005bcc32bba454a7af2074a42287fdf688ad5140d4fda7b";
+
+/// Loads May's hash-pinned host-program manifest.
+///
+/// # Errors
+/// Fails when the embedded manifest does not validate.
+pub fn host_program_distribution() -> Result<ToolDistribution, ToolRuntimeError> {
+    ToolDistribution::from_json(HOST_PROGRAMS)
+}
+
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha256};
 
-    use super::{EMBEDDED_DISTRIBUTION, EMBEDDED_DISTRIBUTION_SHA256, embedded_distribution};
+    use super::{
+        EMBEDDED_DISTRIBUTION, EMBEDDED_DISTRIBUTION_SHA256, HOST_PROGRAMS, HOST_PROGRAMS_SHA256,
+        embedded_distribution, host_program_distribution,
+    };
 
     #[test]
     fn embedded_distribution_matches_the_published_release_asset() {
@@ -38,5 +58,14 @@ mod tests {
     #[test]
     fn embedded_distribution_validates() {
         embedded_distribution().expect("embedded distribution should validate");
+    }
+
+    #[test]
+    fn host_programs_match_their_pin() {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(HOST_PROGRAMS)),
+            HOST_PROGRAMS_SHA256
+        );
+        host_program_distribution().expect("host-program manifest should validate");
     }
 }

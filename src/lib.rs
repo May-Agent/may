@@ -56,6 +56,8 @@ pub mod pasted_text;
 pub mod profile;
 /// `@`-mention extraction and prompt text building.
 pub mod prompt_mentions;
+/// repo-search daemon: code, session and issue search.
+pub mod repo_search;
 /// Scheduled task execution.
 pub mod scheduler;
 
