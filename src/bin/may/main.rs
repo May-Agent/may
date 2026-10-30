@@ -1910,7 +1910,10 @@ mod tests {
             );
             let attr = attr.assume_init();
             let mut size = 0usize;
-            assert_eq!(libc::pthread_attr_getstacksize(&attr, &raw mut size), 0);
+            assert_eq!(
+                libc::pthread_attr_getstacksize(&raw const attr, &raw mut size),
+                0
+            );
             let mut attr = attr;
             libc::pthread_attr_destroy(&raw mut attr);
             size
