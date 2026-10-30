@@ -122,7 +122,7 @@ dependencies = [
 [[package]]
 name = "aither-agent"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -136,7 +136,10 @@ dependencies = [
  "askama 0.16.1",
  "async-channel 2.5.0",
  "async-fs",
+ "async-io 2.6.0",
+ "async-process",
  "async-stream",
+ "blocking",
  "dunce",
  "event-listener 5.4.2",
  "executor-core",
@@ -146,6 +149,7 @@ dependencies = [
  "heck 0.5.0",
  "indexmap",
  "jiff",
+ "notify",
  "num-traits",
  "schemars",
  "serde",
@@ -162,7 +166,7 @@ dependencies = [
 [[package]]
 name = "aither-attachments"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -175,7 +179,7 @@ dependencies = [
 [[package]]
 name = "aither-browser"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -188,7 +192,7 @@ dependencies = [
 [[package]]
 name = "aither-claude"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -206,7 +210,7 @@ dependencies = [
 [[package]]
 name = "aither-cloud"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -223,7 +227,7 @@ dependencies = [
 [[package]]
 name = "aither-codex"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -247,7 +251,7 @@ dependencies = [
 [[package]]
 name = "aither-copilot"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -268,7 +272,7 @@ dependencies = [
 [[package]]
 name = "aither-core"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -285,7 +289,7 @@ dependencies = [
 [[package]]
 name = "aither-derive"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -296,7 +300,7 @@ dependencies = [
 [[package]]
 name = "aither-gemini"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -323,7 +327,7 @@ dependencies = [
 [[package]]
 name = "aither-mcp"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-core",
  "aither-sandbox",
@@ -346,7 +350,7 @@ dependencies = [
 [[package]]
 name = "aither-models"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-core",
  "serde",
@@ -356,7 +360,7 @@ dependencies = [
 [[package]]
 name = "aither-openai"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -382,7 +386,7 @@ dependencies = [
 [[package]]
 name = "aither-sandbox"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -436,7 +440,7 @@ dependencies = [
 [[package]]
 name = "aither-skills"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "async-fs",
  "futures-lite 2.6.1",
@@ -448,7 +452,7 @@ dependencies = [
 [[package]]
 name = "aither-webfetch"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -470,7 +474,7 @@ dependencies = [
 [[package]]
 name = "aither-websearch"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#2c268595a4744db1f203fc367e0fc2f82c5c4885"
+source = "git+https://github.com/lexoliu/aither?branch=dev#f3a5546d065cdade25df57c7ea90edc844a9456a"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -4321,7 +4325,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -4712,14 +4716,14 @@ version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fbce0b6b4f5c50b8e014e227d51ddf721558308566b4f6ba608abcea4d272cce"
 dependencies = [
- "async-channel 2.5.0",
+ "async-channel 1.9.0",
  "castaway",
  "crossbeam-utils",
  "curl",
  "curl-sys",
  "encoding_rs",
  "event-listener 5.4.2",
- "futures-lite 2.6.1",
+ "futures-lite 1.13.0",
  "http 0.2.12",
  "log",
  "mime",

@@ -47,7 +47,7 @@ fn terminal_status_from_result(result: &ToolResult) -> TerminalExecutionStatus {
         return TerminalExecutionStatus::Failed;
     }
     match result.command().map(|command| &command.outcome) {
-        // A foreground run killed at its time bound failed; a user stop is `ToolEventRecord::Stopped`.
+        // A run killed at its timeout failed; a user stop is `ToolEventRecord::Stopped`.
         Some(CommandOutcome::Killed { .. }) => TerminalExecutionStatus::Failed,
         Some(CommandOutcome::Exited { code }) if *code != 0 => TerminalExecutionStatus::Failed,
         Some(CommandOutcome::Exited { .. } | CommandOutcome::Running { .. }) | None => {
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(
             terminal_status_from_result(&command(CommandOutcome::Killed {
                 task_id: "t".to_string(),
-                notice: "killed at the foreground limit".to_string(),
+                notice: "killed at its timeout".to_string(),
             })),
             TerminalExecutionStatus::Failed
         );
