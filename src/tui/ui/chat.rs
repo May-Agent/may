@@ -2045,8 +2045,11 @@ fn render_input_line(
         }
     }
 
-    // Input text with caret (convert char index to byte index)
+    // Input text with caret (convert char index to byte index). The real
+    // terminal cursor marks the caret — the `│` stays only in the
+    // scratch anchor used for cursor placement.
     let mut line = input_caret_line(ctx);
+    line.spans.pop();
     let byte_idx = char_to_byte_index(ctx.input, ctx.cursor);
     line.spans
         .push(Span::raw(ctx.input[byte_idx..].to_string()));
