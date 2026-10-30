@@ -166,7 +166,7 @@ impl<B: CollectionBackend> SearchIndexer<B> {
                         Some(error.to_string()),
                         self.db.search_outbox_len().await.unwrap_or_default(),
                     );
-                    backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
+                    backoff = (backoff * 2).min(Duration::from_mins(15));
                 }
             }
             let timer = async {
@@ -279,7 +279,10 @@ mod tests {
 
         db.delete_session(&session.id).await.expect("delete");
         indexer.drain().await.expect("drain deletes");
-        assert!(backend.ids(SESSIONS_COLLECTION).is_empty());
+        assert_eq!(
+            backend.ids(SESSIONS_COLLECTION),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(db.search_outbox_len().await.expect("len"), 0);
     }
 }

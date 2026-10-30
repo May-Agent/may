@@ -22,7 +22,7 @@ use crate::ui_server::state::UiServerState;
 
 /// Idle agents of the sessions the daemon ran.
 #[derive(Default)]
-pub(crate) struct ParkedAgents {
+pub struct ParkedAgents {
     workers: Mutex<HashMap<String, Arc<AgentWorker>>>,
 }
 
@@ -47,17 +47,18 @@ impl ParkedAgents {
             state.db(),
             state.runtime_service.runs().clone(),
         );
-        if let Some(previous) = self
+        let previous = self
             .workers()
-            .insert(session_id.to_string(), Arc::new(worker))
-        {
+            .insert(session_id.to_string(), Arc::new(worker));
+        if let Some(previous) = previous {
             previous.shutdown();
         }
     }
 
     /// Stops `session_id`'s idle agent, if any.
     pub(crate) fn evict(&self, session_id: &str) {
-        if let Some(worker) = self.workers().remove(session_id) {
+        let worker = self.workers().remove(session_id);
+        if let Some(worker) = worker {
             worker.shutdown();
         }
     }
@@ -118,7 +119,7 @@ async fn answer(handle: crate::agent::AgentHandle) -> Option<TuiEvent> {
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CompactRequest {
+pub struct CompactRequest {
     /// What the summary should keep in focus.
     #[serde(default)]
     focus: Option<String>,
@@ -139,7 +140,7 @@ pub struct CompactResponse {
 }
 
 /// `POST /api/sessions/{id}/compact`.
-pub(crate) async fn compact_session(
+pub async fn compact_session(
     params: Params,
     Json(req): Json<CompactRequest>,
     State(state): State<Arc<UiServerState>>,
@@ -167,7 +168,7 @@ pub(crate) async fn compact_session(
 }
 
 /// `GET /api/sessions/{id}/context-report`: a [`crate::agent::ContextReport`].
-pub(crate) async fn context_report(
+pub async fn context_report(
     params: Params,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<skyzen::Response> {
@@ -192,7 +193,7 @@ pub struct ContextDumpResponse {
 
 /// `POST /api/sessions/{id}/context-dump`: writes the assembled context to
 /// the session's `outputs/context-dump.md`.
-pub(crate) async fn context_dump(
+pub async fn context_dump(
     params: Params,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<ContextDumpResponse>> {
@@ -245,7 +246,7 @@ pub struct BtwResponse {
 
 /// `POST /api/sessions/{id}/btw`: answers a side question with the
 /// session's model, outside the conversation.
-pub(crate) async fn btw(
+pub async fn btw(
     params: Params,
     Json(req): Json<BtwRequest>,
     State(state): State<Arc<UiServerState>>,
@@ -284,7 +285,7 @@ pub(crate) async fn btw(
 /// `DELETE /api/sessions/{id}/agent`: drops the session's idle agent, for a
 /// client that changed the conversation outside a turn (a rewind); the next
 /// turn rebuilds it from history.
-pub(crate) async fn release_agent(
+pub async fn release_agent(
     params: Params,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<crate::ui_server::types::ApiHealth>> {

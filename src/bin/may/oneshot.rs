@@ -307,7 +307,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             last_agent_event = std::time::Instant::now();
         }
         match event {
-            Event::Poll => {}
             Event::AskUser(request) => {
                 answer_oneshot_question(&runtime_deps, &app, request, &mut output).await?;
             }
@@ -412,7 +411,8 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 output.end_text_line()?;
                 return Ok(());
             }
-            Event::Agent(
+            Event::Poll
+            | Event::Agent(
                 TuiEvent::Compacted(_)
                 | TuiEvent::ContextReport(_)
                 | TuiEvent::ContextDump(_)

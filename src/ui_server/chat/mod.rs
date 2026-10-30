@@ -1,10 +1,8 @@
 mod hosts;
 mod hub;
 pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
-pub(crate) use hosts::{
-    ParkedAgents, btw, compact_session, context_dump, context_report, release_agent,
-};
-pub(crate) use hub::{TurnFrame, TurnHub};
+pub use hosts::{ParkedAgents, btw, compact_session, context_dump, context_report, release_agent};
+pub use hub::{TurnFrame, TurnHub};
 mod tool_dispatch;
 mod turn_persister;
 
@@ -171,7 +169,7 @@ impl HubSink {
         }
     }
 
-    fn next_seq(&mut self) -> u64 {
+    const fn next_seq(&mut self) -> u64 {
         let seq = self.seq;
         self.seq += 1;
         seq
@@ -254,6 +252,9 @@ struct SessionTurnFrame<'a, T> {
     data: &'a T,
 }
 
+// The hub publishes synchronously; the trait's methods are async for sinks
+// that write to a socket.
+#[allow(clippy::unused_async_trait_impl)]
 impl ChatSink for HubSink {
     async fn on_start(&mut self, session_id: &str, assistant_id: &str) -> bool {
         self.turn_id.clear();

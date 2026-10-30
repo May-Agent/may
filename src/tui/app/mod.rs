@@ -3312,38 +3312,6 @@ pub enum SendAction {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::utf8_complete_len;
-
-    #[test]
-    fn utf8_complete_len_holds_only_incomplete_trailing_sequence() {
-        assert_eq!(utf8_complete_len(b"hello"), 5);
-        assert_eq!(utf8_complete_len(b""), 0);
-
-        // é (2-byte) split mid-sequence — the second byte is held back.
-        let split = "é".as_bytes();
-        let buf = [b"hi", &split[..1]].concat();
-        assert_eq!(utf8_complete_len(&buf), 2);
-        let buf = [b"hi", split].concat();
-        assert_eq!(utf8_complete_len(&buf), 4);
-
-        // 4-byte emoji split at 1, 2 and 3 bytes — all held.
-        let emoji = "🦀".as_bytes();
-        for cut in 1..emoji.len() {
-            let buf = [b"x", &emoji[..cut]].concat();
-            assert_eq!(utf8_complete_len(&buf), 1, "cut {cut}");
-        }
-        let buf = [b"x", emoji].concat();
-        assert_eq!(utf8_complete_len(&buf), 5);
-
-        // A genuinely invalid byte mid-buffer is skipped, not held; only a
-        // trailing incomplete sequence shortens the prefix.
-        let buf = [b"ok".as_slice(), &[0xff], b"!", &emoji[..2]].concat();
-        assert_eq!(utf8_complete_len(&buf), 4);
-    }
-}
-
 fn btw_message(role: &str, content: impl Into<String>) -> crate::ui_server::BtwMessage {
     crate::ui_server::BtwMessage {
         role: role.to_string(),
@@ -3385,4 +3353,36 @@ async fn stream_btw_answer(
         }
     }
     let _ = tx.send(AppEvent::BtwFinished).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf8_complete_len;
+
+    #[test]
+    fn utf8_complete_len_holds_only_incomplete_trailing_sequence() {
+        assert_eq!(utf8_complete_len(b"hello"), 5);
+        assert_eq!(utf8_complete_len(b""), 0);
+
+        // é (2-byte) split mid-sequence — the second byte is held back.
+        let split = "é".as_bytes();
+        let buf = [b"hi", &split[..1]].concat();
+        assert_eq!(utf8_complete_len(&buf), 2);
+        let buf = [b"hi", split].concat();
+        assert_eq!(utf8_complete_len(&buf), 4);
+
+        // 4-byte emoji split at 1, 2 and 3 bytes — all held.
+        let emoji = "🦀".as_bytes();
+        for cut in 1..emoji.len() {
+            let buf = [b"x", &emoji[..cut]].concat();
+            assert_eq!(utf8_complete_len(&buf), 1, "cut {cut}");
+        }
+        let buf = [b"x", emoji].concat();
+        assert_eq!(utf8_complete_len(&buf), 5);
+
+        // A genuinely invalid byte mid-buffer is skipped, not held; only a
+        // trailing incomplete sequence shortens the prefix.
+        let buf = [b"ok".as_slice(), &[0xff], b"!", &emoji[..2]].concat();
+        assert_eq!(utf8_complete_len(&buf), 4);
+    }
 }

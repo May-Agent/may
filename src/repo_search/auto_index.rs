@@ -19,13 +19,13 @@ use crate::db::{ChatDb, RepoUsage};
 /// How often the hot set is recomputed.
 const TICK: Duration = Duration::from_secs(60);
 /// How often a hot worktree is touched again.
-pub const RETOUCH: Duration = Duration::from_secs(15 * 60);
+pub const RETOUCH: Duration = Duration::from_mins(15);
 /// Usage older than this drops out of the hot set.
 const WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
 /// At most this many worktrees are kept warm.
 const HOT_SET_SIZE: usize = 20;
 /// Longest wait after repeated failures.
-const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60);
+const MAX_BACKOFF: Duration = Duration::from_hours(1);
 
 /// Recency-weighted rank: uses, discounted by days since the latest use.
 fn rank(usage: &RepoUsage, now: i64) -> f64 {

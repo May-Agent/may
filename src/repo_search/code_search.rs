@@ -132,11 +132,11 @@ impl CodeSearchTool {
     async fn run(&self, args: CodeSearchArgs) -> Result<String, RepoSearchError> {
         let dir = args.repo.clone().unwrap_or_else(|| self.cwd.clone());
         let Some(worktree) = worktree_root(&dir) else {
-            return Ok(NotWorktree {
+            return NotWorktree {
                 dir: &dir.display().to_string(),
             }
             .render()
-            .map_err(render_error)?);
+            .map_err(render_error);
         };
         if let Some(db) = &self.db
             && let Err(error) = db.touch_repo_usage(&worktree).await

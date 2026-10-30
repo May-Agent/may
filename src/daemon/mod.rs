@@ -165,7 +165,7 @@ fn acquire_single_instance(paths: &DaemonPaths) -> anyhow::Result<SingleInstance
     Ok(SingleInstance { _lock: lock })
 }
 
-/// Removes the LanceDB session index May kept before search moved to
+/// Removes the `LanceDB` session index May kept before search moved to
 /// repo-search.
 fn remove_legacy_search_index(may_dir: &Path) {
     for name in [
@@ -183,7 +183,7 @@ fn remove_legacy_search_index(may_dir: &Path) {
             Ok(()) => tracing::info!(path = %path.display(), "removed the legacy session index"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "failed to remove the legacy session index")
+                tracing::warn!(path = %path.display(), %error, "failed to remove the legacy session index");
             }
         }
     }

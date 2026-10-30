@@ -236,7 +236,7 @@ async fn send_frame(
     frame: &super::chat::TurnFrame,
 ) -> bool {
     sender
-        .send(skyzen::responder::sse::Event::data(frame.data.to_string()).event(frame.kind))
+        .send(skyzen::responder::sse::Event::data(&frame.data).event(frame.kind))
         .await
         .is_ok()
 }

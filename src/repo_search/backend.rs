@@ -196,6 +196,7 @@ pub mod testing {
         }
     }
 
+    #[allow(clippy::unused_async_trait_impl, clippy::significant_drop_tightening)]
     impl CollectionBackend for MemoryCollections {
         async fn upsert(
             &self,
