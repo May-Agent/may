@@ -52,9 +52,9 @@ pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
 pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
 
 use super::state::{
-    ActiveTextInput, AppMode, ChatgptAuthStatus, ConfigEditMode, ConfigState, CopilotAuthStatus,
-    McpAddMode, PasteFilter, SelectionPoint, SkillAddMode, SshAddMode, StatusNotice, TextSelection,
-    detect_api_key_from_env,
+    ActiveTextInput, AppMode, AskUserState, ChatgptAuthStatus, ConfigEditMode, ConfigState,
+    CopilotAuthStatus, McpAddMode, PasteFilter, SelectionPoint, SkillAddMode, SshAddMode,
+    StatusNotice, TextSelection, detect_api_key_from_env,
 };
 /// Application state (UI only - agent managed externally).
 #[derive(Debug)]
@@ -256,6 +256,14 @@ pub struct App {
     pub diff_preview_at: Option<std::time::Instant>,
     /// Loaded secret values for bash-mode masking and env injection.
     pub secrets: crate::secrets::Secrets,
+    /// Questions the agent asked that nobody answered yet, for the status bar.
+    pub open_question_count: usize,
+    /// Which open question `/questions` shows next, so repeated use walks
+    /// through all of them.
+    pub question_cursor: usize,
+    /// The open question being answered when a blocking prompt took over the
+    /// screen; it comes back, draft intact, when the prompt is done.
+    parked_question: Option<AskUserState>,
 }
 
 /// Live-output read state for a running terminal call bound to a
@@ -478,6 +486,9 @@ impl App {
             live_reads: std::collections::HashMap::new(),
             diff_preview_at: None,
             secrets,
+            open_question_count: 0,
+            question_cursor: 0,
+            parked_question: None,
         })
     }
 
@@ -1381,6 +1392,24 @@ impl App {
         super::reducer::reduce_event(self, event)
     }
 
+    /// Show a prompt a run is blocked on. An open question being answered
+    /// is parked with its draft, not discarded.
+    pub fn show_blocking_prompt(&mut self, prompt: AppMode) {
+        super::reducer::ask_user::show_blocking_prompt(
+            &mut self.mode,
+            &mut self.parked_question,
+            prompt,
+        );
+    }
+
+    /// Bring back the parked open question once the screen is free.
+    pub fn restore_parked_question(&mut self) {
+        super::reducer::ask_user::restore_parked_question(
+            &mut self.mode,
+            &mut self.parked_question,
+        );
+    }
+
     /// Show a status notice that stays until replaced or cleared.
     pub fn set_status(&mut self, text: impl Into<String>) {
         self.status = Some(StatusNotice::persistent(text));
@@ -2262,6 +2291,7 @@ impl App {
                 self.open_jobs();
                 None
             }
+            "/questions" => Some(SendAction::OpenQuestions),
             "/btw" => {
                 self.open_btw();
                 None
@@ -2837,12 +2867,14 @@ pub enum SendAction {
     Send(PendingMessage),
     /// Persist a pending message for later dispatch.
     EnqueuePending(PendingMessage),
+    /// Show an open question of the session in the answer modal.
+    OpenQuestions,
     /// Submit an ask-user response.
     RespondAskUser {
         /// ID of the pending ask-user request being answered.
         request_id: String,
-        /// The ask-user request that was presented to the user.
-        request: crate::ask_user::AskUserRequest,
+        /// The prompt a run is blocked on, or `None` for an open question.
+        request: Option<crate::ask_user::AskUserRequest>,
         /// The user's answers, one entry per question.
         answers: Vec<crate::ask_user::QuestionAnswer>,
     },

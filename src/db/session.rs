@@ -19,11 +19,11 @@ use crate::session::{
 use crate::xml::XmlBlock;
 
 use super::common::{
-    I64ValueRow, PendingAskUserLookup, PendingAskUserQuestionOptionRow, PendingAskUserQuestionRow,
-    PendingAskUserRequestRow, PendingMessageAttachmentRow, PendingMessageEntryRow,
-    PendingPermissionLookup, PendingWorkspaceLookup, SessionIdRow, db_custom_error, overflow_error,
-    parse_attachment_kind, parse_pending_user_message_mode, parse_session_plan_state,
-    parse_session_runtime_state, row_not_found, session_not_found_db_error, storage_error,
+    I64ValueRow, PendingAskUserQuestionOptionRow, PendingAskUserQuestionRow,
+    PendingAskUserRequestRow, PendingMessageAttachmentRow, PendingMessageEntryRow, SessionIdRow,
+    db_custom_error, overflow_error, parse_attachment_kind, parse_pending_user_message_mode,
+    parse_session_plan_state, parse_session_runtime_state, row_not_found,
+    session_not_found_db_error, storage_error,
 };
 use super::entity::{
     session_pending_permissions, session_pending_workspace, session_plans, session_runtimes,
@@ -31,9 +31,11 @@ use super::entity::{
 };
 use super::{ChatDb, ChatDbError, query};
 
-/// Grouped pending ask-user request rows used when assembling a runtime summary.
+/// Grouped ask-user rows used when assembling a runtime summary: the request
+/// a run waits on, and the questions left open without a waiter.
 struct PendingAskUserParts {
     row: Option<PendingAskUserRequestRow>,
+    open_questions: Vec<PersistedAskUserRequest>,
     questions: Vec<PendingAskUserQuestionRow>,
     options: Vec<PendingAskUserQuestionOptionRow>,
 }
@@ -154,7 +156,7 @@ impl ChatDb {
         }
     }
 
-    fn persisted_ask_user_request_from_parts(
+    pub(super) fn persisted_ask_user_request_from_parts(
         row: PendingAskUserRequestRow,
         question_rows: Vec<PendingAskUserQuestionRow>,
         option_rows: Vec<PendingAskUserQuestionOptionRow>,
@@ -272,6 +274,7 @@ impl ChatDb {
                     ask_user.options.clone(),
                 )
             }),
+            open_questions: ask_user.open_questions,
             updated_at: runtime_row.map(|row| row.updated_at),
             ..Default::default()
         };
@@ -335,7 +338,7 @@ impl ChatDb {
         .await?;
         let ask_user_row = query!(
             self.db,
-            "SELECT * FROM session_pending_ask_user_requests_v2 WHERE session_id = ? LIMIT 1",
+            "SELECT * FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1 LIMIT 1",
             session_id
         )
         .fetch_optional::<PendingAskUserRequestRow>()
@@ -377,6 +380,7 @@ impl ChatDb {
             workspace_row,
             PendingAskUserParts {
                 row: ask_user_row,
+                open_questions: self.open_ask_user_questions(session_id).await?,
                 questions: ask_user_question_rows,
                 options: ask_user_option_rows,
             },
@@ -523,7 +527,7 @@ impl ChatDb {
     }
 
     /// Insert a pending message and its attachments within an existing transaction.
-    async fn insert_pending_message_in_tx(
+    pub(super) async fn insert_pending_message_in_tx(
         &self,
         tx: &mut skyzen_services::DbTransaction,
         session_id: &str,
@@ -834,21 +838,21 @@ impl ChatDb {
         // Clear existing
         query!(
             tx,
-            "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
+            "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1)",
             session_id
         )
         .execute()
         .await?;
         query!(
             tx,
-            "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
+            "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1)",
             session_id
         )
         .execute()
         .await?;
         query!(
             tx,
-            "DELETE FROM session_pending_ask_user_requests_v2 WHERE session_id = ?",
+            "DELETE FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1",
             session_id
         )
         .execute()
@@ -857,7 +861,7 @@ impl ChatDb {
         if let Some(request) = &request {
             query!(
                 tx,
-                "INSERT INTO session_pending_ask_user_requests_v2 (request_id, session_id, created_at) VALUES (?, ?, ?)",
+                "INSERT INTO session_pending_ask_user_requests_v2 (request_id, session_id, created_at, blocking) VALUES (?, ?, ?, 1)",
                 request.id.as_str(),
                 session_id,
                 now.as_str()
@@ -1003,45 +1007,6 @@ impl ChatDb {
         .map(|row| row.session_id))
     }
 
-    pub(crate) async fn find_pending_permission_request(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<PendingPermissionLookup>, ChatDbError> {
-        Ok(query!(
-            self.db,
-            "SELECT session_id FROM session_pending_permissions WHERE request_id = ? LIMIT 1",
-            request_id
-        )
-        .fetch_optional::<PendingPermissionLookup>()
-        .await?)
-    }
-
-    pub(crate) async fn find_pending_workspace_request(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<PendingWorkspaceLookup>, ChatDbError> {
-        Ok(query!(
-            self.db,
-            "SELECT session_id FROM session_pending_workspace WHERE request_id = ? LIMIT 1",
-            request_id
-        )
-        .fetch_optional::<PendingWorkspaceLookup>()
-        .await?)
-    }
-
-    pub(crate) async fn find_pending_ask_user_request(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<PendingAskUserLookup>, ChatDbError> {
-        Ok(query!(
-            self.db,
-            "SELECT session_id FROM session_pending_ask_user_requests_v2 WHERE request_id = ? LIMIT 1",
-            request_id
-        )
-        .fetch_optional::<PendingAskUserLookup>()
-        .await?)
-    }
-
     /// Check if a session exists in the database.
     ///
     /// # Errors
@@ -1115,6 +1080,7 @@ impl ChatDb {
         query!(self.db, "DELETE FROM messages WHERE session_id = ?", id)
             .execute()
             .await?;
+        self.delete_session_ask_user_requests(Some(id)).await?;
         self.delete_session_context_snapshot(id).await?;
         query!(self.db, "DELETE FROM sessions WHERE id = ?", id)
             .execute()
@@ -1128,6 +1094,7 @@ impl ChatDb {
     /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn delete_all_sessions(&self) -> Result<u64, ChatDbError> {
         let result = query!(self.db, "DELETE FROM messages").execute().await?;
+        self.delete_session_ask_user_requests(None).await?;
         let snapshot_result = query!(self.db, "DELETE FROM session_context_snapshots")
             .execute()
             .await?;
@@ -1258,21 +1225,6 @@ impl ChatDb {
                 query!(tx, sql, updated_at, session_id).execute().await?;
             }
         }
-        Ok(())
-    }
-
-    /// Update session stats after inserting a message row.
-    pub(super) async fn update_session_stats(
-        &self,
-        session_id: &str,
-        updated_at: &str,
-        preview: Option<&str>,
-        increment_count: bool,
-    ) -> Result<(), ChatDbError> {
-        let mut tx = self.db.begin().await?;
-        Self::update_session_stats_in(&mut tx, session_id, updated_at, preview, increment_count)
-            .await?;
-        tx.commit().await?;
         Ok(())
     }
 }

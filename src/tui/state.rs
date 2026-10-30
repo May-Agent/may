@@ -152,7 +152,7 @@ pub struct RewindState {
 /// Per-question interaction state.
 #[derive(Debug)]
 pub struct AskUserQuestionState {
-    /// Cursor position in the option list (includes extra items: skip, custom).
+    /// Cursor position in the option list (includes the extra custom item).
     pub cursor: usize,
     /// Selected option indices (for the predefined options).
     pub selections: Vec<usize>,
@@ -160,8 +160,6 @@ pub struct AskUserQuestionState {
     pub custom_mode: bool,
     /// Custom answer text buffer.
     pub custom_text: String,
-    /// Whether this question was skipped.
-    pub skipped: bool,
 }
 
 impl Default for AskUserQuestionState {
@@ -171,6 +169,13 @@ impl Default for AskUserQuestionState {
 }
 
 impl AskUserQuestionState {
+    /// Whether the user chose an option or wrote a text. Nothing else
+    /// answers a question.
+    #[must_use]
+    pub fn is_answered(&self) -> bool {
+        !self.selections.is_empty() || !self.custom_text.trim().is_empty()
+    }
+
     /// Create empty question state.
     #[must_use]
     pub const fn new() -> Self {
@@ -179,7 +184,6 @@ impl AskUserQuestionState {
             selections: Vec::new(),
             custom_mode: false,
             custom_text: String::new(),
-            skipped: false,
         }
     }
 }
@@ -198,8 +202,9 @@ impl std::fmt::Debug for AskUserState {
 pub struct AskUserState {
     /// Stable persisted request identifier.
     pub request_id: String,
-    /// The original request (holds the response channel).
-    pub request: AskUserRequest,
+    /// The prompt a run is blocked on (holds the response channel); `None`
+    /// for an open question, which no run waits on.
+    pub request: Option<AskUserRequest>,
     /// Normalized list of questions.
     pub questions: Vec<Question>,
     /// Current question index.
@@ -212,6 +217,30 @@ impl AskUserState {
     /// Build interaction state for `request` and its `questions`.
     #[must_use]
     pub fn new(request_id: String, request: AskUserRequest, questions: Vec<Question>) -> Self {
+        Self::build(request_id, Some(request), questions)
+    }
+
+    /// Build interaction state for the open question `open`.
+    #[must_use]
+    pub fn for_open_question(open: crate::session::PersistedAskUserRequest) -> Self {
+        let questions = open
+            .questions
+            .into_iter()
+            .map(|question| Question {
+                section: question.section,
+                question: question.question,
+                option: question.option,
+                multi_select: question.multi_select,
+            })
+            .collect();
+        Self::build(open.id, None, questions)
+    }
+
+    fn build(
+        request_id: String,
+        request: Option<AskUserRequest>,
+        questions: Vec<Question>,
+    ) -> Self {
         let states = questions
             .iter()
             .map(|_| AskUserQuestionState::new())
@@ -243,10 +272,10 @@ impl AskUserState {
     }
 
     /// Total number of items in the list for current question:
-    /// options + "Skip" + "Custom answer"
+    /// options + "Custom answer"
     #[must_use]
     pub fn current_item_count(&self) -> usize {
-        self.current().map_or(0, |q| q.option.len() + 2)
+        self.current().map_or(0, |q| q.option.len() + 1)
     }
 
     /// Whether there are multiple questions.

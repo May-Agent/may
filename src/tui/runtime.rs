@@ -69,6 +69,9 @@ pub enum TuiRuntimeError {
         /// URL that is not a local `file://` URL.
         url: String,
     },
+    /// An answer to an open question was refused.
+    #[error("{0}")]
+    Answer(#[from] crate::session::AnswerError),
     /// Listening for messages from other agents failed.
     #[error("failed to listen for messages from other agents: {0}")]
     AgentLink(#[from] crate::agent_link::AgentLinkError),
@@ -105,6 +108,25 @@ pub enum TuiRuntimeError {
     /// Failed to decode data URL.
     #[error("failed to decode data URL: {0}")]
     DecodeDataUrl(#[source] base64::DecodeError),
+}
+
+/// Whether the caller committed its response to a prompt a run is blocked on.
+///
+/// Only the committer wakes the run with its own response. When another
+/// process sharing the database committed first, it finds no waiter
+/// in its own registry and takes the resume path, so this process answers
+/// the live run with what was committed (`R`), read back by request id, and
+/// the user is told their own response was not used.
+#[derive(Debug, Clone)]
+#[must_use]
+pub enum ResponseCommit<R> {
+    /// This call committed the response; the caller wakes the run with it.
+    Committed,
+    /// Another response was committed first; the caller answers the run with
+    /// it.
+    Lost(R),
+    /// The prompt was withdrawn and nothing was committed; the run fails.
+    Withdrawn,
 }
 
 /// Session runtime facade used by the local TUI: queue state, pending interactions, and permission approval.
@@ -333,31 +355,47 @@ impl LocalSessionRuntime {
         Ok(request_id)
     }
 
-    /// Record the user's answers and clear the pending request.
+    /// Commit the user's answers to the prompt a run is blocked on, clearing
+    /// it by its id. The caller wakes the run only on
+    /// [`ResponseCommit::Committed`].
     ///
     /// # Errors
-    /// Returns [`TuiRuntimeError`] on storage failure.
+    /// Returns [`TuiRuntimeError`] when the answers do not fit the prompt or
+    /// on storage failure; nothing is committed then.
+    ///
+    /// # Panics
+    /// Panics when a question reported as answered has no answers in the
+    /// history: the commit writes both in one transaction, so that is a
+    /// corrupted database.
     pub async fn resolve_ask_user_response(
         &self,
-        app: &mut App,
         session_id: &SessionId,
         request_id: &str,
         answers: &[QuestionAnswer],
-    ) -> Result<(), TuiRuntimeError> {
-        self.runtime_service
-            .set_waiting_ask_user(session_id.as_str(), None)
-            .await?;
+    ) -> Result<ResponseCommit<Vec<QuestionAnswer>>, TuiRuntimeError> {
+        match self
+            .runtime_service
+            .answer_ask_user(request_id, answers)
+            .await?
+        {
+            Some(crate::session::AskUserAnswer::Committed(_)) => {}
+            Some(crate::session::AskUserAnswer::AlreadyAnswered { .. }) => {
+                let committed = self
+                    .runtime_service
+                    .committed_ask_user_answers(request_id)
+                    .await?
+                    .expect("an answered question has its committed answers in the history");
+                return Ok(ResponseCommit::Lost(committed));
+            }
+            None => return Ok(ResponseCommit::Withdrawn),
+        }
         self.runtime_service
             .set_state(
                 session_id.as_str(),
                 crate::session::SessionRuntimeState::Running,
             )
             .await?;
-        app.session_manager
-            .db()
-            .append_ask_user_response_message(session_id.as_str(), request_id, answers, None)
-            .await?;
-        Ok(())
+        Ok(ResponseCommit::Committed)
     }
 
     /// Persist a workspace-access request and surface it in the app.
@@ -397,31 +435,37 @@ impl LocalSessionRuntime {
         Ok(request_id)
     }
 
-    /// Record the workspace decision and clear the pending request.
+    /// Commit the workspace decision, clearing the pending request by its
+    /// id. The caller wakes the run only on [`ResponseCommit::Committed`].
     ///
     /// # Errors
-    /// Returns [`TuiRuntimeError`] on storage failure.
+    /// Returns [`TuiRuntimeError`] on storage failure; nothing is committed
+    /// then.
     pub async fn resolve_workspace_response(
         &self,
-        app: &mut App,
         session_id: &SessionId,
         request_id: &str,
         approved: bool,
-    ) -> Result<(), TuiRuntimeError> {
-        self.runtime_service
-            .set_waiting_workspace(session_id.as_str(), None)
-            .await?;
+    ) -> Result<ResponseCommit<bool>, TuiRuntimeError> {
+        if self
+            .runtime_service
+            .commit_workspace_response(request_id, approved)
+            .await?
+            .is_none()
+        {
+            let committed = self
+                .runtime_service
+                .committed_workspace_decision(request_id)
+                .await?;
+            return Ok(committed.map_or(ResponseCommit::Withdrawn, ResponseCommit::Lost));
+        }
         self.runtime_service
             .set_state(
                 session_id.as_str(),
                 crate::session::SessionRuntimeState::Running,
             )
             .await?;
-        app.session_manager
-            .db()
-            .append_workspace_response_message(session_id.as_str(), request_id, approved, None)
-            .await?;
-        Ok(())
+        Ok(ResponseCommit::Committed)
     }
 
     /// Fetch the permission request blocking the session, if any.
@@ -439,36 +483,72 @@ impl LocalSessionRuntime {
             .waiting_permission)
     }
 
+    /// The open questions of a session, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
+    pub async fn open_questions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::session::PersistedAskUserRequest>, TuiRuntimeError> {
+        Ok(self
+            .runtime_service
+            .get(session_id.as_str())
+            .await?
+            .open_questions)
+    }
+
+    /// Commit the answers to an open question into the session queue.
+    /// Returns whether this call committed them: `false` when the question
+    /// is no longer open (withdrawn, or answered elsewhere).
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the answers do not fit the question
+    /// or on storage failure.
+    pub async fn answer_open_question(
+        &self,
+        request_id: &str,
+        answers: &[QuestionAnswer],
+    ) -> Result<bool, TuiRuntimeError> {
+        Ok(matches!(
+            self.runtime_service
+                .answer_ask_user(request_id, answers)
+                .await?,
+            Some(crate::session::AskUserAnswer::Committed(_))
+        ))
+    }
+
     /// Record the permission decision and clear the pending request.
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_permission_response(
         &self,
-        app: &mut App,
         session_id: &SessionId,
         request_id: &str,
         approved: bool,
     ) -> Result<(), TuiRuntimeError> {
-        let responded = self.permission_approver.respond(request_id, approved);
-        self.runtime_service
-            .set_waiting_permission(session_id.as_str(), None)
-            .await?;
+        // Commit first (the request cleared by its id, the decision in the
+        // history), then wake the run.
+        let Some(resolved) = self
+            .permission_approver
+            .resolve(request_id, approved)
+            .await?
+        else {
+            tracing::warn!(request_id, "permission response for a request not pending");
+            return Ok(());
+        };
         self.runtime_service
             .set_state(
                 session_id.as_str(),
-                if responded {
+                if resolved.woke {
                     crate::session::SessionRuntimeState::Running
                 } else {
                     crate::session::SessionRuntimeState::Idle
                 },
             )
             .await?;
-        app.session_manager
-            .db()
-            .append_permission_response_message(session_id.as_str(), request_id, approved, None)
-            .await?;
-        if !responded {
+        if !resolved.woke {
             tracing::warn!(
                 request_id,
                 "permission response resolved without a live waiter"
@@ -1312,19 +1392,55 @@ impl RuntimeDeps {
             .await
     }
 
-    /// Record the user's answers and clear the pending request.
+    /// The open questions of the current session, oldest first.
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] on storage failure.
+    pub async fn open_questions(
+        &self,
+        app: &App,
+    ) -> Result<Vec<crate::session::PersistedAskUserRequest>, TuiRuntimeError> {
+        let Some(session_id) = app
+            .session_manager
+            .current()
+            .map(|session| session.id.clone())
+        else {
+            return Ok(Vec::new());
+        };
+        self.local_runtime.open_questions(&session_id).await
+    }
+
+    /// Commit the user's answers to an open question; the answer joins the
+    /// session queue, which the event loop dispatches. Returns whether this
+    /// call committed them: `false` when the question is no longer open.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the answers do not fit the question
+    /// or on storage failure.
+    pub async fn answer_open_question(
+        &self,
+        request_id: &str,
+        answers: &[QuestionAnswer],
+    ) -> Result<bool, TuiRuntimeError> {
+        self.local_runtime
+            .answer_open_question(request_id, answers)
+            .await
+    }
+
+    /// Commit the user's answers to the prompt a run is blocked on; the
+    /// caller wakes the run afterwards, only if this call committed.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the answers do not fit the prompt or
+    /// on storage failure.
     pub async fn resolve_ask_user_response(
         &self,
-        app: &mut App,
         session_id: &SessionId,
         request_id: &str,
         answers: &[QuestionAnswer],
-    ) -> Result<(), TuiRuntimeError> {
+    ) -> Result<ResponseCommit<Vec<QuestionAnswer>>, TuiRuntimeError> {
         self.local_runtime
-            .resolve_ask_user_response(app, session_id, request_id, answers)
+            .resolve_ask_user_response(session_id, request_id, answers)
             .await
     }
 
@@ -1343,19 +1459,19 @@ impl RuntimeDeps {
             .await
     }
 
-    /// Record the workspace decision and clear the pending request.
+    /// Commit the workspace decision; the caller wakes the run afterwards,
+    /// only if this call committed.
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_workspace_response(
         &self,
-        app: &mut App,
         session_id: &SessionId,
         request_id: &str,
         approved: bool,
-    ) -> Result<(), TuiRuntimeError> {
+    ) -> Result<ResponseCommit<bool>, TuiRuntimeError> {
         self.local_runtime
-            .resolve_workspace_response(app, session_id, request_id, approved)
+            .resolve_workspace_response(session_id, request_id, approved)
             .await
     }
 
@@ -1383,7 +1499,7 @@ impl RuntimeDeps {
     /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn resolve_permission_response(
         &self,
-        app: &mut App,
+        app: &App,
         request_id: &str,
         approved: bool,
     ) -> Result<(), TuiRuntimeError> {
@@ -1393,7 +1509,7 @@ impl RuntimeDeps {
             .map(|session| session.id.clone())
             .ok_or(TuiRuntimeError::NoActiveSession)?;
         self.local_runtime
-            .resolve_permission_response(app, &session_id, request_id, approved)
+            .resolve_permission_response(&session_id, request_id, approved)
             .await
     }
 
@@ -1683,11 +1799,16 @@ async fn build_worker_for_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalSessionRuntime, QueuedRun};
+    use aither_sandbox::TerminalMode;
+
+    use super::{LocalSessionRuntime, QueuedRun, ResponseCommit};
     use crate::SessionId;
+    use crate::ask_user::{AnswerValue, QuestionAnswer};
     use crate::db::ChatDb;
     use crate::session::{
-        PendingUserMessage, PendingUserMessageMode, RunOutcome, SessionRuntimeService,
+        PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
+        PersistedAskUserRequest, PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload,
+        RunOutcome, SessionRuntimeService,
     };
 
     fn queued(content: &str) -> PendingUserMessage {
@@ -1829,5 +1950,388 @@ mod tests {
             .finish_idle(RunOutcome::Completed)
             .await
             .expect("holder ends");
+    }
+
+    async fn local_session() -> (tempfile::TempDir, LocalSessionRuntime, SessionId) {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("open");
+        db.create_session("session", Some("Session"), Some("test-model"))
+            .await
+            .expect("create session");
+        (
+            dir,
+            LocalSessionRuntime::new(db),
+            SessionId::from_string("session"),
+        )
+    }
+
+    async fn bounded<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(20), future)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+    }
+
+    fn workspace_request(id: &str) -> PersistedWorkspaceRequest {
+        PersistedWorkspaceRequest {
+            id: id.to_string(),
+            request: PersistedWorkspaceRequestPayload {
+                path: "/srv/data".to_string(),
+                reason: "read the dataset".to_string(),
+                session_id: Some("session".to_string()),
+            },
+        }
+    }
+
+    fn ssh_prompt(id: &str) -> PersistedAskUserRequest {
+        PersistedAskUserRequest {
+            id: id.to_string(),
+            questions: vec![PersistedAskUserQuestion {
+                section: String::new(),
+                question: "Allow SSH?".to_string(),
+                option: vec!["Allow".to_string(), "Deny".to_string()],
+                multi_select: false,
+            }],
+        }
+    }
+
+    fn allow() -> Vec<QuestionAnswer> {
+        vec![QuestionAnswer {
+            section: String::new(),
+            answer: AnswerValue::Selected(vec!["Allow".to_string()]),
+        }]
+    }
+
+    async fn responses(local: &LocalSessionRuntime, role: &str) -> usize {
+        local
+            .runtime_service
+            .db()
+            .get_messages_by_role("session", role)
+            .await
+            .expect("history loads")
+            .len()
+    }
+
+    /// Start a run waiting on a permission decision; returns the pending
+    /// request id and the waiter, which reports what it saw on waking.
+    async fn wait_for_permission(
+        local: &LocalSessionRuntime,
+        session_id: &SessionId,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<(bool, Option<String>, usize)>,
+    ) {
+        let permissions = local.permission_approver_for(session_id);
+        let service = local.runtime_service.clone();
+        let waiter = tokio::spawn(async move {
+            let allowed = permissions
+                .request_and_wait(TerminalMode::Unsafe, "make install".to_string())
+                .await
+                .expect("the waiter is woken with a decision");
+            let runtime = service.get("session").await.expect("runtime");
+            let responses = service
+                .db()
+                .get_messages_by_role("session", "permission_response")
+                .await
+                .expect("history loads")
+                .len();
+            (
+                allowed,
+                runtime.waiting_permission.map(|request| request.id),
+                responses,
+            )
+        });
+        let id = bounded("the permission request to show", async {
+            loop {
+                if let Some(request) = local
+                    .runtime_service
+                    .get("session")
+                    .await
+                    .expect("runtime")
+                    .waiting_permission
+                {
+                    return request.id;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        (id, waiter)
+    }
+
+    /// The TUI commits a permission decision before it wakes the run, and
+    /// clears the request it answered by its id: a stale decision leaves a
+    /// newer request pending.
+    #[tokio::test]
+    async fn a_permission_response_commits_before_it_wakes_the_run_and_clears_by_id() {
+        let (_dir, local, session_id) = local_session().await;
+        let (older, first) = wait_for_permission(&local, &session_id).await;
+        local
+            .resolve_permission_response(&session_id, &older, true)
+            .await
+            .expect("the decision commits");
+        let (approved, pending, recorded) = bounded("the first run to wake", first)
+            .await
+            .expect("the waiter finishes");
+        assert!(approved);
+        assert_eq!(pending, None, "the request was cleared before the run woke");
+        assert_eq!(
+            recorded, 1,
+            "the decision was in the history before the run woke"
+        );
+
+        let (newer, second) = wait_for_permission(&local, &session_id).await;
+        local
+            .resolve_permission_response(&session_id, &older, true)
+            .await
+            .expect("a stale decision is not a failure");
+        let still = local
+            .runtime_service
+            .get("session")
+            .await
+            .expect("runtime")
+            .waiting_permission
+            .map(|request| request.id);
+        assert_eq!(
+            still,
+            Some(newer.clone()),
+            "the newer request stays pending"
+        );
+        assert!(
+            !second.is_finished(),
+            "the stale decision woke the newer run"
+        );
+        local
+            .resolve_permission_response(&session_id, &newer, false)
+            .await
+            .expect("the decision commits");
+        let (approved, ..) = bounded("the second run to wake", second)
+            .await
+            .expect("the waiter finishes");
+        assert!(!approved);
+    }
+
+    /// A permission decision whose commit fails wakes nobody and leaves the
+    /// request pending.
+    #[tokio::test]
+    async fn a_failed_permission_commit_wakes_nobody() {
+        let (_dir, local, session_id) = local_session().await;
+        let (id, waiter) = wait_for_permission(&local, &session_id).await;
+        local
+            .runtime_service
+            .db()
+            .execute_for_test("CREATE TRIGGER fail_response_history BEFORE INSERT ON message_permission_responses BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+            .await
+            .expect("break the history writes");
+        assert!(
+            local
+                .resolve_permission_response(&session_id, &id, true)
+                .await
+                .is_err()
+        );
+        assert!(!waiter.is_finished(), "the failed decision woke the run");
+        assert_eq!(
+            local
+                .runtime_service
+                .get("session")
+                .await
+                .expect("runtime")
+                .waiting_permission
+                .map(|request| request.id),
+            Some(id)
+        );
+        waiter.abort();
+    }
+
+    /// A workspace decision commits (the request cleared by its id, the
+    /// decision in the history) when the call returns, which is before the
+    /// caller wakes the run; a stale one leaves a newer request pending, and
+    /// one whose commit fails returns the error so nothing is woken.
+    #[tokio::test]
+    async fn a_workspace_response_commits_by_id_before_the_caller_wakes_the_run() {
+        let (_dir, local, session_id) = local_session().await;
+        let service = &local.runtime_service;
+        service
+            .set_waiting_workspace("session", Some(workspace_request("older")))
+            .await
+            .expect("older request");
+        assert!(matches!(
+            local
+                .resolve_workspace_response(&session_id, "older", true)
+                .await
+                .expect("the decision commits"),
+            ResponseCommit::Committed
+        ));
+        let runtime = service.get("session").await.expect("runtime");
+        assert!(runtime.waiting_workspace.is_none());
+        assert_eq!(responses(&local, "workspace_response").await, 1);
+
+        service
+            .set_waiting_workspace("session", Some(workspace_request("newer")))
+            .await
+            .expect("newer request");
+        assert!(
+            matches!(
+                local
+                    .resolve_workspace_response(&session_id, "older", false)
+                    .await
+                    .expect("a stale decision is not a failure"),
+                ResponseCommit::Lost(true)
+            ),
+            "a decision that lost the commit carries the committed decision, not its own"
+        );
+        assert!(
+            matches!(
+                local
+                    .resolve_workspace_response(&session_id, "never-asked", true)
+                    .await
+                    .expect("a withdrawn request is not a failure"),
+                ResponseCommit::Withdrawn
+            ),
+            "a request nobody committed has no decision to carry"
+        );
+        assert_eq!(
+            service
+                .get("session")
+                .await
+                .expect("runtime")
+                .waiting_workspace
+                .map(|request| request.id),
+            Some("newer".to_string()),
+            "the newer request stays pending"
+        );
+        assert_eq!(responses(&local, "workspace_response").await, 1);
+
+        service
+            .db()
+            .execute_for_test("CREATE TRIGGER fail_response_history BEFORE INSERT ON message_workspace_responses BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+            .await
+            .expect("break the history writes");
+        assert!(
+            local
+                .resolve_workspace_response(&session_id, "newer", true)
+                .await
+                .is_err(),
+            "a failed commit is returned, so the caller wakes nobody"
+        );
+        assert!(
+            service
+                .get("session")
+                .await
+                .expect("runtime")
+                .waiting_workspace
+                .is_some(),
+            "nothing was committed"
+        );
+    }
+
+    /// The same for the prompt a run blocks on.
+    #[tokio::test]
+    async fn an_ask_user_response_commits_by_id_before_the_caller_wakes_the_run() {
+        let (_dir, local, session_id) = local_session().await;
+        let service = &local.runtime_service;
+        service
+            .set_waiting_ask_user("session", Some(ssh_prompt("older")))
+            .await
+            .expect("older prompt");
+        assert!(matches!(
+            local
+                .resolve_ask_user_response(&session_id, "older", &allow())
+                .await
+                .expect("the answer commits"),
+            ResponseCommit::Committed
+        ));
+        assert!(
+            service
+                .get("session")
+                .await
+                .expect("runtime")
+                .waiting_ask_user
+                .is_none()
+        );
+        assert_eq!(responses(&local, "ask_user_response").await, 1);
+
+        service
+            .set_waiting_ask_user("session", Some(ssh_prompt("newer")))
+            .await
+            .expect("newer prompt");
+        let deny = vec![QuestionAnswer {
+            section: String::new(),
+            answer: AnswerValue::Selected(vec!["Deny".to_string()]),
+        }];
+        let ResponseCommit::Lost(committed) = local
+            .resolve_ask_user_response(&session_id, "older", &deny)
+            .await
+            .expect("a stale answer is not a failure")
+        else {
+            panic!("an answer that lost the commit must report the committed answers");
+        };
+        assert!(
+            matches!(
+                committed.as_slice(),
+                [QuestionAnswer { answer: AnswerValue::Selected(values), .. }]
+                    if values == &["Allow".to_string()]
+            ),
+            "the live run is answered with the committed answer, not this process's own: {committed:?}"
+        );
+        assert!(
+            matches!(
+                local
+                    .resolve_ask_user_response(&session_id, "never-asked", &allow())
+                    .await
+                    .expect("a withdrawn prompt is not a failure"),
+                ResponseCommit::Withdrawn
+            ),
+            "a prompt nobody committed has no answers to carry"
+        );
+        assert_eq!(
+            service
+                .get("session")
+                .await
+                .expect("runtime")
+                .waiting_ask_user
+                .map(|request| request.id),
+            Some("newer".to_string()),
+            "the newer prompt stays pending"
+        );
+        assert_eq!(responses(&local, "ask_user_response").await, 1);
+
+        service
+            .db()
+            .execute_for_test("CREATE TRIGGER fail_response_history BEFORE INSERT ON message_ask_user_responses BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+            .await
+            .expect("break the history writes");
+        assert!(
+            local
+                .resolve_ask_user_response(&session_id, "newer", &allow())
+                .await
+                .is_err(),
+            "a failed commit is returned, so the caller wakes nobody"
+        );
+    }
+
+    /// Answering an open question that was withdrawn meanwhile commits
+    /// nothing and says so, instead of dropping the answer silently.
+    #[tokio::test]
+    async fn answering_a_withdrawn_open_question_reports_it_is_gone() {
+        let (_dir, local, _session_id) = local_session().await;
+        let service = &local.runtime_service;
+        service
+            .open_question("session", &ssh_prompt("open-1"))
+            .await
+            .expect("the question opens");
+        assert!(
+            service
+                .withdraw_question("session", "open-1")
+                .await
+                .expect("withdrawn")
+        );
+        let committed = local
+            .answer_open_question("open-1", &allow())
+            .await
+            .expect("not a failure");
+        assert!(!committed, "the answer to a withdrawn question is not sent");
     }
 }

@@ -10,6 +10,7 @@ mod logs;
 mod memory;
 mod message;
 mod notification;
+mod open_questions;
 mod profile;
 mod run_lease;
 mod session;
@@ -32,6 +33,7 @@ pub use common::{
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use message::MessageMeta;
+pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
 pub use run_lease::RunFence;
 
 use common::{
@@ -70,12 +72,20 @@ impl ChatDb {
         Self::ensure_profile_preference_columns(&db).await?;
         Self::ensure_session_columns(&db).await?;
         Self::ensure_message_columns(&db).await?;
+        Self::ensure_ask_user_blocking_column(&db).await?;
         Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
         Self::ensure_session_run_lease_table(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Ok(Self { db })
+    }
+
+    /// Run `sql` as given, so a test can break the storage a commit needs.
+    #[cfg(test)]
+    pub(crate) async fn execute_for_test(&self, sql: &str) -> Result<(), ChatDbError> {
+        query!(self.db, sql).execute().await?;
+        Ok(())
     }
 
     async fn ensure_session_columns(db: &SkyDb) -> Result<(), ChatDbError> {
@@ -91,6 +101,26 @@ impl ChatDb {
             query!(db, "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT")
                 .execute()
                 .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_ask_user_blocking_column(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(
+            db,
+            "PRAGMA table_info(session_pending_ask_user_requests_v2)"
+        )
+        .fetch_all::<SqliteTableInfoRow>()
+        .await?;
+        if !columns.iter().any(|column| column.name == "blocking") {
+            // Rows written before the column existed are the prompts a run
+            // was waiting on, which is what `blocking` marks.
+            query!(
+                db,
+                "ALTER TABLE session_pending_ask_user_requests_v2 ADD COLUMN blocking BOOLEAN NOT NULL DEFAULT 1"
+            )
+            .execute()
+            .await?;
         }
         Ok(())
     }
