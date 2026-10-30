@@ -1026,15 +1026,8 @@ where
                     let is_esc = *key_code == KeyCode::Esc;
                     // Esc while a subagent runs stops just that run; a second
                     // Esc (or Ctrl+C) still aborts the whole turn.
-                    if is_esc && let Some(runs) = &app.subagent_runs {
-                        let stopped = runs.cancel_all();
-                        if stopped > 0 {
-                            app.set_status(format!(
-                                "Stopped {stopped} subagent{} — Esc again to abort turn",
-                                if stopped == 1 { "" } else { "s" }
-                            ));
-                            continue;
-                        }
+                    if is_esc && app.cancel_all_subagents() {
+                        continue;
                     }
                     if is_ctrl_c || is_esc {
                         tracing::info!("Agent interrupted by user");

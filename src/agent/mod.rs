@@ -56,7 +56,7 @@ pub use runner::{
     AgentHandle, AgentWorker, ForeignTurn, RemoteTurn, RunLease, TuiEvent, spawn_worker,
 };
 pub use subagent_tracker::{
-    SubagentRunSnapshot, SubagentTracker, TrackedSubagentTool, UsageObservedModel,
+    SubagentHandles, SubagentRunSnapshot, SubagentTracker, TrackedSubagentTool, UsageObservedModel,
 };
 pub use task_tool::{
     TaskBroker, TaskCreateRequest, TaskCreateResult, TaskRuntimeKind, channel as task_channel,
