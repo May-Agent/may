@@ -1,11 +1,11 @@
 use aither_core::llm::{CommandResult, CommandStream, ToolResult, tool::ToolResultPart};
 use aither_sandbox::builtin::{InputTerminalArgs, KillTerminalArgs, ReadTerminalDeltaArgs};
-use aither_sandbox::{TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode};
+use aither_sandbox::{TerminalArgs, TerminalExecutionMode};
 
 /// Frontend-agnostic start event for a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolStartKind {
-    /// A `terminal` or `terminal_background` tool invocation.
+    /// A `terminal` tool invocation, foreground or detached.
     Terminal {
         /// Model-provided summary shown as the call's headline.
         description: String,
@@ -110,15 +110,6 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
                 description: args.description,
                 script: args.script,
                 mode: args.mode,
-            }
-        }
-        "terminal_background" => {
-            let args = serde_json::from_str::<TerminalBackgroundArgs>(arguments)
-                .unwrap_or_else(|e| panic!("invalid terminal_background tool args payload: {e}"));
-            ToolStartKind::Terminal {
-                description: args.terminal.description,
-                script: args.terminal.script,
-                mode: args.terminal.mode,
             }
         }
         "terminal_input" => {
@@ -298,8 +289,8 @@ mod tests {
     #[test]
     fn parse_tool_start_covers_terminal_family() {
         match parse_tool_start(
-            "terminal_background",
-            r#"{"description":"serve","script":"bun dev","timeout":60}"#,
+            "terminal",
+            r#"{"description":"serve","script":"bun dev","timeout":60,"background":true}"#,
         ) {
             ToolStartKind::Terminal {
                 description,

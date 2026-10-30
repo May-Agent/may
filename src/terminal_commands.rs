@@ -594,7 +594,7 @@ mod tests {
         .await
         .expect("commands should register");
         let main = builder.build(session_dir.join("outputs"));
-        let subagent = main.for_subagent();
+        let subagent = main.for_subagent(None, None);
 
         // `subagent` is built per terminal, so a subagent launches with its own
         // authority; it is not reserved for the main agent.
@@ -766,7 +766,7 @@ mod tests {
         .await
         .expect("commands should register");
         let main = builder.build(session_dir.join("outputs"));
-        let subagent = main.for_subagent();
+        let subagent = main.for_subagent(None, None);
 
         assert!(!main.is_reserved("agent"));
         assert!(subagent.is_reserved("agent"));

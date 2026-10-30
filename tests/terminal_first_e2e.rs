@@ -108,7 +108,7 @@ const FORK_ANSWER: &str = "FORK-ANSWER-OK";
 /// launch that never finishes ends the test with a message instead of hanging.
 const SUBAGENT_PROBE_MAX_REQUESTS: usize = 40;
 
-/// Waits at most eight seconds (the foreground limit is ten) for the launch
+/// Waits at most eight seconds (the foreground wait is ten) for the launch
 /// job to finish, and prints what it wrote.
 const SUBAGENT_POLL_SCRIPT: &str = "i=0; while [ $i -lt 8 ]; do if [ -f sub.done ]; then echo POLL_DONE; cat sub.out; exit 0; fi; sleep 1; i=$((i+1)); done; echo POLL_PENDING";
 
@@ -279,15 +279,15 @@ impl MockScenarioState {
                 MockHttpResponse::sse(text_stream_frames(chunks.clone(), *delay))
             }
             MockChatScenario::TerminalRoundTrip => match self.request_index {
-                // The command blocks on `read`, so it runs as a background
-                // job: `terminal` foreground calls are killed at their bound,
-                // never promoted.
+                // The command blocks on `read`; it is started detached so the
+                // test drives its stdin as a background job.
                 0 => MockHttpResponse::sse(vec![
                     delayed_sse_frame(
                         tool_call_chunk(
                             "call-terminal",
-                            "terminal_background",
+                            "terminal",
                             &serde_json::json!({
+                                "background": true,
                                 "description": "Ask the terminal for the user's name",
                                 "script": "printf 'cwd=%s\\n' \"$(pwd -P)\"; printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
                                 "mode": "sandboxed",
@@ -485,13 +485,14 @@ impl MockScenarioState {
             verify_native_tool_surface(request)?;
         }
         let latest = latest_tool_output(request);
-        let terminal_call = |name: &str, id: &str, script: &str| {
+        let terminal_call = |background: bool, id: &str, script: &str| {
             MockHttpResponse::sse(vec![
                 delayed_sse_frame(
                     tool_call_chunk(
                         id,
-                        name,
+                        "terminal",
                         &serde_json::json!({
+                            "background": background,
                             "description": "Run the subagent authority probe",
                             "script": script,
                             "mode": "sandboxed",
@@ -511,7 +512,7 @@ impl MockScenarioState {
         let id = format!("call-probe-{}", self.request_index);
         let response = if is_child {
             latest.map_or_else(
-                || terminal_call("terminal", &id, probe.child_script),
+                || terminal_call(false, &id, probe.child_script),
                 |output| text(format!("child probe output: {output}")),
             )
         } else {
@@ -523,13 +524,13 @@ impl MockScenarioState {
                         model_flags = probe.model_flags,
                         flags = probe.grant_flags,
                     );
-                    terminal_call("terminal_background", &id, &launch)
+                    terminal_call(true, &id, &launch)
                 }
                 Some(output) if output.contains("MAIN_FINAL") => text("probe complete".to_string()),
                 Some(output) if output.contains("POLL_DONE") => {
-                    terminal_call("terminal", &id, probe.final_script)
+                    terminal_call(false, &id, probe.final_script)
                 }
-                Some(_) => terminal_call("terminal", &id, SUBAGENT_POLL_SCRIPT),
+                Some(_) => terminal_call(false, &id, SUBAGENT_POLL_SCRIPT),
             }
         };
         self.request_index += 1;
@@ -543,13 +544,14 @@ impl MockScenarioState {
                 self.request_index
             ));
         }
-        let terminal_call = |name: &str, id: &str, script: &str| {
+        let terminal_call = |background: bool, id: &str, script: &str| {
             MockHttpResponse::sse(vec![
                 delayed_sse_frame(
                     tool_call_chunk(
                         id,
-                        name,
+                        "terminal",
                         &serde_json::json!({
+                            "background": background,
                             "description": "Run the fork probe",
                             "script": script,
                             "mode": "sandboxed",
@@ -574,18 +576,18 @@ impl MockScenarioState {
             text(FORK_ANSWER)
         } else {
             match latest_tool_output(request) {
-                None => terminal_call("terminal", &id, FORK_SECRET_SCRIPT),
+                None => terminal_call(false, &id, FORK_SECRET_SCRIPT),
                 Some(output) if output.contains("MAIN_FINAL") => text("fork probe complete"),
                 Some(output) if output.contains("POLL_DONE") => {
-                    terminal_call("terminal", &id, "echo MAIN_FINAL")
+                    terminal_call(false, &id, "echo MAIN_FINAL")
                 }
                 Some(output) if output.contains(FORK_SECRET) => {
                     let launch = format!(
                         "( printf '{FORK_TASK_MARKER}: report what you know.\\n' > prompt.md\nsubagent start fork prompt.md ) > sub.out 2>&1; touch sub.done"
                     );
-                    terminal_call("terminal_background", &id, &launch)
+                    terminal_call(true, &id, &launch)
                 }
-                Some(_) => terminal_call("terminal", &id, SUBAGENT_POLL_SCRIPT),
+                Some(_) => terminal_call(false, &id, SUBAGENT_POLL_SCRIPT),
             }
         };
         self.request_index += 1;
@@ -656,7 +658,6 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
     if names
         != [
             "terminal",
-            "terminal_background",
             "terminal_input",
             "terminal_kill",
             "terminal_read",
