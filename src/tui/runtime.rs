@@ -110,6 +110,25 @@ pub enum TuiRuntimeError {
     DecodeDataUrl(#[source] base64::DecodeError),
 }
 
+/// Whether the caller committed its response to a prompt a run is blocked on.
+///
+/// Only the committer wakes the run with its own response. When another
+/// process sharing the database committed first, it finds no waiter
+/// in its own registry and takes the resume path, so this process answers
+/// the live run with what was committed (`R`), read back by request id, and
+/// the user is told their own response was not used.
+#[derive(Debug, Clone)]
+#[must_use]
+pub enum ResponseCommit<R> {
+    /// This call committed the response; the caller wakes the run with it.
+    Committed,
+    /// Another response was committed first; the caller answers the run with
+    /// it.
+    Lost(R),
+    /// The prompt was withdrawn and nothing was committed; the run fails.
+    Withdrawn,
+}
+
 /// Session runtime facade used by the local TUI: queue state, pending interactions, and permission approval.
 #[derive(Debug, Clone)]
 pub struct LocalSessionRuntime {
@@ -337,31 +356,46 @@ impl LocalSessionRuntime {
     }
 
     /// Commit the user's answers to the prompt a run is blocked on, clearing
-    /// it by its id. The caller wakes the run afterwards.
+    /// it by its id. The caller wakes the run only on
+    /// [`ResponseCommit::Committed`].
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] when the answers do not fit the prompt or
     /// on storage failure; nothing is committed then.
+    ///
+    /// # Panics
+    /// Panics when a question reported as answered has no answers in the
+    /// history: the commit writes both in one transaction, so that is a
+    /// corrupted database.
     pub async fn resolve_ask_user_response(
         &self,
         session_id: &SessionId,
         request_id: &str,
         answers: &[QuestionAnswer],
-    ) -> Result<(), TuiRuntimeError> {
-        if self
+    ) -> Result<ResponseCommit<Vec<QuestionAnswer>>, TuiRuntimeError> {
+        match self
             .runtime_service
             .answer_ask_user(request_id, answers)
             .await?
-            .is_some()
         {
-            self.runtime_service
-                .set_state(
-                    session_id.as_str(),
-                    crate::session::SessionRuntimeState::Running,
-                )
-                .await?;
+            Some(crate::session::AskUserAnswer::Committed(_)) => {}
+            Some(crate::session::AskUserAnswer::AlreadyAnswered { .. }) => {
+                let committed = self
+                    .runtime_service
+                    .committed_ask_user_answers(request_id)
+                    .await?
+                    .expect("an answered question has its committed answers in the history");
+                return Ok(ResponseCommit::Lost(committed));
+            }
+            None => return Ok(ResponseCommit::Withdrawn),
         }
-        Ok(())
+        self.runtime_service
+            .set_state(
+                session_id.as_str(),
+                crate::session::SessionRuntimeState::Running,
+            )
+            .await?;
+        Ok(ResponseCommit::Committed)
     }
 
     /// Persist a workspace-access request and surface it in the app.
@@ -402,7 +436,7 @@ impl LocalSessionRuntime {
     }
 
     /// Commit the workspace decision, clearing the pending request by its
-    /// id. The caller wakes the run afterwards.
+    /// id. The caller wakes the run only on [`ResponseCommit::Committed`].
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] on storage failure; nothing is committed
@@ -412,21 +446,26 @@ impl LocalSessionRuntime {
         session_id: &SessionId,
         request_id: &str,
         approved: bool,
-    ) -> Result<(), TuiRuntimeError> {
+    ) -> Result<ResponseCommit<bool>, TuiRuntimeError> {
         if self
             .runtime_service
             .commit_workspace_response(request_id, approved)
             .await?
-            .is_some()
+            .is_none()
         {
-            self.runtime_service
-                .set_state(
-                    session_id.as_str(),
-                    crate::session::SessionRuntimeState::Running,
-                )
+            let committed = self
+                .runtime_service
+                .committed_workspace_decision(request_id)
                 .await?;
+            return Ok(committed.map_or(ResponseCommit::Withdrawn, ResponseCommit::Lost));
         }
-        Ok(())
+        self.runtime_service
+            .set_state(
+                session_id.as_str(),
+                crate::session::SessionRuntimeState::Running,
+            )
+            .await?;
+        Ok(ResponseCommit::Committed)
     }
 
     /// Fetch the permission request blocking the session, if any.
@@ -1389,7 +1428,7 @@ impl RuntimeDeps {
     }
 
     /// Commit the user's answers to the prompt a run is blocked on; the
-    /// caller wakes the run afterwards.
+    /// caller wakes the run afterwards, only if this call committed.
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] when the answers do not fit the prompt or
@@ -1399,7 +1438,7 @@ impl RuntimeDeps {
         session_id: &SessionId,
         request_id: &str,
         answers: &[QuestionAnswer],
-    ) -> Result<(), TuiRuntimeError> {
+    ) -> Result<ResponseCommit<Vec<QuestionAnswer>>, TuiRuntimeError> {
         self.local_runtime
             .resolve_ask_user_response(session_id, request_id, answers)
             .await
@@ -1420,7 +1459,8 @@ impl RuntimeDeps {
             .await
     }
 
-    /// Commit the workspace decision; the caller wakes the run afterwards.
+    /// Commit the workspace decision; the caller wakes the run afterwards,
+    /// only if this call committed.
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] on storage failure.
@@ -1429,7 +1469,7 @@ impl RuntimeDeps {
         session_id: &SessionId,
         request_id: &str,
         approved: bool,
-    ) -> Result<(), TuiRuntimeError> {
+    ) -> Result<ResponseCommit<bool>, TuiRuntimeError> {
         self.local_runtime
             .resolve_workspace_response(session_id, request_id, approved)
             .await
@@ -1761,7 +1801,7 @@ async fn build_worker_for_session(
 mod tests {
     use aither_sandbox::TerminalMode;
 
-    use super::{LocalSessionRuntime, QueuedRun};
+    use super::{LocalSessionRuntime, QueuedRun, ResponseCommit};
     use crate::SessionId;
     use crate::ask_user::{AnswerValue, QuestionAnswer};
     use crate::db::ChatDb;
@@ -2117,10 +2157,13 @@ mod tests {
             .set_waiting_workspace("session", Some(workspace_request("older")))
             .await
             .expect("older request");
-        local
-            .resolve_workspace_response(&session_id, "older", true)
-            .await
-            .expect("the decision commits");
+        assert!(matches!(
+            local
+                .resolve_workspace_response(&session_id, "older", true)
+                .await
+                .expect("the decision commits"),
+            ResponseCommit::Committed
+        ));
         let runtime = service.get("session").await.expect("runtime");
         assert!(runtime.waiting_workspace.is_none());
         assert_eq!(responses(&local, "workspace_response").await, 1);
@@ -2129,10 +2172,26 @@ mod tests {
             .set_waiting_workspace("session", Some(workspace_request("newer")))
             .await
             .expect("newer request");
-        local
-            .resolve_workspace_response(&session_id, "older", true)
-            .await
-            .expect("a stale decision is not a failure");
+        assert!(
+            matches!(
+                local
+                    .resolve_workspace_response(&session_id, "older", false)
+                    .await
+                    .expect("a stale decision is not a failure"),
+                ResponseCommit::Lost(true)
+            ),
+            "a decision that lost the commit carries the committed decision, not its own"
+        );
+        assert!(
+            matches!(
+                local
+                    .resolve_workspace_response(&session_id, "never-asked", true)
+                    .await
+                    .expect("a withdrawn request is not a failure"),
+                ResponseCommit::Withdrawn
+            ),
+            "a request nobody committed has no decision to carry"
+        );
         assert_eq!(
             service
                 .get("session")
@@ -2177,10 +2236,13 @@ mod tests {
             .set_waiting_ask_user("session", Some(ssh_prompt("older")))
             .await
             .expect("older prompt");
-        local
-            .resolve_ask_user_response(&session_id, "older", &allow())
-            .await
-            .expect("the answer commits");
+        assert!(matches!(
+            local
+                .resolve_ask_user_response(&session_id, "older", &allow())
+                .await
+                .expect("the answer commits"),
+            ResponseCommit::Committed
+        ));
         assert!(
             service
                 .get("session")
@@ -2195,10 +2257,35 @@ mod tests {
             .set_waiting_ask_user("session", Some(ssh_prompt("newer")))
             .await
             .expect("newer prompt");
-        local
-            .resolve_ask_user_response(&session_id, "older", &allow())
+        let deny = vec![QuestionAnswer {
+            section: String::new(),
+            answer: AnswerValue::Selected(vec!["Deny".to_string()]),
+        }];
+        let ResponseCommit::Lost(committed) = local
+            .resolve_ask_user_response(&session_id, "older", &deny)
             .await
-            .expect("a stale answer is not a failure");
+            .expect("a stale answer is not a failure")
+        else {
+            panic!("an answer that lost the commit must report the committed answers");
+        };
+        assert!(
+            matches!(
+                committed.as_slice(),
+                [QuestionAnswer { answer: AnswerValue::Selected(values), .. }]
+                    if values == &["Allow".to_string()]
+            ),
+            "the live run is answered with the committed answer, not this process's own: {committed:?}"
+        );
+        assert!(
+            matches!(
+                local
+                    .resolve_ask_user_response(&session_id, "never-asked", &allow())
+                    .await
+                    .expect("a withdrawn prompt is not a failure"),
+                ResponseCommit::Withdrawn
+            ),
+            "a prompt nobody committed has no answers to carry"
+        );
         assert_eq!(
             service
                 .get("session")

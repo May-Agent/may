@@ -15,7 +15,9 @@ use jiff::Timestamp;
 use may_agent::agent::{AgentWorker, TuiEvent};
 use may_agent::ask_user;
 use may_agent::session::RunOutcome;
-use may_agent::tui::runtime::{AssistantReply, LocalSessionRuntime, RuntimeDeps, TitleGenContext};
+use may_agent::tui::runtime::{
+    AssistantReply, LocalSessionRuntime, ResponseCommit, RuntimeDeps, TitleGenContext,
+};
 use may_agent::tui::{App, PendingMessage};
 use may_agent::workspace_request;
 
@@ -42,11 +44,22 @@ async fn answer_oneshot_question(
         .register_ask_user_request(app, &session_id, &questions)
         .await?;
     let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
-    runtime_deps
+    match runtime_deps
         .resolve_ask_user_response(&session_id, &request_id, &answers)
-        .await?;
-    request.respond(answers).map_err(anyhow::Error::from)?;
-    Ok(())
+        .await?
+    {
+        ResponseCommit::Committed => request.respond(answers).map_err(anyhow::Error::from),
+        ResponseCommit::Lost(committed) => {
+            writeln!(
+                output.stderr()?,
+                "[notice] the question was already answered elsewhere; the run continues with that answer, not yours"
+            )?;
+            request.respond(committed).map_err(anyhow::Error::from)
+        }
+        ResponseCommit::Withdrawn => Err(anyhow::anyhow!(
+            "the question was withdrawn; this answer was not sent"
+        )),
+    }
 }
 
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
@@ -207,10 +220,24 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     .register_workspace_request(&mut app, &session_id, &request.args.request)
                     .await?;
                 let approved = prompt_oneshot_workspace(&request.args.request, output.stderr()?)?;
-                runtime_deps
+                match runtime_deps
                     .resolve_workspace_response(&session_id, &request_id, approved)
-                    .await?;
-                request.respond(approved).map_err(anyhow::Error::from)?;
+                    .await?
+                {
+                    ResponseCommit::Committed => {
+                        request.respond(approved).map_err(anyhow::Error::from)?;
+                    }
+                    ResponseCommit::Lost(committed) => {
+                        writeln!(
+                            output.stderr()?,
+                            "[notice] the workspace request was already answered elsewhere; the run continues with that decision, not yours"
+                        )?;
+                        request.respond(committed).map_err(anyhow::Error::from)?;
+                    }
+                    ResponseCommit::Withdrawn => anyhow::bail!(
+                        "the workspace request was withdrawn; this decision was not sent"
+                    ),
+                }
             }
             Event::Agent(TuiEvent::Agent(result)) => {
                 if let Ok(TimedEvent {

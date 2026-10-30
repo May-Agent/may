@@ -11,17 +11,15 @@ use super::types::{PermissionRespondRequest, SessionRuntimeResponse, WorkspaceRe
 use crate::session::AnswerError;
 
 /// Resume a session whose run is gone with the decision it was waiting for.
+/// A session whose run is live (in this or another process) is left alone:
+/// that run is answered through its own prompt, and the resume takes the
+/// run lease before writing anything.
 async fn resume_after_decision(
     state: &Arc<UiServerState>,
     session_id: &str,
     request_kind: super::chat::ResumeRequestKind,
     approved: bool,
 ) -> SkyResult<crate::session::SessionRuntimeSummary> {
-    state
-        .runtime_service
-        .set_state(session_id, crate::session::SessionRuntimeState::Idle)
-        .await
-        .map_err(internal_error)?;
     super::chat::schedule_waiting_turn_resume(
         state,
         session_id,

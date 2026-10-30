@@ -10,10 +10,11 @@
 //! delivery to the agent (when there is no live waiter to wake) joins the
 //! session queue. A failure rolls all of it back.
 
-use crate::ask_user::{Question, QuestionAnswer};
+use crate::ask_user::{AnswerValue, Question, QuestionAnswer};
 use crate::session::{PendingUserMessage, PersistedAskUserQuestion, PersistedAskUserRequest};
 
 use super::common::{
+    CommittedAnswerRow, CommittedDecisionRow, CommittedResponseLookup, CommittedSelectedOptionRow,
     PendingAskUserLookup, PendingAskUserQuestionOptionRow, PendingAskUserQuestionRow,
     PendingAskUserRequestRow, PendingPermissionLookup, PendingWorkspaceLookup, overflow_error,
 };
@@ -224,6 +225,89 @@ impl ChatDb {
         .fetch_optional::<PendingPermissionLookup>()
         .await?
         .map(|lookup| lookup.session_id))
+    }
+
+    /// The answers committed for the question `request_id`, read back from
+    /// the history, or `None` when no answer was committed for it.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or a stored answer of an
+    /// unknown kind.
+    pub async fn committed_ask_user_answers(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<Vec<QuestionAnswer>>, ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        let Some(response) = query!(
+            tx,
+            "SELECT message_id FROM message_ask_user_responses WHERE request_id = ? LIMIT 1",
+            request_id
+        )
+        .fetch_optional::<CommittedResponseLookup>()
+        .await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let rows = query!(
+            tx,
+            "SELECT ordinal, section, answer_kind, custom_text FROM message_ask_user_response_answers WHERE message_id = ? ORDER BY ordinal ASC",
+            response.message_id
+        )
+        .fetch_all::<CommittedAnswerRow>()
+        .await?;
+        let selected = query!(
+            tx,
+            "SELECT answer_ordinal, value FROM message_ask_user_response_selected_options WHERE message_id = ? ORDER BY answer_ordinal ASC, option_ordinal ASC",
+            response.message_id
+        )
+        .fetch_all::<CommittedSelectedOptionRow>()
+        .await?;
+        tx.commit().await?;
+        let answers = rows
+            .into_iter()
+            .map(|row| {
+                let answer = match (row.answer_kind.as_str(), row.custom_text) {
+                    ("selected", None) => AnswerValue::Selected(
+                        selected
+                            .iter()
+                            .filter(|option| option.answer_ordinal == row.ordinal)
+                            .map(|option| option.value.clone())
+                            .collect(),
+                    ),
+                    ("custom", Some(text)) => AnswerValue::Custom(text),
+                    (kind, _) => {
+                        return Err(super::common::storage_error(format!(
+                            "committed ask-user answer {request_id} has unreadable kind {kind}"
+                        )));
+                    }
+                };
+                Ok(QuestionAnswer {
+                    section: row.section,
+                    answer,
+                })
+            })
+            .collect::<Result<Vec<_>, ChatDbError>>()?;
+        Ok(Some(answers))
+    }
+
+    /// The decision committed for the workspace request `request_id`, read
+    /// back from the history, or `None` when none was committed for it.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn committed_workspace_decision(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<bool>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT approved FROM message_workspace_responses WHERE request_id = ? LIMIT 1",
+            request_id
+        )
+        .fetch_optional::<CommittedDecisionRow>()
+        .await?
+        .map(|row| row.approved))
     }
 
     /// The pending question `request_id` and the session it belongs to, or
