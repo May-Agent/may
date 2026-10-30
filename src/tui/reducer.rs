@@ -281,7 +281,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 super::ui::chat::ToolStatus::Done
             };
             app.chat
-                .update_tool_with_output(&outcome.call_id, status, None, Some(&output));
+                .update_tool_with_output(&outcome.call_id, status, Some(&output));
             if outcome.had_secret {
                 app.chat.push_notice(crate::secrets::SECRET_WARNING);
             }

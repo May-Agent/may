@@ -1,23 +1,64 @@
 use aither_core::llm::{CommandResult, CommandStream, ToolResult, tool::ToolResultPart};
-use aither_sandbox::{TerminalArgs, TerminalExecutionMode};
+use aither_sandbox::builtin::{InputTerminalArgs, KillTerminalArgs, ReadTerminalDeltaArgs};
+use aither_sandbox::{TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode};
 
 /// Frontend-agnostic start event for a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolStartKind {
-    /// A terminal tool invocation.
+    /// A `terminal` or `terminal_background` tool invocation.
     Terminal {
+        /// Model-provided summary shown as the call's headline.
+        description: String,
         /// Command or script being executed.
-        command: String,
+        script: String,
         /// Requested execution backend for the command.
         mode: TerminalExecutionMode,
+    },
+    /// A `terminal_input` invocation: text written to a background task's
+    /// stdin. The task id is kept for the frontend to resolve into a
+    /// user-facing label; it is never rendered itself.
+    Stdin {
+        /// Task identifier of the target background job.
+        task_id: String,
+        /// The text written to the task's stdin.
+        input: String,
+    },
+    /// A `terminal_read` or `terminal_kill` invocation on a background task.
+    JobControl {
+        /// Which control action runs.
+        action: JobControlAction,
+        /// Task identifier of the target background job.
+        task_id: String,
     },
     /// Any other tool invocation.
     Generic {
         /// Tool name.
         name: String,
-        /// Raw arguments payload.
+        /// Best-effort one-line summary extracted from the arguments.
+        summary: String,
+        /// Raw arguments payload, shown in the expanded body.
         arguments: String,
     },
+}
+
+/// A control action on a background terminal task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobControlAction {
+    /// `terminal_read`: incremental output read.
+    Read,
+    /// `terminal_kill`: task termination.
+    Kill,
+}
+
+impl JobControlAction {
+    /// Short chip label shown on the call's headline.
+    #[must_use]
+    pub const fn chip(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Kill => "kill",
+        }
+    }
 }
 
 /// An image produced by a tool call, carried alongside its text output.
@@ -56,24 +97,91 @@ pub enum ToolEndKind {
 ///
 /// # Panics
 ///
-/// Panics when `name` is `terminal` but `arguments` does not deserialize as
-/// terminal tool args — the agent and its tool schema are versioned together,
-/// so a malformed payload indicates a bug.
+/// Panics when `name` is a known terminal tool but `arguments` does not
+/// deserialize as that tool's args — the agent and its tool schema are
+/// versioned together, so a malformed payload indicates a bug.
 #[must_use]
 pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
-    if name == "terminal" {
-        let args = serde_json::from_str::<TerminalArgs>(arguments)
-            .unwrap_or_else(|e| panic!("invalid terminal tool args payload: {e}"));
-        ToolStartKind::Terminal {
-            command: args.script,
-            mode: args.mode,
+    match name {
+        "terminal" => {
+            let args = serde_json::from_str::<TerminalArgs>(arguments)
+                .unwrap_or_else(|e| panic!("invalid terminal tool args payload: {e}"));
+            ToolStartKind::Terminal {
+                description: args.description,
+                script: args.script,
+                mode: args.mode,
+            }
         }
-    } else {
-        ToolStartKind::Generic {
+        "terminal_background" => {
+            let args = serde_json::from_str::<TerminalBackgroundArgs>(arguments)
+                .unwrap_or_else(|e| panic!("invalid terminal_background tool args payload: {e}"));
+            ToolStartKind::Terminal {
+                description: args.terminal.description,
+                script: args.terminal.script,
+                mode: args.terminal.mode,
+            }
+        }
+        "terminal_input" => {
+            let args = serde_json::from_str::<InputTerminalArgs>(arguments)
+                .unwrap_or_else(|e| panic!("invalid terminal_input tool args payload: {e}"));
+            ToolStartKind::Stdin {
+                task_id: args.task_id,
+                input: args.input,
+            }
+        }
+        "terminal_kill" => {
+            let args = serde_json::from_str::<KillTerminalArgs>(arguments)
+                .unwrap_or_else(|e| panic!("invalid terminal_kill tool args payload: {e}"));
+            ToolStartKind::JobControl {
+                action: JobControlAction::Kill,
+                task_id: args.task_id,
+            }
+        }
+        "terminal_read" => {
+            let args = serde_json::from_str::<ReadTerminalDeltaArgs>(arguments)
+                .unwrap_or_else(|e| panic!("invalid terminal_read tool args payload: {e}"));
+            ToolStartKind::JobControl {
+                action: JobControlAction::Read,
+                task_id: args.task_id,
+            }
+        }
+        _ => ToolStartKind::Generic {
             name: name.to_string(),
+            summary: generic_summary(arguments),
             arguments: arguments.to_string(),
-        }
+        },
     }
+}
+
+/// Argument keys inspected for a one-line summary of an unknown tool call,
+/// in priority order. Covers the shared command surface (`description`,
+/// `query`, `prompt`, ...) plus free-form MCP payloads.
+const GENERIC_SUMMARY_KEYS: &[&str] = &[
+    "description",
+    "query",
+    "prompt",
+    "question",
+    "input",
+    "url",
+    "path",
+    "title",
+    "command",
+    "name",
+];
+
+/// Extract a best-effort one-line summary from a tool's arguments JSON:
+/// the first line of the first non-empty string field among
+/// [`GENERIC_SUMMARY_KEYS`]. Empty when nothing readable is present.
+fn generic_summary(arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return String::new();
+    };
+    GENERIC_SUMMARY_KEYS
+        .iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .and_then(|field| field.lines().next())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Parse tool-call completion payload into a minimal end event.
@@ -173,12 +281,92 @@ mod tests {
             );
             let start = parse_tool_start("terminal", &args);
             match start {
-                ToolStartKind::Terminal { command, mode } => {
-                    assert_eq!(command, "echo hi");
+                ToolStartKind::Terminal {
+                    description,
+                    script,
+                    mode,
+                } => {
+                    assert_eq!(description, "say hi");
+                    assert_eq!(script, "echo hi");
                     assert_eq!(mode, expected);
                 }
-                ToolStartKind::Generic { .. } => panic!("expected terminal start event"),
+                _ => panic!("expected terminal start event"),
             }
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_covers_terminal_family() {
+        match parse_tool_start(
+            "terminal_background",
+            r#"{"description":"serve","script":"bun dev","timeout":60}"#,
+        ) {
+            ToolStartKind::Terminal {
+                description,
+                script,
+                mode,
+            } => {
+                assert_eq!(description, "serve");
+                assert_eq!(script, "bun dev");
+                assert_eq!(mode, TerminalExecutionMode::Default);
+            }
+            _ => panic!("expected terminal start event"),
+        }
+
+        match parse_tool_start(
+            "terminal_input",
+            r#"{"task_id":"finch-comet","input":"Friday","append_newline":true}"#,
+        ) {
+            ToolStartKind::Stdin { task_id, input } => {
+                assert_eq!(task_id, "finch-comet");
+                assert_eq!(input, "Friday");
+            }
+            _ => panic!("expected stdin start event"),
+        }
+
+        match parse_tool_start("terminal_kill", r#"{"task_id":"finch-comet"}"#) {
+            ToolStartKind::JobControl { action, task_id } => {
+                assert_eq!(action, super::JobControlAction::Kill);
+                assert_eq!(task_id, "finch-comet");
+            }
+            _ => panic!("expected kill start event"),
+        }
+
+        match parse_tool_start(
+            "terminal_read",
+            r#"{"task_id":"finch-comet","cursor":0,"max_bytes":1024}"#,
+        ) {
+            ToolStartKind::JobControl { action, task_id } => {
+                assert_eq!(action, super::JobControlAction::Read);
+                assert_eq!(task_id, "finch-comet");
+            }
+            _ => panic!("expected read start event"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_generic_extracts_summary() {
+        match parse_tool_start("websearch", r#"{"query":"may agent","extra":1}"#) {
+            ToolStartKind::Generic {
+                name,
+                summary,
+                arguments,
+            } => {
+                assert_eq!(name, "websearch");
+                assert_eq!(summary, "may agent");
+                assert!(arguments.contains("may agent"));
+            }
+            _ => panic!("expected generic start event"),
+        }
+
+        // Unknown shapes still surface: no summary, raw args kept.
+        match parse_tool_start("mystery", r#"{"foo":42}"#) {
+            ToolStartKind::Generic { summary, .. } => assert_eq!(summary, ""),
+            _ => panic!("expected generic start event"),
+        }
+        match parse_tool_start("mystery", "not json") {
+            ToolStartKind::Generic { summary, .. } => assert_eq!(summary, ""),
+            _ => panic!("expected generic start event"),
         }
     }
 
