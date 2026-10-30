@@ -34,6 +34,7 @@ pub(super) fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
 
 /// Render the main layout.
 pub fn render(frame: &mut Frame, app: &mut App) {
+    let render_start = std::time::Instant::now();
     let area = frame.area();
 
     // Full-screen modes (don't show chat behind them)
@@ -72,7 +73,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // Scan chat content for images and request fetches for any not yet cached
+    let t = std::time::Instant::now();
     app.scan_and_fetch_images();
+    app.frame_stats.image_scan = t.elapsed();
 
     // Build queue message previews
     let queue_messages: Vec<String> = app
@@ -147,7 +150,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let scroll = app.scroll;
 
     // Render everything in a single unified scrollable area
-    chat::render_unified(
+    app.frame_stats.chat = chat::render_unified(
         frame,
         chat_area,
         &app.chat,
@@ -212,6 +215,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         spinner_frame: app.spinner_frame,
     };
     let mut collapse_regions = Vec::new();
+    let t = std::time::Instant::now();
     let plain_all_lines = chat::build_plain_wrapped_lines_unified(
         &app.chat,
         chat_area.width,
@@ -225,12 +229,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Some(&mut collapse_regions),
         images_supported,
     );
+    app.frame_stats.plain_lines = t.elapsed();
 
     let view_h = chat_area.height as usize;
     app.render_top_padding = view_h.saturating_sub(plain_all_lines.len());
     app.rendered_plain_lines = plain_all_lines;
     app.collapse_regions = collapse_regions;
 
+    let t = std::time::Instant::now();
     if app.selection.is_some() {
         render_text_selection_overlay(frame, chat_area, app);
     }
@@ -288,6 +294,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.completion.is_active() && !app.completion.is_empty() {
         render_completion_overlay(frame, area, app);
     }
+
+    app.frame_stats.overlay = t.elapsed();
+    app.frame_stats.total = render_start.elapsed();
 }
 
 fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
