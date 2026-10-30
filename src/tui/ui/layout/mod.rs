@@ -1048,10 +1048,10 @@ fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState) {
     let mut lines: Vec<Line> = Vec::new();
     if awaiting_question {
         lines.push(Line::from(Span::styled(
-            format!("> {}▌", state.input),
+            format!("> {}", state.input),
             Style::default().fg(Color::White),
         )));
-        // IME anchor at the `▌` cell; approximate the wrap for long input.
+        // IME anchor at the caret; approximate the wrap for long input.
         let offset = 2 + UnicodeWidthStr::width(state.input.as_str());
         let row_w = usize::from(inner.width).max(1);
         let caret_row = usize::from(inner.y)
@@ -1736,7 +1736,6 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
         let input_line = Paragraph::new(Line::from(vec![
             Span::styled("  > ", Style::default().fg(Color::Cyan)),
             Span::styled(&qs.custom_text, Style::default().fg(Color::White)),
-            Span::styled("_", Style::default().fg(Color::DarkGray)),
         ]));
         frame.render_widget(input_line, chunks[2]);
         let caret_x = chunks[2].x

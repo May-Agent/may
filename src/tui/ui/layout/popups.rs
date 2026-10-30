@@ -114,7 +114,7 @@ pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!("> {}_", app.mcp_add_name),
+                    format!("> {}", app.mcp_add_name),
                     Style::default().fg(Color::Yellow),
                 )),
                 Line::from(""),
@@ -138,7 +138,7 @@ pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!("> {}_", app.mcp_add_command),
+                    format!("> {}", app.mcp_add_command),
                     Style::default().fg(Color::Yellow),
                 )),
                 Line::from(""),
@@ -172,7 +172,7 @@ pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(widget, popup_area);
 
-    // IME anchor on the `_` marker of the active `> {text}_` content row.
+    // IME anchor at the caret of the active input row.
     let caret = match app.mcp_add_mode {
         McpAddMode::Name => Some((app.mcp_add_name.as_str(), 3)),
         McpAddMode::Command => Some((app.mcp_add_command.as_str(), 5)),
@@ -262,7 +262,7 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                format!("> {}_", app.ssh_add_name),
+                format!("> {}", app.ssh_add_name),
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(""),
@@ -284,7 +284,7 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                format!("> {}_", app.ssh_add_target),
+                format!("> {}", app.ssh_add_target),
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(""),
@@ -364,7 +364,6 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(vec![
                     Span::styled("Search: ", Style::default().fg(Color::Cyan)),
                     Span::styled(&app.skill_search, Style::default().fg(Color::Yellow)),
-                    Span::styled("_", Style::default().fg(Color::Yellow)),
                 ])
             };
             frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
@@ -519,7 +518,7 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!("> {}_", app.skill_github_input),
+                    format!("> {}", app.skill_github_input),
                     Style::default().fg(Color::Yellow),
                 )),
                 Line::from(""),

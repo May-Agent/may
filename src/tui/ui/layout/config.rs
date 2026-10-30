@@ -230,7 +230,7 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
             let cursor_pos = char_to_byte_idx(&display_value, cur);
             let display = if is_focused {
                 format!(
-                    "{}|{}",
+                    "{}{}",
                     &display_value[..cursor_pos],
                     &display_value[cursor_pos..]
                 )
@@ -282,7 +282,7 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
             true,
         );
 
-        // IME anchor on the `|` marker of the focused field (masked fields
+        // IME anchor at the caret of the focused field (masked fields
         // show one `*` per char, so width equals the char cursor).
         let (value, field_area, masked) = match *focused_field {
             0 => (name, chunks[0], false),
@@ -320,11 +320,11 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
         // Show input at selected row (masked is ASCII so byte=char, but use helper for consistency)
         let masked: String = input.chars().map(|_| '*').collect();
         let cursor_pos = char_to_byte_idx(&masked, cursor);
-        let display = format!("{}|{}", &masked[..cursor_pos], &masked[cursor_pos..]);
+        let display = format!("{}{}", &masked[..cursor_pos], &masked[cursor_pos..]);
         items[state.selected] = ListItem::new(format!("  API Key: {display}"))
             .style(Style::default().fg(Color::Yellow));
 
-        // IME anchor on the `|` marker inside the selected row.
+        // IME anchor at the caret inside the selected row.
         let row = area.y + 1 + u16::try_from(state.selected).unwrap_or(u16::MAX);
         if row < area.bottom().saturating_sub(1) {
             let caret_x = area.x + 12 + u16::try_from(cursor).unwrap_or(u16::MAX);
@@ -412,12 +412,12 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
     // If in text edit mode, show edit overlay
     if let Some((input, cursor)) = state.edit_text() {
         let cursor_pos = char_to_byte_idx(input, cursor);
-        let display = format!("{}|{}", &input[..cursor_pos], &input[cursor_pos..]);
+        let display = format!("{}{}", &input[..cursor_pos], &input[cursor_pos..]);
         items[state.selected] =
             ListItem::new(format!("  {}: {}", tier_names[state.selected], display))
                 .style(Style::default().fg(Color::Yellow));
 
-        // IME anchor on the `|` marker inside the selected row.
+        // IME anchor at the caret inside the selected row.
         let row = area.y + 1 + u16::try_from(state.selected).unwrap_or(u16::MAX);
         if row < area.bottom().saturating_sub(1) {
             let prefix = 5 + tier_names[state.selected].len();
@@ -479,11 +479,11 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
         && state.selected == 0
     {
         let cursor_pos = char_to_byte_idx(input, cursor);
-        let display = format!("{}|{}", &input[..cursor_pos], &input[cursor_pos..]);
+        let display = format!("{}{}", &input[..cursor_pos], &input[cursor_pos..]);
         items[0] = ListItem::new(format!("  Max iterations:        {display}"))
             .style(Style::default().fg(Color::Yellow));
 
-        // IME anchor on the `|` marker inside the edited row.
+        // IME anchor at the caret inside the edited row.
         let caret_x =
             area.x + 26 + u16::try_from(display_width_prefix(input, cursor)).unwrap_or(u16::MAX);
         frame.set_cursor_position((caret_x.min(area.right().saturating_sub(2)), area.y + 1));
