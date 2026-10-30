@@ -1,5 +1,11 @@
+mod background;
 mod hosts;
 mod hub;
+pub use background::SessionBackgrounds;
+pub use background::spawn_watcher as spawn_background_watcher;
+pub use background::{
+    cancel_subagent, cancel_subagents, get_background, get_job, kill_job, read_job,
+};
 pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
 pub use hosts::{ParkedAgents, btw, compact_session, context_dump, context_report, release_agent};
 pub use hub::{TurnFrame, TurnHub};
@@ -2864,10 +2870,14 @@ fn prepare_agent_for_request<'a>(
                 tool_distribution: state.tool_distribution.clone(),
                 tool_environments: state.tool_environments.clone(),
                 provider_attempt,
+                subagents: Some(state.session_background.subagents(ctx.session_id.as_str())),
             },
         )
         .await
         .map_err(UiChatPreparationError::BuildAgent)?;
+        state
+            .session_background
+            .add_job_registry(ctx.session_id.as_str(), agent.job_registry());
 
         if let Some(snapshot) = ctx.context_snapshot.as_ref() {
             // Try to restore from checkpoint with ID-based delta.

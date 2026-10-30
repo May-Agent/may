@@ -35,6 +35,8 @@ pub enum UiEventTopic {
     SessionTurn = 1 << 11,
     /// Live agent events of a session's turn, as the TUI renders them.
     SessionAgent = 1 << 12,
+    /// A session's background jobs or subagent runs changed.
+    SessionBackground = 1 << 13,
 }
 
 impl UiEventTopic {
@@ -59,6 +61,7 @@ impl UiEventTopic {
             Self::BrowserLifecycle => "browser_lifecycle",
             Self::SessionTurn => "session_turn",
             Self::SessionAgent => "session_agent",
+            Self::SessionBackground => "session_background",
         }
     }
 }
@@ -81,6 +84,7 @@ impl FromStr for UiEventTopic {
             "browser_lifecycle" => Ok(Self::BrowserLifecycle),
             "session_turn" => Ok(Self::SessionTurn),
             "session_agent" => Ok(Self::SessionAgent),
+            "session_background" => Ok(Self::SessionBackground),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -119,6 +123,8 @@ impl UiEventTopics {
     pub const SESSION_TURN: Self = Self(UiEventTopic::SessionTurn.bit());
     /// `session_agent` topic.
     pub const SESSION_AGENT: Self = Self(UiEventTopic::SessionAgent.bit());
+    /// `session_background` topic.
+    pub const SESSION_BACKGROUND: Self = Self(UiEventTopic::SessionBackground.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0

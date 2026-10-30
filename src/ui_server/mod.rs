@@ -300,6 +300,7 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
             .context("failed to identify the running build")?,
         turn_hub: Arc::new(chat::TurnHub::default()),
         parked_agents: chat::ParkedAgents::default(),
+        session_background: chat::SessionBackgrounds::default(),
     });
 
     chat::resume_pending_follow_up_runs(state.clone())
@@ -317,6 +318,7 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
     }
     chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
     title_generation::spawn_worker(state.clone(), title_generation_rx);
+    chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
     let router = build_router(state.clone(), mode);
@@ -411,6 +413,14 @@ fn api_routes() -> Route {
                         "/context-dump".post(chat::context_dump),
                         "/btw".post(chat::btw),
                         "/agent".delete(chat::release_agent),
+                    )),
+                    Route::new((
+                        "/background".at(chat::get_background),
+                        "/jobs/read".at(chat::read_job),
+                        "/jobs/{pid}".at(chat::get_job),
+                        "/jobs/{pid}/kill".post(chat::kill_job),
+                        "/subagents".delete(chat::cancel_subagents),
+                        "/subagents/{runId}".delete(chat::cancel_subagent),
                     )),
                     Route::new((
                         "/artifacts/runtime/preview".at(get_artifact_runtime_preview),

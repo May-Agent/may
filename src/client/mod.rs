@@ -5,6 +5,7 @@
 //! the daemon pushes. Each request opens its own connection; the socket is
 //! local, so a connection costs microseconds.
 
+pub mod background;
 mod sse;
 mod wire;
 

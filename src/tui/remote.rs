@@ -16,9 +16,11 @@ use async_channel::{Receiver, Sender, unbounded};
 
 use crate::agent::runner::WorkerCommand;
 use crate::agent::{AgentHandle, AgentWorker, ForeignTurn, RemoteTurn, TuiEvent};
+use crate::client::background::{RemoteBackground, SessionBackgroundSnapshot};
 use crate::client::{
     DaemonClient, RunEnd, SessionAgentBody, SessionAgentFrame, WireAgentEvent, session_path,
 };
+use crate::tui::event::{AppEvent, EventSender};
 use crate::ui_server::{CompactResponse, ContextDumpResponse};
 
 /// Wait before reopening a dropped event stream.
@@ -55,19 +57,34 @@ impl Shared {
 /// An agent worker for `session_id` whose agent runs in the daemon behind
 /// `client`.
 #[must_use]
-pub fn spawn_remote_worker(client: DaemonClient, session_id: String) -> AgentWorker {
+pub fn spawn_remote_worker(
+    client: DaemonClient,
+    session_id: String,
+    app_events: EventSender,
+) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let (foreign_tx, foreign_rx) = unbounded::<ForeignTurn>();
     let shared = Arc::new(Shared::default());
+    let background = RemoteBackground::new(client.clone(), session_id.clone());
     tokio::spawn(follow_session(
         client.clone(),
         session_id.clone(),
         shared.clone(),
-        foreign_tx,
-        command_tx.clone(),
+        Forwarding {
+            foreign_tx,
+            command_tx: command_tx.clone(),
+            app_events,
+        },
     ));
     tokio::spawn(run_commands(client, session_id, shared, command_rx));
-    AgentWorker::remote(command_tx, foreign_rx)
+    AgentWorker::remote(command_tx, foreign_rx, background)
+}
+
+/// Where the session's events go besides the turn being forwarded.
+struct Forwarding {
+    foreign_tx: Sender<ForeignTurn>,
+    command_tx: Sender<WorkerCommand>,
+    app_events: EventSender,
 }
 
 /// One turn being forwarded to its handle.
@@ -80,11 +97,10 @@ async fn follow_session(
     client: DaemonClient,
     session_id: String,
     shared: Arc<Shared>,
-    foreign_tx: Sender<ForeignTurn>,
-    command_tx: Sender<WorkerCommand>,
+    forwarding: Forwarding,
 ) {
     let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("topics", "session_agent,session_turn")
+        .append_pair("topics", "session_agent,session_turn,session_background")
         .append_pair("sessionId", &session_id)
         .finish();
     let mut current: Option<ForwardedTurn> = None;
@@ -107,10 +123,27 @@ async fn follow_session(
                     let Ok(frame) = serde_json::from_str::<SessionAgentFrame>(&event.data) else {
                         continue;
                     };
-                    forward_agent_frame(frame, &mut current, &shared, &foreign_tx, &command_tx)
-                        .await;
+                    forward_agent_frame(
+                        frame,
+                        &mut current,
+                        &shared,
+                        &forwarding.foreign_tx,
+                        &forwarding.command_tx,
+                    )
+                    .await;
                 }
                 "session_turn" => forward_turn_error(&event.data, &mut current).await,
+                "session_background" => {
+                    if let Ok(snapshot) =
+                        serde_json::from_str::<SessionBackgroundSnapshot>(&event.data)
+                    {
+                        let (jobs, subagents) = snapshot.into_parts();
+                        let _ = forwarding
+                            .app_events
+                            .send(AppEvent::BackgroundLoaded { jobs, subagents })
+                            .await;
+                    }
+                }
                 _ => {}
             }
         }

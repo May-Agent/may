@@ -75,7 +75,13 @@ enum MockChatScenario {
     /// The first request asks the user a question through the `ask_user`
     /// terminal command; every later request gets a plain text reply.
     AsksUser,
+    /// The first request starts [`BACKGROUND_JOB_SCRIPT`] as a background
+    /// terminal job; every later request gets a plain text reply.
+    StartsBackgroundJob,
 }
+
+/// The long-running script of [`MockChatScenario::StartsBackgroundJob`].
+const BACKGROUND_JOB_SCRIPT: &str = "sleep 120";
 
 /// A scripted main agent / subagent pair sharing one mock model.
 ///
@@ -408,6 +414,29 @@ impl MockScenarioState {
                 ]),
                 _ => MockHttpResponse::sse(text_stream_frames(
                     vec!["noted".to_string()],
+                    Duration::from_millis(10),
+                )),
+            },
+            MockChatScenario::StartsBackgroundJob => match self.request_index {
+                0 => MockHttpResponse::sse(vec![
+                    delayed_sse_frame(
+                        tool_call_chunk(
+                            "call-background-job",
+                            "terminal",
+                            &serde_json::json!({
+                                "description": "Start a long job",
+                                "script": BACKGROUND_JOB_SCRIPT,
+                                "mode": "sandboxed",
+                                "background": true,
+                                "timeout": 600,
+                            }),
+                        ),
+                        Duration::from_millis(10),
+                    ),
+                    done_frame(Duration::from_millis(10)),
+                ]),
+                _ => MockHttpResponse::sse(text_stream_frames(
+                    vec!["started".to_string()],
                     Duration::from_millis(10),
                 )),
             },
@@ -3717,5 +3746,128 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
         String::from_utf8_lossy(&stop.stderr).contains("Stopped"),
         "the one-shot run should leave its daemon running: {}",
         String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// The session's background work, as `GET /api/sessions/{id}/background`
+/// reports it.
+async fn background_of(
+    client: &reqwest::Client,
+    server: &RunningUiServer,
+    session_id: &str,
+) -> Value {
+    let response = client
+        .get(format!(
+            "{}/api/sessions/{session_id}/background",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("background request should succeed");
+    expect_status(&server.log, response, StatusCode::OK)
+        .await
+        .json()
+        .await
+        .expect("background payload should be JSON")
+}
+
+fn background_job<'a>(background: &'a Value, script: &str) -> Option<&'a Value> {
+    background
+        .get("jobs")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|job| job.get("script").and_then(Value::as_str) == Some(script))
+}
+
+#[tokio::test]
+#[serial]
+async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    // The turn stays open while its background job runs.
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let background = background_of(&client, &server, &session_id).await;
+        if background_job(&background, BACKGROUND_JOB_SCRIPT)
+            .and_then(|job| job.pointer("/status/state"))
+            .and_then(Value::as_str)
+            == Some("running")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the job should be listed as running: {background}; server logs:\n{}",
+            server.log.contents().await
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // The event stream carries the same snapshot.
+    let events = client
+        .get(format!("{}/api/events", server.base_url))
+        .query(&[
+            ("topics", "session_background"),
+            ("sessionId", session_id.as_str()),
+        ])
+        .send()
+        .await
+        .expect("event stream should open");
+    let mut reader = SseReader::new(events);
+    let event = tokio::time::timeout(Duration::from_secs(10), reader.next_event())
+        .await
+        .expect("a session_background event should arrive")
+        .expect("the stream should stay open");
+    assert_eq!(event.event, "session_background");
+    let snapshot: Value = serde_json::from_str(&event.data).expect("snapshot JSON");
+    let pid = background_job(&snapshot, BACKGROUND_JOB_SCRIPT)
+        .and_then(|job| job.get("pid"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("the event should list the job: {snapshot}"));
+
+    let response = client
+        .post(format!(
+            "{}/api/sessions/{session_id}/jobs/{pid}/kill",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("kill request should succeed");
+    let killed: Value = expect_status(&server.log, response, StatusCode::OK)
+        .await
+        .json()
+        .await
+        .expect("kill payload should be JSON");
+    assert_eq!(killed.get("ok"), Some(&Value::Bool(true)), "{killed}");
+
+    // With its job gone the turn finishes, and the job reads as killed.
+    let events = collect_turn_events(turn, "the background-job turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should complete; events: {events:?}"
+    );
+    let background = background_of(&client, &server, &session_id).await;
+    assert_eq!(
+        background_job(&background, BACKGROUND_JOB_SCRIPT)
+            .and_then(|job| job.pointer("/status/state"))
+            .and_then(Value::as_str),
+        Some("killed"),
+        "{background}"
     );
 }

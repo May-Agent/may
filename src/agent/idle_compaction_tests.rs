@@ -242,6 +242,7 @@ impl SessionParts {
             ),
             tool_environments: self.tool_environments.clone(),
             provider_attempt: 0,
+            subagents: None,
         }
     }
 }

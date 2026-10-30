@@ -108,9 +108,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Running background entries for the status bar: tracked subagents first,
     // then running terminal jobs.
     let mut background_items: Vec<chat::StatusBackgroundItem> = app
-        .subagent_tracker
-        .running()
-        .into_iter()
+        .subagents
+        .iter()
+        .cloned()
         .map(|run| chat::StatusBackgroundItem {
             elapsed_secs: run.elapsed_secs(),
             label: run.agent,

@@ -147,6 +147,8 @@ pub struct AgentWorker {
     /// Turns of the session another client (or the daemon's queue) started,
     /// for a worker whose agent runs in the daemon.
     foreign_turns: Option<Receiver<ForeignTurn>>,
+    /// The session's background work in the daemon, for a remote worker.
+    background: Option<crate::client::background::RemoteBackground>,
 }
 
 impl std::fmt::Debug for AgentWorker {
@@ -319,6 +321,7 @@ impl AgentWorker {
     pub(crate) fn remote(
         command_tx: Sender<WorkerCommand>,
         foreign_turns: Receiver<ForeignTurn>,
+        background: crate::client::background::RemoteBackground,
     ) -> Self {
         Self {
             command_tx,
@@ -327,7 +330,15 @@ impl AgentWorker {
             btw_llm: None,
             subagent_tracker: crate::agent::SubagentTracker::default(),
             foreign_turns: Some(foreign_turns),
+            background: Some(background),
         }
+    }
+
+    /// The session's jobs and subagents in the daemon, for a worker whose
+    /// agent runs there.
+    #[must_use]
+    pub const fn background(&self) -> Option<&crate::client::background::RemoteBackground> {
+        self.background.as_ref()
     }
 
     /// Live tracker of this worker's `subagent` command invocations.
@@ -417,6 +428,7 @@ pub fn spawn_worker<E: Executor + 'static>(
         btw_llm: Some(btw_llm),
         subagent_tracker,
         foreign_turns: None,
+        background: None,
     }
 }
 

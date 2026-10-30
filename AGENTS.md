@@ -111,6 +111,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 **`src/ui_server/`** - The daemon's API
 - `chat/mod.rs`: the one turn runner (`run_agent_loop`); `chat/hub.rs` `TurnHub` fans a session's turn out as `session_turn` / `session_agent` events, with replay of the turn in progress for late subscribers
 - `chat/hosts.rs`: idle agents kept between turns (prompt cache stays warm), `/compact`, `/context`, `/btw`
+- `chat/background.rs`: each session's terminal jobs and subagent runs across agent rebuilds; REST under `/api/sessions/{id}/background|jobs|subagents`, pushed as `session_background`
 - `remote_access.rs`: Tailscale serve
 
 **`src/repo_search/`** - Code, session and issue search through the repo-search daemon (`search` command, `may-sessions` / `may-issues-*` collections, the SQLite `search_outbox`, auto-indexing of frequently used repos)

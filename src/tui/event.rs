@@ -69,8 +69,15 @@ pub enum AppEvent {
     },
 
     // ─── Background jobs ─────────────────────────────────────────────
-    /// Job list refreshed from the session's `JobRegistry`.
-    JobsLoaded(Vec<aither_sandbox::JobInfo>),
+    /// The session's jobs and subagent runs, as the daemon reported them.
+    BackgroundLoaded {
+        /// Terminal jobs.
+        jobs: Vec<aither_sandbox::JobInfo>,
+        /// Subagent runs in flight.
+        subagents: Vec<crate::agent::SubagentRunSnapshot>,
+    },
+    /// A background request finished with a message for the status line.
+    Status(String),
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
         /// Process ID the kill targeted.
@@ -127,7 +134,8 @@ impl AppEvent {
             Self::ProfileSessionsLoaded(_) => "profile_sessions_loaded",
             Self::ConfigSaved(_) => "config_saved",
             Self::ImageDecoded { .. } => "image_decoded",
-            Self::JobsLoaded(_) => "jobs_loaded",
+            Self::BackgroundLoaded { .. } => "background_loaded",
+            Self::Status(_) => "status",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",

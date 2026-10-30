@@ -456,6 +456,8 @@ pub struct UiServerState {
     pub(crate) turn_hub: Arc<super::chat::TurnHub>,
     /// Each session's agent between turns.
     pub(crate) parked_agents: super::chat::ParkedAgents,
+    /// Each session's background jobs and subagent runs, across turns.
+    pub(crate) session_background: super::chat::SessionBackgrounds,
 }
 
 impl UiServerState {
