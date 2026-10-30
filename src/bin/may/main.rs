@@ -51,7 +51,8 @@ use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
 use may_agent::session::RunOutcome;
 use may_agent::tui::runtime::{
-    AssistantReply, LocalSessionRuntime, QueuedRunStart, RuntimeDeps, TitleGenContext,
+    AssistantReply, LocalSessionRuntime, QueuedRunStart, ResponseCommit, RuntimeDeps,
+    TitleGenContext,
 };
 use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
 use may_agent::workspace_request::{self, WorkspaceRequestQueue};
@@ -464,6 +465,8 @@ where
             );
         }
 
+        app.restore_parked_question();
+
         // Open questions are listed in the status bar and opened with
         // `/questions`; they never take over the input on their own.
         app.open_question_count = runtime_deps.open_questions(app).await?.len();
@@ -631,7 +634,7 @@ where
                     .register_ask_user_request(app, &session_id, &questions)
                     .await?;
                 let state = may_agent::tui::AskUserState::new(request_id, request, questions);
-                app.mode = may_agent::tui::AppMode::AskUser(state);
+                app.show_blocking_prompt(may_agent::tui::AppMode::AskUser(state));
             }
 
             Event::Workspace(request) => {
@@ -648,12 +651,12 @@ where
                 let request_id = runtime_deps
                     .register_workspace_request(app, &session_id, &request.args.request)
                     .await?;
-                app.mode = may_agent::tui::AppMode::WorkspaceConfirm(
+                app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
                     may_agent::tui::state::WorkspaceConfirmState {
                         request_id,
                         request,
                     },
-                );
+                ));
             }
 
             Event::Agent(tui_event) => {
@@ -881,12 +884,33 @@ where
                                 .current()
                                 .map(|session| session.id.clone())
                                 .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-                            runtime_deps
+                            match runtime_deps
                                 .resolve_ask_user_response(&session_id, &request_id, &answers)
-                                .await?;
-                            request.respond(answers).unwrap_or_else(|_| {
-                                panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
-                            });
+                                .await?
+                            {
+                                ResponseCommit::Committed => {
+                                    request.respond(answers).unwrap_or_else(|_| {
+                                        panic!(
+                                            "{}",
+                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                        )
+                                    });
+                                }
+                                ResponseCommit::Lost(committed) => {
+                                    request.respond(committed).unwrap_or_else(|_| {
+                                        panic!(
+                                            "{}",
+                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                        )
+                                    });
+                                    app.chat.push_notice(
+                                        "That prompt was already answered elsewhere; the run continues with that answer, not yours",
+                                    );
+                                }
+                                ResponseCommit::Withdrawn => app.chat.push_notice(
+                                    "That prompt was withdrawn; your answer was not sent",
+                                ),
+                            }
                         } else if !runtime_deps
                             .answer_open_question(&request_id, &answers)
                             .await?
@@ -1072,12 +1096,27 @@ where
                             .current()
                             .map(|session| session.id.clone())
                             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-                        runtime_deps
+                        match runtime_deps
                             .resolve_workspace_response(&session_id, &request_id, approved)
-                            .await?;
-                        request.respond(approved).unwrap_or_else(|_| {
-                            panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
-                        });
+                            .await?
+                        {
+                            ResponseCommit::Committed => {
+                                request.respond(approved).unwrap_or_else(|_| {
+                                    panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
+                                });
+                            }
+                            ResponseCommit::Lost(committed) => {
+                                request.respond(committed).unwrap_or_else(|_| {
+                                    panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
+                                });
+                                app.chat.push_notice(
+                                    "That request was already answered elsewhere; the run continues with that decision, not yours",
+                                );
+                            }
+                            ResponseCommit::Withdrawn => app.chat.push_notice(
+                                "That request was withdrawn; your decision was not sent",
+                            ),
+                        }
                     }
                     Some(SendAction::RespondPermission {
                         request_id,
