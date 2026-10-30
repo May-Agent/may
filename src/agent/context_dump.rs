@@ -1,26 +1,13 @@
-//! Verbatim context composition for `/context dump`.
+//! Verbatim request transcript for `/context dump`.
 //!
-//! The [`ContextReport`] panel answers "how much"; this module answers
-//! "what exactly". A dump is built from the live [`aither_agent::Context`]
-//! — every named stable-prefix block in wire order, including staged
-//! updates waiting for reassembly — plus the full assembled message list
-//! a [`ContextWindowSnapshot`] measured on the same state. Rendering is a
-//! markdown file the TUI writes to the session's `outputs/` directory, so
-//! developers can read, grep, and diff context across prompt changes.
-//!
-//! [`ContextReport`]: super::context_report::ContextReport
+//! Renders the assembled message list of a [`ContextWindowSnapshot`] —
+//! the exact sequence the provider would receive on the next request —
+//! as a readable transcript the TUI writes to the session's `outputs/`
+//! directory. No decomposition or metrics: the file is the request.
 
-use aither_agent::{ContextWindowMetrics, ContextWindowSnapshot};
+use aither_agent::ContextWindowSnapshot;
 use aither_core::llm::{Message as LlmMessage, Role};
 use askama::Template;
-
-/// Estimated tokens per rendered character — the heuristic the agent
-/// itself uses for context budgeting.
-const CHARS_PER_TOKEN: usize = 4;
-
-const fn est_tokens(chars: usize) -> usize {
-    chars / CHARS_PER_TOKEN
-}
 
 const fn role_label(role: Role) -> &'static str {
     match role {
@@ -31,47 +18,6 @@ const fn role_label(role: Role) -> &'static str {
     }
 }
 
-/// Which span of the assembled request a wire message belongs to.
-#[derive(Debug, Clone, Copy)]
-pub enum MessageSection {
-    /// The stable system prefix — all named blocks joined into one message.
-    Prefix,
-    /// The active handoff document.
-    Handoff,
-    /// Recent conversation, durable system alerts included.
-    Conversation,
-    /// Live context rendered fresh for the next request.
-    Tail,
-}
-
-impl MessageSection {
-    /// Row label shown in the dump.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Prefix => "system prefix",
-            Self::Handoff => "handoff",
-            Self::Conversation => "conversation",
-            Self::Tail => "live tail",
-        }
-    }
-}
-
-/// One named stable-prefix block, verbatim.
-#[derive(Debug)]
-pub struct ContextBlockDump {
-    /// Block tag — iteration order of `system_blocks` is wire order.
-    pub tag: String,
-    /// Block content as it rides the wire.
-    pub content: String,
-    /// Staged replacement waiting for the next reassembly, if any.
-    pub staged_update: Option<String>,
-    /// `content` size.
-    pub chars: usize,
-    /// Estimated tokens.
-    pub tokens: usize,
-}
-
 /// An assistant tool call, arguments verbatim.
 #[derive(Debug)]
 pub struct ContextToolCallDump {
@@ -79,8 +25,6 @@ pub struct ContextToolCallDump {
     pub name: String,
     /// Serialized call arguments.
     pub arguments: String,
-    /// `name` + `arguments` size.
-    pub chars: usize,
 }
 
 /// One provider-tagged reasoning block; the payload is opaque so the dump
@@ -93,15 +37,13 @@ pub struct ContextReasoningDump {
     pub payload_chars: usize,
 }
 
-/// One wire message with provenance metadata.
+/// One wire message.
 #[derive(Debug)]
 pub struct ContextMessageDump {
     /// Position in the assembled request.
     pub index: usize,
     /// `user` / `assistant` / `system` / `tool`.
     pub role: &'static str,
-    /// Which request span this message forms.
-    pub section: MessageSection,
     /// Message content as it rides the wire.
     pub content: String,
     /// Attachment urls.
@@ -112,13 +54,9 @@ pub struct ContextMessageDump {
     pub tool_calls: Vec<ContextToolCallDump>,
     /// Reasoning blocks recorded on this message.
     pub reasoning: Vec<ContextReasoningDump>,
-    /// Rendered size: content plus tool-call payloads.
-    pub chars: usize,
-    /// Estimated tokens.
-    pub tokens: usize,
 }
 
-/// A verbatim, developer-facing view of the assembled context window.
+/// The verbatim request transcript of the assembled context window.
 #[derive(Debug, Template)]
 #[template(path = "context_dump.md", escape = "none")]
 pub struct ContextDump {
@@ -130,87 +68,33 @@ pub struct ContextDump {
     pub provider_id: String,
     /// RFC 3339 capture time.
     pub captured_at: String,
-    /// `ContextWindowPhase` rendered for display.
-    pub phase_label: String,
-    /// Usage fraction rendered for display.
-    pub usage_pct: String,
-    /// Window metrics at capture time.
-    pub metrics: ContextWindowMetrics,
-    /// Named stable-prefix blocks in wire order.
-    pub blocks: Vec<ContextBlockDump>,
     /// Full assembled message list in wire order.
     pub messages: Vec<ContextMessageDump>,
-    /// Joined size of the stable prefix.
-    pub prefix_chars: usize,
-    /// Estimated prefix tokens.
-    pub prefix_tokens: usize,
 }
 
 impl ContextDump {
-    /// Build a dump from the live context and a snapshot measured on the
-    /// same state.
+    /// Build a dump from a snapshot of the live context.
     pub(crate) fn assemble(
         model_id: &str,
         provider_id: &str,
         session_id: &str,
-        context: &aither_agent::Context,
         snapshot: &ContextWindowSnapshot,
     ) -> Self {
-        let blocks = context
-            .system_blocks()
-            .iter()
-            .map(|(tag, content)| ContextBlockDump {
-                tag: tag.clone(),
-                chars: content.len(),
-                tokens: est_tokens(content.len()),
-                staged_update: context.staged_system_update(tag).map(str::to_string),
-                content: content.clone(),
-            })
-            .collect::<Vec<_>>();
-
-        // `build_request` lays messages out as: joined prefix, optional
-        // handoff, conversation items, optional live tail.
-        let prefix_messages = usize::from(!blocks.is_empty());
-        let handoff_messages = usize::from(context.handoff().is_some());
-        let conversation_start = prefix_messages + handoff_messages;
-        let conversation_end = conversation_start + context.recent().len();
-
-        let messages = snapshot
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(index, message)| {
-                let section = if index < prefix_messages {
-                    MessageSection::Prefix
-                } else if index < conversation_start {
-                    MessageSection::Handoff
-                } else if index < conversation_end {
-                    MessageSection::Conversation
-                } else {
-                    MessageSection::Tail
-                };
-                message_dump(index, message, section)
-            })
-            .collect();
-
-        let prefix_chars = blocks.iter().map(|block| block.chars).sum();
-
         Self {
             session_id: session_id.to_string(),
             model_id: model_id.to_string(),
             provider_id: provider_id.to_string(),
             captured_at: jiff::Timestamp::now().to_string(),
-            phase_label: format!("{:?}", snapshot.phase),
-            usage_pct: format!("{:.0}%", f64::from(snapshot.metrics.usage_fraction) * 100.0),
-            metrics: snapshot.metrics.clone(),
-            prefix_tokens: est_tokens(prefix_chars),
-            prefix_chars,
-            blocks,
-            messages,
+            messages: snapshot
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| message_dump(index, message))
+                .collect(),
         }
     }
 
-    /// Render the dump to markdown.
+    /// Render the dump to a readable transcript.
     ///
     /// # Panics
     ///
@@ -222,26 +106,10 @@ impl ContextDump {
     }
 }
 
-fn message_dump(index: usize, message: &LlmMessage, section: MessageSection) -> ContextMessageDump {
-    let tool_calls = message
-        .tool_calls()
-        .iter()
-        .map(|call| {
-            let arguments = call.arguments.to_string();
-            ContextToolCallDump {
-                chars: call.name.len() + arguments.len(),
-                name: call.name.clone(),
-                arguments,
-            }
-        })
-        .collect::<Vec<_>>();
-    let chars = message.content().len() + tool_calls.iter().map(|call| call.chars).sum::<usize>();
+fn message_dump(index: usize, message: &LlmMessage) -> ContextMessageDump {
     ContextMessageDump {
         index,
         role: role_label(message.role()),
-        section,
-        chars,
-        tokens: est_tokens(chars),
         content: message.content().to_string(),
         attachments: message
             .attachments()
@@ -249,7 +117,14 @@ fn message_dump(index: usize, message: &LlmMessage, section: MessageSection) -> 
             .map(|attachment| attachment.url().to_string())
             .collect(),
         tool_call_id: message.tool_call_id().map(str::to_string),
-        tool_calls,
+        tool_calls: message
+            .tool_calls()
+            .iter()
+            .map(|call| ContextToolCallDump {
+                name: call.name.clone(),
+                arguments: call.arguments.to_string(),
+            })
+            .collect(),
         reasoning: message
             .reasoning()
             .iter()
@@ -264,16 +139,7 @@ fn message_dump(index: usize, message: &LlmMessage, section: MessageSection) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_agent::{Block, ContextWindowPhase};
-
-    fn test_context() -> aither_agent::Context {
-        let mut context = aither_agent::Context::default();
-        context.insert_system_text("memory", "remember this");
-        context.insert_system_text("persona", "be brief");
-        context.push(LlmMessage::user("hello"));
-        context.push(LlmMessage::assistant("hi there"));
-        context
-    }
+    use aither_agent::{ContextWindowMetrics, ContextWindowPhase};
 
     fn test_metrics() -> ContextWindowMetrics {
         ContextWindowMetrics {
@@ -290,78 +156,90 @@ mod tests {
         }
     }
 
-    fn snapshot_for(context: &aither_agent::Context, tail: &[Block]) -> ContextWindowSnapshot {
-        ContextWindowSnapshot {
+    #[test]
+    fn dump_renders_the_request_in_wire_order() {
+        let mut context = aither_agent::Context::default();
+        context.insert_system_text("memory", "remember this");
+        context.insert_system_text("persona", "be brief");
+        context.push(LlmMessage::user("hello"));
+        context.push(LlmMessage::assistant("hi there"));
+        let snapshot = ContextWindowSnapshot {
             phase: ContextWindowPhase::Stable,
             metrics: test_metrics(),
-            messages: context.build_request(tail),
-        }
-    }
+            messages: context.build_request(&[]),
+        };
 
-    #[test]
-    fn dump_decomposes_prefix_and_labels_message_sections() {
-        let context = test_context();
-        let tail = [Block::new("tasks", "tasks: one open")];
-        let snapshot = snapshot_for(&context, &tail);
-
-        let dump = ContextDump::assemble("gpt-5", "openai", "session-id", &context, &snapshot);
-
-        assert_eq!(
-            dump.blocks
-                .iter()
-                .map(|block| block.tag.as_str())
-                .collect::<Vec<_>>(),
-            ["memory", "persona"]
-        );
-        assert_eq!(dump.blocks[0].content, "remember this");
-        assert!(dump.blocks[0].staged_update.is_none());
-
-        assert_eq!(dump.messages.len(), 4);
-        assert!(matches!(dump.messages[0].section, MessageSection::Prefix));
-        assert_eq!(dump.messages[0].role, "system");
-        assert_eq!(dump.messages[0].content, "remember this\nbe brief");
-        assert!(matches!(
-            dump.messages[1].section,
-            MessageSection::Conversation
-        ));
-        assert_eq!(dump.messages[1].role, "user");
-        assert!(matches!(
-            dump.messages[2].section,
-            MessageSection::Conversation
-        ));
-        assert!(matches!(dump.messages[3].section, MessageSection::Tail));
-        assert_eq!(dump.messages[3].content, "tasks: one open");
-    }
-
-    #[test]
-    fn dump_marks_handoff_between_prefix_and_conversation() {
-        let mut context = test_context();
-        context.set_handoff("handoff doc");
-        let snapshot = snapshot_for(&context, &[]);
-
-        let dump = ContextDump::assemble("gpt-5", "openai", "s", &context, &snapshot);
-
-        assert_eq!(dump.messages.len(), 4);
-        assert!(matches!(dump.messages[0].section, MessageSection::Prefix));
-        assert!(matches!(dump.messages[1].section, MessageSection::Handoff));
-        assert!(matches!(
-            dump.messages[2].section,
-            MessageSection::Conversation
-        ));
-        assert!(matches!(
-            dump.messages[3].section,
-            MessageSection::Conversation
-        ));
-    }
-
-    #[test]
-    fn dump_renders_without_panicking() {
-        let context = test_context();
-        let snapshot = snapshot_for(&context, &[]);
-        let dump = ContextDump::assemble("gpt-5", "openai", "s", &context, &snapshot);
+        let dump = ContextDump::assemble("gpt-5", "openai", "s", &snapshot);
         let text = dump.render();
-        assert!(text.contains("`memory`"));
+
+        assert!(text.contains("[0] role: system"));
         assert!(text.contains("remember this"));
-        assert!(text.contains("hi there"));
+        assert!(text.contains("be brief"));
+        assert!(text.contains("[1] role: user\nhello"));
+        assert!(text.contains("[2] role: assistant\nhi there"));
+        assert_eq!(dump.messages.len(), 3);
+    }
+
+    #[test]
+    fn example_render() {
+        use aither_core::llm::{Attachment, ReasoningState, ToolCall};
+
+        let mut context = aither_agent::Context::default();
+        context.insert_system_text(
+            "base_system",
+            "You run in a terminal-first environment.\n\n<commands>\n- websearch <query>: search the web\n- browser <action>: drive the managed browser\n</commands>\n\n<skills>\n- pdf/ — read and write PDFs\n</skills>",
+        );
+        context.insert_system_text(
+            "persona",
+            "You are May. Be warm, lead with the point, prefer prose over lists.",
+        );
+        context.insert_system_text(
+            "permissions",
+            "Read access to the entire filesystem. Write access is restricted to the session sandbox and approved workdirs. Destructive or irreversible commands require approval.",
+        );
+        context.push(LlmMessage::user("为什么这个函数会 panic"));
+        context.push(LlmMessage::Assistant {
+            content: "先跑一下最小复现看看 panic 从哪来。".to_string(),
+            tool_calls: vec![ToolCall::new(
+                "terminal:1",
+                "terminal",
+                serde_json::json!({"command": "cargo test reproduce -- --nocapture", "timeout": 120}),
+            )],
+            reasoning: vec![ReasoningState::new("claude", "<opaque thinking payload>")],
+        });
+        context.push(LlmMessage::tool(
+            "terminal:1",
+            "thread 'reproduce' panicked at src/lib.rs:42:9:\nindex out of bounds: the len is 3 but the index is 5\nnote: run with `RUST_BACKTRACE=1`",
+        ));
+        context.push(
+            LlmMessage::user("附件里是出错时的堆栈").with_attachment(Attachment::new(
+                url::Url::parse("file:///Users/lexoliu/Coding/demo/backtrace.log").unwrap(),
+                "text/plain".parse::<mime::Mime>().unwrap(),
+            )),
+        );
+        context.push(LlmMessage::assistant("看到了——是第 42 行对空列表取 [5]。"));
+
+        let tail = [aither_agent::Block::new(
+            "tasks",
+            "<tasks>\n- [ ] fix index-out-of-bounds in src/lib.rs:42\n</tasks>",
+        )];
+        let snapshot = ContextWindowSnapshot {
+            phase: ContextWindowPhase::Stable,
+            metrics: test_metrics(),
+            messages: context.build_request(&tail),
+        };
+        let dump = ContextDump::assemble("swe-2-high", "custom", "mighty-pine-fjord", &snapshot);
+        let text = dump.render();
+
+        assert!(text.contains("[0] role: system\nYou run in a terminal-first environment."));
+        assert!(text.contains(
+            "[2] role: assistant\nreasoning: claude (25 bytes)\ntool_calls:\n  - name: terminal\n    arguments: {\"command\":\"cargo test reproduce -- --nocapture\",\"timeout\":120}"
+        ));
+        assert!(text.contains("[3] role: tool\ntool_call_id: terminal:1\nthread 'reproduce'"));
+        assert!(text.contains(
+            "[4] role: user\nattachments:\n  - file:///Users/lexoliu/Coding/demo/backtrace.log\n附件里是出错时的堆栈"
+        ));
+        assert!(text.contains("[6] role: system\n<tasks>"));
+        assert_eq!(dump.messages.len(), 7);
     }
 }
