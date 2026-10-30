@@ -1,0 +1,7 @@
+Unanswered ask_user questions. The answer arrives as a message; until then do not decide them yourself, and keep their dependent tasks marked BLOCKING <request_id> in tasks.md.
+{% for request in requests -%}
+{{ request.id }}:
+{% for question in request.questions -%}
+- {% if !question.section.is_empty() %}[{{ question.section }}] {% endif %}{{ question.question }}{% if !question.option.is_empty() %} (options: {{ question.option|join(", ") }}){% endif %}
+{% endfor -%}
+{% endfor -%}

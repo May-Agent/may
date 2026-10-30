@@ -220,7 +220,8 @@ export const enUS = {
     askUser: {
       title: 'May needs your input',
       other: 'Other',
-      skip: 'Skip',
+      failed: 'Could not send the answer. The question may no longer be open.',
+      openTitle: 'May asked a question',
     },
   },
   settings: {

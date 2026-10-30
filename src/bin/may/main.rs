@@ -51,7 +51,8 @@ use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::ask_user::{self, AskUserQueue};
 use may_agent::session::RunOutcome;
 use may_agent::tui::runtime::{
-    AssistantReply, LocalSessionRuntime, QueuedRunStart, RuntimeDeps, TitleGenContext,
+    AssistantReply, LocalSessionRuntime, QueuedRunStart, ResponseCommit, RuntimeDeps,
+    TitleGenContext,
 };
 use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
 use may_agent::workspace_request::{self, WorkspaceRequestQueue};
@@ -464,6 +465,12 @@ where
             );
         }
 
+        app.restore_parked_question();
+
+        // Open questions are listed in the status bar and opened with
+        // `/questions`; they never take over the input on their own.
+        app.open_question_count = runtime_deps.open_questions(app).await?.len();
+
         runtime_deps
             .listen_for_agent_messages(app, &agent_listeners, events.sender())
             .await?;
@@ -627,7 +634,7 @@ where
                     .register_ask_user_request(app, &session_id, &questions)
                     .await?;
                 let state = may_agent::tui::AskUserState::new(request_id, request, questions);
-                app.mode = may_agent::tui::AppMode::AskUser(state);
+                app.show_blocking_prompt(may_agent::tui::AppMode::AskUser(state));
             }
 
             Event::Workspace(request) => {
@@ -644,12 +651,12 @@ where
                 let request_id = runtime_deps
                     .register_workspace_request(app, &session_id, &request.args.request)
                     .await?;
-                app.mode = may_agent::tui::AppMode::WorkspaceConfirm(
+                app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
                     may_agent::tui::state::WorkspaceConfirmState {
                         request_id,
                         request,
                     },
-                );
+                ));
             }
 
             Event::Agent(tui_event) => {
@@ -871,17 +878,63 @@ where
                         request,
                         answers,
                     }) => {
-                        let session_id = app
-                            .session_manager
-                            .current()
-                            .map(|session| session.id.clone())
-                            .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-                        runtime_deps
-                            .resolve_ask_user_response(app, &session_id, &request_id, &answers)
-                            .await?;
-                        request.respond(answers).unwrap_or_else(|_| {
-                            panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
-                        });
+                        if let Some(request) = request {
+                            let session_id = app
+                                .session_manager
+                                .current()
+                                .map(|session| session.id.clone())
+                                .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+                            match runtime_deps
+                                .resolve_ask_user_response(&session_id, &request_id, &answers)
+                                .await?
+                            {
+                                ResponseCommit::Committed => {
+                                    request.respond(answers).unwrap_or_else(|_| {
+                                        panic!(
+                                            "{}",
+                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                        )
+                                    });
+                                }
+                                ResponseCommit::Lost(committed) => {
+                                    request.respond(committed).unwrap_or_else(|_| {
+                                        panic!(
+                                            "{}",
+                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                        )
+                                    });
+                                    app.chat.push_notice(
+                                        "That prompt was already answered elsewhere; the run continues with that answer, not yours",
+                                    );
+                                }
+                                ResponseCommit::Withdrawn => app.chat.push_notice(
+                                    "That prompt was withdrawn; your answer was not sent",
+                                ),
+                            }
+                        } else if !runtime_deps
+                            .answer_open_question(&request_id, &answers)
+                            .await?
+                        {
+                            app.chat.push_notice(
+                                "That question is no longer open; your answer was not sent",
+                            );
+                        }
+                    }
+                    Some(SendAction::OpenQuestions) => {
+                        let open = runtime_deps.open_questions(app).await?;
+                        if open.is_empty() {
+                            app.chat.push_notice("No open questions");
+                        } else {
+                            let index = app.question_cursor % open.len();
+                            app.question_cursor = index + 1;
+                            let request = open
+                                .into_iter()
+                                .nth(index)
+                                .expect("the index is within the open questions");
+                            app.mode = may_agent::tui::AppMode::AskUser(
+                                may_agent::tui::AskUserState::for_open_question(request),
+                            );
+                        }
                     }
                     Some(SendAction::StartCopilotAuth) => {
                         run_copilot_auth(app, events, terminal).await?;
@@ -1043,12 +1096,27 @@ where
                             .current()
                             .map(|session| session.id.clone())
                             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-                        runtime_deps
-                            .resolve_workspace_response(app, &session_id, &request_id, approved)
-                            .await?;
-                        request.respond(approved).unwrap_or_else(|_| {
-                            panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
-                        });
+                        match runtime_deps
+                            .resolve_workspace_response(&session_id, &request_id, approved)
+                            .await?
+                        {
+                            ResponseCommit::Committed => {
+                                request.respond(approved).unwrap_or_else(|_| {
+                                    panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
+                                });
+                            }
+                            ResponseCommit::Lost(committed) => {
+                                request.respond(committed).unwrap_or_else(|_| {
+                                    panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
+                                });
+                                app.chat.push_notice(
+                                    "That request was already answered elsewhere; the run continues with that decision, not yours",
+                                );
+                            }
+                            ResponseCommit::Withdrawn => app.chat.push_notice(
+                                "That request was withdrawn; your decision was not sent",
+                            ),
+                        }
                     }
                     Some(SendAction::RespondPermission {
                         request_id,

@@ -15,7 +15,9 @@ use jiff::Timestamp;
 use may_agent::agent::{AgentWorker, TuiEvent};
 use may_agent::ask_user;
 use may_agent::session::RunOutcome;
-use may_agent::tui::runtime::{AssistantReply, LocalSessionRuntime, RuntimeDeps, TitleGenContext};
+use may_agent::tui::runtime::{
+    AssistantReply, LocalSessionRuntime, ResponseCommit, RuntimeDeps, TitleGenContext,
+};
 use may_agent::tui::{App, PendingMessage};
 use may_agent::workspace_request;
 
@@ -42,11 +44,22 @@ async fn answer_oneshot_question(
         .register_ask_user_request(app, &session_id, &questions)
         .await?;
     let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
-    runtime_deps
-        .resolve_ask_user_response(app, &session_id, &request_id, &answers)
-        .await?;
-    request.respond(answers).map_err(anyhow::Error::from)?;
-    Ok(())
+    match runtime_deps
+        .resolve_ask_user_response(&session_id, &request_id, &answers)
+        .await?
+    {
+        ResponseCommit::Committed => request.respond(answers).map_err(anyhow::Error::from),
+        ResponseCommit::Lost(committed) => {
+            writeln!(
+                output.stderr()?,
+                "[notice] the question was already answered elsewhere; the run continues with that answer, not yours"
+            )?;
+            request.respond(committed).map_err(anyhow::Error::from)
+        }
+        ResponseCommit::Withdrawn => Err(anyhow::anyhow!(
+            "the question was withdrawn; this answer was not sent"
+        )),
+    }
 }
 
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
@@ -153,7 +166,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         if let Some(request) = runtime_deps.pending_permission(&app).await? {
             let approved = prompt_oneshot_permission(&request.request, output.stderr()?)?;
             runtime_deps
-                .resolve_permission_response(&mut app, &request.id, approved)
+                .resolve_permission_response(&app, &request.id, approved)
                 .await?;
             continue;
         }
@@ -207,10 +220,24 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     .register_workspace_request(&mut app, &session_id, &request.args.request)
                     .await?;
                 let approved = prompt_oneshot_workspace(&request.args.request, output.stderr()?)?;
-                runtime_deps
-                    .resolve_workspace_response(&mut app, &session_id, &request_id, approved)
-                    .await?;
-                request.respond(approved).map_err(anyhow::Error::from)?;
+                match runtime_deps
+                    .resolve_workspace_response(&session_id, &request_id, approved)
+                    .await?
+                {
+                    ResponseCommit::Committed => {
+                        request.respond(approved).map_err(anyhow::Error::from)?;
+                    }
+                    ResponseCommit::Lost(committed) => {
+                        writeln!(
+                            output.stderr()?,
+                            "[notice] the workspace request was already answered elsewhere; the run continues with that decision, not yours"
+                        )?;
+                        request.respond(committed).map_err(anyhow::Error::from)?;
+                    }
+                    ResponseCommit::Withdrawn => anyhow::bail!(
+                        "the workspace request was withdrawn; this decision was not sent"
+                    ),
+                }
             }
             Event::Agent(TuiEvent::Agent(result)) => {
                 if let Ok(TimedEvent {
@@ -308,21 +335,18 @@ fn prompt_oneshot_questions(
         if question.multi_select {
             writeln!(
                 stderr,
-                "Enter comma-separated numbers, `s` to skip, or any other text for a custom answer:"
+                "Enter comma-separated numbers, or any other text for a custom answer:"
             )?;
         } else {
             writeln!(
                 stderr,
-                "Enter a number, `s` to skip, or any other text for a custom answer:"
+                "Enter a number, or any other text for a custom answer:"
             )?;
         }
         stderr.flush()?;
         let answer = loop {
             let input = read_oneshot_line()?;
             let trimmed = input.trim();
-            if trimmed.eq_ignore_ascii_case("s") || trimmed.eq_ignore_ascii_case("skip") {
-                break may_agent::ask_user::AnswerValue::Skipped;
-            }
             if question.option.is_empty() {
                 if trimmed.is_empty() {
                     writeln!(stderr, "answer must not be empty")?;

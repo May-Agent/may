@@ -15,6 +15,7 @@ use crate::agent::PermissionApprover;
 use crate::agent::browser_tool::{BrowserBroker, BrowserQueue};
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::register_tool::RegisterQueue;
+use crate::agent::ssh_authorizer::PermissionChoice;
 use crate::agent::task_tool::{TaskBroker, TaskQueue};
 use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
@@ -494,7 +495,6 @@ impl UiServerState {
 pub enum UiAnswerInput {
     Selected { values: Vec<String> },
     Custom { text: String },
-    Skipped,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -528,7 +528,6 @@ impl TryFrom<UiAnswerInput> for AnswerValue {
                 }
                 Ok(Self::Custom(trimmed.to_string()))
             }
-            UiAnswerInput::Skipped => Ok(Self::Skipped),
         }
     }
 }
@@ -545,6 +544,42 @@ pub struct UiQuestionAnswer {
 pub struct AskUserRespondRequest {
     pub(crate) id: String,
     pub(crate) answers: Vec<UiQuestionAnswer>,
+}
+
+/// What resolving a question did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskUserOutcome {
+    /// The run waiting on the prompt was woken with the answer.
+    Woke,
+    /// The answer to an open question joined the session queue; the caller
+    /// dispatches it.
+    Queued,
+    /// The run that blocked on the prompt is gone. The decision is
+    /// committed; the session resumes with the interrupted-run reminder, not
+    /// with a question of the agent's own.
+    Resume {
+        /// Whether the user allowed what the prompt asked for.
+        approved: bool,
+    },
+    /// An earlier call committed the answer; nothing more happens.
+    AlreadyAnswered,
+}
+
+/// A question that an answer resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskUserResolved {
+    pub session_id: String,
+    pub outcome: AskUserOutcome,
+}
+
+/// Whether `answers` select the allow option of the internal prompt
+/// `request`: the test the live gate applies.
+fn answers_allow(request: &PersistedAskUserRequest, answers: &[QuestionAnswer]) -> bool {
+    request
+        .questions
+        .first()
+        .and_then(|question| PermissionChoice::from_options(&question.option))
+        .is_some_and(|choice| choice.allows(answers))
 }
 
 #[derive(Debug, Clone)]
@@ -567,17 +602,6 @@ pub enum WorkspaceApprovalError {
     PersistHistory(#[source] crate::db::ChatDbError),
     #[error("workspace request interrupted")]
     Interrupted,
-}
-
-/// Generate skipped answers for all questions in the request.
-fn skipped_answers(questions: &[Question]) -> Vec<QuestionAnswer> {
-    questions
-        .iter()
-        .map(|q| QuestionAnswer {
-            section: q.section.clone(),
-            answer: AnswerValue::Skipped,
-        })
-        .collect()
 }
 
 impl AskUserApprover {
@@ -638,15 +662,76 @@ impl AskUserApprover {
             }
         }
 
-        let answers = rx
-            .recv()
-            .await
-            .unwrap_or_else(|_| skipped_answers(&questions));
-        let _ = request.respond(answers);
+        // A closed registry means the server is going down; dropping the
+        // request tells the asking run it was interrupted.
+        if let Ok(answers) = rx.recv().await {
+            let _ = request.respond(answers);
+        }
     }
 
-    pub(crate) fn respond(&self, request_id: &str, answers: Vec<QuestionAnswer>) -> bool {
-        self.live_responses.resolve(request_id, answers)
+    /// Resolve the pending question `request_id` with `answers`: the answer
+    /// is committed first, then the waiting run is woken. The waiter is
+    /// taken out of the registry before the commit, so nothing else resolves
+    /// it meanwhile; it goes back if nothing is committed. A run that is gone
+    /// by the wake leaves the committed decision to the caller to resume.
+    /// Returns `None` when the question is not pending and was never
+    /// answered.
+    ///
+    /// # Errors
+    /// Returns [`crate::session::AnswerError`] when the answers do not fit
+    /// the question or the commit fails; nothing is woken or queued then.
+    ///
+    /// # Panics
+    /// Panics if the approver has no runtime service.
+    pub(crate) async fn resolve(
+        &self,
+        request_id: &str,
+        answers: Vec<QuestionAnswer>,
+    ) -> Result<Option<AskUserResolved>, crate::session::AnswerError> {
+        let runtime = self
+            .runtime_service
+            .as_ref()
+            .expect("resolving an ask-user question needs the runtime service");
+        let waiter = self.live_responses.take(request_id);
+        let restore = |waiter: &Option<async_channel::Sender<Vec<QuestionAnswer>>>| {
+            if let Some(waiter) = waiter {
+                self.live_responses.restore(request_id, waiter);
+            }
+        };
+        let answered = match runtime.answer_ask_user(request_id, &answers).await {
+            Ok(answered) => answered,
+            Err(error) => {
+                restore(&waiter);
+                return Err(error);
+            }
+        };
+        let committed = match answered {
+            None => {
+                restore(&waiter);
+                return Ok(None);
+            }
+            Some(crate::session::AskUserAnswer::AlreadyAnswered { session_id }) => {
+                restore(&waiter);
+                return Ok(Some(AskUserResolved {
+                    session_id,
+                    outcome: AskUserOutcome::AlreadyAnswered,
+                }));
+            }
+            Some(crate::session::AskUserAnswer::Committed(committed)) => committed,
+        };
+        let outcome = if committed.delivered {
+            AskUserOutcome::Queued
+        } else if waiter.is_some_and(|waiter| waiter.try_send(answers.clone()).is_ok()) {
+            AskUserOutcome::Woke
+        } else {
+            AskUserOutcome::Resume {
+                approved: answers_allow(&committed.request, &answers),
+            }
+        };
+        Ok(Some(AskUserResolved {
+            session_id: committed.session_id,
+            outcome,
+        }))
     }
 }
 
@@ -721,8 +806,34 @@ impl WorkspaceApprover {
             .map_err(|_| WorkspaceApprovalError::Interrupted)
     }
 
-    pub(crate) fn respond(&self, request_id: &str, approved: bool) -> bool {
-        self.live_responses.resolve(request_id, approved)
+    /// Resolve the pending request `request_id`: the decision is committed
+    /// first (the request cleared by its id, the decision in the history),
+    /// and only then is the waiting run woken. Returns `None` when the
+    /// request is not pending.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] when the commit fails; nothing is
+    /// woken then.
+    ///
+    /// # Panics
+    /// Panics if the approver has no runtime service.
+    pub(crate) async fn resolve(
+        &self,
+        request_id: &str,
+        approved: bool,
+    ) -> Result<Option<crate::session::ResolvedRequest>, crate::db::ChatDbError> {
+        let runtime = self
+            .runtime_service
+            .as_ref()
+            .expect("resolving a workspace request needs the runtime service");
+        let Some(session_id) = runtime
+            .commit_workspace_response(request_id, approved)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let woke = self.live_responses.resolve(request_id, approved);
+        Ok(Some(crate::session::ResolvedRequest { session_id, woke }))
     }
 }
 

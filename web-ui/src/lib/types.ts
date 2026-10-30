@@ -164,6 +164,7 @@ export interface SessionRuntimeSummary {
   waitingPermission?: PersistedPermissionRequest | null;
   waitingWorkspace?: PersistedWorkspaceRequest | null;
   waitingAskUser?: PersistedAskUserRequest | null;
+  openQuestions?: PersistedAskUserRequest[];
   updatedAt?: string | null;
 }
 

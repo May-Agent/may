@@ -1,0 +1,8 @@
+<system-reminder>
+The user answered your ask_user question {{ request_id }}.
+{% for entry in entries -%}
+Question: {{ entry.question }}
+Answer: {{ entry.answer }}
+{% endfor -%}
+Clear the BLOCKING {{ request_id }} marks in tasks.md and continue with the work this unblocks.
+</system-reminder>

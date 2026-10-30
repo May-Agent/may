@@ -172,6 +172,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 model: &app.model_display(),
                 usage: usage_info,
                 queue_count: app.queue.len(),
+                open_questions: app.open_question_count,
                 background: &background_items,
                 decode_rate,
                 status_message: app.status_text(),
@@ -199,6 +200,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         model: &app.model_display(),
         usage: usage_info,
         queue_count: app.queue.len(),
+        open_questions: app.open_question_count,
         background: &background_items,
         decode_rate,
         status_message: app.status_text(),
@@ -1483,9 +1485,9 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
         return;
     };
 
-    // Item count: options + Skip + Custom answer
+    // Item count: options + Custom answer
     let opt_count = question.option.len();
-    let total_items = opt_count + 2;
+    let total_items = opt_count + 1;
 
     // Calculate overlay height: question(2) + items + custom_input?(1) + help(1) + border(2)
     let custom_line = u16::from(qs.custom_mode);
@@ -1568,7 +1570,7 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     .wrap(ratatui::widgets::Wrap { trim: false });
     frame.render_widget(q_text, chunks[0]);
 
-    // Render items: options + Skip + Custom answer
+    // Render items: options + Custom answer
     let visible_height = chunks[1].height as usize;
     let scroll_offset = if qs.cursor >= visible_height {
         qs.cursor - visible_height + 1
@@ -1613,21 +1615,7 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
                     Span::styled(&question.option[global_idx], cursor_style),
                 ])));
             }
-            std::cmp::Ordering::Equal => {
-                // Skip
-                let skip_style = if qs.skipped {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                let mark = if qs.skipped { ">> " } else { "   " };
-                items.push(ListItem::new(Line::from(vec![
-                    Span::styled(prefix, cursor_style),
-                    Span::styled(mark, skip_style),
-                    Span::styled("Skip", if is_cursor { cursor_style } else { skip_style }),
-                ])));
-            }
-            std::cmp::Ordering::Greater => {
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
                 // Custom answer
                 let has_custom = !qs.custom_text.is_empty();
                 let custom_style = if has_custom {
@@ -1678,10 +1666,17 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     } else {
         ""
     };
-    let help_text = if question.multi_select {
-        format!("Space: toggle | Enter: confirm | j/k: navigate{nav} | Esc: skip all")
+    // An open question stays open when its modal closes; a prompt a run
+    // blocks on can only be answered.
+    let close = if state.request.is_none() {
+        " | Esc: close (stays open)"
     } else {
-        format!("Enter: select | j/k: navigate{nav} | Esc: skip all")
+        ""
+    };
+    let help_text = if question.multi_select {
+        format!("Space: toggle | Enter: confirm | j/k: navigate{nav}{close}")
+    } else {
+        format!("Enter: select | j/k: navigate{nav}{close}")
     };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))
