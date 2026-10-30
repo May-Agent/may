@@ -19,11 +19,13 @@ mod exec;
 mod oneshot;
 
 use std::io;
+use std::io::Write as _;
 use std::mem;
 use std::panic;
 
 use aither_agent::{AgentEvent, TimedEvent};
 use anyhow::Context;
+use askama::Template as _;
 
 use crate::browser::run_browser;
 use crate::cli::{CliMode, parse_cli_mode_from_env};
@@ -60,6 +62,48 @@ use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
 
 const PANIC_MESSAGE: &str = include_str!("../../texts/panic_message.txt");
 
+/// Header of a `/bug` or panic snapshot, rendered ahead of the ring dump.
+#[derive(askama::Template)]
+#[template(path = "bug_report.txt", escape = "none")]
+struct BugReportHeader<'a> {
+    version: &'a str,
+    timestamp: &'a str,
+    os: &'a str,
+    arch: &'a str,
+    session_id: &'a str,
+    mode: &'a str,
+}
+
+/// `/bug`: dump the session context and the recent log ring to a new file
+/// under `~/.may/bugs`, returning where it landed.
+fn write_bug_snapshot(
+    app: &App,
+    log_ring: &may_agent::log_ring::LogRingHandle,
+) -> anyhow::Result<std::path::PathBuf> {
+    let bugs_dir = dirs::home_dir()
+        .context("Failed to determine home directory")?
+        .join(".may")
+        .join("bugs");
+    let timestamp = jiff::Timestamp::now().to_string();
+    let header = BugReportHeader {
+        version: env!("CARGO_PKG_VERSION"),
+        timestamp: timestamp.as_str(),
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        session_id: app
+            .session_manager
+            .current()
+            .map_or("none", |session| session.id.as_str()),
+        mode: app.mode.name(),
+    }
+    .render()
+    .context("Failed to render the bug report header")?;
+    let path = bugs_dir.join(format!("bug-{}.log", jiff::Timestamp::now().as_second()));
+    log_ring.dump_to(&path, &header)?;
+    tracing::info!(path = %path.display(), "bug snapshot written");
+    Ok(path)
+}
+
 fn ensure_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
@@ -72,12 +116,10 @@ async fn main() -> anyhow::Result<()> {
     let cli_mode = parse_cli_mode_from_env();
     let is_server_mode = matches!(cli_mode, CliMode::Ui(_) | CliMode::Rest(_));
 
-    // Initialize logging to file (shared by both server and TUI modes)
-    let log_dir = dirs::home_dir()
-        .context("Failed to determine home directory")?
-        .join(".may")
-        .join("logs");
-    std::fs::create_dir_all(&log_dir).context("Failed to create ~/.may/logs directory")?;
+    // Diagnostics live in a bounded in-memory ring; `/bug` and the panic
+    // hook dump it on demand under ~/.may/bugs.
+    let (log_writer, log_ring) =
+        may_agent::log_ring::LogRingHandle::new(may_agent::log_ring::DEFAULT_LOG_RING_CAPACITY);
     let env_filter = EnvFilter::from_default_env()
         .add_directive("may=info".parse()?)
         .add_directive("may_agent=debug".parse()?)
@@ -93,19 +135,33 @@ async fn main() -> anyhow::Result<()> {
         .add_directive("skyzen_core=warn".parse()?);
 
     if is_server_mode {
-        let file_appender = tracing_appender::rolling::daily(log_dir, "may.log");
         tracing_subscriber::registry()
-            .with(fmt::layer().with_writer(file_appender).with_ansi(false))
+            .with(fmt::layer().with_writer(log_writer).with_ansi(false))
             .with(fmt::layer().with_writer(io::stderr).with_ansi(true))
             .with(env_filter)
             .init();
     } else {
-        let file_appender = tracing_appender::rolling::daily(log_dir, "may.log");
         tracing_subscriber::registry()
-            .with(fmt::layer().with_writer(file_appender).with_ansi(false))
+            .with(fmt::layer().with_writer(log_writer).with_ansi(false))
             .with(env_filter)
             .init();
     }
+
+    // A panic dumps the panic message and the recent log to ~/.may/bugs
+    // before the previous hook restores the terminal / prints the trace.
+    let panic_ring = log_ring.clone();
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        if let Some(bugs_dir) = dirs::home_dir().map(|home| home.join(".may").join("bugs"))
+            && let Err(error) = panic_ring.dump_to(
+                &bugs_dir.join(format!("panic-{}.log", jiff::Timestamp::now().as_second())),
+                &panic_info.to_string(),
+            )
+        {
+            eprintln!("failed to write the panic log dump: {error}");
+        }
+        previous_hook(panic_info);
+    }));
 
     if !matches!(cli_mode, CliMode::Help(_)) {
         may_agent::startup::validate_configuration().await?;
@@ -178,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let result = run_app(&mut terminal, image_support).await;
+    let result = run_app(&mut terminal, image_support, log_ring).await;
 
     // Cleanup terminal
     disable_raw_mode()?;
@@ -196,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
+    log_ring: may_agent::log_ring::LogRingHandle,
 ) -> anyhow::Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -286,6 +343,7 @@ where
         workspace_queue,
         ask_user_queue,
         &mut mcp_manager,
+        log_ring,
     )
     .await
 }
@@ -384,6 +442,7 @@ async fn main_event_loop<B: Backend>(
     workspace_queue: WorkspaceRequestQueue,
     ask_user_queue: AskUserQueue,
     mcp_manager: &mut McpManager,
+    log_ring: may_agent::log_ring::LogRingHandle,
 ) -> anyhow::Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -475,9 +534,42 @@ where
         app.restore_parked_question();
 
         // Open questions are listed in the status bar and opened with
-        // `/questions`; they never take over the input on their own.
+        // `/questions` or Ctrl+Left; a fresh question (0 -> N) pops the
+        // docked panel itself, notifies, and rings the terminal bell so the
+        // dock icon bounces. Later additions only update the count.
         let step_start = std::time::Instant::now();
-        app.open_question_count = runtime_deps.open_questions(app).await?.len();
+        let open = runtime_deps.open_questions(app).await?;
+        let had_none = app.open_question_count == 0;
+        app.open_question_count = open.len();
+        if had_none && let Some(first) = open.into_iter().next() {
+            let question_text = first
+                .questions
+                .first()
+                .map_or("A new question is waiting", |q| q.question.as_str());
+            if let Some(session_id) = app
+                .session_manager
+                .current()
+                .map(|session| session.id.clone())
+            {
+                runtime_deps
+                    .notify_open_question(&session_id, question_text)
+                    .await;
+            }
+            let _ = io::stdout()
+                .write_all(b"\x07")
+                .and_then(|()| io::stdout().flush());
+            app.offer_open_question(may_agent::tui::AskUserState::for_open_question(first));
+        } else if app.open_question_count == 0
+            && matches!(
+                app.mode,
+                may_agent::tui::AppMode::AskUser(ref state) if state.request.is_none()
+            )
+        {
+            // Every open question went away (answered or withdrawn elsewhere):
+            // the docked panel closes on its own; a blocking prompt is not
+            // touched.
+            app.mode = may_agent::tui::AppMode::Chat;
+        }
 
         runtime_deps
             .listen_for_agent_messages(app, &agent_listeners, events.sender())
@@ -649,11 +741,24 @@ where
                     .current()
                     .map(|session| session.id.clone())
                     .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-                let request_id = runtime_deps
-                    .register_ask_user_request(app, &session_id, &questions)
-                    .await?;
-                let state = may_agent::tui::AskUserState::new(request_id, request, questions);
-                app.show_blocking_prompt(may_agent::tui::AppMode::AskUser(state));
+                match runtime_deps
+                    .register_ask_user_request(&session_id, &questions)
+                    .await
+                {
+                    Ok(request_id) => {
+                        let state =
+                            may_agent::tui::AskUserState::new(request_id, request, questions);
+                        app.show_blocking_prompt(may_agent::tui::AppMode::AskUser(state));
+                    }
+                    // A dropped request fails the tool call instead of
+                    // taking the process down with it.
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to register ask-user request");
+                        app.chat
+                            .push_error(&format!("Could not open the question: {error}"));
+                        drop(request);
+                    }
+                }
             }
 
             Event::Workspace(request) => {
@@ -667,15 +772,25 @@ where
                     .current()
                     .map(|session| session.id.clone())
                     .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-                let request_id = runtime_deps
+                match runtime_deps
                     .register_workspace_request(app, &session_id, &request.args.request)
-                    .await?;
-                app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
-                    may_agent::tui::state::WorkspaceConfirmState {
-                        request_id,
-                        request,
-                    },
-                ));
+                    .await
+                {
+                    Ok(request_id) => {
+                        app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
+                            may_agent::tui::state::WorkspaceConfirmState {
+                                request_id,
+                                request,
+                            },
+                        ));
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to register workspace request");
+                        app.chat
+                            .push_error(&format!("Could not open the workspace request: {error}"));
+                        drop(request);
+                    }
+                }
             }
 
             Event::Agent(tui_event) => {
@@ -1030,6 +1145,14 @@ where
                             tracing::warn!("Failed to open URL in browser: {}", e);
                         }
                     }
+                    Some(SendAction::BugReport) => match write_bug_snapshot(app, &log_ring) {
+                        Ok(path) => app
+                            .chat
+                            .push_notice(&format!("Bug snapshot saved to {}", path.display())),
+                        Err(error) => app
+                            .chat
+                            .push_error(&format!("Failed to save bug snapshot: {error}")),
+                    },
                     Some(SendAction::Compact(focus)) => {
                         if agent_handle.is_none() {
                             if let Some(w) = worker.as_ref() {

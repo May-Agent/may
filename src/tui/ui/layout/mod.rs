@@ -65,10 +65,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_workspace_confirm(frame, area, &state.request);
             return;
         }
-        AppMode::AskUser(state) => {
-            render_ask_user(frame, area, state);
-            return;
-        }
         _ => {}
     }
 
@@ -248,6 +244,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Render popups if in special modes
     match app.mode {
+        // The questions panel docks at the bottom over the still-rendered
+        // chat: opening it never hides the conversation behind it.
+        AppMode::AskUser(ref state) => {
+            render_ask_user(frame, area, state);
+        }
         AppMode::SessionSelect => {
             render_session_popup(frame, area, app);
         }

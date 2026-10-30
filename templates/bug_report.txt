@@ -1,0 +1,7 @@
+may bug report
+version: {{ version }}
+time: {{ timestamp }}
+os: {{ os }}
+arch: {{ arch }}
+session: {{ session_id }}
+mode: {{ mode }}

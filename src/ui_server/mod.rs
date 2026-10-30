@@ -27,6 +27,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
+
 use anyhow::{Context, anyhow};
 #[cfg(feature = "ui")]
 use skyzen::EmbeddedStaticDir;
@@ -261,6 +263,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
         cwd,
         may_dir,
+        session_open_locks: Mutex::new(std::collections::HashMap::new()),
     });
 
     chat::resume_pending_follow_up_runs(state.clone())
