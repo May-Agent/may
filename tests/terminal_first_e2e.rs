@@ -916,28 +916,11 @@ impl TestHarness {
         Self { home, may_dir }
     }
 
-    /// Plain-text tracing output May writes under the test home's log
-    /// directory (the stderr copy carries ANSI styling).
-    async fn file_logs(&self) -> String {
-        let log_dir = self.may_dir.join("logs");
-        let mut entries = tokio::fs::read_dir(&log_dir)
-            .await
-            .expect("May log directory should exist");
-        let mut logs = String::new();
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .expect("May log directory should be readable")
-        {
-            if entry.file_name().to_string_lossy().starts_with("may.log") {
-                logs.push_str(
-                    &tokio::fs::read_to_string(entry.path())
-                        .await
-                        .expect("May log file should be readable"),
-                );
-            }
-        }
-        logs
+    /// Tracing output a spawned server emitted, with ANSI styling stripped so
+    /// assertions can match log content. May keeps diagnostics in an in-memory
+    /// ring now; the captured stderr copy carries the same lines.
+    async fn server_logs(&self, server: &RunningUiServer) -> String {
+        strip_ansi_escapes(&server.log.contents().await)
     }
 
     /// Session in the local profile. Terminal-first contract tests use this so
@@ -1022,6 +1005,22 @@ impl ServerLog {
                 )
             })
     }
+}
+
+/// Removes ANSI CSI styling sequences (`ESC [ … final-byte`) from captured
+/// terminal output so log assertions can match plain text.
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(escape) = rest.find("\x1b[") {
+        out.push_str(&rest[..escape]);
+        let after = &rest[escape + 2..];
+        rest = after
+            .find(|c: char| ('@'..='~').contains(&c))
+            .map_or("", |end| &after[end + 1..]);
+    }
+    out.push_str(rest);
+    out
 }
 
 impl RunningUiServer {
@@ -2599,7 +2598,7 @@ async fn ui_server_error_logs_its_cause() {
         serde_json::json!({ "error": "Internal server error" })
     );
 
-    let logs = harness.file_logs().await;
+    let logs = harness.server_logs(&server).await;
     let logged = logs.lines().any(|line| {
         line.contains("ERROR")
             && line.contains("internal server error")
@@ -2960,7 +2959,7 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
         .await;
     }
 
-    let logs = harness.file_logs().await;
+    let logs = harness.server_logs(&server).await;
     let ready_lines = logs
         .lines()
         .filter(|line| line.contains("session tool environments ready"))
