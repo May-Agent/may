@@ -325,18 +325,9 @@ async fn run_save_full_config(
         config.remote_access.enabled = req.remote_access.enabled;
         config
             .remote_access
-            .cloudflared_binary
-            .clone_from(&req.remote_access.cloudflared_binary);
-        config.remote_access.tunnel_token = req
-            .remote_access
-            .tunnel_token
-            .clone()
-            .filter(|value| !value.trim().is_empty());
-        config.remote_access.public_url = req
-            .remote_access
-            .public_url
-            .clone()
-            .filter(|value| !value.trim().is_empty());
+            .tailscale_binary
+            .clone_from(&req.remote_access.tailscale_binary);
+        config.remote_access.https_port = req.remote_access.https_port;
         config.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
     });
 

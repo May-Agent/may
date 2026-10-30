@@ -14,11 +14,26 @@ cargo fmt                      # Format code
 cargo clippy                   # Run lints
 ```
 
+## The May daemon
+
+One resident daemon runs every agent loop, the task scheduler and search indexing. The TUI, one-shot runs (`may "<prompt>"`) and the web UI are its clients.
+
+```bash
+cargo run --bin may -- daemon            # run the daemon in the foreground
+cargo run --bin may -- daemon status     # pid, login service, search index backlog
+cargo run --bin may -- daemon stop
+cargo run --bin may -- daemon install    # launchd agent / systemd user unit
+```
+
+- It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs) and on TCP `127.0.0.1:8787` (`[daemon] port`); `[daemon] listen` adds more addresses, applied live.
+- `~/.may/daemon.lock` keeps it single-instance. Every client starts it on demand and replaces it when its build id differs from the client's, so after a rebuild the next `cargo run` restarts it.
+- Remote access is `tailscale serve` in front of the loopback listener (`[remote_access]`), never a public listener.
+
 ## Fast Web UI + Rust API Iteration Workflow
 
 Use this workflow when iterating on `may rest` + web UI together:
 
-1. Run Rust server in API-only mode (default, fastest):
+1. Run the daemon in the foreground in API-only mode (default, fastest); `may rest` is the same as `may daemon`:
 
 ```bash
 cargo run --bin may -- rest --port 8787
@@ -27,7 +42,7 @@ cargo run --bin may -- rest --port 8787
 - The `ui` Cargo feature is **off by default**, so `build.rs` skips `web-ui` production build/embed.
 - `may ui` fails fast without that feature; use `may rest` for API-only iteration.
 - This keeps Rust incremental compiles fast.
-- After completing any Rust code change, restart the Rust API server before validation.
+- After completing any Rust code change, restart the Rust API server before validation (`may daemon stop`, or just restart the foreground process).
 
 2. Run Vite dev server separately with API proxy:
 
@@ -86,12 +101,27 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 **`src/agent/`** - MayAgent wrapper
 - `may.rs`: Wraps `aither_agent::Agent` with May-specific system prompt (via Askama template at `templates/system.md`), permission handling, and session context
 
+**`src/daemon/`** - The resident daemon
+- `mod.rs`: `run_daemon`, single-instance lock, listeners, auto-index
+- `serve.rs`: hyper accept loops (unix socket, TCP) calling skyzen's `Router::go`
+- `lifecycle.rs`: `ensure_running` (auto-spawn, build-id replacement), service install/uninstall, stop
+
+**`src/client/`** - `DaemonClient`: REST over the unix socket, and the `/api/events` SSE parser
+
+**`src/ui_server/`** - The daemon's API
+- `chat/mod.rs`: the one turn runner (`run_agent_loop`); `chat/hub.rs` `TurnHub` fans a session's turn out as `session_turn` / `session_agent` events, with replay of the turn in progress for late subscribers
+- `chat/hosts.rs`: idle agents kept between turns (prompt cache stays warm), `/compact`, `/context`, `/btw`
+- `remote_access.rs`: Tailscale serve
+
+**`src/repo_search/`** - Code, session and issue search through the repo-search daemon (`search` command, `may-sessions` / `may-issues-*` collections, the SQLite `search_outbox`, auto-indexing of frequently used repos)
+
 **`src/session/`** - Session lifecycle
 - `manager.rs`: Creates/loads/lists sessions, manages current session
 - `store.rs`: Filesystem persistence to `~/.may/sessions/<uuid>/`
 - `history.rs`: Chat history with YAML frontmatter format (see format below)
 
-**`src/tui/`** - Terminal UI (ratatui-based)
+**`src/tui/`** - Terminal UI (ratatui-based), a daemon client
+- `remote.rs`: the `AgentWorker` whose turns run in the daemon; turns other clients start arrive as foreign turns
 - `app.rs`: State machine with modes: `Chat`, `SessionSelect`, `FilePicker`, `Help`, `ToolDetail`, `Welcome`, `ProviderConfig`
 - `ui/chat.rs`: `ChatStream` containing `ChatElement` variants (UserMessage, AssistantText, ToolCall, TodoBlock, Error, Loading, Thinking)
 - `event.rs`: Terminal event capture via crossterm
@@ -121,11 +151,13 @@ Do not treat `.txt` or `.md` files as the canonical session persistence layer.
 
 ### Event Loop Architecture
 
+Turns run in the daemon. A client sends with `POST /api/sessions/{id}/messages` (it returns at once) and follows the turn on `/api/events?topics=session_agent,session_turn&sessionId=…`; every attached client sees the same events.
+
 ```
-main loop:
+TUI main loop:
   1. Draw UI via terminal.draw()
   2. Check message queue for pending messages
-  3. Race: terminal events vs agent stream events
+  3. Race: terminal events vs agent events forwarded from the daemon's stream
   4. Dispatch to App::handle_event() or App::handle_agent_event()
 
 During streaming:

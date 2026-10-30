@@ -262,6 +262,13 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to listen on {tcp}"))?;
     let unix_listener = bind_unix(&paths.socket())?;
+    // Remote access forwards the tailnet to this listener.
+    state.remote_access_manager.set_local_addr(
+        tcp_listener
+            .local_addr()
+            .context("the daemon's TCP listener has no address")?,
+    );
+    crate::ui_server::sync_remote_access(&state).await?;
     tokio::spawn(serve::serve_tcp(tcp_listener, router.clone()));
     tokio::spawn(serve::serve_unix(unix_listener, router.clone()));
     tracing::info!(%tcp, socket = %paths.socket().display(), "May daemon listening");

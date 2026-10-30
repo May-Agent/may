@@ -1,11 +1,19 @@
+//! Remote access over Tailscale.
+//!
+//! When enabled, the daemon asks the local `tailscale` to serve its loopback
+//! TCP listener on the tailnet over HTTPS (`tailscale serve --bg`), so every
+//! device on the user's tailnet reaches the web UI and API at the machine's
+//! `MagicDNS` name. Tailscale holds the configuration itself; the manager only
+//! adds and removes the one handler it owns and checks that it is still in
+//! place.
+
 use std::collections::VecDeque;
-use std::process::Stdio;
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::str::FromStr;
-use tokio::io::{AsyncBufReadExt, BufReader};
-
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::RemoteAccessConfig;
@@ -17,19 +25,24 @@ use super::state::UiServerState;
 use super::types::{ApiHealth, RemoteAccessState, RemoteAccessStatusResponse};
 
 const MAX_REMOTE_ACCESS_LOGS: usize = 48;
+/// How often a running serve is checked against `tailscale serve status`.
+const SERVE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
+/// One `tailscale serve` handler: the tailnet HTTPS port forwarding to the
+/// daemon's loopback listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteAccessLaunchSpec {
-    cloudflared_binary: String,
-    tunnel_token: String,
-    public_url: String,
+struct ServeSpec {
+    tailscale_binary: String,
+    https_port: u16,
+    /// Proxy target, `http://127.0.0.1:<port>`.
+    target: String,
 }
 
 #[derive(Debug)]
 struct RemoteAccessRuntime {
     status: RemoteAccessStatusResponse,
-    launch_spec: Option<RemoteAccessLaunchSpec>,
-    last_stderr_line: Option<String>,
+    /// The handler this daemon added, while it is in place.
+    serving: Option<ServeSpec>,
 }
 
 impl Default for RemoteAccessRuntime {
@@ -42,8 +55,7 @@ impl Default for RemoteAccessRuntime {
                 last_error: None,
                 recent_logs: Vec::new(),
             },
-            launch_spec: None,
-            last_stderr_line: None,
+            serving: None,
         }
     }
 }
@@ -59,16 +71,12 @@ enum RemoteAccessCommand {
     },
 }
 
-enum RemoteAccessEvent {
-    Stdout(String),
-    Stderr(String),
-    ReaderError(String),
-}
-
 #[derive(Clone)]
 pub struct RemoteAccessManager {
     command_tx: mpsc::Sender<RemoteAccessCommand>,
     status_rx: watch::Receiver<RemoteAccessStatusResponse>,
+    /// The daemon's loopback TCP address, once it listens.
+    local_addr: watch::Sender<Option<SocketAddr>>,
 }
 
 impl std::fmt::Debug for RemoteAccessManager {
@@ -82,11 +90,24 @@ impl RemoteAccessManager {
     pub(crate) fn new(ui_event_bus: UiEventBus) -> Self {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (status_tx, status_rx) = watch::channel(RemoteAccessRuntime::default().status);
-        tokio::spawn(run_remote_access_actor(command_rx, status_tx, ui_event_bus));
+        let (local_addr, local_addr_rx) = watch::channel(None);
+        tokio::spawn(run_remote_access_actor(
+            command_rx,
+            status_tx,
+            local_addr_rx,
+            ui_event_bus,
+        ));
         Self {
             command_tx,
             status_rx,
+            local_addr,
         }
+    }
+
+    /// Records the TCP address the daemon serves on; remote access forwards
+    /// to its port on loopback.
+    pub(crate) fn set_local_addr(&self, addr: SocketAddr) {
+        self.local_addr.send_replace(Some(addr));
     }
 
     pub(crate) fn snapshot(&self) -> RemoteAccessStatusResponse {
@@ -188,252 +209,256 @@ async fn has_local_profile(db: &ChatDb) -> Result<bool, crate::db::ChatDbError> 
 async fn run_remote_access_actor(
     mut command_rx: mpsc::Receiver<RemoteAccessCommand>,
     status_tx: watch::Sender<RemoteAccessStatusResponse>,
+    local_addr: watch::Receiver<Option<SocketAddr>>,
     ui_event_bus: UiEventBus,
 ) {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut runtime = RemoteAccessRuntime::default();
-    let mut child: Option<tokio::process::Child> = None;
-    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    let mut check = tokio::time::interval(SERVE_CHECK_INTERVAL);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
-            Some(command) = command_rx.recv() => {
+            command = command_rx.recv() => {
+                let Some(command) = command else { break };
                 match command {
                     RemoteAccessCommand::Sync { config, has_local_profile, response } => {
-                        let result = sync_remote_access_runtime(
-                            &mut runtime,
-                            &mut child,
-                            &event_tx,
-                            &status_tx,
-                            &ui_event_bus,
-                            config,
-                            has_local_profile,
-                        ).await;
+                        let addr = *local_addr.borrow();
+                        let result = sync_runtime(&mut runtime, config, has_local_profile, addr).await;
+                        if let Err(error) = &result {
+                            runtime.status.state = RemoteAccessState::Error;
+                            runtime.status.last_error = Some(error.clone());
+                            push_log(&mut runtime.status.recent_logs, error);
+                        }
+                        publish(&runtime.status, &status_tx, &ui_event_bus);
                         let _ = response.send(result);
                     }
                     RemoteAccessCommand::Stop { response } => {
-                        let result = stop_remote_access_runtime(
-                            &mut runtime,
-                            &mut child,
-                            &status_tx,
-                            &ui_event_bus,
-                        ).await;
+                        let result = stop_runtime(&mut runtime).await;
+                        if result.is_ok() {
+                            runtime.status.last_error = None;
+                        }
+                        publish(&runtime.status, &status_tx, &ui_event_bus);
                         let _ = response.send(result);
                     }
                 }
             }
-            Some(event) = event_rx.recv() => {
-                match event {
-                    RemoteAccessEvent::Stdout(line) => {
-                        push_log(&mut runtime.status.recent_logs, &line);
-                    }
-                    RemoteAccessEvent::Stderr(line) => {
-                        runtime.last_stderr_line = Some(line.clone());
-                        push_log(&mut runtime.status.recent_logs, &line);
-                    }
-                    RemoteAccessEvent::ReaderError(message) => {
-                        runtime.status.last_error = Some(message.clone());
-                        push_log(&mut runtime.status.recent_logs, &message);
-                    }
-                }
-                publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
-            }
-            _ = tick.tick() => {
-                if let Some(process) = child.as_mut() {
-                    match process.try_wait() {
-                        Ok(Some(status)) => {
-                            let success = status.success();
-                            let code = status.code().unwrap_or(-1);
-                            runtime.launch_spec = None;
-                            child = None;
-                            runtime.status.state = if runtime.status.enabled {
-                                RemoteAccessState::Error
-                            } else {
-                                RemoteAccessState::Disabled
-                            };
-                            runtime.status.last_error = Some(if success {
-                                "cloudflared exited unexpectedly".to_string()
-                            } else {
-                                runtime.last_stderr_line.clone().unwrap_or_else(|| {
-                                    format!("cloudflared exited with code {code}")
-                                })
-                            });
-                            publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            runtime.launch_spec = None;
-                            child = None;
-                            runtime.status.state = RemoteAccessState::Error;
-                            runtime.status.last_error = Some(error.to_string());
-                            publish_remote_access_status(&runtime.status, &status_tx, &ui_event_bus);
-                        }
-                    }
+            _ = check.tick() => {
+                if let Some(spec) = runtime.serving.clone()
+                    && let Err(error) = check_serving(&spec).await
+                {
+                    runtime.serving = None;
+                    runtime.status.state = RemoteAccessState::Error;
+                    runtime.status.last_error = Some(error.clone());
+                    push_log(&mut runtime.status.recent_logs, &error);
+                    publish(&runtime.status, &status_tx, &ui_event_bus);
                 }
             }
-            else => break,
         }
     }
 }
 
-async fn sync_remote_access_runtime(
+async fn sync_runtime(
     runtime: &mut RemoteAccessRuntime,
-    child: &mut Option<tokio::process::Child>,
-    event_tx: &mpsc::UnboundedSender<RemoteAccessEvent>,
-    status_tx: &watch::Sender<RemoteAccessStatusResponse>,
-    ui_event_bus: &UiEventBus,
     config: RemoteAccessConfig,
     has_local_profile: bool,
+    local_addr: Option<SocketAddr>,
 ) -> Result<(), String> {
     runtime.status.enabled = config.enabled;
-    runtime.status.public_url.clone_from(&config.public_url);
-
     if !config.enabled {
-        stop_remote_access_runtime(runtime, child, status_tx, ui_event_bus).await?;
-        runtime.status.enabled = false;
-        runtime.status.state = RemoteAccessState::Disabled;
+        stop_runtime(runtime).await?;
         runtime.status.last_error = None;
-        runtime.last_stderr_line = None;
-        publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
         return Ok(());
     }
 
-    let launch_spec = validate_remote_access_config(&config, has_local_profile)?;
-    if child.is_some()
-        && runtime
-            .launch_spec
-            .as_ref()
-            .is_some_and(|current| current == &launch_spec)
-    {
+    let spec = serve_spec(&config, has_local_profile, local_addr)?;
+    if runtime.serving.as_ref() == Some(&spec) && check_serving(&spec).await.is_ok() {
         runtime.status.state = RemoteAccessState::Running;
         runtime.status.last_error = None;
-        runtime.last_stderr_line = None;
-        publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
         return Ok(());
     }
 
-    stop_remote_access_runtime(runtime, child, status_tx, ui_event_bus).await?;
+    stop_runtime(runtime).await?;
     runtime.status.enabled = true;
-    runtime.status.public_url = Some(launch_spec.public_url.clone());
     runtime.status.state = RemoteAccessState::Starting;
     runtime.status.last_error = None;
-    runtime.last_stderr_line = None;
-    publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
 
-    let mut process = tokio::process::Command::new(launch_spec.cloudflared_binary.as_str())
-        .arg("tunnel")
-        .arg("--no-autoupdate")
-        .arg("run")
-        .arg("--token")
-        .arg(launch_spec.tunnel_token.as_str())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to launch cloudflared: {error}"))?;
+    let https = https_flag(spec.https_port);
+    let output = tailscale(
+        &spec.tailscale_binary,
+        vec!["serve".into(), "--bg".into(), https, spec.target.clone()],
+    )
+    .await?;
+    push_log(&mut runtime.status.recent_logs, &output);
+    runtime.serving = Some(spec.clone());
 
-    if let Some(stdout) = process.stdout.take() {
-        spawn_remote_access_log_reader(stdout, event_tx.clone(), false);
-    }
-    if let Some(stderr) = process.stderr.take() {
-        spawn_remote_access_log_reader(stderr, event_tx.clone(), true);
-    }
-
+    let host = tailnet_host(&spec.tailscale_binary).await?;
+    let url = public_url(&host, spec.https_port);
     push_log(
         &mut runtime.status.recent_logs,
-        &format!("starting tunnel at {}", launch_spec.public_url),
+        &format!("serving {} at {url}", spec.target),
     );
+    runtime.status.public_url = Some(url);
     runtime.status.state = RemoteAccessState::Running;
-    runtime.status.last_error = None;
-    runtime.launch_spec = Some(launch_spec);
-    *child = Some(process);
-    publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
     Ok(())
 }
 
-async fn stop_remote_access_runtime(
-    runtime: &mut RemoteAccessRuntime,
-    child: &mut Option<tokio::process::Child>,
-    status_tx: &watch::Sender<RemoteAccessStatusResponse>,
-    ui_event_bus: &UiEventBus,
-) -> Result<(), String> {
-    if let Some(mut process) = child.take() {
-        if let Err(error) = process.start_kill() {
-            return Err(format!("failed to stop cloudflared: {error}"));
-        }
-        let _ = process.wait().await;
+async fn stop_runtime(runtime: &mut RemoteAccessRuntime) -> Result<(), String> {
+    if let Some(spec) = runtime.serving.take() {
+        let https = https_flag(spec.https_port);
+        let output = tailscale(
+            &spec.tailscale_binary,
+            vec!["serve".into(), https, "off".into()],
+        )
+        .await
+        .inspect_err(|_| runtime.serving = Some(spec.clone()))?;
+        push_log(&mut runtime.status.recent_logs, &output);
     }
-    runtime.launch_spec = None;
-    runtime.last_stderr_line = None;
-    runtime.status.state = if runtime.status.enabled {
-        RemoteAccessState::Error
-    } else {
-        RemoteAccessState::Disabled
-    };
-    publish_remote_access_status(&runtime.status, status_tx, ui_event_bus);
+    runtime.status.public_url = None;
+    runtime.status.state = RemoteAccessState::Disabled;
     Ok(())
 }
 
-fn validate_remote_access_config(
+fn serve_spec(
     config: &RemoteAccessConfig,
     has_local_profile: bool,
-) -> Result<RemoteAccessLaunchSpec, String> {
+    local_addr: Option<SocketAddr>,
+) -> Result<ServeSpec, String> {
     if has_local_profile && !config.allow_local_environment {
         return Err(
             "remote access is blocked while local-environment profiles exist; enable allow_local_environment to override"
                 .to_string(),
         );
     }
-
-    let token = config
-        .tunnel_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "remote access requires a Cloudflare tunnel token".to_string())?;
-    let public_url = config
-        .public_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "remote access requires a public HTTPS URL".to_string())?;
-    if !public_url.starts_with("https://") {
-        return Err("remote access public_url must start with https://".to_string());
-    }
-
-    Ok(RemoteAccessLaunchSpec {
-        cloudflared_binary: config.cloudflared_binary.trim().to_string(),
-        tunnel_token: token.to_string(),
-        public_url: public_url.to_string(),
+    let port = local_addr
+        .map(|addr| addr.port())
+        .ok_or_else(|| "the May daemon is not listening on TCP yet".to_string())?;
+    let binary = config.tailscale_binary.trim();
+    Ok(ServeSpec {
+        tailscale_binary: if binary.is_empty() {
+            crate::config::DEFAULT_TAILSCALE_BINARY.to_string()
+        } else {
+            binary.to_string()
+        },
+        https_port: config.https_port,
+        target: format!("http://127.0.0.1:{port}"),
     })
 }
 
-fn spawn_remote_access_log_reader(
-    reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    event_tx: mpsc::UnboundedSender<RemoteAccessEvent>,
-    stderr: bool,
-) {
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    let payload = if stderr {
-                        RemoteAccessEvent::Stderr(line)
-                    } else {
-                        RemoteAccessEvent::Stdout(line)
-                    };
-                    if event_tx.send(payload).is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = event_tx.send(RemoteAccessEvent::ReaderError(error.to_string()));
-                    break;
-                }
-            }
-        }
-    });
+fn https_flag(port: u16) -> String {
+    format!("--https={port}")
+}
+
+fn public_url(host: &str, https_port: u16) -> String {
+    if https_port == 443 {
+        format!("https://{host}")
+    } else {
+        format!("https://{host}:{https_port}")
+    }
+}
+
+/// Runs `tailscale <args>` and returns its trimmed output, or the reason it
+/// failed.
+async fn tailscale(binary: &str, args: Vec<String>) -> Result<String, String> {
+    let binary = binary.to_string();
+    let output = blocking::unblock({
+        let binary = binary.clone();
+        move || std::process::Command::new(binary).args(args).output()
+    })
+    .await
+    .map_err(|error| format!("failed to run {binary}: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!("{binary} exited with {}", output.status)
+    } else {
+        stderr
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct TailscaleStatus {
+    #[serde(rename = "BackendState", default)]
+    backend_state: String,
+    #[serde(rename = "Self")]
+    self_node: Option<TailscaleNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TailscaleNode {
+    #[serde(rename = "DNSName", default)]
+    dns_name: String,
+}
+
+/// The machine's `MagicDNS` name, from `tailscale status --json`.
+async fn tailnet_host(binary: &str) -> Result<String, String> {
+    let output = tailscale(binary, vec!["status".into(), "--json".into()]).await?;
+    parse_tailnet_host(&output)
+}
+
+fn parse_tailnet_host(output: &str) -> Result<String, String> {
+    let status: TailscaleStatus = serde_json::from_str(output)
+        .map_err(|error| format!("unexpected `tailscale status` output: {error}"))?;
+    if status.backend_state != "Running" {
+        return Err(format!(
+            "Tailscale is not connected (state: {})",
+            status.backend_state
+        ));
+    }
+    let host = status
+        .self_node
+        .map(|node| node.dns_name.trim_end_matches('.').to_string())
+        .unwrap_or_default();
+    if host.is_empty() {
+        return Err("this machine has no MagicDNS name; enable MagicDNS for the tailnet".into());
+    }
+    Ok(host)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ServeStatus {
+    #[serde(rename = "Web", default)]
+    web: std::collections::BTreeMap<String, ServeHost>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ServeHost {
+    #[serde(rename = "Handlers", default)]
+    handlers: std::collections::BTreeMap<String, ServeHandler>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ServeHandler {
+    #[serde(rename = "Proxy", default)]
+    proxy: String,
+}
+
+/// Checks that Tailscale still serves `spec`; someone may have reset it.
+async fn check_serving(spec: &ServeSpec) -> Result<(), String> {
+    let output = tailscale(
+        &spec.tailscale_binary,
+        vec!["serve".into(), "status".into(), "--json".into()],
+    )
+    .await?;
+    if serves(&output, spec) {
+        Ok(())
+    } else {
+        Err("the Tailscale serve configuration no longer forwards to May".to_string())
+    }
+}
+
+fn serves(status_json: &str, spec: &ServeSpec) -> bool {
+    let status: ServeStatus = serde_json::from_str(status_json).unwrap_or_default();
+    let suffix = format!(":{}", spec.https_port);
+    status.web.iter().any(|(host, served)| {
+        host.ends_with(&suffix)
+            && served
+                .handlers
+                .get("/")
+                .is_some_and(|handler| handler.proxy.trim_end_matches('/') == spec.target)
+    })
 }
 
 fn push_log(logs: &mut Vec<String>, line: &str) {
@@ -442,14 +467,16 @@ fn push_log(logs: &mut Vec<String>, line: &str) {
         return;
     }
     let mut deque = VecDeque::from(std::mem::take(logs));
-    deque.push_back(trimmed.to_string());
+    for line in trimmed.lines() {
+        deque.push_back(line.to_string());
+    }
     while deque.len() > MAX_REMOTE_ACCESS_LOGS {
         let _ = deque.pop_front();
     }
     *logs = deque.into_iter().collect();
 }
 
-fn publish_remote_access_status(
+fn publish(
     status: &RemoteAccessStatusResponse,
     status_tx: &watch::Sender<RemoteAccessStatusResponse>,
     ui_event_bus: &UiEventBus,
@@ -465,27 +492,65 @@ mod tests {
     fn base_config() -> RemoteAccessConfig {
         RemoteAccessConfig {
             enabled: true,
-            cloudflared_binary: "cloudflared".to_string(),
-            tunnel_token: Some("token".to_string()),
-            public_url: Some("https://may.example.com".to_string()),
-            allow_local_environment: false,
+            ..RemoteAccessConfig::default()
         }
     }
 
+    const ADDR: Option<SocketAddr> = Some(SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        8787,
+    ));
+
     #[test]
     fn rejects_local_environment_without_explicit_override() {
-        let error = validate_remote_access_config(&base_config(), true)
+        let error = serve_spec(&base_config(), true, ADDR)
             .expect_err("local profiles should be blocked by default");
         assert!(error.contains("allow_local_environment"));
     }
 
     #[test]
-    fn rejects_non_https_public_url() {
-        let mut config = base_config();
-        config.allow_local_environment = true;
-        config.public_url = Some("http://example.com".to_string());
-        let error =
-            validate_remote_access_config(&config, false).expect_err("http URL must be rejected");
-        assert!(error.contains("https://"));
+    fn forwards_to_the_daemon_port_on_loopback() {
+        let spec = serve_spec(
+            &base_config(),
+            false,
+            Some(SocketAddr::from(([0, 0, 0, 0], 9000))),
+        )
+        .expect("valid spec");
+        assert_eq!(spec.target, "http://127.0.0.1:9000");
+        assert_eq!(spec.https_port, 443);
+        assert_eq!(spec.tailscale_binary, "tailscale");
+    }
+
+    #[test]
+    fn needs_the_daemon_listening() {
+        let error = serve_spec(&base_config(), false, None).expect_err("no listener yet");
+        assert!(error.contains("not listening"));
+    }
+
+    #[test]
+    fn reads_the_magicdns_name() {
+        let output = r#"{"BackendState":"Running","Self":{"DNSName":"mac.tail1234.ts.net."}}"#;
+        assert_eq!(
+            parse_tailnet_host(output).as_deref(),
+            Ok("mac.tail1234.ts.net")
+        );
+        let stopped = r#"{"BackendState":"Stopped","Self":{"DNSName":""}}"#;
+        assert!(parse_tailnet_host(stopped).is_err());
+    }
+
+    #[test]
+    fn public_url_omits_the_default_port() {
+        assert_eq!(public_url("mac.ts.net", 443), "https://mac.ts.net");
+        assert_eq!(public_url("mac.ts.net", 8443), "https://mac.ts.net:8443");
+    }
+
+    #[test]
+    fn recognizes_its_handler_in_serve_status() {
+        let spec = serve_spec(&base_config(), false, ADDR).expect("valid spec");
+        let status = r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8787"}}}}}"#;
+        assert!(serves(status, &spec));
+        let other = r#"{"Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}"#;
+        assert!(!serves(other, &spec));
+        assert!(!serves("{}", &spec));
     }
 }

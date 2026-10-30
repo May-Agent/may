@@ -1365,9 +1365,8 @@ pub struct UiSystemProfileConfig {
 #[serde(rename_all = "camelCase")]
 pub struct UiRemoteAccessConfig {
     pub(crate) enabled: bool,
-    pub(crate) cloudflared_binary: String,
-    pub(crate) tunnel_token: Option<String>,
-    pub(crate) public_url: Option<String>,
+    pub(crate) tailscale_binary: String,
+    pub(crate) https_port: u16,
     pub(crate) allow_local_environment: bool,
 }
 
@@ -1375,9 +1374,8 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
     fn from(value: &RemoteAccessConfig) -> Self {
         Self {
             enabled: value.enabled,
-            cloudflared_binary: value.cloudflared_binary.clone(),
-            tunnel_token: value.tunnel_token.clone(),
-            public_url: value.public_url.clone(),
+            tailscale_binary: value.tailscale_binary.clone(),
+            https_port: value.https_port,
             allow_local_environment: value.allow_local_environment,
         }
     }
