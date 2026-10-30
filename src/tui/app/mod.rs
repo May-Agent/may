@@ -6,6 +6,7 @@ mod model_picker;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use async_channel::Receiver;
 use blocking::unblock;
@@ -38,6 +39,10 @@ pub const ERR_TOOL_RESPONSE_SEND: &str = include_str!("../../texts/tool_response
 
 /// Two Esc presses within this window open the rewind picker.
 const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Two clicks at the same spot within this window select the word under
+/// the cursor.
+const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long a transient status notice (e.g. "Copied selection") stays on
 /// screen before it clears itself.
@@ -168,7 +173,7 @@ pub struct App {
     /// Receiver for clipboard paste resolution (oneshot)
     pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, TuiError>>>,
     /// Pending paste results waiting to be handled
-    pub pending_paste_results: std::collections::VecDeque<Result<ClipboardPasteResult, TuiError>>,
+    pub pending_paste_results: std::collections::VecDeque<PendingPaste>,
     /// Pending attachment jobs (clipboard read / download)
     pub pending_attachment_jobs: usize,
     /// Cumulative token usage for current session
@@ -248,6 +253,9 @@ pub struct App {
     pub render_top_padding: usize,
     /// Row spans of collapsible tool calls in `rendered_plain_lines` space
     pub collapse_regions: Vec<super::ui::chat::ClickRegion>,
+    /// When and where the last plain click finished; a second press at the
+    /// same spot inside `DOUBLE_CLICK_WINDOW` selects the word under it.
+    last_click: Option<(Instant, SelectionPoint)>,
     /// Session background-job registry (set when the agent worker installs)
     pub job_registry: Option<aither_sandbox::JobRegistry>,
     /// In-flight subagent runs for the session (list/cancel handle)
@@ -280,6 +288,18 @@ pub struct App {
     /// The open question being answered when a blocking prompt took over the
     /// screen; it comes back, draft intact, when the prompt is done.
     parked_question: Option<AskUserState>,
+}
+
+/// A paste queued for the main loop: either text applied through the
+/// terminal-paste path or a result destined for an attachment.
+#[derive(Debug)]
+pub enum PendingPaste {
+    /// Text applied like a terminal paste: into the focused input when it
+    /// fits, or an attachment when it is large.
+    Input(String),
+    /// Clipboard read or large terminal paste that becomes an attachment
+    /// (image or pasted text), or a clipboard failure to report.
+    Attachment(Result<ClipboardPasteResult, TuiError>),
 }
 
 /// Live-output read state for a running terminal call bound to a
@@ -493,6 +513,7 @@ impl App {
             rendered_plain_lines: Vec::new(),
             render_top_padding: 0,
             collapse_regions: Vec::new(),
+            last_click: None,
             job_registry: None,
             subagent_runs: None,
             btw_llm: None,
@@ -1459,7 +1480,7 @@ impl App {
     }
 
     /// Get the currently active text input field, if any.
-    const fn active_text_input(&mut self) -> Option<ActiveTextInput<'_>> {
+    fn active_text_input(&mut self) -> Option<ActiveTextInput<'_>> {
         // Check mode-specific inputs first
         match &self.mode {
             AppMode::Chat => {
@@ -1552,13 +1573,25 @@ impl App {
                     }
                 }
             }
+            AppMode::AskUser(_) => {
+                if let AppMode::AskUser(state) = &mut self.mode
+                    && let Some(qs) = state.current_state_mut()
+                    && qs.custom_mode
+                {
+                    return Some(ActiveTextInput::Simple {
+                        input: &mut qs.custom_text,
+                        filter: PasteFilter::Any,
+                    });
+                }
+            }
             // FilePicker is handled separately (has its own insert_str method)
             _ => {}
         }
         None
     }
 
-    /// Handle bracketed paste event.
+    /// Route pasted text — a terminal paste event or a Ctrl+V clipboard
+    /// read — into the focused input, or an attachment when it is large.
     pub(super) fn handle_bracketed_paste(&mut self, text: String) -> Option<SendAction> {
         // Special handling for Chat mode: large pastes become attachments
         if matches!(self.mode, AppMode::Chat)
@@ -1642,6 +1675,13 @@ impl App {
                     return Ok(None);
                 }
                 KeyCode::Char('q') => return Ok(Some(SendAction::Quit)),
+                // Ctrl+V pastes the system clipboard through the same path
+                // as a terminal paste; bound globally so every text input
+                // can use it.
+                KeyCode::Char('v' | 'V') => {
+                    self.handle_paste();
+                    return Ok(None);
+                }
                 KeyCode::Char('n') => {
                     self.quit_pending = false;
                     self.status = None;
@@ -1675,7 +1715,7 @@ impl App {
         }
 
         match &self.mode {
-            AppMode::Chat => Ok(self.handle_chat_key(code, modifiers)),
+            AppMode::Chat => Ok(self.handle_chat_key(code)),
             AppMode::SessionSelect => Ok(super::reducer::navigation::handle_session_select_key(
                 self, code,
             )),
@@ -1896,13 +1936,7 @@ impl App {
     }
 
     /// Handle key in chat mode (unified input + navigation).
-    fn handle_chat_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<SendAction> {
-        // Handle Ctrl+V for paste
-        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('v') {
-            self.handle_paste();
-            return None;
-        }
-
+    fn handle_chat_key(&mut self, code: KeyCode) -> Option<SendAction> {
         match code {
             KeyCode::Enter => {
                 // Handle completion if active
@@ -2139,10 +2173,29 @@ impl App {
             MouseEventKind::ScrollUp => self.scroll_chat_up(SCROLL_STEP_LINES),
             MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
-                self.selection = self.mouse_to_selection_point(mouse).map(|p| TextSelection {
-                    anchor: p,
-                    cursor: p,
+                let point = self.mouse_to_selection_point(mouse);
+                let double_click = point.is_some_and(|p| {
+                    self.last_click.is_some_and(|(at, last)| {
+                        at.elapsed() <= DOUBLE_CLICK_WINDOW
+                            && last.line == p.line
+                            && last.column.abs_diff(p.column) <= 1
+                    })
                 });
+                if double_click {
+                    // Second click at the same spot: select the word under
+                    // the cursor instead of starting a point selection.
+                    self.last_click = None;
+                    self.selection = point.and_then(|p| {
+                        self.rendered_plain_lines
+                            .get(p.line)
+                            .and_then(|line| TextSelection::word_at(line, p))
+                    });
+                } else {
+                    self.selection = point.map(|p| TextSelection {
+                        anchor: p,
+                        cursor: p,
+                    });
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let next = self.mouse_to_selection_point(mouse);
@@ -2155,22 +2208,29 @@ impl App {
                     self.selection = None;
                     let point = ratatui::layout::Position::new(mouse.column, mouse.row);
                     // A press/release without a drag is a click: open the
-                    // zoom view when it lands on an image, else toggle the
-                    // collapsed state of the tool call under the cursor.
+                    // zoom view when it lands on an image; otherwise remember
+                    // it for double-click detection, then toggle the collapsed
+                    // state of the tool call under the cursor.
                     if let Some(region) = self.image_regions.iter().find(|r| r.rect.contains(point))
                     {
+                        self.last_click = None;
                         self.mode = AppMode::ImageView(ImageViewState {
                             key: region.key.clone(),
                             caption: region.caption.clone(),
                         });
-                    } else if let Some(point) = self.mouse_to_selection_point(mouse)
-                        && let Some(region) = self
-                            .collapse_regions
-                            .iter()
-                            .find(|r| point.line >= r.start && point.line < r.end)
-                    {
-                        let id = region.element_id.clone();
-                        self.chat.toggle_expanded(&id);
+                    } else {
+                        self.last_click = self
+                            .mouse_to_selection_point(mouse)
+                            .map(|point| (Instant::now(), point));
+                        if let Some(point) = self.mouse_to_selection_point(mouse)
+                            && let Some(region) = self
+                                .collapse_regions
+                                .iter()
+                                .find(|r| point.line >= r.start && point.line < r.end)
+                        {
+                            let id = region.element_id.clone();
+                            self.chat.toggle_expanded(&id);
+                        }
                     }
                 }
             }
@@ -2360,6 +2420,7 @@ impl App {
             "/quit" => Some(SendAction::Quit),
             "/compact" => Some(SendAction::Compact(None)),
             "/context" => Some(SendAction::ContextReport),
+            "/context dump" => Some(SendAction::ContextDump),
             "/mcp" => {
                 self.mode = AppMode::McpManage;
                 None
@@ -2394,13 +2455,31 @@ impl App {
         }
     }
 
-    /// Queue a paste result to be handled by the main loop.
+    /// Queue a paste result that becomes an attachment (a large terminal
+    /// paste already accepted for the input path).
     pub fn enqueue_paste_result(&mut self, result: Result<ClipboardPasteResult, TuiError>) {
-        self.pending_paste_results.push_back(result);
+        self.pending_paste_results
+            .push_back(PendingPaste::Attachment(result));
     }
 
-    /// Dequeue the next pending paste result.
-    pub fn dequeue_paste_result(&mut self) -> Option<Result<ClipboardPasteResult, TuiError>> {
+    /// Queue a Ctrl+V clipboard read. Clipboard text follows the
+    /// terminal-paste path — the focused input when it fits, an attachment
+    /// when large — while images always attach.
+    pub fn enqueue_clipboard_result(&mut self, result: Result<ClipboardPasteResult, TuiError>) {
+        let paste = match result {
+            Ok(result) => match result.into_parts() {
+                (None, Some(text)) => PendingPaste::Input(text),
+                (image, text) => {
+                    PendingPaste::Attachment(Ok(ClipboardPasteResult::from_parts(image, text)))
+                }
+            },
+            Err(error) => PendingPaste::Attachment(Err(error)),
+        };
+        self.pending_paste_results.push_back(paste);
+    }
+
+    /// Dequeue the next pending paste.
+    pub fn dequeue_pending_paste(&mut self) -> Option<PendingPaste> {
         self.pending_paste_results.pop_front()
     }
 
@@ -2409,7 +2488,28 @@ impl App {
         self.pending_attachment_jobs > 0 || !self.pending_paste_results.is_empty()
     }
 
-    /// Handle a completed paste result (clipboard or bracketed paste).
+    /// Apply a queued paste to the UI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TuiError`] when an attachment-bound paste fails to save or
+    /// the result carries a clipboard failure.
+    pub async fn handle_pending_paste(&mut self, paste: PendingPaste) -> AppResult<()> {
+        match paste {
+            PendingPaste::Input(text) => {
+                // Clear the "Reading clipboard..." notice: attachment-bound
+                // pastes replace it with their own status, text into an
+                // input leaves none behind.
+                self.status = None;
+                self.handle_bracketed_paste(text);
+                Ok(())
+            }
+            PendingPaste::Attachment(result) => self.handle_paste_result(result).await,
+        }
+    }
+
+    /// Handle a completed paste result bound for an attachment (clipboard
+    /// image or large pasted text).
     ///
     /// # Errors
     ///
@@ -2417,7 +2517,7 @@ impl App {
     /// when the corresponding attachment manager is not initialized, an error from
     /// saving the pasted content, or [`TuiError::EmptyPasteResult`] when the paste
     /// result contains neither image nor text.
-    pub async fn handle_paste_result(
+    async fn handle_paste_result(
         &mut self,
         result: Result<ClipboardPasteResult, TuiError>,
     ) -> AppResult<()> {
@@ -2471,7 +2571,8 @@ impl App {
         Err(TuiError::EmptyPasteResult)
     }
 
-    /// Handle paste (Ctrl+V) - check for image or text in clipboard.
+    /// Handle paste (Ctrl+V) - check for image or text in clipboard. The
+    /// resolved result is queued via [`App::enqueue_clipboard_result`].
     fn handle_paste(&mut self) {
         if self.clipboard_rx.is_some() {
             self.set_status("Clipboard paste already in progress");
@@ -2592,6 +2693,9 @@ impl App {
         let trimmed = content.trim();
         if trimmed == "/context" && attachments.is_empty() {
             return SendAction::ContextReport;
+        }
+        if trimmed == "/context dump" && attachments.is_empty() {
+            return SendAction::ContextDump;
         }
         if let Some(rest) = trimmed.strip_prefix("/compact")
             && attachments.is_empty()
@@ -2955,6 +3059,8 @@ pub enum SendAction {
     Compact(Option<String>),
     /// Measure and display context-window usage.
     ContextReport,
+    /// Dump the verbatim assembled context to the session's outputs dir.
+    ContextDump,
     /// MCP server management actions.
     McpAdd {
         /// Name of the MCP server to add.

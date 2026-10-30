@@ -438,6 +438,41 @@ impl TextSelection {
             (self.cursor, self.anchor)
         }
     }
+
+    /// Word-shaped selection covering `point.column` in `text`: the maximal
+    /// run of same-class characters around it. `None` when the column lands
+    /// past the line's content.
+    #[must_use]
+    pub fn word_at(text: &str, point: SelectionPoint) -> Option<Self> {
+        let chars: Vec<char> = text.chars().collect();
+        if point.column >= chars.len() {
+            return None;
+        }
+        let word = is_word_char(chars[point.column]);
+        let start = (0..point.column)
+            .rev()
+            .find(|&i| is_word_char(chars[i]) != word)
+            .map_or(0, |i| i + 1);
+        let end = (point.column + 1..chars.len())
+            .find(|&i| is_word_char(chars[i]) != word)
+            .unwrap_or(chars.len());
+        Some(Self {
+            anchor: SelectionPoint {
+                line: point.line,
+                column: start,
+            },
+            cursor: SelectionPoint {
+                line: point.line,
+                column: end,
+            },
+        })
+    }
+}
+
+/// Character class a double-click expands over: word characters form runs,
+/// everything else (whitespace, punctuation) forms runs of its own.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// A status-line notice. A notice with a deadline is transient and clears
@@ -735,7 +770,55 @@ pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'stat
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::StatusNotice;
+    use super::{SelectionPoint, StatusNotice, TextSelection};
+
+    fn point(line: usize, column: usize) -> SelectionPoint {
+        SelectionPoint { line, column }
+    }
+
+    #[test]
+    fn word_at_selects_the_word_run_around_the_column() {
+        // Inside the word — the whole word is covered, whichever char is hit.
+        for column in [2, 3, 4, 5] {
+            let sel = TextSelection::word_at("a word here", point(0, column))
+                .expect("column lands on 'word'");
+            assert_eq!(
+                sel.normalized(),
+                (point(0, 2), point(0, 6)),
+                "column {column}"
+            );
+        }
+
+        // Word run at line start and line end.
+        let sel = TextSelection::word_at("first second", point(0, 0)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 0), point(0, 5)));
+        let sel = TextSelection::word_at("first second", point(0, 11)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 6), point(0, 12)));
+    }
+
+    #[test]
+    fn word_at_treats_underscore_as_word_and_selects_punctuation_runs() {
+        let sel = TextSelection::word_at("foo_bar baz", point(0, 4)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 0), point(0, 7)));
+
+        // A click on punctuation selects the punctuation run.
+        let sel = TextSelection::word_at("a::b", point(0, 2)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 1), point(0, 3)));
+    }
+
+    #[test]
+    fn word_at_returns_none_past_the_content() {
+        assert!(TextSelection::word_at("", point(0, 0)).is_none());
+        assert!(TextSelection::word_at("abc", point(0, 3)).is_none());
+        assert!(TextSelection::word_at("abc", point(0, 10)).is_none());
+    }
+
+    #[test]
+    fn word_at_columns_are_char_indices_not_display_cells() {
+        // Wide chars take two cells but one char index each.
+        let sel = TextSelection::word_at("你好 world", point(0, 3)).unwrap();
+        assert_eq!(sel.normalized(), (point(0, 3), point(0, 8)));
+    }
 
     #[test]
     fn transient_notice_clears_after_expiry() {
