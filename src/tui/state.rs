@@ -51,6 +51,17 @@ pub enum AppMode {
     JobDetail(JobDetailState),
     /// `/btw` side-question overlay: answered outside conversation history
     Btw(BtwState),
+    /// Zoomed image overlay (click an inline image to open)
+    ImageView(ImageViewState),
+}
+
+/// State for the zoomed image overlay.
+#[derive(Debug, Clone)]
+pub struct ImageViewState {
+    /// Key of the decoded image in `App::image_cache`.
+    pub key: String,
+    /// Path or URL shown under the image.
+    pub caption: String,
 }
 
 impl AppMode {

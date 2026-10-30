@@ -26,7 +26,7 @@ pub struct StreamingMarkdown {
     /// Images found during parsing (alt, url)
     images: Vec<(String, String)>,
     /// Image positions: (url, `line_index`) for rendering at correct scroll position
-    image_positions: Vec<(String, usize)>,
+    image_positions: Vec<(String, usize, String)>,
     /// Current incomplete line (not yet parsed)
     pending_line: String,
     /// Whether we're currently appending inline spans into an open visual line
@@ -149,10 +149,11 @@ impl StreamingMarkdown {
         self.images.clone()
     }
 
-    /// Get image positions: (url, `line_index`) for each image.
-    /// The `line_index` is the position in the rendered output where the image should be displayed.
+    /// Get image positions: (url, `line_index`, caption) for each image.
+    /// The `line_index` is the position in the rendered output where the image should be displayed;
+    /// `caption` is the path/URL shown under the zoomed image.
     #[must_use]
-    pub fn image_positions(&self) -> &[(String, usize)] {
+    pub fn image_positions(&self) -> &[(String, usize, String)] {
         &self.image_positions
     }
 
@@ -173,14 +174,14 @@ impl StreamingMarkdown {
         self.inline_open = false;
     }
 
-    /// Record any images among `elements` in `images`/`image_positions`,
-    /// positioned at rendered line `line_index`.
-    fn record_inline_images(&mut self, elements: &[InlineElement], line_index: usize) {
+    /// Record any images among `elements` in `images` for fetching. Inline
+    /// images have no reserved rows and render as a link, so they are never
+    /// registered in `image_positions` for the overlay.
+    fn record_inline_images(&mut self, elements: &[InlineElement]) {
         for elem in elements {
             if let InlineElement::Image { alt, url } = elem {
                 tracing::debug!("InlineElement::Image detected: alt={}, url={}", alt, url);
                 self.images.push((alt.clone(), url.clone()));
-                self.image_positions.push((url.clone(), line_index));
             }
         }
     }
@@ -194,8 +195,7 @@ impl StreamingMarkdown {
     fn block_inline_spans(&mut self, content: &str, base_style: Style) -> Vec<Span<'static>> {
         self.inline_parser.reset();
         let elements = self.inline_parser.parse(content);
-        let line_index = self.rendered.len();
-        self.record_inline_images(&elements, line_index);
+        self.record_inline_images(&elements);
         elements
             .into_iter()
             .map(|elem| {
@@ -255,13 +255,7 @@ impl StreamingMarkdown {
                 ));
             }
             ParseEvent::InlineElements(elements) => {
-                // Track inline images at the current visual line.
-                let line_index = if self.inline_open {
-                    self.rendered.len().saturating_sub(1)
-                } else {
-                    self.rendered.len()
-                };
-                self.record_inline_images(&elements, line_index);
+                self.record_inline_images(&elements);
                 for elem in elements {
                     self.push_inline_span(render_inline_element(elem));
                 }
@@ -271,7 +265,8 @@ impl StreamingMarkdown {
                 tracing::debug!("ParseEvent::Image detected: alt={}, url={}", alt, url);
                 self.images.push((alt.clone(), url.clone()));
                 let line_index = self.rendered.len();
-                self.image_positions.push((url.clone(), line_index));
+                self.image_positions
+                    .push((url.clone(), line_index, url.clone()));
                 self.render_image_placeholder(&alt, &url);
             }
             ParseEvent::Heading { level, content } => {
@@ -407,26 +402,13 @@ impl StreamingMarkdown {
     /// When no image support: shows as a styled link format.
     fn render_image_placeholder(&mut self, alt: &str, url: &str) {
         if self.images_supported {
-            // Terminal supports images - reserve space for inline image
-            // Line 0: Header with alt text only (image renders below)
-            self.rendered.push(Line::from(vec![
-                Span::styled("🖼 ", Style::default()),
-                Span::styled(
-                    alt.to_string(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            // Lines 1 to IMAGE_HEIGHT-1: Reserved space for actual image rendering
-            // These will be overwritten by the image overlay in layout.rs
-            for _ in 1..IMAGE_HEIGHT {
+            // Reserved blank rows the image overlay paints over.
+            for _ in 0..IMAGE_HEIGHT {
                 self.rendered.push(Line::from(""));
             }
         } else {
             // No image support - render as a styled link (compact, no reserved space)
             self.rendered.push(Line::from(vec![
-                Span::styled("🖼 ", Style::default()),
                 Span::styled(
                     alt.to_string(),
                     Style::default()
@@ -473,7 +455,7 @@ fn render_inline_element(elem: streamdown_parser::InlineElement) -> Span<'static
             // Inline images always render as link-style placeholder
             // (actual images are rendered as overlays, not inline)
             Span::styled(
-                format!("🖼 {alt} ({url})"),
+                format!("{alt} ({url})"),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::UNDERLINED),
@@ -549,8 +531,8 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(text.contains("🖼"));
         assert!(text.contains("My Image"));
+        assert!(text.contains("https://example.com/test.png"));
     }
 
     #[test]
@@ -691,9 +673,8 @@ mod tests {
                 "https://example.com/diagram.png".to_string()
             )]
         );
-        assert_eq!(
-            md.image_positions(),
-            &[("https://example.com/diagram.png".to_string(), 0)]
-        );
+        // Inline images render as a link — no reserved rows, so no overlay
+        // position is registered.
+        assert_eq!(md.image_positions(), []);
     }
 }
