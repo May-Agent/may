@@ -28,8 +28,6 @@ pub mod copilot;
 pub mod db;
 /// Live decode-speed measurement for streamed model output.
 pub mod decode_meter;
-/// Embedding provider resolution for retrieval tools.
-pub mod embedding_provider;
 mod file_tracker;
 mod fs_utils;
 mod heel;

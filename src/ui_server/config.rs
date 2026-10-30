@@ -127,12 +127,6 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            embedding_model: config
-                .models
-                .embedding_model
-                .as_ref()
-                .map(ToString::to_string),
-            embedding_dimensions: config.models.embedding_dimensions,
             compaction_model: config
                 .models
                 .compaction_model
@@ -276,17 +270,6 @@ async fn run_save_full_config(
         config.models.balanced = parse_selector_list(&req.models.balanced);
         config.models.fast = parse_selector_list(&req.models.fast);
         config.models.image_generation = parse_selector_list(&req.models.image_generation);
-        config.models.embedding_model = req
-            .models
-            .embedding_model
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| {
-                value
-                    .parse::<ModelSelector>()
-                    .expect("ui config save must receive valid model selectors")
-            });
-        config.models.embedding_dimensions = req.models.embedding_dimensions;
         config.models.compaction_model = req
             .models
             .compaction_model

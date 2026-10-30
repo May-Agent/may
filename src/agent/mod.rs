@@ -22,7 +22,6 @@ mod provider;
 pub(crate) mod register_tool;
 pub mod runner;
 mod runtime_context;
-mod search_match;
 /// Session tool registration for the agent.
 pub mod session_tool;
 /// Authorization for `terminal` ssh-mode targets.

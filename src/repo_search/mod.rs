@@ -5,8 +5,9 @@
 //! request opens a fresh connection through the platform launcher, which
 //! starts or replaces the daemon when needed.
 
-mod backend;
+pub(crate) mod backend;
 mod code_search;
+pub mod indexer;
 
 pub use backend::{CollectionBackend, CollectionHit, RepoSearchCollections};
 pub use code_search::CodeSearchTool;

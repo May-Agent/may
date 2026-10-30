@@ -34,6 +34,23 @@ impl IssueStore for MayIssueStore {
         }
     }
 
+    fn search_key(&self) -> String {
+        let mut key = String::from("may:");
+        key.push_str(&self.repo_key);
+        key
+    }
+
+    async fn updated_since(
+        &self,
+        since: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<IssueSummary>, IssueError> {
+        Ok(self
+            .db
+            .issues_updated_since(&self.repo_key, since, limit)
+            .await?)
+    }
+
     async fn create(
         &self,
         title: &str,

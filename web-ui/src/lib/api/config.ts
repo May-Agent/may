@@ -55,8 +55,6 @@ export interface UiModelsConfig {
   balanced: string[];
   fast: string[];
   imageGeneration: string[];
-  embeddingModel?: string | null;
-  embeddingDimensions?: number | null;
   /** Model compaction runs on instead of the session model, as `provider::model`. */
   compactionModel?: string | null;
 }

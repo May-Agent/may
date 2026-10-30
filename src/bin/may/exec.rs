@@ -451,7 +451,6 @@ async fn build_exec_terminal_tool(
         context,
         may_config,
         resolved_provider.llm,
-        resolved_provider.search_embedder,
         &tool_dispatchers,
         environment,
     )
@@ -464,7 +463,6 @@ async fn build_exec_registry<LLM>(
     context: &ExecSessionContext,
     _may_config: &MayConfig,
     llm: LLM,
-    search_embedder: may_agent::embedding_provider::EmbeddingModelResolution,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
 ) -> Result<Arc<aither_sandbox::ToolRegistry>, ExecError>
@@ -492,7 +490,6 @@ where
             session_id: context.session_id.as_str().to_string(),
             may_dir: context.may_dir.clone(),
             sandbox_dir: context.sandbox_dir.clone(),
-            search_embedder,
             cwd: cwd.clone(),
             db: Some(context.db.clone()),
             ask_user: None,

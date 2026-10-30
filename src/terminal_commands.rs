@@ -19,9 +19,10 @@ use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagent
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
-use crate::embedding_provider::EmbeddingModelResolution;
 use crate::mcp::load_active_mcp_connections;
-use crate::repo_search::{CodeSearchTool, RepoSearch};
+use crate::issue::search::IssueSearch;
+use crate::repo_search::indexer::SearchIndexer;
+use crate::repo_search::{CodeSearchTool, RepoSearch, RepoSearchCollections};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
 
 /// Configuration for the `imagine` (image generation) IPC command.
@@ -50,8 +51,6 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub may_dir: PathBuf,
     /// Session sandbox working directory.
     pub sandbox_dir: PathBuf,
-    /// Resolved embedding model for semantic search.
-    pub search_embedder: EmbeddingModelResolution,
     /// Host directory the session works in; `search` defaults to its worktree.
     pub cwd: PathBuf,
     /// History database, which records the worktrees `search` is used in.
@@ -136,7 +135,12 @@ where
         SessionTool::new(
             config.may_dir.clone(),
             config.session_id.clone(),
-            config.search_embedder.clone(),
+            config.db.clone().map(|db| {
+                SearchIndexer::new(
+                    db,
+                    RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+                )
+            }),
         ),
     );
     register_tool_with_description(
@@ -148,14 +152,20 @@ where
             config.db.clone(),
         ),
     );
-    describe_tool(
-        &mut descriptions,
-        &IssueTool::new(config.issue_store.clone()),
-    );
-    builder.configure_role_tools(
-        IssueTool::new(config.issue_store.clone()),
-        SubagentIssueTool::new(config.issue_store),
-    );
+    let issue_search = config.db.clone().map(|db| {
+        IssueSearch::new(
+            db,
+            RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+        )
+    });
+    let mut issue_tool = IssueTool::new(config.issue_store.clone());
+    let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store);
+    if let Some(search) = issue_search {
+        issue_tool = issue_tool.with_search(search.clone());
+        subagent_issue_tool = subagent_issue_tool.with_search(search);
+    }
+    describe_tool(&mut descriptions, &issue_tool);
+    builder.configure_role_tools(issue_tool, subagent_issue_tool);
 
     if let Some(runtime) = config.ask_user {
         let ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
@@ -405,7 +415,6 @@ mod tests {
                 session_id: "session-1".to_string(),
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
-                search_embedder: EmbeddingModelResolution::Disabled,
                 cwd: PathBuf::from("."),
                 db: None,
                 ask_user: Some(ask_user_runtime),
@@ -462,7 +471,6 @@ mod tests {
                 session_id: "session-1".to_string(),
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
-                search_embedder: EmbeddingModelResolution::Disabled,
                 cwd: PathBuf::from("."),
                 db: None,
                 ask_user: None,
@@ -520,7 +528,6 @@ mod tests {
                 session_id: "session-1".to_string(),
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
-                search_embedder: EmbeddingModelResolution::Disabled,
                 cwd: PathBuf::from("."),
                 db: None,
                 ask_user: None,
@@ -566,7 +573,6 @@ mod tests {
                 session_id: "session-1".to_string(),
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
-                search_embedder: EmbeddingModelResolution::Disabled,
                 cwd: PathBuf::from("."),
                 db: None,
                 ask_user: Some(ask_user_runtime.clone()),
@@ -739,7 +745,6 @@ mod tests {
                 session_id: "main".to_string(),
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
-                search_embedder: EmbeddingModelResolution::Disabled,
                 cwd: PathBuf::from("."),
                 db: None,
                 ask_user: None,
@@ -812,7 +817,6 @@ mod tests {
                 session_id: "session-1".to_string(),
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
-                search_embedder: EmbeddingModelResolution::Disabled,
                 cwd: PathBuf::from("."),
                 db: None,
                 ask_user: None,
