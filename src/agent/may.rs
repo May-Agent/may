@@ -483,6 +483,8 @@ impl MayAgent {
                 may_dir: config.may_dir.clone(),
                 sandbox_dir: config.sandbox_dir.clone(),
                 search_embedder: config.search_embedder.clone(),
+                cwd: config.cwd.clone(),
+                db: Some(config.db.clone()),
                 ask_user: hook_runtime.clone(),
                 imagine: Some(imagine_config),
                 task_runtime: match &config.environment {

@@ -12,6 +12,7 @@ mod message;
 mod notification;
 mod open_questions;
 mod profile;
+mod repo_usage;
 mod run_lease;
 mod session;
 mod sql;
@@ -33,6 +34,7 @@ pub use common::{
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use message::MessageMeta;
+pub use repo_usage::RepoUsage;
 pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
 pub use run_lease::RunFence;
 
