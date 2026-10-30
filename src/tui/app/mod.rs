@@ -1426,6 +1426,18 @@ impl App {
         );
     }
 
+    /// Offer the open-question panel: it opens now when the chat is up,
+    /// parks behind whatever screen is open otherwise. Used when a new open
+    /// question arrives so the user sees it without the panel ripping a
+    /// different screen away.
+    pub fn offer_open_question(&mut self, state: AskUserState) {
+        if matches!(self.mode, AppMode::Chat) {
+            self.mode = AppMode::AskUser(state);
+        } else {
+            self.parked_question = Some(state);
+        }
+    }
+
     /// Bring back the parked open question once the screen is free.
     pub fn restore_parked_question(&mut self) {
         super::reducer::ask_user::restore_parked_question(
@@ -1657,6 +1669,7 @@ impl App {
                     self.handle_paste();
                     return Ok(None);
                 }
+                KeyCode::Left => return Ok(Some(SendAction::OpenQuestions)),
                 KeyCode::Char('n') => {
                     self.quit_pending = false;
                     self.status = None;
@@ -2368,6 +2381,7 @@ impl App {
             "/compact" => Some(SendAction::Compact(None)),
             "/context" => Some(SendAction::ContextReport),
             "/context dump" => Some(SendAction::ContextDump),
+            "/bug" => Some(SendAction::BugReport),
             "/mcp" => {
                 self.mode = AppMode::McpManage;
                 None
@@ -2643,6 +2657,9 @@ impl App {
         }
         if trimmed == "/context dump" && attachments.is_empty() {
             return SendAction::ContextDump;
+        }
+        if trimmed == "/bug" && attachments.is_empty() {
+            return SendAction::BugReport;
         }
         if let Some(rest) = trimmed.strip_prefix("/compact")
             && attachments.is_empty()
@@ -3004,6 +3021,8 @@ pub enum SendAction {
     SwitchModel(String),
     /// Compact the conversation history with optional focus hint.
     Compact(Option<String>),
+    /// Write the recent-log snapshot to `~/.may/bugs`.
+    BugReport,
     /// Measure and display context-window usage.
     ContextReport,
     /// Dump the verbatim assembled context to the session's outputs dir.
