@@ -437,7 +437,7 @@ where
                 Ok(result) => {
                     app.clipboard_rx = None;
                     app.pending_attachment_jobs = app.pending_attachment_jobs.saturating_sub(1);
-                    app.enqueue_paste_result(result);
+                    app.enqueue_clipboard_result(result);
                 }
                 Err(TryRecvError::Closed) => {
                     app.clipboard_rx = None;
@@ -450,8 +450,8 @@ where
             }
         }
 
-        while let Some(result) = app.dequeue_paste_result() {
-            app.handle_paste_result(result).await?;
+        while let Some(paste) = app.dequeue_pending_paste() {
+            app.handle_pending_paste(paste).await?;
         }
 
         if matches!(app.mode, may_agent::tui::AppMode::Chat)
