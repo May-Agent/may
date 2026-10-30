@@ -415,9 +415,12 @@ where
         }
 
         tracing::info!("=== LOOP START ===");
+        let mut phases = may_agent::tui::perf::LoopPhases::default();
 
         // First draw: updates content_height/view_height for accurate overflow calculation.
+        let draw_start = std::time::Instant::now();
         terminal.draw(|frame| ui::render(frame, app))?;
+        phases.draw = draw_start.elapsed();
         tracing::info!("after draw");
 
         // Check for model fetch results (non-blocking)
@@ -450,10 +453,13 @@ where
             }
         }
 
+        let step_start = std::time::Instant::now();
         while let Some(paste) = app.dequeue_pending_paste() {
             app.handle_pending_paste(paste).await?;
         }
+        phases.step("paste_results", step_start.elapsed());
 
+        let step_start = std::time::Instant::now();
         if matches!(app.mode, may_agent::tui::AppMode::Chat)
             && let Some(request) = runtime_deps.pending_permission(app).await?
         {
@@ -464,16 +470,19 @@ where
                 },
             );
         }
+        phases.step("pending_permission", step_start.elapsed());
 
         app.restore_parked_question();
 
         // Open questions are listed in the status bar and opened with
         // `/questions`; they never take over the input on their own.
+        let step_start = std::time::Instant::now();
         app.open_question_count = runtime_deps.open_questions(app).await?.len();
 
         runtime_deps
             .listen_for_agent_messages(app, &agent_listeners, events.sender())
             .await?;
+        phases.step("questions+listeners", step_start.elapsed());
 
         // A saved change to the cache lifetime or compaction model replaces
         // the idle worker with one built from the saved config.
@@ -502,6 +511,7 @@ where
         if agent_handle.is_none()
             && let Some(w) = worker.as_ref()
         {
+            let step_start = std::time::Instant::now();
             match runtime_deps.begin_queued_run(app).await? {
                 QueuedRunStart::Started(msg) => {
                     busy_elsewhere_notified = false;
@@ -523,6 +533,7 @@ where
                 }
                 QueuedRunStart::Nothing => busy_elsewhere_notified = false,
             }
+            phases.step("begin_queued_run", step_start.elapsed());
         }
 
         // DIAGNOSTIC: Check channel states before entering select
@@ -612,6 +623,14 @@ where
         let Some(event) = event else {
             tracing::warn!("All channels closed, exiting");
             break;
+        };
+        let event_kind = match &event {
+            Event::Terminal(e) => e.kind(),
+            Event::AskUser(_) => "ask_user",
+            Event::Workspace(_) => "workspace",
+            Event::WorkerBuilt(_) => "worker_built",
+            Event::Agent(_) => "agent",
+            Event::Context(_) => "context",
         };
 
         match event {
@@ -739,7 +758,6 @@ where
                             .push_error(&format!("Context report failed: {err}"));
                     }
                     Some(TuiEvent::ContextDump(Ok(dump))) => {
-                        let block_count = dump.blocks.len();
                         let message_count = dump.messages.len();
                         let text = dump.render();
                         let dir = app.session_manager.current().map(|session| {
@@ -756,7 +774,7 @@ where
                                 match write {
                                     Ok(()) => {
                                         app.chat.push_notice(&format!(
-                                            "Context dump written to {} — {block_count} blocks, {message_count} messages",
+                                            "Context dump written to {} — {message_count} messages",
                                             path.display(),
                                         ));
                                         app.scroll = usize::MAX;
@@ -835,6 +853,7 @@ where
                 }
 
                 // Handle normal terminal events
+                let ev_start = std::time::Instant::now();
                 match app.handle_event(*terminal_event)? {
                     Some(SendAction::Quit) => break,
                     Some(SendAction::NewSession) => {
@@ -1287,8 +1306,20 @@ where
                     }
                     None => {}
                 }
+                phases.event = ev_start.elapsed();
             }
         }
+
+        // Report a stall whenever one busy iteration exceeded the jank
+        // threshold; the log carries the render breakdown for repro.
+        may_agent::tui::perf::report(
+            &phases,
+            &app.frame_stats,
+            app.scroll,
+            app.rendered_plain_lines.len(),
+            events.backlog(),
+            event_kind,
+        );
     }
 
     Ok(())

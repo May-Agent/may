@@ -849,10 +849,10 @@ impl MayAgent {
         ))
     }
 
-    /// Verbatim context composition for `/context dump`.
+    /// Verbatim request transcript for `/context dump`.
     ///
     /// Same measurement discipline as [`Self::context_report`]: runtime
-    /// blocks are reconciled first, so the dump describes the state the
+    /// blocks are reconciled first, so the transcript shows the state the
     /// next request would be assembled from.
     ///
     /// # Errors
@@ -866,7 +866,6 @@ impl MayAgent {
             &self.model_id,
             &self.provider_id,
             self.session_id.as_str(),
-            self.inner.context(),
             &snapshot,
         ))
     }
