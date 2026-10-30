@@ -62,6 +62,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/ssh", "Manage preconfigured SSH servers"),
     ("/skill", "Manage installed skills"),
     ("/config", "Open configuration"),
+    (
+        "/bug",
+        "Save a bug snapshot (recent logs + session info) to ~/.may/bugs",
+    ),
     ("/quit", "Exit May"),
 ];
 

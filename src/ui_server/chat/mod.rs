@@ -671,6 +671,50 @@ fn active_session_conflict_error() -> skyzen::Error {
         .set_status(skyzen::StatusCode::CONFLICT)
 }
 
+/// Map a refused session-open lock onto the REST surface: contention is a
+/// conflict, filesystem failure is internal.
+fn session_open_refusal(error: crate::session::SessionOpenLockError) -> skyzen::Error {
+    match error {
+        crate::session::SessionOpenLockError::Locked { .. } => {
+            skyzen::Error::msg(error.to_string()).set_status(skyzen::StatusCode::CONFLICT)
+        }
+        crate::session::SessionOpenLockError::Io(_) => internal_error(error),
+    }
+}
+
+/// Bind `session_id` to this server when nothing else owns its open lock.
+/// Sessions bind lazily here: once a session is used for chat or runs the
+/// lock is cached for the server's lifetime.
+pub(super) async fn ensure_session_open(state: &UiServerState, session_id: &str) -> SkyResult<()> {
+    {
+        let locks = state.session_open_locks.lock().await;
+        if locks.contains_key(session_id) {
+            return Ok(());
+        }
+    }
+    let profile_id = state
+        .db()
+        .get_session(session_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            skyzen::Error::msg(["session ", session_id, " not found"].concat())
+                .set_status(skyzen::StatusCode::NOT_FOUND)
+        })?
+        .profile_id;
+    let paths =
+        crate::session::SessionStore::new(crate::session::MayHomePaths::new(state.may_dir.clone()))
+            .session_paths(session_id, profile_id.as_deref());
+    let lock = crate::session::SessionOpenLock::acquire(session_id, paths.root())
+        .map_err(session_open_refusal)?;
+    state
+        .session_open_locks
+        .lock()
+        .await
+        .insert(session_id.to_string(), lock);
+    Ok(())
+}
+
 fn persisted_attachments(
     attachments: Vec<super::types::ApiAttachment>,
 ) -> Vec<PersistedAttachment> {
@@ -754,6 +798,10 @@ async fn clear_terminal_runtime_state(
 pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
+        if let Err(error) = ensure_session_open(&state, &session_id).await {
+            tracing::warn!(session_id = %session_id, error = %error, "follow-up dispatch skipped: session is open elsewhere");
+            return;
+        }
         let guard = match state.runtime_service.runs().acquire(&session_id).await {
             Ok(guard) => guard,
             // The run holding the session looks for pending work again when
@@ -1014,6 +1062,7 @@ pub(super) async fn enqueue_chat(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<UiServerState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
+    ensure_session_open(&state, &req.session_id).await?;
     let pending = pending_user_message_from_request(req.clone());
     let runtime = state
         .runtime_service
@@ -1104,6 +1153,8 @@ pub(super) async fn chat_stream(
     if runtime.is_active() {
         return Err(active_session_conflict_error());
     }
+
+    ensure_session_open(&state, &req.session_id).await?;
 
     let run_guard = state
         .runtime_service

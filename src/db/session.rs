@@ -824,18 +824,13 @@ impl ChatDb {
         self.load_session_runtime_summary(session_id).await
     }
 
-    /// Persist or clear a waiting ask-user request via direct SQL.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    pub async fn set_waiting_ask_user(
+    /// Delete the pending ask-user rows of `session_id` marked `blocking`:
+    /// the request rows and their question/option children.
+    pub(super) async fn delete_blocking_ask_user_in_tx(
         &self,
+        tx: &mut skyzen_services::DbTransaction,
         session_id: &str,
-        request: Option<PersistedAskUserRequest>,
-    ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        let now = jiff::Timestamp::now().to_string();
-        let mut tx = self.db.begin().await?;
-        // Clear existing
+    ) -> Result<(), ChatDbError> {
         query!(
             tx,
             "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 1)",
@@ -857,46 +852,110 @@ impl ChatDb {
         )
         .execute()
         .await?;
-        // Insert new if present
-        if let Some(request) = &request {
+        Ok(())
+    }
+
+    /// Insert a pending ask-user request row with its questions and options.
+    /// `blocking` marks whether a run waits on the prompt (`1`) or the
+    /// question stays open without a waiter (`0`).
+    pub(super) async fn insert_pending_ask_user_in_tx(
+        &self,
+        tx: &mut skyzen_services::DbTransaction,
+        session_id: &str,
+        request: &PersistedAskUserRequest,
+        blocking: bool,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            tx,
+            "INSERT INTO session_pending_ask_user_requests_v2 (request_id, session_id, created_at, blocking) VALUES (?, ?, ?, ?)",
+            request.id.as_str(),
+            session_id,
+            now.as_str(),
+            blocking
+        )
+        .execute()
+        .await?;
+        for (question_ordinal, question) in request.questions.iter().enumerate() {
+            let question_ordinal = i64::try_from(question_ordinal)
+                .map_err(|error| overflow_error("ask-user question ordinal", &error))?;
             query!(
                 tx,
-                "INSERT INTO session_pending_ask_user_requests_v2 (request_id, session_id, created_at, blocking) VALUES (?, ?, ?, 1)",
+                "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select) VALUES (?, ?, ?, ?, ?)",
                 request.id.as_str(),
-                session_id,
-                now.as_str()
+                question_ordinal,
+                question.section.as_str(),
+                question.question.as_str(),
+                question.multi_select
             )
             .execute()
             .await?;
-            for (question_ordinal, question) in request.questions.iter().enumerate() {
-                let question_ordinal = i64::try_from(question_ordinal)
-                    .map_err(|error| overflow_error("ask-user question ordinal", &error))?;
+            for (option_ordinal, option) in question.option.iter().enumerate() {
                 query!(
                     tx,
-                    "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO session_pending_ask_user_question_options_v2 (request_id, question_ordinal, option_ordinal, value) VALUES (?, ?, ?, ?)",
                     request.id.as_str(),
                     question_ordinal,
-                    question.section.as_str(),
-                    question.question.as_str(),
-                    question.multi_select
+                    i64::try_from(option_ordinal).map_err(|error| overflow_error("ask-user option ordinal", &error))?,
+                    option.as_str()
                 )
                 .execute()
                 .await?;
-                for (option_ordinal, option) in question.option.iter().enumerate() {
-                    query!(
-                        tx,
-                        "INSERT INTO session_pending_ask_user_question_options_v2 (request_id, question_ordinal, option_ordinal, value) VALUES (?, ?, ?, ?)",
-                        request.id.as_str(),
-                        question_ordinal,
-                        i64::try_from(option_ordinal).map_err(|error| overflow_error("ask-user option ordinal", &error))?,
-                        option.as_str()
-                    )
-                    .execute()
-                    .await?;
-                }
             }
         }
+        Ok(())
+    }
+
+    /// Persist or clear a waiting ask-user request via direct SQL.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or malformed rows.
+    pub async fn set_waiting_ask_user(
+        &self,
+        session_id: &str,
+        request: Option<PersistedAskUserRequest>,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        self.delete_blocking_ask_user_in_tx(&mut tx, session_id)
+            .await?;
+        if let Some(request) = &request {
+            self.insert_pending_ask_user_in_tx(&mut tx, session_id, request, true)
+                .await?;
+        }
         tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
+    /// Register a blocking ask-user request atomically: the session's
+    /// previous blocking rows are replaced by `request` and the request
+    /// joins the message history, all in one transaction. Retried a bounded
+    /// number of times on `SQLITE_BUSY` contention.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn register_ask_user_request(
+        &self,
+        session_id: &str,
+        request: &PersistedAskUserRequest,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        super::common::with_busy_retry(|| async {
+            let mut tx = self.db.begin().await?;
+            self.delete_blocking_ask_user_in_tx(&mut tx, session_id)
+                .await?;
+            self.insert_pending_ask_user_in_tx(&mut tx, session_id, request, true)
+                .await?;
+            self.append_ask_user_request_message_in_tx(
+                &mut tx,
+                session_id,
+                request.id.as_str(),
+                &super::open_questions::history_questions(&request.questions),
+                None,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .await?;
         self.load_session_runtime_summary(session_id).await
     }
 
@@ -1226,5 +1285,70 @@ impl ChatDb {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::super::{ChatDb, query};
+    use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
+
+    fn ask_user_request(id: &str) -> PersistedAskUserRequest {
+        PersistedAskUserRequest {
+            id: id.to_string(),
+            questions: vec![PersistedAskUserQuestion {
+                section: "Section".to_string(),
+                question: "Pick one".to_string(),
+                option: vec!["a".to_string(), "b".to_string()],
+                multi_select: false,
+            }],
+        }
+    }
+
+    /// A write lock held on one pool delays registration on a second pool
+    /// only until the holder commits; the whole registration then lands.
+    #[tokio::test]
+    async fn register_ask_user_request_completes_after_held_write_commits() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let holder = ChatDb::open(&db_path).await.expect("holder db should open");
+        holder
+            .create_session("session-a", Some("Session"), Some("model"))
+            .await
+            .expect("session should be created");
+        // Open the second pool first: migrations at open time take a write
+        // lock and would queue behind the held transaction.
+        let waiter = ChatDb::open(&db_path).await.expect("waiter db should open");
+
+        // A write statement on an open transaction takes the write lock.
+        let mut tx = holder.db.begin().await.expect("tx should begin");
+        query!(
+            tx,
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            "held",
+            "session-a"
+        )
+        .execute()
+        .await
+        .expect("held write should succeed");
+
+        let task = tokio::spawn(async move {
+            waiter
+                .register_ask_user_request("session-a", &ask_user_request("req-1"))
+                .await
+        });
+        async_io::Timer::after(std::time::Duration::from_millis(300)).await;
+        tx.commit().await.expect("held write should commit");
+
+        let summary = task
+            .await
+            .expect("registration task should finish")
+            .expect("registration should succeed");
+        let waiting = summary
+            .waiting_ask_user
+            .expect("the request should be waiting");
+        assert_eq!(waiting.id, "req-1");
     }
 }
