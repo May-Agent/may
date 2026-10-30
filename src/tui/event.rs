@@ -108,6 +108,38 @@ pub enum AppEvent {
     },
 }
 
+impl AppEvent {
+    /// Stable name for logs and jank reports.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Key(..) => "key",
+            Self::Tick => "tick",
+            Self::Resize(..) => "resize",
+            Self::Paste(_) => "paste",
+            Self::Mouse(_) => "mouse",
+            Self::SessionsLoaded(_) => "sessions_loaded",
+            Self::SessionDeleted { .. } => "session_deleted",
+            Self::SkillsLoaded(_) => "skills_loaded",
+            Self::SkillInstalled(_) => "skill_installed",
+            Self::SkillDeleted(_) => "skill_deleted",
+            Self::ProfilesLoaded(_) => "profiles_loaded",
+            Self::ProfileSessionsLoaded(_) => "profile_sessions_loaded",
+            Self::ConfigSaved(_) => "config_saved",
+            Self::ImageDecoded { .. } => "image_decoded",
+            Self::JobsLoaded(_) => "jobs_loaded",
+            Self::JobKilled { .. } => "job_killed",
+            Self::JobDetailLoaded { .. } => "job_detail_loaded",
+            Self::TerminalOutputs(_) => "terminal_outputs",
+            Self::BtwDelta(_) => "btw_delta",
+            Self::BtwFinished => "btw_finished",
+            Self::BtwFailed(_) => "btw_failed",
+            Self::BashFinished(_) => "bash_finished",
+            Self::SecretStored { .. } => "secret_stored",
+        }
+    }
+}
+
 /// Masked result of a bash-mode command, ready for display and the agent.
 #[derive(Debug)]
 pub struct BashOutcome {
@@ -201,6 +233,13 @@ impl EventHandler {
     /// Get the next event.
     pub async fn next(&mut self) -> Option<AppEvent> {
         self.rx.recv().await.ok()
+    }
+
+    /// Events queued behind the receiver — a growing backlog during a
+    /// scroll burst means the loop cannot keep up with input.
+    #[must_use]
+    pub fn backlog(&self) -> usize {
+        self.rx.len()
     }
 }
 
