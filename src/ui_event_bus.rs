@@ -31,6 +31,10 @@ pub enum UiEventTopic {
     RemoteAccess = 1 << 9,
     /// Browser process lifecycle changed.
     BrowserLifecycle = 1 << 10,
+    /// Live chat events of a session's turn, as the web UI renders them.
+    SessionTurn = 1 << 11,
+    /// Live agent events of a session's turn, as the TUI renders them.
+    SessionAgent = 1 << 12,
 }
 
 impl UiEventTopic {
@@ -53,6 +57,8 @@ impl UiEventTopic {
             Self::ProfileSessions => "profile_sessions",
             Self::RemoteAccess => "remote_access",
             Self::BrowserLifecycle => "browser_lifecycle",
+            Self::SessionTurn => "session_turn",
+            Self::SessionAgent => "session_agent",
         }
     }
 }
@@ -73,6 +79,8 @@ impl FromStr for UiEventTopic {
             "profile_sessions" => Ok(Self::ProfileSessions),
             "remote_access" => Ok(Self::RemoteAccess),
             "browser_lifecycle" => Ok(Self::BrowserLifecycle),
+            "session_turn" => Ok(Self::SessionTurn),
+            "session_agent" => Ok(Self::SessionAgent),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -107,6 +115,10 @@ impl UiEventTopics {
     pub const REMOTE_ACCESS: Self = Self(UiEventTopic::RemoteAccess.bit());
     /// `browser_lifecycle` topic.
     pub const BROWSER_LIFECYCLE: Self = Self(UiEventTopic::BrowserLifecycle.bit());
+    /// `session_turn` topic.
+    pub const SESSION_TURN: Self = Self(UiEventTopic::SessionTurn.bit());
+    /// `session_agent` topic.
+    pub const SESSION_AGENT: Self = Self(UiEventTopic::SessionAgent.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0
@@ -119,7 +131,8 @@ impl UiEventTopics {
             | Self::SESSION_RUNTIMES.0
             | Self::PROFILE_SESSIONS.0
             | Self::REMOTE_ACCESS.0
-            | Self::BROWSER_LIFECYCLE.0,
+            | Self::BROWSER_LIFECYCLE.0
+            | Self::SESSION_TURN.0,
     );
 
     /// Whether no topics are set.

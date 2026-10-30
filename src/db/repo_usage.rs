@@ -62,7 +62,9 @@ impl ChatDb {
     pub async fn repo_usage_since(&self, since: i64) -> Result<Vec<RepoUsage>, ChatDbError> {
         Ok(self
             .db
-            .query("SELECT worktree, last_used_at, use_count FROM repo_usage WHERE last_used_at >= ?")
+            .query(
+                "SELECT worktree, last_used_at, use_count FROM repo_usage WHERE last_used_at >= ?",
+            )
             .bind(since)
             .fetch_all::<RepoUsage>()
             .await?)

@@ -126,10 +126,7 @@ impl RepoSearch {
         let prepared = self.prepared().await?;
         let mut launcher = PlatformLauncher::user(prepared.program.clone())?;
         let report = launcher.prepare().await;
-        Ok(
-            launcher::connect(&mut launcher, &prepared.hello, report, log_note)
-                .await?,
-        )
+        Ok(launcher::connect(&mut launcher, &prepared.hello, report, log_note).await?)
     }
 }
 

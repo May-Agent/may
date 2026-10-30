@@ -30,4 +30,8 @@ pub struct Model {
     /// Per-session reasoning/thinking depth override ("low" | "medium" | "high").
     /// NULL means "no override; provider/model default applies".
     pub reasoning_effort: Option<String>,
+    /// Host directory the session works in, when a client named one (the
+    /// TUI's launch directory); `None` uses the daemon's.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
