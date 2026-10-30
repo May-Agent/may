@@ -1069,12 +1069,28 @@ pub struct MayConfig {
     /// Remote access settings.
     #[serde(default)]
     pub remote_access: RemoteAccessConfig,
+    /// Daemon listener settings.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<ModelSelector>,
     /// Preconfigured SSH targets available to the agent.
     #[serde(default)]
     pub ssh_servers: Vec<SshServerConfig>,
+}
+
+/// Where the May daemon listens besides its unix socket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DaemonConfig {
+    /// TCP port on `127.0.0.1` for the web UI and API; `None` uses 8787.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Further TCP addresses to serve on, such as a tailnet address
+    /// (`"100.101.102.103:8787"`). Requests on these are accepted from any
+    /// peer that can reach the address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen: Vec<std::net::SocketAddr>,
 }
 
 const fn default_max_iterations() -> usize {
@@ -1092,6 +1108,7 @@ impl Default for MayConfig {
             appearance: Appearance::default(),
             browser: BrowserConfig::default(),
             remote_access: RemoteAccessConfig::default(),
+            daemon: DaemonConfig::default(),
             last_model: None,
             ssh_servers: Vec::new(),
         }

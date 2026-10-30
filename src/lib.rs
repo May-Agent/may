@@ -17,6 +17,8 @@ pub mod bundle;
 pub mod cache_lifetime;
 /// `ChatGPT` subscription OAuth flow.
 pub mod chatgpt;
+/// Client of the May daemon over its unix socket.
+pub mod client;
 /// Configuration loading and types.
 pub mod command_output;
 pub mod config;
@@ -24,6 +26,8 @@ pub mod config;
 pub mod container;
 /// GitHub Copilot OAuth flow.
 pub mod copilot;
+/// The resident daemon that runs every agent loop and serves the UIs.
+pub mod daemon;
 /// SQLite persistence for sessions, messages, and app state.
 pub mod db;
 /// Live decode-speed measurement for streamed model output.

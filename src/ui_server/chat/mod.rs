@@ -1857,6 +1857,8 @@ fn run_agent_loop<'a>(
             schedule_profile_memory_processing(state, profile_id.as_deref()).await;
             title_generation::enqueue(state, &session_id, req.content.clone(), full_text.clone());
             enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
+            // The turn's messages are in the search outbox now.
+            let _ = state.search_index_wake_tx.try_send(());
 
             return Ok(AgentRunResult {
                 assistant_id,
