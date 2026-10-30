@@ -31,6 +31,15 @@ async fn handle(
 ) -> Result<hyper::Response<ResponseBody>, Infallible> {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
+    // `tailscale serve` proxies tailnet requests over loopback and names the
+    // tailnet user who sent them.
+    if let Some(login) = request
+        .headers()
+        .get("tailscale-user-login")
+        .and_then(|value| value.to_str().ok())
+    {
+        tracing::info!(%login, %method, %path, "tailnet request");
+    }
     let mut request: skyzen::Request = request.map(|body| {
         skyzen::Body::from_stream(
             BodyDataStream::new(body).map_err(|error| BodyError::Other(Box::new(error))),

@@ -93,9 +93,8 @@ export interface UiBrowserConfig {
 
 export interface UiRemoteAccessConfig {
   enabled: boolean;
-  cloudflaredBinary: string;
-  tunnelToken?: string | null;
-  publicUrl?: string | null;
+  tailscaleBinary: string;
+  httpsPort: number;
   allowLocalEnvironment: boolean;
 }
 
