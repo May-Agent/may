@@ -3630,3 +3630,92 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
 
     server.stop().await;
 }
+
+#[tokio::test]
+#[serial]
+async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn(
+        "hello from the daemon".into(),
+    ))
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    // A port of its own, so the daemon this run starts never meets another.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port should be found")
+        .port();
+    let config_path = harness.home_path().join(".may/config.toml");
+    let mut config: toml::Table = toml::from_str(
+        &tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("test config should be readable"),
+    )
+    .expect("test config should parse");
+    let mut daemon = toml::Table::new();
+    daemon.insert("port".into(), toml::Value::Integer(i64::from(port)));
+    config.insert("daemon".into(), toml::Value::Table(daemon));
+    tokio::fs::write(
+        &config_path,
+        toml::to_string(&config).expect("test config should serialize"),
+    )
+    .await
+    .expect("test config should be written");
+
+    // One-shot runs use the default profile, a container one; this host may
+    // have no container runtime, so the profile runs locally instead.
+    let db = may_agent::db::ChatDb::open(&harness.home_path().join(".may/history.db"))
+        .await
+        .expect("test database should open");
+    let default_profile = db
+        .ensure_default_profiles()
+        .await
+        .expect("default profiles should exist");
+    db.update_profile(
+        &default_profile,
+        may_agent::db::UpdateProfileParams {
+            name: None,
+            icon: None,
+            environment: Some(may_agent::db::ProfileEnvironmentKind::Local),
+            container_image: None,
+            container_id: None,
+            sort_order: None,
+            persona: None,
+            preferences: None,
+            location_aware: None,
+        },
+    )
+    .await
+    .expect("default profile should switch to local");
+    drop(db);
+
+    let binary = may_binary_path();
+    let output = Command::new(&binary)
+        .arg("say hi")
+        .env("HOME", harness.home_path())
+        .env("HEEL_BIN", heel_bin())
+        .output()
+        .await
+        .expect("may one-shot should run");
+    let stop = Command::new(&binary)
+        .args(["daemon", "stop"])
+        .env("HOME", harness.home_path())
+        .output()
+        .await
+        .expect("may daemon stop should run");
+
+    assert!(
+        output.status.success(),
+        "one-shot run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hello from the daemon"),
+        "stdout should carry the turn's text: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("Stopped"),
+        "the one-shot run should leave its daemon running: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
